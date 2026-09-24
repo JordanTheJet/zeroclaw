@@ -92,6 +92,10 @@ pub enum SopIngressOutcome {
 pub struct SopIngress<'a> {
     engine: Option<&'a Arc<Mutex<SopEngine>>>,
     audit: Option<&'a SopAuditLogger>,
+    /// When attached, every `Started` action this ingress produces is routed
+    /// into the shared driver supervisor instead of being logged and dropped
+    /// by `process_headless_results` (the channel half of the headless-driver gap).
+    driver_sink: Option<&'a crate::sop::executor::SopDriverSink>,
 }
 
 impl<'a> SopIngress<'a> {
@@ -100,7 +104,20 @@ impl<'a> SopIngress<'a> {
         engine: Option<&'a Arc<Mutex<SopEngine>>>,
         audit: Option<&'a SopAuditLogger>,
     ) -> Self {
-        Self { engine, audit }
+        Self {
+            engine,
+            audit,
+            driver_sink: None,
+        }
+    }
+
+    /// Attach the shared driver supervisor. Callers that omit this keep the
+    /// previous behavior; callers whose triggers can start auto-mode runs
+    /// (channel ingress) must attach it or their runs are created undriven.
+    #[must_use]
+    pub fn with_driver_sink(mut self, sink: &'a crate::sop::executor::SopDriverSink) -> Self {
+        self.driver_sink = Some(sink);
+        self
     }
 
     /// Lift one untrusted transport delivery into the shared SOP path.
@@ -176,22 +193,28 @@ impl<'a> SopIngress<'a> {
             return SopIngressOutcome::Unavailable(reason);
         };
 
-        SopIngressOutcome::Dispatched(
-            dispatch_untrusted_fan_in_inner(
-                engine,
-                audit,
-                PreparedSopIngress {
-                    source,
-                    topic,
-                    payload,
-                    target_sop,
-                    delivery_dedup,
-                    active_dedup,
-                    max_bytes,
-                },
-            )
-            .await,
+        let results = dispatch_untrusted_fan_in_inner(
+            engine,
+            audit,
+            PreparedSopIngress {
+                source,
+                topic,
+                payload,
+                target_sop,
+                delivery_dedup,
+                active_dedup,
+                max_bytes,
+            },
         )
+        .await;
+        if let Some(sink) = self.driver_sink {
+            for result in &results {
+                if let DispatchResult::Started { action, .. } = result {
+                    sink.drive(action);
+                }
+            }
+        }
+        SopIngressOutcome::Dispatched(results)
     }
 }
 
@@ -279,7 +302,7 @@ pub fn ingress_kind(source: SopTriggerSource) -> SopIngressKind {
 // ── Action helpers ──────────────────────────────────────────────
 
 /// Extract the `run_id` from any `SopRunAction` variant.
-fn extract_run_id_from_action(action: &SopRunAction) -> &str {
+pub(crate) fn extract_run_id_from_action(action: &SopRunAction) -> &str {
     match action {
         SopRunAction::ExecuteStep { run_id, .. }
         | SopRunAction::WaitApproval { run_id, .. }
@@ -840,10 +863,37 @@ async fn dispatch_sop_event_filtered(
                             reason,
                         });
                     }
-                    // `has_retryable_defer` was false, so no `Defer` remains here.
-                    SopAdmission::Defer { .. } => unreachable!(
-                        "a retryable Defer would have returned via the has_retryable_defer branch"
-                    ),
+                    // Unreachable today: `has_retryable_defer` was computed from
+                    // this same vector and returned above when any sibling was
+                    // deferred. If a refactor ever lets a `Defer` reach here, a
+                    // mixed Started+Deferred batch would be the 2b hazard described
+                    // below, so defer the WHOLE delivery and start nothing.
+                    SopAdmission::Defer { reason } => {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_attrs(::serde_json::json!({
+                                "sop_name": sop_name, "reason": reason
+                            })),
+                            &format!(
+                                "SOP dispatch: late Defer for '{sop_name}', deferring the whole delivery: {reason}"
+                            )
+                        );
+                        for admitted in admit_names.drain(..) {
+                            results.push(DispatchResult::Deferred {
+                                sop_name: admitted,
+                                reason: "AMQP delivery deferred because another matched SOP is backpressured".to_string(),
+                            });
+                        }
+                        results.push(DispatchResult::Deferred {
+                            sop_name: sop_name.clone(),
+                            reason,
+                        });
+                        return results;
+                    }
                 }
             }
 
@@ -945,7 +995,7 @@ async fn dispatch_sop_event_filtered(
             let mut remaining = reservations.into_iter();
             for reservation in remaining.by_ref() {
                 let sop_name = reservation.sop_name().to_string();
-                match eng.activate_reserved_run(reservation, event.clone()) {
+                match eng.activate_reserved_run(reservation, event.clone(), None) {
                     Ok(action) => activated.push((sop_name, action)),
                     Err(e) => {
                         activation_failure = Some((sop_name, e.to_string()));
@@ -1299,6 +1349,26 @@ pub fn results_need_redelivery(results: &[DispatchResult]) -> bool {
 /// Compatibility wrapper for fan-in sources that already require concrete
 /// engine and audit handles. New or handle-optional sources should use
 /// [`SopIngress`] so missing handles and source-interest gating share one path.
+pub async fn dispatch_untrusted_fan_in_driven(
+    engine: &Arc<Mutex<SopEngine>>,
+    audit: &SopAuditLogger,
+    driver_sink: Option<&crate::sop::executor::SopDriverSink>,
+    source: SopTriggerSource,
+    topic: Option<&str>,
+    payload: Option<&str>,
+    dedup: Option<(String, bool)>,
+) -> Vec<DispatchResult> {
+    let mut ingress = SopIngress::new(Some(engine), Some(audit));
+    if let Some(sink) = driver_sink {
+        ingress = ingress.with_driver_sink(sink);
+    }
+    match ingress.dispatch(source, topic, payload, None, dedup).await {
+        SopIngressOutcome::Dispatched(results) => results,
+        SopIngressOutcome::NotInterested => vec![DispatchResult::NoMatch],
+        SopIngressOutcome::Unavailable(_) => vec![],
+    }
+}
+
 pub async fn dispatch_untrusted_fan_in(
     engine: &Arc<Mutex<SopEngine>>,
     audit: &SopAuditLogger,

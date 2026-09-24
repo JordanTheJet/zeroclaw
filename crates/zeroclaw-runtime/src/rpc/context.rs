@@ -163,6 +163,10 @@ pub struct RpcContext {
     /// Shared SOP engine from the daemon (for RPC/TUI agent sessions).
     /// `None` when standalone — sessions build their own.
     pub sop_engine: Option<Arc<std::sync::Mutex<crate::sop::SopEngine>>>,
+    /// The daemon generation's driver supervisor set. Approval surfaces
+    /// register resumed headless drivers here so reload drains them instead
+    /// of letting them run detached under superseded configuration.
+    pub sop_driver_handles: Option<crate::sop::SopDriverHandles>,
     pub sop_audit: Option<Arc<crate::sop::SopAuditLogger>>,
 
     /// Lifecycle hook runner. `None` when hooks are disabled in config.
@@ -184,6 +188,28 @@ pub struct RpcContext {
     /// Certificate paths fail closed on `None` rather than issuing
     /// credentials with no trail.
     pub cert_audit: Option<Arc<crate::security::audit::AuditLogger>>,
+
+    /// Test-only pause between the prepare and commit halves of
+    /// `commit_config_with_live_session_refresh`. See `ConfigCommitPause`.
+    #[cfg(test)]
+    pub config_commit_pause: Option<Arc<ConfigCommitPause>>,
+}
+
+/// Test-only pause point inside `commit_config_with_live_session_refresh`:
+/// fires `arrived` once the prepare phase has completed (so every per-session
+/// skip decision has already dropped the skipped sessions' ordering guards
+/// and the `list_ids()` snapshot has passed), then parks on `release` until
+/// the test fires it. Lets a regression drive other RPCs (`session/configure`,
+/// session rehydration) deterministically inside the prepared-and-skipped
+/// window — after the refresh snapshot has passed over a session but before
+/// the candidate config is saved and swapped.
+#[cfg(test)]
+#[derive(Default)]
+pub struct ConfigCommitPause {
+    /// Notified (once) when the commit reaches the pause.
+    pub arrived: tokio::sync::Notify,
+    /// The commit parks on this after `arrived`; the test releases it.
+    pub release: tokio::sync::Notify,
 }
 
 impl RpcContext {
@@ -215,8 +241,11 @@ impl RpcContext {
             tui_registry: Arc::new(TuiRegistry::new(&tui_dir)),
             acp_session_store: AcpSessionStore::new(data_dir.as_path()).ok().map(Arc::new),
             sop_engine: None,
+            sop_driver_handles: None,
             sop_audit: None,
             hooks: None,
+            #[cfg(test)]
+            config_commit_pause: None,
             cert_audit,
         })
     }
@@ -237,8 +266,11 @@ impl RpcContext {
             tui_registry: Arc::new(TuiRegistry::new_unsigned()),
             acp_session_store: None,
             sop_engine: None,
+            sop_driver_handles: None,
             sop_audit: None,
             hooks: None,
+            #[cfg(test)]
+            config_commit_pause: None,
             cert_audit: None,
         })
     }
@@ -268,8 +300,11 @@ impl RpcContext {
             tui_registry: Arc::new(TuiRegistry::new_unsigned()),
             acp_session_store: None,
             sop_engine: None,
+            sop_driver_handles: None,
             sop_audit: None,
             hooks: None,
+            #[cfg(test)]
+            config_commit_pause: None,
             cert_audit,
         })
     }
@@ -294,8 +329,11 @@ impl RpcContext {
             tui_registry: Arc::new(TuiRegistry::new_unsigned()),
             acp_session_store: None,
             sop_engine: None,
+            sop_driver_handles: None,
             sop_audit: None,
             hooks: None,
+            #[cfg(test)]
+            config_commit_pause: None,
             cert_audit: None,
         })
     }
@@ -320,8 +358,11 @@ impl RpcContext {
             tui_registry: Arc::new(TuiRegistry::new_unsigned()),
             acp_session_store: None,
             sop_engine: Some(sop_engine),
+            sop_driver_handles: Some(crate::sop::SopDriverHandles::default()),
             sop_audit: None,
             hooks: None,
+            #[cfg(test)]
+            config_commit_pause: None,
             cert_audit: None,
         })
     }
@@ -349,8 +390,10 @@ impl RpcContext {
             tui_registry: Arc::new(TuiRegistry::new_unsigned()),
             acp_session_store: None,
             sop_engine: Some(sop_engine),
+            sop_driver_handles: None,
             sop_audit: Some(sop_audit),
             hooks: None,
+            config_commit_pause: None,
             cert_audit: None,
         })
     }
@@ -375,8 +418,11 @@ impl RpcContext {
             tui_registry: Arc::new(TuiRegistry::new_unsigned()),
             acp_session_store: None,
             sop_engine: None,
+            sop_driver_handles: None,
             sop_audit: None,
             hooks: None,
+            #[cfg(test)]
+            config_commit_pause: None,
             cert_audit: None,
         })
     }
@@ -401,8 +447,11 @@ impl RpcContext {
             tui_registry: Arc::new(TuiRegistry::new_unsigned()),
             acp_session_store: None,
             sop_engine: None,
+            sop_driver_handles: None,
             sop_audit: None,
             hooks: None,
+            #[cfg(test)]
+            config_commit_pause: None,
             cert_audit: None,
         })
     }
@@ -428,8 +477,11 @@ impl RpcContext {
             tui_registry: Arc::new(TuiRegistry::new_unsigned()),
             acp_session_store,
             sop_engine: None,
+            sop_driver_handles: None,
             sop_audit: None,
             hooks: None,
+            #[cfg(test)]
+            config_commit_pause: None,
             cert_audit: None,
         })
     }
@@ -455,8 +507,11 @@ impl RpcContext {
             tui_registry: Arc::new(TuiRegistry::new_unsigned()),
             acp_session_store: None,
             sop_engine: None,
+            sop_driver_handles: None,
             sop_audit: None,
             hooks: None,
+            #[cfg(test)]
+            config_commit_pause: None,
             cert_audit: None,
         })
     }

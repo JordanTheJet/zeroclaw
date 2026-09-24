@@ -30,7 +30,6 @@
     clippy::unnecessary_literal_bound,
     clippy::unnecessary_map_or,
     clippy::unnecessary_wraps,
-    dead_code,
     unused_variables,
     unused_imports
 )]
@@ -42,6 +41,15 @@ use serde::{Deserialize, Serialize};
 use std::fmt::Write as _;
 use std::io::{BufRead, ErrorKind, Read, Write};
 
+#[cfg(feature = "agent-runtime")]
+use crossterm::{
+    cursor::{Hide, MoveTo, Show},
+    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    execute,
+    terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
+};
+
+#[cfg(any(not(feature = "agent-runtime"), windows))]
 const STDIN_LINE_CAP: usize = 1024 * 1024;
 
 /// Result of [`read_capped_line`].
@@ -80,6 +88,7 @@ fn read_capped_line<R: std::io::BufRead>(reader: R, cap: usize) -> std::io::Resu
 /// UTF-8 char boundary. `String::truncate` panics when the byte index lands
 /// inside a multi-byte character, so a raw `line.truncate(cap)` on piped input
 /// is a latent panic. No-op when the string already fits.
+#[cfg(any(windows, test))]
 fn cap_line_utf8_safe(line: &mut String, cap: usize) {
     if line.len() > cap {
         line.truncate(line.floor_char_boundary(cap));
@@ -109,6 +118,7 @@ fn discard_until_newline<R: std::io::BufRead>(reader: &mut R) -> std::io::Result
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+#[cfg(feature = "agent-runtime")]
 use zeroclaw_config::api_error::{ConfigApiCode, ConfigApiError};
 
 /// Resolve a `cli-*` Fluent key for CLI output. Routes through the runtime
@@ -128,14 +138,14 @@ fn t(key: &str, fallback: &str) -> String {
 
 /// `t` with `{$name}` arguments.
 #[allow(unused_variables)]
-fn ta(key: &str, args: &[(&str, &str)], fallback: &str) -> String {
+fn ta(key: &str, args: &[(&str, &str)], fallback: impl Into<String>) -> String {
     #[cfg(feature = "agent-runtime")]
     {
         zeroclaw_runtime::i18n::get_required_cli_string_with_args(key, args)
     }
     #[cfg(not(feature = "agent-runtime"))]
     {
-        fallback.to_string() // i18n-exempt: English fallback when Fluent (agent-runtime) is disabled
+        fallback.into() // i18n-exempt: English fallback when Fluent (agent-runtime) is disabled
     }
 }
 
@@ -176,6 +186,516 @@ fn quickstart_row(key: &str, glyph: &str, summary: &str) -> String {
 }
 
 #[cfg(feature = "agent-runtime")]
+const QUICKSTART_SELECTOR_MIN_WIDTH: usize = 20;
+
+#[cfg(feature = "agent-runtime")]
+const QUICKSTART_SELECTOR_ROW_OVERHEAD: usize = 3;
+
+#[cfg(feature = "agent-runtime")]
+const QUICKSTART_SELECTOR_VERTICAL_OVERHEAD: usize = 2;
+
+#[cfg(feature = "agent-runtime")]
+fn quickstart_selector_row_budget(terminal_width: usize) -> Option<usize> {
+    if terminal_width < QUICKSTART_SELECTOR_MIN_WIDTH {
+        return None;
+    }
+    terminal_width.checked_sub(QUICKSTART_SELECTOR_ROW_OVERHEAD)
+}
+
+/// Resolve the terminal dimensions the Quickstart checklist will be fitted to.
+///
+/// A narrow terminal whose size is unavailable must not get rows fitted against
+/// a guessed geometry — that would reintroduce the exact overflow class this
+/// change exists to prevent. Unknown dimensions therefore take the same
+/// fail-closed path as a too-narrow terminal.
+#[cfg(feature = "agent-runtime")]
+fn quickstart_selector_terminal_size<T: QuickstartSelectorTerminal>(
+    term: &mut T,
+) -> Option<(u16, u16)> {
+    term.size_checked()
+}
+
+/// Whether a sampled terminal size is usable for fitting the checklist.
+#[cfg(all(feature = "agent-runtime", test))]
+fn quickstart_selector_size_is_usable(size: Option<(u16, u16)>) -> bool {
+    size.is_some()
+}
+
+#[cfg(feature = "agent-runtime")]
+fn quickstart_selector_min_height(item_count: usize) -> usize {
+    item_count.saturating_add(QUICKSTART_SELECTOR_VERTICAL_OVERHEAD)
+}
+
+#[cfg(feature = "agent-runtime")]
+fn quickstart_selector_fits_height(terminal_height: usize, item_count: usize) -> bool {
+    terminal_height >= quickstart_selector_min_height(item_count)
+}
+
+#[cfg(feature = "agent-runtime")]
+fn fit_quickstart_selector_row(row: &str, budget: usize) -> String {
+    let normalized: String = row
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect();
+    if normalized.len() <= budget && console::measure_text_width(&normalized) <= budget {
+        return normalized;
+    }
+    if budget == 0 {
+        return String::new();
+    }
+
+    let marker = if budget >= "…".len() { "…" } else { "." };
+    let byte_budget = budget - marker.len();
+    let width_budget = budget - console::measure_text_width(marker);
+    let mut fitted = String::with_capacity(budget);
+    for ch in normalized.chars() {
+        fitted.push(ch);
+        if fitted.len() > byte_budget || console::measure_text_width(&fitted) > width_budget {
+            fitted.pop();
+            break;
+        }
+    }
+    fitted.push_str(marker);
+    fitted
+}
+
+#[cfg(feature = "agent-runtime")]
+fn quickstart_selector_resize_error(
+    initial_size: (u16, u16),
+    current_size: (u16, u16),
+) -> anyhow::Error {
+    let (initial_height, initial_width) = initial_size;
+    let (current_height, current_width) = current_size;
+    anyhow::Error::msg(qta(
+        "cli-quickstart-terminal-resized",
+        &[
+            ("initial_width", &initial_width.to_string()),
+            ("initial_height", &initial_height.to_string()),
+            ("current_width", &current_width.to_string()),
+            ("current_height", &current_height.to_string()),
+        ],
+    ))
+}
+
+/// Decide whether an interaction may continue at the size sampled now.
+///
+/// Returns `Err` both when the terminal changed size and when its size became
+/// unavailable: an unknown size is not evidence that the geometry still
+/// matches, and `Term::size()`'s fabricated `(24, 80)` fallback could even
+/// compare *equal* to the initial sample on an 80x24 terminal that has since
+/// lost its size query. Unknown therefore fails closed, like a resize.
+#[cfg(feature = "agent-runtime")]
+fn quickstart_selector_recheck_size(
+    initial_size: (u16, u16),
+    current_size: Option<(u16, u16)>,
+) -> Result<()> {
+    match current_size {
+        Some(current) if current == initial_size => Ok(()),
+        Some(current) => Err(quickstart_selector_resize_error(initial_size, current)),
+        None => Err(anyhow::Error::msg(qta(
+            "cli-quickstart-terminal-size-unknown",
+            &[],
+        ))),
+    }
+}
+
+#[cfg(feature = "agent-runtime")]
+fn quickstart_selector_frame_lines(
+    labels: &[String],
+    prompt: &str,
+    selected: usize,
+) -> Vec<String> {
+    std::iter::once(format!("? {prompt}"))
+        .chain(labels.iter().enumerate().map(|(index, label)| {
+            let marker = if index == selected { ">" } else { " " };
+            format!("{marker} {label}")
+        }))
+        .collect()
+}
+
+#[cfg(feature = "agent-runtime")]
+fn render_quickstart_selector<T: QuickstartSelectorTerminal>(
+    term: &mut T,
+    lines: &[String],
+) -> std::io::Result<()> {
+    for line in lines {
+        term.write_line(line)?;
+    }
+    term.flush()
+}
+
+#[cfg(feature = "agent-runtime")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QuickstartSelectorKey {
+    Down,
+    Up,
+    Select,
+    Cancel,
+    Interrupt,
+    Other,
+}
+
+#[cfg(feature = "agent-runtime")]
+trait QuickstartSelectorTerminal {
+    /// Geometry of the terminal that receives `write_line` output, as
+    /// `(rows, columns)`, or `None` when it cannot be determined.
+    fn size_checked(&mut self) -> Option<(u16, u16)>;
+    fn enter_alternate_screen(&mut self) -> std::io::Result<()>;
+    fn clear_screen(&mut self) -> std::io::Result<()>;
+    fn move_cursor_to_origin(&mut self) -> std::io::Result<()>;
+    fn hide_cursor(&mut self) -> std::io::Result<()>;
+    fn show_cursor(&mut self) -> std::io::Result<()>;
+    fn leave_alternate_screen(&mut self) -> std::io::Result<()>;
+    fn write_line(&mut self, line: &str) -> std::io::Result<()>;
+    fn flush(&mut self) -> std::io::Result<()>;
+    fn read_key(&mut self) -> std::io::Result<QuickstartSelectorKey>;
+}
+
+/// The input half of the Crossterm selector: raw-mode ownership plus key
+/// decoding. It is separate from the output half so a regression can drive the
+/// production output adapter with injected keys.
+#[cfg(feature = "agent-runtime")]
+trait QuickstartSelectorInput {
+    fn read_key(&mut self) -> std::io::Result<QuickstartSelectorKey>;
+}
+
+#[cfg(feature = "agent-runtime")]
+struct CrosstermQuickstartInput {
+    restore_cooked_mode: bool,
+}
+
+#[cfg(feature = "agent-runtime")]
+impl CrosstermQuickstartInput {
+    fn new() -> std::io::Result<Self> {
+        let raw_mode_was_enabled = terminal::is_raw_mode_enabled()?;
+        if !raw_mode_was_enabled {
+            terminal::enable_raw_mode()?;
+        }
+        Ok(Self {
+            restore_cooked_mode: !raw_mode_was_enabled,
+        })
+    }
+}
+
+#[cfg(feature = "agent-runtime")]
+impl Drop for CrosstermQuickstartInput {
+    fn drop(&mut self) {
+        if self.restore_cooked_mode {
+            let _ = terminal::disable_raw_mode();
+        }
+    }
+}
+
+#[cfg(feature = "agent-runtime")]
+impl QuickstartSelectorInput for CrosstermQuickstartInput {
+    fn read_key(&mut self) -> std::io::Result<QuickstartSelectorKey> {
+        loop {
+            match event::read()? {
+                Event::Key(key)
+                    if key.kind == KeyEventKind::Press || key.kind == KeyEventKind::Repeat =>
+                {
+                    let control = key.modifiers.contains(KeyModifiers::CONTROL);
+                    let modified = key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::META);
+                    return Ok(match key.code {
+                        KeyCode::Char('c') if control => QuickstartSelectorKey::Interrupt,
+                        KeyCode::Down | KeyCode::Tab => QuickstartSelectorKey::Down,
+                        KeyCode::Char('j') if !modified => QuickstartSelectorKey::Down,
+                        KeyCode::Up | KeyCode::BackTab => QuickstartSelectorKey::Up,
+                        KeyCode::Char('k') if !modified => QuickstartSelectorKey::Up,
+                        KeyCode::Enter => QuickstartSelectorKey::Select,
+                        KeyCode::Char(' ') if !modified => QuickstartSelectorKey::Select,
+                        KeyCode::Esc => QuickstartSelectorKey::Cancel,
+                        KeyCode::Char('q') if !modified => QuickstartSelectorKey::Cancel,
+                        _ => QuickstartSelectorKey::Other,
+                    });
+                }
+                // A resize is returned to the loop so the checked geometry is
+                // sampled immediately rather than waiting for another key.
+                Event::Resize(_, _) => return Ok(QuickstartSelectorKey::Other),
+                _ => {}
+            }
+        }
+    }
+}
+
+/// A frame destination whose own terminal geometry can be measured.
+///
+/// Quickstart requires stdin and stderr to be terminals, not the same
+/// terminal. The frame is therefore fitted to the descriptor it is written to
+/// rather than to whichever terminal a process-global query describes.
+#[cfg(all(feature = "agent-runtime", unix))]
+trait QuickstartSelectorOutput: Write + std::os::fd::AsFd {}
+
+#[cfg(all(feature = "agent-runtime", unix))]
+impl<W: Write + std::os::fd::AsFd> QuickstartSelectorOutput for W {}
+
+#[cfg(all(feature = "agent-runtime", not(unix)))]
+trait QuickstartSelectorOutput: Write {}
+
+#[cfg(all(feature = "agent-runtime", not(unix)))]
+impl<W: Write> QuickstartSelectorOutput for W {}
+
+/// Measure the terminal behind `output` as `(rows, columns)`.
+///
+/// A zero dimension means the driver holds no geometry for that terminal. It
+/// is reported as unknown so the caller fails closed instead of fitting rows
+/// to a zero-width frame.
+#[cfg(all(feature = "agent-runtime", unix))]
+fn quickstart_output_terminal_size<W: QuickstartSelectorOutput>(output: &W) -> Option<(u16, u16)> {
+    use std::os::fd::AsRawFd;
+
+    let mut size = std::mem::MaybeUninit::<libc::winsize>::uninit();
+    // SAFETY: `size` points to writable `winsize` storage and the borrowed
+    // descriptor stays open for the duration of the call.
+    let result = unsafe {
+        libc::ioctl(
+            output.as_fd().as_raw_fd(),
+            libc::TIOCGWINSZ,
+            size.as_mut_ptr(),
+        )
+    };
+    if result != 0 {
+        return None;
+    }
+    // SAFETY: a successful `TIOCGWINSZ` initialized `size`.
+    let size = unsafe { size.assume_init() };
+    (size.ws_row > 0 && size.ws_col > 0).then_some((size.ws_row, size.ws_col))
+}
+
+/// Measure the active console screen buffer as `(rows, columns)`.
+///
+/// Crossterm offers no per-handle geometry query here. A native console
+/// shares one screen buffer between stdout and stderr, so the measured
+/// surface is the one that receives the frame. Native-console rendering is
+/// not exercised by hosted checks and remains a documented verification gap.
+#[cfg(all(feature = "agent-runtime", not(unix)))]
+fn quickstart_output_terminal_size<W: QuickstartSelectorOutput>(_output: &W) -> Option<(u16, u16)> {
+    terminal::size().ok().map(|(columns, rows)| (rows, columns))
+}
+
+/// Crossterm-backed selector terminal: frames go to `output`, keys come from
+/// `input`, and geometry is always read from `output`.
+#[cfg(feature = "agent-runtime")]
+struct CrosstermQuickstartTerminal<W: QuickstartSelectorOutput, K: QuickstartSelectorInput> {
+    output: W,
+    input: K,
+}
+
+#[cfg(feature = "agent-runtime")]
+impl CrosstermQuickstartTerminal<std::io::Stderr, CrosstermQuickstartInput> {
+    fn stderr() -> std::io::Result<Self> {
+        Ok(Self {
+            output: std::io::stderr(),
+            input: CrosstermQuickstartInput::new()?,
+        })
+    }
+}
+
+#[cfg(feature = "agent-runtime")]
+impl<W: QuickstartSelectorOutput, K: QuickstartSelectorInput> QuickstartSelectorTerminal
+    for CrosstermQuickstartTerminal<W, K>
+{
+    fn size_checked(&mut self) -> Option<(u16, u16)> {
+        quickstart_output_terminal_size(&self.output)
+    }
+
+    fn enter_alternate_screen(&mut self) -> std::io::Result<()> {
+        execute!(self.output, EnterAlternateScreen)
+    }
+
+    fn clear_screen(&mut self) -> std::io::Result<()> {
+        execute!(self.output, Clear(ClearType::All))
+    }
+
+    fn move_cursor_to_origin(&mut self) -> std::io::Result<()> {
+        execute!(self.output, MoveTo(0, 0))
+    }
+
+    fn hide_cursor(&mut self) -> std::io::Result<()> {
+        execute!(self.output, Hide)
+    }
+
+    fn show_cursor(&mut self) -> std::io::Result<()> {
+        execute!(self.output, Show)
+    }
+
+    fn leave_alternate_screen(&mut self) -> std::io::Result<()> {
+        // Crossterm uses the native screen-buffer API on legacy Windows
+        // consoles and the ANSI sequence on terminals that support it.
+        execute!(self.output, LeaveAlternateScreen)
+    }
+
+    fn write_line(&mut self, line: &str) -> std::io::Result<()> {
+        // Raw mode disables the Unix terminal driver's LF-to-CRLF mapping.
+        // Emit both controls explicitly so every row begins in column zero.
+        write!(self.output, "{line}\r\n")
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.output.flush()
+    }
+
+    fn read_key(&mut self) -> std::io::Result<QuickstartSelectorKey> {
+        self.input.read_key()
+    }
+}
+
+/// Own the alternate screen from before its first fallible operation.
+///
+/// Claiming ownership before `enter_alternate_screen` means a partial write or
+/// flush failure still triggers a best-effort restore. Cleanup attempts are
+/// independent: a cursor error must never strand the alternate screen.
+#[cfg(feature = "agent-runtime")]
+struct QuickstartSelectorScreen<'a, T: QuickstartSelectorTerminal> {
+    term: &'a mut T,
+    restore_needed: bool,
+}
+
+#[cfg(feature = "agent-runtime")]
+impl<'a, T: QuickstartSelectorTerminal> QuickstartSelectorScreen<'a, T> {
+    fn enter(term: &'a mut T) -> std::io::Result<Self> {
+        let screen = Self {
+            term,
+            restore_needed: true,
+        };
+        screen.term.enter_alternate_screen()?;
+        screen.term.clear_screen()?;
+        screen.term.move_cursor_to_origin()?;
+        screen.term.hide_cursor()?;
+        screen.term.flush()?;
+        Ok(screen)
+    }
+
+    fn restore(&mut self) -> std::io::Result<()> {
+        if !self.restore_needed {
+            return Ok(());
+        }
+        self.restore_needed = false;
+
+        let mut first_error = None;
+        for result in [
+            self.term.show_cursor(),
+            self.term.leave_alternate_screen(),
+            self.term.flush(),
+        ] {
+            if first_error.is_none() {
+                first_error = result.err();
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+}
+
+#[cfg(feature = "agent-runtime")]
+impl<T: QuickstartSelectorTerminal> Drop for QuickstartSelectorScreen<'_, T> {
+    fn drop(&mut self) {
+        let _ = self.restore();
+    }
+}
+
+#[cfg(feature = "agent-runtime")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QuickstartSelectorOutcome {
+    Pick(Option<usize>),
+    Interrupt,
+}
+
+/// Render the fixed-size Quickstart checklist without dialoguer paging.
+///
+/// The terminal dimensions sampled for fitting are part of this interaction's
+/// contract. They describe the terminal that receives the frame, and every
+/// input event rechecks them before navigation or selection; a resize exits
+/// the selector-owned alternate screen instead of trying to erase a
+/// main-screen frame whose physical rows the terminal may have reflowed. A
+/// resize of the output terminal alone raises no input event, so it is caught
+/// at the next key. Leaving the alternate screen atomically restores
+/// unrelated output.
+#[cfg(feature = "agent-runtime")]
+fn interact_quickstart_selector<T: QuickstartSelectorTerminal>(
+    term: &mut T,
+    labels: &[String],
+    prompt: &str,
+    initial_size: (u16, u16),
+) -> Result<QuickstartSelectorOutcome> {
+    if labels.is_empty() {
+        bail!(qta("cli-quickstart-empty-checklist", &[]));
+    }
+    let current_size = quickstart_selector_terminal_size(term);
+    quickstart_selector_recheck_size(initial_size, current_size)?;
+
+    let mut screen = QuickstartSelectorScreen::enter(term)?;
+    let interaction = (|| -> Result<QuickstartSelectorOutcome> {
+        let mut selected = 0;
+        let mut frame = quickstart_selector_frame_lines(labels, prompt, selected);
+        render_quickstart_selector(screen.term, &frame)?;
+
+        loop {
+            let key = screen.term.read_key()?;
+            let current_size = quickstart_selector_terminal_size(screen.term);
+            quickstart_selector_recheck_size(initial_size, current_size)?;
+
+            match key {
+                QuickstartSelectorKey::Down => {
+                    selected = (selected + 1) % labels.len();
+                    frame = quickstart_selector_frame_lines(labels, prompt, selected);
+                    screen.term.clear_screen()?;
+                    screen.term.move_cursor_to_origin()?;
+                    render_quickstart_selector(screen.term, &frame)?;
+                }
+                QuickstartSelectorKey::Up => {
+                    selected = selected.checked_sub(1).unwrap_or(labels.len() - 1);
+                    frame = quickstart_selector_frame_lines(labels, prompt, selected);
+                    screen.term.clear_screen()?;
+                    screen.term.move_cursor_to_origin()?;
+                    render_quickstart_selector(screen.term, &frame)?;
+                }
+                QuickstartSelectorKey::Select => {
+                    return Ok(QuickstartSelectorOutcome::Pick(Some(selected)));
+                }
+                QuickstartSelectorKey::Cancel => {
+                    return Ok(QuickstartSelectorOutcome::Pick(None));
+                }
+                QuickstartSelectorKey::Interrupt => {
+                    return Ok(QuickstartSelectorOutcome::Interrupt);
+                }
+                QuickstartSelectorKey::Other => {}
+            }
+        }
+    })();
+    let cleanup = screen.restore();
+    match (interaction, cleanup) {
+        (Ok(QuickstartSelectorOutcome::Interrupt), _) => Ok(QuickstartSelectorOutcome::Interrupt),
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error.into()),
+        (Ok(selection), Ok(())) => Ok(selection),
+    }
+}
+
+#[cfg(feature = "agent-runtime")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QuickstartChecklistAction {
+    Provider,
+    Risk,
+    Memory,
+    Channels,
+    PeerGroups,
+    Agent,
+    Create,
+    Quit,
+}
+
+#[cfg(feature = "agent-runtime")]
+fn quickstart_action_for_pick(
+    choices: &[(QuickstartChecklistAction, String)],
+    pick: Option<usize>,
+) -> QuickstartChecklistAction {
+    pick.and_then(|index| choices.get(index).map(|(action, _)| *action))
+        .unwrap_or(QuickstartChecklistAction::Quit)
+}
+
+#[cfg(feature = "agent-runtime")]
 fn quickstart_step_label(step: zeroclaw_runtime::quickstart::QuickstartStep) -> String {
     t(step.label_key(), step.label())
 }
@@ -184,6 +704,7 @@ fn quickstart_step_label(step: zeroclaw_runtime::quickstart::QuickstartStep) -> 
 /// line, preserving any non-comment whitespace. Mirrors the gateway's
 /// `apply_comments`. Best-effort — silently bails on parse errors so a
 /// successful set isn't downgraded to a failure for a metadata problem.
+#[cfg(feature = "agent-runtime")]
 async fn apply_comment_inline(
     config_path: &std::path::Path,
     path: &str,
@@ -197,6 +718,7 @@ async fn apply_comment_inline(
     .context("failed to write comment annotation")
 }
 
+#[cfg(feature = "agent-runtime")]
 fn config_patch_prop_kind(config: &Config, path: &str) -> Option<crate::config::PropKind> {
     config
         .prop_fields()
@@ -205,6 +727,7 @@ fn config_patch_prop_kind(config: &Config, path: &str) -> Option<crate::config::
         .map(|f| f.kind)
 }
 
+#[cfg(feature = "agent-runtime")]
 fn json_value_to_setprop_string(
     value: &serde_json::Value,
     config: &Config,
@@ -230,6 +753,7 @@ fn json_value_to_setprop_string(
     }
 }
 
+#[cfg(feature = "agent-runtime")]
 fn config_patch_map_prop_error(err: anyhow::Error, path: &str, op_index: usize) -> ConfigApiError {
     let msg = err.to_string();
     if msg.starts_with("Unknown property") {
@@ -241,11 +765,13 @@ fn config_patch_map_prop_error(err: anyhow::Error, path: &str, op_index: usize) 
     }
 }
 
+#[cfg(feature = "agent-runtime")]
 fn config_patch_json_error(err: &ConfigApiError) -> Result<()> {
     eprintln!("{}", serde_json::to_string_pretty(err)?);
     std::process::exit(1);
 }
 
+#[cfg(feature = "agent-runtime")]
 fn config_patch_json_value_type_error(
     message: impl Into<String>,
     path: Option<String>,
@@ -261,6 +787,7 @@ fn config_patch_json_value_type_error(
     err
 }
 
+#[cfg(feature = "agent-runtime")]
 fn config_patch_fail_json_or_human<T>(
     json: bool,
     err: ConfigApiError,
@@ -344,6 +871,7 @@ fn pause_after_no_command_help() {
 
 #[cfg(feature = "agent-runtime")]
 mod agent;
+#[cfg(feature = "agent-runtime")]
 mod alias_cli;
 #[cfg(feature = "agent-runtime")]
 mod approval;
@@ -385,6 +913,7 @@ mod i18n;
 mod identity;
 #[cfg(feature = "agent-runtime")]
 mod integrations;
+#[cfg(feature = "agent-runtime")]
 mod memory;
 #[cfg(feature = "agent-runtime")]
 mod migration;
@@ -396,6 +925,8 @@ mod observability;
 mod peripherals;
 #[cfg(feature = "agent-runtime")]
 mod platform;
+#[cfg(feature = "plugins-wasm")]
+mod plugin_catalog;
 #[cfg(feature = "plugins-wasm")]
 mod plugin_registry;
 #[cfg(feature = "plugins-wasm")]
@@ -516,7 +1047,7 @@ impl LogLevel {
 enum EvalCommands {
     /// Run a suite of evaluation cases.
     Run {
-        /// Directory of `*.json` trace fixtures (defaults to `evals`).
+        /// Directory of `*.json` trace fixtures (defaults to `evals/regression`).
         #[arg(long)]
         suite: Option<String>,
 
@@ -686,8 +1217,13 @@ Methods: initialize, session/new, session/prompt, session/stop.
 
 Examples:
   zeroclaw acp                        # start ACP server
+  zeroclaw acp --agent fable         # default new sessions to agent fable
   zeroclaw acp --max-sessions 5       # limit concurrent sessions")]
     Acp {
+        /// Process-scoped default agent for alias-less session/new requests
+        #[arg(long)]
+        agent: Option<String>,
+
         /// Maximum concurrent sessions (default: 10)
         #[arg(long)]
         max_sessions: Option<usize>,
@@ -1056,8 +1592,8 @@ expectations. No network calls, fully deterministic. Exits non-zero if any case 
 so it can gate CI.
 
 Examples:
-  zeroclaw eval run                                  # replay ./evals
-  zeroclaw eval run --suite evals --format json")]
+  zeroclaw eval run                                  # replay ./evals/regression
+  zeroclaw eval run --suite evals/regression --format json")]
     Eval {
         #[command(subcommand)]
         eval_command: EvalCommands,
@@ -1170,62 +1706,6 @@ enum DeprecatedPropsCommands {
 }
 
 #[cfg(feature = "agent-runtime")]
-fn runtime_dir_env_is_explicit(name: &str, value: &str) -> bool {
-    match name {
-        "ZEROCLAW_CONFIG_DIR" | "ZEROCLAW_DATA_DIR" => !value.trim().is_empty(),
-        "ZEROCLAW_WORKSPACE" => !value.is_empty(),
-        _ => false,
-    }
-}
-
-#[cfg(feature = "agent-runtime")]
-fn resolve_homebrew_onboard_config_dir(
-    exe: &Path,
-    env_lookup: impl Fn(&str) -> Option<String>,
-) -> Option<PathBuf> {
-    let explicit_runtime_dir = [
-        "ZEROCLAW_CONFIG_DIR",
-        "ZEROCLAW_DATA_DIR",
-        "ZEROCLAW_WORKSPACE",
-    ]
-    .iter()
-    .any(|name| env_lookup(name).is_some_and(|value| runtime_dir_env_is_explicit(name, &value)));
-
-    if explicit_runtime_dir {
-        return None;
-    }
-
-    zeroclaw_runtime::service::homebrew_var_dir_from_exe(exe)
-}
-
-#[cfg(feature = "agent-runtime")]
-fn apply_homebrew_onboard_config_dir_with(
-    exe: &Path,
-    env_lookup: impl Fn(&str) -> Option<String>,
-    mut set_env: impl FnMut(&'static str, &Path),
-) -> Option<PathBuf> {
-    let config_dir = resolve_homebrew_onboard_config_dir(exe, env_lookup)?;
-    set_env("ZEROCLAW_CONFIG_DIR", &config_dir);
-    Some(config_dir)
-}
-
-#[cfg(feature = "agent-runtime")]
-fn apply_homebrew_onboard_config_dir() {
-    let Ok(exe) = std::env::current_exe() else {
-        return;
-    };
-
-    apply_homebrew_onboard_config_dir_with(
-        &exe,
-        |name| std::env::var(name).ok(),
-        |name, value| {
-            // SAFETY: called early in the onboard command path before new threads are spawned.
-            unsafe { std::env::set_var(name, value) };
-        },
-    );
-}
-
-#[cfg(feature = "agent-runtime")]
 fn quickstart_runtime_profile_for_provider(
     provider_type: &str,
     providers: &[zeroclaw_runtime::quickstart::QuickstartTypeOption],
@@ -1335,7 +1815,6 @@ async fn run_quickstart_cli(
     enum ChannelChoice {
         Fresh {
             kind: String,
-            display_name: String,
             alias: String,
             extras: std::collections::BTreeMap<String, String>,
         },
@@ -1434,19 +1913,6 @@ async fn run_quickstart_cli(
         }
     }
 
-    // ── Main checklist loop ─────────────────────────────────────
-    #[derive(Clone, Copy)]
-    enum Action {
-        Provider,
-        Risk,
-        Memory,
-        Channels,
-        PeerGroups,
-        Agent,
-        Create,
-        Quit,
-    }
-
     println!();
     println!(
         "{}",
@@ -1536,74 +2002,127 @@ async fn run_quickstart_cli(
         };
 
         let risk_summary = preset_summary(&form.risk);
-        let mut labels: Vec<String> = vec![
-            quickstart_row(
-                "cli-quickstart-row-model-provider",
-                glyph(form.provider_done()),
-                &provider_summary,
+        let mut choices: Vec<(QuickstartChecklistAction, String)> = vec![
+            (
+                QuickstartChecklistAction::Provider,
+                quickstart_row(
+                    "cli-quickstart-row-model-provider",
+                    glyph(form.provider_done()),
+                    &provider_summary,
+                ),
             ),
-            quickstart_row(
-                "cli-quickstart-row-risk-profile",
-                glyph(form.risk_done()),
-                &risk_summary,
+            (
+                QuickstartChecklistAction::Risk,
+                quickstart_row(
+                    "cli-quickstart-row-risk-profile",
+                    glyph(form.risk_done()),
+                    &risk_summary,
+                ),
             ),
-            quickstart_row(
-                "cli-quickstart-row-memory",
-                glyph(form.memory_done()),
-                &memory_summary,
+            (
+                QuickstartChecklistAction::Memory,
+                quickstart_row(
+                    "cli-quickstart-row-memory",
+                    glyph(form.memory_done()),
+                    &memory_summary,
+                ),
             ),
-            quickstart_row(
-                "cli-quickstart-row-channels",
-                glyph(form.channels_done()),
-                &channels_summary,
+            (
+                QuickstartChecklistAction::Channels,
+                quickstart_row(
+                    "cli-quickstart-row-channels",
+                    glyph(form.channels_done()),
+                    &channels_summary,
+                ),
             ),
-            quickstart_row(
-                "cli-quickstart-row-peer-groups",
-                glyph(form.peer_groups_done()),
-                &peer_groups_summary,
+            (
+                QuickstartChecklistAction::PeerGroups,
+                quickstart_row(
+                    "cli-quickstart-row-peer-groups",
+                    glyph(form.peer_groups_done()),
+                    &peer_groups_summary,
+                ),
             ),
-            quickstart_row(
-                "cli-quickstart-row-agent-identity",
-                glyph(form.agent_done()),
-                &agent_summary,
+            (
+                QuickstartChecklistAction::Agent,
+                quickstart_row(
+                    "cli-quickstart-row-agent-identity",
+                    glyph(form.agent_done()),
+                    &agent_summary,
+                ),
             ),
         ];
         let create_enabled = form.all_done();
-        labels.push(if create_enabled {
-            t("cli-quickstart-create-agent", "── Create agent")
-        } else {
-            t(
-                "cli-quickstart-create-agent-locked",
-                "── Create agent (locked — fill every selector first)",
-            )
-        });
+        choices.push((
+            QuickstartChecklistAction::Create,
+            if create_enabled {
+                t("cli-quickstart-create-agent", "── Create agent")
+            } else {
+                t(
+                    "cli-quickstart-create-agent-locked",
+                    "── Create agent (locked — fill every selector first)",
+                )
+            },
+        ));
 
-        let actions = [
-            Action::Provider,
-            Action::Risk,
-            Action::Memory,
-            Action::Channels,
-            Action::PeerGroups,
-            Action::Agent,
-            Action::Create,
-        ];
+        let mut term = CrosstermQuickstartTerminal::stderr()?;
+        // Fail closed when the terminal API cannot report its dimensions;
+        // fitting against a guessed size would reintroduce row overflow.
+        let Some(terminal_size) = quickstart_selector_terminal_size(&mut term) else {
+            anyhow::bail!("{}", qta("cli-quickstart-terminal-size-unknown", &[]));
+        };
+        let (terminal_height, terminal_width) = terminal_size;
+        let terminal_height = usize::from(terminal_height);
+        let terminal_width = usize::from(terminal_width);
+        let Some(row_budget) = quickstart_selector_row_budget(terminal_width) else {
+            let terminal_width = terminal_width.to_string();
+            let min_width = QUICKSTART_SELECTOR_MIN_WIDTH.to_string();
+            anyhow::bail!(
+                "{}",
+                qta(
+                    "cli-quickstart-terminal-too-narrow",
+                    &[("width", &terminal_width), ("min_width", &min_width)],
+                )
+            );
+        };
+        let labels: Vec<String> = choices
+            .iter()
+            .map(|(_, label)| fit_quickstart_selector_row(label, row_budget))
+            .collect();
+        let min_height = quickstart_selector_min_height(labels.len());
+        if !quickstart_selector_fits_height(terminal_height, labels.len()) {
+            let terminal_height = terminal_height.to_string();
+            let min_height = min_height.to_string();
+            anyhow::bail!(
+                "{}",
+                qta(
+                    "cli-quickstart-terminal-too-short",
+                    &[("height", &terminal_height), ("min_height", &min_height)],
+                )
+            );
+        }
 
-        let pick = FuzzySelect::new()
-            .with_prompt(t(
+        let prompt = fit_quickstart_selector_row(
+            &t(
                 "cli-quickstart-open-selector-prompt",
                 "Open a selector (Enter), or pick Create. Esc to quit.",
-            ))
-            .items(&labels)
-            .default(0)
-            .max_length(labels.len())
-            .interact_opt()?;
-        let action = match pick {
-            Some(i) => actions[i],
-            None => Action::Quit, // Esc on the main checklist quits.
+            ),
+            row_budget,
+        );
+        // Keep this checklist non-searchable and non-paged, and fail closed if
+        // its fitted terminal dimensions change while it is active.
+        let outcome = interact_quickstart_selector(&mut term, &labels, &prompt, terminal_size)?;
+        // `process::exit` does not run destructors. Restore cooked mode before
+        // preserving the selector's historical Ctrl+C exit semantics.
+        drop(term);
+        let pick = match outcome {
+            QuickstartSelectorOutcome::Pick(pick) => pick,
+            QuickstartSelectorOutcome::Interrupt => std::process::exit(130),
         };
+        let action = quickstart_action_for_pick(&choices, pick);
 
         match action {
-            Action::Quit => {
+            QuickstartChecklistAction::Quit => {
                 println!(
                     "{}",
                     t(
@@ -1613,7 +2132,7 @@ async fn run_quickstart_cli(
                 );
                 return Ok(());
             }
-            Action::Create => {
+            QuickstartChecklistAction::Create => {
                 if !create_enabled {
                     println!(
                         "{}",
@@ -1626,7 +2145,7 @@ async fn run_quickstart_cli(
                 }
                 break;
             }
-            Action::Provider => {
+            QuickstartChecklistAction::Provider => {
                 // Step 1: pick Existing or Fresh, when there are
                 // existing providers to choose from.
                 let mut mode_labels: Vec<String> = Vec::new();
@@ -1792,7 +2311,7 @@ async fn run_quickstart_cli(
                     fields: field_buf,
                 });
             }
-            Action::Risk => {
+            QuickstartChecklistAction::Risk => {
                 let chosen = pick_preset(
                     &t("cli-quickstart-risk-profile-prompt", "Risk profile"),
                     RISK_PRESETS
@@ -1808,7 +2327,7 @@ async fn run_quickstart_cli(
                     });
                 }
             }
-            Action::Memory => {
+            QuickstartChecklistAction::Memory => {
                 let kinds: [MemoryChoice; 6] = [
                     MemoryChoice::Sqlite,
                     MemoryChoice::Markdown,
@@ -1846,7 +2365,7 @@ async fn run_quickstart_cli(
                 };
                 form.memory = Some(kinds[i]);
             }
-            Action::Channels => {
+            QuickstartChecklistAction::Channels => {
                 // Channels sub-flow: list current drafts + Add / Done.
                 loop {
                     let mut items: Vec<String> = form
@@ -1991,7 +2510,6 @@ async fn run_quickstart_cli(
                         }
                         form.channels.push(ChannelChoice::Fresh {
                             kind: chosen.kind.clone(),
-                            display_name: chosen.display_name.clone(),
                             alias,
                             extras,
                         });
@@ -2002,7 +2520,7 @@ async fn run_quickstart_cli(
                     break;
                 }
             }
-            Action::PeerGroups => {
+            QuickstartChecklistAction::PeerGroups => {
                 // Available channel refs: staged channels (this run) +
                 // unassigned channels already in config. Refs already
                 // covered by a staged peer-group are filtered out.
@@ -2118,7 +2636,7 @@ async fn run_quickstart_cli(
                     break;
                 }
             }
-            Action::Agent => {
+            QuickstartChecklistAction::Agent => {
                 let default_name = form
                     .agent
                     .as_ref()
@@ -2482,6 +3000,7 @@ fn model_path_provider_type(path: &str) -> Option<&'static str> {
         .map(|p| p.name)
 }
 
+#[cfg(any(feature = "agent-runtime", test))]
 fn map_key_for_prop_path<'a>(section_path: &str, prop_path: &'a str) -> Option<&'a str> {
     let tail = prop_path.strip_prefix(section_path)?.strip_prefix('.')?;
     let mut parts = tail.split('.');
@@ -2492,6 +3011,7 @@ fn map_key_for_prop_path<'a>(section_path: &str, prop_path: &'a str) -> Option<&
 
 /// Split `section_arg` into the map key under `section_path` with NOTHING after
 /// it, the `config init <section>.<alias>` shape.
+#[cfg(any(feature = "agent-runtime", test))]
 fn map_key_for_section_arg<'a>(section_path: &str, section_arg: &'a str) -> Option<&'a str> {
     let tail = section_arg.strip_prefix(section_path)?.strip_prefix('.')?;
     (!tail.is_empty() && !tail.contains('.')).then_some(tail)
@@ -2501,6 +3021,7 @@ fn map_key_for_section_arg<'a>(section_path: &str, section_arg: &'a str) -> Opti
 /// alias `split` extracts. `#[resource_key]` sections are excluded: their keys
 /// are values from another domain (model id, voice, tool name) and may
 /// themselves contain dots, so a dot split would yield a bogus alias.
+#[cfg(any(feature = "agent-runtime", test))]
 fn alias_target_for_path<'a>(
     path: &'a str,
     split: impl Fn(&str, &'a str) -> Option<&'a str>,
@@ -2519,6 +3040,7 @@ fn alias_target_for_path<'a>(
 /// exists, the section is resource-keyed or a natural-key list, or the argument
 /// is a plain nested prefix that `init_defaults` already handles). A reserved
 /// alias is an error, not a silent no-op.
+#[cfg(any(feature = "agent-runtime", test))]
 fn init_map_alias(config: &mut Config, section_arg: &str) -> Result<Option<String>> {
     let Some((section_path, alias)) = alias_target_for_path(section_arg, map_key_for_section_arg)
     else {
@@ -2533,6 +3055,7 @@ fn init_map_alias(config: &mut Config, section_arg: &str) -> Result<Option<Strin
 
 /// Dirty every generated leaf under a newly created map alias so required
 /// default-valued fields survive the incremental writer's empty-leaf pruning.
+#[cfg(feature = "agent-runtime")]
 fn mark_new_map_alias_dirty(config: &mut Config, alias_path: &str) {
     let prefix = format!("{alias_path}.");
     let leaf_paths: Vec<String> = config
@@ -2550,6 +3073,7 @@ fn mark_new_map_alias_dirty(config: &mut Config, alias_path: &str) {
     }
 }
 
+#[cfg(any(feature = "agent-runtime", test))]
 fn ensure_map_key_for_prop_path(config: &mut Config, prop_path: &str) -> Result<bool> {
     let Some((section_path, key)) = alias_target_for_path(prop_path, map_key_for_prop_path) else {
         return Ok(false);
@@ -2754,7 +3278,7 @@ fn which_zerocode_on_path() -> bool {
 #[cfg(feature = "plugins-wasm")]
 #[derive(Subcommand, Debug)]
 enum PluginCommands {
-    /// List installed plugins
+    /// List installed and cached-registry plugins
     List,
     /// Search an installable plugin registry
     Search {
@@ -2771,6 +3295,10 @@ enum PluginCommands {
         /// Registry JSON URL used for install-by-name
         #[arg(long)]
         registry: Option<String>,
+        /// Install even if the plugin fails to load against this host's WIT ABI
+        /// (skips the install-time load-check)
+        #[arg(long)]
+        no_verify: bool,
     },
     /// Remove an installed plugin
     Remove {
@@ -2784,6 +3312,54 @@ enum PluginCommands {
     },
     /// Move plugins from legacy install directories into the configured one
     Migrate,
+}
+
+/// Run the install-time load-check on an admitted source and decide whether
+/// the install may proceed. A plugin that does not instantiate against this
+/// host's WIT world would install cleanly and then be silently skipped at
+/// daemon startup; this surfaces that failure at the CLI with its full
+/// diagnostic. The check runs against the exact bytes admission read,
+/// which are the bytes [`PluginHost::install_admitted`] then installs, so what
+/// was verified is what gets installed. With `--no-verify` the check is not
+/// run at all (nothing is compiled or instantiated) and a note says so; a
+/// source with no WASM component has nothing to instantiate and passes.
+#[cfg(feature = "plugins-wasm")]
+async fn verify_plugin_loads_or_bail(
+    admitted: &zeroclaw::plugins::host::AdmittedSource,
+    no_verify: bool,
+) -> Result<()> {
+    let manifest = admitted.manifest();
+    let Some(component) = admitted.component() else {
+        return Ok(());
+    };
+    if no_verify {
+        eprintln!(
+            "{}",
+            ta(
+                "cli-plugin-install-verify-bypassed",
+                &[("name", manifest.name.as_str())],
+                format!(
+                    "note: skipping the install-time load check for '{}' (--no-verify); if it does not load against this host it will be skipped at startup",
+                    manifest.name
+                ),
+            )
+        );
+        return Ok(());
+    }
+    match zeroclaw::plugins::validate::verify_component_loads(component, manifest).await {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let detail = format!("{error:#}");
+            bail!(ta(
+                "cli-plugin-install-verify-failed",
+                &[("name", manifest.name.as_str()), ("error", detail.as_str())],
+                format!(
+                    "install failed: '{}' does not load against this host:\n{detail}\nOverride with --no-verify to install anyway.",
+                    manifest.name
+                ),
+            ))
+        }
+    }
 }
 
 #[cfg(feature = "plugins-wasm")]
@@ -4030,6 +4606,20 @@ fn main() -> Result<()> {
     async_main(command)
 }
 
+/// Explicit runtime construction instead of `#[tokio::main]` so worker
+/// threads get an 8 MiB stack. Debug builds of the deepest inline RPC
+/// handlers (quickstart apply walks the whole config tree with several
+/// `Config`-sized temporaries) overflow tokio's 2 MiB worker default and
+/// abort the daemon. The size matches the 8 MiB main-thread stacks the
+/// workspace already requests via linker args on other targets.
+fn async_main(command: clap::Command) -> Result<()> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(8 * 1024 * 1024)
+        .build()?
+        .block_on(async_main_inner(command))
+}
+
 /// True when a desktop entry's `Name` deliberately identifies ZeroClaw: it is
 /// exactly "ZeroClaw" or "ZeroClaw" followed by a separator (e.g. "ZeroClaw
 /// Companion"), case-insensitively. Matching the visible application name — not
@@ -4524,9 +5114,8 @@ fn find_linux_desktop_app() -> Option<PathBuf> {
     None
 }
 
-#[tokio::main]
 #[allow(clippy::too_many_lines)]
-async fn async_main(command: clap::Command) -> Result<()> {
+async fn async_main_inner(command: clap::Command) -> Result<()> {
     // Install default crypto model_provider for Rustls TLS.
     // This prevents the error: "could not automatically determine the process-level CryptoProvider"
     // when both aws-lc-rs and ring features are available (or neither is explicitly selected).
@@ -4682,6 +5271,15 @@ async fn async_main(command: clap::Command) -> Result<()> {
 
     #[cfg(feature = "agent-runtime")]
     if let Commands::Service {
+        service_command: ServiceCommands::RunDesktopDaemon { port },
+        ..
+    } = &cli.command
+    {
+        return service::run_desktop_daemon(*port).await;
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    if let Commands::Service {
         service_command: ServiceCommands::RunOpenrcLogWriter { stream },
         ..
     } = &cli.command
@@ -4691,25 +5289,39 @@ async fn async_main(command: clap::Command) -> Result<()> {
 
     // All other commands need config loaded first
     let mut config = Box::pin(Config::load_or_init()).await?;
+    let running_executable =
+        running_executable_for_remediation().map(|path| path.display().to_string());
     for section in config
         .degraded_sections
         .iter()
         .chain(config.degraded_security.iter())
     {
-        eprintln!(
-            "{}",
+        let path = config.config_path.display().to_string();
+        let warning = if let Some(executable) = running_executable.as_deref() {
+            let fallback = format!(
+                "warning: config section `{section}` in {path} is malformed and was reset to \
+                 defaults for this run. Values in that section are NOT in effect. Use the \
+                 running executable at `{executable}` with `config migrate` to see the parse \
+                 error, then repair the file."
+            );
             ta(
-                "cli-config-section-degraded",
+                "cli-config-section-degraded-executable",
                 &[
                     ("section", section),
-                    ("path", &config.config_path.display().to_string()),
+                    ("path", &path),
+                    ("executable", executable),
                 ],
-                "warning: config section is malformed and was reset to defaults \
-                 for this run. Values in that section are NOT in effect. Run \
-                 `zeroclaw config migrate` to see the parse error, then repair \
-                 the file."
+                &fallback,
             )
-        );
+        } else {
+            format!(
+                "warning: config section `{section}` in {path} is malformed and was reset to \
+                 defaults for this run. Values in that section are NOT in effect. The running \
+                 executable path could not be resolved; repair the file through a daemon-owned \
+                 config surface instead of an unqualified PATH command."
+            )
+        };
+        eprintln!("{warning}");
     }
     for section in &config.retired_wati_config_sections {
         let fallback = format!(
@@ -4877,6 +5489,14 @@ async fn async_main(command: clap::Command) -> Result<()> {
             Commands::Completions { .. } | Commands::MarkdownHelp | Commands::MarkdownSchema => {
                 anyhow::bail!("documentation command was not handled before runtime dispatch")
             }
+            Commands::Props { props_command } => {
+                let DeprecatedPropsCommands::Any(args) = props_command;
+                drop(args);
+                anyhow::bail!(
+                    "`zeroclaw props` has been renamed to `zeroclaw config`. \
+                     Replace `props` with `config` in your command and try again."
+                );
+            }
             _ => {
                 anyhow::bail!(
                     "This command requires the full runtime. Rebuild with default features:\n  cargo build --release"
@@ -4981,6 +5601,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
         }
 
         Commands::Acp {
+            agent,
             max_sessions,
             session_timeout,
         } => {
@@ -5013,17 +5634,16 @@ async fn async_main(command: clap::Command) -> Result<()> {
                         })
                         .ok();
                 let server = if let Some(store) = store {
-                    std::sync::Arc::new(channels::acp_server::AcpServer::new_with_store(
-                        config, acp_config, store,
-                    ))
+                    channels::acp_server::AcpServer::new_with_store(config, acp_config, store)
                 } else {
-                    std::sync::Arc::new(channels::acp_server::AcpServer::new(config, acp_config))
-                };
-                server.run().await
+                    channels::acp_server::AcpServer::new(config, acp_config)
+                }
+                .with_connection_default_agent(agent);
+                std::sync::Arc::new(server).run().await
             }
             #[cfg(not(feature = "channel-acp-server"))]
             {
-                let _ = (max_sessions, session_timeout);
+                let _ = (agent, max_sessions, session_timeout);
                 anyhow::bail!("ACP server requires the `channel-acp-server` feature")
             }
         }
@@ -5181,7 +5801,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                                 ta(
                                     "cli-pairing-fetch-failed",
                                     &[("endpoint", &endpoint)],
-                                    &format!(
+                                    format!(
                                         "❌ Failed to fetch pairing code from gateway at {endpoint}"
                                     ),
                                 )
@@ -5356,6 +5976,15 @@ async fn async_main(command: clap::Command) -> Result<()> {
             let mut degraded_nag: Option<tokio::task::JoinHandle<()>> =
                 gate_security_posture(&current_config, allow_degraded_security)?;
             let startup_feedback_enabled = !cli.verbose;
+            // Cron drivers a generation aborted that had not stopped by the time
+            // its teardown returned. Held across the reload boundary so the next
+            // generation adopts them instead of the process losing track of a
+            // task that is still doing work under superseded config.
+            let mut carried_sop_drivers: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+            // Runs whose aborted driver the previous generation could not settle.
+            // The next engine restores them as active, so it has to own their
+            // terminal write too; see `SopDriverTeardown::unsettled_runs`.
+            let mut carried_unsettled_sop_runs: Vec<String> = Vec::new();
             loop {
                 if startup_feedback_enabled && daemon::stderr_is_interactive_foreground() {
                     let mut stderr = std::io::stderr().lock();
@@ -5368,6 +5997,14 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 let canvas_store_for_gateway = canvas_store_for_gateway.clone();
                 let canvas_store_for_channels = canvas_store_for_channels.clone();
                 let mut registry = daemon::DaemonRegistry::new();
+                #[cfg(feature = "gateway")]
+                let plugin_webhooks = Arc::new(zeroclaw_api::webhook::PluginWebhookRegistry::new());
+                #[cfg(feature = "gateway")]
+                let channel_plugin_webhooks = Some(Arc::clone(&plugin_webhooks));
+                #[cfg(not(feature = "gateway"))]
+                let channel_plugin_webhooks: Option<
+                    Arc<zeroclaw_api::webhook::PluginWebhookRegistry>,
+                > = None;
 
                 // SOP loading is gated on `runtime_enabled()`: `sops_dir` is unset
                 // (or empty) by default, so SOP runtime behavior is off until an
@@ -5384,29 +6021,96 @@ async fn async_main(command: clap::Command) -> Result<()> {
                         mem,
                         sop_adapters,
                     );
+                    let unsettled = std::mem::take(&mut carried_unsettled_sop_runs);
+                    if !unsettled.is_empty() {
+                        let mut guard = match engine.lock() {
+                            Ok(guard) => guard,
+                            Err(poisoned) => poisoned.into_inner(),
+                        };
+                        guard.adopt_orphaned_run_settlements(unsettled.into_iter().map(|run_id| {
+                            (
+                                run_id,
+                                zeroclaw_runtime::sop::OrphanedRunSettlement::DriverAborted,
+                            )
+                        }));
+                    }
                     (Some(engine), Some(audit))
                 } else {
+                    let unsettled = std::mem::take(&mut carried_unsettled_sop_runs);
+                    if !unsettled.is_empty() {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Fail
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({ "run_ids": unsettled })),
+                            "SOP runtime is disabled after reload, so runs whose driver was \
+                             aborted at teardown cannot be settled; they stay Running in the \
+                             store until the SOP runtime is enabled again"
+                        );
+                    }
                     (None, None)
                 };
 
                 // EPIC A1 + SOP cron: drive periodic maintenance and cron
                 // triggers against the shared engine for this daemon iteration.
+                // The generation-owned driver supervisor: exists whenever the
+                // SOP engine does, whether or not the maintenance tick runs.
+                let sop_driver_supervisor = if sop_engine.is_some() {
+                    Some(SopDriverSupervisor::new(std::mem::take(
+                        &mut carried_sop_drivers,
+                    )))
+                } else {
+                    let carried = std::mem::take(&mut carried_sop_drivers);
+                    if !carried.is_empty() {
+                        // No generation to adopt them: re-aborted and reported
+                        // rather than silently dropped. Production drops the
+                        // reaper's handle; the reaper owns the drivers.
+                        drop(reap_orphaned_sop_drivers(carried));
+                    }
+                    None
+                };
                 let sop_maintenance = spawn_sop_maintenance(
+                    &current_config,
                     sop_engine.as_ref(),
                     sop_audit.as_ref(),
                     current_config.sop.maintenance_interval_secs,
+                    sop_driver_supervisor
+                        .as_ref()
+                        .map(|supervisor| supervisor.drivers.clone()),
                 );
+                // Channel-ingress half of the supervisor: the sink registers
+                // every driver it spawns in the generation's supervisor set.
+                let sop_driver_sink = match (sop_driver_supervisor.as_ref(), sop_engine.as_ref()) {
+                    (Some(supervisor), Some(engine)) => {
+                        Some(zeroclaw_runtime::sop::SopDriverSink::new(
+                            current_config.clone(),
+                            std::sync::Arc::clone(engine),
+                            sop_audit.clone(),
+                            supervisor.drivers.clone(),
+                        ))
+                    }
+                    _ => None,
+                };
 
                 #[cfg(feature = "gateway")]
                 registry.register_gateway(Box::new({
                     let sop_e = sop_engine.clone();
                     let sop_a = sop_audit.clone();
+                    let sop_dh = sop_driver_supervisor
+                        .as_ref()
+                        .map(|supervisor| supervisor.drivers.clone());
+                    let plugin_webhooks = Arc::clone(&plugin_webhooks);
                     move |host, port, config, tx, reload_controls, tui_registry, ready_tx| {
                         let canvas_store = canvas_store_for_gateway.clone();
                         let sop_engine = sop_e.clone();
                         let sop_audit = sop_a.clone();
+                        let sop_driver_handles = sop_dh.clone();
+                        let plugin_webhooks = Arc::clone(&plugin_webhooks);
                         Box::pin(async move {
-                            Box::pin(zeroclaw_gateway::run_gateway(
+                            Box::pin(zeroclaw_gateway::run_gateway_with_plugin_webhooks(
                                 &host,
                                 port,
                                 config,
@@ -5416,7 +6120,11 @@ async fn async_main(command: clap::Command) -> Result<()> {
                                 Some(canvas_store),
                                 sop_engine,
                                 sop_audit,
-                                ready_tx,
+                                zeroclaw_gateway::GatewaySupervision::new(
+                                    ready_tx,
+                                    plugin_webhooks,
+                                    sop_driver_handles,
+                                ),
                             ))
                             .await
                         })
@@ -5426,19 +6134,25 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 registry.register_channels(Box::new({
                     let sop_e = sop_engine.clone();
                     let sop_a = sop_audit.clone();
+                    let sop_ds = sop_driver_sink.clone();
+                    let plugin_webhooks = channel_plugin_webhooks.clone();
                     move |config, cancel| {
                         let canvas_store = canvas_store_for_channels.clone();
                         let sop_engine = sop_e.clone();
                         let sop_audit = sop_a.clone();
+                        let sop_driver_sink = sop_ds.clone();
+                        let plugin_webhooks = plugin_webhooks.clone();
                         Box::pin(async move {
-                            Box::pin(zeroclaw_channels::orchestrator::start_channels(
+                            let channels = zeroclaw_channels::orchestrator::start_channels_with_plugin_webhooks(
                                 config,
                                 Some(canvas_store),
                                 cancel,
                                 sop_engine,
                                 sop_audit,
-                            ))
-                            .await
+                                plugin_webhooks,
+                                sop_driver_sink,
+                            );
+                            Box::pin(channels).await
                         })
                     }
                 }));
@@ -5447,15 +6161,18 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 registry.register_mqtt(Box::new({
                     let engine = sop_engine.clone();
                     let audit = sop_audit.clone();
+                    let driver_sink = sop_driver_sink.clone();
                     move |mqtt_config| {
                         let engine = engine.clone();
                         let audit = audit.clone();
+                        let driver_sink = driver_sink.clone();
                         Box::pin(async move {
                             if let (Some(engine), Some(audit)) = (engine, audit) {
                                 zeroclaw_channels::orchestrator::mqtt::run_mqtt_sop_listener(
                                     &mqtt_config,
                                     engine,
                                     audit,
+                                    driver_sink,
                                 )
                                 .await
                             } else {
@@ -5729,13 +6446,20 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 registry.register_enroll(Box::new(move |ctx, cancel, _client_count| {
                     let enroll_bridge_ports = enroll_bridge_ports_for_endpoint.clone();
                     Box::pin(async move {
-                        let (enroll_cfg, wss_cfg, relay_cfg, data_dir) = {
+                        let (
+                            enroll_cfg,
+                            wss_cfg,
+                            relay_cfg,
+                            data_dir,
+                            startup_pairing_code_policy,
+                        ) = {
                             let cfg = ctx.config.read();
                             (
                                 cfg.enroll.clone(),
                                 cfg.wss.clone(),
                                 cfg.relay.clone(),
                                 cfg.data_dir.clone(),
+                                cfg.gateway.pairing_code,
                             )
                         };
                         if !enroll_cfg.enabled {
@@ -5835,6 +6559,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                         let pairing = std::sync::Arc::new(zeroclaw_config::pairing::PairingGuard::new(
                             true,
                             &[],
+                            startup_pairing_code_policy,
                         ));
                         if let Some(code) = pairing.pairing_code() {
                             let sas = zeroclaw_tls::enrollment_sas(&code, &ca_fingerprint);
@@ -5921,6 +6646,10 @@ async fn async_main(command: clap::Command) -> Result<()> {
                             ca_key_pem,
                             ledger,
                             pairing,
+                            pairing_code_policy: {
+                                let config = ctx.config.clone();
+                                std::sync::Arc::new(move || config.read().gateway.pairing_code)
+                            },
                             static_client_pins_configured: wss_cfg
                                 .client_auth
                                 .as_ref()
@@ -5939,7 +6668,13 @@ async fn async_main(command: clap::Command) -> Result<()> {
 
                 // Pass the shared SOP engine through the registry so
                 // RpcContext (RPC/TUI agent sessions) can share it.
-                registry.set_sop_engine(sop_engine, sop_audit);
+                registry.set_sop_engine(
+                    sop_engine,
+                    sop_audit,
+                    sop_driver_supervisor
+                        .as_ref()
+                        .map(|supervisor| supervisor.drivers.clone()),
+                );
 
                 let exit = Box::pin(daemon::run(
                     current_config.clone(),
@@ -5950,8 +6685,21 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     startup_feedback_enabled,
                 ))
                 .await;
-                if let Some(handle) = sop_maintenance {
-                    handle.abort();
+                // Before the loop re-reads config and builds a fresh SOP
+                // engine: in-flight cron drivers hold this generation's config
+                // and engine, so they must not straddle the rebuild.
+                if let Some(maintenance) = sop_maintenance {
+                    // Producer first: no new driver can register while the
+                    // supervisor's drain runs.
+                    maintenance.stop().await;
+                }
+                if let Some(supervisor) = sop_driver_supervisor {
+                    // Anything still running is carried into the next
+                    // generation rather than detached, so a driver that has not
+                    // yet reached an await point stays owned and observable.
+                    let teardown = supervisor.shutdown().await;
+                    carried_sop_drivers = teardown.still_running;
+                    carried_unsettled_sop_runs = teardown.unsettled_runs;
                 }
                 let exit = exit?;
                 match exit {
@@ -5987,6 +6735,9 @@ async fn async_main(command: clap::Command) -> Result<()> {
             }
             if let Some(handle) = degraded_nag.take() {
                 handle.abort();
+            }
+            if zeroclaw_runtime::restart::desktop_restart_requested() {
+                std::process::exit(zeroclaw_runtime::restart::DESKTOP_RESTART_EXIT_CODE);
             }
             // Bare-process auto-restart: the daemon has now torn down (the
             // gateway listener is released), so launch the upgraded binary as a
@@ -6125,8 +6876,23 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 let summary: Vec<String> = agent_aliases
                     .iter()
                     .map(|alias| match config.risk_profile_for_agent(alias) {
-                        Some(p) => format!("{alias}={:?}", p.level),
-                        None => format!("{alias}=<no risk_profile>"),
+                        Some(p) => {
+                            let level = format!("{:?}", p.level);
+                            let fallback = format!("{alias}={level}");
+                            ta(
+                                "cli-status-agent-risk-profile",
+                                &[("alias", alias), ("level", &level)],
+                                &fallback,
+                            )
+                        }
+                        None => {
+                            let fallback = format!("{alias}=<no risk_profile>");
+                            ta(
+                                "cli-status-agent-no-risk-profile-summary",
+                                &[("alias", alias)],
+                                &fallback,
+                            )
+                        }
                     })
                     .collect();
                 println!(
@@ -6152,6 +6918,33 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     "{}",
                     t("cli-status-service-stopped", "🔴 Service:       stopped")
                 );
+            }
+            #[cfg(feature = "gateway")]
+            {
+                match zeroclaw_gateway::resolve_web_dashboard_availability(&config) {
+                    Some(zeroclaw_gateway::WebDashboardAvailability::Embedded) => {
+                        let path = "embedded";
+                        let fallback = format!("🌐 Web UI:        FOUND ({path})");
+                        println!(
+                            "{}",
+                            ta("cli-status-web-ui-found", &[("path", path)], &fallback)
+                        );
+                    }
+                    Some(zeroclaw_gateway::WebDashboardAvailability::Filesystem(web_dist_dir)) => {
+                        let path = web_dist_dir.display().to_string();
+                        let fallback = format!("🌐 Web UI:        FOUND ({path})");
+                        println!(
+                            "{}",
+                            ta("cli-status-web-ui-found", &[("path", &path)], &fallback)
+                        );
+                    }
+                    None => {
+                        println!(
+                            "{}",
+                            t("cli-status-web-ui-missing", "🌐 Web UI:        MISSING")
+                        );
+                    }
+                }
             }
             let effective_memory_backend = config.resolve_active_storage().kind();
             let heartbeat_value = if config.heartbeat.enabled {
@@ -6317,6 +7110,64 @@ async fn async_main(command: clap::Command) -> Result<()> {
                                     &spent_month_fallback
                                 )
                             );
+                            // Pricing provenance is recorded per usage row.
+                            // The warning qualifies the monthly spend line,
+                            // so it reads the current-UTC-month model rollup
+                            // rather than `summary.by_model`, which stays
+                            // daily-scoped for other consumers; unpriced usage
+                            // from an earlier day this month must not vanish
+                            // at day rollover. Surface any explicitly unpriced
+                            // subset loudly rather than let an understated
+                            // dollar total reassure the operator. Configured
+                            // zero rates and legacy rows without provenance
+                            // remain compatible and do not trigger this
+                            // warning.
+                            let month_by_model = match tracker.get_current_month_model_stats() {
+                                Ok(by_model) => by_model,
+                                Err(e) => {
+                                    eprintln!(
+                                        "{}",
+                                        ta(
+                                            "cli-warn-cost-usage",
+                                            &[("err", &e.to_string())],
+                                            "Could not load cost usage"
+                                        )
+                                    );
+                                    std::collections::HashMap::new()
+                                }
+                            };
+                            let unpriced =
+                                zeroclaw_runtime::agent::cost::unpriced_models_in_summary(
+                                    &month_by_model,
+                                );
+                            if !unpriced.is_empty() {
+                                let uncosted_tokens: u64 =
+                                    unpriced.iter().map(|m| m.unpriced_tokens).sum();
+                                let count = unpriced.len().to_string();
+                                let tokens = uncosted_tokens.to_string();
+                                let models = unpriced
+                                    .iter()
+                                    .map(|m| m.model.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(", ");
+                                let warn_fallback = format!(
+                                    "  ⚠ Pricing unavailable for {count} model(s) ({tokens} tokens uncosted): {models}. \
+Recorded spend is understated and daily/monthly caps CANNOT be enforced for these. \
+Add pricing to the active provider profile or supply a catalog entry."
+                                );
+                                eprintln!(
+                                    "{}",
+                                    ta(
+                                        "cli-status-pricing-unavailable",
+                                        &[
+                                            ("count", &count),
+                                            ("tokens", &tokens),
+                                            ("models", &models),
+                                        ],
+                                        &warn_fallback
+                                    )
+                                );
+                            }
                         }
                         Err(e) => {
                             eprintln!(
@@ -6366,15 +7217,20 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 } else {
                     t("cli-status-word-not-configured", "not configured")
                 };
-                println!(
-                    "  {:9} {}",
-                    entry.name,
-                    if entry.configured {
-                        format!("✅ {}", channel_status)
-                    } else {
-                        format!("❌ {}", channel_status)
-                    }
-                );
+                let status = if entry.configured {
+                    ta(
+                        "cli-status-channel-configured",
+                        &[("status", &channel_status)],
+                        format!("✅ {channel_status}"),
+                    )
+                } else {
+                    ta(
+                        "cli-status-channel-not-configured",
+                        &[("status", &channel_status)],
+                        format!("❌ {channel_status}"),
+                    )
+                };
+                println!("  {:9} {}", entry.name, status);
             }
             let uncompiled =
                 zeroclaw_channels::listing::configured_uncompiled_channels(&config.channels);
@@ -6387,14 +7243,11 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     )
                 );
                 for entry in &uncompiled {
-                    println!(
-                        "  {:9} {}",
-                        entry.name,
-                        t(
-                            "cli-status-channel-not-compiled",
-                            "🚫 configured, not compiled"
-                        )
+                    let status = t(
+                        "cli-status-channel-not-compiled",
+                        "🚫 configured, not compiled",
                     );
+                    println!("  {:9} {}", entry.name, status);
                 }
                 println!(
                     "{}",
@@ -6640,17 +7493,51 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     (None, None)
                 };
                 // EPIC A1 + SOP cron: same tick as the full daemon path.
+                let sop_driver_supervisor = sop_engine
+                    .as_ref()
+                    .map(|_| SopDriverSupervisor::new(Vec::new()));
                 let sop_maintenance = spawn_sop_maintenance(
+                    &config,
                     sop_engine.as_ref(),
                     sop_audit.as_ref(),
                     config.sop.maintenance_interval_secs,
+                    sop_driver_supervisor
+                        .as_ref()
+                        .map(|supervisor| supervisor.drivers.clone()),
                 );
+                // Channel-ingress half of the supervisor: the sink registers
+                // every driver it spawns in the generation's supervisor set.
+                let sop_driver_sink = match (sop_driver_supervisor.as_ref(), sop_engine.as_ref()) {
+                    (Some(supervisor), Some(engine)) => {
+                        Some(zeroclaw_runtime::sop::SopDriverSink::new(
+                            config.clone(),
+                            std::sync::Arc::clone(engine),
+                            sop_audit.clone(),
+                            supervisor.drivers.clone(),
+                        ))
+                    }
+                    _ => None,
+                };
+
                 let result = Box::pin(channels::start_channels(
-                    config, None, cancel, sop_engine, sop_audit,
+                    config,
+                    None,
+                    cancel,
+                    sop_engine,
+                    sop_audit,
+                    sop_driver_sink,
                 ))
                 .await;
-                if let Some(handle) = sop_maintenance {
-                    handle.abort();
+                // `channel start` runs one configuration generation and exits,
+                // but drivers still hold the engine; drain them before the
+                // process tears the subsystem down.
+                if let Some(maintenance) = sop_maintenance {
+                    maintenance.stop().await;
+                }
+                if let Some(supervisor) = sop_driver_supervisor {
+                    // No next generation on this path: the process exits after
+                    // `channel start` returns, which ends any straggler.
+                    drop(supervisor.shutdown().await);
                 }
                 result
             }
@@ -6979,10 +7866,12 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     mode.unwrap_or_else(|| config.eval.mode.clone()).parse()?;
                 let report = commands::eval::run(std::path::PathBuf::from(suite_dir), mode).await?;
                 commands::eval::print_report(&report, format);
-                if !report.all_passed() {
-                    std::process::exit(1);
+                // Only a failing suite needs the hard exit to carry a non-zero
+                // status; a passing run returns normally so shutdown runs.
+                match report.exit_code() {
+                    0 => Ok(()),
+                    code => std::process::exit(code),
                 }
-                Ok(())
             }
         },
 
@@ -7846,7 +8735,9 @@ async fn async_main(command: clap::Command) -> Result<()> {
             }
         },
 
-        Commands::Props { .. } => {
+        Commands::Props { props_command } => {
+            let DeprecatedPropsCommands::Any(args) = props_command;
+            drop(args);
             anyhow::bail!(
                 "`zeroclaw props` has been renamed to `zeroclaw config`. \
                  Replace `props` with `config` in your command and try again."
@@ -7857,20 +8748,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
         Commands::Plugin { plugin_command } => match plugin_command {
             PluginCommands::List => {
                 let host = plugin_host_with_configured_security(&config)?;
-                let plugins = host.list_plugins();
-                if plugins.is_empty() {
-                    println!("{}", t("cli-plugins-none", "No plugins installed."));
-                } else {
-                    println!("{}", t("cli-plugins-installed", "Installed plugins:"));
-                    for p in &plugins {
-                        println!(
-                            "  {} v{} — {}",
-                            p.name,
-                            p.version,
-                            p.description.as_deref().unwrap_or("(no description)")
-                        );
-                    }
-                }
+                plugin_catalog::print(&config, &host);
                 let target = config.plugins.resolved_plugins_dir().display().to_string();
                 for legacy in crate::config::schema::legacy_plugin_dirs_with_entries(&config) {
                     eprintln!(
@@ -7937,7 +8815,11 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 }
                 Ok(())
             }
-            PluginCommands::Install { source, registry } => {
+            PluginCommands::Install {
+                source,
+                registry,
+                no_verify,
+            } => {
                 if plugin_registry::looks_like_url(&source) {
                     bail!(
                         "`zeroclaw plugin install <url>` is not supported; use `--registry <url>` with a plugin name, or install a local plugin path"
@@ -7945,7 +8827,9 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 }
                 let mut host = plugin_host_with_configured_security(&config)?;
                 if plugin_registry::is_local_plugin_source(&source) {
-                    let name = host.install(&source)?;
+                    let admitted = host.admit_source(&source)?;
+                    verify_plugin_loads_or_bail(&admitted, no_verify).await?;
+                    let name = host.install_admitted(admitted)?;
                     let config_entries = installed_plugin_config_entries(&host, &name)?;
                     println!(
                         "{}",
@@ -7973,7 +8857,9 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     )
                     .await?;
                     let plugin_dir = downloaded.plugin_dir().display().to_string();
-                    let name = host.install(&plugin_dir)?;
+                    let admitted = host.admit_source(&plugin_dir)?;
+                    verify_plugin_loads_or_bail(&admitted, no_verify).await?;
+                    let name = host.install_admitted(admitted)?;
                     let config_entries = installed_plugin_config_entries(&host, &name)?;
                     println!(
                         "{}",
@@ -8379,6 +9265,7 @@ fi"#
 // ─── Gateway helper functions ───────────────────────────────────────────────
 
 /// Resolve gateway host and port from CLI args or config.
+#[cfg(feature = "agent-runtime")]
 fn resolve_gateway_addr(config: &Config, port: Option<u16>, host: Option<String>) -> (u16, String) {
     let port = port.unwrap_or(config.gateway.port);
     let host = host.unwrap_or_else(|| config.gateway.host.clone());
@@ -8386,6 +9273,7 @@ fn resolve_gateway_addr(config: &Config, port: Option<u16>, host: Option<String>
 }
 
 /// Log gateway startup message.
+#[cfg(feature = "agent-runtime")]
 fn log_gateway_start(host: &str, port: u16) {
     if port == 0 {
         ::zeroclaw_log::record!(
@@ -8448,18 +9336,9 @@ async fn shutdown_gateway(host: &str, port: u16, path_prefix: Option<&str>) -> R
 /// Dispatch the gateway-backed SOP verbs. Requires the `agent-runtime` build (the
 /// gateway HTTP client + `gateway_admin_url` live behind it, like `shutdown_gateway`);
 /// without it these verbs cannot reach the daemon, so they error clearly.
+#[cfg(feature = "agent-runtime")]
 async fn sop_admin_dispatch(cmd: SopCommands, config: &crate::config::Config) -> Result<()> {
-    #[cfg(feature = "agent-runtime")]
-    {
-        sop_admin_request(cmd, config).await
-    }
-    #[cfg(not(feature = "agent-runtime"))]
-    {
-        let _ = (cmd, config);
-        anyhow::bail!(
-            "`zeroclaw sop approve/deny/pending/logs` requires the agent-runtime build (the gateway client)"
-        )
-    }
+    sop_admin_request(cmd, config).await
 }
 
 /// CLI -> daemon dispatch for the out-of-band SOP approval verbs (EPIC C, C8).
@@ -8630,6 +9509,18 @@ async fn sop_admin_request(cmd: SopCommands, config: &crate::config::Config) -> 
                             ("message", message),
                         ],
                         "  (log event)",
+                    )
+                );
+            }
+            // A retained segment the daemon could not read was left out, so the
+            // rows above are not the run's full history. Say so instead of
+            // presenting a partial timeline as complete.
+            if body.get("incomplete").and_then(|value| value.as_bool()) == Some(true) {
+                println!(
+                    "{}",
+                    t(
+                        "cli-sop-logs-incomplete",
+                        "Some retained log segments could not be read; this history may be incomplete."
                     )
                 );
             }
@@ -9511,6 +10402,25 @@ fn warn_verifiable_intent_withheld(config: &Config) {
     );
 }
 
+fn running_executable_for_remediation() -> Option<std::path::PathBuf> {
+    #[cfg(feature = "agent-runtime")]
+    {
+        if let Some(executable) = zeroclaw_runtime::restart::recorded_launch_executable() {
+            return Some(executable.to_path_buf());
+        }
+        if zeroclaw_runtime::restart::launch_command_recorded() {
+            return None;
+        }
+        std::env::current_exe().ok()
+    }
+
+    #[cfg(not(feature = "agent-runtime"))]
+    {
+        std::env::current_exe().ok()
+    }
+}
+
+#[cfg(feature = "agent-runtime")]
 fn gate_security_posture(
     config: &zeroclaw::config::Config,
     allow_degraded: bool,
@@ -9520,13 +10430,27 @@ fn gate_security_posture(
     }
     let sections = config.degraded_security.join(", ");
     if !allow_degraded {
+        let remediation_executable = running_executable_for_remediation();
+        let remediation = remediation_executable.map_or_else(
+            || {
+                "The running executable path could not be resolved; use a daemon-owned repair \
+                 surface such as the gateway config editor instead of an unqualified PATH command."
+                    .to_string()
+            },
+            |exe| {
+                format!(
+                    "Running executable: {}. Use that executable with `config migrate` to see \
+                     the precise error.",
+                    exe.display()
+                )
+            },
+        );
         anyhow::bail!(
             "Config contains malformed security-critical sections ({sections}); \
              they were reset to defaults, so the running posture may be weaker \
              than intended. Refusing to serve with a degraded security posture. \
-             Repair these sections in {} and restart — run `zeroclaw config \
-             migrate` to see the precise error. To boot anyway (e.g. to reach \
-             the gateway config editor and repair from there), re-run with \
+             Repair these sections in {} and restart — {remediation} To boot anyway \
+             (e.g. to reach the gateway config editor and repair from there), re-run with \
              `--allow-degraded-security`.",
             config.config_path.display()
         );
@@ -9709,39 +10633,94 @@ fn build_sop_adapters(config: &Config) -> zeroclaw_runtime::sop::SopEngineAdapte
     }
 }
 
+/// Abort SOP cron drivers that no generation will adopt, and keep joining them.
+///
+/// `abort` only requests cancellation, so a driver that reaches no await point
+/// keeps running under the superseded config. Dropping its `JoinHandle` would
+/// detach that task, losing the last way to observe work still in flight — so a
+/// reaper owns the handles and joins them instead.
+///
+/// Returns the reaper's handle (`None` when nothing was still running) so a test
+/// can observe that ownership was retained rather than merely claimed.
+#[cfg(feature = "agent-runtime")]
+fn reap_orphaned_sop_drivers(
+    carried: Vec<tokio::task::JoinHandle<()>>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let orphaned = carried
+        .iter()
+        .filter(|driver| !driver.is_finished())
+        .count();
+    for driver in &carried {
+        driver.abort();
+    }
+    if orphaned == 0 {
+        return None;
+    }
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+            .with_attrs(::serde_json::json!({"orphaned": orphaned})),
+        "SOP cron driver(s) from a previous generation are still running, but this \
+         configuration runs no SOP maintenance to own them; re-aborted and handed to a \
+         reaper that joins them"
+    );
+    Some(::zeroclaw_spawn::spawn!(async move {
+        for driver in carried {
+            let _ = driver.await;
+        }
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                .with_attrs(::serde_json::json!({"orphaned": orphaned})),
+            "orphaned SOP cron driver(s) from a superseded generation have stopped"
+        );
+    }))
+}
+
 /// Spawn the periodic SOP maintenance tick (EPIC A1 + SOP cron): on each interval it
 /// fires fail-closed approval timeouts, reaps expired concurrency-claim leases,
 /// prunes terminal runs past the retention policy, and dispatches cached cron
 /// SOP triggers. Returns `None` (no task) when the tick is disabled
 /// (`interval_secs == 0`) or no SOP engine is configured. The caller owns the
-/// returned handle and aborts it when the foreground daemon/channel run exits.
-/// The tick itself self-approves nothing - timeout handling follows
+/// returned handle and shuts it down when the foreground daemon/channel run
+/// exits. The tick itself self-approves nothing - timeout handling follows
 /// `approval_timeout_action` (default `escalate`, fail-closed).
 #[cfg(feature = "agent-runtime")]
 fn spawn_sop_maintenance(
+    config: &Config,
     sop_engine: Option<&std::sync::Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     sop_audit: Option<&std::sync::Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
     interval_secs: u64,
-) -> Option<tokio::task::JoinHandle<()>> {
+    // The generation's supervisor set: the tick registers every driver it
+    // starts here, and the supervisor — not this ticker — owns the drain.
+    drivers: Option<SopDriverSet>,
+) -> Option<SopMaintenance> {
     if interval_secs == 0 {
         return None;
     }
     let engine = sop_engine.cloned()?;
+    let drivers = drivers?;
     let audit = sop_audit.cloned();
+    let config = config.clone();
     let cron_cache = audit
         .as_ref()
         .map(|_| zeroclaw_runtime::sop::dispatch::SopCronCache::from_engine(&engine));
-    Some(::zeroclaw_spawn::spawn!(async move {
+    let tick_drivers = drivers;
+    let ticker = ::zeroclaw_spawn::spawn!(async move {
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut last_cron_check = chrono::Utc::now();
         loop {
             ticker.tick().await;
             let Some(report) = run_sop_maintenance_tick(
+                &config,
                 &engine,
                 audit.as_ref(),
                 cron_cache.as_ref(),
                 &mut last_cron_check,
+                &tick_drivers,
             )
             .await
             else {
@@ -9763,7 +10742,287 @@ fn spawn_sop_maintenance(
                 );
             }
         }
-    }))
+    });
+    Some(SopMaintenance { ticker })
+}
+
+/// In-flight headless drivers for one daemon generation — cron-started,
+/// channel-started, and approval-resumed alike.
+///
+/// Shared between every producer that registers drivers and the
+/// [`SopDriverSupervisor`] that drains them before the subsystem rebuilds.
+#[cfg(feature = "agent-runtime")]
+type SopDriverSet = zeroclaw_runtime::sop::SopDriverHandles;
+
+/// How long a daemon generation waits for its in-flight cron drivers to finish
+/// before aborting the stragglers. Long enough for a step already in a provider
+/// call to land, short enough that a reload is not held hostage by one.
+#[cfg(feature = "agent-runtime")]
+const SOP_DRIVER_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long the shutdown waits for aborted drivers to actually stop. An aborted
+/// task ends at its next await point, so this is a grace for that hop, not a
+/// second drain — a driver still running when it expires is reported rather than
+/// waited on forever, so one wedged task cannot hold a reload open.
+#[cfg(feature = "agent-runtime")]
+const SOP_DRIVER_ABORT_JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// One daemon generation's SOP maintenance tick. The drivers the tick starts
+/// register in the generation's [`SopDriverSupervisor`], which owns the drain;
+/// stopping the tick (see [`Self::stop`]) only guarantees no further producer
+/// runs while that drain finalizes the set.
+#[cfg(feature = "agent-runtime")]
+struct SopMaintenance {
+    ticker: tokio::task::JoinHandle<()>,
+}
+
+/// What one generation's driver teardown hands to the next generation.
+#[cfg(feature = "agent-runtime")]
+struct SopDriverTeardown {
+    /// Drivers aborted but not yet stopped; the next generation adopts them
+    /// (see [`SopDriverSupervisor::carried`]).
+    still_running: Vec<tokio::task::JoinHandle<()>>,
+    /// Runs whose driver was aborted but whose terminal write could not be
+    /// made here: the store refused it, or a straggler still held the engine.
+    /// Their durable rows are still `Running`, so the next generation's engine
+    /// restores them; it adopts these so its maintenance owns the settlement
+    /// instead of renewing a claim nothing will release.
+    unsettled_runs: Vec<String>,
+}
+
+/// One daemon generation's headless-driver supervisor. Every driver the
+/// generation starts — a cron tick, channel ingress, or an approval resume —
+/// registers in `drivers`, and teardown drains the set before the loop
+/// rebuilds, so no headless work straddles a reload unowned.
+///
+/// Exists whenever the SOP engine exists; the maintenance ticker is one
+/// producer among several, not the owner.
+#[cfg(feature = "agent-runtime")]
+struct SopDriverSupervisor {
+    drivers: SopDriverSet,
+    /// Drivers a previous generation aborted that had not stopped by the time
+    /// its teardown returned.
+    ///
+    /// Cancellation lands at a task's next await point, and a task that reaches
+    /// none cannot be forced. Rather than dropping those handles — which
+    /// detaches the tasks and loses every way to observe them — this generation
+    /// adopts them: [`Self::shutdown`] reports the ones still running and hands
+    /// the rest forward again, so a straggler stays owned and counted until it
+    /// actually ends. They are already aborted, so they are never waited on
+    /// again; a wedged task costs one `is_finished` check per reload, not
+    /// another drain.
+    carried: Vec<tokio::task::JoinHandle<()>>,
+}
+
+#[cfg(feature = "agent-runtime")]
+impl SopMaintenance {
+    /// Abort the tick and JOIN it. `abort` only requests cancellation, and a
+    /// tick already inside its body can still spawn and register a driver;
+    /// awaiting the aborted handle is what guarantees no new producer runs
+    /// while the supervisor's drain below finalizes the set.
+    async fn stop(self) {
+        self.ticker.abort();
+        let _ = self.ticker.await;
+    }
+}
+
+#[cfg(feature = "agent-runtime")]
+impl SopDriverSupervisor {
+    fn new(carried: Vec<tokio::task::JoinHandle<()>>) -> Self {
+        if !carried.is_empty() {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"carried": carried.len()})),
+                "Adopted SOP driver(s) that a previous generation aborted but that had not \
+                 stopped; this generation tracks them until they do"
+            );
+        }
+        Self {
+            drivers: SopDriverSet::default(),
+            carried,
+        }
+    }
+
+    /// Let in-flight drivers finish under the configuration they started
+    /// with, aborting — and then joining — any that overrun
+    /// [`SOP_DRIVER_DRAIN_TIMEOUT`]. The caller must stop every producer
+    /// (the maintenance tick, via [`SopMaintenance::stop`]) first.
+    ///
+    /// Returns the drivers that were still running when this returned: aborted,
+    /// but not yet stopped, because cancellation only lands at a task's next
+    /// await point and one that reaches none cannot be forced. The next
+    /// generation adopts them (see [`SopMaintenance::carried`]) instead of
+    /// detaching them. **A returned handle means a task from this generation is
+    /// still executing under superseded config, for as long as it takes to
+    /// yield** — the caller cannot assume a clean boundary, only a tracked one.
+    /// Empty on every ordinary shutdown.
+    #[must_use]
+    async fn shutdown(self) -> SopDriverTeardown {
+        self.shutdown_with_deadlines(SOP_DRIVER_DRAIN_TIMEOUT, SOP_DRIVER_ABORT_JOIN_TIMEOUT)
+            .await
+    }
+
+    /// [`Self::shutdown`] with the two deadlines supplied, so a test can drive
+    /// the drain-expiry and join-expiry paths without waiting out the
+    /// production ones.
+    async fn shutdown_with_deadlines(
+        self,
+        drain_timeout: std::time::Duration,
+        abort_join_timeout: std::time::Duration,
+    ) -> SopDriverTeardown {
+        // Adopted from an earlier generation: already aborted, so they are
+        // re-checked rather than re-waited. Anything still running is handed
+        // forward again below.
+        let mut still_running: Vec<tokio::task::JoinHandle<()>> = self
+            .carried
+            .into_iter()
+            .filter(|driver| !driver.is_finished())
+            .collect();
+        // Borrowed by the drain below, not consumed: it must be able to time
+        // out without dropping the handles, because dropping a `JoinHandle`
+        // detaches its task rather than stopping it — and the abort arm still
+        // has to join them.
+        // Closed, not merely emptied. A producer can outlive the point where
+        // its generation stops accepting work — an RPC connection task can
+        // resolve an approval after the listener stopped accepting — so a
+        // driver can still arrive here. Closing makes that registration fail
+        // instead of landing in a vector this generation will never drain
+        // again.
+        let mut pending = match self.drivers.lock() {
+            Ok(mut drivers) => drivers.close_and_take_owned(),
+            Err(poisoned) => poisoned.into_inner().close_and_take_owned(),
+        };
+        if pending.is_empty() {
+            return SopDriverTeardown {
+                still_running,
+                unsettled_runs: Vec::new(),
+            };
+        }
+        // A cursor, not an iterator: when the drain deadline fires mid-loop the
+        // abort arm below has to resume where this one stopped. Awaiting a
+        // `JoinHandle` that already resolved panics ("polled after
+        // completion"), so a second pass over the whole vector would turn a
+        // mixed batch — one driver that finished in time, one that did not —
+        // into a shutdown panic instead of a carried-forward straggler.
+        let mut joined_upto = 0usize;
+        let drained = tokio::time::timeout(drain_timeout, async {
+            while joined_upto < pending.len() {
+                let _ = (&mut pending[joined_upto].handle).await;
+                joined_upto += 1;
+            }
+        })
+        .await;
+        if drained.is_ok() {
+            return SopDriverTeardown {
+                still_running,
+                unsettled_runs: Vec::new(),
+            };
+        }
+        // `abort` only *requests* cancellation: the task stops at its next
+        // await point, which is after this call returns. Joining the aborted
+        // handles is what makes the boundary real — without it the next
+        // generation could start while a straggler is still inside a provider
+        // call under the superseded config. The join is bounded in turn, so a
+        // task that reaches no await point cannot wedge the reload; it is
+        // carried forward instead, still aborted and still tracked.
+        // Only the handles the drain did not consume: the ones before the
+        // cursor already resolved, and both aborting and re-awaiting them is
+        // either a no-op or a panic.
+        let aborted_from = joined_upto;
+        for driver in &pending[aborted_from..] {
+            driver.handle.abort();
+        }
+        let joined = tokio::time::timeout(abort_join_timeout, async {
+            while joined_upto < pending.len() {
+                let _ = (&mut pending[joined_upto].handle).await;
+                joined_upto += 1;
+            }
+        })
+        .await;
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({
+                    "drain_timeout_secs": drain_timeout.as_secs(),
+                    "abort_join_timeout_secs": abort_join_timeout.as_secs(),
+                    "joined_after_abort": joined.is_ok(),
+                })),
+            "SOP cron drivers did not finish before the drain deadline; aborted them so the next \
+             daemon generation does not overlap superseded configuration"
+        );
+        // Every aborted driver leaves its run `Running` and claimed with nothing
+        // to advance it, and the next generation restores active runs without
+        // starting drivers for them. Settle each one here, before that engine is
+        // built from the same store. `try_lock`, not `lock`: a straggler that has
+        // not reached an await point may hold the engine, and waiting on it
+        // would wedge the reload. A run that cannot be settled now is handed to
+        // the next generation, whose maintenance owns the retry.
+        let mut unsettled_runs = Vec::new();
+        for driver in &pending[aborted_from..] {
+            let Some((run_id, engine)) = driver.run.as_ref() else {
+                continue;
+            };
+            let settled = match engine.try_lock() {
+                Ok(mut guard) => guard
+                    .settle_orphaned_run(
+                        run_id,
+                        zeroclaw_runtime::sop::OrphanedRunSettlement::DriverAborted,
+                    )
+                    .map_err(|e| e.to_string()),
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned
+                    .into_inner()
+                    .settle_orphaned_run(
+                        run_id,
+                        zeroclaw_runtime::sop::OrphanedRunSettlement::DriverAborted,
+                    )
+                    .map_err(|e| e.to_string()),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    Err("the engine is still held by a driver that has not stopped".to_string())
+                }
+            };
+            if let Err(error) = settled {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "run_id": run_id,
+                            "error": error,
+                        })),
+                    "Could not settle a SOP run whose driver was aborted at teardown; the next \
+                     generation's maintenance takes over the terminal write"
+                );
+                unsettled_runs.push(run_id.clone());
+            }
+        }
+        still_running.extend(
+            pending
+                .into_iter()
+                .filter(|driver| !driver.handle.is_finished())
+                .map(|driver| driver.handle),
+        );
+        if !still_running.is_empty() {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "abort_join_timeout_secs": abort_join_timeout.as_secs(),
+                        "still_running": still_running.len(),
+                    })),
+                "SOP cron driver(s) had not stopped when the post-abort join grace expired; they \
+                 keep running under the superseded config until they reach an await point, and \
+                 the next generation starts alongside them. Carried into that generation so they \
+                 stay tracked rather than detached"
+            );
+        }
+        SopDriverTeardown {
+            still_running,
+            unsettled_runs,
+        }
+    }
 }
 
 #[cfg(feature = "agent-runtime")]
@@ -9789,10 +11048,12 @@ impl SopMaintenanceTickReport {
 
 #[cfg(feature = "agent-runtime")]
 async fn run_sop_maintenance_tick(
+    config: &Config,
     engine: &std::sync::Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>,
     audit: Option<&std::sync::Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
     cron_cache: Option<&zeroclaw_runtime::sop::dispatch::SopCronCache>,
     last_cron_check: &mut chrono::DateTime<chrono::Utc>,
+    drivers: &SopDriverSet,
 ) -> Option<SopMaintenanceTickReport> {
     let maintenance = match engine.lock() {
         Ok(mut e) => e.run_maintenance_tick(),
@@ -9822,8 +11083,28 @@ async fn run_sop_maintenance_tick(
         .await;
         for result in &results {
             match result {
-                zeroclaw_runtime::sop::dispatch::DispatchResult::Started { .. } => {
+                zeroclaw_runtime::sop::dispatch::DispatchResult::Started { action, .. } => {
                     report.cron_started += 1;
+                    if matches!(
+                        action.as_ref(),
+                        zeroclaw_runtime::sop::SopRunAction::ExecuteStep { .. }
+                            | zeroclaw_runtime::sop::SopRunAction::DeterministicStep { .. }
+                    ) {
+                        // Admitted so this daemon generation can drain the
+                        // driver before a reload swaps the config and engine it
+                        // captured. Admission and creation share one lock, so a
+                        // generation that drained mid-tick refuses the driver
+                        // rather than starting one nothing will drain. Finished
+                        // handles are dropped on the way in so a long-lived
+                        // daemon does not accumulate them.
+                        zeroclaw_runtime::sop::spawn_and_register_sop_driver(
+                            drivers,
+                            config.clone(),
+                            std::sync::Arc::clone(engine),
+                            Some(std::sync::Arc::clone(audit)),
+                            action.as_ref().clone(),
+                        );
+                    }
                 }
                 zeroclaw_runtime::sop::dispatch::DispatchResult::Skipped { .. }
                 | zeroclaw_runtime::sop::dispatch::DispatchResult::Deferred { .. }
@@ -9841,7 +11122,22 @@ async fn run_sop_maintenance_tick(
                 }
             }
         }
-        zeroclaw_runtime::sop::dispatch::process_headless_results(&results);
+        let unhandled = results
+            .iter()
+            .filter(|result| {
+                !matches!(
+                    result,
+                    zeroclaw_runtime::sop::dispatch::DispatchResult::Started { action, .. }
+                        if matches!(
+                            action.as_ref(),
+                            zeroclaw_runtime::sop::SopRunAction::ExecuteStep { .. }
+                                | zeroclaw_runtime::sop::SopRunAction::DeterministicStep { .. }
+                        )
+                )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        zeroclaw_runtime::sop::dispatch::process_headless_results(&unhandled);
     }
 
     Some(report)
@@ -9865,7 +11161,7 @@ async fn run_gateway_if_enabled(
     // manually" message, None for tui_registry (no TUI socket), and None
     // for canvas_store so the gateway falls back to its own default.
     let result = Box::pin(gateway::run_gateway(
-        host, port, config, tx, None, None, None, None, None, None,
+        host, port, config, tx, None, None, None, None, None, None, None,
     ))
     .await;
     // Self-respawn after the listener is released, if an in-app upgrade
@@ -9884,7 +11180,7 @@ async fn run_gateway_if_enabled(
     }
 }
 
-#[cfg(not(feature = "gateway"))]
+#[cfg(all(feature = "agent-runtime", not(feature = "gateway")))]
 #[allow(clippy::unused_async)]
 async fn run_gateway_if_enabled(
     _host: &str,
@@ -9895,6 +11191,7 @@ async fn run_gateway_if_enabled(
     anyhow::bail!("Gateway feature is not enabled. Rebuild with --features gateway")
 }
 
+#[cfg(any(feature = "agent-runtime", test))]
 fn is_addr_in_use_error(err: &anyhow::Error) -> bool {
     err.chain().any(|cause| {
         cause
@@ -9903,10 +11200,12 @@ fn is_addr_in_use_error(err: &anyhow::Error) -> bool {
     })
 }
 
+#[cfg(any(feature = "agent-runtime", test))]
 fn is_default_gateway_addr(host: &str, port: u16, default_host: &str, default_port: u16) -> bool {
     host == default_host && port == default_port
 }
 
+#[cfg(any(feature = "agent-runtime", test))]
 fn gateway_browser_host(host: &str) -> &str {
     match host {
         "0.0.0.0" => "127.0.0.1",
@@ -9915,6 +11214,7 @@ fn gateway_browser_host(host: &str) -> &str {
     }
 }
 
+#[cfg(any(feature = "agent-runtime", test))]
 fn gateway_addr_in_use_message(
     host: &str,
     port: u16,
@@ -9958,6 +11258,7 @@ fn gateway_addr_in_use_message(
     lines.join("\n")
 }
 
+#[cfg(any(feature = "agent-runtime", test))]
 fn gateway_restart_recovery_command(host: &str, port: u16, default_host: &str) -> String {
     let mut command = format!("    zeroclaw gateway start --port {port}");
     if host != default_host {
@@ -9966,6 +11267,7 @@ fn gateway_restart_recovery_command(host: &str, port: u16, default_host: &str) -
     command
 }
 
+#[cfg(any(feature = "agent-runtime", test))]
 fn gateway_paircode_recovery_command(
     host: &str,
     port: u16,
@@ -9983,6 +11285,7 @@ fn gateway_paircode_recovery_command(
     command
 }
 
+#[cfg(any(feature = "agent-runtime", test))]
 fn available_gateway_restart_hint_port(host: &str, port: u16) -> Option<u16> {
     const SCAN_LIMIT: u16 = 20;
 
@@ -10080,6 +11383,855 @@ mod tests {
     use super::*;
     use clap::{CommandFactory, Parser};
     use std::net::TcpListener;
+
+    #[cfg(feature = "agent-runtime")]
+    struct SelectorTestTerminal {
+        size: Option<(u16, u16)>,
+        keys: std::collections::VecDeque<std::io::Result<QuickstartSelectorKey>>,
+        actions: Vec<&'static str>,
+        fail_action: Option<&'static str>,
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    impl SelectorTestTerminal {
+        fn new(
+            size: Option<(u16, u16)>,
+            keys: impl IntoIterator<Item = std::io::Result<QuickstartSelectorKey>>,
+        ) -> Self {
+            Self {
+                size,
+                keys: keys.into_iter().collect(),
+                actions: Vec::new(),
+                fail_action: None,
+            }
+        }
+
+        fn perform(&mut self, action: &'static str) -> std::io::Result<()> {
+            self.actions.push(action);
+            if self.fail_action == Some(action) {
+                return Err(std::io::Error::other(format!("injected {action} failure")));
+            }
+            Ok(())
+        }
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    impl QuickstartSelectorTerminal for SelectorTestTerminal {
+        fn size_checked(&mut self) -> Option<(u16, u16)> {
+            self.size
+        }
+
+        fn enter_alternate_screen(&mut self) -> std::io::Result<()> {
+            self.perform("enter_alternate_screen")
+        }
+
+        fn clear_screen(&mut self) -> std::io::Result<()> {
+            self.perform("clear_screen")
+        }
+
+        fn move_cursor_to_origin(&mut self) -> std::io::Result<()> {
+            self.perform("move_cursor_to_origin")
+        }
+
+        fn hide_cursor(&mut self) -> std::io::Result<()> {
+            self.perform("hide_cursor")
+        }
+
+        fn show_cursor(&mut self) -> std::io::Result<()> {
+            self.perform("show_cursor")
+        }
+
+        fn leave_alternate_screen(&mut self) -> std::io::Result<()> {
+            self.perform("leave_alternate_screen")
+        }
+
+        fn write_line(&mut self, _line: &str) -> std::io::Result<()> {
+            self.perform("write_line")
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.perform("flush")
+        }
+
+        fn read_key(&mut self) -> std::io::Result<QuickstartSelectorKey> {
+            self.actions.push("read_key");
+            self.keys.pop_front().unwrap_or_else(|| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "no injected selector key",
+                ))
+            })
+        }
+    }
+
+    /// One step of a deterministic PTY interaction: a key press, or a resize
+    /// of the output terminal applied between key presses the way a terminal
+    /// emulator changes a window while the selector waits for input.
+    #[cfg(all(feature = "agent-runtime", unix))]
+    enum PtyStep {
+        Key(QuickstartSelectorKey),
+        ResizeOutput { rows: u16, columns: u16 },
+    }
+
+    /// Injected input for the production Crossterm adapter.
+    ///
+    /// Keys are queued rather than read from the process-global event source
+    /// so the regression runs under a test harness without racing a
+    /// controlling terminal. Resizes are applied to the PTY master exactly as
+    /// a terminal emulator would, so the adapter's own geometry query must
+    /// observe them.
+    #[cfg(all(feature = "agent-runtime", unix))]
+    struct PtyQuickstartInput {
+        master: std::fs::File,
+        steps: std::collections::VecDeque<PtyStep>,
+    }
+
+    #[cfg(all(feature = "agent-runtime", unix))]
+    impl QuickstartSelectorInput for PtyQuickstartInput {
+        fn read_key(&mut self) -> std::io::Result<QuickstartSelectorKey> {
+            loop {
+                match self.steps.pop_front() {
+                    Some(PtyStep::Key(key)) => return Ok(key),
+                    Some(PtyStep::ResizeOutput { rows, columns }) => {
+                        set_pty_size(&self.master, rows, columns);
+                    }
+                    None => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "no injected selector key",
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Open a PTY pair sized `rows` by `columns`, returned as `(master, slave)`.
+    #[cfg(all(feature = "agent-runtime", unix))]
+    fn open_pty(rows: u16, columns: u16) -> (std::fs::File, std::fs::File) {
+        use std::os::fd::FromRawFd;
+
+        let mut master_fd = -1;
+        let mut slave_fd = -1;
+        let mut dimensions = libc::winsize {
+            ws_row: rows,
+            ws_col: columns,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        // SAFETY: both descriptor pointers refer to live `c_int` storage. The
+        // optional name and termios inputs are null, and `dimensions` remains
+        // live for the duration of the call.
+        let openpty_result = unsafe {
+            libc::openpty(
+                &raw mut master_fd,
+                &raw mut slave_fd,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &raw mut dimensions,
+            )
+        };
+        assert_eq!(openpty_result, 0, "openpty failed");
+
+        // SAFETY: `openpty` returned two distinct, live descriptors. Each is
+        // transferred to exactly one `File`, which closes it exactly once.
+        unsafe {
+            (
+                std::fs::File::from_raw_fd(master_fd),
+                std::fs::File::from_raw_fd(slave_fd),
+            )
+        }
+    }
+
+    #[cfg(all(feature = "agent-runtime", unix))]
+    fn set_pty_size(pty: &std::fs::File, rows: u16, columns: u16) {
+        use std::os::fd::AsRawFd;
+
+        let dimensions = libc::winsize {
+            ws_row: rows,
+            ws_col: columns,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        // SAFETY: `pty` owns a live PTY descriptor and `dimensions` is a fully
+        // initialized `winsize` that outlives the call.
+        let result =
+            unsafe { libc::ioctl(pty.as_raw_fd(), libc::TIOCSWINSZ, &raw const dimensions) };
+        assert_eq!(result, 0, "TIOCSWINSZ failed");
+    }
+
+    /// Build the production Crossterm adapter over a PTY slave with injected
+    /// input, so the exact production escape sequences and geometry query run.
+    #[cfg(all(feature = "agent-runtime", unix))]
+    fn pty_quickstart_terminal(
+        master: &std::fs::File,
+        slave: std::fs::File,
+        steps: impl IntoIterator<Item = PtyStep>,
+    ) -> CrosstermQuickstartTerminal<std::fs::File, PtyQuickstartInput> {
+        CrosstermQuickstartTerminal {
+            output: slave,
+            input: PtyQuickstartInput {
+                master: master.try_clone().expect("PTY master should be clonable"),
+                steps: steps.into_iter().collect(),
+            },
+        }
+    }
+
+    /// Read everything written to the PTY, returning once the output is idle.
+    #[cfg(all(feature = "agent-runtime", unix))]
+    fn drain_pty_output(master: &mut std::fs::File) -> String {
+        use std::os::fd::AsRawFd;
+
+        // SAFETY: the PTY master descriptor is live; preserving its current
+        // flags and adding O_NONBLOCK prevents a spurious poll wakeup from
+        // hanging the test.
+        let master_flags = unsafe { libc::fcntl(master.as_raw_fd(), libc::F_GETFL) };
+        assert!(master_flags >= 0, "reading PTY master flags failed");
+        assert_eq!(
+            unsafe {
+                libc::fcntl(
+                    master.as_raw_fd(),
+                    libc::F_SETFL,
+                    master_flags | libc::O_NONBLOCK,
+                )
+            },
+            0,
+            "setting PTY master nonblocking mode failed"
+        );
+
+        let mut output = Vec::new();
+        let mut buffer = [0u8; 4096];
+        loop {
+            let mut poll_fd = libc::pollfd {
+                fd: master.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: `poll_fd` points to one initialized poll descriptor.
+            let ready = unsafe { libc::poll(&raw mut poll_fd, 1, 100) };
+            assert!(ready >= 0, "polling PTY output failed");
+            if ready == 0 || poll_fd.revents & libc::POLLIN == 0 {
+                break;
+            }
+            match master.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(read) => output.extend_from_slice(&buffer[..read]),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("failed to read PTY output: {error}"),
+            }
+        }
+        String::from_utf8(output).expect("selector output should be UTF-8")
+    }
+
+    #[cfg(all(feature = "agent-runtime", unix))]
+    const PTY_CLEAR_AND_HOME: &str = "\u{1b}[2J\u{1b}[1;1H";
+
+    #[cfg(all(feature = "agent-runtime", unix))]
+    const PTY_SHOW_CURSOR_AND_LEAVE_SCREEN: &str = "\u{1b}[?25h\u{1b}[?1049l";
+
+    #[cfg(all(feature = "agent-runtime", unix))]
+    #[test]
+    fn quickstart_selector_repeated_navigation_redraws_at_pty_origin() {
+        let (mut master, slave) = open_pty(20, 80);
+        let mut term = pty_quickstart_terminal(
+            &master,
+            slave,
+            [
+                PtyStep::Key(QuickstartSelectorKey::Down),
+                PtyStep::Key(QuickstartSelectorKey::Down),
+                PtyStep::Key(QuickstartSelectorKey::Up),
+                PtyStep::Key(QuickstartSelectorKey::Cancel),
+            ],
+        );
+
+        let outcome = interact_quickstart_selector(
+            &mut term,
+            &["first".to_string(), "second".to_string()],
+            "Choose",
+            (20, 80),
+        )
+        .expect("repeated PTY navigation should succeed");
+        assert_eq!(outcome, QuickstartSelectorOutcome::Pick(None));
+
+        let output = drain_pty_output(&mut master);
+        drop(term);
+
+        assert_eq!(
+            output.matches(PTY_CLEAR_AND_HOME).count(),
+            4,
+            "the initial frame and all three navigation redraws must begin at the PTY origin; \
+             output: {output:?}"
+        );
+    }
+
+    /// Quickstart accepts distinct input and output terminals. The frame must
+    /// be fitted to the terminal that receives it: a process-global query can
+    /// describe the controlling terminal while stderr is a narrower one.
+    #[cfg(all(feature = "agent-runtime", unix))]
+    #[test]
+    fn quickstart_selector_measures_the_terminal_that_receives_the_frame() {
+        let (controlling_master, controlling_slave) = open_pty(20, 80);
+        let (mut output_master, output_slave) = open_pty(20, 40);
+
+        let mut controlling = pty_quickstart_terminal(&controlling_master, controlling_slave, []);
+        assert_eq!(
+            controlling.size_checked(),
+            Some((20, 80)),
+            "the adapter over the controlling PTY reports that PTY's geometry"
+        );
+
+        let mut term = pty_quickstart_terminal(
+            &output_master,
+            output_slave,
+            [
+                PtyStep::Key(QuickstartSelectorKey::Down),
+                PtyStep::Key(QuickstartSelectorKey::Cancel),
+            ],
+        );
+        let output_size = quickstart_selector_terminal_size(&mut term)
+            .expect("the output PTY reports its geometry");
+        assert_eq!(
+            output_size,
+            (20, 40),
+            "the adapter over the output PTY must report the output PTY, not the controlling one"
+        );
+
+        // Fit exactly as the Quickstart caller does, from the sampled output
+        // geometry, with content that only fits the wider terminal unfitted.
+        let row_budget = quickstart_selector_row_budget(usize::from(output_size.1))
+            .expect("40 columns is a supported width");
+        let prompt = "Open a selector (Enter), or pick Create. Esc to quit.";
+        let fitted_prompt = fit_quickstart_selector_row(prompt, row_budget);
+        assert_ne!(
+            fitted_prompt, prompt,
+            "the prompt needs fitting at 40 columns"
+        );
+        let label = "[ ] Model provider — not yet chosen (pick one to continue)";
+        let fitted_label = fit_quickstart_selector_row(label, row_budget);
+        assert_ne!(fitted_label, label, "the row needs fitting at 40 columns");
+
+        let outcome = interact_quickstart_selector(
+            &mut term,
+            std::slice::from_ref(&fitted_label),
+            &fitted_prompt,
+            output_size,
+        )
+        .expect("navigation on the output PTY should succeed");
+        assert_eq!(outcome, QuickstartSelectorOutcome::Pick(None));
+
+        let output = drain_pty_output(&mut output_master);
+        drop(term);
+        drop(controlling);
+
+        assert!(
+            output.contains(&format!("? {fitted_prompt}")) && output.contains(&fitted_label),
+            "the fitted prompt and row must reach the output terminal; output: {output:?}"
+        );
+        assert!(
+            !output.contains(prompt) && !output.contains(label),
+            "unfitted text must never reach the 40-column output terminal; output: {output:?}"
+        );
+        for line in output.split("\r\n") {
+            assert!(
+                console::measure_text_width(line) <= 40,
+                "{line:?} exceeds the 40-column output terminal"
+            );
+        }
+    }
+
+    /// A resize of the output terminal alone raises no Crossterm resize event,
+    /// so the recheck on the next key must read the output terminal itself.
+    #[cfg(all(feature = "agent-runtime", unix))]
+    #[test]
+    fn quickstart_selector_fails_closed_when_only_the_output_terminal_resizes() {
+        let (mut master, slave) = open_pty(20, 40);
+        let mut term = pty_quickstart_terminal(
+            &master,
+            slave,
+            [
+                PtyStep::Key(QuickstartSelectorKey::Down),
+                PtyStep::ResizeOutput {
+                    rows: 20,
+                    columns: 30,
+                },
+                PtyStep::Key(QuickstartSelectorKey::Down),
+                PtyStep::Key(QuickstartSelectorKey::Cancel),
+            ],
+        );
+        let initial_size = quickstart_selector_terminal_size(&mut term)
+            .expect("the output PTY reports its geometry");
+        assert_eq!(initial_size, (20, 40));
+
+        let error = interact_quickstart_selector(
+            &mut term,
+            &["first".to_string(), "second".to_string()],
+            "Choose",
+            initial_size,
+        )
+        .expect_err("an output-only resize must stop the selector");
+        assert_eq!(
+            error.to_string(),
+            quickstart_selector_resize_error((20, 40), (20, 30)).to_string(),
+            "the recheck must report the output terminal's new geometry"
+        );
+
+        let output = drain_pty_output(&mut master);
+        drop(term);
+
+        assert_eq!(
+            output.matches(PTY_CLEAR_AND_HOME).count(),
+            2,
+            "only the initial frame and the pre-resize redraw may be drawn; output: {output:?}"
+        );
+        assert!(
+            output.ends_with(PTY_SHOW_CURSOR_AND_LEAVE_SCREEN),
+            "the cursor and main screen must be restored after the resize; output: {output:?}"
+        );
+    }
+
+    #[cfg(all(feature = "agent-runtime", unix))]
+    #[test]
+    fn quickstart_output_terminal_size_is_unknown_without_reported_geometry() {
+        let not_a_terminal = tempfile::tempfile().expect("temporary file");
+        assert_eq!(quickstart_output_terminal_size(&not_a_terminal), None);
+
+        let (_unset_master, unset_slave) = open_pty(0, 0);
+        assert_eq!(quickstart_output_terminal_size(&unset_slave), None);
+
+        let (_master, slave) = open_pty(9, 20);
+        assert_eq!(quickstart_output_terminal_size(&slave), Some((9, 20)));
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    #[test]
+    fn fit_quickstart_selector_row_respects_byte_and_display_budgets() {
+        let short = "[ ] Memory — not yet chosen";
+        assert_eq!(fit_quickstart_selector_row(short, 80), short);
+
+        let rows = [
+            "[✓] Model provider — Anthropic (alias: main, model: claude-sonnet-4-5)",
+            "[✓] モデルプロバイダー — Anthropic（モデル：長い名前）",
+            "[✓] 模型提供方 — 提供商与模型摘要",
+            "emoji 👩‍💻 and combining e\u{301} text",
+            "line one\nline two\twith controls",
+        ];
+        for row in rows {
+            for budget in 0..=64 {
+                let fitted = fit_quickstart_selector_row(row, budget);
+                assert!(
+                    fitted.len() <= budget,
+                    "{fitted:?} uses {} bytes with budget {budget}",
+                    fitted.len()
+                );
+                assert!(
+                    console::measure_text_width(&fitted) <= budget,
+                    "{fitted:?} uses {} columns with budget {budget}",
+                    console::measure_text_width(&fitted)
+                );
+                assert!(
+                    fitted.chars().all(|ch| !ch.is_control()),
+                    "{fitted:?} contains a terminal control character"
+                );
+            }
+        }
+
+        let long = rows[0];
+        assert_eq!(fit_quickstart_selector_row(long, 0), "");
+        assert_eq!(fit_quickstart_selector_row(long, 1), ".");
+        assert_eq!(fit_quickstart_selector_row(long, 2), "[.");
+        assert!(fit_quickstart_selector_row(long, 40).ends_with('…'));
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    #[test]
+    fn quickstart_selector_budget_rejects_unsafe_terminal_widths() {
+        assert!(
+            (0..QUICKSTART_SELECTOR_MIN_WIDTH)
+                .all(|width| quickstart_selector_row_budget(width).is_none())
+        );
+        assert_eq!(quickstart_selector_row_budget(20), Some(17));
+        assert_eq!(quickstart_selector_row_budget(21), Some(18));
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    #[test]
+    fn quickstart_selector_minimum_width_keeps_actions_identifiable() {
+        let budget = quickstart_selector_row_budget(QUICKSTART_SELECTOR_MIN_WIDTH).unwrap();
+        let rows = [
+            ("[ ] Model provider — not yet chosen", "[ ] Model"),
+            ("[ ] Risk profile — not yet chosen", "[ ] Risk"),
+            ("[ ] Memory — not yet chosen", "[ ] Memory"),
+            ("[ ] Channels (0) — not yet chosen", "[ ] Channels"),
+            ("[ ] Peer groups — not yet chosen", "[ ] Peer"),
+            ("[ ] Agent identity — not yet chosen", "[ ] Agent"),
+            ("── Create agent", "── Create"),
+        ];
+
+        for (row, identifiable_prefix) in rows {
+            let fitted = fit_quickstart_selector_row(row, budget);
+            assert!(
+                fitted.starts_with(identifiable_prefix),
+                "{fitted:?} does not identify {row:?}"
+            );
+        }
+    }
+
+    /// The checklist rows exactly as a committed locale ships them.
+    ///
+    /// The identifiability guarantee is about the strings users actually see,
+    /// so these are read from the committed catalogues rather than retyped:
+    /// a hand-written approximation can stay distinguishable at a width where
+    /// the real, longer, column-padded row has already collapsed.
+    #[cfg(feature = "agent-runtime")]
+    fn quickstart_checklist_rows_for_locale(cli_ftl: &str) -> Vec<String> {
+        const ROW_KEYS: [&str; 6] = [
+            "cli-quickstart-row-model-provider",
+            "cli-quickstart-row-risk-profile",
+            "cli-quickstart-row-memory",
+            "cli-quickstart-row-channels",
+            "cli-quickstart-row-peer-groups",
+            "cli-quickstart-row-agent-identity",
+        ];
+
+        let value_for = |key: &str| -> String {
+            cli_ftl
+                .lines()
+                .find_map(|line| line.strip_prefix(&format!("{key} = ")))
+                .unwrap_or_else(|| panic!("{key} should be defined in the catalogue"))
+                .to_string()
+        };
+
+        let mut rows: Vec<String> = ROW_KEYS
+            .iter()
+            .map(|key| {
+                value_for(key)
+                    .replace("{$glyph}", "[ ]")
+                    .replace("{$summary}", "not yet chosen")
+            })
+            .collect();
+        rows.push(value_for("cli-quickstart-create-agent"));
+        rows
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    #[test]
+    fn quickstart_selector_accepted_widths_keep_every_action_distinguishable() {
+        // The blocker this guards: a width floor chosen only for arithmetic
+        // safety left widths 3 and 4 "supported" while every fitted row
+        // collapsed to "" or ".", producing an interactive menu in which the
+        // user could not tell Provider from Risk from Create — and could
+        // commit real config chosen blind. Accepting a width must therefore
+        // mean the rows stay individually readable, in every locale we ship,
+        // not merely that the budget subtraction did not underflow.
+        let locales: [(&str, &str); 5] = [
+            (
+                "en",
+                include_str!("../crates/zeroclaw-runtime/locales/en/cli.ftl"),
+            ),
+            (
+                "es",
+                include_str!("../crates/zeroclaw-runtime/locales/es/cli.ftl"),
+            ),
+            (
+                "fr",
+                include_str!("../crates/zeroclaw-runtime/locales/fr/cli.ftl"),
+            ),
+            (
+                "ja",
+                include_str!("../crates/zeroclaw-runtime/locales/ja/cli.ftl"),
+            ),
+            (
+                "zh-CN",
+                include_str!("../crates/zeroclaw-runtime/locales/zh-CN/cli.ftl"),
+            ),
+        ];
+
+        for (locale, cli_ftl) in locales {
+            let rows = quickstart_checklist_rows_for_locale(cli_ftl);
+            assert_eq!(rows.len(), 7, "{locale}: expected seven checklist rows");
+
+            for width in 0..=120usize {
+                let Some(budget) = quickstart_selector_row_budget(width) else {
+                    continue;
+                };
+
+                let fitted: Vec<String> = rows
+                    .iter()
+                    .map(|row| fit_quickstart_selector_row(row, budget))
+                    .collect();
+
+                for (row, label) in rows.iter().zip(&fitted) {
+                    assert!(
+                        !label.is_empty(),
+                        "{locale}: width {width} accepted but {row:?} fits to an empty label"
+                    );
+                    assert!(
+                        label.chars().any(|ch| ch.is_alphanumeric()),
+                        "{locale}: width {width} accepted but {row:?} fits to {label:?}, \
+                         which carries no readable text"
+                    );
+                }
+
+                let distinct: std::collections::HashSet<&str> =
+                    fitted.iter().map(String::as_str).collect();
+                assert_eq!(
+                    distinct.len(),
+                    fitted.len(),
+                    "{locale}: width {width} accepted but the fitted rows are not all \
+                     distinguishable: {fitted:?}"
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    #[test]
+    fn quickstart_selector_rejects_widths_that_erase_action_labels() {
+        // The specific widths the previous floor blessed. At width 3 the row
+        // budget was 0 and every label fitted to ""; at width 4 the budget was
+        // 1 and every label fitted to ".". Both must now be rejected before
+        // any interaction can start.
+        let rows = quickstart_checklist_rows_for_locale(include_str!(
+            "../crates/zeroclaw-runtime/locales/en/cli.ftl"
+        ));
+
+        for width in [0usize, 1, 2, 3, 4, 5, 10, 19] {
+            assert_eq!(
+                quickstart_selector_row_budget(width),
+                None,
+                "width {width} must be rejected, not fitted"
+            );
+        }
+
+        // Demonstrate what acceptance at those widths would have meant, so the
+        // rejection above is anchored to the user-visible failure rather than
+        // to an arbitrary constant.
+        for (collapsed_budget, expected) in [(0usize, ""), (1, ".")] {
+            let fitted: std::collections::HashSet<String> = rows
+                .iter()
+                .map(|row| fit_quickstart_selector_row(row, collapsed_budget))
+                .collect();
+            assert_eq!(
+                fitted,
+                std::collections::HashSet::from([expected.to_string()]),
+                "budget {collapsed_budget} collapses every action to {expected:?}"
+            );
+        }
+
+        assert!(
+            quickstart_selector_row_budget(QUICKSTART_SELECTOR_MIN_WIDTH).is_some(),
+            "the floor itself must remain usable"
+        );
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    #[test]
+    fn quickstart_selector_height_prevents_paging_suffixes() {
+        let item_count = 7;
+        let min_height = quickstart_selector_min_height(item_count);
+
+        assert_eq!(min_height, 9);
+        assert!((0..min_height).all(|height| !quickstart_selector_fits_height(height, item_count)));
+        assert!(quickstart_selector_fits_height(min_height, item_count));
+        assert!(quickstart_selector_fits_height(min_height + 1, item_count));
+        assert_eq!(
+            quickstart_selector_min_height(usize::MAX),
+            usize::MAX,
+            "the terminal guard must not wrap on an unexpected item count"
+        );
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    #[test]
+    fn quickstart_selector_prompt_stays_within_final_terminal_budget() {
+        let prompts = [
+            "Open a selector (Enter), or pick Create. Esc to quit.",
+            "選択肢を開くには Enter、終了するには Esc を押してください。",
+            "Open a selector\nwithout adding a physical terminal row.",
+        ];
+
+        for terminal_width in [20, 40, 80] {
+            let budget = quickstart_selector_row_budget(terminal_width).unwrap();
+            for prompt in prompts {
+                let fitted = fit_quickstart_selector_row(prompt, budget);
+                assert!(
+                    fitted.len() <= budget,
+                    "{fitted:?} uses {} bytes with budget {budget}",
+                    fitted.len()
+                );
+                assert!(
+                    console::measure_text_width(&fitted) <= budget,
+                    "{fitted:?} uses {} columns with budget {budget}",
+                    console::measure_text_width(&fitted)
+                );
+                assert!(
+                    fitted.chars().all(|ch| !ch.is_control()),
+                    "{fitted:?} contains a terminal control character"
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    #[test]
+    fn quickstart_selector_unknown_terminal_size_fails_closed() {
+        // A narrow terminal with an unavailable size must not get rows fitted
+        // against a guessed geometry.
+        assert!(
+            !quickstart_selector_size_is_usable(None),
+            "an unknown terminal size must not be accepted for fitting"
+        );
+        assert!(
+            quickstart_selector_size_is_usable(Some((24, 80))),
+            "a reported size must still be accepted"
+        );
+
+        let mut term = SelectorTestTerminal::new(None, []);
+        assert_eq!(
+            quickstart_selector_terminal_size(&mut term),
+            None,
+            "the selector must preserve a failed terminal size query"
+        );
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    #[test]
+    fn quickstart_selector_recheck_rejects_resize_and_unknown_size() {
+        let initial = (24u16, 80u16);
+
+        assert!(
+            quickstart_selector_recheck_size(initial, Some(initial)).is_ok(),
+            "an unchanged size must allow the interaction to continue"
+        );
+
+        let resized = quickstart_selector_recheck_size(initial, Some((24, 40)))
+            .expect_err("a changed size must abort the interaction");
+        assert!(
+            resized.to_string().contains("40"),
+            "the resize error should name the new width; got {resized}"
+        );
+
+        // The important half: unknown is not evidence the geometry still
+        // matches. Without the checked query this branch would compare the
+        // fabricated (24, 80) against the initial sample, find them equal, and
+        // keep redrawing rows fitted for a terminal it can no longer see.
+        let unknown = quickstart_selector_recheck_size(initial, None)
+            .expect_err("an unavailable size must abort the interaction");
+        assert_eq!(
+            unknown.to_string(),
+            qta("cli-quickstart-terminal-size-unknown", &[]),
+            "unknown size must surface the localized size-unknown error"
+        );
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    #[test]
+    fn quickstart_selector_ctrl_c_restores_screen_even_when_cursor_restore_fails() {
+        let mut term =
+            SelectorTestTerminal::new(Some((20, 80)), [Ok(QuickstartSelectorKey::Interrupt)]);
+        term.fail_action = Some("show_cursor");
+
+        let outcome = interact_quickstart_selector(
+            &mut term,
+            &["first".to_string(), "second".to_string()],
+            "Choose",
+            (20, 80),
+        )
+        .expect("cleanup failure must not replace Ctrl+C interrupt semantics");
+
+        assert_eq!(outcome, QuickstartSelectorOutcome::Interrupt);
+        let show = term
+            .actions
+            .iter()
+            .position(|action| *action == "show_cursor")
+            .expect("cursor restoration must be attempted");
+        let leave = term
+            .actions
+            .iter()
+            .position(|action| *action == "leave_alternate_screen")
+            .expect("alternate-screen restoration must be attempted");
+        assert!(
+            show < leave,
+            "cleanup attempts should retain their safe order"
+        );
+        assert_eq!(term.actions.last(), Some(&"flush"));
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    #[test]
+    fn quickstart_selector_partial_entry_failure_still_restores_screen() {
+        let mut term = SelectorTestTerminal::new(Some((20, 80)), []);
+        term.fail_action = Some("clear_screen");
+
+        let error = match QuickstartSelectorScreen::enter(&mut term) {
+            Ok(_) => panic!("injected clear failure should abort entry"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("clear_screen"));
+        assert_eq!(
+            term.actions,
+            [
+                "enter_alternate_screen",
+                "clear_screen",
+                "show_cursor",
+                "leave_alternate_screen",
+                "flush",
+            ]
+        );
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    #[test]
+    fn quickstart_selector_read_error_still_restores_screen() {
+        let mut term = SelectorTestTerminal::new(
+            Some((20, 80)),
+            [Err(std::io::Error::other("injected read failure"))],
+        );
+
+        let error =
+            interact_quickstart_selector(&mut term, &["first".to_string()], "Choose", (20, 80))
+                .expect_err("injected read failure should surface");
+        assert!(error.to_string().contains("injected read failure"));
+        assert!(term.actions.contains(&"show_cursor"));
+        assert!(term.actions.contains(&"leave_alternate_screen"));
+        assert_eq!(term.actions.last(), Some(&"flush"));
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    #[test]
+    fn quickstart_selection_maps_by_index_when_fitted_labels_are_identical() {
+        let actions = [
+            QuickstartChecklistAction::Provider,
+            QuickstartChecklistAction::Risk,
+            QuickstartChecklistAction::Memory,
+            QuickstartChecklistAction::Channels,
+            QuickstartChecklistAction::PeerGroups,
+            QuickstartChecklistAction::Agent,
+            QuickstartChecklistAction::Create,
+        ];
+        let choices: Vec<(QuickstartChecklistAction, String)> = actions
+            .iter()
+            .copied()
+            .map(|action| (action, "same row".to_string()))
+            .collect();
+        let fitted: Vec<String> = choices
+            .iter()
+            .map(|(_, label)| fit_quickstart_selector_row(label, 0))
+            .collect();
+        assert!(fitted.windows(2).all(|pair| pair[0] == pair[1]));
+
+        for (index, expected) in actions.into_iter().enumerate() {
+            assert_eq!(quickstart_action_for_pick(&choices, Some(index)), expected);
+        }
+        assert_eq!(
+            quickstart_action_for_pick(&choices, None),
+            QuickstartChecklistAction::Quit
+        );
+        assert_eq!(
+            quickstart_action_for_pick(&choices, Some(choices.len())),
+            QuickstartChecklistAction::Quit
+        );
+    }
 
     #[cfg(all(feature = "agent-runtime", target_os = "linux"))]
     #[test]
@@ -10652,6 +12804,29 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn desktop_daemon_cli_parses_hidden_command() {
+        let cli = Cli::try_parse_from([
+            "zeroclaw",
+            "service",
+            "run-desktop-daemon",
+            "--port",
+            "42617",
+        ])
+        .expect("internal desktop daemon should parse");
+        assert!(matches!(
+            cli.command,
+            Commands::Service {
+                service_command: ServiceCommands::RunDesktopDaemon { port },
+                ..
+            } if port == 42617
+        ));
+
+        let help = Cli::command().render_help().to_string();
+        assert!(!help.contains("run-desktop-daemon"));
+    }
+
+    #[test]
     fn probe_config_dir_extracts_global_flag_in_all_forms() {
         fn argv(parts: &[&str]) -> std::vec::IntoIter<std::ffi::OsString> {
             parts
@@ -10748,6 +12923,20 @@ mod tests {
     }
 
     #[test]
+    fn acp_cli_accepts_process_default_agent() {
+        let cli = Cli::try_parse_from(["zeroclaw", "acp", "--agent", "fable"])
+            .expect("standalone ACP should accept a process default agent");
+
+        match cli.command {
+            Commands::Acp { agent, .. } => {
+                assert_eq!(agent.as_deref(), Some("fable"));
+            }
+            other => panic!("expected ACP command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
     fn cli_quickstart_uses_advertised_local_provider_runtime_default() {
         let providers = vec![zeroclaw_runtime::quickstart::QuickstartTypeOption {
             kind: "lmstudio".into(),
@@ -10763,6 +12952,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "agent-runtime")]
     fn cli_quickstart_uses_advertised_remote_provider_runtime_default() {
         let providers = vec![zeroclaw_runtime::quickstart::QuickstartTypeOption {
             kind: "anthropic".into(),
@@ -10778,6 +12968,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "agent-runtime")]
     fn cli_quickstart_uses_state_fallback_when_provider_has_no_override() {
         let providers = vec![zeroclaw_runtime::quickstart::QuickstartTypeOption {
             kind: "ollama".into(),
@@ -11875,110 +14066,6 @@ mod tests {
 
     #[test]
     #[cfg(feature = "agent-runtime")]
-    fn homebrew_onboard_config_dir_detects_cellar_paths() {
-        assert_eq!(
-            resolve_homebrew_onboard_config_dir(
-                Path::new("/opt/homebrew/Cellar/zeroclaw/0.8.0/bin/zeroclaw"),
-                |_| None,
-            ),
-            Some(PathBuf::from("/opt/homebrew/var/zeroclaw")),
-        );
-        assert_eq!(
-            resolve_homebrew_onboard_config_dir(
-                Path::new("/usr/local/Cellar/zeroclaw/0.8.0/bin/zeroclaw"),
-                |_| None,
-            ),
-            Some(PathBuf::from("/usr/local/var/zeroclaw")),
-        );
-    }
-
-    #[test]
-    #[cfg(feature = "agent-runtime")]
-    fn homebrew_onboard_config_dir_detects_brew_bin_symlink_layout() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let prefix = temp.path().join("homebrew");
-        std::fs::create_dir_all(prefix.join("Cellar")).expect("create Cellar marker");
-        let exe = prefix.join("bin/zeroclaw");
-
-        assert_eq!(
-            resolve_homebrew_onboard_config_dir(&exe, |_| None),
-            Some(prefix.join("var/zeroclaw")),
-        );
-    }
-
-    #[test]
-    #[cfg(feature = "agent-runtime")]
-    fn homebrew_onboard_config_dir_preserves_explicit_runtime_paths() {
-        let exe = Path::new("/opt/homebrew/Cellar/zeroclaw/0.8.0/bin/zeroclaw");
-
-        for var in [
-            "ZEROCLAW_CONFIG_DIR",
-            "ZEROCLAW_DATA_DIR",
-            "ZEROCLAW_WORKSPACE",
-        ] {
-            assert_eq!(
-                resolve_homebrew_onboard_config_dir(exe, |name| {
-                    (name == var).then(|| "/tmp/zeroclaw-explicit".to_string())
-                }),
-                None,
-                "{var} should take precedence over Homebrew detection",
-            );
-        }
-    }
-
-    #[test]
-    #[cfg(feature = "agent-runtime")]
-    fn homebrew_onboard_config_dir_treats_workspace_whitespace_as_explicit() {
-        let exe = Path::new("/opt/homebrew/Cellar/zeroclaw/0.8.0/bin/zeroclaw");
-
-        assert_eq!(
-            resolve_homebrew_onboard_config_dir(exe, |name| {
-                (name == "ZEROCLAW_WORKSPACE").then(|| "   ".to_string())
-            }),
-            None,
-        );
-    }
-
-    #[test]
-    #[cfg(feature = "agent-runtime")]
-    fn apply_homebrew_onboard_config_dir_sets_detected_config_dir() {
-        let exe = Path::new("/opt/homebrew/Cellar/zeroclaw/0.8.0/bin/zeroclaw");
-        let mut applied = None;
-
-        let detected = apply_homebrew_onboard_config_dir_with(
-            exe,
-            |_| None,
-            |name, value| applied = Some((name, value.to_path_buf())),
-        );
-
-        assert_eq!(detected, Some(PathBuf::from("/opt/homebrew/var/zeroclaw")));
-        assert_eq!(
-            applied,
-            Some((
-                "ZEROCLAW_CONFIG_DIR",
-                PathBuf::from("/opt/homebrew/var/zeroclaw"),
-            )),
-        );
-    }
-
-    #[test]
-    #[cfg(feature = "agent-runtime")]
-    fn apply_homebrew_onboard_config_dir_skips_explicit_config_dir() {
-        let exe = Path::new("/opt/homebrew/Cellar/zeroclaw/0.8.0/bin/zeroclaw");
-        let mut applied = None;
-
-        let detected = apply_homebrew_onboard_config_dir_with(
-            exe,
-            |name| (name == "ZEROCLAW_CONFIG_DIR").then(|| "/tmp/zeroclaw".to_string()),
-            |name, value| applied = Some((name, value.to_path_buf())),
-        );
-
-        assert_eq!(detected, None);
-        assert_eq!(applied, None);
-    }
-
-    #[test]
-    #[cfg(feature = "agent-runtime")]
     fn cli_parses_estop_default_engage() {
         let cli = Cli::try_parse_from(["zeroclaw", "estop"]).expect("estop command should parse");
 
@@ -12524,22 +14611,343 @@ mod tests {
         );
     }
 
+    /// Fixture for the cron-dispatch regressions: a one-step SOP on a
+    /// once-a-minute cron trigger, a mock OpenAI-compatible provider so the
+    /// step's agent turn actually completes, and the engine/audit/cache trio
+    /// the maintenance tick consumes.
+    ///
+    /// `owner` is the SOP's `agent`. `Some("sop-runner")` names the one
+    /// configured agent; `None` leaves the procedure unowned, which the
+    /// headless driver must refuse rather than borrow an identity for.
+    #[cfg(feature = "agent-runtime")]
+    struct CronSopHarness {
+        _tmp: tempfile::TempDir,
+        _server: wiremock::MockServer,
+        config: Config,
+        engine: std::sync::Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>,
+        audit: std::sync::Arc<zeroclaw_runtime::sop::SopAuditLogger>,
+        cache: zeroclaw_runtime::sop::dispatch::SopCronCache,
+        drivers: SopDriverSet,
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    const CRON_SOP_AGENT: &str = "sop-runner";
+
+    #[cfg(feature = "agent-runtime")]
+    async fn cron_sop_harness(owner: Option<&str>) -> CronSopHarness {
+        cron_sop_harness_with(owner, false).await
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    fn orphaned_run_sop(name: &str) -> zeroclaw_runtime::sop::Sop {
+        use zeroclaw_runtime::sop::{
+            Sop, SopExecutionMode, SopPriority, SopStep, SopStepKind, SopTrigger,
+        };
+        Sop {
+            name: name.into(),
+            description: "orphaned-run regression".into(),
+            version: "0.1.0".into(),
+            execution_mode: SopExecutionMode::Auto,
+            priority: SopPriority::Normal,
+            triggers: vec![SopTrigger::Manual],
+            steps: vec![SopStep {
+                number: 1,
+                title: "Step one".into(),
+                body: "Do step one".into(),
+                suggested_tools: vec![],
+                requires_confirmation: false,
+                kind: SopStepKind::default(),
+                schema: None,
+                ..SopStep::default()
+            }],
+            cooldown_secs: 0,
+            max_concurrent: 2,
+            location: None,
+            deterministic: false,
+            admission_policy: zeroclaw_runtime::sop::types::SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
+            agent: None,
+        }
+    }
+
+    /// Start one run on `store` and return the engine holding it plus its id.
+    #[cfg(feature = "agent-runtime")]
+    fn engine_with_one_running_run(
+        name: &str,
+        store: std::sync::Arc<dyn zeroclaw_runtime::sop::SopRunStore>,
+    ) -> (
+        std::sync::Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>,
+        String,
+    ) {
+        let mut engine =
+            zeroclaw_runtime::sop::SopEngine::new(zeroclaw_config::schema::SopConfig::default())
+                .with_store(store);
+        engine.set_sops_for_test(vec![orphaned_run_sop(name)]);
+        let action = engine
+            .start_run(
+                name,
+                zeroclaw_runtime::sop::SopEvent {
+                    source: zeroclaw_runtime::sop::SopTriggerSource::Manual,
+                    topic: None,
+                    payload: None,
+                    timestamp: "2026-09-24T00:00:00Z".into(),
+                },
+            )
+            .expect("the run starts");
+        let run_id = match &action {
+            zeroclaw_runtime::sop::SopRunAction::ExecuteStep { run_id, .. } => run_id.clone(),
+            other => panic!("expected the run to be ready for a driver, got {other:?}"),
+        };
+        (std::sync::Arc::new(std::sync::Mutex::new(engine)), run_id)
+    }
+
+    /// A reload that has to abort a driver mid-step must not strand its run.
+    ///
+    /// The aborted driver leaves the run `Running` and claimed, and the next
+    /// generation restores active runs without starting drivers for them. This
+    /// uses the SQLite store the daemon runs on and rebuilds the replacement
+    /// engine from the same database, because in-memory cleanup alone would
+    /// leave the durable row restorable: the run has to be terminal on disk,
+    /// with its claim released, before the next generation reads it.
     #[tokio::test]
     #[cfg(feature = "agent-runtime")]
-    async fn sop_maintenance_tick_dispatches_cached_cron_triggers() {
+    async fn an_aborted_driver_settles_its_run_before_the_next_generation_restores_it() {
+        use zeroclaw_runtime::sop::SopRunStore as _;
+        use zeroclaw_runtime::sop::types::SopRunStatus;
+
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let db = tmp.path().join("sop-runs.db");
+        let name = "aborted-driver";
+        let store =
+            std::sync::Arc::new(zeroclaw_runtime::sop::SqliteRunStore::open(&db).expect("store"));
+        let (engine, run_id) = engine_with_one_running_run(name, store.clone());
+        assert_eq!(
+            store.claim_counts(name).unwrap().0,
+            1,
+            "the run holds a claim"
+        );
+
+        // A driver mid-step that will not finish on its own.
+        let drivers = SopDriverSet::default();
+        assert!(zeroclaw_runtime::sop::admit_sop_driver_for_run(
+            &drivers,
+            &run_id,
+            &engine,
+            || ::zeroclaw_spawn::spawn!(std::future::pending::<()>()),
+        ));
+
+        let teardown = SopDriverSupervisor {
+            drivers,
+            carried: Vec::new(),
+        }
+        .shutdown_with_deadlines(
+            std::time::Duration::from_millis(20),
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+        assert!(
+            teardown.still_running.is_empty(),
+            "the aborted driver stopped"
+        );
+        assert!(
+            teardown.unsettled_runs.is_empty(),
+            "the run was settled at teardown, so nothing is handed on"
+        );
+
+        {
+            let guard = engine.lock().unwrap();
+            assert!(!guard.active_runs().contains_key(&run_id));
+            assert_eq!(
+                guard.get_run(&run_id).unwrap().status,
+                SopRunStatus::Failed,
+                "a step that was underway and did not finish is recorded as failed"
+            );
+        }
+        assert_eq!(
+            store.claim_counts(name).unwrap().0,
+            0,
+            "settlement released the claim"
+        );
+        assert!(
+            store
+                .list_events(&run_id)
+                .unwrap()
+                .iter()
+                .any(|event| event.kind == "run_driver_aborted"),
+            "the durable record says why the run ended"
+        );
+
+        // The replacement generation opens the same database.
+        let reopened =
+            std::sync::Arc::new(zeroclaw_runtime::sop::SqliteRunStore::open(&db).expect("store"));
+        let mut rebuilt =
+            zeroclaw_runtime::sop::SopEngine::new(zeroclaw_config::schema::SopConfig::default())
+                .with_store(reopened.clone());
+        rebuilt.set_sops_for_test(vec![orphaned_run_sop(name)]);
+        rebuilt.restore_runs();
+        assert!(
+            !rebuilt.active_runs().contains_key(&run_id),
+            "the next generation must not restore a settled run as active"
+        );
+        rebuilt.run_maintenance_tick();
+        assert_eq!(
+            reopened.claim_counts(name).unwrap().0,
+            0,
+            "and nothing renews a claim for it"
+        );
+    }
+
+    /// When the terminal write at teardown fails, the run is still `Running` on
+    /// disk and the next generation restores it with a renewed claim. That
+    /// generation must take over the settlement rather than hold the claim
+    /// forever with no driver.
+    #[tokio::test]
+    #[cfg(feature = "agent-runtime")]
+    async fn a_run_teardown_could_not_settle_is_settled_by_the_next_generation() {
+        use zeroclaw_runtime::sop::SopRunStore as _;
+        use zeroclaw_runtime::sop::store::testing::FailFirstTerminalWrite;
+        use zeroclaw_runtime::sop::types::SopRunStatus;
+
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let db = tmp.path().join("sop-runs.db");
+        let name = "unsettled-at-teardown";
+        let store = std::sync::Arc::new(FailFirstTerminalWrite::new(
+            zeroclaw_runtime::sop::SqliteRunStore::open(&db).expect("store"),
+        ));
+        let (engine, run_id) = engine_with_one_running_run(name, store.clone());
+
+        let drivers = SopDriverSet::default();
+        assert!(zeroclaw_runtime::sop::admit_sop_driver_for_run(
+            &drivers,
+            &run_id,
+            &engine,
+            || ::zeroclaw_spawn::spawn!(std::future::pending::<()>()),
+        ));
+        let teardown = SopDriverSupervisor {
+            drivers,
+            carried: Vec::new(),
+        }
+        .shutdown_with_deadlines(
+            std::time::Duration::from_millis(20),
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+        assert!(
+            store.fired(),
+            "the teardown's terminal write was the one that failed"
+        );
+        assert_eq!(
+            teardown.unsettled_runs,
+            vec![run_id.clone()],
+            "a run teardown could not settle is handed to the next generation"
+        );
+        assert_eq!(
+            store.claim_counts(name).unwrap().0,
+            1,
+            "still claimed on disk"
+        );
+
+        // The next generation, as the daemon loop builds it: a fresh engine on
+        // the same store that restores active runs, then adopts the hand-off.
+        let mut next =
+            zeroclaw_runtime::sop::SopEngine::new(zeroclaw_config::schema::SopConfig::default())
+                .with_store(store.clone());
+        next.set_sops_for_test(vec![orphaned_run_sop(name)]);
+        next.restore_runs();
+        assert!(
+            next.active_runs().contains_key(&run_id),
+            "the unsettled row restores as active"
+        );
+        next.adopt_orphaned_run_settlements(teardown.unsettled_runs.into_iter().map(|run_id| {
+            (
+                run_id,
+                zeroclaw_runtime::sop::OrphanedRunSettlement::DriverAborted,
+            )
+        }));
+        let summary = next.run_maintenance_tick();
+        assert_eq!(summary.settled_orphaned_runs, 1);
+        assert!(!next.active_runs().contains_key(&run_id));
+        assert_eq!(next.get_run(&run_id).unwrap().status, SopRunStatus::Failed);
+        assert_eq!(
+            store.claim_counts(name).unwrap().0,
+            0,
+            "the next generation released the claim instead of renewing it"
+        );
+    }
+
+    /// `calls_tool`: the model asks for one tool before answering, so a test can
+    /// assert on what the step recorded having run.
+    #[cfg(feature = "agent-runtime")]
+    async fn cron_sop_harness_with(owner: Option<&str>, calls_tool: bool) -> CronSopHarness {
         use std::sync::{Arc, Mutex};
-        use zeroclaw_config::schema::{MemoryConfig, SopConfig};
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, MemoryConfig, RiskProfileConfig, SopConfig,
+        };
         use zeroclaw_memory::traits::Memory;
         use zeroclaw_runtime::sop::{
             Sop, SopEngine, SopExecutionMode, SopPriority, SopStep, SopStepKind, SopTrigger,
         };
+
+        let server = wiremock::MockServer::start().await;
+        if calls_tool {
+            // Consumed by the first request only, so the follow-up falls through
+            // to the plain answer mounted below.
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .and(wiremock::matchers::path("/chat/completions"))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({
+                        "id": "chatcmpl-tool",
+                        "object": "chat.completion",
+                        "created": 0,
+                        "model": "test-model",
+                        "choices": [{
+                            "index": 0,
+                            "message": {
+                                "role": "assistant",
+                                "content": serde_json::Value::Null,
+                                "tool_calls": [{
+                                    "id": "call-1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "audit_probe",
+                                        "arguments": "{}",
+                                    },
+                                }],
+                            },
+                            "finish_reason": "tool_calls",
+                        }],
+                        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                    }),
+                ))
+                .up_to_n_times(1)
+                .mount(&server)
+                .await;
+        }
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/chat/completions"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "chatcmpl-test",
+                    "object": "chat.completion",
+                    "created": 0,
+                    "model": "test-model",
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "step one done"},
+                        "finish_reason": "stop",
+                    }],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                })),
+            )
+            .mount(&server)
+            .await;
 
         let mut engine = SopEngine::new(SopConfig::default());
         engine.set_sops_for_test(vec![Sop {
             name: "cron-sop".into(),
             description: "cron regression".into(),
             version: "0.1.0".into(),
-            execution_mode: SopExecutionMode::Supervised,
+            execution_mode: SopExecutionMode::Auto,
             priority: SopPriority::Normal,
             triggers: vec![SopTrigger::Cron {
                 expression: "* * * * *".into(),
@@ -12560,7 +14968,7 @@ mod tests {
             deterministic: false,
             admission_policy: zeroclaw_runtime::sop::types::SopAdmissionPolicy::Parallel,
             max_pending_approvals: 0,
-            agent: None,
+            agent: owner.map(str::to_string),
         }]);
         let engine = Arc::new(Mutex::new(engine));
 
@@ -12574,14 +14982,857 @@ mod tests {
         let audit = Arc::new(zeroclaw_runtime::sop::SopAuditLogger::new(memory));
         let cache = zeroclaw_runtime::sop::dispatch::SopCronCache::from_engine(&engine);
 
+        let mut providers = zeroclaw_config::providers::Providers::default();
+        {
+            let base = providers
+                .models
+                .ensure("custom", "default")
+                .expect("`custom` slot must exist on ModelProviders");
+            base.api_key = Some("test-key".into());
+            base.model = Some("test-model".into());
+            base.uri = Some(server.uri());
+        }
+        let mut agents = std::collections::HashMap::new();
+        agents.insert(
+            CRON_SOP_AGENT.to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                model_provider: "custom.default".into(),
+                risk_profile: "default".into(),
+                ..Default::default()
+            },
+        );
+        // A headless step runs under the owning agent's fail-closed approval
+        // policy, so a Supervised agent's step may only use tools it
+        // auto-approves, exactly as in a real deployment. `audit_probe` is the
+        // tool the call-recording regression asks for.
+        let mut risk_profile = RiskProfileConfig::default();
+        risk_profile.auto_approve.push("audit_probe".into());
+        let mut risk_profiles = std::collections::HashMap::new();
+        risk_profiles.insert("default".to_string(), risk_profile);
+        let mut config = Config {
+            data_dir: tmp.path().to_path_buf(),
+            config_path: tmp.path().join("config.toml"),
+            providers,
+            agents,
+            risk_profiles,
+            ..Config::default()
+        };
+        config.reliability.provider_retries = 0;
+        config.reliability.scheduler_retries = 0;
+
+        CronSopHarness {
+            _tmp: tmp,
+            _server: server,
+            config,
+            engine,
+            audit,
+            cache,
+            drivers: SopDriverSet::default(),
+        }
+    }
+
+    /// Wait for the cron-started run to leave the active set, then return the
+    /// retained terminal run.
+    #[cfg(feature = "agent-runtime")]
+    async fn await_terminal_cron_run(
+        harness: &CronSopHarness,
+    ) -> zeroclaw_runtime::sop::types::SopRun {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                {
+                    let engine = harness.engine.lock().unwrap();
+                    if engine.active_runs().is_empty()
+                        && let Some(run) = engine.finished_runs(Some("cron-sop")).first()
+                    {
+                        return (*run).clone();
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("cron-started SOP should be driven to a retained terminal run")
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "agent-runtime")]
+    async fn sop_maintenance_tick_drives_cached_cron_triggers() {
+        let harness = cron_sop_harness(Some(CRON_SOP_AGENT)).await;
+
         let mut last_cron_check = chrono::Utc::now() - chrono::Duration::minutes(2);
-        let report =
-            run_sop_maintenance_tick(&engine, Some(&audit), Some(&cache), &mut last_cron_check)
-                .await
-                .expect("maintenance tick should complete");
+        let report = run_sop_maintenance_tick(
+            &harness.config,
+            &harness.engine,
+            Some(&harness.audit),
+            Some(&harness.cache),
+            &mut last_cron_check,
+            &harness.drivers,
+        )
+        .await
+        .expect("maintenance tick should complete");
 
         assert_eq!(report.cron_started, 1);
-        assert_eq!(engine.lock().unwrap().active_runs().len(), 1);
+        assert_eq!(
+            harness.drivers.lock().unwrap().len(),
+            1,
+            "the tick must retain its driver so the daemon generation can drain it"
+        );
+
+        let run = await_terminal_cron_run(&harness).await;
+        // The point of the regression: the cron path must run the step through
+        // the resolved agent and SUCCEED, not merely stop being stranded.
+        assert_eq!(
+            run.status,
+            zeroclaw_runtime::sop::types::SopRunStatus::Completed,
+            "cron-started run should reach Completed, got {:?} ({:?})",
+            run.status,
+            run.step_results
+        );
+        let step = run
+            .step_results
+            .first()
+            .expect("the driven step should be recorded on the run");
+        assert_eq!(
+            step.status,
+            zeroclaw_runtime::sop::types::SopStepStatus::Completed
+        );
+        assert_eq!(
+            step.effective_agent.as_deref(),
+            Some(CRON_SOP_AGENT),
+            "the step must be attributed to the SOP's own agent"
+        );
+        assert!(
+            step.output.contains("step one done"),
+            "step output should carry the agent turn's result, got {:?}",
+            step.output
+        );
+    }
+
+    /// An unattended run is the one whose record cannot be reconstructed from a
+    /// conversation afterwards: nobody watched it, and there is no session to
+    /// read back. The headless driver recorded `tool_calls: []` regardless of
+    /// what the step actually ran, so the stored record did not merely omit the
+    /// calls, it asserted there had been none.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(feature = "agent-runtime")]
+    async fn headless_step_records_the_tool_calls_it_made() {
+        let harness = cron_sop_harness_with(Some(CRON_SOP_AGENT), true).await;
+
+        let mut last_cron_check = chrono::Utc::now() - chrono::Duration::minutes(2);
+        run_sop_maintenance_tick(
+            &harness.config,
+            &harness.engine,
+            Some(&harness.audit),
+            Some(&harness.cache),
+            &mut last_cron_check,
+            &harness.drivers,
+        )
+        .await
+        .expect("maintenance tick should complete");
+
+        let run = await_terminal_cron_run(&harness).await;
+        let step = run
+            .step_results
+            .first()
+            .expect("the cron run executed its step");
+
+        assert!(
+            !step.tool_calls.is_empty(),
+            "a headless step must record the calls it made, got {:?}",
+            step.tool_calls
+        );
+        assert_eq!(
+            step.tool_calls[0].tool, "audit_probe",
+            "the recorded call must name the tool the step actually requested"
+        );
+    }
+
+    /// With the maintenance tick disabled entirely, the generation's driver
+    /// supervisor must still exist and drive channel-started work: a file
+    /// event through the production filesystem adapter starts an auto-mode
+    /// SOP whose driver registers in the supervisor's set and completes under
+    /// the SOP's own agent. Guards the conditional sink construction and the
+    /// adapter wiring, which a dispatch-helper regression cannot see.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(feature = "agent-runtime")]
+    async fn filesystem_adapter_drives_a_run_with_maintenance_disabled() {
+        use zeroclaw_runtime::sop::{
+            Sop, SopExecutionMode, SopPriority, SopStep, SopStepKind, SopTrigger,
+        };
+
+        let harness = cron_sop_harness(Some(CRON_SOP_AGENT)).await;
+        let watch = tempfile::tempdir().expect("watch dir");
+        // Canonical, not as handed out: on macOS the temp dir sits under
+        // `/var`, a symlink to `/private/var`, and the watcher reports the
+        // resolved path. Configuring the trigger with the unresolved one makes
+        // `filesystem_path_matches` compare two spellings of the same
+        // directory and never fire, so the adapter would look broken on a
+        // platform where it is not.
+        let watch_dir = std::fs::canonicalize(watch.path()).expect("canonical watch dir");
+        {
+            let mut engine = harness.engine.lock().unwrap();
+            engine.set_sops_for_test(vec![Sop {
+                name: "fs-sop".into(),
+                description: "maintenance-disabled adapter regression".into(),
+                version: "0.1.0".into(),
+                execution_mode: SopExecutionMode::Auto,
+                priority: SopPriority::Normal,
+                triggers: vec![SopTrigger::Filesystem {
+                    path: watch_dir.to_string_lossy().into_owned(),
+                    events: vec![],
+                    condition: None,
+                }],
+                steps: vec![SopStep {
+                    number: 1,
+                    title: "Step one".into(),
+                    body: "Do step one".into(),
+                    suggested_tools: vec![],
+                    requires_confirmation: false,
+                    kind: SopStepKind::default(),
+                    schema: None,
+                    ..SopStep::default()
+                }],
+                cooldown_secs: 0,
+                max_concurrent: 2,
+                location: None,
+                deterministic: false,
+                admission_policy: zeroclaw_runtime::sop::types::SopAdmissionPolicy::Parallel,
+                max_pending_approvals: 0,
+                agent: Some(CRON_SOP_AGENT.to_string()),
+            }]);
+        }
+
+        // No maintenance tick exists anywhere in this test: the supervisor's
+        // set stands alone, exactly as when `maintenance_interval_secs == 0`.
+        let supervisor_set = zeroclaw_runtime::sop::SopDriverHandles::default();
+        let sink = zeroclaw_runtime::sop::SopDriverSink::new(
+            harness.config.clone(),
+            std::sync::Arc::clone(&harness.engine),
+            Some(std::sync::Arc::clone(&harness.audit)),
+            supervisor_set.clone(),
+        );
+        let channel = zeroclaw_channels::filesystem::FilesystemChannel::new(
+            zeroclaw_channels::filesystem::FilesystemChannelConfig {
+                config: zeroclaw_config::schema::FilesystemConfig {
+                    enabled: true,
+                    paths: vec![watch_dir.to_string_lossy().into_owned()],
+                    events: vec!["created".into(), "modified".into()],
+                    debounce_ms: 50,
+                    ..Default::default()
+                },
+                alias: "fswatch".into(),
+                engine: std::sync::Arc::clone(&harness.engine),
+                audit: std::sync::Arc::clone(&harness.audit),
+                driver_sink: Some(sink),
+            },
+        );
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let listener = ::zeroclaw_spawn::spawn!(async move {
+            use zeroclaw_api::channel::Channel;
+            let _ = channel.listen(tx).await;
+        });
+        // Give the watcher a beat to arm before the event lands.
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        std::fs::write(watch.path().join("event.txt"), "review please").expect("write event");
+
+        let run = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            loop {
+                {
+                    let engine = harness.engine.lock().unwrap();
+                    if let Some(run) = engine.finished_runs(Some("fs-sop")).first() {
+                        return (*run).clone();
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("a file event must start and finish a run with no maintenance tick");
+        assert_eq!(
+            run.status,
+            zeroclaw_runtime::sop::types::SopRunStatus::Completed,
+            "{:?}",
+            run.step_results
+        );
+        assert!(
+            !supervisor_set.lock().unwrap().is_empty(),
+            "the driver must register in the supervisor set"
+        );
+        listener.abort();
+    }
+
+    /// The channel half of the same gap: a channel-triggered auto SOP was
+    /// admitted by the shared ingress and then stranded, because no caller of
+    /// the ingress owned a driver for the run it had just started. With the
+    /// ingress carrying a `SopDriverSink`, the started run must be handed a
+    /// supervised driver and reach a retained terminal state under the SOP's
+    /// own agent.
+    #[tokio::test]
+    #[cfg(feature = "agent-runtime")]
+    async fn channel_ingress_drives_started_run_to_terminal() {
+        use zeroclaw_runtime::sop::{
+            Sop, SopExecutionMode, SopPriority, SopStep, SopStepKind, SopTrigger,
+        };
+
+        let harness = cron_sop_harness(Some(CRON_SOP_AGENT)).await;
+
+        // Same machinery as the cron regressions (agent, provider mock, audit,
+        // driver set) — only the trigger source changes.
+        {
+            let mut engine = harness.engine.lock().unwrap();
+            engine.set_sops_for_test(vec![Sop {
+                name: "channel-sop".into(),
+                description: "channel ingress regression".into(),
+                version: "0.1.0".into(),
+                execution_mode: SopExecutionMode::Auto,
+                priority: SopPriority::Normal,
+                triggers: vec![SopTrigger::Channel {
+                    channel: "telegram".into(),
+                    alias: None,
+                    condition: None,
+                }],
+                steps: vec![SopStep {
+                    number: 1,
+                    title: "Step one".into(),
+                    body: "Do step one".into(),
+                    suggested_tools: vec![],
+                    requires_confirmation: false,
+                    kind: SopStepKind::default(),
+                    schema: None,
+                    ..SopStep::default()
+                }],
+                cooldown_secs: 0,
+                max_concurrent: 2,
+                location: None,
+                deterministic: false,
+                admission_policy: zeroclaw_runtime::sop::types::SopAdmissionPolicy::Parallel,
+                max_pending_approvals: 0,
+                agent: Some(CRON_SOP_AGENT.to_string()),
+            }]);
+        }
+
+        let sink = zeroclaw_runtime::sop::SopDriverSink::new(
+            harness.config.clone(),
+            std::sync::Arc::clone(&harness.engine),
+            Some(std::sync::Arc::clone(&harness.audit)),
+            harness.drivers.clone(),
+        );
+
+        let results = zeroclaw_runtime::sop::dispatch::dispatch_untrusted_fan_in_driven(
+            &harness.engine,
+            &harness.audit,
+            Some(&sink),
+            zeroclaw_runtime::sop::types::SopTriggerSource::Channel,
+            Some("telegram.main:message"),
+            Some("review please"),
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            results.len(),
+            1,
+            "exactly one SOP should match, got {results:?}"
+        );
+        assert!(
+            matches!(
+                &results[0],
+                zeroclaw_runtime::sop::dispatch::DispatchResult::Started { .. }
+            ),
+            "the channel event should start the SOP, got {:?}",
+            results[0]
+        );
+        assert_eq!(
+            harness.drivers.lock().unwrap().len(),
+            1,
+            "the ingress must register the started run's driver in the shared set"
+        );
+
+        let run = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                {
+                    let engine = harness.engine.lock().unwrap();
+                    if engine.active_runs().is_empty()
+                        && let Some(run) = engine.finished_runs(Some("channel-sop")).first()
+                    {
+                        return (*run).clone();
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("channel-started SOP should be driven to a retained terminal run");
+
+        assert_eq!(
+            run.status,
+            zeroclaw_runtime::sop::types::SopRunStatus::Completed,
+            "channel-started run should reach Completed, got {:?} ({:?})",
+            run.status,
+            run.step_results
+        );
+        let step = run
+            .step_results
+            .first()
+            .expect("the driven step should be recorded on the run");
+        assert_eq!(
+            step.status,
+            zeroclaw_runtime::sop::types::SopStepStatus::Completed
+        );
+        assert_eq!(
+            step.effective_agent.as_deref(),
+            Some(CRON_SOP_AGENT),
+            "the step must be attributed to the SOP's own agent"
+        );
+        assert!(
+            step.output.contains("step one done"),
+            "step output should carry the agent turn's result, got {:?}",
+            step.output
+        );
+    }
+
+    /// A cron SOP with no owning agent must fail closed. Before this, the
+    /// headless driver fell back to the alphabetically first configured agent,
+    /// running an unattended procedure under an unrelated agent's provider,
+    /// workspace, tools, and risk profile.
+    #[tokio::test]
+    #[cfg(feature = "agent-runtime")]
+    async fn sop_maintenance_tick_refuses_unowned_cron_sop() {
+        let harness = cron_sop_harness(None).await;
+
+        let mut last_cron_check = chrono::Utc::now() - chrono::Duration::minutes(2);
+        let report = run_sop_maintenance_tick(
+            &harness.config,
+            &harness.engine,
+            Some(&harness.audit),
+            Some(&harness.cache),
+            &mut last_cron_check,
+            &harness.drivers,
+        )
+        .await
+        .expect("maintenance tick should complete");
+        assert_eq!(report.cron_started, 1);
+
+        let run = await_terminal_cron_run(&harness).await;
+        assert_eq!(
+            run.status,
+            zeroclaw_runtime::sop::types::SopRunStatus::Failed,
+            "an unowned headless SOP must fail, not borrow another agent"
+        );
+        let step = run
+            .step_results
+            .first()
+            .expect("the refused step should be recorded on the run");
+        assert_eq!(
+            step.effective_agent, None,
+            "a refused step must not be attributed to any agent"
+        );
+        assert!(
+            step.output.contains("no owning agent"),
+            "the failure should name the missing owner, got {:?}",
+            step.output
+        );
+        assert!(
+            !step.output.contains(CRON_SOP_AGENT),
+            "the refusal must not fall back to the one configured agent, got {:?}",
+            step.output
+        );
+    }
+
+    /// Disabling an agent withdraws it from service. An unattended cron SOP is
+    /// the one run with nobody watching, so a disabled owner must stop it
+    /// rather than quietly keep executing under the agent the operator turned
+    /// off.
+    #[tokio::test]
+    #[cfg(feature = "agent-runtime")]
+    async fn sop_maintenance_tick_refuses_a_disabled_owner() {
+        let mut harness = cron_sop_harness(Some(CRON_SOP_AGENT)).await;
+        harness
+            .config
+            .agents
+            .get_mut(CRON_SOP_AGENT)
+            .expect("harness configures the owning agent")
+            .enabled = false;
+
+        let mut last_cron_check = chrono::Utc::now() - chrono::Duration::minutes(2);
+        let report = run_sop_maintenance_tick(
+            &harness.config,
+            &harness.engine,
+            Some(&harness.audit),
+            Some(&harness.cache),
+            &mut last_cron_check,
+            &harness.drivers,
+        )
+        .await
+        .expect("maintenance tick should complete");
+        assert_eq!(report.cron_started, 1);
+
+        let run = await_terminal_cron_run(&harness).await;
+        assert_eq!(
+            run.status,
+            zeroclaw_runtime::sop::types::SopRunStatus::Failed,
+            "a SOP owned by a disabled agent must fail closed"
+        );
+        let step = run
+            .step_results
+            .first()
+            .expect("the refused step should be recorded on the run");
+        assert_eq!(
+            step.effective_agent, None,
+            "a refused step must not be attributed to any agent"
+        );
+        assert!(
+            step.output.contains("disabled"),
+            "the failure should name the disabled owner, got {:?}",
+            step.output
+        );
+        assert!(
+            !step.output.contains("step one done"),
+            "the step must not have run under the disabled agent, got {:?}",
+            step.output
+        );
+    }
+
+    /// `abort` only requests cancellation. Shutdown must join the handles it
+    /// aborts, or the replacement generation can start while a straggler is
+    /// still running under the superseded config — the overlap this teardown
+    /// exists to prevent.
+    #[tokio::test]
+    #[cfg(feature = "agent-runtime")]
+    async fn sop_maintenance_shutdown_joins_the_drivers_it_aborts() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        /// Flips its flag when the driver task's future is dropped, which is
+        /// what actually happens when an aborted task stops.
+        struct StoppedFlag(std::sync::Arc<AtomicBool>);
+        impl Drop for StoppedFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let stopped = std::sync::Arc::new(AtomicBool::new(false));
+        let driver_flag = std::sync::Arc::clone(&stopped);
+        let drivers = SopDriverSet::default();
+        // Outlasts the drain deadline: shutdown has to abort it.
+        assert!(zeroclaw_runtime::sop::admit_sop_driver(&drivers, || {
+            ::zeroclaw_spawn::spawn!(async move {
+                let _flag = StoppedFlag(driver_flag);
+                tokio::time::sleep(std::time::Duration::from_hours(24)).await;
+            })
+        }));
+
+        // Short deadlines so the drain-expiry path runs without waiting out the
+        // production ones; the logic under test is identical.
+        let carried = SopDriverSupervisor {
+            drivers,
+            carried: Vec::new(),
+        }
+        .shutdown_with_deadlines(
+            std::time::Duration::from_millis(50),
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+
+        assert!(
+            stopped.load(Ordering::SeqCst),
+            "shutdown returned while an aborted driver was still running"
+        );
+        assert!(
+            carried.still_running.is_empty(),
+            "a driver that stopped on abort has nothing to carry forward"
+        );
+    }
+
+    /// A generation that adopts no drivers must still own the ones it inherited.
+    /// The flag is the point: if the reaper returned without joining — or if the
+    /// handles were dropped, which detaches the tasks — it would still be false
+    /// when the reaper finished.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(feature = "agent-runtime")]
+    async fn orphaned_sop_drivers_are_reaped_rather_than_detached() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let started = std::sync::Arc::new(AtomicBool::new(false));
+        let finished = std::sync::Arc::new(AtomicBool::new(false));
+        let start_flag = std::sync::Arc::clone(&started);
+        let flag = std::sync::Arc::clone(&finished);
+        // Blocking, so `abort` cannot stop it once it is polled: exactly the
+        // driver whose handle must not be dropped.
+        let driver = ::zeroclaw_spawn::spawn!(async move {
+            start_flag.store(true, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            flag.store(true, Ordering::SeqCst);
+        });
+        // Wait for the first poll. `abort` on a task the runtime has not polled
+        // yet cancels it outright, which under load would leave the driver never
+        // having run at all — a race in the test, not in the reaper.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !started.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the driver must begin before it is reaped");
+
+        let reaper = reap_orphaned_sop_drivers(vec![driver])
+            .expect("a driver still running must be reaped, not dropped");
+        tokio::time::timeout(std::time::Duration::from_secs(5), reaper)
+            .await
+            .expect("the reaper must finish once its drivers stop")
+            .expect("the reaper task itself must not fail");
+
+        assert!(
+            finished.load(Ordering::SeqCst),
+            "the reaper must join its drivers before finishing"
+        );
+    }
+
+    /// Nothing to own: every carried driver already stopped, so there is no
+    /// reaper to spawn.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(feature = "agent-runtime")]
+    async fn finished_drivers_need_no_reaper() {
+        let driver = ::zeroclaw_spawn::spawn!(async {});
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !driver.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+
+        assert!(
+            reap_orphaned_sop_drivers(vec![driver]).is_none(),
+            "a batch with nothing running must not spawn a reaper"
+        );
+    }
+
+    /// The drain and the post-abort join are two passes over the SAME handles.
+    /// When the drain deadline lands mid-batch — one driver already joined, one
+    /// still running — the second pass must resume at the cursor rather than
+    /// re-await a handle that already resolved: polling a completed
+    /// `JoinHandle` panics, which would turn an ordinary slow driver into a
+    /// shutdown panic whenever a sibling finished in time.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(feature = "agent-runtime")]
+    async fn sop_maintenance_shutdown_survives_a_mixed_completion_batch() {
+        // Ordered deliberately: the first resolves at once, so the drain
+        // consumes its handle before the deadline; the second reaches no await
+        // point and outlives both deadlines.
+        // Briefly pending rather than instantly complete: admission prunes
+        // finished handles, so a zero-await task would be pruned by the next
+        // admission and this test would lose the mixed batch it exists for.
+        let drivers = SopDriverSet::default();
+        assert!(zeroclaw_runtime::sop::admit_sop_driver(&drivers, || {
+            ::zeroclaw_spawn::spawn!(async {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            })
+        }));
+        assert!(zeroclaw_runtime::sop::admit_sop_driver(&drivers, || {
+            ::zeroclaw_spawn::spawn!(async {
+                std::thread::sleep(std::time::Duration::from_secs(2));
+            })
+        }));
+        let carried = SopDriverSupervisor {
+            drivers,
+            carried: Vec::new(),
+        }
+        .shutdown_with_deadlines(
+            std::time::Duration::from_millis(50),
+            std::time::Duration::from_millis(100),
+        )
+        .await;
+
+        assert_eq!(
+            carried.still_running.len(),
+            1,
+            "only the driver that outlived the grace is carried; the one the drain \
+             already joined must not be awaited a second time"
+        );
+    }
+
+    /// The other half of the contract: a driver that reaches no await point
+    /// cannot be cancelled on demand, and the join grace exists so one cannot
+    /// wedge a reload. It must then be carried into the next generation rather
+    /// than dropped — dropping a `JoinHandle` detaches the task, losing the
+    /// last way to observe work still running under superseded config.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(feature = "agent-runtime")]
+    async fn sop_maintenance_shutdown_carries_a_driver_that_outlives_its_abort() {
+        let drivers = SopDriverSet::default();
+        // Blocking, not `tokio::time::sleep`: abort lands at the next await
+        // point, and this task deliberately reaches none while the grace runs.
+        assert!(zeroclaw_runtime::sop::admit_sop_driver(&drivers, || {
+            ::zeroclaw_spawn::spawn!(async {
+                std::thread::sleep(std::time::Duration::from_secs(2));
+            })
+        }));
+
+        let started = std::time::Instant::now();
+        let carried = SopDriverSupervisor {
+            drivers,
+            carried: Vec::new(),
+        }
+        .shutdown_with_deadlines(
+            std::time::Duration::from_millis(50),
+            std::time::Duration::from_millis(100),
+        )
+        .await;
+
+        assert_eq!(
+            carried.still_running.len(),
+            1,
+            "a driver still running when the join grace expired must be carried, not detached"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "the join grace must bound the wait rather than block on the task"
+        );
+
+        // The next generation adopts it: already aborted, so it is re-checked
+        // and handed on again without a second drain.
+        let adopted_at = std::time::Instant::now();
+        let still_carried = SopDriverSupervisor {
+            drivers: SopDriverSet::default(),
+            carried: carried.still_running,
+        }
+        .shutdown_with_deadlines(
+            std::time::Duration::from_millis(50),
+            std::time::Duration::from_millis(100),
+        )
+        .await;
+
+        assert_eq!(
+            still_carried.still_running.len(),
+            1,
+            "an adopted driver that is still running stays carried"
+        );
+        assert!(
+            adopted_at.elapsed() < std::time::Duration::from_millis(500),
+            "adopting an already-aborted driver must not re-drain it"
+        );
+    }
+
+    /// A producer can outlive the point where its generation stops taking work:
+    /// the RPC listener stops accepting while its existing connection tasks keep
+    /// running, so one of them can resolve an approval after the drain has
+    /// already taken the set. The drain therefore CLOSES the set rather than
+    /// merely emptying it.
+    ///
+    /// Refusing the driver afterwards is not enough on its own. Creating the
+    /// task first and checking the generation second lets Tokio poll the driver
+    /// in between, so a rejected run can already be mutating the SOP engine
+    /// under superseded config and permissions before anything cancels it — and
+    /// cancellation is only cooperative, so a driver that reaches no await point
+    /// could not be stopped at all, only abandoned. Admission therefore creates
+    /// the task only once the generation has accepted it, which is what this
+    /// proves: the body never runs, rather than being cancelled once it has.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(feature = "agent-runtime")]
+    async fn sop_driver_admitted_after_the_drain_never_starts() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let drivers = SopDriverSet::default();
+        let carried = SopDriverSupervisor {
+            drivers: std::sync::Arc::clone(&drivers),
+            carried: Vec::new(),
+        }
+        .shutdown()
+        .await;
+        assert!(
+            carried.still_running.is_empty() && carried.unsettled_runs.is_empty(),
+            "a generation with no drivers drains clean"
+        );
+        assert!(
+            drivers.lock().unwrap().is_closed(),
+            "the drain must close the set so late producers cannot join it"
+        );
+
+        // One flag for the act of creating the driver, one for the driver's own
+        // body. A closed generation may set neither: the work has to be refused
+        // before it starts, not cancelled once it has.
+        let spawned = std::sync::Arc::new(AtomicBool::new(false));
+        let body_ran = std::sync::Arc::new(AtomicBool::new(false));
+        let spawned_flag = std::sync::Arc::clone(&spawned);
+        let body_flag = std::sync::Arc::clone(&body_ran);
+
+        let admitted = zeroclaw_runtime::sop::admit_sop_driver(&drivers, || {
+            spawned_flag.store(true, Ordering::SeqCst);
+            ::zeroclaw_spawn::spawn!(async move {
+                body_flag.store(true, Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_hours(24)).await;
+            })
+        });
+
+        assert!(
+            !admitted,
+            "a driver produced after its generation drained must be refused"
+        );
+        assert!(
+            !spawned.load(Ordering::SeqCst),
+            "the refused driver must never be created at all; creating it and refusing it \
+             afterwards is precisely the race this admission order closes"
+        );
+        assert!(
+            drivers.lock().unwrap().is_empty(),
+            "the refused driver must not land in the drained set"
+        );
+
+        // Give a task that should not exist every chance to run before
+        // concluding that it did not. Without this, a body that HAD started
+        // might simply not have been polled yet, and the assertion below would
+        // pass on scheduling luck rather than on the refusal.
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !body_ran.load(Ordering::SeqCst),
+            "no driver body may run under a generation that has already drained"
+        );
+    }
+
+    /// The open half of the same boundary, and the control for the refusal test
+    /// above: admission creates the driver AND takes ownership of it in one
+    /// step, so the set a generation drains really does hold the task it
+    /// started — and a driver body that is allowed to run does run, which is
+    /// what stops the refusal test from passing vacuously.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(feature = "agent-runtime")]
+    async fn sop_driver_admitted_into_an_open_generation_is_created_and_owned() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let drivers = SopDriverSet::default();
+        let body_ran = std::sync::Arc::new(AtomicBool::new(false));
+        let body_flag = std::sync::Arc::clone(&body_ran);
+
+        let admitted = zeroclaw_runtime::sop::admit_sop_driver(&drivers, || {
+            ::zeroclaw_spawn::spawn!(async move {
+                body_flag.store(true, Ordering::SeqCst);
+            })
+        });
+
+        assert!(admitted, "an open generation admits a driver");
+        assert_eq!(
+            drivers.lock().unwrap().len(),
+            1,
+            "the admitted driver is owned by the generation that admitted it"
+        );
+
+        let carried = SopDriverSupervisor {
+            drivers: std::sync::Arc::clone(&drivers),
+            carried: Vec::new(),
+        }
+        .shutdown()
+        .await;
+        assert!(
+            carried.still_running.is_empty() && carried.unsettled_runs.is_empty(),
+            "the admitted driver finished well inside the drain"
+        );
+        assert!(
+            body_ran.load(Ordering::SeqCst),
+            "an admitted driver's body must actually run, or the refusal test proves nothing"
+        );
     }
 
     #[test]
@@ -12670,6 +15921,7 @@ mod tests {
                     model: Some("claude-opus-4-7".to_string()),
                     ..Default::default()
                 },
+                ..Default::default()
             },
         );
 

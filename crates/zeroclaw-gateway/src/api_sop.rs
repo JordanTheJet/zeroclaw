@@ -44,6 +44,10 @@ pub struct SopLogsQuery {
     limit: Option<usize>,
     #[serde(default)]
     until_line_offset: Option<u64>,
+    /// Segment-aware cursor from a previous page's `next_segment_cursor`, so a
+    /// run's history pages across rotated archives exactly as `/api/logs` does.
+    #[serde(default)]
+    until_segment_cursor: Option<String>,
 }
 
 fn sop_disabled() -> JsonErr {
@@ -195,18 +199,34 @@ pub async fn handle_sop_logs(
         ));
     }
 
+    let segment_cursor = match query.until_segment_cursor.as_deref() {
+        None | Some("") => None,
+        Some(raw) => Some(zeroclaw_log::SegmentCursor::from_wire(raw).ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "invalid until_segment_cursor: value is not a valid segment cursor",
+                })),
+            )
+        })?),
+    };
+
     let filter = zeroclaw_log::LogFilter {
         until_line_offset: query.until_line_offset,
         field_eq: std::collections::BTreeMap::from([("sop_run_id".to_string(), query.run_id)]),
         ..Default::default()
     };
-    let response = crate::api_logs::load_logs_response(&filter, query.limit.unwrap_or(200))
-        .map_err(|err| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": format!("log read failed: {err:#}") })),
-            )
-        })?;
+    let response = crate::api_logs::load_logs_response(
+        &filter,
+        query.limit.unwrap_or(200),
+        segment_cursor.as_ref(),
+    )
+    .map_err(|err| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("log read failed: {err:#}") })),
+        )
+    })?;
     Ok((StatusCode::OK, Json(response)))
 }
 
@@ -264,6 +284,7 @@ fn resolve(
         &config,
         std::sync::Arc::clone(engine),
         state.sop_audit.clone(),
+        state.sop_driver_handles.as_ref(),
         &outcome,
     );
     let (code, label) = broker_outcome_response(&outcome);
@@ -424,7 +445,11 @@ pub(crate) mod tests {
         config.gateway.allow_remote_admin = true;
         let mut state = crate::api::test_state(config);
         state.sop_engine = Some(Arc::new(Mutex::new(engine)));
-        state.pairing = Arc::new(PairingGuard::new(true, &[token.to_string()]));
+        state.pairing = Arc::new(PairingGuard::new(
+            true,
+            &[token.to_string()],
+            zeroclaw_config::pairing::PairingCodePolicy::default(),
+        ));
         (state, run_id)
     }
 
@@ -463,6 +488,7 @@ pub(crate) mod tests {
             std::sync::Arc::new(zeroclaw_runtime::security::pairing::PairingGuard::new(
                 true,
                 &[token.to_string(), other.to_string()],
+                zeroclaw_config::pairing::PairingCodePolicy::default(),
             ));
         let resp = handle_sop_approve(
             State(state_other),
@@ -590,9 +616,12 @@ pub(crate) mod tests {
         // Pairing is now OFF - `is_authenticated` accepts any token, so the SAME
         // token string that legitimately satisfied membership when paired must NOT
         // grant an authenticated identity anymore.
-        state.pairing = std::sync::Arc::new(
-            zeroclaw_runtime::security::pairing::PairingGuard::new(false, &[]),
-        );
+        state.pairing =
+            std::sync::Arc::new(zeroclaw_runtime::security::pairing::PairingGuard::new(
+                false,
+                &[],
+                zeroclaw_config::pairing::PairingCodePolicy::default(),
+            ));
         let loopback: SocketAddr = "127.0.0.1:9".parse().unwrap();
 
         let resp = handle_sop_approve(

@@ -523,6 +523,12 @@ pub struct SopRunsRequest {
     pub sop: Option<String>,
 }
 
+/// Parameters for `sops/run-detail`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SopRunDetailRequest {
+    pub run_id: String,
+}
+
 /// Request payload for `sops/save` and `sops/create`. The `sop` field is the
 /// wire form of the runtime `Sop`; the daemon deserializes and validates it.
 /// `sops/validate` also accepts this form to validate an unsaved draft.
@@ -531,6 +537,18 @@ pub struct SopSaveRequest {
     pub sop: serde_json::Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub original_name: Option<String>,
+}
+
+/// Request payload for `sops/rename`: move the SOP stored under `from` to
+/// `to`. Rename is its own operation rather than a side effect of `sops/save`
+/// because saving persists under the submitted SOP's name, so a name change
+/// smuggled through a save would fork the SOP or overwrite a different one.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SopRenameRequest {
+    /// Name the SOP is stored under today.
+    pub from: String,
+    /// Name to move it to. Must not already be taken.
+    pub to: String,
 }
 
 /// Request payload for `fs.list_dir`.

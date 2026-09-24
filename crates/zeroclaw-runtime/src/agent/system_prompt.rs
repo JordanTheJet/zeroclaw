@@ -12,7 +12,20 @@ use zeroclaw_api::runtime_traits::{POSIX_DELETION_GUIDANCE, ShellProfile};
 pub const BOOTSTRAP_MAX_CHARS: usize = 20_000;
 pub const NO_TOOLS_TASK_FRAMING: &str = "No tools are available for this turn";
 pub const NATIVE_TOOLS_TASK_FRAMING: &str = "Use tools when the request requires action";
-const TRUNCATION_MARKER: &str = "\n\n[System prompt truncated to fit context budget]\n";
+
+/// Model-facing `always_ask` exception under Full autonomy.
+fn full_autonomy_always_ask_prompt_lines(always_ask: &[String]) -> String {
+    if always_ask.iter().any(|tool| tool == "*") {
+        "- `always_ask` is set to `*`, so every tool still requires operator approval, or fails closed when no approver is present.\n".to_string()
+    } else if always_ask.is_empty() {
+        "- No tools are listed in `always_ask`.\n".to_string()
+    } else {
+        format!(
+            "- Tools listed in `always_ask` still require operator approval, or fail closed when no approver is present: {}.\n",
+            always_ask.join(", ")
+        )
+    }
+}
 
 fn load_openclaw_bootstrap_files(
     prompt: &mut String,
@@ -42,6 +55,43 @@ fn load_openclaw_bootstrap_files(
     if inject_memory {
         inject_workspace_file(prompt, workspace_dir, "MEMORY.md", max_chars_per_file);
     }
+}
+
+fn append_project_context(
+    prompt: &mut String,
+    workspace_dir: &std::path::Path,
+    identity_config: Option<&zeroclaw_config::schema::IdentityConfig>,
+    bootstrap_max_chars: Option<usize>,
+    inject_memory: bool,
+) {
+    prompt.push_str("## Project Context\n\n");
+
+    if let Some(config) = identity_config
+        && identity::is_aieos_configured(config)
+    {
+        match identity::load_aieos_identity(config, workspace_dir) {
+            Ok(Some(aieos_identity)) => {
+                let aieos_prompt = identity::aieos_to_system_prompt(&aieos_identity);
+                if !aieos_prompt.is_empty() {
+                    prompt.push_str(&aieos_prompt);
+                    prompt.push_str("\n\n");
+                }
+            }
+            Ok(None) => {
+                let max_chars = bootstrap_max_chars.unwrap_or(BOOTSTRAP_MAX_CHARS);
+                load_openclaw_bootstrap_files(prompt, workspace_dir, max_chars, inject_memory);
+            }
+            Err(e) => {
+                eprintln!("Warning: Failed to load AIEOS identity: {e}. Using OpenClaw format.");
+                let max_chars = bootstrap_max_chars.unwrap_or(BOOTSTRAP_MAX_CHARS);
+                load_openclaw_bootstrap_files(prompt, workspace_dir, max_chars, inject_memory);
+            }
+        }
+        return;
+    }
+
+    let max_chars = bootstrap_max_chars.unwrap_or(BOOTSTRAP_MAX_CHARS);
+    load_openclaw_bootstrap_files(prompt, workspace_dir, max_chars, inject_memory);
 }
 
 /// Build the default system prompt.
@@ -274,9 +324,10 @@ pub fn build_system_prompt_with_mode_and_effective_tools(
 
     // ── 1d. Tool Authorization (Full autonomy) ──────────────────────
     // At Full autonomy the user has explicitly opted into letting the model
-    // act without per-call approval. The generic Safety block alone isn't
-    // enough to overcome model safety-priors that produce simulated
-    // refusal text without ever dispatching a tool call.
+    // act without per-call approval for tools that are not listed in
+    // `always_ask`. The generic Safety block alone isn't enough to overcome
+    // model safety-priors that produce simulated refusal text without ever
+    // dispatching a tool call.
     // Name the power tools the autonomy policy authorizes and tell the model
     // it is authorized to *call/attempt* them (not that they are exempt from
     // policy): command policy, forbidden_commands, forbidden_paths, and OS
@@ -290,13 +341,18 @@ pub fn build_system_prompt_with_mode_and_effective_tools(
         if !power_tools.is_empty() {
             prompt.push_str(
                 "## Tool Authorization\n\n\
-                 The runtime autonomy policy is set to `full`. The user has granted the agent permission to act without per-call approval, so the following tools are registered and authorized to call (to attempt) under Full autonomy: ",
+                 The runtime autonomy policy is set to `full`. Uncovered tools are authorized to call (to attempt) without per-call approval. The following tools are registered under Full autonomy: ",
             );
             prompt.push_str(&power_tools.join(", "));
+            prompt.push_str(".\n");
+            prompt.push_str(&full_autonomy_always_ask_prompt_lines(
+                autonomy_config
+                    .map(|cfg| cfg.always_ask.as_slice())
+                    .unwrap_or(&[]),
+            ));
             prompt.push_str(
-                ".\n\
-                 When the user asks you to run a shell command, write or edit a file, or otherwise act through these tools, CALL the tool directly — do NOT self-refuse with simulated text such as \"blocked by security policy\" or \"restricted in this environment\" merely because the request uses shell or file-write tooling.\n\
-                 Full autonomy removes the approval prompt, not the runtime safeguards: command policy, `forbidden_commands`, `forbidden_paths`, and OS sandboxing still apply, and a call can still return a real tool error. If such an error occurs, it is reported as a tool error in the conversation; only then should you explain what was blocked. Never invent a block that did not happen.\n\n",
+                "When the user asks you to run a shell command, write or edit a file, or otherwise act through these tools, CALL the tool directly unless it is listed in `always_ask` — do NOT self-refuse with simulated text such as \"blocked by security policy\" or \"restricted in this environment\" merely because the request uses shell or file-write tooling.\n\
+                 Full autonomy auto-approves uncovered tools; it does not remove runtime safeguards: command policy, `forbidden_commands`, `forbidden_paths`, and OS sandboxing still apply, and a call can still return a real tool error. If such an error occurs, it is reported as a tool error in the conversation; only then should you explain what was blocked. Never invent a block that did not happen.\n\n",
             );
         }
     }
@@ -350,21 +406,34 @@ pub fn build_system_prompt_with_mode_and_effective_tools(
         POSIX_DELETION_GUIDANCE,
         ShellProfile::safe_deletion_guidance,
     ));
-    prompt.push_str(match autonomy_config.map(|cfg| cfg.level) {
+    match autonomy_config.map(|cfg| cfg.level) {
         Some(crate::security::AutonomyLevel::Full) => {
-            "- Respect the runtime autonomy policy: if a tool or action is allowed, execute it directly instead of asking the user for extra approval.\n\
-             - If a tool or action is blocked by policy or unavailable, explain that concrete restriction instead of simulating an approval dialog.\n"
+            prompt.push_str(
+                "- Respect the runtime autonomy policy: Full auto-approves tools that are not listed in `always_ask`. Execute those directly instead of asking the user for extra approval.\n",
+            );
+            prompt.push_str(&full_autonomy_always_ask_prompt_lines(
+                autonomy_config
+                    .map(|cfg| cfg.always_ask.as_slice())
+                    .unwrap_or(&[]),
+            ));
+            prompt.push_str(
+                "- If a tool or action is blocked by policy or unavailable, explain that concrete restriction instead of simulating an approval dialog.\n",
+            );
         }
         Some(crate::security::AutonomyLevel::ReadOnly) => {
-            "- Respect the runtime autonomy policy: this runtime is read-only for side effects unless a tool explicitly reports otherwise.\n\
-             - If a requested action is blocked by policy, explain the restriction directly instead of simulating an approval dialog.\n"
+            prompt.push_str(
+                "- Respect the runtime autonomy policy: this runtime is read-only for side effects unless a tool explicitly reports otherwise.\n\
+                 - If a requested action is blocked by policy, explain the restriction directly instead of simulating an approval dialog.\n",
+            );
         }
         _ => {
-            "- When in doubt, ask before acting externally.\n\
-             - Respect the runtime autonomy policy: ask for approval only when the current runtime policy actually requires it.\n\
-             - If a tool or action is blocked by policy or unavailable, explain that concrete restriction instead of simulating an approval dialog.\n"
+            prompt.push_str(
+                "- When in doubt, ask before acting externally.\n\
+                 - Respect the runtime autonomy policy: ask for approval only when the current runtime policy actually requires it.\n\
+                 - If a tool or action is blocked by policy or unavailable, explain that concrete restriction instead of simulating an approval dialog.\n",
+            );
         }
-    });
+    }
     prompt.push('\n');
 
     // ── 2b. Shell dialect ───────────────────────────────────────
@@ -383,6 +452,16 @@ pub fn build_system_prompt_with_mode_and_effective_tools(
     }
 
     // ── 3. Skills (full or compact, based on config) ─────────────
+    if compact_context {
+        append_project_context(
+            &mut prompt,
+            workspace_dir,
+            identity_config,
+            bootstrap_max_chars,
+            inject_memory,
+        );
+    }
+
     if !skills.is_empty() {
         prompt.push_str(&crate::skills::skills_to_prompt_with_mode_and_availability(
             skills,
@@ -401,54 +480,14 @@ pub fn build_system_prompt_with_mode_and_effective_tools(
     );
 
     // ── 5. Bootstrap files (injected into context) ──────────────
-    prompt.push_str("## Project Context\n\n");
-
-    // Check if AIEOS identity is configured
-    if let Some(config) = identity_config {
-        if identity::is_aieos_configured(config) {
-            // Load AIEOS identity
-            match identity::load_aieos_identity(config, workspace_dir) {
-                Ok(Some(aieos_identity)) => {
-                    let aieos_prompt = identity::aieos_to_system_prompt(&aieos_identity);
-                    if !aieos_prompt.is_empty() {
-                        prompt.push_str(&aieos_prompt);
-                        prompt.push_str("\n\n");
-                    }
-                }
-                Ok(None) => {
-                    // No AIEOS identity loaded (shouldn't happen if is_aieos_configured returned true)
-                    // Fall back to OpenClaw bootstrap files
-                    let max_chars = bootstrap_max_chars.unwrap_or(BOOTSTRAP_MAX_CHARS);
-                    load_openclaw_bootstrap_files(
-                        &mut prompt,
-                        workspace_dir,
-                        max_chars,
-                        inject_memory,
-                    );
-                }
-                Err(e) => {
-                    // Log error but don't fail - fall back to OpenClaw
-                    eprintln!(
-                        "Warning: Failed to load AIEOS identity: {e}. Using OpenClaw format."
-                    );
-                    let max_chars = bootstrap_max_chars.unwrap_or(BOOTSTRAP_MAX_CHARS);
-                    load_openclaw_bootstrap_files(
-                        &mut prompt,
-                        workspace_dir,
-                        max_chars,
-                        inject_memory,
-                    );
-                }
-            }
-        } else {
-            // OpenClaw format
-            let max_chars = bootstrap_max_chars.unwrap_or(BOOTSTRAP_MAX_CHARS);
-            load_openclaw_bootstrap_files(&mut prompt, workspace_dir, max_chars, inject_memory);
-        }
-    } else {
-        // No identity config - use OpenClaw format
-        let max_chars = bootstrap_max_chars.unwrap_or(BOOTSTRAP_MAX_CHARS);
-        load_openclaw_bootstrap_files(&mut prompt, workspace_dir, max_chars, inject_memory);
+    if !compact_context {
+        append_project_context(
+            &mut prompt,
+            workspace_dir,
+            identity_config,
+            bootstrap_max_chars,
+            inject_memory,
+        );
     }
 
     // ── 6. Date ─────────────────────────────────────────────────
@@ -527,36 +566,7 @@ pub fn build_system_prompt_with_mode_and_effective_tools(
     // truncation rather than left in the truncatable tail.
     append_timestamp_orientation(&mut prompt);
 
-    // ── 9. Truncation (max_system_prompt_chars budget) ──────────
-    if max_system_prompt_chars > 0 && prompt.len() > max_system_prompt_chars {
-        // The orientation is runtime-critical, so it must land inside the
-        // budget. Reserve room for the orientation (and the truncation
-        // marker) at the head-retained portion, then re-append it so it
-        // always survives even when the assembled prompt overflows.
-        let reserved = TIMESTAMP_ORIENTATION.len() + TRUNCATION_MARKER.len();
-        if max_system_prompt_chars >= reserved {
-            // Keep the top portion (identity + safety) minus the reserved tail.
-            let mut end = max_system_prompt_chars - reserved;
-            // Ensure we don't split a multi-byte UTF-8 character.
-            while end > 0 && !prompt.is_char_boundary(end) {
-                end -= 1;
-            }
-            prompt.truncate(end);
-            prompt.push_str(TRUNCATION_MARKER);
-            append_timestamp_orientation(&mut prompt);
-        } else {
-            // When the budget cannot hold both retained content and the
-            // critical tail, prioritize as much of the orientation as fits.
-            // This preserves the full orientation whenever possible without
-            // violating the configured prompt ceiling for very small budgets.
-            let mut end = max_system_prompt_chars.min(TIMESTAMP_ORIENTATION.len());
-            while end > 0 && !TIMESTAMP_ORIENTATION.is_char_boundary(end) {
-                end -= 1;
-            }
-            prompt.clear();
-            prompt.push_str(&TIMESTAMP_ORIENTATION[..end]);
-        }
-    }
+    prompt = finalize_system_prompt(prompt, max_system_prompt_chars);
 
     if prompt.is_empty() {
         "You are ZeroClaw, a fast and efficient AI assistant built in Rust. Be helpful, concise, and direct."
@@ -564,6 +574,39 @@ pub fn build_system_prompt_with_mode_and_effective_tools(
     } else {
         prompt
     }
+}
+
+/// Apply the final model-visible prompt budget in Unicode scalar values.
+pub fn finalize_system_prompt(mut prompt: String, max_chars: usize) -> String {
+    if max_chars > 0 && prompt.chars().count() > max_chars {
+        // The orientation is runtime-critical, so it must land inside the
+        // budget. Reserve room at the head-retained portion, then re-append it
+        // so it always survives even when the assembled prompt overflows.
+        let orientation_chars = TIMESTAMP_ORIENTATION.chars().count();
+        if max_chars >= orientation_chars {
+            // Keep the top portion (identity + safety) minus the required tail.
+            let end = max_chars - orientation_chars;
+            let byte_end = prompt
+                .char_indices()
+                .nth(end)
+                .map_or(prompt.len(), |(index, _)| index);
+            prompt.truncate(byte_end);
+            append_timestamp_orientation(&mut prompt);
+        } else {
+            // When the budget cannot hold both retained content and the
+            // critical tail, prioritize as much of the orientation as fits.
+            // This preserves the full orientation whenever possible without
+            // violating the configured prompt ceiling for very small budgets.
+            let end = max_chars.min(TIMESTAMP_ORIENTATION.chars().count());
+            let byte_end = TIMESTAMP_ORIENTATION
+                .char_indices()
+                .nth(end)
+                .map_or(TIMESTAMP_ORIENTATION.len(), |(index, _)| index);
+            prompt.clear();
+            prompt.push_str(&TIMESTAMP_ORIENTATION[..byte_end]);
+        }
+    }
+    prompt
 }
 
 /// Render only the skills section against an assembled effective tool surface.
@@ -985,9 +1028,18 @@ mod tests {
     }
 
     fn build_with_autonomy(tools: &[(&str, &str)], level: AutonomyLevel) -> String {
+        build_with_profile(tools, level, &[])
+    }
+
+    fn build_with_profile(
+        tools: &[(&str, &str)],
+        level: AutonomyLevel,
+        always_ask: &[&str],
+    ) -> String {
         let workspace = tempfile::TempDir::new().expect("tempdir");
         let autonomy = zeroclaw_config::schema::RiskProfileConfig {
             level,
+            always_ask: always_ask.iter().map(|tool| (*tool).to_string()).collect(),
             ..Default::default()
         };
         build_system_prompt_with_mode_and_autonomy(
@@ -1037,8 +1089,10 @@ mod tests {
     fn full_autonomy_authorization_is_attempt_scoped_not_unconditional() {
         // Regression guard: the Full-autonomy block must authorize the model to
         // *attempt* the registered tools without self-refusing, but must NOT
-        // claim the tools are exempt from security policy. Full autonomy removes
-        // the approval prompt, not forbidden_commands/forbidden_paths/sandbox.
+        // claim the tools are exempt from security policy. Full autonomy
+        // auto-approves uncovered tools; it does not remove
+        // forbidden_commands/forbidden_paths/sandbox, and `always_ask` still
+        // prompts.
         let tools = [
             ("shell", "Run a shell command"),
             ("file_write", "Write a file"),
@@ -1073,6 +1127,10 @@ mod tests {
             !auth.contains("NOT blocked by any security policy")
                 && !auth.contains("not blocked by any security policy"),
             "block must not claim the tools are exempt from all security policy"
+        );
+        assert!(
+            !auth.contains("Full autonomy removes the approval prompt"),
+            "block must not claim Full unconditionally removes approval prompts"
         );
     }
 
@@ -1147,10 +1205,10 @@ mod tests {
             let budget = 600;
             let prompt = prompt_with_finite_budget(compact, budget, &tools);
 
-            // Truncation must actually have fired (otherwise the test proves
-            // nothing about the retained-budget guarantee).
+            // Hitting the exact ceiling proves truncation ran without adding
+            // model-visible implementation metadata.
             assert!(
-                prompt.contains("[System prompt truncated to fit context budget]"),
+                prompt.chars().count() == budget && !prompt.contains("System prompt truncated"),
                 "compact={compact}: expected truncation to fire at budget {budget}; prompt was:\n{prompt}"
             );
             // The runtime-owned orientation must survive inside the budget.
@@ -1159,9 +1217,9 @@ mod tests {
                 "compact={compact}: timestamp orientation must survive finite-budget truncation; prompt was:\n{prompt}"
             );
             assert!(
-                prompt.len() <= budget,
+                prompt.chars().count() <= budget,
                 "compact={compact}: prompt length {} exceeded budget {budget}",
-                prompt.len()
+                prompt.chars().count()
             );
         }
     }
@@ -1172,24 +1230,24 @@ mod tests {
             "shell",
             "Run a shell command with enough description to overflow",
         )];
-        let reserved = TIMESTAMP_ORIENTATION.len() + TRUNCATION_MARKER.len();
+        let reserved = TIMESTAMP_ORIENTATION.chars().count();
 
         for compact in [false, true] {
             for budget in [
                 1,
-                TIMESTAMP_ORIENTATION.len() - 1,
-                TIMESTAMP_ORIENTATION.len(),
+                TIMESTAMP_ORIENTATION.chars().count() - 1,
+                TIMESTAMP_ORIENTATION.chars().count(),
                 reserved - 1,
                 reserved,
             ] {
                 let prompt = prompt_with_finite_budget(compact, budget, &tools);
                 assert!(
-                    prompt.len() <= budget,
+                    prompt.chars().count() <= budget,
                     "compact={compact}: prompt length {} exceeded budget {budget}",
-                    prompt.len()
+                    prompt.chars().count()
                 );
 
-                if budget >= TIMESTAMP_ORIENTATION.len() {
+                if budget >= TIMESTAMP_ORIENTATION.chars().count() {
                     assert!(
                         prompt.ends_with(TIMESTAMP_ORIENTATION),
                         "compact={compact}: full orientation must survive budget {budget}: {prompt}"
@@ -1202,6 +1260,147 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn final_prompt_budget_counts_unicode_scalars_and_honors_exact_limit() {
+        let reserved = TIMESTAMP_ORIENTATION.chars().count();
+        let max_chars = reserved + 40;
+        let retained = "界".repeat(max_chars - reserved);
+        let prompt = format!("{}TAIL", "界".repeat(400));
+        let finalized = super::finalize_system_prompt(prompt, max_chars);
+
+        assert_eq!(finalized.chars().count(), max_chars);
+        assert!(finalized.starts_with(&retained));
+        assert!(!finalized.contains("System prompt truncated"));
+        assert!(finalized.ends_with(TIMESTAMP_ORIENTATION));
+        assert!(!finalized.contains("TAIL"));
+    }
+
+    #[test]
+    fn compact_prompt_prioritizes_bootstrap_before_skills_and_runtime_metadata() {
+        let workspace = tempfile::TempDir::new().expect("tempdir");
+        std::fs::write(
+            workspace.path().join("AGENTS.md"),
+            "BOOTSTRAP_CONTRACT_REQUIRED",
+        )
+        .expect("write AGENTS.md");
+        let skills = vec![Skill {
+            name: "lower-priority".into(),
+            description: "LOW_PRIORITY_SKILL_METADATA".into(),
+            description_localizations: Default::default(),
+            version: "1.0.0".into(),
+            author: None,
+            tags: Vec::new(),
+            tools: Vec::new(),
+            prompts: Vec::new(),
+            slash_options: Vec::new(),
+            always: false,
+            location: None,
+        }];
+
+        let prompt = build_system_prompt_with_mode_and_autonomy(
+            workspace.path(),
+            "local-model",
+            &[("read_skill", "Load skill instructions by name")],
+            &skills,
+            None,
+            Some(8_000),
+            Some(&zeroclaw_config::schema::RiskProfileConfig::default()),
+            false,
+            SkillsPromptInjectionMode::Compact,
+            true,
+            0,
+            true,
+            false,
+            None,
+        );
+
+        let safety = prompt.find("## Safety").expect("safety framing");
+        let project = prompt.find("## Project Context").expect("project context");
+        let bootstrap = prompt
+            .find("BOOTSTRAP_CONTRACT_REQUIRED")
+            .expect("bootstrap contract");
+        let skills = prompt.find("## Available Skills").expect("skill metadata");
+        let workspace = prompt.find("## Workspace").expect("workspace metadata");
+        let runtime = prompt.find("## Runtime").expect("runtime metadata");
+
+        assert!(safety < project);
+        assert!(project < bootstrap);
+        assert!(bootstrap < skills);
+        assert!(skills < workspace);
+        assert!(workspace < runtime);
+    }
+
+    #[test]
+    fn compact_full_assembly_enforces_unicode_budget_after_all_builder_sections() {
+        let workspace = tempfile::TempDir::new().expect("tempdir");
+        std::fs::write(
+            workspace.path().join("AGENTS.md"),
+            format!("BOOTSTRAP_CONTRACT_REQUIRED\n{}", "界".repeat(7_000)),
+        )
+        .expect("write AGENTS.md");
+        let skills = vec![Skill {
+            name: "lower-priority".into(),
+            description: "LOW_PRIORITY_SKILL_METADATA".into(),
+            description_localizations: Default::default(),
+            version: "1.0.0".into(),
+            author: None,
+            tags: Vec::new(),
+            tools: Vec::new(),
+            prompts: Vec::new(),
+            slash_options: Vec::new(),
+            always: false,
+            location: None,
+        }];
+
+        let prompt = build_system_prompt_with_mode_and_autonomy(
+            workspace.path(),
+            "local-model",
+            &[("read_skill", "Load skill instructions by name")],
+            &skills,
+            None,
+            Some(8_000),
+            Some(&zeroclaw_config::schema::RiskProfileConfig::default()),
+            false,
+            SkillsPromptInjectionMode::Compact,
+            true,
+            8_000,
+            true,
+            false,
+            None,
+        );
+
+        assert_eq!(prompt.chars().count(), 8_000);
+        assert!(prompt.contains("## Safety"));
+        assert!(prompt.contains("BOOTSTRAP_CONTRACT_REQUIRED"));
+        assert!(!prompt.contains("System prompt truncated"));
+        assert!(prompt.ends_with(TIMESTAMP_ORIENTATION));
+        assert!(!prompt.contains("LOW_PRIORITY_SKILL_METADATA"));
+    }
+
+    #[test]
+    fn final_prompt_budget_preserves_orientation_priority_at_boundaries() {
+        let oversized = "界".repeat(400);
+        let orientation_chars = TIMESTAMP_ORIENTATION.chars().count();
+        let reserved = orientation_chars;
+
+        assert_eq!(
+            super::finalize_system_prompt(oversized.clone(), reserved - 1),
+            TIMESTAMP_ORIENTATION
+                .chars()
+                .take(reserved - 1)
+                .collect::<String>()
+        );
+        assert_eq!(
+            super::finalize_system_prompt(oversized.clone(), orientation_chars),
+            TIMESTAMP_ORIENTATION
+        );
+        assert_eq!(
+            super::finalize_system_prompt(oversized, 3),
+            TIMESTAMP_ORIENTATION.chars().take(3).collect::<String>()
+        );
+        assert_eq!(super::finalize_system_prompt("界TAIL".into(), 0), "界TAIL");
     }
 
     #[test]
@@ -1243,6 +1442,42 @@ mod tests {
         assert!(
             !prompt.contains("## Tool Authorization"),
             "Tool Authorization should be skipped when no power tools (shell/file_write/file_edit) are registered"
+        );
+    }
+
+    #[test]
+    fn full_autonomy_prompt_names_exact_always_ask_exception() {
+        let tools = [("shell", "Run a shell command")];
+        let prompt = build_with_profile(&tools, AutonomyLevel::Full, &["shell"]);
+        assert!(
+            prompt.contains("always_ask"),
+            "Full prompt must mention the always_ask exception"
+        );
+        assert!(
+            prompt.contains("shell"),
+            "exact always_ask entry must be named"
+        );
+        assert!(
+            !prompt.contains("Full autonomy removes the approval prompt"),
+            "must not claim Full unconditionally removes prompts"
+        );
+        assert!(
+            prompt.contains("fail closed") || prompt.contains("fails closed"),
+            "must describe fail-closed behavior when no approver is present"
+        );
+    }
+
+    #[test]
+    fn full_autonomy_prompt_names_wildcard_always_ask_exception() {
+        let tools = [("shell", "Run a shell command")];
+        let prompt = build_with_profile(&tools, AutonomyLevel::Full, &["*"]);
+        assert!(
+            prompt.contains("`always_ask` is set to `*`"),
+            "wildcard always_ask must be described as covering every tool"
+        );
+        assert!(
+            !prompt.contains("Full autonomy removes the approval prompt"),
+            "must not claim Full unconditionally removes prompts"
         );
     }
 }
