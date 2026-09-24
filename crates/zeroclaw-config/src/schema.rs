@@ -25317,10 +25317,14 @@ impl Config {
     /// running it can already edit the config file directly, so creating a
     /// row there adds no authority; a plugin with no config row otherwise has
     /// no command that can create one, and `plugin list` needs a repair it can
-    /// print. The remote config APIs (the gateway's HTTP set and patch, the
-    /// RPC set) keep [`Self::ensure_map_key_for_path`], so they still cannot
-    /// create a list row: over those paths a new `plugins.entries` row carrying
-    /// `egress_hosts` would grant network reach remotely.
+    /// print. The remote property-path APIs (the gateway's HTTP set and
+    /// patch, the RPC set) keep [`Self::ensure_map_key_for_path`], so this
+    /// change does not let them create a list row as a side effect of setting
+    /// a field. It is not a remote boundary for plugin grants: the explicit
+    /// map-key create (`POST /api/config/map-key`, RPC `ConfigMapKeyCreate`)
+    /// could already create a `plugins.entries` row, and property set can
+    /// already write `egress_hosts` on an existing row, both behind the
+    /// gateway's authentication.
     ///
     /// The same guarantees apply: an existing entry is left alone, and a new
     /// entry whose trailing field does not resolve is rolled back.

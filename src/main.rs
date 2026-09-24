@@ -3778,7 +3778,7 @@ fn existing_egress_grant_lines(
     // Called only for rows the install just found, so the row exists.
     let state = EgressGrantState::Enforced {
         granted: granted.clone(),
-        allow_private,
+        allow_private: allow_private.clone(),
         row_exists: true,
     };
     let plan = plan_egress_gap(
@@ -3859,10 +3859,68 @@ fn existing_egress_grant_lines(
         ));
     }
 
+    // A manifest with no `[egress]` table stays quiet about operator-authored
+    // grants (see `should_report_diff`), but the row survives `plugin remove`
+    // and is keyed by package name alone, so a reinstalled package, possibly
+    // from another publisher, inherits whatever it grants. Say so once, here,
+    // where the package takes that reach over.
+    if declared_egress.is_empty()
+        && let Some(grants) = egress_grant_summary(&granted, &allow_private)
+    {
+        lines.push(ta(
+            "cli-plugin-egress-inherited",
+            &[
+                ("name", package),
+                ("grants", &grants),
+                ("key", instance_key),
+            ],
+            "This plugin declares no egress but inherits its existing config entry's grant.",
+        ));
+    }
+
     if let Some(reason) = &repair_incomplete {
         lines.push(egress_repair_incomplete_line(package, reason, instance_key));
     }
     lines
+}
+
+/// What an instance row grants, for the lines that warn a grant outlives or
+/// is inherited by a package: its hosts, then its private carve-outs. `None`
+/// when the row grants nothing.
+#[cfg(feature = "plugins-wasm")]
+fn egress_grant_summary(granted: &[String], allow_private: &[String]) -> Option<String> {
+    let mut parts = Vec::new();
+    if !granted.is_empty() {
+        parts.push(granted.join(", "));
+    }
+    if !allow_private.is_empty() {
+        parts.push(format!("private: {}", allow_private.join(", ")));
+    }
+    (!parts.is_empty()).then(|| parts.join("; "))
+}
+
+/// The lines `plugin remove` prints for the package's config rows that keep an
+/// egress grant. `plugin remove` deletes the package, not its configuration,
+/// and a package installed later under the same name inherits these rows.
+#[cfg(feature = "plugins-wasm")]
+fn removed_plugin_kept_grant_lines(
+    config: &crate::config::schema::Config,
+    package: &str,
+    instance_keys: &[String],
+) -> Vec<String> {
+    instance_keys
+        .iter()
+        .filter_map(|key| {
+            let (granted, allow_private) = config.plugins.entry_egress(key);
+            egress_grant_summary(&granted, &allow_private).map(|grants| {
+                ta(
+                    "cli-plugin-removed-grant-kept",
+                    &[("name", package), ("key", key), ("grants", &grants)],
+                    "The plugin's config entry keeps its egress grant.",
+                )
+            })
+        })
+        .collect()
 }
 
 /// The one line both surfaces print when the runtime refuses a canonical row:
@@ -9708,11 +9766,19 @@ Add pricing to the active provider profile or supply a catalog entry."
             }
             PluginCommands::Remove { name } => {
                 let mut host = plugin_host_with_configured_security(&config)?;
+                #[cfg(feature = "plugins-wasm")]
+                let instance_keys: Vec<String> = installed_plugin_config_entries(&host, &name)
+                    .map(|entries| entries.into_iter().map(|(_, key)| key).collect())
+                    .unwrap_or_default();
                 host.remove(&name)?;
                 println!(
                     "{}",
                     ta("cli-plugin-removed", &[("name", &name)], "Plugin removed")
                 );
+                #[cfg(feature = "plugins-wasm")]
+                for line in removed_plugin_kept_grant_lines(&config, &name, &instance_keys) {
+                    println!("{line}");
+                }
                 Ok(())
             }
             PluginCommands::Info { name } => {
@@ -16391,6 +16457,55 @@ type = "string"
     /// per-plugin report must stay silent, and the deployment line must name
     /// the responsible paths, once. Once the deployment is fixed, the real gap
     /// is reported as usual.
+    /// A row outlives `plugin remove` and is keyed by package name alone, so a
+    /// package reinstalled under the name, which may come from another
+    /// publisher and declare nothing, inherits the old grant. Install must say
+    /// so, private carve-outs included, and `remove` must say the grant stays.
+    #[test]
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    fn an_undeclaring_reinstall_is_told_it_inherits_the_existing_grant() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let mut config = config_in_dir(tmp.path());
+        let manifest = tool_manifest("weather-tool", &[], true);
+        let instance_key = expected_instance_key(&manifest);
+        config.plugins.entries = vec![crate::config::schema::PluginEntryConfig {
+            name: instance_key.clone(),
+            config: std::collections::HashMap::new(),
+            egress_hosts: vec!["api.example.com".to_string(), "10.0.0.5".to_string()],
+            egress_allow_private: vec!["10.0.0.5".to_string()],
+        }];
+
+        let install = existing_egress_grant_lines(&config, "weather-tool", &instance_key, &[]);
+        assert_eq!(install.len(), 1, "{install:?}");
+        assert!(
+            install[0].contains("declares no egress")
+                && install[0].contains("api.example.com, 10.0.0.5; private: 10.0.0.5")
+                && install[0].contains(&instance_key),
+            "{install:?}"
+        );
+
+        let removed = removed_plugin_kept_grant_lines(
+            &config,
+            "weather-tool",
+            std::slice::from_ref(&instance_key),
+        );
+        assert_eq!(removed.len(), 1, "{removed:?}");
+        assert!(
+            removed[0].contains(&instance_key) && removed[0].contains("private: 10.0.0.5"),
+            "{removed:?}"
+        );
+
+        // A row that grants nothing has nothing to inherit or keep.
+        config.plugins.entries[0].egress_hosts.clear();
+        config.plugins.entries[0].egress_allow_private.clear();
+        assert!(
+            existing_egress_grant_lines(&config, "weather-tool", &instance_key, &[]).is_empty()
+        );
+        assert!(
+            removed_plugin_kept_grant_lines(&config, "weather-tool", &[instance_key]).is_empty()
+        );
+    }
+
     #[test]
     #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
     fn a_deployment_wide_refusal_is_reported_once_with_its_own_paths_not_as_a_row_repair() {
