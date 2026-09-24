@@ -494,13 +494,23 @@ impl Drop for StateEnvelope {
 fn open_database(path: &Path) -> Result<Connection, PluginStateError> {
     let parent = path.parent().ok_or(PluginStateError::Unavailable)?;
     std::fs::create_dir_all(parent).map_err(|_| PluginStateError::Unavailable)?;
-    let connection = Connection::open(path).map_err(|_| PluginStateError::Unavailable)?;
+    // Create the file owner-only before SQLite opens it, so it never exists
+    // with umask permissions. SQLite gives the `-wal` and `-shm` files the
+    // main file's mode, and the chmod below tightens a file created earlier.
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt as _;
+        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(path)
+            .map_err(|_| PluginStateError::Unavailable)?;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
             .map_err(|_| PluginStateError::Unavailable)?;
     }
+    let connection = Connection::open(path).map_err(|_| PluginStateError::Unavailable)?;
     connection
         .execute_batch(
             "PRAGMA journal_mode = WAL;
@@ -692,6 +702,17 @@ mod tests {
                         .any(|window| window == forbidden),
                     "database or journal exposed logical plugin state"
                 );
+            }
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            for path in std::fs::read_dir(root.path().join("data"))
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+            {
+                let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+                assert_eq!(mode, 0o600, "{} is not owner-only", path.display());
             }
         }
         let connection = Connection::open(&first.db_path).unwrap();
