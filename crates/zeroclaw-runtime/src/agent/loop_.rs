@@ -259,6 +259,35 @@ fn glob_match(pattern: &str, name: &str) -> bool {
     }
 }
 
+/// The approval manager an `agent::run` turn enforces, if any.
+///
+/// An interactive run prompts the operator through the CLI. A headless SOP step
+/// turn has nobody to prompt, and it is the non-interactive run this entry point
+/// executes on an unattended trigger: cron, channel ingress, an approval
+/// resume. With no manager at all the approval gate reads every tool as not
+/// requiring approval, so a tool the owning agent's risk profile lists in
+/// `always_ask` ran unattended on exactly that surface. A headless step
+/// therefore gets the fail-closed non-interactive manager built from the owning
+/// agent's own profile: that policy still applies in full, and anything it would
+/// put in front of a person is denied because no person can answer. This is
+/// the same manager channel-driven turns already run under.
+///
+/// Other non-interactive callers keep their existing behavior; this only closes
+/// the unattended SOP step surface.
+fn run_approval_manager(
+    interactive: bool,
+    headless_sop_step: bool,
+    risk_profile: &zeroclaw_config::schema::RiskProfileConfig,
+) -> Option<ApprovalManager> {
+    if interactive {
+        Some(ApprovalManager::from_risk_profile(risk_profile))
+    } else if headless_sop_step {
+        Some(ApprovalManager::for_non_interactive(risk_profile))
+    } else {
+        None
+    }
+}
+
 pub fn apply_policy_tool_filter(
     tools: &mut Vec<Box<dyn Tool>>,
     policy: Option<&zeroclaw_config::policy::SecurityPolicy>,
@@ -1809,11 +1838,8 @@ pub async fn run(
         )?;
 
         // ── Approval manager (supervised mode) ───────────────────────
-        let approval_manager = if interactive {
-            Some(ApprovalManager::from_risk_profile(&risk_profile))
-        } else {
-            None
-        };
+        let approval_manager =
+            run_approval_manager(interactive, sop_step_scope.is_some(), &risk_profile);
         let memory_session_id = session_state_file.as_deref().and_then(|path| {
             let raw = path.to_string_lossy().trim().to_string();
             if raw.is_empty() {
@@ -5206,6 +5232,119 @@ mod tests {
         fn alias(&self) -> &str {
             "RouteAwareStreamingModelProvider"
         }
+    }
+
+    /// A headless SOP step runs non-interactively on an unattended trigger. It
+    /// must still enforce the owning agent's approval policy: a tool that policy
+    /// lists in `always_ask` is denied before its implementation runs, because
+    /// no operator can answer the prompt. Full autonomy isolates the rule under
+    /// test, so the only thing that can stop the guarded tool is `always_ask`,
+    /// and an unguarded tool in the same turn still runs.
+    #[tokio::test]
+    async fn a_headless_sop_step_denies_an_always_ask_tool_before_it_runs() {
+        let profile = zeroclaw_config::schema::RiskProfileConfig {
+            level: zeroclaw_config::policy::AutonomyLevel::Full,
+            always_ask: vec!["guarded_write".to_string()],
+            ..zeroclaw_config::schema::RiskProfileConfig::default()
+        };
+        assert!(
+            run_approval_manager(false, false, &profile).is_none(),
+            "ordinary non-interactive runs keep their existing behavior"
+        );
+        let manager = run_approval_manager(false, true, &profile)
+            .expect("a headless SOP step turn must carry an approval manager");
+        assert!(
+            manager.is_non_interactive(),
+            "a headless step has nobody to prompt, so its manager must fail closed"
+        );
+
+        let turn_id = uuid::Uuid::new_v4().to_string();
+        let model_provider = ScriptedModelProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"guarded_write","arguments":{"value":"x"}}
+</tool_call>"#,
+            r#"<tool_call>
+{"name":"plain_read","arguments":{"value":"y"}}
+</tool_call>"#,
+            "done",
+        ]);
+        let guarded = Arc::new(AtomicUsize::new(0));
+        let plain = Arc::new(AtomicUsize::new(0));
+        let tools_registry = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![
+            Box::new(CountingTool::new("guarded_write", Arc::clone(&guarded))),
+            Box::new(CountingTool::new("plain_read", Arc::clone(&plain))),
+        ]);
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("run the step"),
+        ];
+        let observer = NoopObserver;
+
+        run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            served_route_sink: None,
+            sop_reassembly: None,
+            exec: ResolvedAgentExecution {
+                model_access: ResolvedModelAccess {
+                    model_provider: &model_provider,
+                    provider_name: "mock-provider",
+                    model: "mock-model",
+                    dispatch_model: "mock-model",
+                    temperature: Some(0.0),
+                },
+                tools_registry: &tools_registry,
+                observer: &observer,
+                silent: true,
+                approval: Some(&manager),
+                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
+                max_tool_iterations: 4,
+                hooks: None,
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                activated_tools: None,
+                model_switch_callback: None,
+                pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                strict_tool_parsing: false,
+                parallel_tools: false,
+                max_tool_result_chars: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
+                receipt_generator: None,
+                knobs: &LoopKnobs::default(),
+            },
+            history: &mut history,
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
+            channel_name: "sop",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            shared_budget: None,
+            channel: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            image_cache: None,
+            memory: None,
+            ingress: IngressContext::sub_turn(),
+            agent_alias: None,
+            turn_id: &turn_id,
+        })
+        .await
+        .expect("the turn completes with the guarded tool denied");
+
+        assert_eq!(
+            guarded.load(Ordering::SeqCst),
+            0,
+            "an always_ask tool must be denied before its implementation executes"
+        );
+        assert_eq!(
+            plain.load(Ordering::SeqCst),
+            1,
+            "a tool the policy does not guard still runs under the fail-closed manager"
+        );
     }
 
     struct CountingTool {
