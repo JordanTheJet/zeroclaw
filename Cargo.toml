@@ -146,7 +146,7 @@ hex = "0.4"
 async-trait = "0.1"
 
 # Memory / persistence (migration.rs, behind agent-runtime)
-rusqlite = { version = "0.37", features = ["bundled"], optional = true }
+rusqlite = { version = "0.40", features = ["bundled", "fallible_uint"], optional = true }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 
 # Interactive CLI prompts (memory CLI uses dialoguer unconditionally)
