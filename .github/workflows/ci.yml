@@ -151,11 +151,17 @@ jobs:
       - name: Test release version preparation failures
         run: python3 scripts/release/bump-version.test.py
 
+      - name: Test early Apple release credential validation
+        run: python3 scripts/release/apple_preflight_test.py
+
       - name: Test monthly outdated result classification
         run: bash scripts/ci/monthly_outdated_result.test.sh
 
       - name: Test release tool installer mappings
         run: bash scripts/ci/install_release_tool.test.sh
+
+      - name: Test crates.io publish ordering and preflight
+        run: python3 scripts/release/publish_crates_test.py
 
       - name: Test apt install timeout and retry behavior
         run: bash scripts/ci/apt_install.test.sh
@@ -170,6 +176,9 @@ jobs:
 
       - name: Test release announcement composer
         run: bash scripts/ci/release_post_text.test.sh
+
+      - name: Test docs stable metadata promotion
+        run: python3 scripts/docs/promote_stable_test.py
 
   relay-container-smoke-changes:
     name: Detect Relay Container Smoke changes
