@@ -44,6 +44,10 @@ const NONCE_LEN: usize = 12;
 /// can never collide with another use of the install key.
 const KEYED_DIGEST_DOMAIN: &[u8] = b"zeroclaw.secret-store.keyed-digest.v1\0";
 
+/// HKDF `info` for the blind-index subkey. The install key encrypts with
+/// ChaCha20-Poly1305; digests use a key derived from it, never the key itself.
+const KEYED_DIGEST_SUBKEY_INFO: &[u8] = b"zeroclaw.secret-store.keyed-digest-subkey.v1";
+
 const ONEPASSWORD_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Maps a backend to its provisioning lifecycle.
@@ -434,12 +438,24 @@ impl SecretStore {
 }
 
 fn keyed_digest_with_key(key: &[u8], domain: &[u8], data: &[u8]) -> Result<[u8; 32]> {
-    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key)
+    let subkey = keyed_digest_subkey(key)?;
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&subkey)
         .map_err(|_| anyhow::Error::msg("Secret key file is corrupt"))?;
     mac.update(KEYED_DIGEST_DOMAIN);
     mac.update(&(domain.len() as u64).to_be_bytes());
     mac.update(domain);
     mac.update(data);
+    Ok(mac.finalize().into_bytes().into())
+}
+
+/// One-block HKDF-Expand (RFC 5869) of the install key. The key is already
+/// 32 uniformly random bytes, so it serves as the pseudorandom key directly
+/// and the Extract step is skipped, as RFC 5869 section 3.3 permits.
+fn keyed_digest_subkey(key: &[u8]) -> Result<[u8; 32]> {
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key)
+        .map_err(|_| anyhow::Error::msg("Secret key file is corrupt"))?;
+    mac.update(KEYED_DIGEST_SUBKEY_INFO);
+    mac.update(&[1]);
     Ok(mac.finalize().into_bytes().into())
 }
 
@@ -1239,6 +1255,20 @@ mod tests {
             first,
             "blind-index derivation is independent of the plaintext preference"
         );
+    }
+
+    #[test]
+    fn keyed_digests_use_a_derived_subkey_not_the_install_key() {
+        let key = [7_u8; 32];
+        let digest = keyed_digest_with_key(&key, b"owner", b"value").unwrap();
+        let mut raw = <Hmac<Sha256> as Mac>::new_from_slice(&key).unwrap();
+        raw.update(KEYED_DIGEST_DOMAIN);
+        raw.update(&5_u64.to_be_bytes());
+        raw.update(b"owner");
+        raw.update(b"value");
+        let raw: [u8; 32] = raw.finalize().into_bytes().into();
+        assert_ne!(digest, raw, "the AEAD key must not also key the HMAC");
+        assert_ne!(keyed_digest_subkey(&key).unwrap(), key);
     }
 
     #[test]
