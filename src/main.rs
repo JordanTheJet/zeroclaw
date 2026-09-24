@@ -3461,12 +3461,25 @@ fn installed_plugin_config_entries(
 /// An unknown plugin and a plugin that declares nothing give the same answer —
 /// an empty list — because "declares nothing" is the same state as "no
 /// `[egress]` table".
+///
+/// A declaration also counts only with a transport that can use it:
+/// `http_client`, the one the host governs today. Without it the declared
+/// hosts are not seeded, because a row persists across `plugin remove`, and a
+/// grant seeded for a version that could not reach the network would silently
+/// become live reach when a later version of the same package adds
+/// `http_client`. That later install then meets an existing row, which is
+/// never extended, so the operator grants it deliberately. `plugin list`
+/// applies the same rule.
 #[cfg(feature = "plugins-wasm")]
 fn declared_egress_hosts(
     host: &zeroclaw::plugins::host::PluginHost,
     plugin_name: &str,
 ) -> Vec<String> {
     host.manifest(plugin_name)
+        .filter(|m| {
+            m.permissions
+                .contains(&zeroclaw::plugins::PluginPermission::HttpClient)
+        })
         .map(|m| m.egress.hosts.clone())
         .unwrap_or_default()
 }
@@ -16073,6 +16086,92 @@ mod tests {
             .expect("the operator must be able to author the grant on the seeded row");
         let (granted, _private) = config.plugins.entry_egress(&instance_key);
         assert_eq!(granted, vec!["gitea.internal.example.com".to_string()]);
+    }
+
+    /// A declaration without a transport never becomes a grant, including
+    /// after a later version adds one. Version 1 declares a host but asks for
+    /// no network permission: install creates its row (the declaration makes
+    /// it host state) and leaves the grant empty. `plugin remove` keeps the
+    /// row, so version 2, which adds `http_client` with the same declaration,
+    /// meets an existing row, and an existing row is never extended. The host
+    /// stays ungranted until the operator grants it.
+    #[tokio::test]
+    #[cfg(feature = "plugins-wasm")]
+    async fn a_transportless_declaration_does_not_become_reach_when_a_later_version_adds_http() {
+        use zeroclaw::plugins::host::PluginHost;
+
+        let write_source = |permissions: &str| {
+            let manifest_toml = format!(
+                "name = \"dormant-tool\"\n\
+                 version = \"1.0.0\"\n\
+                 wasm_path = \"plugin.wasm\"\n\
+                 capabilities = [\"tool\"]\n\
+                 permissions = [{permissions}]\n\
+                 [egress]\n\
+                 hosts = [\"api.example.com\"]\n"
+            );
+            let source = tempfile::tempdir().expect("source dir");
+            std::fs::write(source.path().join("manifest.toml"), &manifest_toml)
+                .expect("write manifest");
+            std::fs::write(source.path().join("plugin.wasm"), b"\0asm").expect("write wasm");
+            (source, manifest_from_toml(&manifest_toml))
+        };
+        let grant_of = |config: &crate::config::schema::Config, key: &str| {
+            config
+                .plugins
+                .entries
+                .iter()
+                .find(|e| e.name == key)
+                .map(|e| e.egress_hosts.clone())
+        };
+
+        let tmp = tempfile::tempdir().expect("config dir");
+        let mut config = config_in_dir(tmp.path());
+        let plugins = tempfile::tempdir().expect("plugins dir");
+        let mut host = PluginHost::from_plugins_dir(plugins.path()).expect("host");
+
+        // v1: declares a host, no transport.
+        let (v1_source, v1) = write_source("");
+        let key = expected_instance_key(&v1);
+        let admitted = host
+            .admit_source(v1_source.path().to_str().unwrap())
+            .expect("admit v1");
+        Box::pin(publish_and_seed_plugin(
+            &mut host,
+            &mut config,
+            admitted,
+            |_| {},
+        ))
+        .await
+        .expect("install v1");
+        assert_eq!(
+            grant_of(&config, &key),
+            Some(Vec::new()),
+            "v1 gets a row but no grant: it has no transport to use one"
+        );
+
+        // Remove v1; its row stays, as `plugin remove` leaves config alone.
+        host.remove("dormant-tool").expect("remove v1");
+
+        // v2: same declaration, now with http_client.
+        let (v2_source, v2) = write_source("\"http_client\"");
+        assert_eq!(expected_instance_key(&v2), key, "same package, same row");
+        let admitted = host
+            .admit_source(v2_source.path().to_str().unwrap())
+            .expect("admit v2");
+        Box::pin(publish_and_seed_plugin(
+            &mut host,
+            &mut config,
+            admitted,
+            |_| {},
+        ))
+        .await
+        .expect("install v2");
+        assert_eq!(
+            grant_of(&config, &key),
+            Some(Vec::new()),
+            "adding http_client must not turn the earlier declaration into reach"
+        );
     }
 
     /// REGRESSION (grant ceremony, rollback half): a fresh `plugin install`
