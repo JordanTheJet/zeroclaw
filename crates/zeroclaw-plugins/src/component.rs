@@ -173,10 +173,14 @@ pub mod bindings {
         wasmtime::component::bindgen!({
             world: "tool-plugin",
             path: "wit/v0",
-            imports: { default: async },
+            imports: {
+                default: async,
+                "zeroclaw:plugin/websocket": async | trappable,
+            },
             exports: { default: async },
             with: {
                 "zeroclaw:plugin/sockets.connection": crate::sockets::SocketConnection,
+                "zeroclaw:plugin/websocket.connection": crate::component_websocket::WebSocketConnection,
             },
         });
     }
@@ -184,10 +188,14 @@ pub mod bindings {
         wasmtime::component::bindgen!({
             world: "channel-plugin",
             path: "wit/v0",
-            imports: { default: async },
+            imports: {
+                default: async,
+                "zeroclaw:plugin/websocket": async | trappable,
+            },
             exports: { default: async },
             with: {
                 "zeroclaw:plugin/sockets.connection": crate::sockets::SocketConnection,
+                "zeroclaw:plugin/websocket.connection": crate::component_websocket::WebSocketConnection,
             },
         });
     }
@@ -591,6 +599,7 @@ pub fn add_wasi_http(linker: &mut wasmtime::component::Linker<PluginState>) -> R
 pub(crate) struct OptionalImports {
     pub(crate) http: bool,
     pub(crate) sockets: bool,
+    pub(crate) websocket: bool,
 }
 
 impl OptionalImports {
@@ -599,6 +608,7 @@ impl OptionalImports {
         Self {
             http: state.http_enabled(),
             sockets: state.permission_enabled(PluginPermission::SocketClient),
+            websocket: state.permission_enabled(PluginPermission::WebSocketClient),
         }
     }
 }
@@ -616,6 +626,12 @@ pub(crate) fn ensure_imports_coherent(
         PluginPermission::SocketClient,
         "zeroclaw:plugin/sockets",
         imports.sockets,
+    )?;
+    ensure_permission_coherent(
+        store,
+        PluginPermission::WebSocketClient,
+        "zeroclaw:plugin/websocket",
+        imports.websocket,
     )
 }
 
@@ -1358,7 +1374,8 @@ mod tests {
                 &plain,
                 OptionalImports {
                     http: false,
-                    sockets: true
+                    sockets: true,
+                    websocket: false,
                 }
             )
             .is_err(),

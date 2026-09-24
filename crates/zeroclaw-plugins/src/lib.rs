@@ -13,6 +13,8 @@ mod component_logging;
 mod component_secrets;
 #[cfg(feature = "plugins-wasmtime")]
 mod component_state;
+#[cfg(feature = "plugins-wasmtime")]
+mod component_websocket;
 pub mod config;
 pub mod egress;
 pub mod endpoint;

@@ -395,6 +395,11 @@ world channel-plugin {
     /// instance's egress grant first.
     @unstable(feature = plugins-wit-v0-sockets)
     import sockets;
+    /// Host-mediated outbound WebSocket. Linked only for an instance holding
+    /// the `websocket_client` grant; every upgrade passes the instance's
+    /// egress grant first.
+    @unstable(feature = plugins-wit-v0-websocket)
+    import websocket;
     export plugin-info;
     export channel;
 }

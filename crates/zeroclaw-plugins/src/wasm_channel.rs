@@ -122,6 +122,7 @@ fn build_linker(imports: crate::component::OptionalImports) -> Result<Linker<Plu
     let mut options = crate::component::bindings::channel::LinkOptions::default();
     options.plugins_wit_v0(true);
     options.plugins_wit_v0_sockets(imports.sockets);
+    options.plugins_wit_v0_websocket(imports.websocket);
     wt(
         ChannelPlugin::add_to_linker::<_, wasmtime::component::HasSelf<_>>(
             &mut linker,

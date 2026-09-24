@@ -41,6 +41,7 @@ fn base_linker(imports: crate::component::OptionalImports) -> Result<Linker<Plug
     let mut options = crate::component::bindings::tool::LinkOptions::default();
     options.plugins_wit_v0(true);
     options.plugins_wit_v0_sockets(imports.sockets);
+    options.plugins_wit_v0_websocket(imports.websocket);
     wt(
         ToolPlugin::add_to_linker::<_, wasmtime::component::HasSelf<_>>(
             &mut linker,
