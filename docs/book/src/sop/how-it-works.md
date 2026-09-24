@@ -128,13 +128,20 @@ take an advisory lock on a `.sop-authoring.lock` file in the SOP root before
 touching anything, so two of them cannot interleave even across processes: the
 CLI writing into a root a running daemon also authors into waits its turn rather
 than racing it. An authoring call that cannot take the lock within ten seconds
-fails rather than queueing indefinitely. Reads are not serialized and do not need
-to be, because every write lands through an atomic rename, so a reader sees one
-whole revision or the other.
+fails rather than queueing indefinitely. Reads are not serialized. Every file an
+authoring call writes is replaced through an atomic rename, so a reader never
+sees a truncated or half-written file. A save writes two files, `SOP.toml` and
+`SOP.md`, one after the other, so a reader that runs during a save can briefly
+see the manifest from one revision and the steps from the other, and a reader
+racing the first save of a new SOP can see its manifest before its steps exist.
+The next read after the save returns sees both files at the new revision.
 
-Each step commits through a rename, so both an ordinary reader and a killed
-process see one whole revision. The directory holding each renamed entry is
-flushed afterwards, so on Unix the ordering also survives a machine crash. macOS
+Each step commits through a rename, so neither an ordinary reader nor a killed
+process ever sees a step half-done. The directory holding each renamed entry is
+flushed afterwards, so on Unix the ordering also survives a machine crash. If
+that flush fails after the rename has already happened, the operation still
+finishes and the failure is logged: the change is complete and visible, and
+only the crash guarantee for that one entry is lost. macOS
 honors the flush for ordering without forcing the device cache to drain, and
 Windows has no directory-sync primitive, so on those platforms the last step of
 the guarantee is the filesystem's to keep rather than something ZeroClaw can

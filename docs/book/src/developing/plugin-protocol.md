@@ -47,10 +47,12 @@ omits the compiled component.
 - **Sandboxed by default.** The host loads each plugin into a WASI context with
   no filesystem preopens and no ambient network. A plugin cannot quietly reach
   the host; it gets exactly the host functions wired into its world and nothing
-  more. Outbound HTTP is the one network surface that can be opened, and only
-  when the manifest grants `http_client` and that capability adapter explicitly
-  enables its tested HTTP boundary. The tool adapter does; channel and memory
-  currently withhold it.
+  more. Outbound HTTP is the one network surface that can be opened, and it is
+  governed in two layers: the manifest's `http_client` grant selects whether
+  the adapter links the `wasi:http` *surface*, and the operator's per-instance
+  `plugins.entries.<key>.egress_hosts` grant selects the *reach*. The tool and
+  channel adapters link the surface; memory currently withholds it. With no
+  egress grant the reach is deny-all, so a linked surface alone sends nothing.
 - **Verifiable provenance.** Manifests can be Ed25519-signed, and an operator
   can require signatures from trusted publishers before any plugin loads.
 
@@ -64,18 +66,21 @@ before you design around a capability that is not there.
   `config_read` exposes the plugin's own schema-validated public config. A tool
   or channel schema can designate secrets withheld from public config and
   resolved in authorized service calls. An `http_client` grant is necessary
-  for outbound `wasi:http`, but the capability adapter must also opt into that
-  host surface. The tool adapter does; channel and memory intentionally remain
-  HTTP-free until their network boundaries have component-level coverage.
-  Filesystem and
+  for outbound `wasi:http`, but it is not sufficient: the capability adapter
+  must link that host surface (tool and channel do; memory intentionally
+  remains HTTP-free until its network boundary has component-level coverage),
+  and the operator must grant destinations through `egress_hosts`. Without
+  that grant every destination is refused before a packet leaves or a name is
+  resolved. Filesystem and
   memory-access permissions are still accepted by the manifest schema but
   inert: their host functions are not yet registered in the linker. See
   Permissions and Host imports below.
 - **No ambient host network or filesystem.** The WASI context has no preopens and
   no ambient network, so a plugin cannot open raw sockets or read host files
-  through ambient WASI. A tool plugin with an `http_client` grant gets outbound
-  `wasi:http`; channel and memory plugins currently do not. No plugin can
-  listen.
+  through ambient WASI. A tool or channel plugin with an `http_client` grant
+  gets outbound `wasi:http`, reaching only the destinations its operator
+  egress grant lists; memory plugins currently get no HTTP surface. No plugin
+  can listen.
   Channel plugins that must receive inbound traffic do not open a listener
   themselves: the host runs the listener and feeds messages through the
   `inbound` import, which the plugin drains from its `poll-message` export.
@@ -124,8 +129,9 @@ hold a warm store guarded by an async mutex for the lifetime of the plugin.
 
 Tool plugins are discovered and registered end to end: the runtime walks
 `channel_plugin_details()`'s tool counterpart and builds a `WasmTool` for each.
-The channel host adapter (`WasmChannel`, its fail-closed `wasi:http` gating, point-of-use
-config services, and host-fed `inbound` queue) is complete and unit-covered, and
+The channel host adapter (`WasmChannel`, its grant-gated `wasi:http` surface
+behind the host-owned egress policy, point-of-use config services, and host-fed
+`inbound` queue) is complete and covered by a real-component egress test, and
 `PluginHost::channel_plugin_details()` exposes the wasm-backed channel plugins
 to register. The runtime now resolves an explicitly declared
 `[channels.plugin.<alias>]` binding, constructs its `WasmChannel`, and registers
@@ -176,8 +182,23 @@ or treating registry metadata as proof that code was installed.
 
 `zeroclaw plugin install <name>` resolves the name from the registry, downloads
 the selected zip archive, verifies the optional SHA-256 digest, safely extracts
-the archive, and then hands the extracted plugin directory to the existing
-`PluginHost::install` path. Local path installs are unchanged:
+the archive, and then hands the extracted plugin directory to the same
+admission path a local install uses. Admission (`PluginHost::admit_source`)
+parses and signature-checks the manifest, validates its shape and config,
+refuses a name that is already installed, and reads the component once: the
+path must stay inside the package with no symlink on it, the read is capped at
+64 MiB and refused from the file's metadata when it is larger, and the
+optional `wasm_sha256` digest is checked. The CLI then runs the install-time
+load check against those admitted bytes: the same instantiation the
+daemon performs at startup, so a component built against a drifted WIT fails
+at install with its full diagnostic instead of being skipped silently later.
+`plugin install --no-verify` skips the load check entirely (nothing is
+compiled) and prints a note; it does not bypass admission. A host built
+without a WASM backend has nothing to instantiate against and installs without
+the check. Installation (`PluginHost::install_admitted`) then persists the
+admitted manifest bytes and writes the admitted component bytes, so what
+was verified is byte for byte what the daemon will load. Local path installs
+follow the same sequence:
 
 When no version is pinned, ZeroClaw chooses the last matching entry in the
 registry index, so registry publishers should order repeated names
@@ -293,9 +314,17 @@ through `config.get` and secrets through `secrets.get` during `configure` and
 operational calls, while instantiation and static metadata discovery remain
 unavailable. `http_client` is a necessary grant, not a complete authority
 decision: the capability adapter must also construct the HTTP context and link
-`wasi:http`. The tool adapter opts in after grant validation. Channel and memory
-adapters deliberately do not, so granting `http_client` to either scope alone
-adds no network surface. The remaining variants
+`wasi:http`, and the host-owned egress policy must permit the destination. The
+tool and channel adapters link the surface after grant validation; the memory
+adapter deliberately does not, so granting `http_client` to a memory scope adds
+no network surface. For tools and channels the surface still reaches nothing
+until the operator lists destinations under
+`plugins.entries.<key>.egress_hosts`; the policy refuses every other host. A
+granted host that resolves to a loopback, private, or link-local address is
+still refused unless the operator also lists it under
+`plugins.entries.<key>.egress_allow_private`, a carveout that relaxes the
+address class for an already-granted destination and never grants one (see
+[Plugins](../plugins/index.md) for the operator side). The remaining variants
 (`file_read`, `file_write`, `memory_read`, `memory_write`) are accepted by the
 manifest schema but are not yet wired to a host import: declaring them grants
 nothing on its own. They reserve the names for the host functions that will
@@ -369,10 +398,12 @@ world's linker wires `logging` (via the host impl in `component_logging.rs`,
 linked alongside `add_wasi` in `component.rs`). Tool and channel link the
 instance-scoped `secrets` service. Channel also imports `config` for its typed
 public object and `inbound` for the host-fed message queue it drains from
-`poll-message`. The tool adapter links outbound `wasi:http` only after the
-admitted scope grants `http_client` (`PluginStoreSpec::with_granted_http` and
-`add_wasi_http` in `component.rs`). Channel and memory withhold both the context
-and linker surface. The filesystem and memory-access permissions remain inert: the
+`poll-message`. The tool and channel adapters link outbound `wasi:http` only
+after the admitted scope grants `http_client` (`PluginStoreSpec::with_granted_http`
+and `add_wasi_http` in `component.rs`), and both compose the host-owned reach
+policy (`PluginStoreSpec::with_egress_policy`) so the guest never gets
+Wasmtime's unrestricted default hooks. Memory withholds both the context and
+the linker surface. The filesystem and memory-access permissions remain inert: the
 host functions that would gate them are not yet wired into the linker. A
 plugin's ambient authority is the WASI context (no preopens, no ambient network)
 plus exactly the host imports its grants and adapter opt-ins jointly enable.

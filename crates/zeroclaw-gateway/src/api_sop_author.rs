@@ -840,13 +840,19 @@ pub async fn handle_sop_save(
     }
     sop.name = name;
     let (dir, _mode) = sops_dir_and_mode(&state);
-    match zeroclaw_runtime::sop::save_sop(&dir, &sop) {
+    // `PUT` edits the SOP named in its URL. If that SOP has been renamed or
+    // deleted since the client loaded it, refuse instead of recreating it
+    // under the retired name; creating a SOP is `POST /api/sops`.
+    match zeroclaw_runtime::sop::save_existing_sop_typed(&dir, &sop) {
         Ok(()) => Json(serde_json::json!({ "saved": sop.name })).into_response(),
-        Err(e) => (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": e.to_string() })),
-        )
-            .into_response(),
+        Err(e) => {
+            let code = match e {
+                zeroclaw_runtime::sop::SopAuthorError::NotFound(_) => StatusCode::NOT_FOUND,
+                zeroclaw_runtime::sop::SopAuthorError::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
+                _ => StatusCode::BAD_REQUEST,
+            };
+            (code, Json(serde_json::json!({ "error": e.to_string() }))).into_response()
+        }
     }
 }
 
@@ -1135,6 +1141,41 @@ mod tests {
             "a rename target that escapes the SOP root is rejected"
         );
         assert!(!sops_dir.parent().unwrap().join("escaped").exists());
+    }
+
+    /// `PUT /api/sops/{name}` edits the SOP named in its URL. After a rename,
+    /// a client still holding the old name must get a not-found, and the
+    /// retired name must not be recreated.
+    #[tokio::test]
+    async fn authoring_save_after_rename_does_not_recreate_the_retired_sop() {
+        let token = "author-token";
+        let (_tmp, sops_dir, state) = authoring_rename_state(token, &["deploy-before"]);
+
+        let resp = handle_sop_rename(
+            State(state.clone()),
+            bearer(token),
+            Path("deploy-before".to_string()),
+            Json(SopRenameBody {
+                to: "deploy-after".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = handle_sop_save(
+            State(state),
+            bearer(token),
+            Path("deploy-before".to_string()),
+            Json(authoring_checkpoint_sop("deploy-before")),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "a stale edit of a renamed SOP is not found, not a silent re-create"
+        );
+        assert!(!sops_dir.join("deploy-before").exists());
+        assert!(sops_dir.join("deploy-after").exists());
     }
 
     #[tokio::test]
