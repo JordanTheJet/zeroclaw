@@ -14864,8 +14864,14 @@ mod tests {
                 ..Default::default()
             },
         );
+        // A headless step runs under the owning agent's fail-closed approval
+        // policy, so a Supervised agent's step may only use tools it
+        // auto-approves, exactly as in a real deployment. `audit_probe` is the
+        // tool the call-recording regression asks for.
+        let mut risk_profile = RiskProfileConfig::default();
+        risk_profile.auto_approve.push("audit_probe".into());
         let mut risk_profiles = std::collections::HashMap::new();
-        risk_profiles.insert("default".to_string(), RiskProfileConfig::default());
+        risk_profiles.insert("default".to_string(), risk_profile);
         let mut config = Config {
             data_dir: tmp.path().to_path_buf(),
             config_path: tmp.path().join("config.toml"),
