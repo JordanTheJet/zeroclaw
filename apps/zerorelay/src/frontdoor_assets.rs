@@ -454,9 +454,12 @@ pub(crate) const APP_JS: &str = r##"(function () {
   // fetched and nothing is submitted - the user still presses "Fetch the agent
   // CA" and confirms the short authentication string. Values are checked
   // against the same shapes the relay and daemon accept; anything else is
-  // ignored. The parameters are then removed from the address bar so the
-  // one-time code does not linger in history, bookmarks or a copied URL. The
-  // pairing code is never echoed into a status line, an error, or any log output.
+  // ignored. The parameters are then removed from the address bar and the
+  // current history entry, so a copied URL or a later bookmark does not carry
+  // the code. The browser may still keep the originally opened link in its own
+  // history store, which no page can rewrite; the code is one-time and
+  // short-lived, so that copy is spent or expired. The pairing code is never
+  // echoed into a status line, an error, or any log output.
   const NODE_ID_SHAPE = /^[\x21-\x7e]{1,128}$/;
   const PAIRING_CODE_SHAPE = /^[0-9A-Za-z]{6,128}$/;
 

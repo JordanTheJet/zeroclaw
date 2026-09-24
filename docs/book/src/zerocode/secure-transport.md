@@ -476,10 +476,16 @@ reflects it, and serves the page with `cache-control: no-store` and
 The page only fills the fields. It does not fetch the agent CA or submit
 anything: the user still presses **Fetch the agent CA** and confirms the
 short-auth-string. Values that do not match the node-id or pairing-code shape
-are ignored, and both parameters are removed from the address bar as soon as
-the page reads them, so the one-time code does not linger in browser history.
-The pairing code is still one-time: treat a link that carries it like the code
-itself.
+are ignored, and both parameters are removed from the address bar and the
+current history entry as soon as the page reads them, so a copied or bookmarked
+URL does not carry the code.
+
+The browser can still record the link as it was first opened in its own history
+database (Chrome does, for both the `?` and `#` forms); no page can rewrite that.
+What makes that copy harmless is the code itself: it is consumed by the first
+successful enrollment and expires ten minutes after it is minted, so the stored
+link is spent or dead. Treat a link that carries an unused code like the code
+itself, and prefer enrolling promptly after minting.
 
 ---
 
