@@ -2969,7 +2969,6 @@ mod tests {
         let (status, json) = response_json(
             handle_prop_get(
                 State(state),
-                HeaderMap::new(),
                 Query(PropQuery {
                     path: "security.audit.enabled".to_string(),
                 }),
