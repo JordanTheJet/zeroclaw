@@ -37,9 +37,11 @@ class ResolveCratesReleaseTest(unittest.TestCase):
         self.git("commit", "-q", "-m", f"commit {count}")
         return self.git("rev-parse", "HEAD")
 
-    def resolve(self, stage=None, sha=None, digest=None, tag="v1.2.3"):
+    def resolve(self, stage=None, sha=None, digest=None, tag="v1.2.3", tooling=None):
         env = {k: v for k, v in os.environ.items()
-               if k not in ("STAGE", "RELEASE_SHA", "VERIFIED_WEB_DIST_DIGEST")}
+               if k not in ("STAGE", "RELEASE_SHA", "VERIFIED_WEB_DIST_DIGEST", "TOOLING_SHA")}
+        if tooling is not None:
+            env["TOOLING_SHA"] = tooling
         env["RELEASE_TAG"] = tag
         if stage is not None:
             env["STAGE"] = stage
@@ -62,7 +64,7 @@ class ResolveCratesReleaseTest(unittest.TestCase):
     def test_preflight_verifies_release_commit_before_the_tag_exists(self):
         out = self.outputs(self.resolve("preflight", self.head))
         self.assertEqual(out, {"stage": "preflight", "version": "1.2.3",
-                               "sha": self.head, "msrv": "1.98"})
+                               "sha": self.head, "tooling_sha": self.head, "msrv": "1.98"})
 
     def test_preflight_rejects_a_checkout_other_than_the_release_commit(self):
         self.assert_fails(self.resolve("preflight", self.first),
@@ -122,6 +124,43 @@ class ResolveCratesReleaseTest(unittest.TestCase):
         self.assert_fails(self.resolve("preflight", self.head, tag="1.2.3"),
                           "release_tag must be vX.Y.Z")
         self.assert_fails(self.resolve("publish-now", self.head), "stage must be all, preflight, or publish")
+
+
+    def released_then_fixed_on_master(self):
+        """Tag the release, land a later fix on master, and check the tag out."""
+        self.git("tag", "-a", "v1.2.3", "-m", "release")
+        fix = self.commit("1.2.3")
+        self.git("update-ref", "refs/remotes/origin/master", fix)
+        self.git("checkout", "-q", "--detach", "v1.2.3")
+        return fix
+
+    def test_recovery_packages_the_tag_with_fixed_master_tooling(self):
+        fix = self.released_then_fixed_on_master()
+        out = self.outputs(self.resolve(tooling=fix))
+        self.assertEqual((out["stage"], out["sha"], out["tooling_sha"]), ("all", self.head, fix))
+
+    def test_recovery_tooling_must_be_on_master(self):
+        self.released_then_fixed_on_master()
+        self.git("checkout", "-q", "-b", "unreviewed")
+        unreviewed = self.commit("1.2.3")
+        self.git("checkout", "-q", "--detach", "v1.2.3")
+        self.assert_fails(self.resolve(tooling=unreviewed), "is not on master")
+
+    def test_recovery_tooling_must_contain_the_release(self):
+        # Older master tooling would reintroduce bugs the release already fixed.
+        self.released_then_fixed_on_master()
+        self.assert_fails(self.resolve(tooling=self.first), "does not contain release commit")
+
+    def test_recovery_tooling_must_exist(self):
+        self.released_then_fixed_on_master()
+        self.assert_fails(self.resolve(tooling="f" * 40), "is not available in this checkout")
+
+    def test_release_runs_always_use_their_own_tooling(self):
+        fix = self.released_then_fixed_on_master()
+        self.assert_fails(self.resolve("preflight", self.head, tooling=fix),
+                          "stage preflight must use the release commit's own tooling")
+        self.assert_fails(self.resolve("publish", self.head, DIGEST, tooling=fix),
+                          "stage publish must use the release commit's own tooling")
 
 
 if __name__ == "__main__":

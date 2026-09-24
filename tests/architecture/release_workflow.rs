@@ -541,11 +541,13 @@ fn crates_io_publisher_is_preflighted_gated_and_resumable() {
     for required in [
         "ref: ${{ inputs.release_sha || inputs.release_tag }}",
         "fetch-depth: 0",
-        "bash scripts/release/resolve_crates_release.sh",
+        "bash .release-tooling/scripts/release/resolve_crates_release.sh",
+        "TOOLING_SHA: ${{ github.workflow_sha }}",
+        "tooling_sha: ${{ steps.meta.outputs.tooling_sha }}",
         "STAGE: ${{ inputs.stage }}",
         "cargo test --locked --test architecture publish_contract",
         "CARGO_TARGET_DIR: ${{ runner.temp }}/crates-io-package-target",
-        "./scripts/release/publish-crates.sh",
+        "./.release-tooling/scripts/release/publish-crates.sh",
     ] {
         assert!(
             preflight.contains(required),
@@ -596,11 +598,42 @@ fn crates_io_publisher_is_preflighted_gated_and_resumable() {
         "an optional token declaration relies on the publish step failing closed without it"
     );
 
+    // Recovery: release scripts run from a pinned checkout that is separate
+    // from the tree being packaged, so a publisher fix merged after the tag
+    // reaches that release without moving the tag. Both jobs use the tooling
+    // commit the resolver approved and keep it out of the packaged tree.
+    for (job, name, reference) in [
+        (preflight, "preflight", "${{ github.workflow_sha }}"),
+        (
+            publish,
+            "publish",
+            "${{ needs.preflight.outputs.tooling_sha }}",
+        ),
+    ] {
+        for required in [
+            format!("          ref: {reference}\n          path: .release-tooling\n"),
+            "          sparse-checkout: |\n            /scripts/release/\n          sparse-checkout-cone-mode: false\n          persist-credentials: false\n".to_string(),
+            format!("          TOOLING_SHA: {reference}\n"),
+            "test \"$(git -C .release-tooling rev-parse HEAD)\" = \"$TOOLING_SHA\"".to_string(),
+            "echo '/.release-tooling/' >> .git/info/exclude".to_string(),
+            "PUBLISH_SOURCE_ROOT: ${{ github.workspace }}".to_string(),
+        ] {
+            assert!(
+                job.contains(&required),
+                "crates.io {name} job is missing release-tooling invariant: {required}"
+            );
+        }
+        assert!(
+            !job.contains("./scripts/release/") && !job.contains("bash scripts/release/"),
+            "crates.io {name} job must run release scripts from .release-tooling only"
+        );
+    }
+
     for required in [
         "environment:\n      name: crates-io",
         "ref: ${{ needs.preflight.outputs.sha }}",
         "CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}",
-        "./scripts/release/publish-crates.sh --execute",
+        "./.release-tooling/scripts/release/publish-crates.sh --execute",
     ] {
         assert!(
             publish.contains(required),
@@ -614,7 +647,7 @@ fn crates_io_publisher_is_preflighted_gated_and_resumable() {
     for required in [
         "cargo web build",
         "web_dist_digest: ${{ steps.web_digest.outputs.digest || inputs.verified_web_dist_digest }}",
-        "bash scripts/release/web_dist_digest.sh web/dist",
+        "bash .release-tooling/scripts/release/web_dist_digest.sh web/dist",
         "WEB_DIST_DIGEST: ${{ steps.web_digest.outputs.digest }}",
         "uses: actions/upload-artifact@",
         "name: crates-io-web-dist",
@@ -664,11 +697,11 @@ fn crates_io_publisher_is_preflighted_gated_and_resumable() {
         "git diff --quiet",
         "git ls-files --others --exclude-standard",
         "web/dist/index.html",
-        "scripts/release/web_dist_digest.sh\" web/dist",
+        "bash \"$SCRIPT_DIR/web_dist_digest.sh\" web/dist",
         "web/dist does not match the bundle preflight verified",
         "cargo publish --dry-run --locked --allow-dirty",
         "--locked --no-verify --allow-dirty",
-        "python3 \"$REPO_ROOT/scripts/release/publish_order.py\" \"$VERSION\" <<<\"$META\"",
+        "python3 \"$SCRIPT_DIR/publish_order.py\" \"$VERSION\" <<<\"$META\"",
         "wait_for_registry_version",
         "will skip what already landed",
     ] {

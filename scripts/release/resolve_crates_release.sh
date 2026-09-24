@@ -10,8 +10,11 @@ set -euo pipefail
 #   STAGE                     all (default) | preflight | publish
 #   VERIFIED_WEB_DIST_DIGEST  stage publish only: digest an earlier preflight
 #                             stage recorded for web/dist
+#   TOOLING_SHA               commit the release scripts are taken from;
+#                             defaults to the release commit itself
 #
-# Prints stage=, version=, sha= and msrv= lines for $GITHUB_OUTPUT.
+# Prints stage=, version=, sha=, tooling_sha= and msrv= lines for
+# $GITHUB_OUTPUT.
 #
 # Stages exist so the stable release can verify its crates before anything
 # irreversible happens. The `preflight` stage runs beside the binary builds,
@@ -95,7 +98,36 @@ if [[ "$head" != "$sha" ]]; then
   exit 1
 fi
 
+# Release recovery. Both v0.8.5 crates.io failures were bugs in the publisher
+# scripts as they stood at the tag, and a fix merged afterwards could not reach
+# that release without moving the tag. A standalone run may therefore take its
+# scripts from a newer commit, while the crates are still packaged from the
+# tag. Only reviewed master tooling that already contains the release commit
+# qualifies; a release run always uses the tooling it was tagged with.
+tooling="${TOOLING_SHA:-$sha}"
+if [[ "$tooling" != "$sha" ]]; then
+  if [[ "$stage" != "all" ]]; then
+    echo "::error::stage ${stage} must use the release commit's own tooling, not ${tooling}." >&2
+    exit 1
+  fi
+  if ! git rev-parse -q --verify "${tooling}^{commit}" >/dev/null; then
+    echo "::error::Release tooling commit ${tooling} is not available in this checkout." >&2
+    exit 1
+  fi
+  if ! git rev-parse -q --verify "refs/remotes/origin/master^{commit}" >/dev/null \
+    || ! git merge-base --is-ancestor "$tooling" refs/remotes/origin/master; then
+    echo "::error::Recovery tooling ${tooling} is not on master; dispatch the recovery from master." >&2
+    exit 1
+  fi
+  if ! git merge-base --is-ancestor "$sha" "$tooling"; then
+    echo "::error::Recovery tooling ${tooling} does not contain release commit ${sha}." >&2
+    exit 1
+  fi
+  echo "Recovery: packaging ${sha} with release tooling from ${tooling}." >&2
+fi
+
 echo "stage=$stage"
 echo "version=$version"
 echo "sha=$sha"
+echo "tooling_sha=$tooling"
 echo "msrv=$msrv"

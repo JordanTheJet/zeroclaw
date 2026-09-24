@@ -99,6 +99,7 @@ jobs:
     outputs:
       version: ${{ steps.meta.outputs.version }}
       sha: ${{ steps.meta.outputs.sha }}
+      tooling_sha: ${{ steps.meta.outputs.tooling_sha }}
       msrv: ${{ steps.meta.outputs.msrv }}
       # The publish stage skips the build and forwards the digest the earlier
       # preflight stage recorded; resolve_crates_release.sh has already
@@ -112,6 +113,26 @@ jobs:
         with:
           ref: ${{ inputs.release_sha || inputs.release_tag }}
           fetch-depth: 0
+      # Release scripts come from a separate checkout. In a release run it is
+      # the release commit; a recovery dispatch from master uses master's
+      # scripts against the tagged tree, which the resolver accepts only when
+      # that commit is on master and already contains the release.
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .release-tooling
+          sparse-checkout: |
+            /scripts/release/
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - name: Keep release tooling out of the packaged tree
+        shell: bash
+        env:
+          TOOLING_SHA: ${{ github.workflow_sha }}
+        run: |
+          set -euo pipefail
+          test "$(git -C .release-tooling rev-parse HEAD)" = "$TOOLING_SHA"
+          echo '/.release-tooling/' >> .git/info/exclude
 
       # Pins the exact commit preflight verified. The publish job checks that
       # out rather than re-resolving the tag, so a tag moved between the two
@@ -124,9 +145,10 @@ jobs:
           RELEASE_SHA: ${{ inputs.release_sha }}
           STAGE: ${{ inputs.stage }}
           VERIFIED_WEB_DIST_DIGEST: ${{ inputs.verified_web_dist_digest }}
+          TOOLING_SHA: ${{ github.workflow_sha }}
         run: |
           set -euo pipefail
-          resolved="$(bash scripts/release/resolve_crates_release.sh)"
+          resolved="$(bash .release-tooling/scripts/release/resolve_crates_release.sh)"
           printf '%s\n' "$resolved" >> "$GITHUB_OUTPUT"
           printf '%s\n' "$resolved"
 
@@ -174,7 +196,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          digest="$(bash scripts/release/web_dist_digest.sh web/dist)"
+          digest="$(bash .release-tooling/scripts/release/web_dist_digest.sh web/dist)"
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
           echo "web/dist digest: $digest"
 
@@ -192,7 +214,8 @@ jobs:
         env:
           CARGO_TARGET_DIR: ${{ runner.temp }}/crates-io-package-target
           WEB_DIST_DIGEST: ${{ steps.web_digest.outputs.digest }}
-        run: ./scripts/release/publish-crates.sh "${{ steps.meta.outputs.version }}"
+          PUBLISH_SOURCE_ROOT: ${{ github.workspace }}
+        run: ./.release-tooling/scripts/release/publish-crates.sh "${{ steps.meta.outputs.version }}"
 
       # Uploaded only after the dry run passed, so the artifact is the tree that
       # was packaged and compiled. The name must not collide with the release
@@ -217,6 +240,7 @@ jobs:
           DRY_RUN: ${{ inputs.dry_run }}
           STAGE: ${{ steps.meta.outputs.stage }}
           SHA: ${{ steps.meta.outputs.sha }}
+          TOOLING_SHA: ${{ steps.meta.outputs.tooling_sha }}
           WEB_DIST_DIGEST: ${{ steps.web_digest.outputs.digest || inputs.verified_web_dist_digest }}
         run: |
           {
@@ -224,6 +248,7 @@ jobs:
             echo "- stage: \`${STAGE}\`"
             echo "- tag: \`${TAG}\`"
             echo "- commit: \`${SHA}\`"
+            echo "- release tooling: \`${TOOLING_SHA}\`"
             echo "- version: \`${VERSION}\`"
             echo "- dry_run: \`${DRY_RUN}\`"
             echo "- web/dist digest: \`${WEB_DIST_DIGEST}\`"
@@ -251,6 +276,26 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           ref: ${{ needs.preflight.outputs.sha }}
+      # Release scripts come from a separate checkout. In a release run it is
+      # the release commit; a recovery dispatch from master uses master's
+      # scripts against the tagged tree, which the resolver accepts only when
+      # that commit is on master and already contains the release.
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ needs.preflight.outputs.tooling_sha }}
+          path: .release-tooling
+          sparse-checkout: |
+            /scripts/release/
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - name: Keep release tooling out of the packaged tree
+        shell: bash
+        env:
+          TOOLING_SHA: ${{ needs.preflight.outputs.tooling_sha }}
+        run: |
+          set -euo pipefail
+          test "$(git -C .release-tooling rev-parse HEAD)" = "$TOOLING_SHA"
+          echo '/.release-tooling/' >> .git/info/exclude
 
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
@@ -271,6 +316,7 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
           VERSION: ${{ needs.preflight.outputs.version }}
           WEB_DIST_DIGEST: ${{ needs.preflight.outputs.web_dist_digest }}
+          PUBLISH_SOURCE_ROOT: ${{ github.workspace }}
         run: |
           set -euo pipefail
           # An empty digest would silently skip the bundle check in the script.
@@ -284,7 +330,7 @@ jobs:
             echo "::error::yet exist needs the publish-new scope, not just publish-update."
             exit 1
           fi
-          ./scripts/release/publish-crates.sh --execute "$VERSION"
+          ./.release-tooling/scripts/release/publish-crates.sh --execute "$VERSION"
 
       # Must branch on the publish outcome: `if: always()` with an unconditional
       # success banner is worst on the run that actually needs reading — a
