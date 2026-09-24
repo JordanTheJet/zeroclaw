@@ -318,6 +318,29 @@ therefore works for plugins exactly as it already works for provider requests.
 Verification itself is unchanged: chain building and hostname matching stay in
 force, and the egress policy still decides which destinations a guest may reach.
 
+Sockets and WebSocket connections start from the same roots. A plugin that must
+reach a service behind a private CA, or present a client certificate, names a
+TLS profile the operator configured on its instance:
+
+```toml
+[[plugins.entries]]
+name = "zpi1_…"                       # the instance key
+egress_hosts = ["imap.corp.example.com"]
+
+[[plugins.entries.tls_profiles]]
+name = "corp"
+hosts = ["imap.corp.example.com"]     # must be inside egress_hosts
+system_roots = false                  # trust only the CA below
+custom_ca_secret = "corp_ca"          # x-secret properties of the plugin's
+client_certificate_secret = "cert"    # config schema holding PEM material
+client_private_key_secret = "key"
+```
+
+A profile chooses certificates only. Its `hosts` must each be granted by
+`egress_hosts`, which config validation checks, and a request that names it
+still passes the ordinary grant first. The certificate material stays in the
+instance's encrypted config; the profile fields are just the property names.
+
 Those roots are read once per process. Rewriting the certificate file at the same
 path, or changing the operating system store, does not reach a running daemon;
 restart it before expecting plugin HTTPS to see the change. The same applies to

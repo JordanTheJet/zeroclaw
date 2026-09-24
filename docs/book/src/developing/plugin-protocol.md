@@ -47,12 +47,14 @@ omits the compiled component.
 - **Sandboxed by default.** The host loads each plugin into a WASI context with
   no filesystem preopens and no ambient network. A plugin cannot quietly reach
   the host; it gets exactly the host functions wired into its world and nothing
-  more. Outbound HTTP is the one network surface that can be opened, and it is
-  governed in two layers: the manifest's `http_client` grant selects whether
-  the adapter links the `wasi:http` *surface*, and the operator's per-instance
-  `plugins.entries.<key>.egress_hosts` grant selects the *reach*. The tool and
-  channel adapters link the surface; memory currently withholds it. With no
-  egress grant the reach is deny-all, so a linked surface alone sends nothing.
+  more. Outbound HTTP, raw sockets, and WebSocket are the network surfaces that
+  can be opened, and each is governed in two layers: the manifest grant
+  (`http_client`, `socket_client`, or `websocket_client`) selects whether the
+  adapter links that *surface*, and the operator's per-instance
+  `plugins.entries.<key>.egress_hosts` grant selects the *reach*, shared by all
+  three. The tool and channel adapters link the surfaces; memory currently
+  withholds them. With no egress grant the reach is deny-all, so a linked
+  surface alone sends nothing.
 - **Verifiable provenance.** Manifests can be Ed25519-signed, and an operator
   can require signatures from trusted publishers before any plugin loads.
 
@@ -73,16 +75,19 @@ before you design around a capability that is not there.
   until its network boundary has component-level coverage), and the operator
   must grant destinations through `egress_hosts`. Without that grant every
   destination is refused before a packet leaves or a name is resolved.
-  Filesystem and
+  `socket_client` and `websocket_client` link the `sockets` and `websocket`
+  imports on the same terms: the same grant, address-class rules, and
+  per-instance connection budget. Filesystem and
   memory-access permissions are still accepted by the manifest schema but
   inert: their host functions are not yet registered in the linker. See
   Permissions and Host imports below.
 - **No ambient host network or filesystem.** The WASI context has no preopens and
   no ambient network, so a plugin cannot open raw sockets or read host files
   through ambient WASI. A tool or channel plugin with an `http_client` grant
-  gets outbound `wasi:http`, reaching only the destinations its operator
-  egress grant lists; memory plugins currently get no HTTP surface. No plugin
-  can listen.
+  gets outbound `wasi:http`, and one with `socket_client` or
+  `websocket_client` gets host-mediated TCP/TLS/STARTTLS or WebSocket
+  connections, all reaching only the destinations its operator egress grant
+  lists; memory plugins currently get none of these. No plugin can listen.
   Channel plugins that must receive inbound traffic do not open a listener
   themselves: the host runs the listener and feeds messages through the
   `inbound` import, which the plugin drains from its `poll-message` export.
@@ -351,7 +356,11 @@ signatures.
 imports `logging` (host) and exports `plugin-info` plus its primary interface:
 `tool-plugin` exports `tool`, `channel-plugin` exports `channel`, and
 `memory-plugin` exports `memory`. Tool also imports `secrets` and `state`;
-channel imports `config`, `secrets`, `state`, and `inbound`. The required
+channel imports `config`, `secrets`, `state`, and `inbound`. Tool and channel
+additionally import `sockets` and `websocket` behind their own features
+(`plugins-wit-v0-sockets`, `plugins-wit-v0-websocket`); the host links each only
+for an instance holding the matching grant, so a component that imports one
+without the grant fails to instantiate. The required
 (no-default) exports for each
 world are listed in the world's doc comment in its `.wit` file.
 
@@ -607,6 +616,45 @@ The runtime stores one authenticated envelope per value in
 The database contains only keyed blind indexes and `enc2:` ciphertext. Missing
 or replaced install keys fail closed and are never silently regenerated while
 durable rows exist. Back up the database and `.secret_key` together.
+
+### `sockets`
+
+Host-mediated outbound TCP. `connect` takes a host, port, mode, and optional
+TLS profile, and returns a `connection` resource:
+
+- `plaintext`: raw TCP. Reachable wherever the operator granted the host;
+  there is no separate plaintext exception (ADR-014).
+- `direct-tls`: TLS is established before `connect` returns.
+- `start-tls`: the connection starts in a negotiation phase where only
+  `send-negotiation` and `receive-negotiation` work. `upgrade-tls` commits the
+  stream to TLS in place; failure closes it, and there is no plaintext retry.
+
+The host resolves the destination once, dials only the checked addresses, and
+holds the instance's connection lease until the resource is dropped. TLS
+verifies against the same roots as plugin HTTPS unless the request names a TLS
+profile. `receive` never blocks; it returns `idle` when nothing is buffered.
+Failures are the typed `socket-error` cases.
+
+### `websocket`
+
+Host-mediated outbound WebSocket. `connect` takes a `ws://` or `wss://` URL,
+extra headers, offered subprotocols, and an optional TLS profile, and returns a
+`connection` resource with `send`, `receive`, `close`, and
+`negotiated-subprotocol`. The host owns DNS, the destination decision, TLS, the
+upgrade handshake, and bounded queues; headers that belong to the handshake
+(`Host`, `Connection`, `Upgrade`, `Sec-WebSocket-*`) are refused. `receive`
+never blocks. Dropping the resource closes the socket and releases the
+connection lease.
+
+### TLS profiles
+
+A `sockets` or `websocket` request may name a TLS profile the operator
+configured on the instance (`[[plugins.entries.tls_profiles]]`). A profile
+selects which certificate authorities to trust and, optionally, a client
+certificate for mutual TLS, read from the instance's `x-secret` properties. It
+never grants a destination: the request must first pass `egress_hosts`, and
+the profile must also cover the host. Naming a profile on a plaintext
+connection is an invalid request.
 
 ### Per-plugin config (`__config` and `config.get`)
 
