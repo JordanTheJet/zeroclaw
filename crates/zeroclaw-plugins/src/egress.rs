@@ -167,6 +167,16 @@ impl EgressPolicy {
     }
 }
 
+/// The two operator-authored lists an instance's grant is made of, as the
+/// canonical config currently resolves them.
+// Gated like its only consumer, the `wasi_http` denial path.
+#[cfg(feature = "plugins-wasmtime")]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct GrantLists {
+    pub(crate) hosts: Vec<String>,
+    pub(crate) allow_private: Vec<String>,
+}
+
 type ResolveEgress =
     dyn Fn(&PluginInstanceScope) -> Result<EgressPolicy, EgressError> + Send + Sync;
 
@@ -240,6 +250,12 @@ impl EgressRequest {
 
     /// Host-issued logical instance identity.
     #[must_use]
+    /// The scope this request was made under.
+    #[cfg(feature = "plugins-wasmtime")]
+    pub(crate) fn scope(&self) -> &PluginInstanceScope {
+        &self.scope
+    }
+
     pub fn instance_id(&self) -> &PluginInstanceId {
         self.scope.id()
     }
@@ -584,6 +600,22 @@ impl EgressHostService {
     #[cfg(all(test, feature = "plugins-wasmtime"))]
     pub(crate) fn live_connections(&self, instance: &PluginInstanceId) -> usize {
         self.connections.live(instance)
+    }
+
+    /// The instance's current operator grant: the `egress_hosts` and
+    /// `egress_allow_private` lists the canonical config resolves to right now.
+    ///
+    /// A denial remedy uses this so the command it prints carries every entry
+    /// the operator already has: `config set` replaces a whole list, so a
+    /// remedy built from the denied host alone would silently revoke the rest.
+    /// `None` when the policy cannot be resolved; the caller must then avoid
+    /// printing a replacement list at all.
+    #[cfg(feature = "plugins-wasmtime")]
+    pub(crate) fn current_grant(&self, scope: &PluginInstanceScope) -> Option<GrantLists> {
+        self.resolver.resolve(scope).ok().map(|policy| GrantLists {
+            hosts: policy.hosts,
+            allow_private: policy.allow_private,
+        })
     }
 
     fn resolve_policy(&self, request: &EgressRequest) -> Result<EgressPolicy, EgressError> {
