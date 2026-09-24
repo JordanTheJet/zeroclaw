@@ -2,6 +2,8 @@
 
 pub mod model;
 pub mod sqlite;
+#[cfg(any(test, feature = "test-util"))]
+pub mod testing;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};

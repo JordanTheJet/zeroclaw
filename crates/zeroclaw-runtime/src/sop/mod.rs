@@ -32,12 +32,14 @@ pub use capability::{
     CapabilityContext, CapabilityInfo, CapabilityResult, SopCapability, SopCapabilityRegistry,
 };
 pub use engine::{
-    CancelOutcome, MaintenanceSummary, SopEngine, err_is_cancellation_persistence_retained,
-    err_is_resume_at_capacity, err_is_terminal_persistence_retained,
+    CancelOutcome, MaintenanceSummary, OrphanedRunSettlement, SopEngine,
+    err_is_cancellation_persistence_retained, err_is_resume_at_capacity,
+    err_is_terminal_persistence_retained,
 };
 pub use executor::{
-    SopDriverHandles, SopDriverRegistry, SopDriverSink, admit_sop_driver,
-    drive_resumed_broker_action, spawn_and_register_sop_driver, spawn_headless_run_driver,
+    RegisteredSopDriver, SopDriverHandles, SopDriverRegistry, SopDriverSink, admit_sop_driver,
+    admit_sop_driver_for_run, drive_resumed_broker_action, spawn_and_register_sop_driver,
+    spawn_headless_run_driver,
 };
 pub use graph::{
     FlowRole, GraphDiagnostic, GraphLayout, GraphLegend, GraphNode, GraphPin, GraphSeverity,

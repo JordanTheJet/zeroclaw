@@ -5981,6 +5981,10 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
             // generation adopts them instead of the process losing track of a
             // task that is still doing work under superseded config.
             let mut carried_sop_drivers: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+            // Runs whose aborted driver the previous generation could not settle.
+            // The next engine restores them as active, so it has to own their
+            // terminal write too; see `SopDriverTeardown::unsettled_runs`.
+            let mut carried_unsettled_sop_runs: Vec<String> = Vec::new();
             loop {
                 if startup_feedback_enabled && daemon::stderr_is_interactive_foreground() {
                     let mut stderr = std::io::stderr().lock();
@@ -6017,8 +6021,36 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                         mem,
                         sop_adapters,
                     );
+                    let unsettled = std::mem::take(&mut carried_unsettled_sop_runs);
+                    if !unsettled.is_empty() {
+                        let mut guard = match engine.lock() {
+                            Ok(guard) => guard,
+                            Err(poisoned) => poisoned.into_inner(),
+                        };
+                        guard.adopt_orphaned_run_settlements(unsettled.into_iter().map(|run_id| {
+                            (
+                                run_id,
+                                zeroclaw_runtime::sop::OrphanedRunSettlement::DriverAborted,
+                            )
+                        }));
+                    }
                     (Some(engine), Some(audit))
                 } else {
+                    let unsettled = std::mem::take(&mut carried_unsettled_sop_runs);
+                    if !unsettled.is_empty() {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Fail
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({ "run_ids": unsettled })),
+                            "SOP runtime is disabled after reload, so runs whose driver was \
+                             aborted at teardown cannot be settled; they stay Running in the \
+                             store until the SOP runtime is enabled again"
+                        );
+                    }
                     (None, None)
                 };
 
@@ -6665,7 +6697,9 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                     // Anything still running is carried into the next
                     // generation rather than detached, so a driver that has not
                     // yet reached an await point stays owned and observable.
-                    carried_sop_drivers = supervisor.shutdown().await;
+                    let teardown = supervisor.shutdown().await;
+                    carried_sop_drivers = teardown.still_running;
+                    carried_unsettled_sop_runs = teardown.unsettled_runs;
                 }
                 let exit = exit?;
                 match exit {
@@ -10628,6 +10662,20 @@ struct SopMaintenance {
     ticker: tokio::task::JoinHandle<()>,
 }
 
+/// What one generation's driver teardown hands to the next generation.
+#[cfg(feature = "agent-runtime")]
+struct SopDriverTeardown {
+    /// Drivers aborted but not yet stopped; the next generation adopts them
+    /// (see [`SopDriverSupervisor::carried`]).
+    still_running: Vec<tokio::task::JoinHandle<()>>,
+    /// Runs whose driver was aborted but whose terminal write could not be
+    /// made here: the store refused it, or a straggler still held the engine.
+    /// Their durable rows are still `Running`, so the next generation's engine
+    /// restores them; it adopts these so its maintenance owns the settlement
+    /// instead of renewing a claim nothing will release.
+    unsettled_runs: Vec<String>,
+}
+
 /// One daemon generation's headless-driver supervisor. Every driver the
 /// generation starts — a cron tick, channel ingress, or an approval resume —
 /// registers in `drivers`, and teardown drains the set before the loop
@@ -10696,7 +10744,7 @@ impl SopDriverSupervisor {
     /// yield** — the caller cannot assume a clean boundary, only a tracked one.
     /// Empty on every ordinary shutdown.
     #[must_use]
-    async fn shutdown(self) -> Vec<tokio::task::JoinHandle<()>> {
+    async fn shutdown(self) -> SopDriverTeardown {
         self.shutdown_with_deadlines(SOP_DRIVER_DRAIN_TIMEOUT, SOP_DRIVER_ABORT_JOIN_TIMEOUT)
             .await
     }
@@ -10708,7 +10756,7 @@ impl SopDriverSupervisor {
         self,
         drain_timeout: std::time::Duration,
         abort_join_timeout: std::time::Duration,
-    ) -> Vec<tokio::task::JoinHandle<()>> {
+    ) -> SopDriverTeardown {
         // Adopted from an earlier generation: already aborted, so they are
         // re-checked rather than re-waited. Anything still running is handed
         // forward again below.
@@ -10728,11 +10776,14 @@ impl SopDriverSupervisor {
         // instead of landing in a vector this generation will never drain
         // again.
         let mut pending = match self.drivers.lock() {
-            Ok(mut drivers) => drivers.close_and_take(),
-            Err(poisoned) => poisoned.into_inner().close_and_take(),
+            Ok(mut drivers) => drivers.close_and_take_owned(),
+            Err(poisoned) => poisoned.into_inner().close_and_take_owned(),
         };
         if pending.is_empty() {
-            return still_running;
+            return SopDriverTeardown {
+                still_running,
+                unsettled_runs: Vec::new(),
+            };
         }
         // A cursor, not an iterator: when the drain deadline fires mid-loop the
         // abort arm below has to resume where this one stopped. Awaiting a
@@ -10743,13 +10794,16 @@ impl SopDriverSupervisor {
         let mut joined_upto = 0usize;
         let drained = tokio::time::timeout(drain_timeout, async {
             while joined_upto < pending.len() {
-                let _ = (&mut pending[joined_upto]).await;
+                let _ = (&mut pending[joined_upto].handle).await;
                 joined_upto += 1;
             }
         })
         .await;
         if drained.is_ok() {
-            return still_running;
+            return SopDriverTeardown {
+                still_running,
+                unsettled_runs: Vec::new(),
+            };
         }
         // `abort` only *requests* cancellation: the task stops at its next
         // await point, which is after this call returns. Joining the aborted
@@ -10761,12 +10815,13 @@ impl SopDriverSupervisor {
         // Only the handles the drain did not consume: the ones before the
         // cursor already resolved, and both aborting and re-awaiting them is
         // either a no-op or a panic.
-        for driver in &pending[joined_upto..] {
-            driver.abort();
+        let aborted_from = joined_upto;
+        for driver in &pending[aborted_from..] {
+            driver.handle.abort();
         }
         let joined = tokio::time::timeout(abort_join_timeout, async {
             while joined_upto < pending.len() {
-                let _ = (&mut pending[joined_upto]).await;
+                let _ = (&mut pending[joined_upto].handle).await;
                 joined_upto += 1;
             }
         })
@@ -10783,7 +10838,57 @@ impl SopDriverSupervisor {
             "SOP cron drivers did not finish before the drain deadline; aborted them so the next \
              daemon generation does not overlap superseded configuration"
         );
-        still_running.extend(pending.into_iter().filter(|driver| !driver.is_finished()));
+        // Every aborted driver leaves its run `Running` and claimed with nothing
+        // to advance it, and the next generation restores active runs without
+        // starting drivers for them. Settle each one here, before that engine is
+        // built from the same store. `try_lock`, not `lock`: a straggler that has
+        // not reached an await point may hold the engine, and waiting on it
+        // would wedge the reload. A run that cannot be settled now is handed to
+        // the next generation, whose maintenance owns the retry.
+        let mut unsettled_runs = Vec::new();
+        for driver in &pending[aborted_from..] {
+            let Some((run_id, engine)) = driver.run.as_ref() else {
+                continue;
+            };
+            let settled = match engine.try_lock() {
+                Ok(mut guard) => guard
+                    .settle_orphaned_run(
+                        run_id,
+                        zeroclaw_runtime::sop::OrphanedRunSettlement::DriverAborted,
+                    )
+                    .map_err(|e| e.to_string()),
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned
+                    .into_inner()
+                    .settle_orphaned_run(
+                        run_id,
+                        zeroclaw_runtime::sop::OrphanedRunSettlement::DriverAborted,
+                    )
+                    .map_err(|e| e.to_string()),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    Err("the engine is still held by a driver that has not stopped".to_string())
+                }
+            };
+            if let Err(error) = settled {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "run_id": run_id,
+                            "error": error,
+                        })),
+                    "Could not settle a SOP run whose driver was aborted at teardown; the next \
+                     generation's maintenance takes over the terminal write"
+                );
+                unsettled_runs.push(run_id.clone());
+            }
+        }
+        still_running.extend(
+            pending
+                .into_iter()
+                .filter(|driver| !driver.handle.is_finished())
+                .map(|driver| driver.handle),
+        );
         if !still_running.is_empty() {
             ::zeroclaw_log::record!(
                 WARN,
@@ -10799,7 +10904,10 @@ impl SopDriverSupervisor {
                  stay tracked rather than detached"
             );
         }
-        still_running
+        SopDriverTeardown {
+            still_running,
+            unsettled_runs,
+        }
     }
 }
 
@@ -14392,6 +14500,243 @@ mod tests {
         cron_sop_harness_with(owner, false).await
     }
 
+    #[cfg(feature = "agent-runtime")]
+    fn orphaned_run_sop(name: &str) -> zeroclaw_runtime::sop::Sop {
+        use zeroclaw_runtime::sop::{
+            Sop, SopExecutionMode, SopPriority, SopStep, SopStepKind, SopTrigger,
+        };
+        Sop {
+            name: name.into(),
+            description: "orphaned-run regression".into(),
+            version: "0.1.0".into(),
+            execution_mode: SopExecutionMode::Auto,
+            priority: SopPriority::Normal,
+            triggers: vec![SopTrigger::Manual],
+            steps: vec![SopStep {
+                number: 1,
+                title: "Step one".into(),
+                body: "Do step one".into(),
+                suggested_tools: vec![],
+                requires_confirmation: false,
+                kind: SopStepKind::default(),
+                schema: None,
+                ..SopStep::default()
+            }],
+            cooldown_secs: 0,
+            max_concurrent: 2,
+            location: None,
+            deterministic: false,
+            admission_policy: zeroclaw_runtime::sop::types::SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
+            agent: None,
+        }
+    }
+
+    /// Start one run on `store` and return the engine holding it plus its id.
+    #[cfg(feature = "agent-runtime")]
+    fn engine_with_one_running_run(
+        name: &str,
+        store: std::sync::Arc<dyn zeroclaw_runtime::sop::SopRunStore>,
+    ) -> (
+        std::sync::Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>,
+        String,
+    ) {
+        let mut engine =
+            zeroclaw_runtime::sop::SopEngine::new(zeroclaw_config::schema::SopConfig::default())
+                .with_store(store);
+        engine.set_sops_for_test(vec![orphaned_run_sop(name)]);
+        let action = engine
+            .start_run(
+                name,
+                zeroclaw_runtime::sop::SopEvent {
+                    source: zeroclaw_runtime::sop::SopTriggerSource::Manual,
+                    topic: None,
+                    payload: None,
+                    timestamp: "2026-09-24T00:00:00Z".into(),
+                },
+            )
+            .expect("the run starts");
+        let run_id = match &action {
+            zeroclaw_runtime::sop::SopRunAction::ExecuteStep { run_id, .. } => run_id.clone(),
+            other => panic!("expected the run to be ready for a driver, got {other:?}"),
+        };
+        (std::sync::Arc::new(std::sync::Mutex::new(engine)), run_id)
+    }
+
+    /// A reload that has to abort a driver mid-step must not strand its run.
+    ///
+    /// The aborted driver leaves the run `Running` and claimed, and the next
+    /// generation restores active runs without starting drivers for them. This
+    /// uses the SQLite store the daemon runs on and rebuilds the replacement
+    /// engine from the same database, because in-memory cleanup alone would
+    /// leave the durable row restorable: the run has to be terminal on disk,
+    /// with its claim released, before the next generation reads it.
+    #[tokio::test]
+    #[cfg(feature = "agent-runtime")]
+    async fn an_aborted_driver_settles_its_run_before_the_next_generation_restores_it() {
+        use zeroclaw_runtime::sop::SopRunStore as _;
+        use zeroclaw_runtime::sop::types::SopRunStatus;
+
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let db = tmp.path().join("sop-runs.db");
+        let name = "aborted-driver";
+        let store =
+            std::sync::Arc::new(zeroclaw_runtime::sop::SqliteRunStore::open(&db).expect("store"));
+        let (engine, run_id) = engine_with_one_running_run(name, store.clone());
+        assert_eq!(
+            store.claim_counts(name).unwrap().0,
+            1,
+            "the run holds a claim"
+        );
+
+        // A driver mid-step that will not finish on its own.
+        let drivers = SopDriverSet::default();
+        assert!(zeroclaw_runtime::sop::admit_sop_driver_for_run(
+            &drivers,
+            &run_id,
+            &engine,
+            || ::zeroclaw_spawn::spawn!(std::future::pending::<()>()),
+        ));
+
+        let teardown = SopDriverSupervisor {
+            drivers,
+            carried: Vec::new(),
+        }
+        .shutdown_with_deadlines(
+            std::time::Duration::from_millis(20),
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+        assert!(
+            teardown.still_running.is_empty(),
+            "the aborted driver stopped"
+        );
+        assert!(
+            teardown.unsettled_runs.is_empty(),
+            "the run was settled at teardown, so nothing is handed on"
+        );
+
+        {
+            let guard = engine.lock().unwrap();
+            assert!(!guard.active_runs().contains_key(&run_id));
+            assert_eq!(
+                guard.get_run(&run_id).unwrap().status,
+                SopRunStatus::Failed,
+                "a step that was underway and did not finish is recorded as failed"
+            );
+        }
+        assert_eq!(
+            store.claim_counts(name).unwrap().0,
+            0,
+            "settlement released the claim"
+        );
+        assert!(
+            store
+                .list_events(&run_id)
+                .unwrap()
+                .iter()
+                .any(|event| event.kind == "run_driver_aborted"),
+            "the durable record says why the run ended"
+        );
+
+        // The replacement generation opens the same database.
+        let reopened =
+            std::sync::Arc::new(zeroclaw_runtime::sop::SqliteRunStore::open(&db).expect("store"));
+        let mut rebuilt =
+            zeroclaw_runtime::sop::SopEngine::new(zeroclaw_config::schema::SopConfig::default())
+                .with_store(reopened.clone());
+        rebuilt.set_sops_for_test(vec![orphaned_run_sop(name)]);
+        rebuilt.restore_runs();
+        assert!(
+            !rebuilt.active_runs().contains_key(&run_id),
+            "the next generation must not restore a settled run as active"
+        );
+        rebuilt.run_maintenance_tick();
+        assert_eq!(
+            reopened.claim_counts(name).unwrap().0,
+            0,
+            "and nothing renews a claim for it"
+        );
+    }
+
+    /// When the terminal write at teardown fails, the run is still `Running` on
+    /// disk and the next generation restores it with a renewed claim. That
+    /// generation must take over the settlement rather than hold the claim
+    /// forever with no driver.
+    #[tokio::test]
+    #[cfg(feature = "agent-runtime")]
+    async fn a_run_teardown_could_not_settle_is_settled_by_the_next_generation() {
+        use zeroclaw_runtime::sop::SopRunStore as _;
+        use zeroclaw_runtime::sop::store::testing::FailFirstTerminalWrite;
+        use zeroclaw_runtime::sop::types::SopRunStatus;
+
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let db = tmp.path().join("sop-runs.db");
+        let name = "unsettled-at-teardown";
+        let store = std::sync::Arc::new(FailFirstTerminalWrite::new(
+            zeroclaw_runtime::sop::SqliteRunStore::open(&db).expect("store"),
+        ));
+        let (engine, run_id) = engine_with_one_running_run(name, store.clone());
+
+        let drivers = SopDriverSet::default();
+        assert!(zeroclaw_runtime::sop::admit_sop_driver_for_run(
+            &drivers,
+            &run_id,
+            &engine,
+            || ::zeroclaw_spawn::spawn!(std::future::pending::<()>()),
+        ));
+        let teardown = SopDriverSupervisor {
+            drivers,
+            carried: Vec::new(),
+        }
+        .shutdown_with_deadlines(
+            std::time::Duration::from_millis(20),
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+        assert!(
+            store.fired(),
+            "the teardown's terminal write was the one that failed"
+        );
+        assert_eq!(
+            teardown.unsettled_runs,
+            vec![run_id.clone()],
+            "a run teardown could not settle is handed to the next generation"
+        );
+        assert_eq!(
+            store.claim_counts(name).unwrap().0,
+            1,
+            "still claimed on disk"
+        );
+
+        // The next generation, as the daemon loop builds it: a fresh engine on
+        // the same store that restores active runs, then adopts the hand-off.
+        let mut next =
+            zeroclaw_runtime::sop::SopEngine::new(zeroclaw_config::schema::SopConfig::default())
+                .with_store(store.clone());
+        next.set_sops_for_test(vec![orphaned_run_sop(name)]);
+        next.restore_runs();
+        assert!(
+            next.active_runs().contains_key(&run_id),
+            "the unsettled row restores as active"
+        );
+        next.adopt_orphaned_run_settlements(teardown.unsettled_runs.into_iter().map(|run_id| {
+            (
+                run_id,
+                zeroclaw_runtime::sop::OrphanedRunSettlement::DriverAborted,
+            )
+        }));
+        let summary = next.run_maintenance_tick();
+        assert_eq!(summary.settled_orphaned_runs, 1);
+        assert!(!next.active_runs().contains_key(&run_id));
+        assert_eq!(next.get_run(&run_id).unwrap().status, SopRunStatus::Failed);
+        assert_eq!(
+            store.claim_counts(name).unwrap().0,
+            0,
+            "the next generation released the claim instead of renewing it"
+        );
+    }
+
     /// `calls_tool`: the model asks for one tool before answering, so a test can
     /// assert on what the step recorded having run.
     #[cfg(feature = "agent-runtime")]
@@ -15051,7 +15396,7 @@ mod tests {
             "shutdown returned while an aborted driver was still running"
         );
         assert!(
-            carried.is_empty(),
+            carried.still_running.is_empty(),
             "a driver that stopped on abort has nothing to carry forward"
         );
     }
@@ -15156,7 +15501,7 @@ mod tests {
         .await;
 
         assert_eq!(
-            carried.len(),
+            carried.still_running.len(),
             1,
             "only the driver that outlived the grace is carried; the one the drain \
              already joined must not be awaited a second time"
@@ -15192,7 +15537,7 @@ mod tests {
         .await;
 
         assert_eq!(
-            carried.len(),
+            carried.still_running.len(),
             1,
             "a driver still running when the join grace expired must be carried, not detached"
         );
@@ -15206,7 +15551,7 @@ mod tests {
         let adopted_at = std::time::Instant::now();
         let still_carried = SopDriverSupervisor {
             drivers: SopDriverSet::default(),
-            carried,
+            carried: carried.still_running,
         }
         .shutdown_with_deadlines(
             std::time::Duration::from_millis(50),
@@ -15215,7 +15560,7 @@ mod tests {
         .await;
 
         assert_eq!(
-            still_carried.len(),
+            still_carried.still_running.len(),
             1,
             "an adopted driver that is still running stays carried"
         );
@@ -15252,7 +15597,7 @@ mod tests {
         .shutdown()
         .await;
         assert!(
-            carried.is_empty(),
+            carried.still_running.is_empty() && carried.unsettled_runs.is_empty(),
             "a generation with no drivers drains clean"
         );
         assert!(
@@ -15337,7 +15682,7 @@ mod tests {
         .shutdown()
         .await;
         assert!(
-            carried.is_empty(),
+            carried.still_running.is_empty() && carried.unsettled_runs.is_empty(),
             "the admitted driver finished well inside the drain"
         );
         assert!(

@@ -275,8 +275,31 @@ pub(crate) async fn drive_shared_deterministic_run(
 /// registration fail instead.
 #[derive(Debug, Default)]
 pub struct SopDriverRegistry {
-    drivers: Vec<tokio::task::JoinHandle<()>>,
+    drivers: Vec<RegisteredSopDriver>,
     closed: bool,
+}
+
+/// One driver a generation owns, with the run it drives when that is known.
+///
+/// The run is what teardown needs when it has to abort a driver: the task
+/// handle alone cannot say which durable run was left `Running` and claimed
+/// with nothing to advance it. A driver admitted without a run (a test, or a
+/// caller with no single run) is still owned and drained; it just has nothing
+/// to settle.
+pub struct RegisteredSopDriver {
+    /// The driver task.
+    pub handle: tokio::task::JoinHandle<()>,
+    /// The run this driver advances, and the engine that holds it.
+    pub run: Option<(String, Arc<Mutex<SopEngine>>)>,
+}
+
+impl std::fmt::Debug for RegisteredSopDriver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RegisteredSopDriver")
+            .field("finished", &self.handle.is_finished())
+            .field("run_id", &self.run.as_ref().map(|(run_id, _)| run_id))
+            .finish()
+    }
 }
 
 impl SopDriverRegistry {
@@ -302,6 +325,16 @@ impl SopDriverRegistry {
     /// operation deliberately: a caller that took the handles without closing
     /// would leave later registrations landing in a set it no longer drains.
     pub fn close_and_take(&mut self) -> Vec<tokio::task::JoinHandle<()>> {
+        self.close_and_take_owned()
+            .into_iter()
+            .map(|driver| driver.handle)
+            .collect()
+    }
+
+    /// [`Self::close_and_take`], keeping each driver's run. The teardown that
+    /// may have to abort a driver uses this, so it can settle the run the
+    /// aborted driver will never advance.
+    pub fn close_and_take_owned(&mut self) -> Vec<RegisteredSopDriver> {
         self.closed = true;
         std::mem::take(&mut self.drivers)
     }
@@ -458,6 +491,35 @@ pub fn admit_sop_driver<F>(handles: &SopDriverHandles, spawn: F) -> bool
 where
     F: FnOnce() -> tokio::task::JoinHandle<()>,
 {
+    admit_driver(handles, None, spawn)
+}
+
+/// [`admit_sop_driver`] for a driver that advances one known run, recorded so
+/// a teardown that has to abort the driver can settle that run.
+pub fn admit_sop_driver_for_run<F>(
+    handles: &SopDriverHandles,
+    run_id: &str,
+    engine: &Arc<Mutex<SopEngine>>,
+    spawn: F,
+) -> bool
+where
+    F: FnOnce() -> tokio::task::JoinHandle<()>,
+{
+    admit_driver(
+        handles,
+        Some((run_id.to_string(), Arc::clone(engine))),
+        spawn,
+    )
+}
+
+fn admit_driver<F>(
+    handles: &SopDriverHandles,
+    run: Option<(String, Arc<Mutex<SopEngine>>)>,
+    spawn: F,
+) -> bool
+where
+    F: FnOnce() -> tokio::task::JoinHandle<()>,
+{
     let mut guard = match handles.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
@@ -472,8 +534,11 @@ where
         );
         return false;
     }
-    guard.drivers.retain(|existing| !existing.is_finished());
-    guard.drivers.push(spawn());
+    guard
+        .drivers
+        .retain(|existing| !existing.handle.is_finished());
+    let handle = spawn();
+    guard.drivers.push(RegisteredSopDriver { handle, run });
     true
 }
 
@@ -504,8 +569,9 @@ pub fn spawn_and_register_sop_driver(
         return false;
     };
     let engine_for_refusal = Arc::clone(&engine);
-    let admitted = admit_sop_driver(handles, move || {
-        spawn_leased_driver(config, engine, audit, first_action, lease)
+    let engine_for_spawn = Arc::clone(&engine);
+    let admitted = admit_sop_driver_for_run(handles, &run_id, &engine, move || {
+        spawn_leased_driver(config, engine_for_spawn, audit, first_action, lease)
     });
     if !admitted {
         settle_refused_run(&engine_for_refusal, &run_id);
@@ -532,7 +598,13 @@ fn settle_refused_run(engine: &Arc<Mutex<SopEngine>>, run_id: &str) {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     };
-    if let Err(e) = guard.settle_run_for_drained_generation(run_id) {
+    // Through the owning path: if this terminal write fails, the engine keeps
+    // the run for maintenance to settle again. No driver was admitted, so
+    // nothing else would ever make that write.
+    if let Err(e) = guard.settle_orphaned_run(
+        run_id,
+        crate::sop::engine::OrphanedRunSettlement::DrainedBeforeAdmission,
+    ) {
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
@@ -541,8 +613,8 @@ fn settle_refused_run(engine: &Arc<Mutex<SopEngine>>, run_id: &str) {
                     "run_id": run_id,
                     "error": e.to_string(),
                 })),
-            "Could not settle a SOP run whose driver was refused; it stays active and will be \
-             retried by the next terminal write rather than silently dropped"
+            "Could not settle a SOP run whose driver was refused; it stays active and SOP \
+             maintenance retries the terminal write until it lands"
         );
     }
 }
@@ -1233,6 +1305,75 @@ mod tests {
     /// This drives the real approval producer against a closed generation and
     /// then rebuilds the engine from the same store, because removing only the
     /// in-memory run would leave the persisted row restorable.
+    /// The failure path of settling a refused driver's run. If the terminal
+    /// write fails, no driver exists to make it again, so the run would stay
+    /// `Running` and claimed indefinitely. The engine must keep ownership of the
+    /// retry, and the next maintenance pass must land it: terminal status and
+    /// the execution claim released.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refused_run_whose_settlement_fails_is_settled_by_maintenance() {
+        use crate::sop::store::testing::FailFirstTerminalWrite;
+
+        let store = Arc::new(FailFirstTerminalWrite::new(InMemoryRunStore::new()));
+        let sop_name = "refused-retry";
+        let mut engine = SopEngine::new(SopConfig::default()).with_store(store.clone());
+        engine.set_sops_for_test(vec![test_sop(sop_name)]);
+        let action = engine.start_run(sop_name, manual_event()).unwrap();
+        let run_id = extract_run_id(&action);
+        assert_eq!(store.claim_counts(sop_name).unwrap().0, 1);
+
+        // The generation drained before this driver could be admitted.
+        let handles = SopDriverHandles::default();
+        handles.lock().unwrap().close_and_take();
+        let engine = Arc::new(Mutex::new(engine));
+        let admitted = spawn_and_register_sop_driver(
+            &handles,
+            zeroclaw_config::schema::Config::default(),
+            Arc::clone(&engine),
+            None,
+            action,
+        );
+        assert!(!admitted, "a drained generation refuses the driver");
+        assert!(
+            store.fired(),
+            "the settlement's terminal write was the one that failed"
+        );
+
+        {
+            let guard = engine.lock().unwrap();
+            assert_eq!(
+                guard.get_run(&run_id).unwrap().status,
+                SopRunStatus::Running,
+                "the failed write leaves the run active"
+            );
+            assert!(
+                guard.has_pending_orphan_settlement(&run_id),
+                "but the engine now owns the retry, so it is not abandoned"
+            );
+        }
+        assert_eq!(store.claim_counts(sop_name).unwrap().0, 1);
+
+        let summary = engine.lock().unwrap().run_maintenance_tick();
+        assert_eq!(
+            summary.settled_orphaned_runs, 1,
+            "maintenance lands the retry"
+        );
+        let guard = engine.lock().unwrap();
+        assert!(!guard.active_runs().contains_key(&run_id));
+        assert_eq!(
+            guard.get_run(&run_id).unwrap().status,
+            SopRunStatus::Cancelled,
+            "settled through the normal terminal path"
+        );
+        assert!(!guard.has_pending_orphan_settlement(&run_id));
+        drop(guard);
+        assert_eq!(
+            store.claim_counts(sop_name).unwrap().0,
+            0,
+            "the terminal write releases the execution claim"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_refused_driver_settles_the_run_it_would_have_advanced() {
         let store = Arc::new(InMemoryRunStore::new());
