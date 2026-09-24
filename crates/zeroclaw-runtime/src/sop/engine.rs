@@ -100,6 +100,18 @@ pub struct SopEngine {
     /// until maintenance can persist the terminal `Failed` transition. This set
     /// creates the safe-boundary fact; it does not duplicate durable run state.
     step_budget_finalization_ready: std::collections::HashSet<String>,
+    /// Run IDs currently owned by a headless driver task. A resumed action can
+    /// be scheduled from several surfaces (HTTP approve, WS, channel, RPC), and
+    /// two drivers over one run execute the same step twice and hand the engine
+    /// two results for it. The lease is process-local like the driver itself;
+    /// the durable run state is unaffected by it.
+    headless_drivers: std::collections::HashSet<String>,
+    /// Process-local retry ownership for runs no driver will ever advance
+    /// whose first terminal write failed. Without it a transient store error
+    /// leaves the run `Running` and claimed with nobody to write the terminal
+    /// state again; maintenance consumes this map until the write lands. The
+    /// durable run row stays the source of truth for status.
+    pending_orphan_settlements: std::collections::HashMap<String, OrphanedRunSettlement>,
 }
 
 /// Cap on the in-memory per-message dispatch-dedup window (`SopEngine::dispatch_dedup`).
@@ -128,6 +140,10 @@ pub struct MaintenanceSummary {
     pub finalized_cancellations: usize,
     /// Step-budget failures terminalized after an earlier store failure.
     pub finalized_step_budget_failures: usize,
+    /// Runs no driver will ever advance (refused at a drained generation, or
+    /// whose driver a reload aborted) terminalized on a retry after the first
+    /// terminal write failed.
+    pub settled_orphaned_runs: usize,
     /// Timeout actions produced. Mostly self-applied (`Escalate` re-stamps,
     /// `Cancel` finalizes); an opt-in `AutoApprove` yields a resumed `ExecuteStep`
     /// the caller logs until EPIC A2's live executor exists.
@@ -142,7 +158,24 @@ impl MaintenanceSummary {
             && self.pruned_runs == 0
             && self.finalized_cancellations == 0
             && self.finalized_step_budget_failures == 0
+            && self.settled_orphaned_runs == 0
     }
+}
+
+/// Why a run is waiting on a terminal write that no driver will ever make.
+///
+/// Both cases are runs the engine still holds as active, with an execution
+/// claim, but that nothing is left to advance. Each settles through the normal
+/// claim-releasing terminal path; the kind only decides the terminal status and
+/// the durable event that explains it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrphanedRunSettlement {
+    /// The generation that started the run drained before a driver was
+    /// admitted for it. Settled `Cancelled`: the work was withdrawn, not tried.
+    DrainedBeforeAdmission,
+    /// A reload aborted the run's driver mid-drive. Settled `Failed`: the step
+    /// was underway and did not finish.
+    DriverAborted,
 }
 
 #[derive(Debug)]
@@ -337,6 +370,8 @@ impl SopEngine {
             claims_retained_after_terminal_rollback: std::collections::HashSet::new(),
             cancellation_finalization_ready: std::collections::HashSet::new(),
             step_budget_finalization_ready: std::collections::HashSet::new(),
+            headless_drivers: std::collections::HashSet::new(),
+            pending_orphan_settlements: std::collections::HashMap::new(),
         }
     }
 
@@ -508,6 +543,13 @@ impl SopEngine {
                 let mut replay_parked_requests = Vec::new();
                 let mut finalize_cancel_requests = Vec::new();
                 for pr in runs {
+                    // A run this engine already holds is live state; the stored
+                    // snapshot is at best equal to it and usually older. Keep
+                    // the in-memory run so a repeated restore cannot rewind a
+                    // run to an earlier step or drop its recorded step results.
+                    if self.active_runs.contains_key(&pr.run.run_id) {
+                        continue;
+                    }
                     // A1: a run persisted while parked at a HITL approval / paused at
                     // a deterministic checkpoint normally holds NO exec claim - it
                     // released its slot on park. Restore it WITHOUT re-establishing a
@@ -1801,13 +1843,31 @@ impl SopEngine {
     }
 
     pub fn start_run(&mut self, sop_name: &str, event: SopEvent) -> Result<SopRunAction> {
+        self.start_run_owned(sop_name, event, None)
+    }
+
+    /// [`Self::start_run`] for a run started INSIDE an agent turn, recording that
+    /// agent on the run.
+    ///
+    /// An unowned procedure borrows its owner from the calling turn, which is
+    /// enough right up until the run parks at an approval: the approved step
+    /// resumes on the headless driver, with no turn to borrow from. Recording
+    /// the initiator here is what lets that resume still run as the agent that
+    /// started it. `None` for every headless trigger, which has no initiating
+    /// turn to record.
+    pub fn start_run_owned(
+        &mut self,
+        sop_name: &str,
+        event: SopEvent,
+        initiator: Option<&str>,
+    ) -> Result<SopRunAction> {
         // A start is a two-phase operation: reserve the exec slot through the
         // authoritative store CAS (no side effect yet), then activate the reserved
         // slot into a live run and dispatch its first step. The phases are split so the
         // AMQP multi-match path can reserve the WHOLE matched batch before activating
         // any of it (see `dispatch`). A single start runs both phases back-to-back.
         let reservation = self.reserve_run_slot(sop_name)?;
-        self.activate_reserved_run(reservation, event)
+        self.activate_reserved_run(reservation, event, initiator)
     }
 
     /// Phase 1 of a start: reserve `sop_name`'s exec slot through the authoritative
@@ -1879,6 +1939,7 @@ impl SopEngine {
         &mut self,
         reservation: StartReservation,
         event: SopEvent,
+        initiator: Option<&str>,
     ) -> Result<SopRunAction> {
         let StartReservation {
             run_id,
@@ -1890,6 +1951,7 @@ impl SopEngine {
         let run = SopRun {
             run_id: run_id.clone(),
             sop_name: sop.name.clone(),
+            initiating_agent: initiator.map(str::to_string),
             trigger_event: event,
             frame_marker_id: new_marker_id(),
             status: SopRunStatus::Running,
@@ -1965,6 +2027,42 @@ impl SopEngine {
                      `resolve_gate` (WaitingApproval) or `approve_step` (PausedCheckpoint) \
                      before advancing with sop_advance",
                     run.status
+                );
+            }
+            // A result belongs to the step that produced it. The run may have
+            // moved on since that step was dispatched (a duplicate driver, a
+            // stale engine copy, a retry that already re-ran the step), and
+            // validating a late result against whatever step the run is on now
+            // rejects or promotes the wrong step and misattributes the record.
+            // Refuse it instead of routing it.
+            if result.step_number != run.current_step {
+                let expected = run.current_step;
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "run_id": run_id,
+                            "current_step": expected,
+                            "result_step": result.step_number,
+                        })),
+                    "SOP engine: advance_step rejected — result is for a step the run is not on"
+                );
+                self.record_transition_event(
+                    run_id,
+                    "step_result_stale",
+                    Some(format!(
+                        "result for step {} arrived while the run is on step {expected}",
+                        result.step_number
+                    )),
+                    ::serde_json::json!({
+                        "step": result.step_number,
+                        "current_step": expected,
+                    }),
+                );
+                bail!(
+                    "Run {run_id} is on step {expected}; a result for step {} cannot advance it",
+                    result.step_number
                 );
             }
             (run.sop_name.clone(), run.current_step)
@@ -2976,6 +3074,201 @@ impl SopEngine {
                 Ok(Some(CancelOutcome::AlreadyTerminal(status)))
             }
         }
+    }
+
+    /// Settle a run whose driver was refused because the generation that owned
+    /// it had already drained.
+    ///
+    /// Deliberately not [`Self::cancel_run_idempotent`]. That path is
+    /// cooperative: a `Running` run becomes `CancelRequested` and stays active
+    /// and claimed until a driver reaches its next boundary. This is the one
+    /// case where no driver exists and none ever will, so waiting for a
+    /// boundary is precisely the stall this prevents. The run therefore goes
+    /// terminal immediately, through the same persistence path a normal
+    /// cancellation uses — which is what releases the execution claim and stops
+    /// a later engine rebuild from restoring it as `Running` and renewing the
+    /// claim forever.
+    ///
+    /// `Cancelled` rather than `Failed`: the work was withdrawn before it ran,
+    /// not attempted and failed. The reason travels on the durable
+    /// `run_generation_drained` event rather than `failure_reason`, which the
+    /// terminal path stamps only for genuine failures.
+    ///
+    /// Returns the status the run held before it was settled, or `None` when no
+    /// active run carries this id — already terminal, or never started.
+    pub fn settle_run_for_drained_generation(
+        &mut self,
+        run_id: &str,
+    ) -> Result<Option<SopRunStatus>> {
+        let Some((prior, current_step)) = self
+            .active_runs
+            .get(run_id)
+            .map(|run| (run.status, run.current_step))
+        else {
+            return Ok(None);
+        };
+        let reason = "the daemon generation that started this run drained before its driver \
+                      was admitted, so no driver exists to advance it"
+            .to_string();
+        let event = SopEventRecord {
+            run_id: run_id.to_string(),
+            seq: 0,
+            ts: now_iso8601(),
+            kind: "run_generation_drained".to_string(),
+            actor: None,
+            reason: Some(reason.clone()),
+            payload: ::serde_json::json!({
+                "step": current_step,
+                "prior_status": prior.to_string(),
+            }),
+        };
+        self.finish_run_with_gate_event(run_id, SopRunStatus::Cancelled, Some(reason), &event)?;
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({"run_id": run_id})),
+            "Settled a SOP run as cancelled: its generation drained before the driver was \
+             admitted, so nothing would have advanced it"
+        );
+        Ok(Some(prior))
+    }
+
+    /// Settle a run whose driver a reload aborted before it finished.
+    ///
+    /// Teardown aborts a driver that overruns the drain deadline. Its run is
+    /// still `Running` and claimed, and no driver will exist for it: the
+    /// replacement generation restores active runs but does not start drivers
+    /// for them, so without this the run would hold a concurrency slot
+    /// indefinitely. It goes terminal here through the normal claim-releasing
+    /// path, `Failed` because the step was underway and did not finish, with a
+    /// durable `run_driver_aborted` event recording why. A run that had already
+    /// asked to cancel is settled `Cancelled` instead, honoring that request.
+    ///
+    /// A run parked at a gate, or already terminal, needs no settlement: parked
+    /// runs are waiting on an operator, not a driver. Returns the prior status
+    /// of a run it settled, or `None` when there was nothing to settle.
+    pub fn settle_run_for_aborted_driver(&mut self, run_id: &str) -> Result<Option<SopRunStatus>> {
+        let Some((prior, current_step)) = self
+            .active_runs
+            .get(run_id)
+            .map(|run| (run.status, run.current_step))
+        else {
+            return Ok(None);
+        };
+        let status = match prior {
+            SopRunStatus::Running => SopRunStatus::Failed,
+            SopRunStatus::CancelRequested => SopRunStatus::Cancelled,
+            _ => return Ok(None),
+        };
+        let reason = "the daemon reloaded while this run's driver was mid-step, and the \
+                      driver was aborted at the drain deadline; nothing would have advanced it"
+            .to_string();
+        let event = SopEventRecord {
+            run_id: run_id.to_string(),
+            seq: 0,
+            ts: now_iso8601(),
+            kind: "run_driver_aborted".to_string(),
+            actor: None,
+            reason: Some(reason.clone()),
+            payload: ::serde_json::json!({
+                "step": current_step,
+                "prior_status": prior.to_string(),
+            }),
+        };
+        self.finish_run_with_gate_event(run_id, status, Some(reason), &event)?;
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({
+                    "run_id": run_id,
+                    "prior_status": prior.to_string(),
+                })),
+            "Settled a SOP run whose driver was aborted at reload, so nothing would have \
+             advanced it"
+        );
+        Ok(Some(prior))
+    }
+
+    /// Settle a run no driver will advance, keeping ownership of the retry.
+    ///
+    /// On success any pending retry for the run is cleared. On failure the run
+    /// is recorded for [`Self::run_maintenance_tick`] to settle again, so a
+    /// transient store error cannot leave it `Running` and claimed with nobody
+    /// left to write its terminal state. The error is still returned so the
+    /// caller can report it.
+    pub fn settle_orphaned_run(
+        &mut self,
+        run_id: &str,
+        kind: OrphanedRunSettlement,
+    ) -> Result<Option<SopRunStatus>> {
+        let result = match kind {
+            OrphanedRunSettlement::DrainedBeforeAdmission => {
+                self.settle_run_for_drained_generation(run_id)
+            }
+            OrphanedRunSettlement::DriverAborted => self.settle_run_for_aborted_driver(run_id),
+        };
+        match &result {
+            Ok(_) => {
+                self.pending_orphan_settlements.remove(run_id);
+            }
+            Err(_) => {
+                self.pending_orphan_settlements
+                    .insert(run_id.to_string(), kind);
+            }
+        }
+        result
+    }
+
+    /// Hand this engine the retry for runs a previous engine could not settle.
+    ///
+    /// A reload tears down the old generation before this engine exists. If
+    /// settling an aborted driver's run failed there, the durable row is still
+    /// `Running`, and restoring it here would renew its claim with no driver
+    /// to advance it. Recording the runs here makes this engine's maintenance
+    /// the owner of that terminal write.
+    pub fn adopt_orphaned_run_settlements(
+        &mut self,
+        runs: impl IntoIterator<Item = (String, OrphanedRunSettlement)>,
+    ) {
+        self.pending_orphan_settlements.extend(runs);
+    }
+
+    /// Runs awaiting a retried terminal write, for callers and tests that need
+    /// to see whether maintenance still owns one.
+    #[must_use]
+    pub fn has_pending_orphan_settlement(&self, run_id: &str) -> bool {
+        self.pending_orphan_settlements.contains_key(run_id)
+    }
+
+    fn retry_pending_orphan_settlements(&mut self) -> usize {
+        let pending: Vec<(String, OrphanedRunSettlement)> = self
+            .pending_orphan_settlements
+            .iter()
+            .map(|(run_id, kind)| (run_id.clone(), *kind))
+            .collect();
+        let mut settled = 0;
+        for (run_id, kind) in pending {
+            match self.settle_orphaned_run(&run_id, kind) {
+                Ok(Some(_)) => settled += 1,
+                Ok(None) => {}
+                Err(error) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "run_id": run_id,
+                                "error": error.to_string(),
+                            })),
+                        "SOP maintenance: settling a run no driver will advance failed again; \
+                         it stays owned for the next pass"
+                    );
+                }
+            }
+        }
+        settled
     }
 
     pub fn approve_step(&mut self, run_id: &str) -> Result<SopRunAction> {
@@ -4028,7 +4321,7 @@ impl SopEngine {
         // Reserve + activate through the shared two-phase start path (identical run_id
         // prefix, logging, and dispatch to the pre-refactor inline body).
         let reservation = self.reserve_run_slot(sop_name)?;
-        self.activate_reserved_run(reservation, event)
+        self.activate_reserved_run(reservation, event, None)
     }
 
     pub fn drive_headless_deterministic(
@@ -5087,6 +5380,9 @@ impl SopEngine {
         self.retry_capacity_blocked_gated_pends();
         let finalized_step_budget_failures = self.retry_ready_step_budget_finalizations();
         let finalized_cancellations = self.retry_ready_cancellation_finalizations();
+        // Before the heartbeat, so a run that settles this pass releases its
+        // claim instead of having it renewed once more.
+        let settled_orphaned_runs = self.retry_pending_orphan_settlements();
         self.heartbeat_active_claims();
         let reaped_claims = self.reap_expired_claims();
         let pruned_runs = self.prune_terminal_runs();
@@ -5096,6 +5392,7 @@ impl SopEngine {
             pruned_runs,
             finalized_cancellations,
             finalized_step_budget_failures,
+            settled_orphaned_runs,
             timeout_actions,
         }
     }
@@ -5340,6 +5637,7 @@ impl SopEngine {
         self.claims_retained_after_terminal_rollback.remove(run_id);
         self.cancellation_finalization_ready.remove(run_id);
         self.step_budget_finalization_ready.remove(run_id);
+        self.pending_orphan_settlements.remove(run_id);
         self.active_runs.remove(run_id);
         self.metrics.record_run_complete(&run);
         // The park snapshot is purely a rehydration artifact: a terminal run must
@@ -5395,6 +5693,7 @@ impl SopEngine {
         self.claims_retained_after_terminal_rollback.remove(run_id);
         self.cancellation_finalization_ready.remove(run_id);
         self.step_budget_finalization_ready.remove(run_id);
+        self.pending_orphan_settlements.remove(run_id);
         self.active_runs.remove(run_id);
         self.metrics.record_run_complete(&run);
         self.remove_deterministic_state_file(&run);
@@ -5547,6 +5846,19 @@ impl SopEngine {
         } else {
             GateState::NotApplicable
         }
+    }
+
+    /// Take the headless-driver lease for `run_id`. Returns `false` when another
+    /// driver already owns the run, in which case the caller must not execute
+    /// its steps: the owning driver will reach the same next action itself.
+    pub(crate) fn try_lease_headless_driver(&mut self, run_id: &str) -> bool {
+        self.headless_drivers.insert(run_id.to_string())
+    }
+
+    /// Release the headless-driver lease taken by `try_lease_headless_driver`.
+    /// Idempotent; releasing a lease that is not held is a no-op.
+    pub(crate) fn release_headless_driver(&mut self, run_id: &str) {
+        self.headless_drivers.remove(run_id);
     }
 
     /// Ordered event/ledger history for a run (from the durable store).
@@ -7746,6 +8058,159 @@ mod tests {
         assert!(matches!(action, SopRunAction::ExecuteStep { ref step, .. } if step.number == 2));
     }
 
+    fn completed_step_result(step_number: u32, output: &str) -> SopStepResult {
+        SopStepResult {
+            step_number,
+            status: SopStepStatus::Completed,
+            output: output.into(),
+            started_at: now_iso8601(),
+            completed_at: Some(now_iso8601()),
+            effective_agent: None,
+            tool_calls: Vec::new(),
+        }
+    }
+
+    /// A late result for a step the run has already left (a duplicate driver,
+    /// a stale engine copy) must not be validated or routed as if it belonged
+    /// to the run's current step: that is how a promoted run got a schema
+    /// rejection recorded against an earlier step and re-ran it.
+    #[test]
+    fn advance_step_rejects_result_for_a_step_the_run_has_left() {
+        let mut sop = test_sop("stale-result", SopExecutionMode::Auto, SopPriority::Normal);
+        sop.steps[1].schema = Some(StepSchema {
+            input: None,
+            output: Some(required_object_schema("ok")),
+        });
+        sop.steps[1].on_failure = StepFailure::Retry { max: 1 };
+        let mut engine = engine_with_sops(vec![sop]);
+        let action = engine.start_run("stale-result", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+
+        let action = engine
+            .advance_step(&run_id, completed_step_result(1, "step one done"))
+            .unwrap();
+        assert!(matches!(action, SopRunAction::ExecuteStep { ref step, .. } if step.number == 2));
+        let results_before = engine.active_runs()[&run_id].step_results.len();
+
+        // A second copy of step 1 finishes late, with prose that would fail
+        // step 2's object schema if it were mistaken for step 2's result.
+        let err = engine
+            .advance_step(&run_id, completed_step_result(1, "step one done again"))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("on step 2") && err.to_string().contains("step 1"),
+            "rejection should name both steps, got: {err}"
+        );
+
+        let run = &engine.active_runs()[&run_id];
+        assert_eq!(run.current_step, 2, "the run must stay on its current step");
+        assert_eq!(run.status, SopRunStatus::Running);
+        assert_eq!(
+            run.step_results.len(),
+            results_before,
+            "a refused result must not be recorded"
+        );
+
+        let events = engine.run_events(&run_id).unwrap();
+        assert!(
+            !events.iter().any(|e| e.kind == "step_schema_reject"),
+            "the late result must not be schema-checked against step 2"
+        );
+        assert!(
+            !events.iter().any(|e| e.kind == "step_retry"),
+            "the late result must not trigger a retry of any step"
+        );
+        let stale = events
+            .iter()
+            .find(|e| e.kind == "step_result_stale")
+            .expect("the refusal is recorded on the run's event trail");
+        assert_eq!(stale.payload["step"], 1);
+        assert_eq!(stale.payload["current_step"], 2);
+    }
+
+    #[test]
+    fn advance_step_still_routes_a_result_for_the_current_step() {
+        let sop = test_sop(
+            "current-result",
+            SopExecutionMode::Auto,
+            SopPriority::Normal,
+        );
+        let mut engine = engine_with_sops(vec![sop]);
+        let action = engine.start_run("current-result", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+
+        let action = engine
+            .advance_step(&run_id, completed_step_result(1, "one"))
+            .unwrap();
+        assert!(matches!(action, SopRunAction::ExecuteStep { ref step, .. } if step.number == 2));
+        let action = engine
+            .advance_step(&run_id, completed_step_result(2, "two"))
+            .unwrap();
+        assert!(matches!(action, SopRunAction::Completed { .. }));
+        let finished = engine.finished_runs(None);
+        assert_eq!(
+            finished[0]
+                .step_results
+                .iter()
+                .map(|r| r.step_number)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+    }
+
+    /// `restore_runs` rehydrates runs the engine does not hold. A run it
+    /// already holds is live state that the stored snapshot can only trail, so
+    /// a repeated restore must not rewind it or drop its recorded results.
+    #[test]
+    fn restore_runs_does_not_rewind_a_live_run() {
+        let store = std::sync::Arc::new(InMemoryRunStore::new());
+        let sop = test_sop("live-run", SopExecutionMode::Auto, SopPriority::Normal);
+        let mut engine = engine_with_sops(vec![sop]).with_store(store.clone());
+        let action = engine.start_run("live-run", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+        engine
+            .advance_step(&run_id, completed_step_result(1, "one"))
+            .unwrap();
+        assert_eq!(engine.active_runs()[&run_id].current_step, 2);
+
+        // A stale snapshot lands in the store with a newer revision, the way a
+        // second engine over the same store would leave it.
+        let mut stale = engine.active_runs()[&run_id].clone();
+        stale.current_step = 1;
+        stale.step_results.clear();
+        let stored = store.load_run(&run_id).unwrap().expect("run persisted");
+        let mut persisted = PersistedRun::new(stale, now_iso8601(), SopTriggerSource::Manual);
+        persisted.revision = stored.revision + 1;
+        store.save_run(&persisted).unwrap();
+
+        engine.restore_runs();
+
+        let run = &engine.active_runs()[&run_id];
+        assert_eq!(run.current_step, 2, "restore must not rewind a live run");
+        assert_eq!(
+            run.step_results.len(),
+            1,
+            "restore must keep recorded results"
+        );
+    }
+
+    #[test]
+    fn headless_driver_lease_is_exclusive_until_released() {
+        let mut engine = engine_with_sops(vec![]);
+        assert!(engine.try_lease_headless_driver("run-a"));
+        assert!(
+            !engine.try_lease_headless_driver("run-a"),
+            "a second driver for the same run must be refused"
+        );
+        assert!(
+            engine.try_lease_headless_driver("run-b"),
+            "leases are per run"
+        );
+        engine.release_headless_driver("run-a");
+        assert!(engine.try_lease_headless_driver("run-a"));
+        engine.release_headless_driver("never-leased");
+    }
+
     #[test]
     fn cancel_run() {
         let mut engine = engine_with_sops(vec![test_sop(
@@ -8492,6 +8957,7 @@ mod tests {
             SopRun {
                 run_id: "r1".to_string(),
                 sop_name: "s1".to_string(),
+                initiating_agent: None,
                 trigger_event: manual_event(),
                 frame_marker_id: "m".to_string(),
                 status: SopRunStatus::WaitingApproval,
@@ -8543,6 +9009,7 @@ mod tests {
                 SopRun {
                     run_id: run_id.to_string(),
                     sop_name: "s1".to_string(),
+                    initiating_agent: None,
                     trigger_event: manual_event(),
                     frame_marker_id: "m".to_string(),
                     status: SopRunStatus::WaitingApproval,
@@ -8587,6 +9054,7 @@ mod tests {
             SopRun {
                 run_id: "r1".to_string(),
                 sop_name: "s1".to_string(),
+                initiating_agent: None,
                 trigger_event: manual_event(),
                 frame_marker_id: "m".to_string(),
                 status: SopRunStatus::Running,
@@ -9268,6 +9736,7 @@ mod tests {
             let run = SopRun {
                 run_id: format!("restore-{i}"),
                 sop_name: "s1".to_string(),
+                initiating_agent: None,
                 trigger_event: manual_event(),
                 frame_marker_id: format!("marker-{i}"),
                 status: SopRunStatus::Running,
@@ -9800,6 +10269,7 @@ mod tests {
         let run = SopRun {
             run_id: "run-001".into(),
             sop_name: "pump-shutdown".into(),
+            initiating_agent: None,
             trigger_event: manual_event(),
             frame_marker_id: "marker-001".into(),
             status: SopRunStatus::Running,
@@ -10685,6 +11155,7 @@ mod tests {
         let parked = SopRun {
             run_id: "parked-1".to_string(),
             sop_name: "s1".to_string(),
+            initiating_agent: None,
             trigger_event: manual_event(),
             frame_marker_id: "marker".to_string(),
             status: SopRunStatus::WaitingApproval,
@@ -10739,6 +11210,7 @@ mod tests {
         let parked = SopRun {
             run_id: "parked-1".to_string(),
             sop_name: "s1".to_string(),
+            initiating_agent: None,
             trigger_event: manual_event(),
             frame_marker_id: "marker".to_string(),
             status: SopRunStatus::WaitingApproval,
@@ -10808,6 +11280,7 @@ mod tests {
         let parked = SopRun {
             run_id: "parked-1".to_string(),
             sop_name: "s1".to_string(),
+            initiating_agent: None,
             trigger_event: manual_event(),
             frame_marker_id: "marker".to_string(),
             status: SopRunStatus::WaitingApproval,
@@ -12573,6 +13046,7 @@ mod tests {
             SopRun {
                 run_id: "r1".to_string(),
                 sop_name: "s1".to_string(),
+                initiating_agent: None,
                 trigger_event: manual_event(),
                 frame_marker_id: "m".to_string(),
                 status: SopRunStatus::WaitingApproval,
@@ -15518,6 +15992,7 @@ type = "manual"
         let run = SopRun {
             run_id: "r-restore".to_string(),
             sop_name: "deploy".to_string(),
+            initiating_agent: None,
             trigger_event: SopEvent {
                 source: SopTriggerSource::Manual,
                 topic: None,
@@ -15563,6 +16038,7 @@ type = "manual"
         let mut run = SopRun {
             run_id: "r-persist".to_string(),
             sop_name: "deploy".to_string(),
+            initiating_agent: None,
             trigger_event: SopEvent {
                 source: SopTriggerSource::Manual,
                 topic: None,
@@ -16160,6 +16636,7 @@ type = "manual"
         let base = SopRun {
             run_id: "r-done".to_string(),
             sop_name: "deploy".to_string(),
+            initiating_agent: None,
             trigger_event: SopEvent {
                 source: SopTriggerSource::Manual,
                 topic: None,

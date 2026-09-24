@@ -23,8 +23,9 @@ use zeroclaw_config::schema::Config;
 use zeroclaw_api::jsonrpc::error_codes::*;
 use zeroclaw_api::jsonrpc::{
     JSONRPC_VERSION, JsonRpcError, JsonRpcFrame, JsonRpcFrameErrorKind, JsonRpcNotification,
-    JsonRpcResponse, RpcOutbound, SopDecideRequest, SopRunDetailRequest, SopRunOverlayRequest,
-    SopRunRequest, SopRunResponse, SopRunsRequest, SopSaveRequest, SopSelectRequest,
+    JsonRpcResponse, RpcOutbound, SopDecideRequest, SopRenameRequest, SopRunDetailRequest,
+    SopRunOverlayRequest, SopRunRequest, SopRunResponse, SopRunsRequest, SopSaveRequest,
+    SopSelectRequest,
 };
 use zeroclaw_api::model_provider::ConversationMessage;
 use zeroclaw_api::runtime_status::{RuntimeConfigKind, RuntimeShellProfile};
@@ -197,6 +198,7 @@ pub enum Method {
     SopsSave,
     SopsCreate,
     SopsDelete,
+    SopsRename,
     SopsDecide,
     SopsWireDraft,
     SopsGraphDraft,
@@ -308,6 +310,7 @@ impl Method {
         (Method::SopsSave, "sops/save"),
         (Method::SopsCreate, "sops/create"),
         (Method::SopsDelete, "sops/delete"),
+        (Method::SopsRename, "sops/rename"),
         (Method::SopsDecide, "sops/decide"),
         (Method::SopsWireDraft, "sops/wire-draft"),
         (Method::SopsGraphDraft, "sops/graph-draft"),
@@ -431,7 +434,7 @@ impl Method {
             | M::SopsRunOverlay
             | M::SopsTriggerSources => (Resource::Sops, Verb::Read),
             M::SopsCreate => (Resource::Sops, Verb::Create),
-            M::SopsSave => (Resource::Sops, Verb::Update),
+            M::SopsSave | M::SopsRename => (Resource::Sops, Verb::Update),
             M::SopsDelete => (Resource::Sops, Verb::Delete),
             M::SopsRun | M::SopsDecide | M::SopsValidate | M::SopsWireDraft | M::SopsGraphDraft => {
                 (Resource::Sops, Verb::Execute)
@@ -2282,6 +2285,7 @@ impl RpcDispatcher {
             Method::SopsSave => self.handle_sops_save(&req.params),
             Method::SopsCreate => self.handle_sops_create(&req.params),
             Method::SopsDelete => self.handle_sops_delete(&req.params),
+            Method::SopsRename => self.handle_sops_rename(&req.params),
             Method::SopsDecide => self.handle_sops_decide(&req.params).await,
             Method::SopsWireDraft => self.handle_sops_wire_draft(&req.params),
             Method::SopsGraphDraft => self.handle_sops_graph_draft(&req.params),
@@ -7221,8 +7225,9 @@ impl RpcDispatcher {
     async fn handle_logs_query(&self, params: &Value) -> RpcResult {
         let p: LogsQueryParams = parse_params(params)?;
 
-        let path = zeroclaw_log::current_log_path()
-            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Log persistence is not enabled"))?;
+        let Some((active, reads_archives)) = zeroclaw_log::active_log_query_scope() else {
+            return Err(rpc_err(INTERNAL_ERROR, "Log persistence is not enabled"));
+        };
 
         let filter = zeroclaw_log::LogFilter {
             since_ts: p.since_ts,
@@ -7240,9 +7245,27 @@ impl RpcDispatcher {
         };
 
         let limit = p.limit.unwrap_or(200);
+        let segment_cursor = match p.until_segment_cursor.as_deref() {
+            None | Some("") => None,
+            Some(raw) => match zeroclaw_log::SegmentCursor::from_wire(raw) {
+                Some(c) => Some(c),
+                None => {
+                    return Err(rpc_err(
+                        INVALID_PARAMS,
+                        "invalid until_segment_cursor: value is not a valid segment cursor",
+                    ));
+                }
+            },
+        };
 
-        let page = zeroclaw_log::load_page(&path, &filter, limit)
-            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Log read failed: {e:#}")))?;
+        let page = zeroclaw_log::query_log_page(
+            &active,
+            reads_archives,
+            &filter,
+            limit,
+            segment_cursor.as_ref(),
+        )
+        .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Log read failed: {e:#}")))?;
 
         let events: Vec<serde_json::Value> = page
             .events
@@ -7256,27 +7279,46 @@ impl RpcDispatcher {
                 .map(|path| path.to_string_lossy().into_owned()),
             next_cursor: page.next_cursor,
             next_cursor_line_offset: page.next_cursor_line_offset,
+            next_segment_cursor: page.next_segment_cursor,
             at_end: page.at_end,
+            incomplete: page.incomplete,
         })
     }
 
     /// `logs/get { id } → LogEvent`. Loads one full event by id from
     /// the persistent JSONL log so the Logs pane can keep only preview
     /// fields in memory and lazy-fetch the full payload only when the
-    /// user opens the detail pane.
+    /// user opens the detail pane. Searches the active file first, then
+    /// retained archives oldest-first, so archive events returned by
+    /// `logs/query` are always findable by id.
     async fn handle_logs_get(&self, params: &Value) -> RpcResult {
         let p: LogsGetParams = parse_params(params)?;
-        let path = zeroclaw_log::current_log_path()
-            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Log persistence is not enabled"))?;
-        let event = zeroclaw_log::find_event_by_id(&path, &p.id)
+        let Some((active, reads_archives)) = zeroclaw_log::active_log_query_scope() else {
+            return Err(rpc_err(INTERNAL_ERROR, "Log persistence is not enabled"));
+        };
+
+        let found = zeroclaw_log::find_event_across_segments(&active, reads_archives, &p.id)
             .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Log read failed: {e:#}")))?;
-        match event {
+
+        match found.event {
             Some(evt) => {
                 let event = serde_json::to_value(evt).map_err(|e| {
                     rpc_err(INTERNAL_ERROR, format!("Failed to serialize event: {e}"))
                 })?;
                 to_result(LogsGetResult { event })
             }
+            // A miss is only authoritative when every segment was read. If one
+            // was skipped, the id may be sitting in it, and reporting "not
+            // found" would present a guess as a fact — the caller stops looking
+            // for an event that is still on disk.
+            None if found.incomplete => Err(rpc_err(
+                INTERNAL_ERROR,
+                format!(
+                    "Log id `{}` was not found, but part of the retained history \
+                     could not be read; the event may still exist",
+                    p.id
+                ),
+            )),
             None => Err(rpc_err(
                 INTERNAL_ERROR,
                 format!("Log id `{}` not found", p.id),
@@ -7837,6 +7879,7 @@ impl RpcDispatcher {
                 &config,
                 Arc::clone(&engine),
                 self.ctx.sop_audit.clone(),
+                self.ctx.sop_driver_handles.as_ref(),
                 &outcome,
             );
         }
@@ -7893,7 +7936,17 @@ impl RpcDispatcher {
             self.authorize_sop_authoring(Method::SopsSave, &sop)?;
             self.authorize_existing_sop(Method::SopsSave, &dir, &sop.name, mode)?;
         }
-        crate::sop::save_sop(&dir, &sop).map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))?;
+        // An edit-save targets the SOP it was loaded from. If that SOP has
+        // been renamed or deleted since, refuse rather than recreate it:
+        // creating a SOP is `sops/create`.
+        crate::sop::save_existing_sop_typed(&dir, &sop).map_err(|e| {
+            let code = match e {
+                crate::sop::SopAuthorError::NotFound(_) => SOP_NOT_FOUND,
+                crate::sop::SopAuthorError::Io(_) => INTERNAL_ERROR,
+                _ => INVALID_PARAMS,
+            };
+            rpc_err(code, e.to_string())
+        })?;
         to_result(serde_json::json!({ "saved": sop.name }))
     }
 
@@ -7924,6 +7977,39 @@ impl RpcDispatcher {
             rpc_err(code, e.to_string())
         })?;
         to_result(serde_json::json!({ "deleted": req.name }))
+    }
+
+    /// Move a SOP to a new name. Separate from `sops/save` on purpose: save
+    /// persists under the submitted SOP's own name, so it can only ever
+    /// overwrite the SOP it was loaded from. Renaming is collision-checked
+    /// and moves the definition; it never copies it.
+    fn handle_sops_rename(&self, params: &Value) -> RpcResult {
+        // Local transports only, for the reason `sops/run-detail` gives: a
+        // remote WSS caller that has completed `initialize` has not
+        // established a principal this dispatcher can authorize a SOP
+        // identity change against, while local IPC is owner-scoped by the
+        // socket itself. Checked before the params are parsed so a refused
+        // caller learns nothing about which SOPs exist. Replace this with a
+        // principal check once there is one, rather than removing it.
+        if self.peer_label.starts_with("wss:") {
+            return Err(rpc_err(
+                AUTH_REQUIRED,
+                "sops/rename is not served over remote WSS: the transport has no \
+                 authenticated principal to authorize a SOP identity change against",
+            ));
+        }
+        let req: SopRenameRequest = parse_params(params)?;
+        let (dir, mode) = self.sops_dir_and_mode();
+        crate::sop::rename_sop_typed(&dir, &req.from, &req.to, mode).map_err(|e| {
+            let code = match e {
+                crate::sop::SopAuthorError::NotFound(_) => SOP_NOT_FOUND,
+                crate::sop::SopAuthorError::AlreadyExists(_) => SOP_ALREADY_EXISTS,
+                crate::sop::SopAuthorError::Io(_) => INTERNAL_ERROR,
+                crate::sop::SopAuthorError::Other(_) => INVALID_PARAMS,
+            };
+            rpc_err(code, e.to_string())
+        })?;
+        to_result(serde_json::json!({ "renamed": req.to, "from": req.from }))
     }
 
     fn handle_sops_wire_draft(&self, params: &Value) -> RpcResult {
@@ -8931,6 +9017,7 @@ mod tests {
             llm_calls_saved: 0,
             revision: 0,
             revision_base: 0,
+            initiating_agent: None,
         };
         let pr = PersistedRun::new(
             run.clone(),
@@ -9209,26 +9296,20 @@ mod tests {
         serde_json::from_str(s).unwrap()
     }
 
-    fn expected_default_shell_family() -> RuntimeShellFamily {
-        #[cfg(target_os = "windows")]
-        {
-            RuntimeShellFamily::Cmd
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            RuntimeShellFamily::Posix
-        }
+    fn expected_default_shell_profile() -> RuntimeShellProfile {
+        zeroclaw_config::platform::create_runtime(&Config::default().runtime)
+            .expect("default native runtime should resolve its shell")
+            .shell_profile()
+            .and_then(RuntimeShellProfile::from_runtime_profile)
+            .expect("default native runtime should expose a shell profile")
     }
 
-    fn expected_default_shell_name() -> &'static str {
-        #[cfg(target_os = "windows")]
-        {
-            "cmd"
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            "sh"
-        }
+    fn expected_default_shell_family() -> RuntimeShellFamily {
+        expected_default_shell_profile().family
+    }
+
+    fn expected_default_shell_name() -> String {
+        expected_default_shell_profile().name
     }
 
     /// A backend whose durable replacement always fails, standing in for a
@@ -13892,6 +13973,224 @@ mod tests {
         assert_eq!(dir, tmp.path().join("shared").join("sops"));
     }
 
+    /// A dispatcher whose SOP root is `<tmp>/sops`, for the synchronous
+    /// authoring handlers (save/create/delete/rename) that need nothing but
+    /// config on disk. The writer channel receiver rides along so it outlives
+    /// the dispatcher.
+    fn make_sop_author_dispatcher(
+        tmp: &std::path::Path,
+    ) -> (RpcDispatcher, tokio::sync::mpsc::Receiver<String>) {
+        make_sop_author_dispatcher_on(tmp, "test-peer-sop-author:pid=1")
+    }
+
+    fn make_sop_author_dispatcher_on(
+        tmp: &std::path::Path,
+        peer_label: &str,
+    ) -> (RpcDispatcher, tokio::sync::mpsc::Receiver<String>) {
+        use zeroclaw_config::schema::{Config, SopConfig};
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+
+        let config = Config {
+            data_dir: tmp.join("data"),
+            config_path: tmp.join("config.toml"),
+            sop: SopConfig {
+                sops_dir: Some(tmp.join("sops").to_string_lossy().into_owned()),
+                ..SopConfig::default()
+            },
+            ..Config::default()
+        };
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let ctx = RpcContext::minimal(config, sessions);
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        (RpcDispatcher::new(ctx, tx, peer_label.to_string()), rx)
+    }
+
+    /// A remote WSS caller that has completed `initialize` has no principal to
+    /// authorize a SOP identity change against. Rename is refused before the
+    /// params are read, and the SOP root is untouched.
+    #[test]
+    fn sops_rename_is_refused_over_remote_wss() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sops_dir = tmp.path().join("sops");
+        crate::sop::save_sop(&sops_dir, &author_test_sop("wss-source")).unwrap();
+        let (d, _rx) = make_sop_author_dispatcher_on(tmp.path(), "wss:203.0.113.7:44321");
+
+        let err = d
+            .handle_sops_rename(&serde_json::json!({ "from": "wss-source", "to": "wss-target" }))
+            .expect_err("a remote WSS caller must not rename a SOP");
+        assert_eq!(err.code, AUTH_REQUIRED, "{err:?}");
+        assert!(sops_dir.join("wss-source").exists());
+        assert!(!sops_dir.join("wss-target").exists());
+    }
+
+    /// A stale edit-save after a rename must not resurrect the retired name.
+    #[test]
+    fn sops_save_after_rename_does_not_recreate_the_retired_sop() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sops_dir = tmp.path().join("sops");
+        crate::sop::save_sop(&sops_dir, &author_test_sop("rpc-before")).unwrap();
+        let (d, _rx) = make_sop_author_dispatcher(tmp.path());
+        d.handle_sops_rename(&serde_json::json!({ "from": "rpc-before", "to": "rpc-after" }))
+            .expect("a local caller renames");
+
+        let err = d
+            .handle_sops_save(&serde_json::json!({
+                "sop": serde_json::to_value(author_test_sop("rpc-before")).unwrap(),
+            }))
+            .expect_err("saving the retired name must be refused");
+        assert_eq!(err.code, SOP_NOT_FOUND, "{err:?}");
+        assert!(!sops_dir.join("rpc-before").exists());
+        assert!(sops_dir.join("rpc-after").exists());
+    }
+
+    fn author_test_sop(name: &str) -> crate::sop::Sop {
+        use crate::sop::{Sop, SopExecutionMode, SopPriority, SopStep, SopTrigger};
+
+        Sop {
+            name: name.to_string(),
+            description: "authoring round trip".to_string(),
+            version: "1.0.0".to_string(),
+            priority: SopPriority::Normal,
+            execution_mode: SopExecutionMode::Supervised,
+            triggers: vec![SopTrigger::Manual],
+            steps: vec![SopStep {
+                number: 1,
+                title: "Do the thing".to_string(),
+                ..SopStep::default()
+            }],
+            cooldown_secs: 0,
+            max_concurrent: 1,
+            location: None,
+            deterministic: false,
+            admission_policy: crate::sop::types::SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
+            agent: None,
+        }
+    }
+
+    #[test]
+    fn sops_rename_moves_the_sop_and_leaves_one_copy() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sops_dir = tmp.path().join("sops");
+        crate::sop::save_sop(&sops_dir, &author_test_sop("rpc-before")).unwrap();
+        let (d, _rx) = make_sop_author_dispatcher(tmp.path());
+
+        let result = d
+            .handle_sops_rename(&serde_json::json!({ "from": "rpc-before", "to": "rpc-after" }))
+            .expect("renaming an existing SOP to a free name must succeed");
+        assert_eq!(result["renamed"], "rpc-after");
+        assert_eq!(result["from"], "rpc-before");
+
+        assert!(!sops_dir.join("rpc-before").exists());
+        let listed = d.handle_sops_list().unwrap();
+        let names: Vec<&str> = listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["rpc-after"], "one SOP, under the new name");
+    }
+
+    #[test]
+    fn sops_rename_reports_a_taken_name_as_already_exists() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sops_dir = tmp.path().join("sops");
+        crate::sop::save_sop(&sops_dir, &author_test_sop("rpc-alpha")).unwrap();
+        crate::sop::save_sop(&sops_dir, &author_test_sop("rpc-beta")).unwrap();
+        let (d, _rx) = make_sop_author_dispatcher(tmp.path());
+
+        let err = d
+            .handle_sops_rename(&serde_json::json!({ "from": "rpc-alpha", "to": "rpc-beta" }))
+            .expect_err("renaming onto a name in use must be refused");
+        assert_eq!(err.code, SOP_ALREADY_EXISTS);
+        assert!(sops_dir.join("rpc-alpha").exists(), "the source stays put");
+        assert!(sops_dir.join("rpc-beta").exists());
+    }
+
+    #[test]
+    fn sops_rename_reports_an_unknown_sop_as_not_found() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (d, _rx) = make_sop_author_dispatcher(tmp.path());
+
+        let err = d
+            .handle_sops_rename(&serde_json::json!({ "from": "rpc-missing", "to": "rpc-new" }))
+            .expect_err("renaming a SOP that does not exist must be refused");
+        assert_eq!(err.code, SOP_NOT_FOUND);
+    }
+
+    #[test]
+    fn sops_rename_rejects_a_path_traversal_target() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sops_dir = tmp.path().join("sops");
+        crate::sop::save_sop(&sops_dir, &author_test_sop("rpc-traversal")).unwrap();
+        let (d, _rx) = make_sop_author_dispatcher(tmp.path());
+
+        let err = d
+            .handle_sops_rename(&serde_json::json!({ "from": "rpc-traversal", "to": "../escaped" }))
+            .expect_err("a rename target must not escape the SOP root");
+        assert_eq!(err.code, INVALID_PARAMS);
+        assert!(sops_dir.join("rpc-traversal").exists());
+        assert!(!tmp.path().join("escaped").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sops_rename_reports_a_filesystem_failure_as_a_server_error() {
+        // A well-formed request against a manifest the daemon cannot read is
+        // the daemon's problem, not the caller's: it must not come back as
+        // INVALID_PARAMS, which tells the client to fix its input.
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sops_dir = tmp.path().join("sops");
+        crate::sop::save_sop(&sops_dir, &author_test_sop("rpc-unreadable")).unwrap();
+        let manifest = sops_dir.join("rpc-unreadable").join("SOP.toml");
+        let original = std::fs::metadata(&manifest).unwrap().permissions();
+        std::fs::set_permissions(&manifest, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read_to_string(&manifest).is_ok() {
+            // Running as root, where the mode bits above are advisory.
+            std::fs::set_permissions(&manifest, original).unwrap();
+            return;
+        }
+
+        let (d, _rx) = make_sop_author_dispatcher(tmp.path());
+        let err = d
+            .handle_sops_rename(
+                &serde_json::json!({ "from": "rpc-unreadable", "to": "rpc-readable" }),
+            )
+            .expect_err("an unreadable manifest must fail the rename");
+        std::fs::set_permissions(&manifest, original).unwrap();
+
+        assert_eq!(err.code, INTERNAL_ERROR, "{err:?}");
+    }
+
+    #[test]
+    fn sops_save_still_refuses_to_rename_the_sop_it_is_editing() {
+        // Edit identity: `sops/save` persists under the submitted SOP's own
+        // name, so a name change slipped through a save would fork the SOP or
+        // clobber another. Renaming has its own method; save keeps rejecting.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sops_dir = tmp.path().join("sops");
+        crate::sop::save_sop(&sops_dir, &author_test_sop("rpc-editing")).unwrap();
+        let (d, _rx) = make_sop_author_dispatcher(tmp.path());
+
+        let err = d
+            .handle_sops_save(&serde_json::json!({
+                "sop": serde_json::to_value(author_test_sop("rpc-renamed-by-save")).unwrap(),
+                "original_name": "rpc-editing",
+            }))
+            .expect_err("an edit-save may not change the SOP's name");
+        assert_eq!(err.code, INVALID_PARAMS);
+        assert!(err.message.contains("rename not supported"), "{err:?}");
+        assert!(sops_dir.join("rpc-editing").exists());
+        assert!(
+            !sops_dir.join("rpc-renamed-by-save").exists(),
+            "a rejected edit-save writes nothing at all"
+        );
+    }
+
     fn make_checkpoint_rpc_dispatcher(
         quorum: u32,
         members: &[&str],
@@ -14140,6 +14439,29 @@ mod tests {
         })
         .await
         .expect("RPC approval must schedule the resumed ExecuteStep");
+
+        let handles = dispatcher
+            .ctx
+            .sop_driver_handles
+            .as_ref()
+            .expect("a context holding an engine carries the generation driver set")
+            .clone();
+        let driver = {
+            let mut guard = handles.lock().expect("driver set lock");
+            assert_eq!(
+                guard.len(),
+                1,
+                "the resumed driver must register in the generation-owned set, not detach"
+            );
+            // Finalize exactly as the generation drain does, so this asserts
+            // against the same operation production uses.
+            let mut taken = guard.close_and_take();
+            taken.pop().expect("registered driver handle")
+        };
+        // The generation drain is a join on exactly these handles: a resumed
+        // driver therefore ends inside the generation that spawned it instead
+        // of running on under superseded configuration.
+        driver.await.expect("the registered resumed driver joins");
     }
 
     #[tokio::test]
@@ -15997,7 +16319,7 @@ mod tests {
             context
                 .shell_profile
                 .as_ref()
-                .map(|profile| profile.name.as_str()),
+                .map(|profile| profile.name.clone()),
             Some(expected_default_shell_name())
         );
 
@@ -16065,7 +16387,7 @@ mod tests {
             status
                 .shell_profile
                 .as_ref()
-                .map(|profile| profile.name.as_str()),
+                .map(|profile| profile.name.clone()),
             Some(expected_default_shell_name())
         );
     }
@@ -18402,6 +18724,7 @@ mod tests {
         let active = crate::agent::history_trim::trim_conversation_to_recent_turns(
             durable.clone(),
             2,
+            crate::agent::history_trim::history_trim_target(2, 1.0),
             false,
         );
         assert!(active.trimmed);
@@ -20785,6 +21108,193 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn existing_session_uses_reloaded_history_trim_low_water() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = make_model_refresh_test_config(&tmp);
+        config
+            .agents
+            .get_mut("test-agent")
+            .expect("test agent exists")
+            .runtime_profile = "reloadable".into();
+        config.runtime_profiles.insert(
+            "reloadable".into(),
+            zeroclaw_config::schema::RuntimeProfileConfig {
+                max_history_messages: Some(4),
+                ..Default::default()
+            },
+        );
+
+        let dispatcher = make_config_set_test_dispatcher(config);
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+        dispatcher
+            .ctx
+            .config
+            .write()
+            .runtime_profiles
+            .get_mut("reloadable")
+            .expect("runtime profile exists")
+            .history_trim_low_water = Some(1.0);
+
+        let agent = dispatcher
+            .ctx
+            .sessions
+            .get_agent(&session_id)
+            .await
+            .expect("session agent exists");
+        let mut agent = agent.lock().await;
+        let event = agent.seed_history_with_event(&[
+            ChatMessage::user("old user"),
+            ChatMessage::assistant("old answer"),
+            ChatMessage::user("middle user"),
+            ChatMessage::assistant("middle answer"),
+            ChatMessage::user("new user"),
+            ChatMessage::assistant("new answer"),
+        ]);
+
+        let Some(TurnEvent::HistoryTrimmed {
+            dropped_messages,
+            kept_turns,
+            ..
+        }) = event
+        else {
+            panic!("an existing session must observe the reloaded low-water fraction");
+        };
+        assert_eq!(dropped_messages, 2, "legacy 1.0 refills to the cap of 4");
+        assert_eq!(kept_turns, 2, "legacy 1.0 retains the newest two turns");
+        let breadcrumb = crate::i18n::get_required_cli_string("history-trim-breadcrumb");
+        let history = agent.history();
+        assert_eq!(
+            history.len(),
+            6,
+            "synthesized system prompt plus breadcrumb plus the retained body"
+        );
+        assert!(!history.iter().any(|message| matches!(
+            message,
+            zeroclaw_providers::ConversationMessage::Chat(chat)
+                if chat.content == "old user" || chat.content == "old answer"
+        )));
+        for retained in ["middle user", "middle answer", "new user", "new answer"] {
+            assert!(
+                history.iter().any(|message| matches!(
+                    message,
+                    zeroclaw_providers::ConversationMessage::Chat(chat)
+                        if chat.content == retained
+                )),
+                "fraction 1.0 loaded after construction must retain {retained}"
+            );
+        }
+        assert_eq!(
+            history
+                .iter()
+                .filter(|message| matches!(
+                    message,
+                    zeroclaw_providers::ConversationMessage::Chat(chat)
+                        if chat.role == "user" && chat.content == breadcrumb
+                ))
+                .count(),
+            1,
+            "exactly one synthetic breadcrumb accompanies the retained turns"
+        );
+    }
+
+    #[tokio::test]
+    async fn config_set_persists_history_trim_low_water_and_trims_existing_session() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = make_model_refresh_test_config(&tmp);
+        config
+            .agents
+            .get_mut("test-agent")
+            .expect("test agent exists")
+            .runtime_profile = "reloadable".into();
+        config.runtime_profiles.insert(
+            "reloadable".into(),
+            zeroclaw_config::schema::RuntimeProfileConfig {
+                max_history_messages: Some(4),
+                history_trim_low_water: None,
+                ..Default::default()
+            },
+        );
+
+        let dispatcher = make_config_set_test_dispatcher(config);
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+
+        let set = dispatcher
+            .handle_config_set(&json!({
+                "prop": "runtime_profiles.reloadable.history_trim_low_water",
+                "value": 1.0
+            }))
+            .await;
+        assert!(
+            set.is_ok(),
+            "config/set must accept the low-water fraction: {set:?}"
+        );
+
+        let config_path = tmp.path().join("config.toml");
+        let disk = std::fs::read_to_string(&config_path).unwrap();
+        let reloaded: zeroclaw_config::schema::Config = toml::from_str(&disk)
+            .unwrap_or_else(|e| panic!("config must reload after the fraction write: {e}\n{disk}"));
+        assert_eq!(
+            reloaded
+                .runtime_profiles
+                .get("reloadable")
+                .and_then(|profile| profile.history_trim_low_water),
+            Some(1.0),
+            "the RPC write must persist the exact fraction to disk"
+        );
+
+        let agent = dispatcher
+            .ctx
+            .sessions
+            .get_agent(&session_id)
+            .await
+            .expect("session agent exists");
+        let mut agent = agent.lock().await;
+        let event = agent.seed_history_with_event(&[
+            ChatMessage::user("old user"),
+            ChatMessage::assistant("old answer"),
+            ChatMessage::user("middle user"),
+            ChatMessage::assistant("middle answer"),
+            ChatMessage::user("new user"),
+            ChatMessage::assistant("new answer"),
+        ]);
+
+        let Some(TurnEvent::HistoryTrimmed {
+            dropped_messages,
+            kept_turns,
+            ..
+        }) = event
+        else {
+            panic!("an existing session must observe the persisted low-water fraction");
+        };
+        assert_eq!(
+            dropped_messages, 2,
+            "fraction 1.0 written via config/set refills to the cap of 4"
+        );
+        assert_eq!(kept_turns, 2, "fraction 1.0 retains the newest two turns");
+        let history = agent.history();
+        assert_eq!(
+            history.len(),
+            6,
+            "synthesized system prompt plus breadcrumb plus the retained body"
+        );
+        assert!(!history.iter().any(|message| matches!(
+            message,
+            zeroclaw_providers::ConversationMessage::Chat(chat)
+                if chat.content == "old user" || chat.content == "old answer"
+        )));
+        for retained in ["middle user", "middle answer", "new user", "new answer"] {
+            assert!(
+                history.iter().any(|message| matches!(
+                    message,
+                    zeroclaw_providers::ConversationMessage::Chat(chat)
+                        if chat.content == retained
+                )),
+                "fraction 1.0 persisted via config/set must retain {retained}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn config_set_provider_model_refreshes_matching_live_session() {
         let tmp = tempfile::TempDir::new().unwrap();
         let dispatcher = make_config_set_test_dispatcher(make_model_refresh_test_config(&tmp));
@@ -21581,6 +22091,7 @@ mod tests {
             tui_registry: Arc::new(crate::rpc::tui_identity::TuiRegistry::new_unsigned()),
             acp_session_store: None,
             sop_engine: None,
+            sop_driver_handles: None,
             sop_audit: None,
             hooks: Some(Arc::new(runner)),
             cert_audit: None,
@@ -21629,6 +22140,7 @@ mod tests {
             tui_registry: Arc::new(crate::rpc::tui_identity::TuiRegistry::new_unsigned()),
             acp_session_store: None,
             sop_engine: None,
+            sop_driver_handles: None,
             sop_audit: None,
             hooks: Some(Arc::new(runner)),
             cert_audit: None,
@@ -21736,6 +22248,7 @@ mod tests {
             tui_registry: Arc::new(crate::rpc::tui_identity::TuiRegistry::new_unsigned()),
             acp_session_store: None,
             sop_engine: None,
+            sop_driver_handles: None,
             sop_audit: None,
             hooks: Some(Arc::new(runner)),
             cert_audit: None,

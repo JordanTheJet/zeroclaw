@@ -28,7 +28,8 @@ env:
 # The Rust-compiling jobs below (lint, build, check, check-plugin-backends,
 # check-32bit, bench, test, test-channel-features, memory-postgres-test, msrv, parallel-runtime-test,
 # installer-drift) and the Linux `build` matrix entry name their runner label
-# directly, so they start as soon as the run does.
+# directly, so runner selection does not wait for fmt. The build matrix still
+# waits for path-changes to select its Windows task-owner recovery tests.
 # `tests/architecture/ci_runner_labels.rs` fails the workspace suite if those
 # labels or their cache-provider inputs drift apart, so moving the fleet stays
 # one reviewed edit even though the constant is written more than once.
@@ -150,11 +151,17 @@ jobs:
       - name: Test release version preparation failures
         run: python3 scripts/release/bump-version.test.py
 
+      - name: Test early Apple release credential validation
+        run: python3 scripts/release/apple_preflight_test.py
+
       - name: Test monthly outdated result classification
         run: bash scripts/ci/monthly_outdated_result.test.sh
 
       - name: Test release tool installer mappings
         run: bash scripts/ci/install_release_tool.test.sh
+
+      - name: Test crates.io publish ordering and preflight
+        run: python3 scripts/release/publish_crates_test.py
 
       - name: Test apt install timeout and retry behavior
         run: bash scripts/ci/apt_install.test.sh
@@ -169,6 +176,9 @@ jobs:
 
       - name: Test release announcement composer
         run: bash scripts/ci/release_post_text.test.sh
+
+      - name: Test docs stable metadata promotion
+        run: python3 scripts/docs/promote_stable_test.py
 
   relay-container-smoke-changes:
     name: Detect Relay Container Smoke changes
@@ -365,6 +375,7 @@ jobs:
 
   build:
     name: ${{ matrix.label }} ${{ matrix.target }}
+    # All build legs wait for this detector; only the Windows recovery step is filtered.
     needs: [path-changes]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 40
@@ -450,16 +461,20 @@ jobs:
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+      # Recovery-filter invariant and retirement condition: README.md bespoke CI gate registry.
       - name: Test Windows task-owner recovery
         if: runner.os == 'Windows' && needs.path-changes.outputs.windows_recovery != 'false'
         shell: bash
         run: |
-          cargo test --profile ci --locked -p zeroclaw-runtime --lib \
+          set -euo pipefail
+          cargo test --locked -p zeroclaw-runtime --lib \
             --target x86_64-pc-windows-msvc \
-            control_plane::authority::tests::windows_process_exit_is_detected -- --exact
-          cargo test --profile ci --locked -p zeroclaw-runtime --lib \
+            control_plane::authority::tests::windows_process_exit_is_detected -- --exact 2>&1 | tee "$RUNNER_TEMP/windows-owner-exit.log"
+          grep -Fq 'test result: ok. 1 passed; 0 failed;' "$RUNNER_TEMP/windows-owner-exit.log"
+          cargo test --locked -p zeroclaw-runtime --lib \
             --target x86_64-pc-windows-msvc \
-            control_plane::boot::tests::recovery_retains_live_foreign_process_then_reclaims_after_exit -- --exact
+            control_plane::boot::tests::recovery_retains_live_foreign_process_then_reclaims_after_exit -- --exact 2>&1 | tee "$RUNNER_TEMP/windows-owner-recovery.log"
+          grep -Fq 'test result: ok. 1 passed; 0 failed;' "$RUNNER_TEMP/windows-owner-recovery.log"
 
   check:
     name: Check (${{ matrix.name }})
@@ -1219,6 +1234,12 @@ jobs:
       - name: Run turn-stream regressions
         working-directory: web
         run: npm run test:contexts
+      - name: Run run-surface regressions
+        working-directory: web
+        run: npm run test:sops
+      - name: Run SOP editor regressions
+        working-directory: web
+        run: npm run test:sop-editor
 
   # ── Required gate ─────────────────────────────────────────────────────────
   # Branch protection requires only this single job — internal structure
