@@ -203,8 +203,10 @@ and evidence. Do not leave it as an option list.
 Use one of these freshness bases:
 
 1. **Current official checks** — GitHub reports the PR cleanly mergeable against
-   current `master` (`mergeStateStatus` is `CLEAN` or `HAS_HOOKS`), and all
-   required checks on the current `$HEAD_SHA` are successful.
+   current `master` (`mergeStateStatus` is `CLEAN` or `HAS_HOOKS`), all
+   required checks on the current `$HEAD_SHA` are successful, and every one of
+   those required checks started after the current `master` head was committed
+   (see the check below).
 2. **Exact queued/merge-result checks** — a merge queue, merge group, or
    equivalent exact-result CI path has validated the result that will land.
 3. **Exact merge-result smoke** — you locally construct or inspect the exact
@@ -216,11 +218,34 @@ Use one of these freshness bases:
    stale or unavailable, tell the user exactly what is stale or unverified and
    get explicit approval to accept that risk for this PR.
 
-When the PR is `BEHIND` or `UNSTABLE`, do not treat old green branch checks as
-merge readiness. If current `master` changed the same files or high-risk shared
-surfaces such as build/CI/config, generated artifacts, public interfaces,
-security or authorization boundaries, provider/channel/runtime paths, or
-required test harnesses, prefer updating the branch and waiting for official CI.
+`CLEAN` only means GitHub found no textual conflict. Branch protection does not
+require PR branches to be up to date, so a `CLEAN` PR can carry green checks
+that ran against an older `master`. Before choosing basis 1, compare when the
+required checks started with when the current `master` head was committed:
+
+```bash
+export MASTER_HEAD_AT=$(gh api repos/zeroclaw-labs/zeroclaw/commits/master \
+  --jq '.commit.committer.date')
+
+gh pr checks "$NUMBER" --repo zeroclaw-labs/zeroclaw --required \
+  --json name,startedAt \
+  --jq '.[] | select(.startedAt < env.MASTER_HEAD_AT) | "\(.name) started \(.startedAt), before master head \(env.MASTER_HEAD_AT)"'
+```
+
+Both timestamps are UTC ISO 8601, so string comparison orders them. If this
+prints anything, those checks did not see current `master`: basis 1 does not
+apply, and the PR is treated as `BEHIND` below even though GitHub reports
+`CLEAN`.
+
+When the PR is `BEHIND` or `UNSTABLE`, or its required checks predate the
+current `master` head, do not treat old green branch checks as merge readiness.
+If current `master` changed the same files or high-risk shared surfaces such as
+build/CI/config, generated artifacts, public interfaces, security or
+authorization boundaries, provider/channel/runtime paths, required test
+harnesses, or anything read by tests that inspect the whole workspace
+(dependency graphs, manifests, architecture and publish contracts), prefer
+updating the branch and waiting for official CI. A new whole-workspace test
+can fail on a `master` change that touches none of the PR's files.
 If updating is unavailable or intentionally skipped, use exact queued or
 merge-result validation, or get explicit stale-risk acceptance that names the
 unverified overlap. Do not run local merge-result smoke as a default substitute
@@ -383,6 +408,23 @@ If `state` is not `MERGED`, report the discrepancy and stop — do not assume su
 
 Report to the user: merge commit SHA and PR URL. After verification, remove only `$BODY_FILE` and its empty `$BODY_DIR`; retain the file on failure so it can be inspected.
 
+**Merging several PRs in one session:** each merge moves `master`, so the next
+PR's required checks now predate the `master` head and Step 1c must be redone
+for it. Before confirming the next merge, check `master`'s required CI on the
+merge commit just created:
+
+```bash
+MERGE_COMMIT_SHA=$(gh pr view "$NUMBER" --repo zeroclaw-labs/zeroclaw \
+  --json mergeCommit --jq '.mergeCommit.oid')
+
+gh run list --repo zeroclaw-labs/zeroclaw --branch master \
+  --commit "$MERGE_COMMIT_SHA" --json workflowName,status,conclusion
+```
+
+If a required workflow failed, stop and report it; do not merge further PRs onto
+a red `master`. If it is still running, say so in the next PR's freshness basis
+so that any stale-risk acceptance covers the unverified previous merge.
+
 **Post-merge (optional, only if user asks):**
 - Fetch latest master: `git checkout master && git pull upstream master` (or `origin master` if no upstream remote)
 - Verify linked issue closed: `gh issue view <N> --json state --jq .state` (should be `CLOSED` when PR body used `Closes #N`)
@@ -423,7 +465,7 @@ leaving a known public tracker stale.
   privacy rules.
 - **Keep the subject in a shell variable and submit the unchanged checked body file.** Never interpolate untrusted content into shell command text.
 - **Always run pre-flight checks** (merge conflicts, review decision, labels, milestone, release-line placement, and CI status) before confirming — do not skip them even if the user says "just merge it."
-- **Always record a freshness basis before confirming** — refreshed official checks, exact queued/merge-result checks, exact merge-result smoke, or explicit stale-risk acceptance. Do not treat old green branch checks as merge readiness when current `master` could invalidate them.
+- **Always record a freshness basis before confirming** — refreshed official checks, exact queued/merge-result checks, exact merge-result smoke, or explicit stale-risk acceptance. Do not treat old green branch checks as merge readiness when current `master` could invalidate them. `CLEAN` is not freshness: required checks that started before the current `master` head was committed are stale. In a batch, check `master`'s required CI on each merge before confirming the next.
 - **Always confirm before merging, no exceptions** — show the user the exact expanded command with real values and require an explicit yes. Never infer consent.
 - **If the merge command fails, stop and report verbatim** — do not retry or work around failures automatically.
 - **Always handle public tracker follow-through after a verified merge** — update relevant public trackers with approval, or report that none apply.
