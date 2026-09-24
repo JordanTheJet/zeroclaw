@@ -236,9 +236,13 @@ impl ActorStream {
             *self = current;
             return Err(SocketFailure::InvalidState);
         };
-        state
-            .begin_upgrade()
-            .map_err(|_| SocketFailure::InvalidState)?;
+        if state.begin_upgrade().is_err() {
+            *self = Self::StartTls {
+                stream: Some(stream),
+                state,
+            };
+            return Err(SocketFailure::InvalidState);
+        }
 
         let connector = tokio_rustls::TlsConnector::from(config);
         match tokio::time::timeout(
@@ -248,9 +252,11 @@ impl ActorStream {
         .await
         {
             Ok(Ok(stream)) => {
-                state
-                    .complete_upgrade()
-                    .map_err(|_| SocketFailure::InvalidState)?;
+                // The plaintext stream is gone either way; a state machine
+                // that refuses `Secured` leaves the connection closed.
+                if state.complete_upgrade().is_err() {
+                    return Err(SocketFailure::TlsHandshakeFailed);
+                }
                 *self = Self::Tls(Box::new(stream));
                 Ok(())
             }
@@ -273,9 +279,17 @@ pub struct SocketConnection {
     inbound: Arc<InboundBuffer>,
     terminal: Arc<Mutex<Option<SocketCloseReason>>>,
     actor: AbortHandle,
+    /// STARTTLS only: the TLS client configuration built when the connection
+    /// opened, so a broken profile fails before any plaintext is exchanged.
+    upgrade_config: Option<Arc<rustls::ClientConfig>>,
 }
 
 impl SocketConnection {
+    fn with_upgrade_config(mut self, config: Arc<rustls::ClientConfig>) -> Self {
+        self.upgrade_config = Some(config);
+        self
+    }
+
     async fn send(&self, class: TrafficClass, bytes: Vec<u8>) -> Result<(), SocketFailure> {
         if bytes.len() > MAX_CHUNK_BYTES {
             return Err(SocketFailure::ChunkTooLarge);
@@ -382,6 +396,7 @@ fn spawn_connection(authorization: Arc<AuthorizedEgress>, stream: ActorStream) -
         inbound,
         terminal,
         actor: actor.abort_handle(),
+        upgrade_config: None,
     }
 }
 
@@ -551,6 +566,18 @@ async fn connect(
             .await
             .map_err(|error| map_egress_error(&error))?,
     );
+    // STARTTLS resolves its TLS configuration before dialing, like direct TLS,
+    // so a missing or invalid profile secret never reaches plaintext
+    // negotiation.
+    let upgrade_config = match mode {
+        ConnectMode::StartTls => Some(
+            state
+                .tls_client_config(&authorization)
+                .await
+                .map_err(|error| map_egress_error(&error))?,
+        ),
+        ConnectMode::Plaintext | ConnectMode::DirectTls => None,
+    };
     let stream = match mode {
         ConnectMode::Plaintext => ActorStream::Plaintext(connect_pinned(&authorization).await?),
         ConnectMode::DirectTls => {
@@ -565,7 +592,10 @@ async fn connect(
             state: StartTlsState::new(),
         },
     };
-    let connection = spawn_connection(authorization, stream);
+    let mut connection = spawn_connection(authorization, stream);
+    if let Some(config) = upgrade_config {
+        connection = connection.with_upgrade_config(config);
+    }
     state
         .resource_table_mut()
         .push(connection)
@@ -628,7 +658,7 @@ async fn upgrade_tls(
     if !state.charge_host_call() {
         return Err(SocketFailure::HostUnavailable);
     }
-    let (authorization, commands) = {
+    let (authorization, commands, config) = {
         let connection = state
             .resource_table()
             .get(&resource)
@@ -636,12 +666,16 @@ async fn upgrade_tls(
         if !connection.ready_for_upgrade() {
             return Err(SocketFailure::InvalidState);
         }
-        (connection.authorization(), connection.command_sender())
+        let config = connection
+            .upgrade_config
+            .clone()
+            .ok_or(SocketFailure::InvalidState)?;
+        (
+            connection.authorization(),
+            connection.command_sender(),
+            config,
+        )
     };
-    let config = state
-        .tls_client_config(&authorization)
-        .await
-        .map_err(|error| map_egress_error(&error))?;
     let server_name = tls_server_name(&authorization)?;
     let (reply, result) = oneshot::channel();
     commands
@@ -1103,6 +1137,43 @@ mod tests {
         )
         .await
         .expect("a service frame opens the granted connection");
+    }
+
+    #[tokio::test]
+    async fn starttls_with_unavailable_profile_material_never_dials() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind STARTTLS server");
+        let address = listener.local_addr().expect("server address");
+        let pki = TestPki::new();
+        let spec = crate::component::PluginStoreSpec::new(
+            scope("main"),
+            // No config values: the profile's secret properties do not resolve.
+            crate::services::test_host_services(),
+            crate::component::test_limits(1_000),
+        )
+        .with_egress_policy(Some(service(["localhost"], [pki.profile()], 2)));
+        let mut state = PluginState::new(spec);
+        state.start_test_frame(true);
+
+        let result = connect(
+            &mut state,
+            "localhost".to_string(),
+            address.port(),
+            ConnectMode::StartTls,
+            Some("test-mtls".to_string()),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(SocketFailure::TlsConfigurationFailed)),
+            "a broken profile must fail at connect"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), listener.accept())
+                .await
+                .is_err(),
+            "no plaintext connection may be opened before TLS material resolves"
+        );
     }
 
     #[tokio::test]
