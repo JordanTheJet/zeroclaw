@@ -93,6 +93,15 @@ fn validate_relay_addr(addr: &str) -> Result<()> {
              IPv4 address."
         );
     }
+    // Check the host with the same parser the daemon uses when it connects, so
+    // a host the relay path cannot use (such as `relay/evil`) is refused here
+    // rather than saved and then rejected at registration.
+    if zeroclaw_runtime::relay::relay_server_name(host).is_err() {
+        anyhow::bail!(
+            "the control plane returned a `relay_addr` whose host ({host}) is not a valid relay \
+             hostname or IPv4 address; no config was written"
+        );
+    }
     match port.parse::<u16>() {
         Ok(p) if p != 0 => Ok(()),
         _ => anyhow::bail!(
@@ -533,6 +542,29 @@ mod tests {
         }
     }
 
+    /// A host that splits as `host:port` but that the relay connection path
+    /// cannot use must be refused before anything is written. `relay/evil`
+    /// used to pass, be saved as `relay_host = "relay/evil"`, and only fail at
+    /// registration.
+    #[test]
+    fn claim_outcome_rejects_hosts_the_relay_path_cannot_use() {
+        for addr in [
+            "relay/evil:8443",
+            "user@relay:8443",
+            "relay?x:8443",
+            "relay..example:8443",
+        ] {
+            let body = format!(r#"{{"node_id":"n","relay_addr":"{addr}"}}"#);
+            let err = claim_outcome(200, &body)
+                .expect_err("an unusable relay host must not produce a claim outcome");
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("not a valid relay hostname") && msg.contains("no config was written"),
+                "{addr}: the refusal must name the host problem and say nothing was written: {msg}"
+            );
+        }
+    }
+
     #[test]
     fn claim_outcome_rejects_malformed_node_id() {
         // Control character in the node-id.
@@ -956,6 +988,40 @@ mod tests {
         // The config file is byte-identical: no half-write on rejection.
         let after = std::fs::read_to_string(&config.config_path).unwrap();
         assert_eq!(before, after, "a rejected claim must not touch the config");
+    }
+
+    #[tokio::test]
+    async fn handle_claim_with_an_unusable_relay_host_does_not_write_config() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = seed_config(tmp.path());
+        let before = std::fs::read_to_string(&config.config_path).unwrap();
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/claim"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "node_id": "node-ok",
+                "relay_addr": "relay/evil:8443",
+            })))
+            .mount(&server)
+            .await;
+
+        let err = handle_claim(&mut config, "tok-host", &server.uri())
+            .await
+            .expect_err("a claim naming an unusable relay host must fail");
+        assert!(
+            format!("{err:#}").contains("not a valid relay hostname"),
+            "err: {err:#}"
+        );
+
+        let after = std::fs::read_to_string(&config.config_path).unwrap();
+        assert_eq!(
+            before, after,
+            "an unusable relay host must not touch the config"
+        );
     }
 
     #[tokio::test]

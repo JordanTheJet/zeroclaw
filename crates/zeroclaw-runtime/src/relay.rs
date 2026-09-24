@@ -595,6 +595,25 @@ async fn serve_once(
     serve_established(cfg, cancel, ws).await
 }
 
+/// Parse `relay_host` the way the connection path consumes it: as the outer
+/// TLS server name, and as the host of the `wss://` registration URI.
+///
+/// Enrollment calls this before persisting a claimed host, so a value either
+/// consumer would reject is refused up front instead of surfacing as
+/// `invalid relay host` at registration, after the claim reported success.
+pub fn relay_server_name(host: &str) -> Result<rustls::pki_types::ServerName<'static>> {
+    let invalid = || anyhow::Error::msg(format!("invalid relay host '{host}'"));
+    let name = rustls::pki_types::ServerName::try_from(host.to_string()).map_err(|_| invalid())?;
+    // A value such as `relay/evil` parses as a URI whose host is only `relay`,
+    // so a successful parse is not enough: the parsed host must be the input.
+    let uri: tokio_tungstenite::tungstenite::http::Uri =
+        format!("wss://{host}/").parse().map_err(|_| invalid())?;
+    if uri.host() != Some(host) {
+        return Err(invalid());
+    }
+    Ok(name)
+}
+
 /// The entire outbound setup for one link: TCP connect, outer TLS, the relay
 /// WebSocket upgrade, and the signed `Hello` -> `Challenge` -> `Register` ->
 /// `Registered` exchange. Kept as ONE future so the caller can impose a single
@@ -625,8 +644,7 @@ async fn connect_and_register(
     let tcp = TcpStream::connect(&cfg.relay_addr)
         .await
         .with_context(|| format!("connecting to relay {}", cfg.relay_addr))?;
-    let server_name = rustls::pki_types::ServerName::try_from(cfg.relay_host.clone())
-        .map_err(|_| anyhow::Error::msg(format!("invalid relay host '{}'", cfg.relay_host)))?;
+    let server_name = relay_server_name(&cfg.relay_host)?;
     let tls = connector
         .connect(server_name, tcp)
         .await
@@ -2239,5 +2257,41 @@ mod bridge_classification_race_tests {
         );
 
         let _held = dialer.await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod relay_server_name_tests {
+    use super::relay_server_name;
+
+    #[test]
+    fn accepts_hostnames_and_ipv4() {
+        for host in [
+            "relay.example",
+            "relay",
+            "192.0.2.10",
+            "relay-1.eu.example.com",
+        ] {
+            assert!(relay_server_name(host).is_ok(), "{host} should be accepted");
+        }
+    }
+
+    #[test]
+    fn rejects_hosts_either_consumer_would_refuse() {
+        for host in [
+            "",
+            "relay/evil",
+            "relay?x",
+            "relay#x",
+            "user@relay",
+            "[2001:db8::1]",
+            "relay example",
+            "relay..example",
+        ] {
+            assert!(
+                relay_server_name(host).is_err(),
+                "{host:?} should be refused"
+            );
+        }
     }
 }
