@@ -2766,6 +2766,79 @@ mod tests {
         }
     }
 
+    /// An agent run after a reload must execute under the reloaded policy.
+    ///
+    /// The executor used to be built once from the startup config and
+    /// installed first-wins in a process global, so a reloaded scheduler
+    /// admitted runs under the new config while the agent still ran under the
+    /// old one: revoked commands and changed risk profiles stayed live. Each
+    /// request now carries the config and effective policy cron admitted it
+    /// under, and the executor keeps none of its own.
+    #[tokio::test]
+    async fn an_agent_run_after_reload_executes_under_the_reloaded_policy() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        config
+            .risk_profiles
+            .entry(TEST_AGENT.into())
+            .or_default()
+            .allowed_commands = vec!["echo".into(), "curl".into()];
+
+        let mut job = test_job("");
+        job.job_type = JobType::Agent;
+        job.prompt = Some("check the feed".into());
+
+        let executor = RecordingExecutor {
+            seen: parking_lot::Mutex::new(Vec::new()),
+        };
+
+        let before = cron_security_policy(&config, TEST_AGENT).expect("policy builds");
+        let (ok, output) = run_agent_job(&config, &before, TEST_AGENT, &job, &executor).await;
+        assert!(ok, "{output}");
+
+        // The operator revokes `curl` and reloads; the next scheduler
+        // generation admits runs under the new config.
+        config
+            .risk_profiles
+            .get_mut(TEST_AGENT)
+            .expect("profile exists")
+            .allowed_commands = vec!["echo".into()];
+        let after = cron_security_policy(&config, TEST_AGENT).expect("policy builds");
+        let (ok, output) = run_agent_job(&config, &after, TEST_AGENT, &job, &executor).await;
+        assert!(ok, "{output}");
+
+        let seen = executor.seen.lock();
+        assert_eq!(seen.len(), 2);
+        assert!(
+            seen[0]
+                .security
+                .allowed_commands
+                .iter()
+                .any(|c| c == "curl"),
+            "the first run ran under the original policy"
+        );
+        assert!(
+            !seen[1]
+                .security
+                .allowed_commands
+                .iter()
+                .any(|c| c == "curl"),
+            "the run after reload must not keep the revoked command, got {:?}",
+            seen[1].security.allowed_commands
+        );
+        assert!(
+            !seen[1]
+                .config
+                .risk_profiles
+                .get(TEST_AGENT)
+                .expect("profile travels with the request")
+                .allowed_commands
+                .iter()
+                .any(|c| c == "curl"),
+            "the config the executor receives must be the reloaded one"
+        );
+    }
+
     /// The scheduler's workspace must survive the crate boundary.
     ///
     /// This asserts the half cron owns: the effective policy crosses the seam
