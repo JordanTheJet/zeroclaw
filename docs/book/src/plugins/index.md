@@ -258,6 +258,14 @@ rows live as `enc2:` ciphertext behind keyed blind indexes in
 `data/plugin-state.db`, using the install `.secret_key`. Fixed quotas and any
 key, storage, or integrity failure fail closed.
 
+State belongs to the instance identity (package name, capability, binding), the
+same identity its config entry uses, not to a publisher. `zeroclaw plugin remove`
+keeps both, so an upgrade (remove, then install) keeps its state. It also means a
+different package installed later under the same name inherits that instance's
+state and configured secrets. Before installing an unrelated plugin under a
+removed plugin's name, delete its `[[plugins.entries]]` row and treat its state
+as readable by the newcomer.
+
 Pre-1.0 plugin authors must migrate explicitly: a manifest that requests
 `config_read` without `config_schema` is no longer discovered. Add a closed
 schema matching the current values, update tool/channel guests to deserialize
