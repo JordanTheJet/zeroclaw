@@ -8,8 +8,8 @@ use crate::store::{
 };
 use crate::{
     CronAgentExecutor, CronAgentRequest, CronAgentRun, CronHealthReporter, CronJob, DeliveryConfig,
-    JobType, Schedule, SessionTarget, all_overdue_jobs, claim_job, clear_stale_locks, due_jobs,
-    next_run_for_schedule, release_job, skip_missed_run, sync_declarative_jobs,
+    JobType, Schedule, SessionTarget, all_overdue_jobs, clear_stale_locks, due_jobs,
+    next_run_for_schedule, skip_missed_run, sync_declarative_jobs,
 };
 use anyhow::Result;
 use chrono::{DateTime, Utc};
@@ -321,28 +321,34 @@ pub(crate) async fn deliver_and_classify_run_result(
 /// has an in-flight claim.
 pub const STATUS_ALREADY_IN_FLIGHT: &str = "already_in_flight";
 
-/// Holds a cron job's in-flight claim for one run and releases it on every
-/// exit path, including an early return, a panic, or a dropped future.
+/// Holds one run's in-flight claim and releases exactly that claim on every
+/// exit path: normal completion, an early return, a panic, or a dropped
+/// future.
 ///
-/// The scheduled path releases explicitly after `persist_job_result`. The
-/// manual path has more exit points than an explicit release can cover, so it
-/// uses this guard instead: construct it only after a successful claim, and
-/// never before, or a refused trigger would release the claim its competitor
-/// is holding.
-struct ClaimGuard<'a> {
-    config: &'a Config,
-    job_id: &'a str,
+/// Scheduled and manual runs both claim through the live-token registry and
+/// both hold one of these. That matters most for the dropped future: a
+/// daemon reload aborts the running scheduler, and an explicit release after
+/// the run would never execute. The token would then stay registered live,
+/// startup recovery would preserve it, and the job would stay locked until
+/// the process restarted. Releasing on drop leaves nothing behind for a
+/// later scheduler generation to trip over.
+///
+/// Construct it only after a successful claim, never before, or a refused
+/// trigger would release the claim its competitor is holding.
+struct ClaimGuard {
+    config: Config,
+    job_id: String,
     lock_token: String,
 }
 
-impl Drop for ClaimGuard<'_> {
+impl Drop for ClaimGuard {
     fn drop(&mut self) {
         // Release only the claim this guard took. A token-qualified release
         // cannot clear a later run's claim on the same job.
-        let released = crate::release_job_for_token(self.config, self.job_id, &self.lock_token);
+        let released = crate::release_job_for_token(&self.config, &self.job_id, &self.lock_token);
         // Once the run is over, recovery must be free to clear the token even
         // if the release failed, or the row would stay locked until restart.
-        crate::finish_agent_claim(self.config, self.job_id, &self.lock_token);
+        crate::finish_agent_claim(&self.config, &self.job_id, &self.lock_token);
         if let Err(e) = released {
             ::zeroclaw_log::record!(
                 WARN,
@@ -351,7 +357,7 @@ impl Drop for ClaimGuard<'_> {
                     .with_attrs(
                         ::serde_json::json!({"job_id": self.job_id, "error": format!("{}", e)})
                     ),
-                "manual cron trigger: failed to release in-flight lock"
+                "cron job: failed to release in-flight lock"
             );
         }
     }
@@ -521,8 +527,8 @@ async fn run_manual_job_inner(
     // Every path below this point releases a claim taken here when `_claim`
     // drops. A claim held by the caller stays the caller's to release.
     let _claim = lock_token.map(|lock_token| ClaimGuard {
-        config,
-        job_id: &job.id,
+        config: config.clone(),
+        job_id: job.id.clone(),
         lock_token,
     });
 
@@ -1153,38 +1159,54 @@ fn withhold_declarative_when_unreconciled(jobs: Vec<CronJob>, sync_failed: bool)
         .collect()
 }
 
-fn claim_due_jobs(config: &Config, jobs: Vec<CronJob>) -> Vec<CronJob> {
+/// A due job this scheduler has claimed, carrying the guard that releases
+/// exactly that claim when the run is done or abandoned.
+struct ClaimedJob {
+    job: CronJob,
+    _claim: ClaimGuard,
+}
+
+fn claim_due_jobs(config: &Config, jobs: Vec<CronJob>) -> Vec<ClaimedJob> {
     jobs.into_iter()
-        .filter(|job| match claim_job(config, &job.id, Utc::now()) {
-            Ok(true) => true,
-            Ok(false) => {
-                ::zeroclaw_log::record!(
-                    DEBUG,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_attrs(::serde_json::json!({"job_id": job.id})),
-                    "Cron job already in flight; skipping duplicate launch"
-                );
-                false
-            }
-            Err(e) => {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(
-                            ::serde_json::json!({"job_id": job.id, "error": format!("{}", e)})
-                        ),
-                    "Cron job: failed to claim in-flight lock; skipping launch"
-                );
-                false
-            }
-        })
+        .filter_map(
+            |job| match crate::claim_job_with_token(config, &job.id, Utc::now()) {
+                Ok(Some(lock_token)) => Some(ClaimedJob {
+                    _claim: ClaimGuard {
+                        config: config.clone(),
+                        job_id: job.id.clone(),
+                        lock_token,
+                    },
+                    job,
+                }),
+                Ok(None) => {
+                    ::zeroclaw_log::record!(
+                        DEBUG,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(::serde_json::json!({"job_id": job.id})),
+                        "Cron job already in flight; skipping duplicate launch"
+                    );
+                    None
+                }
+                Err(e) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(
+                                ::serde_json::json!({"job_id": job.id, "error": format!("{}", e)})
+                            ),
+                        "Cron job: failed to claim in-flight lock; skipping launch"
+                    );
+                    None
+                }
+            },
+        )
         .collect()
 }
 
 async fn process_due_jobs(
     config: &Config,
-    jobs: Vec<CronJob>,
+    jobs: Vec<ClaimedJob>,
     component: &str,
     event_tx: &EventBroadcast,
     agent_executor: Arc<dyn CronAgentExecutor>,
@@ -1194,12 +1216,13 @@ async fn process_due_jobs(
     health_reporter.mark_ok(component);
 
     let max_concurrent = config.scheduler.max_concurrent.max(1);
-    let mut in_flight = stream::iter(jobs.into_iter().filter_map(|job| {
-        let agent_alias = match resolve_owning_agent(config, &job) {
+    let mut in_flight = stream::iter(jobs.into_iter().filter_map(|claimed| {
+        // Returning `None` below drops `claimed`, which releases its claim.
+        let job = &claimed.job;
+        let agent_alias = match resolve_owning_agent(config, job) {
             Ok(alias) => alias,
             Err(reason) => {
                 ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"job_id": job.id, "reason": reason})), "Cron job owner unresolved; refusing to run");
-                let _ = release_job(config, &job.id);
                 return None;
             }
         };
@@ -1208,7 +1231,6 @@ async fn process_due_jobs(
             Ok(s) => Arc::new(s),
             Err(e) => {
                 ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"job_id": job.id, "agent": agent_alias, "error": format!("{}", e)})), "Cron job: failed to build SecurityPolicy for owning agent");
-                let _ = release_job(config, &job.id);
                 return None;
             }
         };
@@ -1217,11 +1239,17 @@ async fn process_due_jobs(
         let agent_executor = Arc::clone(&agent_executor);
         let health_reporter = Arc::clone(&health_reporter);
         Some(async move {
+            // Bind the whole `claimed` here. The body below only reads
+            // `claimed.job`, and an async block captures just the fields it
+            // uses, so without this the guard would stay behind in the closure
+            // and release the claim before the run had even started. Held
+            // here, it lives until this future finishes or is dropped.
+            let claimed = claimed;
             Box::pin(execute_and_persist_job(
                 &config,
                 security.as_ref(),
                 &agent_alias,
-                &job,
+                &claimed.job,
                 &component,
                 agent_executor.as_ref(),
                 health_reporter.as_ref(),
@@ -1295,20 +1323,6 @@ async fn execute_and_persist_job(
         finished_at,
     ))
     .await;
-
-    // Release the in-flight lock claimed during selection (`claim_due_jobs`) now
-    // that the run (and its reschedule/disable/delete in `persist_job_result`) is
-    // done. A deleted one-shot row simply releases nothing. If this fails the lock
-    // is recovered by `clear_stale_locks` at the next startup
-    if let Err(e) = release_job(config, &job.id) {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                .with_attrs(::serde_json::json!({"job_id": job.id, "error": format!("{}", e)})),
-            "Cron job: failed to release in-flight lock after run"
-        );
-    }
 
     ScheduledRunReport {
         job_id: job.id.clone(),
@@ -1796,6 +1810,22 @@ mod tests {
 
     fn test_agent_executor() -> &'static dyn CronAgentExecutor {
         &SuccessfulExecutor
+    }
+
+    /// Wrap in-memory jobs that were never claimed in the database, for tests
+    /// that drive `process_due_jobs` directly. Their guard's token-qualified
+    /// release matches no claim and does nothing.
+    fn unclaimed(config: &Config, jobs: Vec<CronJob>) -> Vec<ClaimedJob> {
+        jobs.into_iter()
+            .map(|job| ClaimedJob {
+                _claim: ClaimGuard {
+                    config: config.clone(),
+                    job_id: job.id.clone(),
+                    lock_token: "test-never-claimed".into(),
+                },
+                job,
+            })
+            .collect()
     }
 
     fn test_agent_executor_arc() -> Arc<dyn CronAgentExecutor> {
@@ -2884,7 +2914,7 @@ mod tests {
 
         process_due_jobs(
             &config,
-            vec![job],
+            unclaimed(&config, vec![job]),
             &component,
             &None,
             test_agent_executor_arc(),
@@ -3759,7 +3789,7 @@ mod tests {
 
         process_due_jobs(
             &config,
-            vec![job],
+            unclaimed(&config, vec![job]),
             &component,
             &event_tx,
             test_agent_executor_arc(),
@@ -3793,7 +3823,7 @@ mod tests {
 
         process_due_jobs(
             &config,
-            vec![job],
+            unclaimed(&config, vec![job]),
             &component,
             &event_tx,
             test_agent_executor_arc(),
@@ -3827,7 +3857,8 @@ mod tests {
             "an in-flight job must be skipped by the next selection pass"
         );
 
-        cron::release_job(&config, &job.id).unwrap();
+        // Finishing the run drops its guard, which releases the claim.
+        drop(claimed);
         let after_release = claim_due_jobs(&config, vec![job]);
         assert_eq!(
             after_release.len(),
@@ -3849,15 +3880,13 @@ mod tests {
         // With an empty alias and an id bound to no [agents.<x>].cron_jobs list,
         // resolve_owning_agent returns None, so the job is skipped as an orphan.
         let job = cron::add_job(&config, TEST_AGENT, "* * * * *", "echo orphan").unwrap();
-        assert!(cron::claim_job(&config, &job.id, Utc::now()).unwrap());
-        let orphan = CronJob {
-            agent_alias: String::new(),
-            ..job.clone()
-        };
+        let mut claimed = claim_due_jobs(&config, vec![job.clone()]);
+        assert_eq!(claimed.len(), 1, "the scheduler claims the due row");
+        claimed[0].job.agent_alias = String::new();
 
         process_due_jobs(
             &config,
-            vec![orphan],
+            claimed,
             &unique_component("orphan"),
             &None,
             test_agent_executor_arc(),
@@ -3881,7 +3910,7 @@ mod tests {
         // event_tx = None — should complete without panic.
         process_due_jobs(
             &config,
-            vec![job],
+            unclaimed(&config, vec![job]),
             &component,
             &None,
             test_agent_executor_arc(),
@@ -3904,7 +3933,7 @@ mod tests {
 
         process_due_jobs(
             &config,
-            vec![job],
+            unclaimed(&config, vec![job]),
             &component,
             &event_tx,
             test_agent_executor_arc(),
@@ -4377,6 +4406,124 @@ mod tests {
         let kept = withhold_declarative_when_unreconciled(jobs, true);
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].source, "imperative");
+    }
+
+    /// An agent run that never finishes, standing in for work still in
+    /// flight when a daemon reload aborts the scheduler.
+    struct NeverFinishingExecutor {
+        started: Arc<tokio::sync::Notify>,
+    }
+
+    impl CronAgentExecutor for NeverFinishingExecutor {
+        fn run_agent_job<'a>(
+            &'a self,
+            _request: CronAgentRequest,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = CronAgentRun> + Send + 'a>>
+        {
+            Box::pin(async move {
+                self.started.notify_one();
+                std::future::pending().await
+            })
+        }
+    }
+
+    /// A run aborted mid-flight, as a daemon reload aborts the scheduler, must
+    /// leave nothing that stops the next scheduler generation from running it.
+    ///
+    /// While the run is live its claim is registered, so startup recovery
+    /// must keep it and a second selection must skip it. Once the run is
+    /// aborted its guard drops and releases the claim, so the next
+    /// generation's recovery and selection proceed normally. A claim released
+    /// only by an explicit call after the run would never be released here,
+    /// and would stay registered live until the process restarted.
+    #[tokio::test]
+    async fn a_run_aborted_by_reload_leaves_the_job_runnable_by_the_next_generation() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let job = cron::add_agent_job(
+            &config,
+            TEST_AGENT,
+            Some("long-running".into()),
+            crate::Schedule::Cron {
+                expr: "* * * * *".into(),
+                tz: None,
+            },
+            "keep working",
+            SessionTarget::Isolated,
+            None,
+            None,
+            false,
+            None,
+            false,
+        )
+        .unwrap();
+
+        // Generation one claims the job and starts a run that never finishes.
+        let started = Arc::new(tokio::sync::Notify::new());
+        let executor: Arc<dyn CronAgentExecutor> = Arc::new(NeverFinishingExecutor {
+            started: Arc::clone(&started),
+        });
+        let claimed = claim_due_jobs(&config, vec![job.clone()]);
+        assert_eq!(claimed.len(), 1);
+        let generation_one = {
+            let config = config.clone();
+            ::zeroclaw_spawn::spawn!(async move {
+                process_due_jobs(
+                    &config,
+                    claimed,
+                    &unique_component("generation-one"),
+                    &None,
+                    executor,
+                    test_health_reporter(),
+                )
+                .await;
+            })
+        };
+        started.notified().await;
+
+        // Mid-run: the live claim survives recovery and blocks reselection.
+        assert_eq!(
+            cron::clear_stale_locks(&config).unwrap(),
+            0,
+            "recovery must not clear a claim whose run is still live"
+        );
+        assert!(
+            claim_due_jobs(&config, vec![job.clone()]).is_empty(),
+            "a live run must not be launched twice"
+        );
+
+        // The reload aborts generation one while the run is still in flight.
+        generation_one.abort();
+        let _ = generation_one.await;
+
+        // Generation two recovers and can run the job straight away.
+        cron::clear_stale_locks(&config).expect("recovery succeeds");
+        assert_eq!(
+            claim_due_jobs(&config, vec![job]).len(),
+            1,
+            "the next generation must be able to claim the aborted job"
+        );
+    }
+
+    /// Releasing a finished claim must not clear a newer claim on the same job.
+    #[tokio::test]
+    async fn a_stale_claim_release_does_not_clear_a_newer_claim() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let job = cron::add_job(&config, TEST_AGENT, "*/5 * * * *", "echo ok").unwrap();
+
+        let first = claim_due_jobs(&config, vec![job.clone()]);
+        assert_eq!(first.len(), 1);
+        // Something else has since re-claimed the row under its own token, as
+        // a later run would after this claim had been recovered.
+        cron::force_claim_for_tests(&config, &job.id, Some("newer-run")).unwrap();
+
+        drop(first);
+
+        assert!(
+            claim_due_jobs(&config, vec![job]).is_empty(),
+            "the newer claim must still hold after the older run releases"
+        );
     }
 
     /// Charges one action from the policy it is handed, as a tool call would.
