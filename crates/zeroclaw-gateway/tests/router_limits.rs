@@ -145,6 +145,10 @@ async fn boot(tmp: tempfile::TempDir, cfg: Config) -> GatewayGuard {
             None,
             None,
             None,
+            // Standalone: a local pairing guard built from config, and no
+            // daemon driver supervisor set.
+            None,
+            None,
             Some(readiness),
         )
         .await
