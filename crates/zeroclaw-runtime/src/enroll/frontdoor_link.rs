@@ -40,11 +40,16 @@ pub fn frontdoor_link(relay_addr: &str, node_id: &str, pairing_code: &str) -> Op
 /// Reduce `[relay].url` to the `host[:port]` authority of the frontdoor page.
 fn relay_authority(relay_addr: &str) -> Option<String> {
     let mut rest = relay_addr.trim();
-    for scheme in ["wss://", "https://", "ws://", "http://"] {
+    // Only a TLS scheme is tolerated; the frontdoor is served over TLS. Any
+    // other scheme (plaintext or unknown) yields no link rather than a guess.
+    for scheme in ["wss://", "https://"] {
         if rest.len() >= scheme.len() && rest[..scheme.len()].eq_ignore_ascii_case(scheme) {
             rest = &rest[scheme.len()..];
             break;
         }
+    }
+    if rest.contains("://") {
+        return None;
     }
     let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
     if authority.is_empty()
@@ -190,6 +195,10 @@ mod tests {
         assert_eq!(frontdoor_link("user@relay:9443", NODE, CODE), None);
         assert_eq!(frontdoor_link("re lay:9443", NODE, CODE), None);
         assert_eq!(frontdoor_link("wss:///relay", NODE, CODE), None);
+        // A non-TLS or unknown scheme is not guessed at.
+        for addr in ["ftp://relay:9443", "file://relay", "FTP://relay"] {
+            assert_eq!(frontdoor_link(addr, NODE, CODE), None, "{addr}");
+        }
     }
 
     #[test]
