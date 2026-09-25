@@ -128,6 +128,14 @@ pub enum BootstrapError {
         /// Underlying failure text.
         reason: String,
     },
+    /// The install destination is not a plain file the launcher may replace
+    /// (for example a symbolic link), so nothing was written.
+    UnsafeInstallTarget {
+        /// The refused destination.
+        path: String,
+        /// What made it unsafe.
+        reason: String,
+    },
     /// Filesystem failure.
     Io {
         /// What the launcher was doing.
@@ -225,6 +233,11 @@ impl fmt::Display for BootstrapError {
             Self::Transport { url, reason } => {
                 write!(f, "failed: request to {url} did not complete ({reason})")
             }
+            Self::UnsafeInstallTarget { path, reason } => write!(
+                f,
+                "refused: install path {path} is {reason}; nothing was written. \
+                 Remove or move it, then retry"
+            ),
             Self::Io { context, reason } => write!(f, "failed: {context} ({reason})"),
         }
     }

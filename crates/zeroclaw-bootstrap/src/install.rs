@@ -200,17 +200,106 @@ fn extract_from_zip(archive: &[u8], binary_name: &str) -> Result<Vec<u8>, Bootst
 }
 
 /// Writes the binary and marks it executable on Unix.
+/// Install `bytes` as the executable at `path`, atomically.
+///
+/// The bytes go to a fresh temporary file in the same directory, which is
+/// marked executable and flushed, then renamed over `path`. A reader therefore
+/// sees either the old binary or the complete new one, never a truncated file,
+/// and a running old binary is replaced rather than rewritten in place (no
+/// `ETXTBSY`). A destination that is a symbolic link or not a regular file is
+/// refused before anything is written, so the install cannot be redirected to
+/// overwrite a file elsewhere.
 fn write_executable(path: &Path, bytes: &[u8]) -> Result<(), BootstrapError> {
-    std::fs::write(path, bytes)
-        .map_err(|err| BootstrapError::io(format!("writing {}", path.display()), &err))?;
+    refuse_unsafe_destination(path)?;
+    let dir = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "zeroclaw".to_string());
+    let (tmp_path, file) = create_unique_temp(dir, &name)?;
+
+    let written = finish_temp(file, bytes).and_then(|()| std::fs::rename(&tmp_path, path));
+    if let Err(err) = written {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(BootstrapError::io(
+            format!("installing {}", path.display()),
+            &err,
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse a destination that exists but is not a regular file. A missing
+/// destination is fine: that is a first install.
+fn refuse_unsafe_destination(path: &Path) -> Result<(), BootstrapError> {
+    let refuse = |reason: &str| BootstrapError::UnsafeInstallTarget {
+        path: path.display().to_string(),
+        reason: reason.to_string(),
+    };
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => Err(refuse("a symbolic link")),
+        Ok(meta) if !meta.is_file() => Err(refuse("not a regular file")),
+        Ok(_) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(BootstrapError::io(
+            format!("inspecting {}", path.display()),
+            &err,
+        )),
+    }
+}
+
+/// Create a new, exclusively owned temporary file next to the destination.
+/// `create_new` fails rather than following anything already at the name.
+fn create_unique_temp(
+    dir: &Path,
+    name: &str,
+) -> Result<(std::path::PathBuf, std::fs::File), BootstrapError> {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    for attempt in 0..16u32 {
+        let candidate = dir.join(format!(
+            ".{name}.{}.{nanos}.{attempt}.tmp",
+            std::process::id()
+        ));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&candidate) {
+            Ok(file) => return Ok((candidate, file)),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return Err(BootstrapError::io(
+                    format!("creating a temporary file in {}", dir.display()),
+                    &err,
+                ));
+            }
+        }
+    }
+    Err(BootstrapError::Io {
+        context: format!("creating a temporary file in {}", dir.display()),
+        reason: "no free temporary name".to_string(),
+    })
+}
+
+/// Write, mark executable, and flush the temporary file before it is renamed.
+fn finish_temp(mut file: std::fs::File, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    file.write_all(bytes)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).map_err(|err| {
-            BootstrapError::io(format!("marking {} executable", path.display()), &err)
-        })?;
+        file.set_permissions(std::fs::Permissions::from_mode(0o755))?;
     }
-    Ok(())
+    file.sync_all()
 }
 
 #[cfg(test)]
@@ -237,5 +326,127 @@ mod tests {
                 "entry `{hostile}` must be refused"
             );
         }
+    }
+
+    fn entries(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .expect("read dir")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn a_fresh_install_is_executable_and_leaves_no_temporary_files() {
+        let dir = tempfile::tempdir().expect("temp");
+        let dest = dir.path().join("zeroclaw");
+        write_executable(&dest, b"new binary").expect("install");
+        assert_eq!(std::fs::read(&dest).expect("read"), b"new binary");
+        assert_eq!(entries(dir.path()), vec!["zeroclaw".to_string()]);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&dest).expect("meta").permissions().mode();
+            assert_eq!(mode & 0o777, 0o755);
+        }
+    }
+
+    /// Replacement goes through a rename, so the old file is swapped out whole
+    /// rather than rewritten in place (no truncated reads, no ETXTBSY).
+    #[cfg(unix)]
+    #[test]
+    fn replacing_a_binary_swaps_in_a_new_file_rather_than_rewriting_it() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().expect("temp");
+        let dest = dir.path().join("zeroclaw");
+        write_executable(&dest, b"old binary").expect("first install");
+        let old_inode = std::fs::metadata(&dest).expect("meta").ino();
+
+        write_executable(&dest, b"new binary").expect("replace");
+
+        assert_eq!(std::fs::read(&dest).expect("read"), b"new binary");
+        assert_ne!(
+            std::fs::metadata(&dest).expect("meta").ino(),
+            old_inode,
+            "the destination must be a new file, not the old one rewritten"
+        );
+        assert_eq!(entries(dir.path()), vec!["zeroclaw".to_string()]);
+    }
+
+    /// A symlink at the destination must not redirect the write to its target.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_destination_is_refused_and_its_target_untouched() {
+        let dir = tempfile::tempdir().expect("temp");
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, b"do not overwrite").expect("victim");
+        let dest = dir.path().join("zeroclaw");
+        std::os::unix::fs::symlink(&victim, &dest).expect("symlink");
+
+        let err = write_executable(&dest, b"new binary").expect_err("must refuse");
+
+        assert!(
+            matches!(err, BootstrapError::UnsafeInstallTarget { .. }),
+            "unexpected error: {err}"
+        );
+        assert_eq!(std::fs::read(&victim).expect("read"), b"do not overwrite");
+        assert!(
+            std::fs::symlink_metadata(&dest)
+                .expect("meta")
+                .file_type()
+                .is_symlink(),
+            "the symlink itself must be left as it was"
+        );
+        assert_eq!(
+            entries(dir.path()),
+            vec!["victim".to_string(), "zeroclaw".to_string()],
+            "no temporary file may be left behind"
+        );
+    }
+
+    #[test]
+    fn a_directory_at_the_destination_is_refused() {
+        let dir = tempfile::tempdir().expect("temp");
+        let dest = dir.path().join("zeroclaw");
+        std::fs::create_dir(&dest).expect("dir");
+        let err = write_executable(&dest, b"new binary").expect_err("must refuse");
+        assert!(
+            matches!(err, BootstrapError::UnsafeInstallTarget { .. }),
+            "unexpected error: {err}"
+        );
+        assert!(dest.is_dir());
+    }
+
+    /// A replacement that cannot complete must leave the existing binary
+    /// exactly as it was and clean up after itself.
+    #[cfg(unix)]
+    #[test]
+    fn an_interrupted_replacement_leaves_the_existing_binary_intact() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("temp");
+        let dest = dir.path().join("zeroclaw");
+        write_executable(&dest, b"old binary").expect("first install");
+
+        // Make the directory unwritable so the replacement fails before the
+        // rename. Root ignores directory permissions, so skip there.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555))
+            .expect("chmod");
+        let probe = dir.path().join("probe");
+        if std::fs::write(&probe, b"x").is_ok() {
+            let _ = std::fs::remove_file(&probe);
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755))
+                .expect("chmod back");
+            eprintln!("skipping: directory permissions are not enforced for this user");
+            return;
+        }
+
+        let result = write_executable(&dest, b"new binary");
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755))
+            .expect("chmod back");
+
+        assert!(result.is_err(), "the replacement must fail");
+        assert_eq!(std::fs::read(&dest).expect("read"), b"old binary");
+        assert_eq!(entries(dir.path()), vec!["zeroclaw".to_string()]);
     }
 }
