@@ -710,13 +710,6 @@ pub async fn run(
                     }
                 };
 
-                // Held back while reconciliation is unresolved: a declarative
-                // row may still carry a body from before the config change the
-                // gate is being resolved from.
-                let jobs = withhold_declarative_when_unreconciled(
-                    jobs,
-                    !crate::declarative_jobs_reconciled(&config),
-                );
                 let jobs = claim_due_jobs(&config, jobs);
                 process_due_jobs(
                     &config,
@@ -1166,8 +1159,17 @@ struct ClaimedJob {
     _claim: ClaimGuard,
 }
 
+/// Claim a batch of due jobs for this scheduler, skipping any another run
+/// already holds.
+///
+/// Every route that selects scheduled work passes through here, polling and
+/// startup catch-up alike, so this is also where declarative rows are held
+/// back while reconciliation is unresolved. Such a row may still carry a body
+/// from before the config its gate resolves from, and filtering at each
+/// caller let startup catch-up run it.
 fn claim_due_jobs(config: &Config, jobs: Vec<CronJob>) -> Vec<ClaimedJob> {
-    jobs.into_iter()
+    withhold_declarative_when_unreconciled(jobs, !crate::declarative_jobs_reconciled(config))
+        .into_iter()
         .filter_map(
             |job| match crate::claim_job_with_token(config, &job.id, Utc::now()) {
                 Ok(Some(lock_token)) => Some(ClaimedJob {
@@ -4537,6 +4539,106 @@ mod tests {
             manual.success,
             "released after reconciling: {}",
             manual.output
+        );
+    }
+
+    /// Startup catch-up must not run a declarative job whose declaration has
+    /// not reconciled.
+    ///
+    /// Catch-up selects overdue rows through its own entry point. It used to
+    /// skip the reconciliation filter the poll loop applied, so after a failed
+    /// sync an overdue job could run its old stored body under the new hook.
+    /// The filter now lives in `claim_due_jobs`, which every scheduled route
+    /// shares. Completing the one-shot after a successful sync shows the entry
+    /// point really executes jobs, so the untouched row before it is not
+    /// vacuous.
+    #[tokio::test]
+    async fn startup_catch_up_does_not_run_an_unreconciled_declaration() {
+        use zeroclaw_config::schema::{CronJobDecl, CronPreHookDecl, CronScheduleDecl};
+
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        allow_gate_test_commands(&mut config);
+
+        // An overdue one-shot, owned by the test agent and synced.
+        let at = (Utc::now() - ChronoDuration::hours(1)).to_rfc3339();
+        config.cron.insert(
+            "overdue-job".to_string(),
+            CronJobDecl {
+                job_type: "shell".into(),
+                schedule: CronScheduleDecl::At { at },
+                command: Some(format!("echo {GATED_BODY_MARKER}")),
+                pre_hook: Some(CronPreHookDecl {
+                    command: "exit 0".into(),
+                    timeout_secs: 30,
+                }),
+                ..CronJobDecl::default()
+            },
+        );
+        config
+            .agents
+            .get_mut(TEST_AGENT)
+            .expect("test agent")
+            .cron_jobs
+            .push("overdue-job".to_string());
+        cron::sync_declarative_jobs(&config, &config.cron).expect("valid config reconciles");
+
+        // An unrelated declaration gets an empty hook command, so the next
+        // sync rejects the whole set before touching the database.
+        let mut broken = config.cron.clone();
+        broken.insert(
+            "unrelated-job".to_string(),
+            CronJobDecl {
+                job_type: "shell".into(),
+                schedule: CronScheduleDecl::Cron {
+                    expr: "*/5 * * * *".into(),
+                    tz: None,
+                },
+                command: Some("echo unrelated".into()),
+                pre_hook: Some(CronPreHookDecl {
+                    command: String::new(),
+                    timeout_secs: 30,
+                }),
+                ..CronJobDecl::default()
+            },
+        );
+        assert!(cron::sync_declarative_jobs(&config, &broken).is_err());
+
+        catch_up_overdue_jobs(
+            &config,
+            &None,
+            test_agent_executor_arc(),
+            test_health_reporter(),
+        )
+        .await;
+        assert!(
+            cron::list_runs(&config, "overdue-job", 10)
+                .unwrap()
+                .is_empty(),
+            "neither the hook nor the stale body may run while unreconciled"
+        );
+        assert!(
+            cron::get_job(&config, "overdue-job")
+                .unwrap()
+                .last_status
+                .is_none(),
+            "the row must be left as it was"
+        );
+
+        // Reconciled again, the same entry point runs the job.
+        cron::sync_declarative_jobs(&config, &config.cron).expect("valid config reconciles");
+        catch_up_overdue_jobs(
+            &config,
+            &None,
+            test_agent_executor_arc(),
+            test_health_reporter(),
+        )
+        .await;
+        // A declarative one-shot deletes itself once it has run, and nothing
+        // else removes it, so its absence is the proof that it ran.
+        assert!(
+            cron::get_job(&config, "overdue-job").is_err(),
+            "catch-up runs and completes the one-shot once it reconciles"
         );
     }
 
