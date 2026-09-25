@@ -2,6 +2,8 @@
 
 pub mod model;
 pub mod sqlite;
+#[cfg(any(test, feature = "test-util"))]
+pub mod testing;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -647,6 +649,7 @@ mod tests {
         let sop_run = SopRun {
             run_id: id.to_string(),
             sop_name: "deploy".to_string(),
+            initiating_agent: None,
             trigger_event: SopEvent {
                 source: SopTriggerSource::Manual,
                 topic: None,

@@ -23,8 +23,9 @@ use zeroclaw_config::schema::Config;
 use zeroclaw_api::jsonrpc::error_codes::*;
 use zeroclaw_api::jsonrpc::{
     JSONRPC_VERSION, JsonRpcError, JsonRpcFrame, JsonRpcFrameErrorKind, JsonRpcNotification,
-    JsonRpcResponse, RpcOutbound, SopDecideRequest, SopRunDetailRequest, SopRunOverlayRequest,
-    SopRunRequest, SopRunResponse, SopRunsRequest, SopSaveRequest, SopSelectRequest,
+    JsonRpcResponse, RpcOutbound, SopDecideRequest, SopRenameRequest, SopRunDetailRequest,
+    SopRunOverlayRequest, SopRunRequest, SopRunResponse, SopRunsRequest, SopSaveRequest,
+    SopSelectRequest,
 };
 use zeroclaw_api::model_provider::ConversationMessage;
 use zeroclaw_api::runtime_status::{RuntimeConfigKind, RuntimeShellProfile};
@@ -197,6 +198,7 @@ pub enum Method {
     SopsSave,
     SopsCreate,
     SopsDelete,
+    SopsRename,
     SopsDecide,
     SopsWireDraft,
     SopsGraphDraft,
@@ -308,6 +310,7 @@ impl Method {
         (Method::SopsSave, "sops/save"),
         (Method::SopsCreate, "sops/create"),
         (Method::SopsDelete, "sops/delete"),
+        (Method::SopsRename, "sops/rename"),
         (Method::SopsDecide, "sops/decide"),
         (Method::SopsWireDraft, "sops/wire-draft"),
         (Method::SopsGraphDraft, "sops/graph-draft"),
@@ -431,7 +434,7 @@ impl Method {
             | M::SopsRunOverlay
             | M::SopsTriggerSources => (Resource::Sops, Verb::Read),
             M::SopsCreate => (Resource::Sops, Verb::Create),
-            M::SopsSave => (Resource::Sops, Verb::Update),
+            M::SopsSave | M::SopsRename => (Resource::Sops, Verb::Update),
             M::SopsDelete => (Resource::Sops, Verb::Delete),
             M::SopsRun | M::SopsDecide | M::SopsValidate | M::SopsWireDraft | M::SopsGraphDraft => {
                 (Resource::Sops, Verb::Execute)
@@ -1646,7 +1649,12 @@ impl RpcDispatcher {
         // paths outright, with the same answer as any other refusal.
         let plain = requested.is_absolute() && super::fs::resolves_locally(requested);
         let allowed = if grants.admin {
-            Some(super::fs::ListingAuthorization::Unconfined)
+            // Operator account governs, but resolve the target so the handler
+            // enumerates a canonical path, never the raw (swappable) request.
+            requested
+                .canonicalize()
+                .ok()
+                .map(super::fs::ListingAuthorization::Unconfined)
         } else if plain {
             let config = self.ctx.config.read();
             super::fs::authorize_listing(&config, grants, requested)
@@ -1674,61 +1682,100 @@ impl RpcDispatcher {
     /// account's wider read access is not lent to the caller. Inline
     /// `data_b64` entries carry their own bytes and pass. `None` grants are an
     /// unbound dispatcher (the direct unit-test handlers) and pass.
+    ///
+    /// Returns one slot per input entry, index-aligned with `entries`: `None`
+    /// for an inline (`data_b64`) entry, or `Some(AttachmentSource)` carrying
+    /// the single canonical target this authorization judged. The caller MUST
+    /// bind the bounded read to the returned source — never re-resolve the raw
+    /// request path — so an alias that resolved inside an entitled root at
+    /// authorization time cannot be swapped to point elsewhere before the read
+    /// (the canonicalization contract in `policy.rs`). When grants are absent or
+    /// admin (no per-path authorization runs) the slots are still resolved so
+    /// the read binds to the same canonical target as the confined path.
     fn authorize_attachment_sources(
         &self,
         method: Method,
         grants: Option<&zeroclaw_api::grants::ResolvedGrants>,
         alias: &str,
         entries: &[FileEntry],
-    ) -> Result<(), JsonRpcError> {
+    ) -> Result<Vec<Option<super::attachments::AttachmentSource>>, JsonRpcError> {
+        // Resolve every path entry to its canonical target ONCE, up front, and
+        // reuse that resolution for both the readability judgement and the
+        // returned read binding. This is the single point of truth the read
+        // must consume.
+        let resolved: Vec<Option<super::attachments::AttachmentSource>> = entries
+            .iter()
+            .map(|entry| self.attachment_source(alias, entry))
+            .collect();
+
+        // Unbound dispatcher (direct unit-test handlers) or an operator grant:
+        // no per-path authorization gate, but still carry the resolved targets.
         let Some(grants) = grants else {
-            return Ok(());
+            return Ok(resolved);
         };
         if grants.admin {
-            return Ok(());
+            return Ok(resolved);
         }
-        let sources: Vec<&str> = entries
-            .iter()
-            .filter(|entry| entry.data_b64.is_none())
-            .filter_map(|entry| entry.path.as_deref())
-            .collect();
-        if sources.is_empty() {
-            return Ok(());
-        }
-        let config = self.ctx.config.read();
-        let policy = zeroclaw_config::policy::SecurityPolicy::for_agent(&config, alias).ok();
-        for source in sources {
-            let path = std::path::Path::new(source);
-            let allowed = path.is_absolute()
-                && super::fs::resolves_locally(path)
-                && policy
-                    .as_ref()
-                    .is_some_and(|policy| policy.is_resolved_path_readable(path));
+
+        for (entry, source) in entries.iter().zip(resolved.iter()) {
+            // Inline bytes carry no path source and need no read authorization.
+            if entry.data_b64.is_some() {
+                continue;
+            }
+            let Some(raw) = entry.path.as_deref() else {
+                continue;
+            };
+            // Judge readability on the SAME canonical target the read will bind
+            // to, not on the raw request spelling. A path that would not resolve
+            // (source is None) is refused closed.
+            let allowed = source.as_ref().is_some_and(|src| {
+                let path = &src.target;
+                path.is_absolute() && super::fs::resolves_locally(path) && {
+                    let config = self.ctx.config.read();
+                    zeroclaw_config::policy::SecurityPolicy::for_agent(&config, alias)
+                        .ok()
+                        .is_some_and(|policy| policy.is_resolved_path_readable(path))
+                }
+            });
             if !allowed {
                 let denied = crate::rpc::auth::AuthDenied::forbidden(format!(
-                    "Principal is not granted attachment source {source:?}: only an absolute local \
+                    "Principal is not granted attachment source {raw:?}: only an absolute local \
                      path that agent {alias:?} may read can be attached by path"
                 ));
                 self.audit_auth_denial(method, &denied);
                 return Err(rpc_err(denied.code, denied.message));
             }
         }
-        Ok(())
+        Ok(resolved)
     }
 
-    /// The approved read root for an attachment source, resolved through the
-    /// same agent policy `authorize_attachment_sources` judged it with. `None`
-    /// when the entry carries inline bytes or the policy bounds no root for it,
-    /// in which case the read falls back to a parent-handle open.
-    fn attachment_source_root(&self, alias: &str, entry: &FileEntry) -> Option<std::path::PathBuf> {
+    /// The authorized source for a path-mode attachment: the canonical resolved
+    /// target and its approved read root, resolved through the same agent policy
+    /// `authorize_attachment_sources` judged it with.
+    ///
+    /// `None` when the entry carries inline bytes (no path source) or the path
+    /// cannot be resolved. Resolving here and carrying the canonical target into
+    /// the bounded read is what keeps an alias that resolved inside an entitled
+    /// root at authorization time from being swapped to point outside before the
+    /// read: the read binds to this target, never to the raw request spelling.
+    /// `root` is `None` when the policy bounds no root for the target, in which
+    /// case the read falls back to a parent-handle open of the canonical target.
+    fn attachment_source(
+        &self,
+        alias: &str,
+        entry: &FileEntry,
+    ) -> Option<super::attachments::AttachmentSource> {
         if entry.data_b64.is_some() {
             return None;
         }
         let path = entry.path.as_deref()?;
         let config = self.ctx.config.read();
-        zeroclaw_config::policy::SecurityPolicy::for_agent(&config, alias)
-            .ok()?
-            .approved_read_root(std::path::Path::new(path))
+        let policy = zeroclaw_config::policy::SecurityPolicy::for_agent(&config, alias).ok()?;
+        // Resolve once; feed the same canonical target to root selection and to
+        // the read. Fail closed if it cannot be resolved.
+        let target = policy.resolve_policy_target(std::path::Path::new(path))?;
+        let root = policy.approved_read_root(&target);
+        Some(super::attachments::AttachmentSource { root, target })
     }
 
     /// Whether this connection holds operator-level (admin) grants. An
@@ -2385,6 +2432,7 @@ impl RpcDispatcher {
             Method::SopsSave => self.handle_sops_save(&req.params),
             Method::SopsCreate => self.handle_sops_create(&req.params),
             Method::SopsDelete => self.handle_sops_delete(&req.params),
+            Method::SopsRename => self.handle_sops_rename(&req.params),
             Method::SopsDecide => self.handle_sops_decide(&req.params).await,
             Method::SopsWireDraft => self.handle_sops_wire_draft(&req.params),
             Method::SopsGraphDraft => self.handle_sops_graph_draft(&req.params),
@@ -3131,6 +3179,22 @@ impl RpcDispatcher {
         // deliberately remains outside this boundary.
         let config_generation_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
         let config = self.ctx.config.read().clone();
+
+        // The wait for the config-generation lock above is also unbounded, and
+        // an authenticated permission-profile edit can hold it while it removes
+        // this caller's agent grant and publishes the new config. The grants
+        // and agent selector re-resolved after admission (before this second
+        // wait) are therefore stale here: they reflect the policy in force
+        // before the edit committed. Re-resolve authority now, under the lock
+        // and against the just-read config, and repeat the agent selector
+        // before anything is constructed or inserted, so a session cannot be
+        // built with authority the caller no longer holds. The workspace
+        // confinement below already re-runs against `grants`; bind it to the
+        // freshly resolved set.
+        let grants = self.recheck_authority_after_admission(Method::SessionNew)?;
+        if let Some(grants) = grants.as_ref() {
+            self.selector_session_agent_with_grants(Method::SessionNew, grants, &req.agent_alias)?;
+        }
 
         // The session cwd: caller-supplied wins, then a resumed ACP session's
         // persisted cwd, then the agent's workspace dir.
@@ -4389,23 +4453,32 @@ impl RpcDispatcher {
                 .to_string_lossy()
                 .to_string();
             let is_wss = self.peer_label.starts_with("wss:");
-            if !is_wss
-                && let Err(denied) = self.authorize_attachment_sources(
+            // Resolve + authorize attachment sources once; the returned slots
+            // are index-aligned with req.attachments and carry the exact
+            // canonical target each read must bind to. On WSS, path sources are
+            // rejected inside process_file_entry, so no resolution is needed.
+            let attachment_sources = if is_wss {
+                Vec::new()
+            } else {
+                match self.authorize_attachment_sources(
                     Method::SessionPrompt,
                     grants.as_ref(),
                     &agent_alias,
                     &req.attachments,
-                )
-            {
-                return Err(self
-                    .refuse_admitted_prompt(sid, req.client_turn_generation, denied)
-                    .await);
-            }
+                ) {
+                    Ok(sources) => sources,
+                    Err(denied) => {
+                        return Err(self
+                            .refuse_admitted_prompt(sid, req.client_turn_generation, denied)
+                            .await);
+                    }
+                }
+            };
             if !prompt.is_empty() {
                 prompt.push('\n');
             }
             for (idx, entry) in req.attachments.iter().enumerate() {
-                let source_root = self.attachment_source_root(&agent_alias, entry);
+                let source = attachment_sources.get(idx).and_then(|s| s.as_ref());
                 let result = tokio::select! {
                     biased;
                     _ = self.connection_cancel.cancelled() => {
@@ -4419,7 +4492,7 @@ impl RpcDispatcher {
                         sid,
                         &upload_root,
                         is_wss,
-                        source_root.as_deref(),
+                        source,
                         &self.ctx.sessions,
                     ) => result?,
                 };
@@ -6948,7 +7021,18 @@ impl RpcDispatcher {
                         .as_ref()
                         .and_then(|dir| {
                             let path = dir.join(filename);
-                            let meta = std::fs::metadata(&path).ok()?;
+                            // No-follow metadata: `personality/get` and `put`
+                            // already use root-bound no-follow helpers, so a
+                            // planted symlink at an allowlisted personality name
+                            // must not disclose an outside target's existence,
+                            // size, or mtime through the listing either. A
+                            // symlink resolves to its own (link) metadata here
+                            // and is reported as a non-file with the link's own
+                            // attributes, never the target's.
+                            let meta = std::fs::symlink_metadata(&path).ok()?;
+                            if !meta.is_file() {
+                                return None;
+                            }
                             let mtime = meta
                                 .modified()
                                 .ok()
@@ -7326,8 +7410,9 @@ impl RpcDispatcher {
     async fn handle_logs_query(&self, params: &Value) -> RpcResult {
         let p: LogsQueryParams = parse_params(params)?;
 
-        let path = zeroclaw_log::current_log_path()
-            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Log persistence is not enabled"))?;
+        let Some((active, reads_archives)) = zeroclaw_log::active_log_query_scope() else {
+            return Err(rpc_err(INTERNAL_ERROR, "Log persistence is not enabled"));
+        };
 
         let filter = zeroclaw_log::LogFilter {
             since_ts: p.since_ts,
@@ -7345,9 +7430,27 @@ impl RpcDispatcher {
         };
 
         let limit = p.limit.unwrap_or(200);
+        let segment_cursor = match p.until_segment_cursor.as_deref() {
+            None | Some("") => None,
+            Some(raw) => match zeroclaw_log::SegmentCursor::from_wire(raw) {
+                Some(c) => Some(c),
+                None => {
+                    return Err(rpc_err(
+                        INVALID_PARAMS,
+                        "invalid until_segment_cursor: value is not a valid segment cursor",
+                    ));
+                }
+            },
+        };
 
-        let page = zeroclaw_log::load_page(&path, &filter, limit)
-            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Log read failed: {e:#}")))?;
+        let page = zeroclaw_log::query_log_page(
+            &active,
+            reads_archives,
+            &filter,
+            limit,
+            segment_cursor.as_ref(),
+        )
+        .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Log read failed: {e:#}")))?;
 
         let events: Vec<serde_json::Value> = page
             .events
@@ -7361,27 +7464,46 @@ impl RpcDispatcher {
                 .map(|path| path.to_string_lossy().into_owned()),
             next_cursor: page.next_cursor,
             next_cursor_line_offset: page.next_cursor_line_offset,
+            next_segment_cursor: page.next_segment_cursor,
             at_end: page.at_end,
+            incomplete: page.incomplete,
         })
     }
 
     /// `logs/get { id } → LogEvent`. Loads one full event by id from
     /// the persistent JSONL log so the Logs pane can keep only preview
     /// fields in memory and lazy-fetch the full payload only when the
-    /// user opens the detail pane.
+    /// user opens the detail pane. Searches the active file first, then
+    /// retained archives oldest-first, so archive events returned by
+    /// `logs/query` are always findable by id.
     async fn handle_logs_get(&self, params: &Value) -> RpcResult {
         let p: LogsGetParams = parse_params(params)?;
-        let path = zeroclaw_log::current_log_path()
-            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Log persistence is not enabled"))?;
-        let event = zeroclaw_log::find_event_by_id(&path, &p.id)
+        let Some((active, reads_archives)) = zeroclaw_log::active_log_query_scope() else {
+            return Err(rpc_err(INTERNAL_ERROR, "Log persistence is not enabled"));
+        };
+
+        let found = zeroclaw_log::find_event_across_segments(&active, reads_archives, &p.id)
             .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Log read failed: {e:#}")))?;
-        match event {
+
+        match found.event {
             Some(evt) => {
                 let event = serde_json::to_value(evt).map_err(|e| {
                     rpc_err(INTERNAL_ERROR, format!("Failed to serialize event: {e}"))
                 })?;
                 to_result(LogsGetResult { event })
             }
+            // A miss is only authoritative when every segment was read. If one
+            // was skipped, the id may be sitting in it, and reporting "not
+            // found" would present a guess as a fact — the caller stops looking
+            // for an event that is still on disk.
+            None if found.incomplete => Err(rpc_err(
+                INTERNAL_ERROR,
+                format!(
+                    "Log id `{}` was not found, but part of the retained history \
+                     could not be read; the event may still exist",
+                    p.id
+                ),
+            )),
             None => Err(rpc_err(
                 INTERNAL_ERROR,
                 format!("Log id `{}` not found", p.id),
@@ -7417,29 +7539,28 @@ impl RpcDispatcher {
             .to_string();
 
         let is_wss = self.peer_label.starts_with("wss:");
-        if !is_wss {
+        // Resolve + authorize once; the returned slots are index-aligned with
+        // req.files and carry the exact canonical target each read binds to. On
+        // WSS, path sources are rejected in process_file_entry.
+        let attachment_sources = if is_wss {
+            Vec::new()
+        } else {
             self.authorize_attachment_sources(
                 Method::FileAttach,
                 self.stamped_grants(),
                 &agent_alias,
                 &req.files,
-            )?;
-        }
+            )?
+        };
 
         let mut total_bytes: u64 = 0;
         let mut results = Vec::with_capacity(req.files.len());
 
-        for entry in &req.files {
-            let source_root = self.attachment_source_root(&agent_alias, entry);
-            let result = process_file_entry(
-                entry,
-                sid,
-                &upload_root,
-                is_wss,
-                source_root.as_deref(),
-                &self.ctx.sessions,
-            )
-            .await?;
+        for (idx, entry) in req.files.iter().enumerate() {
+            let source = attachment_sources.get(idx).and_then(|s| s.as_ref());
+            let result =
+                process_file_entry(entry, sid, &upload_root, is_wss, source, &self.ctx.sessions)
+                    .await?;
             total_bytes += result.size_bytes;
             if total_bytes > MAX_REQUEST_BYTES {
                 return Err(rpc_err(
@@ -7988,6 +8109,7 @@ impl RpcDispatcher {
                 &config,
                 Arc::clone(&engine),
                 self.ctx.sop_audit.clone(),
+                self.ctx.sop_driver_handles.as_ref(),
                 &outcome,
             );
         }
@@ -8044,7 +8166,17 @@ impl RpcDispatcher {
             self.authorize_sop_authoring(Method::SopsSave, &sop)?;
             self.authorize_existing_sop(Method::SopsSave, &dir, &sop.name, mode)?;
         }
-        crate::sop::save_sop(&dir, &sop).map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))?;
+        // An edit-save targets the SOP it was loaded from. If that SOP has
+        // been renamed or deleted since, refuse rather than recreate it:
+        // creating a SOP is `sops/create`.
+        crate::sop::save_existing_sop_typed(&dir, &sop).map_err(|e| {
+            let code = match e {
+                crate::sop::SopAuthorError::NotFound(_) => SOP_NOT_FOUND,
+                crate::sop::SopAuthorError::Io(_) => INTERNAL_ERROR,
+                _ => INVALID_PARAMS,
+            };
+            rpc_err(code, e.to_string())
+        })?;
         to_result(serde_json::json!({ "saved": sop.name }))
     }
 
@@ -8075,6 +8207,39 @@ impl RpcDispatcher {
             rpc_err(code, e.to_string())
         })?;
         to_result(serde_json::json!({ "deleted": req.name }))
+    }
+
+    /// Move a SOP to a new name. Separate from `sops/save` on purpose: save
+    /// persists under the submitted SOP's own name, so it can only ever
+    /// overwrite the SOP it was loaded from. Renaming is collision-checked
+    /// and moves the definition; it never copies it.
+    fn handle_sops_rename(&self, params: &Value) -> RpcResult {
+        // Local transports only, for the reason `sops/run-detail` gives: a
+        // remote WSS caller that has completed `initialize` has not
+        // established a principal this dispatcher can authorize a SOP
+        // identity change against, while local IPC is owner-scoped by the
+        // socket itself. Checked before the params are parsed so a refused
+        // caller learns nothing about which SOPs exist. Replace this with a
+        // principal check once there is one, rather than removing it.
+        if self.peer_label.starts_with("wss:") {
+            return Err(rpc_err(
+                AUTH_REQUIRED,
+                "sops/rename is not served over remote WSS: the transport has no \
+                 authenticated principal to authorize a SOP identity change against",
+            ));
+        }
+        let req: SopRenameRequest = parse_params(params)?;
+        let (dir, mode) = self.sops_dir_and_mode();
+        crate::sop::rename_sop_typed(&dir, &req.from, &req.to, mode).map_err(|e| {
+            let code = match e {
+                crate::sop::SopAuthorError::NotFound(_) => SOP_NOT_FOUND,
+                crate::sop::SopAuthorError::AlreadyExists(_) => SOP_ALREADY_EXISTS,
+                crate::sop::SopAuthorError::Io(_) => INTERNAL_ERROR,
+                crate::sop::SopAuthorError::Other(_) => INVALID_PARAMS,
+            };
+            rpc_err(code, e.to_string())
+        })?;
+        to_result(serde_json::json!({ "renamed": req.to, "from": req.from }))
     }
 
     fn handle_sops_wire_draft(&self, params: &Value) -> RpcResult {
@@ -9082,6 +9247,7 @@ mod tests {
             llm_calls_saved: 0,
             revision: 0,
             revision_base: 0,
+            initiating_agent: None,
         };
         let pr = PersistedRun::new(
             run.clone(),
@@ -9360,26 +9526,20 @@ mod tests {
         serde_json::from_str(s).unwrap()
     }
 
-    fn expected_default_shell_family() -> RuntimeShellFamily {
-        #[cfg(target_os = "windows")]
-        {
-            RuntimeShellFamily::Cmd
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            RuntimeShellFamily::Posix
-        }
+    fn expected_default_shell_profile() -> RuntimeShellProfile {
+        zeroclaw_config::platform::create_runtime(&Config::default().runtime)
+            .expect("default native runtime should resolve its shell")
+            .shell_profile()
+            .and_then(RuntimeShellProfile::from_runtime_profile)
+            .expect("default native runtime should expose a shell profile")
     }
 
-    fn expected_default_shell_name() -> &'static str {
-        #[cfg(target_os = "windows")]
-        {
-            "cmd"
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            "sh"
-        }
+    fn expected_default_shell_family() -> RuntimeShellFamily {
+        expected_default_shell_profile().family
+    }
+
+    fn expected_default_shell_name() -> String {
+        expected_default_shell_profile().name
     }
 
     /// A backend whose durable replacement always fails, standing in for a
@@ -10998,6 +11158,108 @@ mod tests {
         );
     }
 
+    /// End-to-end persisted narrowing over RPC: an operator drives a real
+    /// `config/set permission_profiles.session-scoped.allowed_agents = []`
+    /// (persisted to disk AND published as an accepted revision through the
+    /// actual mutation handler) while alice's prompt is parked at admission.
+    /// When released, the admitted prompt is denied before it reaches the
+    /// provider — proving the recheck reads the committed mutation, not only a
+    /// synthetic `refresh_from_config`. The mutation travels the same handler a
+    /// production `config/set` uses.
+    #[tokio::test]
+    async fn session_prompt_denied_before_execution_by_a_persisted_config_set_narrowing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = session_cwd_config(&tmp, 4242, None);
+        // Grant the operator connection the authority to persist a profile edit.
+        {
+            let profile = config
+                .permission_profiles
+                .get_mut("session-scoped")
+                .expect("the fixture profile exists");
+            profile.grants.insert(
+                zeroclaw_api::grants::Resource::Config,
+                vec![
+                    zeroclaw_api::grants::Verb::Read,
+                    zeroclaw_api::grants::Verb::Update,
+                ],
+            );
+            profile.config_write_paths = vec!["permission_profiles.*".into()];
+        }
+        let agent_workspace = config.agent_workspace_dir("test-agent");
+        let (ctx, chat_backend, _acp_store) = persistence_enforcement_ctx(config);
+        let (provider, mut started_rx, _release_tx) = gated_provider();
+        let sid = "s-prompt-persisted-narrow";
+        install_state_test_session_at(
+            &ctx.sessions,
+            &chat_backend,
+            sid,
+            provider,
+            None,
+            &agent_workspace,
+        )
+        .await;
+
+        // Two connections for the same principal: one carries the parked prompt,
+        // the other drives the persisted mutation.
+        let (mut prompter, mut prompter_rx) = roster_peer(&ctx, 4242).await;
+        let (mut operator, mut operator_rx) = roster_peer(&ctx, 4242).await;
+        let (admitted, release_admitted) = ctx.sessions.set_test_prompt_registration_pause();
+
+        send_prompt(&mut prompter, 11, sid, 6).await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), admitted.notified())
+            .await
+            .expect("the prompt must pass the gate and be admitted");
+
+        // Drive the narrowing through the real config/set RPC: this persists to
+        // disk and republishes the accepted revision via the production handler.
+        let narrowed = rpc(
+            &mut operator,
+            &mut operator_rx,
+            12,
+            "config/set",
+            json!({
+                "prop": "permission_profiles.session-scoped.allowed_agents",
+                "value": []
+            }),
+        )
+        .await;
+        assert!(
+            narrowed.get("error").is_none(),
+            "the persisted narrowing itself is authorized: {narrowed}"
+        );
+        let on_disk = std::fs::read_to_string(tmp.path().join("config.toml")).unwrap();
+        // Assert on the mutation, not just the table key: `session-scoped` is
+        // present whether or not the narrowing took effect, so a silent no-op
+        // would pass a `contains("session-scoped")` check. Parse the persisted
+        // config and prove `allowed_agents` was actually cleared to `[]`.
+        let parsed: toml::Value = toml::from_str(&on_disk)
+            .unwrap_or_else(|e| panic!("persisted config must parse: {e}\n{on_disk}"));
+        let allowed_agents = parsed
+            .get("permission_profiles")
+            .and_then(|v| v.get("session-scoped"))
+            .and_then(|v| v.get("allowed_agents"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "permission_profiles.session-scoped.allowed_agents must be persisted: {on_disk}"
+                )
+            });
+        assert_eq!(
+            allowed_agents,
+            &toml::Value::Array(vec![]),
+            "the narrowing must persist an empty allowed_agents, not a no-op: {on_disk}"
+        );
+
+        release_admitted.notify_one();
+
+        let (response, notifications) = response_and_notifications(&mut prompter_rx, 11).await;
+        assert_eq!(response["error"]["code"], json!(FORBIDDEN), "{response}");
+        assert_turn_refused(&notifications, sid, 6);
+        assert!(
+            started_rx.try_recv().is_err(),
+            "a prompt narrowed by a persisted config/set must be denied before the provider"
+        );
+    }
+
     #[tokio::test]
     async fn session_prompt_survives_an_unrelated_policy_republication_after_admission() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -11807,7 +12069,87 @@ mod tests {
         );
     }
 
-    // ── SOP runs, approvals, and authoring apply the agent selector ─────
+    /// Deterministic alias swap: the request names a symlink that resolves, at
+    /// authorization time, to a file inside the agent's entitled workspace. The
+    /// read must bind to that single resolved canonical target — proving
+    /// authorization and read consume the SAME resolution and there is no
+    /// second, raw-path resolution the swap could exploit. The upload is named
+    /// from the resolved target, not the alias spelling.
+    #[tokio::test]
+    async fn file_attach_by_path_binds_the_read_to_the_authorized_resolved_target() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let (ctx, agent_workspace, inside, _secret, _started_rx) =
+            attachment_source_fixture(&tmp, &outside).await;
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+
+        // A symlink INSIDE the workspace pointing at the allowed in-root file.
+        let alias = agent_workspace.join("alias.link");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&inside, &alias).unwrap();
+
+        let attached = rpc(
+            &mut alice,
+            &mut rx,
+            9,
+            "file/attach",
+            json!({"session_id": "s-sources", "files": [{"path": alias.to_string_lossy()}]}),
+        )
+        .await;
+        assert!(
+            attached["result"]["files"].is_array(),
+            "an alias resolving inside an entitled root must be attached: {attached}"
+        );
+        // The stored file is content-addressed (hash name), so assert the read
+        // bound to the resolved target by its byte length: inside.txt's content.
+        let size = attached["result"]["files"][0]["size_bytes"].as_u64();
+        assert_eq!(
+            size,
+            Some(std::fs::metadata(&inside).unwrap().len()),
+            "the read must bind to the resolved target's bytes: {attached}"
+        );
+    }
+
+    /// A symlink inside the workspace that points OUTSIDE every entitled root
+    /// must be refused: authorization judges readability on the resolved target
+    /// (the outside file), not the in-root alias spelling, so the escape is
+    /// caught before any read and nothing is copied in.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn file_attach_by_path_refuses_an_in_root_alias_that_escapes_the_root() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let (ctx, agent_workspace, _inside, secret, _started_rx) =
+            attachment_source_fixture(&tmp, &outside).await;
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+
+        // A symlink whose *name* lives inside the entitled workspace but whose
+        // target escapes every agent root.
+        let escape = agent_workspace.join("escape.link");
+        std::os::unix::fs::symlink(&secret, &escape).unwrap();
+        // Snapshot AFTER creating the alias so the alias itself is not counted
+        // as a copied-in attachment; the assertion checks no NEW file appears.
+        let files_before = files_under(&agent_workspace);
+
+        let refused = rpc(
+            &mut alice,
+            &mut rx,
+            10,
+            "file/attach",
+            json!({"session_id": "s-sources", "files": [{"path": escape.to_string_lossy()}]}),
+        )
+        .await;
+        assert_eq!(
+            refused["error"]["code"],
+            json!(FORBIDDEN),
+            "an in-root alias resolving outside every root must be refused: {refused}"
+        );
+        assert_eq!(
+            files_under(&agent_workspace),
+            files_before,
+            "a refused escaping alias must not be copied into the agent's workspace"
+        );
+    }
 
     fn gated_sop(name: &str, agent: &str) -> crate::sop::Sop {
         use crate::sop::{Sop, SopExecutionMode, SopPriority, SopStep, SopStepKind, SopTrigger};
@@ -12489,6 +12831,89 @@ mod tests {
             )
             .await;
             assert!(again.get("error").is_none(), "{again}");
+        });
+    }
+
+    /// End-to-end ACR tightening over RPC: an established OIDC connection drives
+    /// an authenticated `config/set` that raises `oidc.corp.required_acr`, then
+    /// its very next RPC on the same connection is refused because the binding
+    /// must re-verify a token that now lacks the required acr. This exercises
+    /// the real mutation + re-resolution path through `process_line`, not a
+    /// synthetic `publish_accepted`. The control (a `providers.*` edit that
+    /// changes no authorization input) leaves the connection usable, proving the
+    /// refusal is specific to the tightened authority.
+    #[test]
+    fn tightening_required_acr_through_config_set_forces_the_connection_to_reverify() {
+        run_on_a_large_stack(|| async move {
+            let tmp = tempfile::TempDir::new().unwrap();
+            // Permit oidc.* writes so the ACR edit itself is authorized; the
+            // fixture principal already holds Config:Update.
+            let mut config = oidc_session_config(&tmp);
+            config
+                .permission_profiles
+                .get_mut("oidc-ops")
+                .expect("the fixture profile exists")
+                .config_write_paths = vec!["providers.*".into(), "oidc.*".into()];
+            let (ctx, _chat_backend, _acp_store) = persistence_enforcement_ctx(config);
+            let (mut oidc, mut rx) = oidc_peer(&ctx);
+
+            // Control: a provider edit changes no authorization input, so the
+            // established binding keeps working afterward.
+            let control = rpc(
+                &mut oidc,
+                &mut rx,
+                1,
+                "config/set",
+                json!({
+                    "prop": "providers.models.openai.test-provider.model",
+                    "value": "still-usable"
+                }),
+            )
+            .await;
+            assert!(control.get("error").is_none(), "control edit: {control}");
+            let after_control = rpc(&mut oidc, &mut rx, 2, "config/list", json!({})).await;
+            assert!(
+                after_control.get("error").is_none(),
+                "an unrelated edit must not disturb the connection: {after_control}"
+            );
+
+            // Tighten the acr requirement through the real RPC mutation path.
+            let tightened = rpc(
+                &mut oidc,
+                &mut rx,
+                3,
+                "config/set",
+                json!({
+                    "prop": "oidc.corp.required_acr",
+                    "value": ["urn:example:assurance:mfa"]
+                }),
+            )
+            .await;
+            assert!(
+                tightened.get("error").is_none(),
+                "the ACR-tightening save itself is authorized: {tightened}"
+            );
+            let on_disk = std::fs::read_to_string(tmp.path().join("config.toml")).unwrap();
+            assert!(
+                on_disk.contains("urn:example:assurance:mfa"),
+                "the tightened acr must be persisted: {on_disk}"
+            );
+
+            // The next RPC on the same connection must be refused: the OIDC
+            // binding was established on a token that lacks the newly-required
+            // acr, so re-resolution fails closed until the client re-verifies.
+            let refused = rpc(&mut oidc, &mut rx, 4, "config/list", json!({})).await;
+            // Pin the refusal code, not merely `error.is_some()`: any unrelated
+            // failure in the `config/list` handler would satisfy a bare
+            // is-some. A failed OIDC rebind resolves through
+            // `DenyReason::BadCredential` to `AUTH_REQUIRED` (`rpc/auth.rs`), so
+            // assert exactly that the way the sibling tests pin `FORBIDDEN`.
+            assert_eq!(
+                refused["error"]["code"],
+                json!(AUTH_REQUIRED),
+                "a connection established before the acr tightened must be forced to \
+                 re-verify with AUTH_REQUIRED, not keep resolving: {refused}"
+            );
         });
     }
 
@@ -14668,6 +15093,224 @@ mod tests {
         assert_eq!(dir, tmp.path().join("shared").join("sops"));
     }
 
+    /// A dispatcher whose SOP root is `<tmp>/sops`, for the synchronous
+    /// authoring handlers (save/create/delete/rename) that need nothing but
+    /// config on disk. The writer channel receiver rides along so it outlives
+    /// the dispatcher.
+    fn make_sop_author_dispatcher(
+        tmp: &std::path::Path,
+    ) -> (RpcDispatcher, tokio::sync::mpsc::Receiver<String>) {
+        make_sop_author_dispatcher_on(tmp, "test-peer-sop-author:pid=1")
+    }
+
+    fn make_sop_author_dispatcher_on(
+        tmp: &std::path::Path,
+        peer_label: &str,
+    ) -> (RpcDispatcher, tokio::sync::mpsc::Receiver<String>) {
+        use zeroclaw_config::schema::{Config, SopConfig};
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+
+        let config = Config {
+            data_dir: tmp.join("data"),
+            config_path: tmp.join("config.toml"),
+            sop: SopConfig {
+                sops_dir: Some(tmp.join("sops").to_string_lossy().into_owned()),
+                ..SopConfig::default()
+            },
+            ..Config::default()
+        };
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let ctx = RpcContext::minimal(config, sessions);
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        (RpcDispatcher::new(ctx, tx, peer_label.to_string()), rx)
+    }
+
+    /// A remote WSS caller that has completed `initialize` has no principal to
+    /// authorize a SOP identity change against. Rename is refused before the
+    /// params are read, and the SOP root is untouched.
+    #[test]
+    fn sops_rename_is_refused_over_remote_wss() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sops_dir = tmp.path().join("sops");
+        crate::sop::save_sop(&sops_dir, &author_test_sop("wss-source")).unwrap();
+        let (d, _rx) = make_sop_author_dispatcher_on(tmp.path(), "wss:203.0.113.7:44321");
+
+        let err = d
+            .handle_sops_rename(&serde_json::json!({ "from": "wss-source", "to": "wss-target" }))
+            .expect_err("a remote WSS caller must not rename a SOP");
+        assert_eq!(err.code, AUTH_REQUIRED, "{err:?}");
+        assert!(sops_dir.join("wss-source").exists());
+        assert!(!sops_dir.join("wss-target").exists());
+    }
+
+    /// A stale edit-save after a rename must not resurrect the retired name.
+    #[test]
+    fn sops_save_after_rename_does_not_recreate_the_retired_sop() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sops_dir = tmp.path().join("sops");
+        crate::sop::save_sop(&sops_dir, &author_test_sop("rpc-before")).unwrap();
+        let (d, _rx) = make_sop_author_dispatcher(tmp.path());
+        d.handle_sops_rename(&serde_json::json!({ "from": "rpc-before", "to": "rpc-after" }))
+            .expect("a local caller renames");
+
+        let err = d
+            .handle_sops_save(&serde_json::json!({
+                "sop": serde_json::to_value(author_test_sop("rpc-before")).unwrap(),
+            }))
+            .expect_err("saving the retired name must be refused");
+        assert_eq!(err.code, SOP_NOT_FOUND, "{err:?}");
+        assert!(!sops_dir.join("rpc-before").exists());
+        assert!(sops_dir.join("rpc-after").exists());
+    }
+
+    fn author_test_sop(name: &str) -> crate::sop::Sop {
+        use crate::sop::{Sop, SopExecutionMode, SopPriority, SopStep, SopTrigger};
+
+        Sop {
+            name: name.to_string(),
+            description: "authoring round trip".to_string(),
+            version: "1.0.0".to_string(),
+            priority: SopPriority::Normal,
+            execution_mode: SopExecutionMode::Supervised,
+            triggers: vec![SopTrigger::Manual],
+            steps: vec![SopStep {
+                number: 1,
+                title: "Do the thing".to_string(),
+                ..SopStep::default()
+            }],
+            cooldown_secs: 0,
+            max_concurrent: 1,
+            location: None,
+            deterministic: false,
+            admission_policy: crate::sop::types::SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
+            agent: None,
+        }
+    }
+
+    #[test]
+    fn sops_rename_moves_the_sop_and_leaves_one_copy() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sops_dir = tmp.path().join("sops");
+        crate::sop::save_sop(&sops_dir, &author_test_sop("rpc-before")).unwrap();
+        let (d, _rx) = make_sop_author_dispatcher(tmp.path());
+
+        let result = d
+            .handle_sops_rename(&serde_json::json!({ "from": "rpc-before", "to": "rpc-after" }))
+            .expect("renaming an existing SOP to a free name must succeed");
+        assert_eq!(result["renamed"], "rpc-after");
+        assert_eq!(result["from"], "rpc-before");
+
+        assert!(!sops_dir.join("rpc-before").exists());
+        let listed = d.handle_sops_list().unwrap();
+        let names: Vec<&str> = listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["rpc-after"], "one SOP, under the new name");
+    }
+
+    #[test]
+    fn sops_rename_reports_a_taken_name_as_already_exists() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sops_dir = tmp.path().join("sops");
+        crate::sop::save_sop(&sops_dir, &author_test_sop("rpc-alpha")).unwrap();
+        crate::sop::save_sop(&sops_dir, &author_test_sop("rpc-beta")).unwrap();
+        let (d, _rx) = make_sop_author_dispatcher(tmp.path());
+
+        let err = d
+            .handle_sops_rename(&serde_json::json!({ "from": "rpc-alpha", "to": "rpc-beta" }))
+            .expect_err("renaming onto a name in use must be refused");
+        assert_eq!(err.code, SOP_ALREADY_EXISTS);
+        assert!(sops_dir.join("rpc-alpha").exists(), "the source stays put");
+        assert!(sops_dir.join("rpc-beta").exists());
+    }
+
+    #[test]
+    fn sops_rename_reports_an_unknown_sop_as_not_found() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (d, _rx) = make_sop_author_dispatcher(tmp.path());
+
+        let err = d
+            .handle_sops_rename(&serde_json::json!({ "from": "rpc-missing", "to": "rpc-new" }))
+            .expect_err("renaming a SOP that does not exist must be refused");
+        assert_eq!(err.code, SOP_NOT_FOUND);
+    }
+
+    #[test]
+    fn sops_rename_rejects_a_path_traversal_target() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sops_dir = tmp.path().join("sops");
+        crate::sop::save_sop(&sops_dir, &author_test_sop("rpc-traversal")).unwrap();
+        let (d, _rx) = make_sop_author_dispatcher(tmp.path());
+
+        let err = d
+            .handle_sops_rename(&serde_json::json!({ "from": "rpc-traversal", "to": "../escaped" }))
+            .expect_err("a rename target must not escape the SOP root");
+        assert_eq!(err.code, INVALID_PARAMS);
+        assert!(sops_dir.join("rpc-traversal").exists());
+        assert!(!tmp.path().join("escaped").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sops_rename_reports_a_filesystem_failure_as_a_server_error() {
+        // A well-formed request against a manifest the daemon cannot read is
+        // the daemon's problem, not the caller's: it must not come back as
+        // INVALID_PARAMS, which tells the client to fix its input.
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sops_dir = tmp.path().join("sops");
+        crate::sop::save_sop(&sops_dir, &author_test_sop("rpc-unreadable")).unwrap();
+        let manifest = sops_dir.join("rpc-unreadable").join("SOP.toml");
+        let original = std::fs::metadata(&manifest).unwrap().permissions();
+        std::fs::set_permissions(&manifest, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read_to_string(&manifest).is_ok() {
+            // Running as root, where the mode bits above are advisory.
+            std::fs::set_permissions(&manifest, original).unwrap();
+            return;
+        }
+
+        let (d, _rx) = make_sop_author_dispatcher(tmp.path());
+        let err = d
+            .handle_sops_rename(
+                &serde_json::json!({ "from": "rpc-unreadable", "to": "rpc-readable" }),
+            )
+            .expect_err("an unreadable manifest must fail the rename");
+        std::fs::set_permissions(&manifest, original).unwrap();
+
+        assert_eq!(err.code, INTERNAL_ERROR, "{err:?}");
+    }
+
+    #[test]
+    fn sops_save_still_refuses_to_rename_the_sop_it_is_editing() {
+        // Edit identity: `sops/save` persists under the submitted SOP's own
+        // name, so a name change slipped through a save would fork the SOP or
+        // clobber another. Renaming has its own method; save keeps rejecting.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sops_dir = tmp.path().join("sops");
+        crate::sop::save_sop(&sops_dir, &author_test_sop("rpc-editing")).unwrap();
+        let (d, _rx) = make_sop_author_dispatcher(tmp.path());
+
+        let err = d
+            .handle_sops_save(&serde_json::json!({
+                "sop": serde_json::to_value(author_test_sop("rpc-renamed-by-save")).unwrap(),
+                "original_name": "rpc-editing",
+            }))
+            .expect_err("an edit-save may not change the SOP's name");
+        assert_eq!(err.code, INVALID_PARAMS);
+        assert!(err.message.contains("rename not supported"), "{err:?}");
+        assert!(sops_dir.join("rpc-editing").exists());
+        assert!(
+            !sops_dir.join("rpc-renamed-by-save").exists(),
+            "a rejected edit-save writes nothing at all"
+        );
+    }
+
     fn make_checkpoint_rpc_dispatcher(
         quorum: u32,
         members: &[&str],
@@ -14916,6 +15559,29 @@ mod tests {
         })
         .await
         .expect("RPC approval must schedule the resumed ExecuteStep");
+
+        let handles = dispatcher
+            .ctx
+            .sop_driver_handles
+            .as_ref()
+            .expect("a context holding an engine carries the generation driver set")
+            .clone();
+        let driver = {
+            let mut guard = handles.lock().expect("driver set lock");
+            assert_eq!(
+                guard.len(),
+                1,
+                "the resumed driver must register in the generation-owned set, not detach"
+            );
+            // Finalize exactly as the generation drain does, so this asserts
+            // against the same operation production uses.
+            let mut taken = guard.close_and_take();
+            taken.pop().expect("registered driver handle")
+        };
+        // The generation drain is a join on exactly these handles: a resumed
+        // driver therefore ends inside the generation that spawned it instead
+        // of running on under superseded configuration.
+        driver.await.expect("the registered resumed driver joins");
     }
 
     #[tokio::test]
@@ -16773,7 +17439,7 @@ mod tests {
             context
                 .shell_profile
                 .as_ref()
-                .map(|profile| profile.name.as_str()),
+                .map(|profile| profile.name.clone()),
             Some(expected_default_shell_name())
         );
 
@@ -16841,7 +17507,7 @@ mod tests {
             status
                 .shell_profile
                 .as_ref()
-                .map(|profile| profile.name.as_str()),
+                .map(|profile| profile.name.clone()),
             Some(expected_default_shell_name())
         );
     }
@@ -19178,6 +19844,7 @@ mod tests {
         let active = crate::agent::history_trim::trim_conversation_to_recent_turns(
             durable.clone(),
             2,
+            crate::agent::history_trim::history_trim_target(2, 1.0),
             false,
         );
         assert!(active.trimmed);
@@ -21561,6 +22228,193 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn existing_session_uses_reloaded_history_trim_low_water() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = make_model_refresh_test_config(&tmp);
+        config
+            .agents
+            .get_mut("test-agent")
+            .expect("test agent exists")
+            .runtime_profile = "reloadable".into();
+        config.runtime_profiles.insert(
+            "reloadable".into(),
+            zeroclaw_config::schema::RuntimeProfileConfig {
+                max_history_messages: Some(4),
+                ..Default::default()
+            },
+        );
+
+        let dispatcher = make_config_set_test_dispatcher(config);
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+        dispatcher
+            .ctx
+            .config
+            .write()
+            .runtime_profiles
+            .get_mut("reloadable")
+            .expect("runtime profile exists")
+            .history_trim_low_water = Some(1.0);
+
+        let agent = dispatcher
+            .ctx
+            .sessions
+            .get_agent(&session_id)
+            .await
+            .expect("session agent exists");
+        let mut agent = agent.lock().await;
+        let event = agent.seed_history_with_event(&[
+            ChatMessage::user("old user"),
+            ChatMessage::assistant("old answer"),
+            ChatMessage::user("middle user"),
+            ChatMessage::assistant("middle answer"),
+            ChatMessage::user("new user"),
+            ChatMessage::assistant("new answer"),
+        ]);
+
+        let Some(TurnEvent::HistoryTrimmed {
+            dropped_messages,
+            kept_turns,
+            ..
+        }) = event
+        else {
+            panic!("an existing session must observe the reloaded low-water fraction");
+        };
+        assert_eq!(dropped_messages, 2, "legacy 1.0 refills to the cap of 4");
+        assert_eq!(kept_turns, 2, "legacy 1.0 retains the newest two turns");
+        let breadcrumb = crate::i18n::get_required_cli_string("history-trim-breadcrumb");
+        let history = agent.history();
+        assert_eq!(
+            history.len(),
+            6,
+            "synthesized system prompt plus breadcrumb plus the retained body"
+        );
+        assert!(!history.iter().any(|message| matches!(
+            message,
+            zeroclaw_providers::ConversationMessage::Chat(chat)
+                if chat.content == "old user" || chat.content == "old answer"
+        )));
+        for retained in ["middle user", "middle answer", "new user", "new answer"] {
+            assert!(
+                history.iter().any(|message| matches!(
+                    message,
+                    zeroclaw_providers::ConversationMessage::Chat(chat)
+                        if chat.content == retained
+                )),
+                "fraction 1.0 loaded after construction must retain {retained}"
+            );
+        }
+        assert_eq!(
+            history
+                .iter()
+                .filter(|message| matches!(
+                    message,
+                    zeroclaw_providers::ConversationMessage::Chat(chat)
+                        if chat.role == "user" && chat.content == breadcrumb
+                ))
+                .count(),
+            1,
+            "exactly one synthetic breadcrumb accompanies the retained turns"
+        );
+    }
+
+    #[tokio::test]
+    async fn config_set_persists_history_trim_low_water_and_trims_existing_session() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = make_model_refresh_test_config(&tmp);
+        config
+            .agents
+            .get_mut("test-agent")
+            .expect("test agent exists")
+            .runtime_profile = "reloadable".into();
+        config.runtime_profiles.insert(
+            "reloadable".into(),
+            zeroclaw_config::schema::RuntimeProfileConfig {
+                max_history_messages: Some(4),
+                history_trim_low_water: None,
+                ..Default::default()
+            },
+        );
+
+        let dispatcher = make_config_set_test_dispatcher(config);
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+
+        let set = dispatcher
+            .handle_config_set(&json!({
+                "prop": "runtime_profiles.reloadable.history_trim_low_water",
+                "value": 1.0
+            }))
+            .await;
+        assert!(
+            set.is_ok(),
+            "config/set must accept the low-water fraction: {set:?}"
+        );
+
+        let config_path = tmp.path().join("config.toml");
+        let disk = std::fs::read_to_string(&config_path).unwrap();
+        let reloaded: zeroclaw_config::schema::Config = toml::from_str(&disk)
+            .unwrap_or_else(|e| panic!("config must reload after the fraction write: {e}\n{disk}"));
+        assert_eq!(
+            reloaded
+                .runtime_profiles
+                .get("reloadable")
+                .and_then(|profile| profile.history_trim_low_water),
+            Some(1.0),
+            "the RPC write must persist the exact fraction to disk"
+        );
+
+        let agent = dispatcher
+            .ctx
+            .sessions
+            .get_agent(&session_id)
+            .await
+            .expect("session agent exists");
+        let mut agent = agent.lock().await;
+        let event = agent.seed_history_with_event(&[
+            ChatMessage::user("old user"),
+            ChatMessage::assistant("old answer"),
+            ChatMessage::user("middle user"),
+            ChatMessage::assistant("middle answer"),
+            ChatMessage::user("new user"),
+            ChatMessage::assistant("new answer"),
+        ]);
+
+        let Some(TurnEvent::HistoryTrimmed {
+            dropped_messages,
+            kept_turns,
+            ..
+        }) = event
+        else {
+            panic!("an existing session must observe the persisted low-water fraction");
+        };
+        assert_eq!(
+            dropped_messages, 2,
+            "fraction 1.0 written via config/set refills to the cap of 4"
+        );
+        assert_eq!(kept_turns, 2, "fraction 1.0 retains the newest two turns");
+        let history = agent.history();
+        assert_eq!(
+            history.len(),
+            6,
+            "synthesized system prompt plus breadcrumb plus the retained body"
+        );
+        assert!(!history.iter().any(|message| matches!(
+            message,
+            zeroclaw_providers::ConversationMessage::Chat(chat)
+                if chat.content == "old user" || chat.content == "old answer"
+        )));
+        for retained in ["middle user", "middle answer", "new user", "new answer"] {
+            assert!(
+                history.iter().any(|message| matches!(
+                    message,
+                    zeroclaw_providers::ConversationMessage::Chat(chat)
+                        if chat.content == retained
+                )),
+                "fraction 1.0 persisted via config/set must retain {retained}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn config_set_provider_model_refreshes_matching_live_session() {
         let tmp = tempfile::TempDir::new().unwrap();
         let dispatcher = make_config_set_test_dispatcher(make_model_refresh_test_config(&tmp));
@@ -22357,6 +23211,7 @@ mod tests {
             tui_registry: Arc::new(crate::rpc::tui_identity::TuiRegistry::new_unsigned()),
             acp_session_store: None,
             sop_engine: None,
+            sop_driver_handles: None,
             sop_audit: None,
             hooks: Some(Arc::new(runner)),
             cert_audit: None,
@@ -22405,6 +23260,7 @@ mod tests {
             tui_registry: Arc::new(crate::rpc::tui_identity::TuiRegistry::new_unsigned()),
             acp_session_store: None,
             sop_engine: None,
+            sop_driver_handles: None,
             sop_audit: None,
             hooks: Some(Arc::new(runner)),
             cert_audit: None,
@@ -22512,6 +23368,7 @@ mod tests {
             tui_registry: Arc::new(crate::rpc::tui_identity::TuiRegistry::new_unsigned()),
             acp_session_store: None,
             sop_engine: None,
+            sop_driver_handles: None,
             sop_audit: None,
             hooks: Some(Arc::new(runner)),
             cert_audit: None,
@@ -23255,6 +24112,179 @@ mod tests {
                         .openai
                         .contains_key("default"),
                     "map-key {method}: the live config must be untouched"
+                );
+            }
+        });
+    }
+
+    // ── session/new rechecks the agent selector after config-lock admission ──
+    //
+    // `handle_session_new` re-resolves authority after the session admission
+    // queue, then waits AGAIN on the unbounded config write lock before it
+    // reads config and builds the session. An operator's permission-profile
+    // edit can hold that lock, strip the caller's agent grant, and publish
+    // while `session/new` is parked. The grants resolved before the lock wait
+    // are then stale; the handler must re-resolve authority and re-run the
+    // agent selector under the lock before constructing anything.
+
+    /// A roster where `alice` may create sessions with agent `alpha`.
+    fn session_new_roster_config(
+        tmp: &tempfile::TempDir,
+        uid: u32,
+    ) -> zeroclaw_config::schema::Config {
+        use std::collections::HashMap;
+        use zeroclaw_api::grants::{Resource, Verb};
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, PermissionProfileConfig, RiskProfileConfig, UserConfig,
+        };
+
+        let mut config = roster_config_in(tmp, uid);
+        std::fs::create_dir_all(&config.data_dir).expect("the data dir is creatable");
+        // The workspace-confinement recheck requires the session cwd to be an
+        // existing directory inside the agent's authorized roots. Create and
+        // authorize the workspace both tests point their `cwd` at, so the sole
+        // authority variable under test is the agent grant itself — not an
+        // incidental unauthorized-workspace refusal.
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("the session workspace is creatable");
+        config.risk_profiles.insert(
+            "session-profile".into(),
+            RiskProfileConfig {
+                allowed_roots: vec![workspace.to_string_lossy().into_owned()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.agents.insert(
+            "alpha".into(),
+            AliasedAgentConfig {
+                enabled: true,
+                risk_profile: "session-profile".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.permission_profiles.insert(
+            "session-alpha".into(),
+            PermissionProfileConfig {
+                allowed_agents: vec!["alpha".into()],
+                // The session-assembly tool gate refuses a constrained selector
+                // before the config lock. A wildcard selector is unrestricted
+                // ONLY when paired with a `tools:execute` grant; grant both so
+                // this fixture resolves to an unconstrained ceiling and reaches
+                // the recheck under test rather than that earlier gate.
+                allowed_tools: vec![zeroclaw_api::grants::WILDCARD.into()],
+                grants: HashMap::from([
+                    (
+                        Resource::Sessions,
+                        vec![Verb::Create, Verb::Read, Verb::Update],
+                    ),
+                    (Resource::Tools, vec![Verb::Execute]),
+                ]),
+                ..PermissionProfileConfig::default()
+            },
+        );
+        config.users.insert(
+            "alice".into(),
+            UserConfig {
+                principal_id: None,
+                uid: Some(uid),
+                permission_profiles: vec!["session-alpha".into()],
+            },
+        );
+        config
+    }
+
+    /// Republish the accepted policy with alice's agent grant removed, so a
+    /// principal re-resolved after this publish may no longer use `alpha`.
+    fn revoke_alice_agent_grant(ctx: &Arc<RpcContext>) {
+        let mut narrowed = ctx.config.read().clone();
+        narrowed
+            .permission_profiles
+            .get_mut("session-alpha")
+            .expect("the fixture profile exists")
+            .allowed_agents
+            .clear();
+        ctx.auth
+            .refresh_from_config(&narrowed)
+            .expect("the narrowed policy compiles");
+    }
+
+    #[test]
+    fn session_new_agent_grant_revoked_while_queued_on_the_config_lock_is_refused() {
+        run_on_a_large_stack(|| async move {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let ctx = enforcement_ctx(session_new_roster_config(&tmp, 4242));
+            let (alice, _rx) = roster_peer(&ctx, 4242).await;
+
+            // A caller-supplied session id lets us look for a durable/live
+            // session afterwards. The agent selector passes at the pre-queue
+            // check (alice still holds the grant when the call starts) and is
+            // rechecked under the config lock after the mid-wait revocation.
+            let session_id = "sess-revoked-while-queued".to_string();
+            let params = json!({
+                "agent_alias": "alpha",
+                "chat_mode": "chat",
+                "session_id": session_id,
+                "cwd": tmp.path().join("workspace"),
+            });
+
+            let call = async move { alice.handle_session_new_for_test(&params).await };
+            let result = rpc_result_after_midwait_policy_change(
+                Arc::clone(&ctx),
+                call,
+                revoke_alice_agent_grant,
+            )
+            .await;
+
+            let err = result
+                .expect_err("a caller whose agent grant was revoked mid-wait must be refused");
+            assert_eq!(err.code, FORBIDDEN, "{err:?}");
+
+            // The refusal must leave no session behind: nothing built, nothing
+            // published, nothing inserted into the store.
+            assert!(
+                !ctx.sessions.list_ids().await.contains(&session_id),
+                "the refused session/new must not publish a live session"
+            );
+        });
+    }
+
+    #[test]
+    fn session_new_survives_an_unrelated_policy_republication_while_queued() {
+        run_on_a_large_stack(|| async move {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let ctx = enforcement_ctx(session_new_roster_config(&tmp, 4242));
+            let (alice, _rx) = roster_peer(&ctx, 4242).await;
+
+            let session_id = "sess-unchanged-authority".to_string();
+            let params = json!({
+                "agent_alias": "alpha",
+                "chat_mode": "chat",
+                "session_id": session_id,
+                "cwd": tmp.path().join("workspace"),
+            });
+
+            // Republish the same authority (an unrelated edit) while parked. The
+            // recheck must NOT refuse: with the agent grant intact the call
+            // proceeds past the selector into construction. Construction may
+            // still fail for reasons unrelated to authority (no real provider is
+            // wired in this fixture), but it must never be a FORBIDDEN authority
+            // denial — that is the property under test.
+            let republish_unchanged = |ctx: &Arc<RpcContext>| {
+                let same = ctx.config.read().clone();
+                ctx.auth
+                    .refresh_from_config(&same)
+                    .expect("republishing the same policy compiles");
+            };
+
+            let call = async move { alice.handle_session_new_for_test(&params).await };
+            let result =
+                rpc_result_after_midwait_policy_change(Arc::clone(&ctx), call, republish_unchanged)
+                    .await;
+
+            if let Err(err) = &result {
+                assert_ne!(
+                    err.code, FORBIDDEN,
+                    "unchanged authority must not be refused at the recheck: {err:?}"
                 );
             }
         });
