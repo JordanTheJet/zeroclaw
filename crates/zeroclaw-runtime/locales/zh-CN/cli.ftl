@@ -789,6 +789,8 @@ cli-plugin-installed-name-version = 已安装插件 {$name} v{$version}
 cli-plugin-config-entry-seeded = 已为 '{$name}' 创建 [[plugins.entries]]。使用 `zeroclaw config set plugins.entries.{$name}.config.<key>` 设置插件配置值。
 cli-plugin-config-entry-key = 配置条目键（{$capability}）：{$key}
 cli-plugin-config-entry-seed-skipped = 警告：已跳过为 '{$name}' 创建配置条目：磁盘上的 [plugins] 部分格式不正确。请修复它，添加带有 `name = "{$name}"` 的 [[plugins.entries]] 块，然后使用 `zeroclaw config set plugins.entries.{$name}.config.<key>` 设置值。
+cli-plugin-install-verify-failed = 安装失败：'{$name}' 无法在此主机上加载：{$error} — 请使用此主机的 WIT（参见 wit/v0）重新构建插件，或使用 --no-verify 强制安装。
+cli-plugin-install-verify-bypassed = 注意：跳过 '{$name}' 的安装时加载检查（--no-verify）；若无法在此主机上加载，将在启动时被跳过
 cli-config-section-degraded = 警告：{$path} 中的配置部分 `{$section}` 格式不正确，本次运行已重置为默认值。该部分中的值不会生效。请运行 `zeroclaw config migrate` 查看解析错误，然后修复文件。
 cli-config-section-retired-wati = 警告：已弃用的 WATI 频道配置部分 `{$section}` 将被忽略，因为 WATI 支持已移除。请使用 Cloud API 或 WhatsApp Web 迁移到 `[channels.whatsapp.<alias>]`，然后撤销未使用的 WATI API 令牌。
 cli-config-section-retired-node-transport = 警告：已弃用的 `[node_transport]` 配置将被忽略，因为旧版 HMAC 节点传输已移除。请从 config.toml 中删除该部分。
@@ -1119,3 +1121,6 @@ channel-approval-opt-allow-always = 始终允许
 channel-approval-opt-reject = 拒绝
 channel-approval-opt-reject-with-edit = 编辑后拒绝
 tool-git-operations-error-docker-runtime-write-unsupported = Git 写入命令在 Docker 运行时中不可用，因为无法将其限制在其容器内。
+
+turn-context-window-exceeded-error = 本次请求超过所选模型的上下文容量。请减少请求内容或启用的工具，或选择上下文容量更大的模型。
+cron-agent-job-failed = 定时任务未能完成，请重试或联系管理员查看日志。

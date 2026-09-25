@@ -3567,6 +3567,12 @@ mod tests {
     }
 
     static DELIVERED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    static CONTEXT_FAILURES_DELIVERED: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+    const CONTEXT_FAILURE_CHANNEL: &str = "context-failure-delivery";
+    /// Stands in for the safe failure text an executor reports. Cron delivers
+    /// whatever the executor produced; which text that is belongs to the host.
+    const CONTEXT_FAILURE_TEXT: &str = "the task does not fit the model's context window";
 
     /// Channel name the recorder counts. Used only by the suppression test.
     const COUNT_CHANNEL: &str = "count-delivery";
@@ -3576,7 +3582,7 @@ mod tests {
         // so repeated calls across tests are safe and the first writer wins. The
         // handler honours the `fail-delivery` failure contract used by the
         // delivery-classification tests so it composes regardless of order.
-        register_delivery_fn(Box::new(|_config, channel, _target, _thread, _output| {
+        register_delivery_fn(Box::new(|_config, channel, _target, _thread, output| {
             Box::pin(async move {
                 if channel == "fail-delivery" {
                     anyhow::bail!("synthetic delivery failure");
@@ -3584,9 +3590,82 @@ mod tests {
                 if channel == COUNT_CHANNEL {
                     DELIVERED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 }
+                if channel == CONTEXT_FAILURE_CHANNEL {
+                    assert_eq!(output, CONTEXT_FAILURE_TEXT);
+                    CONTEXT_FAILURES_DELIVERED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
                 Ok(())
             })
         }));
+    }
+
+    /// A failed agent run's text is delivered and classified unchanged in
+    /// every trigger context.
+    ///
+    /// This is cron's half of the context-window failure path; the host
+    /// produces the safe text and never dispatches to the provider, which the
+    /// runtime's cron host tests cover.
+    #[tokio::test]
+    async fn an_agent_failure_text_is_delivered_unchanged_in_every_context() {
+        use std::sync::atomic::Ordering;
+
+        // The delivery hook is process-global and other tests install their
+        // own; run this in an isolated child so the recorder is ours.
+        const CHILD_ENV: &str = "ZEROCLAW_CRON_CONTEXT_DELIVERY_TEST_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let status = tokio::process::Command::new(std::env::current_exe().unwrap())
+                .arg("scheduler::tests::an_agent_failure_text_is_delivered_unchanged_in_every_context")
+                .arg("--exact")
+                .arg("--test-threads=1")
+                .env(CHILD_ENV, "1")
+                .status()
+                .await
+                .unwrap();
+            assert!(
+                status.success(),
+                "isolated cron delivery test failed: {status}"
+            );
+            return;
+        }
+
+        register_recording_delivery_fn();
+        let delivered_before = CONTEXT_FAILURES_DELIVERED.load(Ordering::SeqCst);
+
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let mut job = test_job("");
+        job.job_type = JobType::Agent;
+        job.delivery = DeliveryConfig {
+            mode: "announce".to_string(),
+            channel: Some(CONTEXT_FAILURE_CHANNEL.to_string()),
+            to: Some("test-target".to_string()),
+            ..Default::default()
+        };
+
+        for context in [
+            CronDeliveryContext::Scheduled,
+            CronDeliveryContext::ToolManual,
+            CronDeliveryContext::GatewayManual,
+            CronDeliveryContext::RpcManual,
+        ] {
+            let outcome = deliver_and_classify_run_result(
+                &config,
+                &job,
+                CronRunOutcome::Executed {
+                    success: false,
+                    output: CONTEXT_FAILURE_TEXT.to_string(),
+                },
+                context,
+            )
+            .await;
+            assert!(!outcome.success);
+            assert_eq!(outcome.status, "error");
+            assert_eq!(outcome.output, CONTEXT_FAILURE_TEXT);
+        }
+        assert_eq!(
+            CONTEXT_FAILURES_DELIVERED.load(Ordering::SeqCst) - delivered_before,
+            4
+        );
     }
 
     fn announce_job() -> CronJob {

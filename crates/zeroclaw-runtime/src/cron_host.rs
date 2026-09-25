@@ -32,6 +32,17 @@ impl CronHealthReporter for RuntimeCronHealth {
 /// Runs cron's agent jobs through the agent loop.
 pub struct RuntimeCronAgentExecutor;
 
+/// The text a failed cron agent run reports, which is stored in run history
+/// and may be delivered to a channel.
+///
+/// The raw error can carry provider responses, prompt text and URLs with
+/// credentials in them. Known terminal causes map to their own safe messages;
+/// anything else reports a generic failure, and the detail goes to the log.
+fn agent_job_error_message(error: &anyhow::Error) -> String {
+    crate::agent::terminal_completion_error_message(error, None)
+        .unwrap_or_else(|| crate::i18n::get_required_cli_string("cron-agent-job-failed"))
+}
+
 impl CronAgentExecutor for RuntimeCronAgentExecutor {
     fn run_agent_job<'a>(
         &'a self,
@@ -79,6 +90,9 @@ impl CronAgentExecutor for RuntimeCronAgentExecutor {
                 // `connect_all` path inside `agent::run` is correct here. The
                 // daemon heartbeat worker is the only `mcp_registry` supplier.
                 mcp_registry: None,
+                // A cron job runs a prompt, not a SOP step. SOP cron triggers
+                // are a separate surface driven by the SOP maintenance tick.
+                sop_step_scope: None,
             };
 
             let temperature = config
@@ -134,9 +148,31 @@ impl CronAgentExecutor for RuntimeCronAgentExecutor {
                             let _ = mem.purge_session(&key).await;
                         }
                     }
+                    let mut error_attributes = ::serde_json::json!({
+                        "job_id": job_id,
+                        "agent_alias": agent_alias,
+                    });
+                    if let Some(exceeded) = crate::agent::context_window_exceeded_from_error(&e) {
+                        error_attributes["error_kind"] = "context_window_exceeded".into();
+                        error_attributes["estimated_tokens"] = exceeded.estimated_tokens.into();
+                        error_attributes["model_context_window"] =
+                            exceeded.model_context_window.into();
+                        error_attributes["provider_attempted"] = false.into();
+                    } else {
+                        error_attributes["error_kind"] = "agent_error".into();
+                        error_attributes["error_bytes"] = e.to_string().len().into();
+                    }
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_category(::zeroclaw_log::EventCategory::Cron)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(error_attributes),
+                        "cron_agent_job_failed"
+                    );
                     CronAgentRun {
                         success: false,
-                        output: format!("agent job failed: {e}"),
+                        output: agent_job_error_message(&e),
                     }
                 }
             }
@@ -338,6 +374,111 @@ mod tests {
         assert!(
             tool_result.contains(scheduler_workspace.to_string_lossy().as_ref()),
             "shell output must come from cron's resolved workspace {scheduler_workspace:?}, got {tool_result:?}"
+        );
+
+        server.abort();
+    }
+
+    #[test]
+    fn agent_job_error_message_preserves_terminal_causes_and_safe_messages() {
+        let context = anyhow::Error::new(crate::agent::ContextWindowExceeded {
+            estimated_tokens: 65_537,
+            model_context_window: 65_536,
+        })
+        .context("maximum context length; https://private.invalid/?key=secret");
+        let provider =
+            anyhow::Error::new(zeroclaw_providers::ReliableProviderTerminalFailure::new(
+                zeroclaw_providers::ReliableProviderTerminalFailureKind::ProviderServer,
+                None,
+                "private provider response".to_string(),
+            ));
+        let semantic =
+            anyhow::Error::new(zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion);
+        let unknown = anyhow::Error::msg("private prompt; https://private.invalid/?key=secret");
+
+        for (error, key) in [
+            (&context, "turn-context-window-exceeded-error"),
+            (&provider, "cli-agent-error-provider-server"),
+            (&semantic, "cli-agent-error-invalid-semantic-completion"),
+            (&unknown, "cron-agent-job-failed"),
+        ] {
+            let output = agent_job_error_message(error);
+            assert_eq!(output, crate::i18n::get_required_cli_string(key));
+            assert!(!output.contains("private") && !output.contains("secret"));
+            assert!(!output.contains("agent job failed:"));
+        }
+    }
+
+    /// A run that cannot fit the model's context window fails with the safe
+    /// context-window message and never dispatches to the provider.
+    ///
+    /// This is the executor half. Cron's half, that the message is delivered
+    /// and classified unchanged in every trigger context, is in
+    /// `zeroclaw-cron`.
+    #[tokio::test]
+    async fn a_context_window_failure_reports_safe_text_without_provider_dispatch() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_route = Arc::clone(&calls);
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                calls_for_route.fetch_add(1, Ordering::SeqCst);
+                async {
+                    Json(serde_json::json!({
+                        "choices": [{"message": {"role": "assistant", "content": "unexpected dispatch"}, "finish_reason": "stop"}],
+                    }))
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp, address).await;
+        config
+            .providers
+            .models
+            .ollama
+            .get_mut(TEST_AGENT)
+            .unwrap()
+            .base
+            .context_window = Some(64);
+        config
+            .runtime_profiles
+            .get_mut(TEST_AGENT)
+            .unwrap()
+            .max_context_tokens = Some(0);
+        let security = SecurityPolicy::for_agent(&config, TEST_AGENT).unwrap();
+
+        let result = RuntimeCronAgentExecutor
+            .run_agent_job(CronAgentRequest {
+                config,
+                security: Arc::new(security),
+                job_id: "context-window".to_string(),
+                agent_alias: TEST_AGENT.to_string(),
+                prompt: "private-context-prompt ".repeat(256),
+                model: None,
+                session_path: std::path::PathBuf::from("cron-context-window"),
+                allowed_tools: Some(vec![]),
+                uses_memory: false,
+            })
+            .await;
+
+        assert!(!result.success);
+        assert_eq!(
+            result.output,
+            crate::i18n::get_required_cli_string("turn-context-window-exceeded-error")
+        );
+        assert!(!result.output.contains("private-context-prompt"));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "the provider must not be called"
         );
 
         server.abort();

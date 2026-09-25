@@ -542,6 +542,7 @@ cli-sop-loaded-header = Loaded SOPs ({$count}):
 cli-sop-none-to-validate = No SOPs found to validate.
 cli-sop-valid = ✅ {$name} — valid
 cli-sop-deleted = Deleted SOP: {$name}
+cli-sop-renamed = Renamed SOP {$from} to {$to}
 cli-sop-warnings = ⚠️  {$name} — {$count} warning(s):
 cli-sop-all-passed = All SOPs passed validation.
 cli-sop-priority = {"  "}Priority:       {$value}
@@ -702,6 +703,7 @@ cli-quickstart-step-agent = Agent
 cli-quickstart-error-internal-no-result = internal error: apply_into returned no result despite no validation errors
 cli-quickstart-error-completion-flag = failed to flip quickstart-completed: {$err}
 cli-quickstart-error-persist-config = failed to persist config: {$err}
+cli-quickstart-error-auth-validation = authorization config rejected before persistence: {$err}
 cli-quickstart-error-not-type-alias-ref = `{$reference}` is not a `<type>.<alias>` reference
 cli-quickstart-error-no-configured-path = no `{$path}` configured
 cli-quickstart-error-provider-required = provider type, alias, and model are required
@@ -872,6 +874,8 @@ cli-plugin-installed-name-version = Installed plugin {$name} v{$version}
 cli-plugin-config-entry-seeded = Seeded [[plugins.entries]] for '{$name}'. Set plugin config values with `zeroclaw config set plugins.entries.{$name}.config.<key>`.
 cli-plugin-config-entry-key = Config entry key ({$capability}): {$key}
 cli-plugin-config-entry-seed-skipped = warning: skipped seeding the config entry for '{$name}': the [plugins] section on disk is malformed. Repair it, add a [[plugins.entries]] block with `name = "{$name}"`, then set values with `zeroclaw config set plugins.entries.{$name}.config.<key>`.
+cli-plugin-install-verify-failed = install failed: '{$name}' does not load against this host: {$error} — rebuild the plugin against this host's WIT (see wit/v0), or override with --no-verify to install anyway.
+cli-plugin-install-verify-bypassed = note: skipping the install-time load check for '{$name}' (--no-verify); if it does not load against this host it will be skipped at startup
 cli-config-section-degraded = warning: config section `{$section}` in {$path} is malformed and was reset to defaults for this run. Values in that section are NOT in effect. Use the running executable at `{$executable}` with `config migrate` to see the parse error, then repair the file.
 cli-config-section-degraded-executable = warning: config section `{$section}` in {$path} is malformed and was reset to defaults for this run. Values in that section are NOT in effect. Use the running executable at `{$executable}` with `config migrate` to see the parse error, then repair the file.
 cli-config-section-retired-wati = warning: retired WATI channel config section `{$section}` is ignored because WATI support was removed. Migrate to `[channels.whatsapp.<alias>]` using the Cloud API or WhatsApp Web, then revoke the unused WATI API token.
@@ -989,6 +993,7 @@ turn-model-fallback-notice = ⚡ { $requested_model } ({ $requested_provider }) 
 # Shown at the end of agent output when the tool call loop exhausted its
 # iteration budget and the agent cannot continue without exceeding limits.
 turn-max-iterations-reached = *Turn stopped: reached maximum tool iterations ({ $max_iterations }).*
+turn-context-window-exceeded-error = This request exceeds the selected model's context window. Reduce the request or enabled tools, or choose a model with a larger context window.
 # Breadcrumb injected into history where older turns were dropped to fit the
 # context budget; user-visible across channels, WS, RPC, ACP.
 history-trim-breadcrumb = [earlier turns omitted to fit the context window]
@@ -1089,7 +1094,6 @@ channel-runtime-safeguard-footer-client-server =
 
 delegate-provider-fallback-warning = Warning: The delegated agent recovered through a provider fallback. Provider failure details were logged and omitted from this result.
 turn-tool-protocol-strict-mixed-error = Strict tool parsing cannot run a fallback chain that mixes native-tool and text-only candidates. Configure every reachable candidate to use the same tool protocol, or set strict_tool_parsing to false.
-turn-context-budget-floor-error = The conversation history still exceeds the configured context budget after dropping every droppable turn. Raise the configured context budget, choose a model with a larger context window, or shorten the current turn.
 turn-context-hook-mutation-unsafe-error = A before-LLM-call hook changed existing messages in a way that cannot be safely reconciled with a required context-budget trim. Configure the hook to only append messages, or shorten the current turn.
 delegate-provider-fallback-header = [Agent '{ $agent }' (requested: { $requested_provider }/{ $requested_model }; served: { $actual_provider }/{ $actual_model })]
 delegate-provider-fallback-header-agentic = [Agent '{ $agent }' (requested: { $requested_provider }/{ $requested_model }; served: { $actual_provider }/{ $actual_model }, agentic)]
@@ -1303,3 +1307,6 @@ channel-approval-opt-reject = Reject
 channel-approval-opt-reject-with-edit = Reject with edit
 tool-git-operations-error-docker-runtime-write-unsupported = Git write commands are unavailable with the Docker runtime because they cannot be confined to its container.
 
+rpc-auth-pairing-revoked = Pairing token revoked: re-pair and re-initialize
+
+cron-agent-job-failed = The scheduled task could not be completed. Please try again or ask an administrator to check the logs.

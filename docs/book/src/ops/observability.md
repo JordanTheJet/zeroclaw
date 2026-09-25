@@ -140,9 +140,38 @@ turn.
 
 | Value | What is captured |
 | --- | --- |
-| `off` (default) | Only `messages_count`. No message content is recorded; existing behavior. |
+| `off` (default) | No message content is recorded. The event still carries `messages_count` plus the always-on prefix fingerprints described below (`system_chars`, `tools_count`, and when present `system_sha256`, `tools_sha256`); they are digests, not content, but a trace reader can still test them for equality. |
 | `redacted` | Full message history (role + content), credential-scanned with the same `scrub_credentials` pass used for `raw_response` and tool I/O, then truncated at `log_tool_io_truncate_bytes`. Truncation is flagged with `request_messages_truncated` and `request_messages_original_bytes`. |
 | `full` | Same credential scrubbing as `redacted`, but untruncated (replay fidelity, mirroring `raw_response`). |
+
+Every `llm_request` event also carries prefix fingerprints of the runtime's
+request inputs, whatever the payload policy: `system_chars` and `tools_count`
+are always present; `system_sha256` (the first 16 hex chars of a SHA-256 over
+the contiguous leading `system` messages, serialized as a JSON array of their
+contents, present only when the first message has the `system` role) and
+`tools_sha256` (the same over the native tool specs serialized as a JSON
+array, present only when tool specs are attached, so a reordered tool set
+fingerprints differently). They describe what the runtime
+handed the provider adapter, one row per logical request; provider-side
+transforms (schema cleaning, cache-control placement, an OAuth system prefix,
+system-message merging on compatible wires, a second leading system message
+that the Anthropic adapter drops, retries inside the adapter) are outside the
+hashed bytes. Read a change as a diagnostic hint, not a cache
+verdict: a changed `system_sha256` means one of the leading system messages
+changed, or one was inserted or removed, for example after an included
+workspace file changed, a before-call hook edited or added one, or the tool
+framing switched between native and text protocol;
+a changed `tools_sha256` means the runtime tool-spec serialization changed,
+which includes metadata fields the wire does not carry. In text-protocol mode
+the tool instructions live inside the system text, so `tools_count` is 0 and
+`tools_sha256` is absent while a tool-set change shows up under
+`system_sha256`. Confirm an actual cache hit or miss from the provider's
+reported cache usage. The fingerprints are counts and unsalted truncated
+hashes, not content: they reveal whether an input changed and let a known
+candidate text be tested for equality, but persist no message text. Anyone
+who can read the trace can test a known candidate prompt or tool set for
+equality, so treat trace files with the same access controls as the opt-in
+payload capture that sits beside them.
 
 Both `redacted` and `full` always run credential scrubbing; the only difference
 between them is truncation. The capture reuses the existing
