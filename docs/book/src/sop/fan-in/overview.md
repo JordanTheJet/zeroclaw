@@ -8,7 +8,7 @@ One ZeroClaw instance can bind several fan-ins at once: an MQTT topic, a filesys
 
 - **One matcher path:** a single matcher evaluates every trigger type, so matching behaves the same regardless of source.
 - **Run-start audit:** started runs are persisted via `SopAuditLogger`.
-- **Headless execution:** cron triggers drive their runs to completion. The maintenance tick hands each started `ExecuteStep` or `DeterministicStep` to the headless run driver, which executes the step as the SOP's own agent. Sources that still have no live driver log `ExecuteStep` actions as pending through `process_headless_results` instead of executing them.
+- **Headless execution:** cron triggers and webhook deliveries drive their runs to completion. The maintenance tick hands each started cron `ExecuteStep` or `DeterministicStep` to the headless run driver, and the webhook route hands each started `ExecuteStep` to it (dispatch already runs deterministic steps); the driver executes the step as the SOP's own agent. Sources that still have no live driver log `ExecuteStep` actions as pending through `process_headless_results` instead of executing them.
 - **Headless ownership:** a headless step runs as the agent named by the step's `agent`, falling back to the SOP's `agent`, and that agent must be configured and enabled. There is no ambient agent turn to inherit an identity from, so a procedure with no owner is **rejected at authoring time** and refused at dispatch; it is never run as some other configured agent. A [manual](./manual.md) SOP is the one case that saves without an owner, because `sop_execute` supplies one; the dashboard's run endpoint, which has no agent behind it, refuses to start such a procedure.
 - **Headless tool scope:** a headless step turn is narrowed exactly like a live one: the SOP control tools (`sop_execute`, `sop_advance`, `sop_approve`) are always removed so a step cannot drive its own run, and the step's declared `scope` is applied on top when `sop.step_scope_enforce` is set. A child agent spawned from the step inherits the same exclusions.
 - **Untrusted input:** topic and payload text are capped, normalized, prompt-guard screened, and framed before reaching model context.
@@ -35,7 +35,7 @@ Each source has a dedicated guide in the sidebar. Live sources (delivered by a r
 | **Cron validation** | Invalid cron expressions fail closed during parsing and cache build |
 | **Headless ownership** | A headless SOP must declare an owning `agent` that is configured and `enabled`; authoring blocks the save and the driver refuses the step rather than borrowing another configured agent. A dashboard-started manual run is refused the same way |
 | **Headless tool scope** | Headless step turns always exclude the SOP control tools and honour the step's declared `scope` under `step_scope_enforce`; child agents spawned from the step inherit those exclusions |
-| **Headless driver lifetime** | Cron drivers are owned by the daemon generation that started them: drained (30s), then aborted and joined (5s) before a reload rebuilds the config and SOP engine. A driver that reaches no await point in that grace keeps running and is carried into the next generation, logged rather than detached |
+| **Headless driver lifetime** | Cron and webhook drivers are owned by the daemon generation that started them: drained (30s), then aborted and joined (5s) before a reload rebuilds the config and SOP engine. A driver that reaches no await point in that grace keeps running and is carried into the next generation, logged rather than detached |
 | **Headless dispatch** | Sources with no live driver log run progression instead of auto-executing `ExecuteStep` |
 
 ## Troubleshooting
@@ -43,7 +43,7 @@ Each source has a dedicated guide in the sidebar. Live sources (delivered by a r
 | Symptom | Likely cause | Fix |
 |---|---|---|
 | SOP never starts from a live source | trigger pattern mismatch or a failing `condition` | Verify the trigger pattern matches the delivered event; check the `condition` against the payload |
-| SOP started but a step did not execute | a source with no live driver (webhook, peripheral, calendar) reached `ExecuteStep` | Use cron or a live source, run an agent loop for `ExecuteStep`, or design the run to pause on approvals |
+| SOP started but a step did not execute | a source with no live driver (peripheral, calendar) reached `ExecuteStep` | Use cron, a webhook, or another live source, run an agent loop for `ExecuteStep`, or design the run to pause on approvals |
 | Cron SOP starts, then fails every run with "no owning agent" | the procedure declares no `agent`, and a headless run has none to inherit | Set `agent` in `SOP.toml` (or on the step) to a configured agent alias |
 | Cron SOP fails every run with "which is disabled" | the owning agent is configured with `enabled = false` | Re-enable the agent, or point `agent` at one that is enabled |
 | Dashboard run button returns `422` for a manual SOP | the procedure's `execute` steps declare no owner, and a dashboard run has no agent turn to inherit one from | Set `agent` in `SOP.toml` (or on the step), or start the procedure from an agent with `sop_execute` |
