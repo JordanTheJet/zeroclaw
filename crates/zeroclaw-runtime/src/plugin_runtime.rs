@@ -133,6 +133,27 @@ impl PluginActivationPlan {
             let Some(provides) = manifest.provides.as_deref() else {
                 continue;
             };
+            // `provides` must name a channel type this build actually knows.
+            //
+            // This is diagnostic, not load-bearing: an unknown id has no
+            // canonical config section, so it would admit nothing regardless.
+            // The value is the log line — a typo otherwise looks exactly like
+            // a plugin whose aliases are simply unconfigured, which is the
+            // kind of silence that costs an operator an afternoon.
+            if !zeroclaw_config::schema::v2::V3_CHANNEL_TYPES.contains(&provides) {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "plugin": manifest.name,
+                            "provides": provides,
+                            "error_key": "plugin_mirror_unknown_channel_id",
+                        })),
+                    "Plugin mirrors a channel id this build does not define; refusing the mirror"
+                );
+                continue;
+            }
             // Two packages claiming one id is ambiguous, and the host will not
             // pick a mirror on the operator's behalf: both fail closed.
             if mirror_claims.get(provides).copied().unwrap_or_default() > 1 {
