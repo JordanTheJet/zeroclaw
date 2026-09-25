@@ -381,6 +381,7 @@ pub(crate) fn test_host_services() -> PluginHostServices {
             wasm_path: None,
             wasm_sha256: None,
             capabilities: vec![scope.id().capability()],
+            provides: None,
             permissions: vec![PluginPermission::ConfigRead],
             config_schema: Some(serde_json::json!({
                 "$schema": "https://json-schema.org/draft/2020-12/schema",
