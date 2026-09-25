@@ -1276,7 +1276,8 @@ impl RpcDispatcher {
     /// did. Admin and explicit-wildcard principals are unaffected: they have
     /// no per-principal narrowing to leak across, so sharing an ID cannot
     /// shrink another principal's tools. This intentionally does NOT defer to
-    /// the future draft #10265, which cannot guard this open non-draft head.
+    /// the future owner-stamping work, which cannot guard this open non-draft
+    /// head.
     fn refuse_constrained_principal_session(
         &self,
         method: Method,
