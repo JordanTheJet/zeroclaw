@@ -525,6 +525,10 @@ pub struct Sop {
     /// ambient agent loop to borrow.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
+    /// Optional decision-model gate and execution-mode choice, from the
+    /// `[decision]` table of `SOP.toml`. See [`super::decision`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision: Option<super::decision::SopDecisionSpec>,
 }
 
 fn default_cooldown_secs() -> u64 {
@@ -609,6 +613,8 @@ pub struct SopManifest {
     pub positions: Vec<StepPosition>,
     #[serde(default)]
     pub steps: Vec<SopStep>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision: Option<super::decision::SopDecisionSpec>,
 }
 
 /// One step's persisted canvas coordinate in SOP.toml.
@@ -678,6 +684,7 @@ impl SopManifest {
                 })
                 .collect(),
             steps: sop.steps.clone(),
+            decision: sop.decision.clone(),
         }
     }
 }
@@ -854,6 +861,11 @@ pub struct SopRun {
     /// reset when a new checkpoint parks, untouched by revise re-parks.
     #[serde(default)]
     pub revision_base: u32,
+    /// Execution mode a decision model chose for this run at dispatch. When
+    /// set it replaces the SOP's authored mode for this run's approval gating;
+    /// step-level confirmations and checkpoints still apply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decided_mode: Option<SopExecutionMode>,
 }
 
 impl ::zeroclaw_api::attribution::Attributable for SopRun {
@@ -1590,6 +1602,7 @@ path = "/sop/test"
             llm_calls_saved: 0,
             revision: 0,
             revision_base: 0,
+            decided_mode: None,
         };
         let json = serde_json::to_string(&run).unwrap();
         let parsed: SopRun = serde_json::from_str(&json).unwrap();
