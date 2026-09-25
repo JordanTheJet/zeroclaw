@@ -48,12 +48,19 @@ pub fn listing_is_authorized(config: &Config, grants: &ResolvedGrants, requested
 }
 
 /// What a listing is confined to once authorized.
+///
+/// Both variants carry the canonical resolved target the authorization was
+/// judged against. The handler enumerates that target, never the raw request
+/// spelling: re-deriving the path after the check would let a writable
+/// component be swapped for a link to another directory in between.
 pub enum ListingAuthorization {
     /// Operator-level principal, or a policy that bounds no root for the path:
     /// the daemon account's own access governs, as it did before confinement.
-    Unconfined,
+    /// Carries the canonical resolved target to enumerate.
+    Unconfined(PathBuf),
     /// Scoped principal: enumeration must stay beneath this approved root.
-    Confined(PathBuf),
+    /// Carries the approved root and the canonical resolved target.
+    Confined { root: PathBuf, target: PathBuf },
 }
 
 /// Authorize a listing and report the boundary enumeration must be bound to.
@@ -63,13 +70,24 @@ pub enum ListingAuthorization {
 /// approved root: re-walking the pathname after this check would let a writable
 /// component be swapped for a link to another directory in between, exposing
 /// names the principal may not read.
+///
+/// The request is resolved once, up front, and the *same* canonical target is
+/// used for the readability check, the approved-root selection, and (via the
+/// returned value) the enumeration itself. Passing the raw request to
+/// `approved_read_root` while checking readability on a separately resolved
+/// target is the alias-swap escape this guards against.
 pub fn authorize_listing(
     config: &Config,
     grants: &ResolvedGrants,
     requested: &Path,
 ) -> Option<ListingAuthorization> {
     if grants.admin {
-        return Some(ListingAuthorization::Unconfined);
+        // An operator's own account governs, but the handler must still
+        // enumerate a resolved target, never the raw (swappable) request.
+        return requested
+            .canonicalize()
+            .ok()
+            .map(ListingAuthorization::Unconfined);
     }
     config
         .agents
@@ -77,12 +95,15 @@ pub fn authorize_listing(
         .filter(|(alias, agent)| agent.enabled && grants.may_use_agent(alias))
         .find_map(|(alias, _)| {
             let policy = SecurityPolicy::for_agent(config, alias).ok()?;
-            if !policy.is_resolved_path_readable(requested) {
+            // Resolve once and reuse the canonical target for every decision
+            // below. Fail closed if it cannot be resolved.
+            let target = policy.resolve_policy_target(requested)?;
+            if !policy.is_resolved_path_readable(&target) {
                 return None;
             }
-            Some(match policy.approved_read_root(requested) {
-                Some(root) => ListingAuthorization::Confined(root),
-                None => ListingAuthorization::Unconfined,
+            Some(match policy.approved_read_root(&target) {
+                Some(root) => ListingAuthorization::Confined { root, target },
+                None => ListingAuthorization::Unconfined(target),
             })
         })
 }
@@ -104,9 +125,18 @@ pub async fn handle_fs_list_dir(
     let req: FsListDirRequest = serde_json::from_value(params.clone())
         .map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))?;
 
-    let path = Path::new(&req.path);
+    // Enumerate the canonical target the authorization was judged against, not
+    // the raw request spelling. `authorize_listing` resolved the request once
+    // and returned that target here; re-deriving it from `req.path` would
+    // reopen the alias-swap window between check and read.
+    let path: &Path = match auth {
+        ListingAuthorization::Confined { target, .. } => target.as_path(),
+        ListingAuthorization::Unconfined(target) => target.as_path(),
+    };
 
-    // Basic traversal guard (more sophisticated policy can be added later)
+    // Basic traversal guard (more sophisticated policy can be added later).
+    // The target is already canonical, so this is a defensive belt-and-braces
+    // check against a `..` slipping through resolution.
     if path.components().any(|c| c.as_os_str() == "..") {
         return Err(rpc_err(FS_INVALID_PATH, "Path traversal not allowed"));
     }
@@ -118,11 +148,11 @@ pub async fn handle_fs_list_dir(
         // Enumerate through a handle opened beneath the approved root. cap-std
         // refuses any component that escapes it, so a directory swapped in
         // after authorization cannot redirect this listing.
-        ListingAuthorization::Confined(root) => {
+        ListingAuthorization::Confined { root, target } => {
             use cap_std::ambient_authority;
             use cap_std::fs::Dir;
 
-            let rel = path
+            let rel = target
                 .strip_prefix(root)
                 .map_err(|_| rpc_err(FS_INVALID_PATH, "Path escapes its approved root"))?;
             let dir = Dir::open_ambient_dir(root, ambient_authority()).map_err(unreadable)?;
@@ -145,7 +175,7 @@ pub async fn handle_fs_list_dir(
                 })
                 .collect()
         }
-        ListingAuthorization::Unconfined => {
+        ListingAuthorization::Unconfined(_) => {
             if !path.is_dir() {
                 return Err(rpc_err(
                     FS_NOT_FOUND,
@@ -255,12 +285,19 @@ mod tests {
         #[cfg(windows)]
         std::os::windows::fs::symlink_dir(&outside, &swapped).unwrap();
 
-        let auth = super::ListingAuthorization::Confined(root.clone());
+        // The authorization carries the in-root canonical target the boundary
+        // was judged against. The handler enumerates that target through a
+        // handle bound to `root`, so the escaping symlink component is refused
+        // by cap-std even though its name sits inside the root.
+        let escaping_auth = super::ListingAuthorization::Confined {
+            root: root.clone(),
+            target: swapped.clone(),
+        };
         let escaping = serde_json::json!({
             "path": swapped.to_string_lossy(),
             "show_hidden": false,
         });
-        let err = super::handle_fs_list_dir(&escaping, &auth)
+        let err = super::handle_fs_list_dir(&escaping, &escaping_auth)
             .await
             .expect_err("a directory escaping the approved root must not be listed");
         assert!(
@@ -269,11 +306,15 @@ mod tests {
         );
 
         // Control: a real directory beneath the root still lists.
+        let allowed_auth = super::ListingAuthorization::Confined {
+            root: root.clone(),
+            target: root.join("real"),
+        };
         let allowed = serde_json::json!({
             "path": root.join("real").to_string_lossy(),
             "show_hidden": false,
         });
-        let listed = super::handle_fs_list_dir(&allowed, &auth)
+        let listed = super::handle_fs_list_dir(&allowed, &allowed_auth)
             .await
             .expect("a directory inside the approved root must still list");
         assert!(

@@ -440,6 +440,13 @@ pub struct ChannelMessage {
     /// Inbound email References chain (parent thread); used to build the
     /// reply's References header. Empty for non-email channels.
     pub references: Vec<String>,
+    /// Set by the receiving channel when the platform marked the inbound event
+    /// itself as a voice message (Matrix: an `m.audio` event carrying
+    /// `org.matrix.msc3245.voice`). This field creates that fact for the
+    /// runtime — nothing else on the inbound side records it. Never derived
+    /// from message text, a reply parent, or room state. `false` means text
+    /// or unknown.
+    pub voice_origin: bool,
 }
 
 /// Message to send through a channel
@@ -467,6 +474,44 @@ pub struct SendMessage {
     /// a voice note even if the peer's default modality is text.
     /// Ignored when `suppress_voice` is also `true`.
     pub force_voice: bool,
+}
+
+/// A native poll to post in a chat.
+///
+/// Channels that cannot post one report [`Channel::supports_native_polls`] as
+/// `false`, and callers fall back to whatever they did before.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PollRequest {
+    /// Chat or peer to post the poll in, in the channel's own addressing.
+    pub recipient: String,
+    pub question: String,
+    /// Answer options, in the order they should be shown.
+    pub options: Vec<String>,
+    /// How many options one voter may pick. `1` is a single-choice poll.
+    pub selectable_count: u32,
+}
+
+impl PollRequest {
+    /// Single-choice poll. Use [`PollRequest::with_selectable_count`] for a
+    /// poll that accepts more than one answer per voter.
+    pub fn new(
+        recipient: impl Into<String>,
+        question: impl Into<String>,
+        options: Vec<String>,
+    ) -> Self {
+        Self {
+            recipient: recipient.into(),
+            question: question.into(),
+            options,
+            selectable_count: 1,
+        }
+    }
+
+    #[must_use]
+    pub fn with_selectable_count(mut self, selectable_count: u32) -> Self {
+        self.selectable_count = selectable_count;
+        self
+    }
 }
 
 /// Cross-channel room visibility used by room-management APIs.
@@ -977,6 +1022,13 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         false
     }
 
+    /// Whether this channel can post a native poll through [`Channel::send_poll`].
+    /// Callers check this before offering one, so a channel without native
+    /// polls keeps whatever fallback the caller already had.
+    fn supports_native_polls(&self) -> bool {
+        false
+    }
+
     /// Whether `send` actually delivers a message OUTBOUND on this channel. Default
     /// `true`. An INBOUND-ONLY transport (e.g. an AMQP trigger source whose `send` is a
     /// deliberate no-op that returns `Ok`) overrides this to `false`, so a surface that
@@ -1234,6 +1286,11 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
     /// Create a new platform room/conversation when the channel supports it.
     async fn create_room(&self, _options: &RoomCreationOptions) -> anyhow::Result<String> {
         anyhow::bail!("channel does not support room creation")
+    }
+
+    /// Post a native poll when the channel supports it.
+    async fn send_poll(&self, _poll: &PollRequest) -> anyhow::Result<()> {
+        anyhow::bail!("channel does not support native polls")
     }
 
     /// Invite a user to an existing platform room/conversation.
