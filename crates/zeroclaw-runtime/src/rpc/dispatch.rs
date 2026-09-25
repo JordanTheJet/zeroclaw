@@ -13129,6 +13129,157 @@ mod tests {
         );
     }
 
+    /// BLOCKER 3 — the config-mutation -> next-turn link, exercised through the
+    /// REAL authenticated, persisted config path rather than a direct
+    /// `refresh_from_config` shortcut.
+    ///
+    /// A principal is seeded unrestricted (wildcard tools + `tools:execute`) so
+    /// its session and first prompt are permitted — a constrained principal is
+    /// refused outright (BLOCKER 2). It is authorized to write its own
+    /// permission-profile subtree so it can drive a persisted `config/set`. The
+    /// flow:
+    ///
+    /// 1. `session/new`, then an allowed control prompt is admitted.
+    /// 2. The principal clears its own wildcard tool selector
+    ///    (`allowed_tools = []`) through the authenticated `config/set` handler.
+    ///    That is the production persistence path: it saves to disk under the
+    ///    config write lock and republishes the accepted authorization
+    ///    generation. The profile — and the user's reference to it — survive, so
+    ///    nothing dangles; but with the wildcard gone the principal is no longer
+    ///    tool-unrestricted (`principal_tool_ceiling` now returns `Some`), even
+    ///    though the coarse `tools:execute` grant is still present.
+    /// 3. The next prompt on the *reused* session is refused fail-closed: the
+    ///    principal is now constrained, and the reused-binding check refuses it
+    ///    before the turn. The session's Agent is not mutated by the refused
+    ///    turn.
+    ///
+    /// This proves the persisted mutation — not merely an in-memory grant edit —
+    /// reaches the queued/reused prompt, which the earlier queue test's
+    /// `refresh_test_principal` helper could not establish. `config/set` is used
+    /// rather than `config/map-key-delete` because `grants` is a
+    /// `HashMap<Resource, _>` (enum-keyed, not `String`-keyed) and so is not an
+    /// addressable map-key section; the `allowed_tools` `Vec<String>` field is
+    /// the real, macro-supported persisted-write surface that flips the ceiling.
+    #[tokio::test]
+    async fn persisted_config_mutation_refuses_reused_session_prompt_fail_closed() {
+        use zeroclaw_api::grants::{Resource, Verb};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Start from the unrestricted principal fixture (wildcard tools +
+        // tools:execute) so session/new and the first prompt are permitted.
+        let mut config = principal_test_config(&tmp, &["*"], &["*"]);
+        // Authorize the principal to drive a persisted `config/set` on its own
+        // permission_profiles subtree: it needs the coarse `Config: update`
+        // verb (checked by `recheck_config_write_authority`) plus a
+        // config-write selector covering the path (the two are independent).
+        {
+            let profile = config
+                .permission_profiles
+                .get_mut("principal-test")
+                .unwrap();
+            profile
+                .grants
+                .insert(Resource::Config, vec![Verb::Read, Verb::Update]);
+            profile.config_write_paths = vec!["permission_profiles.*".into()];
+        }
+
+        let (dispatcher, sessions) = make_acp_test_dispatcher(config);
+        let dispatcher = bind_test_principal(dispatcher).await;
+
+        // 1. Create the session and admit an allowed control prompt.
+        dispatcher
+            .handle_session_new_for_test(
+                &json!({"agent_alias":"test-agent", "session_id":"mutation-link"}),
+            )
+            .await
+            .expect("unrestricted principal opens a session");
+        let agent = sessions.get_agent("mutation-link").await.unwrap();
+        assert!(
+            agent.lock().await.tool_names().contains(&"calculator"),
+            "the control session carries the agent's own tools"
+        );
+        // The control prompt is ADMITTED past the auth gate. The ACP fixture's
+        // provider endpoint is not live, so the turn itself errors afterwards
+        // with an internal (non-auth) code; what matters here is that it is not
+        // refused by authorization. A later FORBIDDEN/AUTH_REQUIRED is the
+        // signal the revocation bit.
+        let control = dispatcher
+            .handle_session_prompt(
+                &json!({"session_id":"mutation-link","prompt":"allowed control"}),
+            )
+            .await;
+        if let Err(e) = &control {
+            assert!(
+                e.code != FORBIDDEN && e.code != AUTH_REQUIRED,
+                "the control prompt must pass authorization before the mutation, got {e:?}"
+            );
+        }
+
+        // 2. Persisted authorization mutation: clear the principal's wildcard
+        // tool selector through the real `config/set` handler. This saves to
+        // disk under the config write lock and republishes the accepted policy
+        // generation — the production persistence path, not an in-memory
+        // `refresh_from_config`. The profile and the user's reference to it
+        // survive (nothing dangles); the principal simply loses its wildcard
+        // `allowed_tools`, so `principal_tool_ceiling` flips from `None`
+        // (unrestricted) to `Some(..)` (constrained) even with `tools:execute`
+        // still granted.
+        //
+        // `config/set` — not `config/map-key-delete` — is used because `grants`
+        // is a `HashMap<Resource, _>` (enum-keyed, not `String`-keyed) and thus
+        // is not an addressable map-key section; `allowed_tools` is a
+        // `Vec<String>` field the config macro exposes as a settable prop.
+        let generation_before = dispatcher.ctx.auth.generation();
+        dispatcher
+            .handle_config_set(&json!({
+                "prop":"permission_profiles.principal-test.allowed_tools",
+                "value": Vec::<String>::new(),
+            }))
+            .await
+            .expect("the persisted allowed_tools clear commits");
+        assert!(
+            dispatcher
+                .ctx
+                .config
+                .read()
+                .permission_profiles
+                .get("principal-test")
+                .unwrap()
+                .allowed_tools
+                .is_empty(),
+            "the wildcard tool selector is gone from the live config"
+        );
+        let on_disk = std::fs::read_to_string(tmp.path().join("config.toml")).unwrap();
+        assert!(
+            on_disk.contains("[permission_profiles.principal-test]"),
+            "the profile itself survives on disk: {on_disk}"
+        );
+        assert_ne!(
+            dispatcher.ctx.auth.generation(),
+            generation_before,
+            "the persisted mutation republished the authorization policy"
+        );
+
+        // 3. The reused session's next prompt is refused fail-closed: the
+        // principal is now constrained (no wildcard selector, so the ceiling is
+        // `Some` even though `tools:execute` is still granted).
+        let refused = dispatcher
+            .handle_session_prompt(
+                &json!({"session_id":"mutation-link","prompt":"must not run after revocation"}),
+            )
+            .await
+            .expect_err("a now-constrained principal must be refused on the reused session");
+        assert!(
+            refused.code == FORBIDDEN || refused.code == AUTH_REQUIRED,
+            "expected a fail-closed refusal, got {refused:?}"
+        );
+        // The refused turn never narrowed or otherwise mutated the Agent.
+        assert!(
+            agent.lock().await.tool_names().contains(&"calculator"),
+            "a refused prompt must not mutate the reused session's agent"
+        );
+    }
+
     /// Rehydration coverage under the BLOCKER 2 fail-closed posture:
     ///
     /// * an unrestricted principal (wildcard + `tools:execute`) rehydrates a
