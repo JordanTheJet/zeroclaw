@@ -24,8 +24,9 @@ use zeroclaw_config::schema::Config;
 use zeroclaw_api::jsonrpc::error_codes::*;
 use zeroclaw_api::jsonrpc::{
     JSONRPC_VERSION, JsonRpcError, JsonRpcFrame, JsonRpcFrameErrorKind, JsonRpcNotification,
-    JsonRpcResponse, RpcOutbound, SopDecideRequest, SopRunDetailRequest, SopRunOverlayRequest,
-    SopRunRequest, SopRunResponse, SopRunsRequest, SopSaveRequest, SopSelectRequest,
+    JsonRpcResponse, RpcOutbound, SopDecideRequest, SopRenameRequest, SopRunDetailRequest,
+    SopRunOverlayRequest, SopRunRequest, SopRunResponse, SopRunsRequest, SopSaveRequest,
+    SopSelectRequest,
 };
 use zeroclaw_api::model_provider::ConversationMessage;
 use zeroclaw_api::runtime_status::{RuntimeConfigKind, RuntimeShellProfile};
@@ -198,6 +199,7 @@ pub enum Method {
     SopsSave,
     SopsCreate,
     SopsDelete,
+    SopsRename,
     SopsDecide,
     SopsWireDraft,
     SopsGraphDraft,
@@ -309,6 +311,7 @@ impl Method {
         (Method::SopsSave, "sops/save"),
         (Method::SopsCreate, "sops/create"),
         (Method::SopsDelete, "sops/delete"),
+        (Method::SopsRename, "sops/rename"),
         (Method::SopsDecide, "sops/decide"),
         (Method::SopsWireDraft, "sops/wire-draft"),
         (Method::SopsGraphDraft, "sops/graph-draft"),
@@ -432,7 +435,7 @@ impl Method {
             | M::SopsRunOverlay
             | M::SopsTriggerSources => (Resource::Sops, Verb::Read),
             M::SopsCreate => (Resource::Sops, Verb::Create),
-            M::SopsSave => (Resource::Sops, Verb::Update),
+            M::SopsSave | M::SopsRename => (Resource::Sops, Verb::Update),
             M::SopsDelete => (Resource::Sops, Verb::Delete),
             M::SopsRun | M::SopsDecide | M::SopsValidate | M::SopsWireDraft | M::SopsGraphDraft => {
                 (Resource::Sops, Verb::Execute)
@@ -2648,6 +2651,7 @@ impl RpcDispatcher {
             Method::SopsSave => self.handle_sops_save(&req.params),
             Method::SopsCreate => self.handle_sops_create(&req.params),
             Method::SopsDelete => self.handle_sops_delete(&req.params),
+            Method::SopsRename => self.handle_sops_rename(&req.params),
             Method::SopsDecide => self.handle_sops_decide(&req.params).await,
             Method::SopsWireDraft => self.handle_sops_wire_draft(&req.params),
             Method::SopsGraphDraft => self.handle_sops_graph_draft(&req.params),
@@ -7963,6 +7967,10 @@ impl RpcDispatcher {
             return Err(rpc_err(INTERNAL_ERROR, "Log persistence is not enabled"));
         };
 
+        let field_eq = p
+            .sop_run_id
+            .map(|run_id| std::collections::BTreeMap::from([("sop_run_id".into(), run_id)]))
+            .unwrap_or_default();
         let filter = zeroclaw_log::LogFilter {
             since_ts: p.since_ts,
             until_ts: p.until_ts,
@@ -7975,7 +7983,7 @@ impl RpcDispatcher {
             trace_id: p.trace_id,
             q: p.q,
             hide_internal: p.hide_internal,
-            field_eq: std::collections::BTreeMap::new(),
+            field_eq,
         };
 
         let limit = p.limit.unwrap_or(200);
@@ -8412,6 +8420,21 @@ impl RpcDispatcher {
             .map(str::trim)
             .filter(|p| !p.is_empty())
             .map(str::to_string);
+        let dedup_key = req
+            .dedup_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|key| !key.is_empty());
+        if dedup_key.is_some_and(|key| key.len() > crate::sop::dispatch::MAX_ACTIVE_DEDUP_KEY_BYTES)
+        {
+            return Err(rpc_err(
+                INVALID_PARAMS,
+                format!(
+                    "dedup_key exceeds {} bytes",
+                    crate::sop::dispatch::MAX_ACTIVE_DEDUP_KEY_BYTES
+                ),
+            ));
+        }
 
         let event = crate::sop::SopEvent {
             source: crate::sop::SopTriggerSource::Manual,
@@ -8420,13 +8443,64 @@ impl RpcDispatcher {
             timestamp: crate::sop::engine::now_iso8601(),
         };
 
-        let results =
-            crate::sop::dispatch::dispatch_sop_event_to(engine, audit, event, &req.name).await;
+        let results = if let Some(dedup_key) = dedup_key {
+            crate::sop::dispatch::dispatch_sop_event_to_deduplicated(
+                engine, audit, event, &req.name, dedup_key,
+            )
+            .await
+        } else {
+            crate::sop::dispatch::dispatch_sop_event_to(engine, audit, event, &req.name).await
+        };
         crate::sop::dispatch::process_headless_results(&results);
 
         for result in &results {
             match result {
-                crate::sop::dispatch::DispatchResult::Started { run_id, .. } => {
+                crate::sop::dispatch::DispatchResult::Started { run_id, action, .. } => {
+                    let needs_driver = matches!(
+                        action.as_ref(),
+                        crate::sop::SopRunAction::ExecuteStep { .. }
+                            | crate::sop::SopRunAction::DeterministicStep { .. }
+                    );
+                    if needs_driver {
+                        // Drive the run this call started, exactly as the gateway
+                        // start path does: admitted into the daemon generation's
+                        // driver set, so a reload drains it, and refused (with the
+                        // run settled) if that generation has already drained.
+                        // Only a context with no generation, a one-shot caller,
+                        // detaches a driver instead.
+                        let config = self.ctx.config.read().clone();
+                        let driven = match self.ctx.sop_driver_handles.as_ref() {
+                            Some(handles) => crate::sop::spawn_and_register_sop_driver(
+                                handles,
+                                config,
+                                Arc::clone(engine),
+                                Some(Arc::clone(audit)),
+                                action.as_ref().clone(),
+                            ),
+                            None => {
+                                drop(crate::sop::spawn_headless_run_driver(
+                                    config,
+                                    Arc::clone(engine),
+                                    Some(Arc::clone(audit)),
+                                    action.as_ref().clone(),
+                                ));
+                                true
+                            }
+                        };
+                        // A shared producer key must only ever name a run that
+                        // something is advancing. If the driver was refused,
+                        // nothing will advance this run, and leaving the key
+                        // pointing at it would let the next Git or
+                        // reconciliation producer coalesce onto it instead of
+                        // doing the work. Withdraw the key in that case only.
+                        if !driven && dedup_key.is_some() {
+                            let mut guard = match engine.lock() {
+                                Ok(guard) => guard,
+                                Err(poisoned) => poisoned.into_inner(),
+                            };
+                            guard.forget_active_dispatch_dedup_for_run(run_id);
+                        }
+                    }
                     return to_result(SopRunResponse {
                         run_id: run_id.clone(),
                     });
@@ -8658,6 +8732,7 @@ impl RpcDispatcher {
                 &config,
                 Arc::clone(&engine),
                 self.ctx.sop_audit.clone(),
+                self.ctx.sop_driver_handles.as_ref(),
                 &outcome,
             );
         }
@@ -8714,7 +8789,17 @@ impl RpcDispatcher {
             self.authorize_sop_authoring(Method::SopsSave, &sop)?;
             self.authorize_existing_sop(Method::SopsSave, &dir, &sop.name, mode)?;
         }
-        crate::sop::save_sop(&dir, &sop).map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))?;
+        // An edit-save targets the SOP it was loaded from. If that SOP has
+        // been renamed or deleted since, refuse rather than recreate it:
+        // creating a SOP is `sops/create`.
+        crate::sop::save_existing_sop_typed(&dir, &sop).map_err(|e| {
+            let code = match e {
+                crate::sop::SopAuthorError::NotFound(_) => SOP_NOT_FOUND,
+                crate::sop::SopAuthorError::Io(_) => INTERNAL_ERROR,
+                _ => INVALID_PARAMS,
+            };
+            rpc_err(code, e.to_string())
+        })?;
         to_result(serde_json::json!({ "saved": sop.name }))
     }
 
@@ -8745,6 +8830,39 @@ impl RpcDispatcher {
             rpc_err(code, e.to_string())
         })?;
         to_result(serde_json::json!({ "deleted": req.name }))
+    }
+
+    /// Move a SOP to a new name. Separate from `sops/save` on purpose: save
+    /// persists under the submitted SOP's own name, so it can only ever
+    /// overwrite the SOP it was loaded from. Renaming is collision-checked
+    /// and moves the definition; it never copies it.
+    fn handle_sops_rename(&self, params: &Value) -> RpcResult {
+        // Local transports only, for the reason `sops/run-detail` gives: a
+        // remote WSS caller that has completed `initialize` has not
+        // established a principal this dispatcher can authorize a SOP
+        // identity change against, while local IPC is owner-scoped by the
+        // socket itself. Checked before the params are parsed so a refused
+        // caller learns nothing about which SOPs exist. Replace this with a
+        // principal check once there is one, rather than removing it.
+        if self.peer_label.starts_with("wss:") {
+            return Err(rpc_err(
+                AUTH_REQUIRED,
+                "sops/rename is not served over remote WSS: the transport has no \
+                 authenticated principal to authorize a SOP identity change against",
+            ));
+        }
+        let req: SopRenameRequest = parse_params(params)?;
+        let (dir, mode) = self.sops_dir_and_mode();
+        crate::sop::rename_sop_typed(&dir, &req.from, &req.to, mode).map_err(|e| {
+            let code = match e {
+                crate::sop::SopAuthorError::NotFound(_) => SOP_NOT_FOUND,
+                crate::sop::SopAuthorError::AlreadyExists(_) => SOP_ALREADY_EXISTS,
+                crate::sop::SopAuthorError::Io(_) => INTERNAL_ERROR,
+                crate::sop::SopAuthorError::Other(_) => INVALID_PARAMS,
+            };
+            rpc_err(code, e.to_string())
+        })?;
+        to_result(serde_json::json!({ "renamed": req.to, "from": req.from }))
     }
 
     fn handle_sops_wire_draft(&self, params: &Value) -> RpcResult {
@@ -9664,6 +9782,7 @@ mod tests {
             admission_policy: SopAdmissionPolicy::Parallel,
             max_pending_approvals: 0,
             agent: None,
+            decision: None,
         }]);
         let action = engine
             .start_run(
@@ -9752,6 +9871,8 @@ mod tests {
             llm_calls_saved: 0,
             revision: 0,
             revision_base: 0,
+            initiating_agent: None,
+            decided_mode: None,
         };
         let pr = PersistedRun::new(
             run.clone(),
@@ -9834,6 +9955,7 @@ mod tests {
             admission_policy: SopAdmissionPolicy::Parallel,
             max_pending_approvals: 0,
             agent: None,
+            decision: None,
         }]);
         let action = engine
             .start_run(
@@ -11726,9 +11848,25 @@ mod tests {
             "the persisted narrowing itself is authorized: {narrowed}"
         );
         let on_disk = std::fs::read_to_string(tmp.path().join("config.toml")).unwrap();
-        assert!(
-            on_disk.contains("session-scoped"),
-            "the narrowed profile must be persisted: {on_disk}"
+        // Assert on the mutation, not just the table key: `session-scoped` is
+        // present whether or not the narrowing took effect, so a silent no-op
+        // would pass a `contains("session-scoped")` check. Parse the persisted
+        // config and prove `allowed_agents` was actually cleared to `[]`.
+        let parsed: toml::Value = toml::from_str(&on_disk)
+            .unwrap_or_else(|e| panic!("persisted config must parse: {e}\n{on_disk}"));
+        let allowed_agents = parsed
+            .get("permission_profiles")
+            .and_then(|v| v.get("session-scoped"))
+            .and_then(|v| v.get("allowed_agents"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "permission_profiles.session-scoped.allowed_agents must be persisted: {on_disk}"
+                )
+            });
+        assert_eq!(
+            allowed_agents,
+            &toml::Value::Array(vec![]),
+            "the narrowing must persist an empty allowed_agents, not a no-op: {on_disk}"
         );
 
         release_admitted.notify_one();
@@ -12664,6 +12802,7 @@ mod tests {
             agent: Some(agent.to_string()),
             admission_policy: crate::sop::types::SopAdmissionPolicy::Parallel,
             max_pending_approvals: 0,
+            decision: None,
         }
     }
 
@@ -13395,10 +13534,16 @@ mod tests {
             // binding was established on a token that lacks the newly-required
             // acr, so re-resolution fails closed until the client re-verifies.
             let refused = rpc(&mut oidc, &mut rx, 4, "config/list", json!({})).await;
-            assert!(
-                refused.get("error").is_some(),
+            // Pin the refusal code, not merely `error.is_some()`: any unrelated
+            // failure in the `config/list` handler would satisfy a bare
+            // is-some. A failed OIDC rebind resolves through
+            // `DenyReason::BadCredential` to `AUTH_REQUIRED` (`rpc/auth.rs`), so
+            // assert exactly that the way the sibling tests pin `FORBIDDEN`.
+            assert_eq!(
+                refused["error"]["code"],
+                json!(AUTH_REQUIRED),
                 "a connection established before the acr tightened must be forced to \
-                 re-verify, not keep resolving: {refused}"
+                 re-verify with AUTH_REQUIRED, not keep resolving: {refused}"
             );
         });
     }
@@ -16498,6 +16643,225 @@ mod tests {
         assert_eq!(dir, tmp.path().join("shared").join("sops"));
     }
 
+    /// A dispatcher whose SOP root is `<tmp>/sops`, for the synchronous
+    /// authoring handlers (save/create/delete/rename) that need nothing but
+    /// config on disk. The writer channel receiver rides along so it outlives
+    /// the dispatcher.
+    fn make_sop_author_dispatcher(
+        tmp: &std::path::Path,
+    ) -> (RpcDispatcher, tokio::sync::mpsc::Receiver<String>) {
+        make_sop_author_dispatcher_on(tmp, "test-peer-sop-author:pid=1")
+    }
+
+    fn make_sop_author_dispatcher_on(
+        tmp: &std::path::Path,
+        peer_label: &str,
+    ) -> (RpcDispatcher, tokio::sync::mpsc::Receiver<String>) {
+        use zeroclaw_config::schema::{Config, SopConfig};
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+
+        let config = Config {
+            data_dir: tmp.join("data"),
+            config_path: tmp.join("config.toml"),
+            sop: SopConfig {
+                sops_dir: Some(tmp.join("sops").to_string_lossy().into_owned()),
+                ..SopConfig::default()
+            },
+            ..Config::default()
+        };
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let ctx = RpcContext::minimal(config, sessions);
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        (RpcDispatcher::new(ctx, tx, peer_label.to_string()), rx)
+    }
+
+    /// A remote WSS caller that has completed `initialize` has no principal to
+    /// authorize a SOP identity change against. Rename is refused before the
+    /// params are read, and the SOP root is untouched.
+    #[test]
+    fn sops_rename_is_refused_over_remote_wss() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sops_dir = tmp.path().join("sops");
+        crate::sop::save_sop(&sops_dir, &author_test_sop("wss-source")).unwrap();
+        let (d, _rx) = make_sop_author_dispatcher_on(tmp.path(), "wss:203.0.113.7:44321");
+
+        let err = d
+            .handle_sops_rename(&serde_json::json!({ "from": "wss-source", "to": "wss-target" }))
+            .expect_err("a remote WSS caller must not rename a SOP");
+        assert_eq!(err.code, AUTH_REQUIRED, "{err:?}");
+        assert!(sops_dir.join("wss-source").exists());
+        assert!(!sops_dir.join("wss-target").exists());
+    }
+
+    /// A stale edit-save after a rename must not resurrect the retired name.
+    #[test]
+    fn sops_save_after_rename_does_not_recreate_the_retired_sop() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sops_dir = tmp.path().join("sops");
+        crate::sop::save_sop(&sops_dir, &author_test_sop("rpc-before")).unwrap();
+        let (d, _rx) = make_sop_author_dispatcher(tmp.path());
+        d.handle_sops_rename(&serde_json::json!({ "from": "rpc-before", "to": "rpc-after" }))
+            .expect("a local caller renames");
+
+        let err = d
+            .handle_sops_save(&serde_json::json!({
+                "sop": serde_json::to_value(author_test_sop("rpc-before")).unwrap(),
+            }))
+            .expect_err("saving the retired name must be refused");
+        assert_eq!(err.code, SOP_NOT_FOUND, "{err:?}");
+        assert!(!sops_dir.join("rpc-before").exists());
+        assert!(sops_dir.join("rpc-after").exists());
+    }
+
+    fn author_test_sop(name: &str) -> crate::sop::Sop {
+        use crate::sop::{Sop, SopExecutionMode, SopPriority, SopStep, SopTrigger};
+
+        Sop {
+            name: name.to_string(),
+            description: "authoring round trip".to_string(),
+            version: "1.0.0".to_string(),
+            priority: SopPriority::Normal,
+            execution_mode: SopExecutionMode::Supervised,
+            triggers: vec![SopTrigger::Manual],
+            steps: vec![SopStep {
+                number: 1,
+                title: "Do the thing".to_string(),
+                ..SopStep::default()
+            }],
+            cooldown_secs: 0,
+            max_concurrent: 1,
+            location: None,
+            deterministic: false,
+            admission_policy: crate::sop::types::SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
+            agent: None,
+            decision: None,
+        }
+    }
+
+    #[test]
+    fn sops_rename_moves_the_sop_and_leaves_one_copy() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sops_dir = tmp.path().join("sops");
+        crate::sop::save_sop(&sops_dir, &author_test_sop("rpc-before")).unwrap();
+        let (d, _rx) = make_sop_author_dispatcher(tmp.path());
+
+        let result = d
+            .handle_sops_rename(&serde_json::json!({ "from": "rpc-before", "to": "rpc-after" }))
+            .expect("renaming an existing SOP to a free name must succeed");
+        assert_eq!(result["renamed"], "rpc-after");
+        assert_eq!(result["from"], "rpc-before");
+
+        assert!(!sops_dir.join("rpc-before").exists());
+        let listed = d.handle_sops_list().unwrap();
+        let names: Vec<&str> = listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["rpc-after"], "one SOP, under the new name");
+    }
+
+    #[test]
+    fn sops_rename_reports_a_taken_name_as_already_exists() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sops_dir = tmp.path().join("sops");
+        crate::sop::save_sop(&sops_dir, &author_test_sop("rpc-alpha")).unwrap();
+        crate::sop::save_sop(&sops_dir, &author_test_sop("rpc-beta")).unwrap();
+        let (d, _rx) = make_sop_author_dispatcher(tmp.path());
+
+        let err = d
+            .handle_sops_rename(&serde_json::json!({ "from": "rpc-alpha", "to": "rpc-beta" }))
+            .expect_err("renaming onto a name in use must be refused");
+        assert_eq!(err.code, SOP_ALREADY_EXISTS);
+        assert!(sops_dir.join("rpc-alpha").exists(), "the source stays put");
+        assert!(sops_dir.join("rpc-beta").exists());
+    }
+
+    #[test]
+    fn sops_rename_reports_an_unknown_sop_as_not_found() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (d, _rx) = make_sop_author_dispatcher(tmp.path());
+
+        let err = d
+            .handle_sops_rename(&serde_json::json!({ "from": "rpc-missing", "to": "rpc-new" }))
+            .expect_err("renaming a SOP that does not exist must be refused");
+        assert_eq!(err.code, SOP_NOT_FOUND);
+    }
+
+    #[test]
+    fn sops_rename_rejects_a_path_traversal_target() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sops_dir = tmp.path().join("sops");
+        crate::sop::save_sop(&sops_dir, &author_test_sop("rpc-traversal")).unwrap();
+        let (d, _rx) = make_sop_author_dispatcher(tmp.path());
+
+        let err = d
+            .handle_sops_rename(&serde_json::json!({ "from": "rpc-traversal", "to": "../escaped" }))
+            .expect_err("a rename target must not escape the SOP root");
+        assert_eq!(err.code, INVALID_PARAMS);
+        assert!(sops_dir.join("rpc-traversal").exists());
+        assert!(!tmp.path().join("escaped").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sops_rename_reports_a_filesystem_failure_as_a_server_error() {
+        // A well-formed request against a manifest the daemon cannot read is
+        // the daemon's problem, not the caller's: it must not come back as
+        // INVALID_PARAMS, which tells the client to fix its input.
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sops_dir = tmp.path().join("sops");
+        crate::sop::save_sop(&sops_dir, &author_test_sop("rpc-unreadable")).unwrap();
+        let manifest = sops_dir.join("rpc-unreadable").join("SOP.toml");
+        let original = std::fs::metadata(&manifest).unwrap().permissions();
+        std::fs::set_permissions(&manifest, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read_to_string(&manifest).is_ok() {
+            // Running as root, where the mode bits above are advisory.
+            std::fs::set_permissions(&manifest, original).unwrap();
+            return;
+        }
+
+        let (d, _rx) = make_sop_author_dispatcher(tmp.path());
+        let err = d
+            .handle_sops_rename(
+                &serde_json::json!({ "from": "rpc-unreadable", "to": "rpc-readable" }),
+            )
+            .expect_err("an unreadable manifest must fail the rename");
+        std::fs::set_permissions(&manifest, original).unwrap();
+
+        assert_eq!(err.code, INTERNAL_ERROR, "{err:?}");
+    }
+
+    #[test]
+    fn sops_save_still_refuses_to_rename_the_sop_it_is_editing() {
+        // Edit identity: `sops/save` persists under the submitted SOP's own
+        // name, so a name change slipped through a save would fork the SOP or
+        // clobber another. Renaming has its own method; save keeps rejecting.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sops_dir = tmp.path().join("sops");
+        crate::sop::save_sop(&sops_dir, &author_test_sop("rpc-editing")).unwrap();
+        let (d, _rx) = make_sop_author_dispatcher(tmp.path());
+
+        let err = d
+            .handle_sops_save(&serde_json::json!({
+                "sop": serde_json::to_value(author_test_sop("rpc-renamed-by-save")).unwrap(),
+                "original_name": "rpc-editing",
+            }))
+            .expect_err("an edit-save may not change the SOP's name");
+        assert_eq!(err.code, INVALID_PARAMS);
+        assert!(err.message.contains("rename not supported"), "{err:?}");
+        assert!(sops_dir.join("rpc-editing").exists());
+        assert!(
+            !sops_dir.join("rpc-renamed-by-save").exists(),
+            "a rejected edit-save writes nothing at all"
+        );
+    }
+
     fn make_checkpoint_rpc_dispatcher(
         quorum: u32,
         members: &[&str],
@@ -16549,6 +16913,7 @@ mod tests {
             admission_policy: SopAdmissionPolicy::Parallel,
             max_pending_approvals: 0,
             agent: None,
+            decision: None,
         };
         crate::sop::save_sop(&sops_dir, &sop).unwrap();
         let mut groups = HashMap::new();
@@ -16600,6 +16965,180 @@ mod tests {
         let mut dispatcher = RpcDispatcher::new(ctx, tx, "local:test".into());
         dispatcher.set_tui_id_for_test(Some(tui_id.to_string()));
         (dispatcher, engine, run_id, temp)
+    }
+
+    /// An RPC dispatcher over one SOP, with the driver handles under test.
+    fn sops_run_dispatcher(
+        sop: crate::sop::types::Sop,
+        handles: Option<crate::sop::SopDriverHandles>,
+    ) -> (
+        RpcDispatcher,
+        Arc<std::sync::Mutex<crate::sop::SopEngine>>,
+        tempfile::TempDir,
+    ) {
+        let mut engine = crate::sop::SopEngine::new(zeroclaw_config::schema::SopConfig::default());
+        engine.set_sops_for_test(vec![sop]);
+        let engine = Arc::new(std::sync::Mutex::new(engine));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(
+            16,
+            Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
+                4, 10, 60,
+            )),
+        ));
+        let mem_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "sqlite".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let memory: Arc<dyn zeroclaw_api::memory_traits::Memory> =
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, temp.path(), None).unwrap());
+        let audit = Arc::new(crate::sop::SopAuditLogger::new(memory));
+        let ctx = RpcContext::minimal_with_sop_engine_and_audit(
+            zeroclaw_config::schema::Config::default(),
+            sessions,
+            Arc::clone(&engine),
+            audit,
+            handles,
+        );
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        (
+            RpcDispatcher::new(ctx, tx, "local:test".into()),
+            engine,
+            temp,
+        )
+    }
+
+    fn manual_sop(
+        name: &str,
+        deterministic: bool,
+        step: crate::sop::types::SopStep,
+    ) -> crate::sop::types::Sop {
+        crate::sop::types::Sop {
+            name: name.to_string(),
+            description: "sops/run driver test".to_string(),
+            version: "0.1.0".to_string(),
+            priority: crate::sop::types::SopPriority::Normal,
+            // A deterministic SOP runs its steps without a model turn, which is
+            // what lets the driven test reach `Completed` with no provider.
+            execution_mode: if deterministic {
+                crate::sop::types::SopExecutionMode::Deterministic
+            } else {
+                crate::sop::types::SopExecutionMode::Auto
+            },
+            triggers: vec![crate::sop::types::SopTrigger::Manual],
+            steps: vec![step],
+            cooldown_secs: 0,
+            max_concurrent: 4,
+            location: None,
+            deterministic,
+            admission_policy: crate::sop::types::SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
+            agent: None,
+            decision: None,
+        }
+    }
+
+    async fn start_with_key(dispatcher: &RpcDispatcher, sop_name: &str, key: &str) -> String {
+        dispatcher
+            .handle_sops_run(&serde_json::json!({ "name": sop_name, "dedup_key": key }))
+            .await
+            .expect("the run starts")
+            .get("run_id")
+            .and_then(serde_json::Value::as_str)
+            .expect("a run id comes back")
+            .to_string()
+    }
+
+    /// `sops/run` drives the run it starts, like the gateway start path. A
+    /// deterministic no-op step needs no model, so reaching `Completed` proves
+    /// a driver really advanced the run rather than leaving it at its first
+    /// step. Once terminal, the producer key no longer coalesces, so the same
+    /// work item can be retried.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sops_run_drives_the_run_it_starts() {
+        let sop_name = "driven";
+        let step = crate::sop::types::SopStep {
+            number: 1,
+            title: "No-op".to_string(),
+            kind: crate::sop::types::SopStepKind::Capability,
+            capability: Some("noop".to_string()),
+            ..crate::sop::types::SopStep::default()
+        };
+        let handles = crate::sop::SopDriverHandles::default();
+        let (dispatcher, engine, _temp) =
+            sops_run_dispatcher(manual_sop(sop_name, true, step), Some(handles));
+        let dedup_key = "ghpr_octocat/example#42";
+        let run_id = start_with_key(&dispatcher, sop_name, dedup_key).await;
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let status = loop {
+            let status = engine
+                .lock()
+                .unwrap()
+                .get_run(&run_id)
+                .map(|run| run.status);
+            if !matches!(
+                status,
+                Some(crate::sop::types::SopRunStatus::Running) | None
+            ) || std::time::Instant::now() >= deadline
+            {
+                break status;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        };
+        assert_eq!(
+            status,
+            Some(crate::sop::types::SopRunStatus::Completed),
+            "a driver must advance the RPC-started run to a terminal state; run: {:?}",
+            engine.lock().unwrap().get_run(&run_id).map(|run| (
+                run.status,
+                run.step_results
+                    .iter()
+                    .map(|r| (r.step_number, r.status, r.output.clone()))
+                    .collect::<Vec<_>>()
+            ))
+        );
+        assert_eq!(
+            engine
+                .lock()
+                .unwrap()
+                .active_dispatch_dedup_lookup(sop_name, dedup_key),
+            None,
+            "a terminal run must not keep suppressing a retry of the same work item"
+        );
+    }
+
+    /// A shared producer key must only name a run something is advancing. When
+    /// the daemon generation has already drained, the driver is refused and the
+    /// run is settled, so the key must not be left pointing at it: the next Git
+    /// or reconciliation producer would otherwise coalesce onto a run nothing
+    /// will ever advance, and the key would suppress real work.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sops_run_withdraws_the_producer_key_when_its_driver_is_refused() {
+        let sop_name = "refused";
+        let step = crate::sop::types::SopStep {
+            number: 1,
+            title: "Step one".to_string(),
+            body: "Do the work".to_string(),
+            ..crate::sop::types::SopStep::default()
+        };
+        let handles = crate::sop::SopDriverHandles::default();
+        handles.lock().unwrap().close_and_take();
+        let (dispatcher, engine, _temp) =
+            sops_run_dispatcher(manual_sop(sop_name, false, step), Some(handles));
+        let dedup_key = "ghpr_octocat/example#43";
+        let run_id = start_with_key(&dispatcher, sop_name, dedup_key).await;
+
+        let guard = engine.lock().unwrap();
+        assert!(
+            !guard.active_runs().contains_key(&run_id),
+            "a run whose driver was refused is settled, not left active"
+        );
+        assert_eq!(
+            guard.active_dispatch_dedup_lookup(sop_name, dedup_key),
+            None,
+            "the producer key must not point at a run nothing will advance"
+        );
     }
 
     #[tokio::test]
@@ -16691,6 +17230,7 @@ mod tests {
             agent: None,
             admission_policy: crate::sop::types::SopAdmissionPolicy::Parallel,
             max_pending_approvals: 0,
+            decision: None,
         };
         crate::sop::save_sop(&sops_dir, &sop).expect("save temporary SOP");
 
@@ -16746,6 +17286,29 @@ mod tests {
         })
         .await
         .expect("RPC approval must schedule the resumed ExecuteStep");
+
+        let handles = dispatcher
+            .ctx
+            .sop_driver_handles
+            .as_ref()
+            .expect("a context holding an engine carries the generation driver set")
+            .clone();
+        let driver = {
+            let mut guard = handles.lock().expect("driver set lock");
+            assert_eq!(
+                guard.len(),
+                1,
+                "the resumed driver must register in the generation-owned set, not detach"
+            );
+            // Finalize exactly as the generation drain does, so this asserts
+            // against the same operation production uses.
+            let mut taken = guard.close_and_take();
+            taken.pop().expect("registered driver handle")
+        };
+        // The generation drain is a join on exactly these handles: a resumed
+        // driver therefore ends inside the generation that spawned it instead
+        // of running on under superseded configuration.
+        driver.await.expect("the registered resumed driver joins");
     }
 
     #[tokio::test]
@@ -16806,6 +17369,7 @@ mod tests {
             agent: None,
             admission_policy: crate::sop::types::SopAdmissionPolicy::Parallel,
             max_pending_approvals: 0,
+            decision: None,
         };
         crate::sop::save_sop(&sops_dir, &sop).expect("save temp SOP");
 
@@ -16907,6 +17471,7 @@ mod tests {
                 agent: None,
                 admission_policy: crate::sop::types::SopAdmissionPolicy::Parallel,
                 max_pending_approvals: 0,
+                decision: None,
             }
         }
 
@@ -24379,6 +24944,7 @@ mod tests {
             tui_registry: Arc::new(crate::rpc::tui_identity::TuiRegistry::new_unsigned()),
             acp_session_store: None,
             sop_engine: None,
+            sop_driver_handles: None,
             sop_audit: None,
             hooks: Some(Arc::new(runner)),
             cert_audit: None,
@@ -24427,6 +24993,7 @@ mod tests {
             tui_registry: Arc::new(crate::rpc::tui_identity::TuiRegistry::new_unsigned()),
             acp_session_store: None,
             sop_engine: None,
+            sop_driver_handles: None,
             sop_audit: None,
             hooks: Some(Arc::new(runner)),
             cert_audit: None,
@@ -24534,6 +25101,7 @@ mod tests {
             tui_registry: Arc::new(crate::rpc::tui_identity::TuiRegistry::new_unsigned()),
             acp_session_store: None,
             sop_engine: None,
+            sop_driver_handles: None,
             sop_audit: None,
             hooks: Some(Arc::new(runner)),
             cert_audit: None,
