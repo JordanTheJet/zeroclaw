@@ -1254,61 +1254,6 @@ impl RpcDispatcher {
         Ok(())
     }
 
-    /// Fail-closed guard for the cross-principal session-sharing hole
-    /// (BLOCKER 2). A *constrained* principal is a non-admin whose
-    /// `allowed_tools` selector is neither the explicit wildcard nor absent —
-    /// i.e. a principal whose tool ceiling is a real narrowing
-    /// (`principal_tool_ceiling` returns `Some(..)`, named or empty).
-    ///
-    /// Composing that narrowing into the assembled agent is NOT sufficient to
-    /// isolate one constrained principal from another. Live and durable
-    /// session records carry no principal owner: `owner_tui_id` / `tui_id` /
-    /// `tui_sig` are reconnect-affinity hints, not security boundaries, and
-    /// the session binding check authorizes only agent + workspace, not the
-    /// owner. Two constrained principals sharing an entitled agent/workspace
-    /// can therefore resume, prompt, rehydrate, and rebind each other's
-    /// sessions by ID — and monotonic narrowing then permanently shrinks the
-    /// victim's Agent.
-    ///
-    /// Until principal-owner stamping lands on both the live and durable
-    /// records (and resume/prompt/rehydration/approval-binding are predicated
-    /// on owner match), the only fail-closed answer is to refuse a session to
-    /// a constrained principal outright, exactly as the pre-composition stage
-    /// did. Admin and explicit-wildcard principals are unaffected: they have
-    /// no per-principal narrowing to leak across, so sharing an ID cannot
-    /// shrink another principal's tools. This intentionally does NOT defer to
-    /// the future owner-stamping work, which cannot guard this open non-draft
-    /// head.
-    fn refuse_constrained_principal_session(
-        &self,
-        method: Method,
-        grants: &zeroclaw_api::grants::ResolvedGrants,
-    ) -> Result<(), JsonRpcError> {
-        // Only a real narrowing is dangerous; admin and "*" return None.
-        if principal_tool_ceiling(grants).is_none() {
-            return Ok(());
-        }
-        let denied = rpc_err(
-            FORBIDDEN,
-            "This principal's tool selector is constrained (non-admin without \
-             allowed_tools = [\"*\"]). Constrained agent sessions are refused \
-             until per-principal session ownership is enforced on live and \
-             durable records: without an owner stamp, sessions are keyed only \
-             by ID and can be resumed or rehydrated across principals, so a \
-             narrowing composed for one principal could shrink another's \
-             session. Grant allowed_tools = [\"*\"] (plus tools = [\"execute\"]) \
-             or admin until then (fail closed, never silently un-isolated).",
-        );
-        self.audit_auth_denial(
-            method,
-            &crate::rpc::auth::AuthDenied {
-                code: denied.code,
-                message: denied.message.clone(),
-            },
-        );
-        Err(denied)
-    }
-
     /// The per-run tool narrowing derived from the bound principal's
     /// selector, applied at agent assembly (composition by intersection
     /// with the agent's own policy): `None` = unrestricted (`admin` or the
@@ -1602,11 +1547,18 @@ impl RpcDispatcher {
         let Some(grants) = grants else {
             return Ok(());
         };
-        // Fail-closed cross-principal isolation (BLOCKER 2): a session binding
-        // authorizes only agent + workspace, never a principal owner, so a
-        // constrained principal must not be given a session it could later
-        // share by ID with another constrained principal.
-        self.refuse_constrained_principal_session(method, grants)?;
+        // The parent slice fail-closed a constrained principal out of every
+        // session because a binding authorized only agent + workspace, never a
+        // principal owner, so two constrained principals could share a session
+        // by ID and one's narrowing could shrink the other's Agent. This slice
+        // removes that precondition: sessions are now stamped with their owner
+        // on both the live and durable records, and resume, prompt,
+        // rehydration and approval binding are all predicated on owner match
+        // (see `resolve_session_record` / `authorize_session_owner` /
+        // `resume_existing`'s `expected_owner`). A constrained principal can no
+        // longer reach another's session by ID, so the outright refusal is
+        // lifted and the selector is composed into that principal's own,
+        // owner-isolated session.
         self.selector_session_agent_with_grants(method, grants, alias)?;
         self.confine_session_workspace_with_grants(method, grants, config, alias, workspace)
     }
@@ -3329,11 +3281,12 @@ impl RpcDispatcher {
         // not by the ones stamped on the connection before the wait.
         let grants = self.recheck_authority_after_admission(Method::SessionNew)?;
         if let Some(grants) = grants.as_ref() {
-            // Fail-closed cross-principal isolation (BLOCKER 2): refuse a
-            // constrained principal a session before any create-or-resume
-            // branch below, since neither branch establishes a principal
-            // owner on the live/durable record.
-            self.refuse_constrained_principal_session(Method::SessionNew, grants)?;
+            // The parent's outright refusal of a constrained principal here is
+            // lifted in this slice: `session/new` stamps the owner on the live
+            // and durable records below (failing closed if the stamp cannot be
+            // recorded), and every create-or-resume branch is owner-predicated,
+            // so neither branch can hand a constrained principal a session that
+            // another principal could reach by ID.
             self.selector_session_agent_with_grants(Method::SessionNew, grants, &req.agent_alias)?;
         }
 
@@ -5011,10 +4964,13 @@ impl RpcDispatcher {
         // effect. Direct unit handlers bind no connection and keep their
         // fixture semantics.
         if let Some(grants) = grants.as_ref() {
-            // The reused/rehydrated binding check above already refused a
-            // constrained principal (BLOCKER 2 fail-closed isolation), so any
-            // grants that reach here are admin or explicit-wildcard: there is
-            // no per-principal narrowing to leak across the shared Agent.
+            // Owner isolation (this slice) replaced the parent's blanket
+            // refusal of a constrained principal here: the session is stamped
+            // with its owner and every resume/rehydration is owner-predicated,
+            // so a constrained principal's grants can only ever re-narrow ITS
+            // OWN session's Agent, never a shared victim's. A prompt whose
+            // principal was narrowed since creation therefore executes under
+            // the narrowed ceiling, applied on the canonical handle here.
             let mut guard = agent.lock().await;
             self.apply_principal_grants_to_agent(grants, &mut guard);
         }
@@ -11764,12 +11720,18 @@ mod tests {
         let (ctx, chat_backend, _acp_store) = persistence_enforcement_ctx(config);
         let (provider, mut started_rx, _release_tx) = gated_provider();
         let sid = "s-prompt-persisted-narrow";
-        install_state_test_session_at(
+        // Owner isolation: the prompt's scoped principal (alice, uid 4242) must
+        // OWN the session to pass the owner gate and reach admission. A
+        // NULL-owner session would now be refused at resolution before the
+        // narrowing under test could ever fire. Stamp the durable+live owner so
+        // this test isolates the *narrowing* denial, not the owner check.
+        install_state_test_session_owned_at(
             &ctx.sessions,
             &chat_backend,
             sid,
             provider,
             None,
+            Some("user:alice"),
             &agent_workspace,
         )
         .await;
@@ -13845,17 +13807,20 @@ mod tests {
         );
     }
 
-    /// BLOCKER 2 fail-closed posture: a *constrained* principal (non-admin,
-    /// named/empty `allowed_tools`) is REFUSED a session outright rather than
-    /// handed a narrowed one. Live and durable session records carry no
-    /// principal owner and are keyed only by ID, so a narrowed session could
-    /// be resumed or rehydrated across principals; composing the narrowing
-    /// into the agent does not isolate one constrained principal from another.
-    /// Until owner stamping lands, the safe answer is to refuse. The narrowing
-    /// composition itself is proven at the unit level against an explicit
-    /// grant set (see the `apply_principal_grants_to_agent` regressions).
+    /// Owner isolation has landed: a *constrained* principal (non-admin,
+    /// named/empty `allowed_tools`) is now handed a narrowed, OWNER-STAMPED
+    /// session rather than refused outright. The parent slice fail-closed here
+    /// because live and durable records carried no owner and were keyed only
+    /// by ID, so a narrowed session could be resumed or rehydrated across
+    /// principals. This slice stamps the owner on both records and predicates
+    /// resume/prompt/rehydration/approval on owner match, so composing the
+    /// narrowing into the assembled agent no longer leaks across principals.
+    /// The session must therefore be created AND carry the creator's durable
+    /// owner. The narrowing composition itself is proven at the unit level
+    /// against an explicit grant set (see the `apply_principal_grants_to_agent`
+    /// regressions).
     #[tokio::test]
-    async fn constrained_principal_session_is_refused_until_owner_isolation_lands() {
+    async fn constrained_principal_session_is_owner_isolated_not_refused() {
         use zeroclaw_config::schema::{PermissionProfileConfig, UserConfig};
         let tmp = tempfile::TempDir::new().unwrap();
         let mut config = make_acp_test_config(&tmp);
@@ -13909,27 +13874,22 @@ mod tests {
                 "session_id": "narrowed-001",
             }))
             .await;
-        let denied = response.expect_err("a constrained principal must be refused a session");
-        assert_eq!(
-            denied.code,
-            zeroclaw_api::jsonrpc::error_codes::FORBIDDEN,
-            "{denied:?}"
-        );
+        response.expect("a constrained principal is now given an owner-isolated session");
         assert!(
-            sessions.get_agent("narrowed-001").await.is_none(),
-            "a refused session must not be installed"
+            sessions.get_agent("narrowed-001").await.is_some(),
+            "the owner-isolated narrowed session must be installed"
         );
     }
 
     /// The selector composes with the coarse `tools:execute` grant, never
     /// instead of it: a `["calculator"]` selector WITHOUT `tools:execute`
     /// yields an empty tool ceiling. `principal_tool_ceiling` reports that
-    /// empty ceiling at the unit level, and the session surface refuses the
-    /// constrained principal outright (BLOCKER 2 fail-closed): an empty
-    /// ceiling composed onto a shared, owner-less session would strip a
-    /// victim's tools just as a named one would.
+    /// empty ceiling at the unit level. With owner isolation landed, the
+    /// session surface no longer refuses the constrained principal: an empty
+    /// ceiling only shrinks the principal's OWN owner-stamped session, never a
+    /// shared victim's, so the narrowed session is created rather than denied.
     #[tokio::test]
-    async fn principal_without_tools_execute_is_refused_and_has_empty_ceiling() {
+    async fn principal_without_tools_execute_has_empty_ceiling_and_owned_session() {
         use zeroclaw_config::schema::{PermissionProfileConfig, UserConfig};
         let tmp = tempfile::TempDir::new().unwrap();
         let mut config = make_acp_test_config(&tmp);
@@ -14006,23 +13966,20 @@ mod tests {
         }
 
         // Even though the ceiling is merely empty (not a named subset), the
-        // constrained principal is refused a session: an empty ceiling still
-        // shrinks a shared, owner-less victim session to nothing.
+        // constrained principal is now GIVEN an owner-isolated session: an
+        // empty ceiling only strips its own owner-stamped session's tools, not
+        // a shared victim's, so owner isolation makes the narrowed session
+        // safe to hand back.
         let response = dispatcher
             .handle_session_new_for_test(&json!({
                 "agent_alias": "test-agent",
                 "session_id": "toolless-001",
             }))
             .await;
-        let denied = response.expect_err("a constrained principal must be refused a session");
-        assert_eq!(
-            denied.code,
-            zeroclaw_api::jsonrpc::error_codes::FORBIDDEN,
-            "{denied:?}"
-        );
+        response.expect("a constrained principal is now given an owner-isolated session");
         assert!(
-            sessions.get_agent("toolless-001").await.is_none(),
-            "a refused session must not be installed"
+            sessions.get_agent("toolless-001").await.is_some(),
+            "the owner-isolated session must be installed"
         );
     }
 
@@ -14098,13 +14055,22 @@ mod tests {
     }
 
     /// A prompt that queued while its principal was still unrestricted must
-    /// execute under the ceiling in force when it is admitted, not the one it
+    /// execute under the ceiling in force when it is ADMITTED, not the one it
     /// was admitted-behind. The principal is seeded unrestricted (so the
-    /// session and its prompt are permitted — a constrained principal is
-    /// refused outright, BLOCKER 2), a prompt is parked behind the session
-    /// queue, the principal is then narrowed to an empty selector, and on
-    /// release the post-admission ceiling prunes every tool BEFORE the turn
-    /// executes.
+    /// session and its first prompt are permitted), a prompt is parked behind
+    /// the session queue, the principal is then narrowed to an empty selector,
+    /// and on release the post-admission ceiling prunes every tool from the
+    /// session's OWN, owner-isolated Agent BEFORE the turn executes.
+    ///
+    /// Owner isolation (this slice) replaced the parent's blanket refusal of a
+    /// constrained principal: the queued prompt is no longer refused at the
+    /// reused-binding check. Instead it re-narrows the creator's own session —
+    /// there is no cross-principal victim to protect, because the record is
+    /// owner-stamped and every resume/rehydration is owner-predicated. The
+    /// proof of correctness is therefore that the Agent LOSES its tools (the
+    /// empty ceiling is composed in), while the turn is admitted past the auth
+    /// gate (it fails only afterward at the deliberately failing provider, with
+    /// a non-auth code — never FORBIDDEN/AUTH_REQUIRED).
     #[tokio::test]
     async fn principal_queued_prompt_after_resume_prunes_before_execution() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -14152,25 +14118,38 @@ mod tests {
             _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
         }
         // Narrow to an empty selector while the prompt is parked. This makes
-        // the principal constrained; the parked prompt must not execute the
-        // agent's tools once released.
+        // the principal constrained; the parked prompt must re-narrow the
+        // session's OWN agent (owner-isolated) on release, pruning every tool
+        // before the turn executes.
         refresh_test_principal(&dispatcher, &[], &["*"]);
         drop(queue_guard);
-        // The now-constrained principal is refused at the post-admission
-        // binding check, so the parked prompt fails closed rather than
-        // running any tool. A local provider double means no network is used.
+        // On release the prompt is ADMITTED past the auth gate (owner isolation
+        // no longer refuses a constrained principal its own session), narrows
+        // the agent to the empty ceiling, then fails at the deliberately
+        // failing provider with a non-auth code. A local provider double means
+        // no network is used.
         let result = tokio::time::timeout(std::time::Duration::from_secs(5), pending)
             .await
             .unwrap();
         assert!(
             result.is_err(),
-            "a prompt whose principal became constrained must be refused, not run: {result:?}"
+            "the failing provider makes the admitted turn error: {result:?}"
         );
-        // The refused turn never mutated the agent through a foreign ceiling.
+        if let Err(e) = &result {
+            assert!(
+                e.code != FORBIDDEN && e.code != AUTH_REQUIRED,
+                "the turn is admitted past auth and fails only at the provider, \
+                 not refused: {e:?}"
+            );
+        }
+        // The prompt executed under the post-admission empty ceiling: the
+        // session's own agent was re-narrowed, so its tools are gone. This is
+        // the owner-isolated re-narrowing that replaced the parent's refusal.
         let agent = original.lock().await;
         assert!(
-            agent.tool_names().contains(&"calculator"),
-            "a refused prompt must not narrow the session's agent"
+            !agent.tool_names().contains(&"calculator"),
+            "the queued prompt must execute under the narrowed (empty) ceiling, \
+             pruning the session's own tools"
         );
     }
 
@@ -14179,10 +14158,9 @@ mod tests {
     /// `refresh_from_config` shortcut.
     ///
     /// A principal is seeded unrestricted (wildcard tools + `tools:execute`) so
-    /// its session and first prompt are permitted — a constrained principal is
-    /// refused outright (BLOCKER 2). It is authorized to write its own
-    /// permission-profile subtree so it can drive a persisted `config/set`. The
-    /// flow:
+    /// its session and first prompt are permitted. It is authorized to write
+    /// its own permission-profile subtree so it can drive a persisted
+    /// `config/set`. The flow:
     ///
     /// 1. `session/new`, then an allowed control prompt is admitted.
     /// 2. The principal clears its own wildcard tool selector
@@ -14193,10 +14171,11 @@ mod tests {
     ///    nothing dangles; but with the wildcard gone the principal is no longer
     ///    tool-unrestricted (`principal_tool_ceiling` now returns `Some`), even
     ///    though the coarse `tools:execute` grant is still present.
-    /// 3. The next prompt on the *reused* session is refused fail-closed: the
-    ///    principal is now constrained, and the reused-binding check refuses it
-    ///    before the turn. The session's Agent is not mutated by the refused
-    ///    turn.
+    /// 3. The next prompt on the *reused* session is ADMITTED (owner isolation
+    ///    lifted the parent's blanket refusal) and re-narrows the session's OWN
+    ///    Agent to the now-empty ceiling before the turn executes: the persisted
+    ///    mutation reaches the reused prompt. The turn then fails only at the
+    ///    dead provider endpoint, with a non-auth code.
     ///
     /// This proves the persisted mutation — not merely an in-memory grant edit —
     /// reaches the queued/reused prompt, which the earlier queue test's
@@ -14206,7 +14185,7 @@ mod tests {
     /// addressable map-key section; the `allowed_tools` `Vec<String>` field is
     /// the real, macro-supported persisted-write surface that flips the ceiling.
     #[tokio::test]
-    async fn persisted_config_mutation_refuses_reused_session_prompt_fail_closed() {
+    async fn persisted_config_mutation_renarrows_reused_session_prompt_owner_isolated() {
         use zeroclaw_api::grants::{Resource, Verb};
 
         let tmp = tempfile::TempDir::new().unwrap();
@@ -14305,23 +14284,35 @@ mod tests {
             "the persisted mutation republished the authorization policy"
         );
 
-        // 3. The reused session's next prompt is refused fail-closed: the
-        // principal is now constrained (no wildcard selector, so the ceiling is
-        // `Some` even though `tools:execute` is still granted).
-        let refused = dispatcher
+        // 3. The reused session's next prompt is now ADMITTED, not refused:
+        // owner isolation replaced the parent's blanket refusal of a
+        // constrained principal. The principal is constrained (no wildcard
+        // selector, so the ceiling is `Some` even though `tools:execute` is
+        // still granted), so the prompt re-narrows its OWN owner-isolated
+        // session's Agent to the empty ceiling BEFORE execution, then fails at
+        // the dead provider endpoint with a non-auth code. The persisted
+        // mutation therefore reaches the reused prompt — proven by the Agent
+        // losing its tools, not by a refusal.
+        let reused = dispatcher
             .handle_session_prompt(
-                &json!({"session_id":"mutation-link","prompt":"must not run after revocation"}),
+                &json!({"session_id":"mutation-link","prompt":"runs under the narrowed ceiling"}),
             )
-            .await
-            .expect_err("a now-constrained principal must be refused on the reused session");
+            .await;
+        if let Err(e) = &reused {
+            assert!(
+                e.code != FORBIDDEN && e.code != AUTH_REQUIRED,
+                "owner isolation admits the constrained principal on its own \
+                 session; it must not be refused by authorization, got {e:?}"
+            );
+        }
+        // The persisted mutation reached the reused prompt: the ceiling flipped
+        // to `Some([])` and the session's own Agent was re-narrowed to empty
+        // before the turn ran. This is the owner-isolated re-narrowing that
+        // replaced the parent's refusal.
         assert!(
-            refused.code == FORBIDDEN || refused.code == AUTH_REQUIRED,
-            "expected a fail-closed refusal, got {refused:?}"
-        );
-        // The refused turn never narrowed or otherwise mutated the Agent.
-        assert!(
-            agent.lock().await.tool_names().contains(&"calculator"),
-            "a refused prompt must not mutate the reused session's agent"
+            !agent.lock().await.tool_names().contains(&"calculator"),
+            "the persisted allowed_tools clear must re-narrow the reused \
+             session's agent to the empty ceiling"
         );
     }
 
@@ -14369,28 +14360,32 @@ mod tests {
         assert!(rebuilt.lock().await.tool_names().contains(&"file_read"));
         assert!(sessions.remove(sid).await);
 
-        // Narrowing the principal makes it constrained: rehydration is now
-        // refused outright, since the durable row has no principal owner and a
-        // constrained ceiling could otherwise cross principals.
+        // Narrowing the principal makes it constrained. Owner isolation (this
+        // slice) stamps the durable row with the principal's owner and
+        // predicates rehydration on owner match, so the SAME principal
+        // rehydrating ITS OWN reaped session now succeeds and the narrowed
+        // ceiling is composed onto the rebuilt Agent, rather than being
+        // refused outright as the owner-less parent posture required.
         refresh_test_principal(&dispatcher, &["file_read"], &["*"]);
         let current = dispatcher.current_prompt_authority().unwrap();
-        let refused = current
+        let rebuilt = current
             .rehydrate_reaped_session(sid, current.stamped_grants())
-            .await;
-        assert!(
-            matches!(&refused, Err(e) if e.code == FORBIDDEN),
-            "a constrained principal must be refused rehydration: code={:?}",
-            refused.as_ref().err().map(|e| e.code)
-        );
-        assert!(sessions.get_agent(sid).await.is_none());
-
-        // A prompt from the constrained principal is likewise refused.
-        let denied = dispatcher
-            .handle_session_prompt(&json!({"session_id":sid,"prompt":"must not run"}))
             .await
-            .unwrap_err();
-        assert_eq!(denied.code, FORBIDDEN);
-        assert!(sessions.get_agent(sid).await.is_none());
+            .expect("a constrained principal rehydrates its own owner-stamped session")
+            .expect("the reaped session rehydrates for its owner");
+        {
+            let guard = rebuilt.lock().await;
+            let tools = guard.tool_names();
+            assert!(
+                tools.contains(&"file_read"),
+                "the narrowed ceiling keeps the selected tool: {tools:?}"
+            );
+            assert!(
+                !tools.contains(&"calculator"),
+                "the narrowed ceiling drops tools outside the selector: {tools:?}"
+            );
+        }
+        assert!(sessions.remove(sid).await);
 
         // Removed-agent rejection: entitlement gone (even with a wildcard tool
         // selector), so rehydration must not produce a session.
