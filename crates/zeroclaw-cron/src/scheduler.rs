@@ -4759,6 +4759,90 @@ mod tests {
         );
     }
 
+    /// A run aborted mid-hook stops the hook's work before its claim is free.
+    ///
+    /// This is the scheduler half of the cancellation contract: the hook's
+    /// process tree dies with the aborted run, and the job only becomes
+    /// claimable once it has, so no second run can overlap the first one's
+    /// surviving work. The hook forks, so `sleep 71` is a real descendant of
+    /// the hook's shell rather than the shell itself.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_run_aborted_mid_hook_stops_the_hook_before_the_job_is_free() {
+        fn hook_pids() -> Vec<u32> {
+            let out = std::process::Command::new("pgrep")
+                .args(["-f", "^sleep 71$"])
+                .output()
+                .expect("pgrep runs");
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .filter_map(|l| l.trim().parse().ok())
+                .collect()
+        }
+        fn running(pid: u32) -> bool {
+            let out = std::process::Command::new("ps")
+                .args(["-o", "stat=", "-p", &pid.to_string()])
+                .output()
+                .expect("ps runs");
+            let stat = String::from_utf8_lossy(&out.stdout);
+            !stat.trim().is_empty() && !stat.trim().starts_with('Z')
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        allow_gate_test_commands(&mut config);
+        let job = declarative_gated_job(&mut config, "reload-mid-hook", "sleep 71; sleep 1", 120);
+
+        let claimed = claim_due_jobs(&config, vec![job.clone()]);
+        assert_eq!(claimed.len(), 1);
+        let run = {
+            let config = config.clone();
+            ::zeroclaw_spawn::spawn!(async move {
+                process_due_jobs(
+                    &config,
+                    claimed,
+                    &unique_component("reload-mid-hook"),
+                    &None,
+                    test_agent_executor_arc(),
+                    test_health_reporter(),
+                )
+                .await;
+            })
+        };
+
+        let mut hook = Vec::new();
+        for _ in 0..100 {
+            hook = hook_pids();
+            if !hook.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(!hook.is_empty(), "the hook's helper must be running");
+        assert!(
+            claim_due_jobs(&config, vec![job.clone()]).is_empty(),
+            "the run holds the claim while its hook runs"
+        );
+
+        // A reload aborts the scheduler while the hook is running.
+        run.abort();
+        let _ = run.await;
+
+        // The job is free again, and nothing the hook started is still running.
+        let reclaimed = claim_due_jobs(&config, vec![job]);
+        assert_eq!(reclaimed.len(), 1, "the aborted run released its claim");
+        for _ in 0..100 {
+            if hook.iter().all(|pid| !running(*pid)) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(
+            hook.iter().all(|pid| !running(*pid)),
+            "the aborted hook's work must not survive to overlap the next run"
+        );
+    }
+
     /// Releasing a finished claim must not clear a newer claim on the same job.
     #[tokio::test]
     async fn a_stale_claim_release_does_not_clear_a_newer_claim() {

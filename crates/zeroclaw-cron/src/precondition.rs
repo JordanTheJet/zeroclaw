@@ -198,6 +198,12 @@ pub(crate) async fn evaluate(
     };
 
     let child_pid = child.id();
+    // From here until the hook's own process is reaped, dropping this future
+    // must take the whole tree with it. A daemon reload aborts the scheduler
+    // mid-hook, and `kill_on_drop` reaches only the shell, not what the shell
+    // started. The guard is disarmed once the process has been reaped, since
+    // after that its process group id may be reused.
+    let mut tree = ProcessTreeGuard::new(child_pid);
     let mut stdout_pipe = child.stdout.take();
     let mut stderr_pipe = child.stderr.take();
     let timeout = Duration::from_secs(hook.timeout_secs);
@@ -217,7 +223,10 @@ pub(crate) async fn evaluate(
 
     let ((stdout_bytes, stdout_capped), (stderr_bytes, stderr_capped), status) =
         match time::timeout(timeout, collect).await {
-            Ok((out, err, Ok(status))) => (out, err, status),
+            Ok((out, err, Ok(status))) => {
+                tree.disarm();
+                (out, err, status)
+            }
             Ok((_, _, Err(error))) => {
                 return PreconditionOutcome::Failed {
                     output: get_required_cli_string_with_args(
@@ -227,7 +236,7 @@ pub(crate) async fn evaluate(
                 };
             }
             Err(_) => {
-                terminate_process_tree(&mut child, child_pid).await;
+                terminate_process_tree(&mut child, &mut tree).await;
                 return PreconditionOutcome::Failed {
                     output: get_required_cli_string_with_args(
                         "cron-pre-hook-timed-out",
@@ -331,39 +340,84 @@ where
     (kept, discarded)
 }
 
-/// Kill a timed-out hook and everything it started, then reap it.
+/// Kills a hook's whole process tree if it is dropped while the hook may still
+/// be running.
 ///
-/// On unix the child was spawned into its own process group, so signalling the
-/// group reaches descendants that would otherwise outlive the timeout. Container
-/// runtimes are not covered: killing a `docker run` client does not stop the
-/// container it started.
-async fn terminate_process_tree(child: &mut tokio::process::Child, pid: Option<u32>) {
+/// Holding this for the life of the hook makes cleanup cancellation-safe: the
+/// timeout path kills the tree explicitly, and every other way the hook's
+/// future can end early, including a daemon reload aborting the scheduler,
+/// drops the guard instead. The kill is synchronous, so it has happened before
+/// anything that outlives the hook, such as the run's claim, is released.
+struct ProcessTreeGuard {
+    pid: Option<u32>,
+    armed: bool,
+}
+
+impl ProcessTreeGuard {
+    fn new(pid: Option<u32>) -> Self {
+        Self { pid, armed: true }
+    }
+
+    /// Kill the tree now and stop guarding it.
+    fn kill(&mut self) {
+        if self.armed {
+            kill_process_tree(self.pid);
+            self.armed = false;
+        }
+    }
+
+    /// Stop guarding a process that has already been reaped.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ProcessTreeGuard {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
+/// Signal a hook's shell and everything it started.
+///
+/// On unix the shell was spawned into its own process group, so signalling the
+/// group reaches descendants that would otherwise outlive it. Windows has no
+/// process groups here; `taskkill /T` walks the child tree, which is what
+/// `<shell> -c <command>` needs since the real work is a grandchild of the
+/// process we hold a handle to. Container runtimes are not covered: killing a
+/// `docker run` client does not stop the container it started, which is why
+/// hooks are refused under them.
+fn kill_process_tree(pid: Option<u32>) {
     #[cfg(unix)]
     if let Some(pid) = pid
         && let Ok(pgid) = libc::pid_t::try_from(pid)
     {
-        // SAFETY: `killpg` takes no pointers and the pgid is this child's own
-        // group, created by `process_group(0)` above.
+        // SAFETY: `killpg` takes no pointers, and the pgid is this child's own
+        // group, created by `process_group(0)` above. The guard stops calling
+        // this once the group leader has been reaped, so the id cannot have
+        // been reused.
         unsafe {
             libc::killpg(pgid, libc::SIGKILL);
         }
     }
-    // Windows has no process groups here; `taskkill /T` walks the child tree,
-    // which is what `<shell> -c <command>` needs since the real work is a
-    // grandchild of the process we hold a handle to.
     #[cfg(windows)]
     if let Some(pid) = pid {
-        let _ = tokio::process::Command::new("taskkill")
+        // Blocking, and so usable from `Drop`: it has to finish before the
+        // guard's owner releases anything the hook was holding.
+        let _ = std::process::Command::new("taskkill")
             .args(["/T", "/F", "/PID", &pid.to_string()])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .status()
-            .await;
+            .status();
     }
     #[cfg(not(any(unix, windows)))]
     let _ = pid;
+}
 
+/// Kill a timed-out hook and everything it started, then reap it.
+async fn terminate_process_tree(child: &mut tokio::process::Child, tree: &mut ProcessTreeGuard) {
+    tree.kill();
     let _ = child.start_kill();
     let _ = child.wait().await;
 }
@@ -400,6 +454,78 @@ fn truncate(output: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// Whether `pid` is still executing. An exited process that has not been
+    /// reaped yet is a zombie and does no more work, so it counts as stopped.
+    #[cfg(unix)]
+    fn process_is_running(pid: u32) -> bool {
+        let out = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .expect("ps runs");
+        let stat = String::from_utf8_lossy(&out.stdout);
+        let stat = stat.trim();
+        !stat.is_empty() && !stat.starts_with('Z')
+    }
+
+    #[cfg(unix)]
+    async fn wait_until(mut condition: impl FnMut() -> bool) -> bool {
+        for _ in 0..100 {
+            if condition() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        false
+    }
+
+    /// Dropping a hook's guard kills what the hook started, not just the hook.
+    ///
+    /// `kill_on_drop` reaches only the shell. A helper the hook backgrounded
+    /// kept running after the hook's future was dropped, which is what a
+    /// daemon reload does to an in-flight hook, so a new run could overlap
+    /// work the old one had started.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_a_hook_kills_the_processes_it_started() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pidfile = tmp.path().join("descendant.pid");
+        let mut process = tokio::process::Command::new("sh");
+        process
+            .arg("-c")
+            .arg(format!(
+                "sleep 30 & echo $! > '{}'; wait",
+                pidfile.display()
+            ))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .process_group(0);
+        let child = process.spawn().expect("the hook shell starts");
+        let tree = ProcessTreeGuard::new(child.id());
+
+        assert!(
+            wait_until(|| std::fs::read_to_string(&pidfile).is_ok_and(|p| !p.trim().is_empty()))
+                .await,
+            "the hook starts its helper"
+        );
+        let descendant: u32 = std::fs::read_to_string(&pidfile)
+            .unwrap()
+            .trim()
+            .parse()
+            .expect("a pid");
+        assert!(process_is_running(descendant), "the helper is running");
+
+        // The hook's future is dropped mid-run.
+        drop(tree);
+        drop(child);
+
+        assert!(
+            wait_until(|| !process_is_running(descendant)).await,
+            "the helper the hook started must not outlive it"
+        );
+    }
+
     use super::*;
     use zeroclaw_config::schema::{CronJobDecl, CronPreHookDecl};
 
