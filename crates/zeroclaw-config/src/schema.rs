@@ -14271,10 +14271,13 @@ pub struct PermissionProfileConfig {
     /// exact prop; `"*"` grants every path. Empty grants NO paths.
     pub config_write_paths: Vec<String>,
     /// Tool names holders may cause an agent to run. Empty grants NO
-    /// tools; broad access requires the explicit `"*"` entry. (Note this
-    /// differs from risk-profile `allowed_tools`, where empty means
-    /// unconstrained: permission profiles are deny-by-default. The
-    /// agent's own risk-profile policy still applies on top.)
+    /// tools; broad access requires the explicit `"*"` entry. This selector
+    /// composes with the coarse `tools = ["execute"]` grant, never replaces
+    /// it: without that grant the holder's sessions run tool-less whatever
+    /// is named here. (Note this differs from risk-profile `allowed_tools`,
+    /// where empty means unconstrained: permission profiles are
+    /// deny-by-default. The agent's own risk-profile policy still applies
+    /// on top.)
     pub allowed_tools: Vec<String>,
     /// Resource-class grants: for each resource kind, the verbs
     /// permitted. Resources: `system`, `sessions`, `memory`, `cron`,

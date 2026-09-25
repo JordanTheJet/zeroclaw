@@ -189,15 +189,47 @@ cron jobs, attachments, personality files, per-agent cost queries, and SOP
 authoring, `allowed_agents = ["*"]` covers only the agents the
 configuration defines, not any alias a request names.
 
-One current limitation is deliberate: per-tool selectors are not yet
-enforced inside agent sessions, so a principal whose `allowed_tools` is
-constrained (neither `admin` nor `"*"`) is **refused** `session/new`,
-`session/prompt`, `sops/run`, and `sops/decide` rather than silently
-under-enforced. Grant `allowed_tools = ["*"]` until the session-assembly
-change lands.
+Tool selectors compose by intersection at agent assembly, on top of the
+coarse grant: model-facing tool execution is `tools = ["execute"]`, and a
+principal without that grant receives a tool-less session whatever its
+`allowed_tools` names, including `"*"`. With the grant held, a session
+created by a constrained principal only receives the tools its
+`allowed_tools` names (an empty list yields a tool-less session), on top
+of whatever the agent's own risk profile allows. After a queued prompt is
+admitted, authorization is rechecked against the shared resolver, including
+credential expiry and revocation. The current principal selector narrows
+static tools, the deferred search registry, already-activated tools, and
+pinned MCP resource content (each pinned block is admitted under its
+`<server>__<uri>` name and is withdrawn from later prompts once the selector
+no longer names it); removed tools cannot be reactivated. Reused sessions
+are narrowed before their next turn, and rehydrated sessions are rebuilt
+under current grants. Agent selectors are checked before a turn and before
+rehydration.
 
-That refusal does not cover every route to an agent's tools. Cron jobs and
-SOP authoring check only the agent selector. A constrained principal
+Narrowing never adds tools back to an existing agent. After expanding grants,
+create a new session to receive the expanded surface. No new config snapshot
+or independent principal-policy cache is stored in the agent.
+
+Deferred MCP instructions are derived from the remaining loadable tools and
+shown only when `tool_search` is exposed. A principal needs both `tool_search`
+and the named deferred MCP tool for on-demand activation; the helper is never
+implicitly granted. Permitted `mode = "always"` MCP tools are preactivated and
+remain callable without the helper.
+
+If either the principal's tool selector or agent selector is constrained,
+`delegate` (bounded and independent), `spawn_subagent`, and `execute_pipeline`
+are unavailable, including skill aliases wrapping those tools. These nested
+paths do not yet carry both current principal ceilings; the ordinary parent
+turn remains usable. Admin principals and principals with both selectors set
+to `"*"` keep their agent's configured nested capabilities.
+
+The existing eight-argument Rust `Agent::from_live_config_with_tui_env`
+constructor remains available. RPC uses the additive
+`from_live_config_with_tui_env_and_principal_tools` constructor and reapplies
+the shared resolver's grants at prompt admission.
+
+That composition does not cover every route to an agent's tools. Cron jobs
+and SOP authoring check only the agent selector. A constrained principal
 holding cron grants can create a shell job for its agent, or give an
 existing agent job a new prompt and trigger it, and one holding SOP create
 or update grants can save a procedure whose trigger runs it later. Treat
@@ -282,22 +314,31 @@ An OIDC access token works the same way with `auth_provider = "oidc.<alias>"`.
   preserves the TUI's registry identity and grants **no** authority. Every
   `initialize` re-presents a credential.
 
+## Session isolation
+
+Every session a scoped principal creates is stamped with that principal's
+id in the live store and on disk (chat backend and ACP store). Scoped
+principals see and touch only their own sessions: listings are filtered,
+reads and mutations get one uniform not-found-or-not-owned denial (no
+existence probing), destructive deletes run as owner-predicated storage
+statements, and in-flight approvals resolve only for the owner of the
+session they were raised for. Sessions created before this change (or by
+unscoped connections) carry no owner: they stay fully visible to unscoped
+connections and invisible to scoped principals.
+
+Memory operations are fail-closed for scoped principals in the interim:
+queries must be scoped to an owned session, and bare-key or cross-session
+memory access stays unscoped-only until principal-owned memory storage
+lands.
+
 ## What this layer does not do (yet)
 
-Session and memory records are not yet principal-owned; that storage
-boundary is its own tracked change. Until it lands, the session methods
-other than `session/new` and `session/prompt` do not check which agent a
-session belongs to. `session/close`, `session/kill`, `session/configure`,
-`session/approve`, `session/messages`, `session/state`, `session/delete`,
-and `session/git_branch` act on any session id or pending approval that a
-principal holding the method's grant names, and `session/list` and
-`session/list-acp` list every session. `session/cancel` also compares the
-caller's TUI registration with the session's. Memory methods are not
-scoped by principal or agent either. `sops/runs` and `sops/run-detail`
-return the run history of every procedure to a principal holding
-`Sops:Read`, whichever agents it ran as, unlike cron history. Gateway HTTP
-routes keep their existing pairing checks, and channel identities do not
-resolve into this principal model.
+Memory records are not yet principal-owned at the storage layer (scoped
+access is fail-closed instead, as above). `sops/runs` and
+`sops/run-detail` return the run history of every procedure to a principal
+holding `Sops:Read`, whichever agents it ran as, unlike cron history.
+Gateway HTTP routes keep their existing pairing checks, and channel
+identities do not resolve into this principal model.
 
 While `security.trust_daemon_uid = true` (the default) and the policy
 compiles, the daemon's own uid on a Unix socket keeps full access, so a

@@ -189,6 +189,10 @@ pub struct ArcToolRef(pub Arc<dyn Tool>);
 
 #[async_trait]
 impl Tool for ArcToolRef {
+    fn requires_unrestricted_principal(&self) -> bool {
+        self.0.requires_unrestricted_principal()
+    }
+
     fn name(&self) -> &str {
         self.0.name()
     }
@@ -293,6 +297,10 @@ impl ::zeroclaw_api::attribution::Attributable for ArcDelegatingTool {
 
 #[async_trait]
 impl Tool for ArcDelegatingTool {
+    fn requires_unrestricted_principal(&self) -> bool {
+        self.inner.requires_unrestricted_principal()
+    }
+
     fn name(&self) -> &str {
         self.inner.name()
     }
