@@ -2999,6 +2999,39 @@ async fn run_quickstart_cli(
                     )
                 );
             }
+            LivenessOutcome::ModelRejected {
+                provider_ref,
+                model,
+                detail,
+            } => {
+                eprintln!();
+                eprintln!(
+                    "{}",
+                    ta(
+                        "cli-quickstart-liveness-model",
+                        &[
+                            ("provider", &provider_ref),
+                            ("model", &model),
+                            ("detail", &detail),
+                        ],
+                        "The provider does not serve the chosen model."
+                    )
+                );
+                eprintln!(
+                    "{}",
+                    t(
+                        "cli-agent-not-created",
+                        "Your agent was not created — and nothing on disk was changed."
+                    )
+                );
+                anyhow::bail!(
+                    "{}",
+                    t(
+                        "cli-quickstart-liveness-model-abort",
+                        "Check the model id and run quickstart again, or pass --no-verify to skip this check."
+                    )
+                );
+            }
             LivenessOutcome::Unreachable {
                 provider_ref,
                 detail,

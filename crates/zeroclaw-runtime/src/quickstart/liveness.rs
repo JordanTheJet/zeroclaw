@@ -9,11 +9,13 @@
 //!
 //! ## Where this runs — and deliberately does not
 //!
-//! The probe stages the submission onto a **clone** of the live config (the
-//! same staging [`super::validate_only`] uses) and sends one minimal chat
-//! round-trip against the staged provider entry. Nothing is persisted and
-//! the live config is never touched, so a refused probe leaves the instance
-//! byte-identical.
+//! The probe stages the submission onto a **clone** of the live config and
+//! sends one minimal chat round-trip against the staged provider entry.
+//! Staging runs in probe-only mode: it skips personality-file staging, which
+//! would create the agent workspace, and the best-effort context-window
+//! lookup, which is a second network request. Nothing is persisted, nothing
+//! is written to disk, and the chat round-trip is the only network call, so
+//! a refused probe leaves the instance byte-identical.
 //!
 //! Interactive surfaces call it between collecting the submission and
 //! calling [`super::apply_with_surface`]. It is **not** wired inside the
@@ -28,6 +30,10 @@
 //! - [`LivenessOutcome::AuthOrAccess`] is a *hard* signal: the provider
 //!   itself refused the credential or access, so the config as submitted
 //!   cannot work. Callers should not persist.
+//! - [`LivenessOutcome::ModelRejected`] is also *hard*: the provider says the
+//!   model does not exist, or the endpoint returned 404. Callers should not
+//!   persist. Other client errors stay soft, because the probe's own request
+//!   parameters can draw a 400 from a model that works.
 //! - [`LivenessOutcome::Unreachable`] is a *soft* signal: the endpoint may
 //!   be down, local-only, or the machine offline. Callers should warn and
 //!   let the user decide.
@@ -71,8 +77,17 @@ pub enum LivenessOutcome {
         model: String,
         detail: String,
     },
+    /// The provider answered, but the model does not exist there: a
+    /// model-not-found error or a 404 from the endpoint. Persisting this
+    /// submission would persist a broken config.
+    ModelRejected {
+        provider_ref: String,
+        model: String,
+        detail: String,
+    },
     /// The provider could not be reached, or failed in a way that does not
-    /// prove the credential wrong (DNS, refused connection, timeout, 5xx).
+    /// prove the config wrong (DNS, refused connection, timeout, 5xx, or a
+    /// client error that does not name the model).
     Unreachable {
         provider_ref: String,
         model: String,
@@ -92,9 +107,9 @@ pub async fn probe_staged_model_liveness(
     surface: Surface,
     timeout: Duration,
 ) -> LivenessOutcome {
-    // Stage exactly like `validate_only`: onto a clone, with staged
-    // personality tempfiles dropping uncommitted at scope exit.
-    let ctx = RunCtx::new(surface);
+    // Stage onto a clone in probe-only mode: no personality files are staged
+    // and no context-window lookup runs, so nothing touches disk.
+    let ctx = RunCtx::for_probe(surface);
     let mut staged = config.clone();
     let mut staged_files = Vec::new();
     let mut errors = Vec::new();
@@ -190,20 +205,43 @@ fn sanitized_error_chain(err: &anyhow::Error) -> String {
     zeroclaw_providers::sanitize_api_error(&format_error_chain(err))
 }
 
+/// True when a probe error says the model itself is not available: a 404
+/// from the provider's API, or a model-not-found message. Deliberately
+/// narrow. A generic 400 or 422 is not included, because the probe's own
+/// request parameters can draw one from a model that works, and a false
+/// hard stop would lock the user out of setup.
+fn is_model_rejection(detail: &str) -> bool {
+    let lower = detail.to_lowercase();
+    lower.contains("api error (404")
+        || lower.contains("model_not_found")
+        || lower.contains("model not found")
+        || lower.contains("no such model")
+        || lower.contains("unknown model")
+        || (lower.contains("model") && lower.contains("does not exist"))
+}
+
 /// Map a chat probe failure onto the outcome contract. Separated so the
-/// auth-vs-transient split — the part that decides whether persist is
-/// blocked — is unit-testable without a network.
+/// hard-versus-soft split, which decides whether persist is blocked, is
+/// unit-testable without a network.
 fn outcome_for_probe_error(provider_ref: &str, model: &str, detail: &str) -> LivenessOutcome {
-    match classify_model_probe_error(detail) {
+    let provider_ref = provider_ref.to_string();
+    let model = model.to_string();
+    let detail = detail.to_string();
+    match classify_model_probe_error(&detail) {
         ModelProbeOutcome::AuthOrAccess => LivenessOutcome::AuthOrAccess {
-            provider_ref: provider_ref.to_string(),
-            model: model.to_string(),
-            detail: detail.to_string(),
+            provider_ref,
+            model,
+            detail,
+        },
+        _ if is_model_rejection(&detail) => LivenessOutcome::ModelRejected {
+            provider_ref,
+            model,
+            detail,
         },
         _ => LivenessOutcome::Unreachable {
-            provider_ref: provider_ref.to_string(),
-            model: model.to_string(),
-            detail: detail.to_string(),
+            provider_ref,
+            model,
+            detail,
         },
     }
 }
@@ -294,8 +332,9 @@ mod tests {
 
     #[test]
     fn only_auth_shaped_errors_block_a_persist() {
-        // The load-bearing split: a credential/access refusal is the only
-        // outcome that stops a persist; everything unproven stays a warning.
+        // The load-bearing split: a credential/access refusal stops a
+        // persist; transport and server failures stay a warning. Model
+        // rejection, the other hard stop, is covered separately below.
         let auth = outcome_for_probe_error(
             "anthropic.default",
             "m",
@@ -321,6 +360,47 @@ mod tests {
         assert!(
             matches!(server_error, LivenessOutcome::Unreachable { .. }),
             "got {server_error:?}"
+        );
+    }
+
+    #[test]
+    fn a_missing_model_blocks_a_persist() {
+        // A mistyped model id is the other config that cannot work: the
+        // provider answers, but says the model is not there.
+        let not_found = outcome_for_probe_error(
+            "openai.default",
+            "gpt-typo",
+            "openai API error (404 Not Found): The model `gpt-typo` does not exist",
+        );
+        assert!(
+            matches!(not_found, LivenessOutcome::ModelRejected { .. }),
+            "got {not_found:?}"
+        );
+
+        let coded = outcome_for_probe_error(
+            "custom.gateway",
+            "m",
+            "custom API error (400 Bad Request): {\"error\":{\"code\":\"model_not_found\"}}",
+        );
+        assert!(
+            matches!(coded, LivenessOutcome::ModelRejected { .. }),
+            "got {coded:?}"
+        );
+    }
+
+    #[test]
+    fn a_client_error_that_does_not_name_the_model_stays_soft() {
+        // The probe's own parameters can draw a 400 from a model that works
+        // (some models reject an explicit temperature). A hard stop here
+        // would lock the user out of setup for a config that is fine.
+        let param = outcome_for_probe_error(
+            "openai.default",
+            "o-series",
+            "openai API error (400 Bad Request): Unsupported parameter: 'temperature'",
+        );
+        assert!(
+            matches!(param, LivenessOutcome::Unreachable { .. }),
+            "got {param:?}"
         );
     }
 }
