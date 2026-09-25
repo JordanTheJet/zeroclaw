@@ -14145,6 +14145,7 @@ dependencies = [
  "clap",
  "directories",
  "hex",
+ "hmac 0.12.1",
  "hostname",
  "libc",
  "parking_lot",
@@ -14420,6 +14421,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "base64 0.22.1",
+ "futures-util",
  "http-body-util",
  "hyper",
  "jsonschema",
@@ -14434,6 +14436,7 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "tokio-rustls",
+ "tokio-tungstenite 0.29.0",
  "toml 1.1.2+spec-1.1.0",
  "toml_edit 0.25.12+spec-1.1.0",
  "wasmtime",
@@ -14445,6 +14448,7 @@ dependencies = [
  "zeroclaw-infra",
  "zeroclaw-log",
  "zeroclaw-spawn",
+ "zeroize",
 ]
 
 [[package]]
@@ -14675,11 +14679,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "zeroclaw-tool-socket-plugin-fixture"
+version = "0.0.0"
+dependencies = [
+ "serde_json",
+ "wit-bindgen 0.51.0",
+]
+
+[[package]]
 name = "zeroclaw-tool-timeout-fixture"
 version = "0.0.0"
 dependencies = [
  "serde_json",
  "waki",
+ "wit-bindgen 0.51.0",
+]
+
+[[package]]
+name = "zeroclaw-tool-websocket-plugin-fixture"
+version = "0.0.0"
+dependencies = [
+ "serde_json",
  "wit-bindgen 0.51.0",
 ]
 

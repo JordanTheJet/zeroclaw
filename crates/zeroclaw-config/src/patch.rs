@@ -193,7 +193,22 @@ pub fn reject_masked_secret_value(
     Ok(())
 }
 
-/// Apply ops to `config` **in memory**. Nothing is written to disk.
+/// Which keyed sections a patch may create an entry in as a side effect of
+/// setting a field under it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyCreation {
+    /// Map sections only. The remote and model-driven writers use this: the
+    /// gateway's `PATCH /api/config` and the agent-facing `config_patch` tool.
+    MapOnly,
+    /// Map sections and keyed list sections. Only the local
+    /// `zeroclaw config patch` command uses this; see
+    /// [`Config::ensure_map_or_list_key_for_path`] for why that adds no
+    /// authority there and must not reach the remote writers.
+    MapOrList,
+}
+
+/// Apply ops to `config` **in memory** with [`KeyCreation::MapOnly`]. Nothing
+/// is written to disk.
 ///
 /// All-or-nothing from the caller's perspective only if the caller discards
 /// `config` on error: ops before a failing one have already mutated it. Every
@@ -203,11 +218,25 @@ pub fn apply_patch_ops(
     config: &mut Config,
     ops: &[PatchOp],
 ) -> Result<Vec<PatchOpResult>, ConfigApiError> {
+    apply_patch_ops_with(config, ops, KeyCreation::MapOnly)
+}
+
+/// [`apply_patch_ops`] with an explicit [`KeyCreation`] policy.
+pub fn apply_patch_ops_with(
+    config: &mut Config,
+    ops: &[PatchOp],
+    keys: KeyCreation,
+) -> Result<Vec<PatchOpResult>, ConfigApiError> {
     let mut results = Vec::with_capacity(ops.len());
 
     for (idx, op) in ops.iter().enumerate() {
         let path = json_pointer_to_dotted(&op.path);
-        if matches!(op.op.as_str(), "add" | "replace") && config.ensure_map_key_for_path(&path) {
+        let refused_reserved_key = matches!(op.op.as_str(), "add" | "replace")
+            && match keys {
+                KeyCreation::MapOnly => config.ensure_map_key_for_path(&path),
+                KeyCreation::MapOrList => config.ensure_map_or_list_key_for_path(&path),
+            };
+        if refused_reserved_key {
             // Refused to vivify the reserved `default` agent: surface the same
             // reserved error the explicit create surfaces do, not a generic 404.
             return Err(ConfigApiError::new(
