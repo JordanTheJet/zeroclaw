@@ -6962,6 +6962,7 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                     let sop_adapters = build_sop_adapters(&current_config);
                     let (engine, audit) = zeroclaw_runtime::sop::build_sop_engine(
                         current_config.sop.clone(),
+                        &current_config.decision_models,
                         &current_config.data_dir,
                         &current_config.install_root_dir(),
                         mem,
@@ -8437,6 +8438,7 @@ Add pricing to the active provider profile or supply a catalog entry."
                     let sop_adapters = build_sop_adapters(&config);
                     let (engine, audit) = zeroclaw_runtime::sop::build_sop_engine(
                         config.sop.clone(),
+                        &config.decision_models,
                         &config.data_dir,
                         &config.install_root_dir(),
                         mem,
@@ -8520,7 +8522,8 @@ Add pricing to the active provider profile or supply a catalog entry."
             // engine). List/Validate/Show stay local + synchronous.
             cmd @ (SopCommands::Approve { .. }
             | SopCommands::Deny { .. }
-            | SopCommands::Pending) => sop_admin_dispatch(cmd, &config).await,
+            | SopCommands::Pending
+            | SopCommands::Logs { .. }) => sop_admin_dispatch(cmd, &config).await,
             other => sop::handle_command(other, &config),
         },
 
@@ -10140,6 +10143,119 @@ async fn sop_admin_request(cmd: SopCommands, config: &crate::config::Config) -> 
             }
             Ok(())
         }
+        SopCommands::Logs {
+            run_id,
+            limit,
+            json,
+        } => {
+            let url = gateway_admin_url(&host, port, prefix, "/admin/sop/logs");
+            let resp = client
+                .get(&url)
+                .query(&[("run_id", run_id.as_str()), ("limit", &limit.to_string())])
+                .timeout(std::time::Duration::from_secs(5))
+                .send()
+                .await
+                .map_err(|e| anyhow::Error::msg(format!("Failed to connect to gateway: {e}")))?;
+            let status = resp.status();
+            let body: serde_json::Value = resp.json().await.unwrap_or_default();
+            if !status.is_success() {
+                let err = body
+                    .get("error")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("request failed");
+                anyhow::bail!("Gateway responded {status}: {err}");
+            }
+            if json {
+                println!("{}", serde_json::to_string_pretty(&body)?);
+                return Ok(());
+            }
+
+            if body
+                .get("persistence_enabled")
+                .and_then(|value| value.as_bool())
+                == Some(false)
+            {
+                println!(
+                    "{}",
+                    t("cli-sop-logs-disabled", "Log persistence is not enabled.")
+                );
+                return Ok(());
+            }
+
+            let events = body
+                .get("events")
+                .and_then(|value| value.as_array())
+                .cloned()
+                .unwrap_or_default();
+            if events.is_empty() {
+                println!(
+                    "{}",
+                    ta(
+                        "cli-sop-logs-none",
+                        &[("run_id", run_id.as_str())],
+                        "No persisted logs found for this SOP run."
+                    )
+                );
+                return Ok(());
+            }
+            println!(
+                "{}",
+                ta(
+                    "cli-sop-logs-header",
+                    &[("run_id", run_id.as_str())],
+                    "SOP run logs:"
+                )
+            );
+            for event in events.iter().rev() {
+                let timestamp = event
+                    .get("@timestamp")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("?");
+                let severity = event
+                    .get("severity_text")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("?");
+                let category = event
+                    .pointer("/event/category")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("?");
+                let action = event
+                    .pointer("/event/action")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("?");
+                let message = event
+                    .get("message")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("");
+                println!(
+                    "{}",
+                    ta(
+                        "cli-sop-logs-row",
+                        &[
+                            ("timestamp", timestamp),
+                            ("severity", severity),
+                            ("category", category),
+                            ("action", action),
+                            ("message", message),
+                        ],
+                        "  (log event)",
+                    )
+                );
+            }
+            // A retained segment the daemon could not read was left out, so the
+            // rows above are not the run's full history. Say so instead of
+            // presenting a partial timeline as complete.
+            if body.get("incomplete").and_then(|value| value.as_bool()) == Some(true) {
+                println!(
+                    "{}",
+                    t(
+                        "cli-sop-logs-incomplete",
+                        "Some retained log segments could not be read; this history may be incomplete."
+                    )
+                );
+            }
+            Ok(())
+        }
         SopCommands::Approve { run_id } => {
             let url = gateway_admin_url(&host, port, prefix, "/admin/sop/approve");
             sop_admin_post(&client, &url, serde_json::json!({ "run_id": run_id })).await
@@ -10153,7 +10269,7 @@ async fn sop_admin_request(cmd: SopCommands, config: &crate::config::Config) -> 
             )
             .await
         }
-        // List/Validate/Show are dispatched on the local synchronous path.
+        // List/Validate/Show/Graph/Delete are dispatched on the local path.
         _ => anyhow::bail!("local SOP verb reached the gateway dispatch path"),
     }
 }
@@ -11244,6 +11360,7 @@ fn build_sop_adapters(config: &Config) -> zeroclaw_runtime::sop::SopEngineAdapte
         route: Some(route),
         forge,
         llm,
+        decision: std::collections::HashMap::default(),
     }
 }
 
@@ -13366,6 +13483,30 @@ mod tests {
     }
 
     #[test]
+    fn sop_logs_cli_parses_run_limit_and_json_output() {
+        let cli = Cli::try_parse_from([
+            "zeroclaw",
+            "sop",
+            "logs",
+            "run-123-0001",
+            "--limit",
+            "42",
+            "--json",
+        ])
+        .expect("sop logs command should parse");
+        assert!(matches!(
+            cli.command,
+            Commands::Sop {
+                sop_command: SopCommands::Logs {
+                    run_id,
+                    limit: 42,
+                    json: true,
+                }
+            } if run_id == "run-123-0001"
+        ));
+    }
+
+    #[test]
     #[cfg(feature = "agent-runtime")]
     fn openrc_log_writer_cli_maps_only_known_streams() {
         for (value, expected) in [
@@ -15257,6 +15398,7 @@ mod tests {
             admission_policy: zeroclaw_runtime::sop::types::SopAdmissionPolicy::Parallel,
             max_pending_approvals: 0,
             agent: None,
+            decision: None,
         }
     }
 
@@ -15559,6 +15701,7 @@ mod tests {
             admission_policy: zeroclaw_runtime::sop::types::SopAdmissionPolicy::Parallel,
             max_pending_approvals: 0,
             agent: owner.map(str::to_string),
+            decision: None,
         }]);
         let engine = Arc::new(Mutex::new(engine));
 
@@ -15790,6 +15933,7 @@ mod tests {
                 admission_policy: zeroclaw_runtime::sop::types::SopAdmissionPolicy::Parallel,
                 max_pending_approvals: 0,
                 agent: Some(CRON_SOP_AGENT.to_string()),
+                decision: None,
             }]);
         }
 
@@ -15899,6 +16043,7 @@ mod tests {
                 admission_policy: zeroclaw_runtime::sop::types::SopAdmissionPolicy::Parallel,
                 max_pending_approvals: 0,
                 agent: Some(CRON_SOP_AGENT.to_string()),
+                decision: None,
             }]);
         }
 
@@ -17303,6 +17448,7 @@ type = "string"
             )]),
             egress_hosts: hosts.iter().map(|h| (*h).to_string()).collect(),
             egress_allow_private: Vec::new(),
+            tls_profiles: Vec::new(),
         }
     }
 
@@ -17415,6 +17561,7 @@ type = "string"
             config: std::collections::HashMap::new(),
             egress_hosts: vec!["api.example.com".to_string()],
             egress_allow_private: Vec::new(),
+            tls_profiles: Vec::new(),
         }];
 
         let lines = egress_grant_gap_lines(&config, &manifest).expect("gap lines must build");
@@ -17810,6 +17957,7 @@ type = "string"
             config: std::collections::HashMap::new(),
             egress_hosts: vec![" api.example.com ".to_string(), String::new()],
             egress_allow_private: Vec::new(),
+            tls_profiles: Vec::new(),
         }];
         assert!(
             !runtime_accepts_row(&config, &instance_key),
@@ -17871,6 +18019,7 @@ type = "string"
             config: std::collections::HashMap::new(),
             egress_hosts: vec!["api.example.com".to_string(), "10.0.0.5".to_string()],
             egress_allow_private: vec!["10.0.0.5".to_string()],
+            tls_profiles: Vec::new(),
         }];
 
         let install = existing_egress_grant_lines(&config, "weather-tool", &instance_key, &[]);
@@ -17920,6 +18069,7 @@ type = "string"
             config: std::collections::HashMap::new(),
             egress_hosts: vec!["api.example.com".to_string()],
             egress_allow_private: Vec::new(),
+            tls_profiles: Vec::new(),
         }];
         config.security.nat64_prefixes = vec!["2001:db8::/97".to_string()];
         assert!(
@@ -17988,6 +18138,7 @@ type = "string"
             config: std::collections::HashMap::new(),
             egress_hosts: vec!["api.example.com".to_string()],
             egress_allow_private: vec!["other.example.com".to_string()],
+            tls_profiles: Vec::new(),
         }];
         assert!(
             !runtime_accepts_row(&config, &instance_key),
@@ -18041,6 +18192,7 @@ type = "string"
             config: std::collections::HashMap::new(),
             egress_hosts: vec!["*.com".to_string()],
             egress_allow_private: Vec::new(),
+            tls_profiles: Vec::new(),
         }];
         assert!(
             !runtime_accepts_row(&config, &instance_key),
@@ -18729,6 +18881,7 @@ hosts = ["api.example.com", "api2.example.com"]
             config: std::collections::HashMap::new(),
             egress_hosts: hosts.iter().map(|h| (*h).to_string()).collect(),
             egress_allow_private: Vec::new(),
+            tls_profiles: Vec::new(),
         };
 
         let dir_a = tempfile::tempdir().expect("profile a");

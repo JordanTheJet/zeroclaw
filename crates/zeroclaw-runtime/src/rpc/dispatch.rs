@@ -7229,6 +7229,10 @@ impl RpcDispatcher {
             return Err(rpc_err(INTERNAL_ERROR, "Log persistence is not enabled"));
         };
 
+        let field_eq = p
+            .sop_run_id
+            .map(|run_id| std::collections::BTreeMap::from([("sop_run_id".into(), run_id)]))
+            .unwrap_or_default();
         let filter = zeroclaw_log::LogFilter {
             since_ts: p.since_ts,
             until_ts: p.until_ts,
@@ -7241,7 +7245,7 @@ impl RpcDispatcher {
             trace_id: p.trace_id,
             q: p.q,
             hide_internal: p.hide_internal,
-            field_eq: std::collections::BTreeMap::new(),
+            field_eq,
         };
 
         let limit = p.limit.unwrap_or(200);
@@ -7633,6 +7637,21 @@ impl RpcDispatcher {
             .map(str::trim)
             .filter(|p| !p.is_empty())
             .map(str::to_string);
+        let dedup_key = req
+            .dedup_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|key| !key.is_empty());
+        if dedup_key.is_some_and(|key| key.len() > crate::sop::dispatch::MAX_ACTIVE_DEDUP_KEY_BYTES)
+        {
+            return Err(rpc_err(
+                INVALID_PARAMS,
+                format!(
+                    "dedup_key exceeds {} bytes",
+                    crate::sop::dispatch::MAX_ACTIVE_DEDUP_KEY_BYTES
+                ),
+            ));
+        }
 
         let event = crate::sop::SopEvent {
             source: crate::sop::SopTriggerSource::Manual,
@@ -7641,13 +7660,64 @@ impl RpcDispatcher {
             timestamp: crate::sop::engine::now_iso8601(),
         };
 
-        let results =
-            crate::sop::dispatch::dispatch_sop_event_to(engine, audit, event, &req.name).await;
+        let results = if let Some(dedup_key) = dedup_key {
+            crate::sop::dispatch::dispatch_sop_event_to_deduplicated(
+                engine, audit, event, &req.name, dedup_key,
+            )
+            .await
+        } else {
+            crate::sop::dispatch::dispatch_sop_event_to(engine, audit, event, &req.name).await
+        };
         crate::sop::dispatch::process_headless_results(&results);
 
         for result in &results {
             match result {
-                crate::sop::dispatch::DispatchResult::Started { run_id, .. } => {
+                crate::sop::dispatch::DispatchResult::Started { run_id, action, .. } => {
+                    let needs_driver = matches!(
+                        action.as_ref(),
+                        crate::sop::SopRunAction::ExecuteStep { .. }
+                            | crate::sop::SopRunAction::DeterministicStep { .. }
+                    );
+                    if needs_driver {
+                        // Drive the run this call started, exactly as the gateway
+                        // start path does: admitted into the daemon generation's
+                        // driver set, so a reload drains it, and refused (with the
+                        // run settled) if that generation has already drained.
+                        // Only a context with no generation, a one-shot caller,
+                        // detaches a driver instead.
+                        let config = self.ctx.config.read().clone();
+                        let driven = match self.ctx.sop_driver_handles.as_ref() {
+                            Some(handles) => crate::sop::spawn_and_register_sop_driver(
+                                handles,
+                                config,
+                                Arc::clone(engine),
+                                Some(Arc::clone(audit)),
+                                action.as_ref().clone(),
+                            ),
+                            None => {
+                                drop(crate::sop::spawn_headless_run_driver(
+                                    config,
+                                    Arc::clone(engine),
+                                    Some(Arc::clone(audit)),
+                                    action.as_ref().clone(),
+                                ));
+                                true
+                            }
+                        };
+                        // A shared producer key must only ever name a run that
+                        // something is advancing. If the driver was refused,
+                        // nothing will advance this run, and leaving the key
+                        // pointing at it would let the next Git or
+                        // reconciliation producer coalesce onto it instead of
+                        // doing the work. Withdraw the key in that case only.
+                        if !driven && dedup_key.is_some() {
+                            let mut guard = match engine.lock() {
+                                Ok(guard) => guard,
+                                Err(poisoned) => poisoned.into_inner(),
+                            };
+                            guard.forget_active_dispatch_dedup_for_run(run_id);
+                        }
+                    }
                     return to_result(SopRunResponse {
                         run_id: run_id.clone(),
                     });
@@ -8929,6 +8999,7 @@ mod tests {
             admission_policy: SopAdmissionPolicy::Parallel,
             max_pending_approvals: 0,
             agent: None,
+            decision: None,
         }]);
         let action = engine
             .start_run(
@@ -9018,6 +9089,7 @@ mod tests {
             revision: 0,
             revision_base: 0,
             initiating_agent: None,
+            decided_mode: None,
         };
         let pr = PersistedRun::new(
             run.clone(),
@@ -9100,6 +9172,7 @@ mod tests {
             admission_policy: SopAdmissionPolicy::Parallel,
             max_pending_approvals: 0,
             agent: None,
+            decision: None,
         }]);
         let action = engine
             .start_run(
@@ -11870,6 +11943,7 @@ mod tests {
             agent: Some(agent.to_string()),
             admission_policy: crate::sop::types::SopAdmissionPolicy::Parallel,
             max_pending_approvals: 0,
+            decision: None,
         }
     }
 
@@ -14066,6 +14140,7 @@ mod tests {
             admission_policy: crate::sop::types::SopAdmissionPolicy::Parallel,
             max_pending_approvals: 0,
             agent: None,
+            decision: None,
         }
     }
 
@@ -14242,6 +14317,7 @@ mod tests {
             admission_policy: SopAdmissionPolicy::Parallel,
             max_pending_approvals: 0,
             agent: None,
+            decision: None,
         };
         crate::sop::save_sop(&sops_dir, &sop).unwrap();
         let mut groups = HashMap::new();
@@ -14293,6 +14369,180 @@ mod tests {
         let mut dispatcher = RpcDispatcher::new(ctx, tx, "local:test".into());
         dispatcher.set_tui_id_for_test(Some(tui_id.to_string()));
         (dispatcher, engine, run_id, temp)
+    }
+
+    /// An RPC dispatcher over one SOP, with the driver handles under test.
+    fn sops_run_dispatcher(
+        sop: crate::sop::types::Sop,
+        handles: Option<crate::sop::SopDriverHandles>,
+    ) -> (
+        RpcDispatcher,
+        Arc<std::sync::Mutex<crate::sop::SopEngine>>,
+        tempfile::TempDir,
+    ) {
+        let mut engine = crate::sop::SopEngine::new(zeroclaw_config::schema::SopConfig::default());
+        engine.set_sops_for_test(vec![sop]);
+        let engine = Arc::new(std::sync::Mutex::new(engine));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(
+            16,
+            Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
+                4, 10, 60,
+            )),
+        ));
+        let mem_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "sqlite".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let memory: Arc<dyn zeroclaw_api::memory_traits::Memory> =
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, temp.path(), None).unwrap());
+        let audit = Arc::new(crate::sop::SopAuditLogger::new(memory));
+        let ctx = RpcContext::minimal_with_sop_engine_and_audit(
+            zeroclaw_config::schema::Config::default(),
+            sessions,
+            Arc::clone(&engine),
+            audit,
+            handles,
+        );
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        (
+            RpcDispatcher::new(ctx, tx, "local:test".into()),
+            engine,
+            temp,
+        )
+    }
+
+    fn manual_sop(
+        name: &str,
+        deterministic: bool,
+        step: crate::sop::types::SopStep,
+    ) -> crate::sop::types::Sop {
+        crate::sop::types::Sop {
+            name: name.to_string(),
+            description: "sops/run driver test".to_string(),
+            version: "0.1.0".to_string(),
+            priority: crate::sop::types::SopPriority::Normal,
+            // A deterministic SOP runs its steps without a model turn, which is
+            // what lets the driven test reach `Completed` with no provider.
+            execution_mode: if deterministic {
+                crate::sop::types::SopExecutionMode::Deterministic
+            } else {
+                crate::sop::types::SopExecutionMode::Auto
+            },
+            triggers: vec![crate::sop::types::SopTrigger::Manual],
+            steps: vec![step],
+            cooldown_secs: 0,
+            max_concurrent: 4,
+            location: None,
+            deterministic,
+            admission_policy: crate::sop::types::SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
+            agent: None,
+            decision: None,
+        }
+    }
+
+    async fn start_with_key(dispatcher: &RpcDispatcher, sop_name: &str, key: &str) -> String {
+        dispatcher
+            .handle_sops_run(&serde_json::json!({ "name": sop_name, "dedup_key": key }))
+            .await
+            .expect("the run starts")
+            .get("run_id")
+            .and_then(serde_json::Value::as_str)
+            .expect("a run id comes back")
+            .to_string()
+    }
+
+    /// `sops/run` drives the run it starts, like the gateway start path. A
+    /// deterministic no-op step needs no model, so reaching `Completed` proves
+    /// a driver really advanced the run rather than leaving it at its first
+    /// step. Once terminal, the producer key no longer coalesces, so the same
+    /// work item can be retried.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sops_run_drives_the_run_it_starts() {
+        let sop_name = "driven";
+        let step = crate::sop::types::SopStep {
+            number: 1,
+            title: "No-op".to_string(),
+            kind: crate::sop::types::SopStepKind::Capability,
+            capability: Some("noop".to_string()),
+            ..crate::sop::types::SopStep::default()
+        };
+        let handles = crate::sop::SopDriverHandles::default();
+        let (dispatcher, engine, _temp) =
+            sops_run_dispatcher(manual_sop(sop_name, true, step), Some(handles));
+        let dedup_key = "ghpr_octocat/example#42";
+        let run_id = start_with_key(&dispatcher, sop_name, dedup_key).await;
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let status = loop {
+            let status = engine
+                .lock()
+                .unwrap()
+                .get_run(&run_id)
+                .map(|run| run.status);
+            if !matches!(
+                status,
+                Some(crate::sop::types::SopRunStatus::Running) | None
+            ) || std::time::Instant::now() >= deadline
+            {
+                break status;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        };
+        assert_eq!(
+            status,
+            Some(crate::sop::types::SopRunStatus::Completed),
+            "a driver must advance the RPC-started run to a terminal state; run: {:?}",
+            engine.lock().unwrap().get_run(&run_id).map(|run| (
+                run.status,
+                run.step_results
+                    .iter()
+                    .map(|r| (r.step_number, r.status, r.output.clone()))
+                    .collect::<Vec<_>>()
+            ))
+        );
+        assert_eq!(
+            engine
+                .lock()
+                .unwrap()
+                .active_dispatch_dedup_lookup(sop_name, dedup_key),
+            None,
+            "a terminal run must not keep suppressing a retry of the same work item"
+        );
+    }
+
+    /// A shared producer key must only name a run something is advancing. When
+    /// the daemon generation has already drained, the driver is refused and the
+    /// run is settled, so the key must not be left pointing at it: the next Git
+    /// or reconciliation producer would otherwise coalesce onto a run nothing
+    /// will ever advance, and the key would suppress real work.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sops_run_withdraws_the_producer_key_when_its_driver_is_refused() {
+        let sop_name = "refused";
+        let step = crate::sop::types::SopStep {
+            number: 1,
+            title: "Step one".to_string(),
+            body: "Do the work".to_string(),
+            ..crate::sop::types::SopStep::default()
+        };
+        let handles = crate::sop::SopDriverHandles::default();
+        handles.lock().unwrap().close_and_take();
+        let (dispatcher, engine, _temp) =
+            sops_run_dispatcher(manual_sop(sop_name, false, step), Some(handles));
+        let dedup_key = "ghpr_octocat/example#43";
+        let run_id = start_with_key(&dispatcher, sop_name, dedup_key).await;
+
+        let guard = engine.lock().unwrap();
+        assert!(
+            !guard.active_runs().contains_key(&run_id),
+            "a run whose driver was refused is settled, not left active"
+        );
+        assert_eq!(
+            guard.active_dispatch_dedup_lookup(sop_name, dedup_key),
+            None,
+            "the producer key must not point at a run nothing will advance"
+        );
     }
 
     #[tokio::test]
@@ -14384,6 +14634,7 @@ mod tests {
             agent: None,
             admission_policy: crate::sop::types::SopAdmissionPolicy::Parallel,
             max_pending_approvals: 0,
+            decision: None,
         };
         crate::sop::save_sop(&sops_dir, &sop).expect("save temporary SOP");
 
@@ -14522,6 +14773,7 @@ mod tests {
             agent: None,
             admission_policy: crate::sop::types::SopAdmissionPolicy::Parallel,
             max_pending_approvals: 0,
+            decision: None,
         };
         crate::sop::save_sop(&sops_dir, &sop).expect("save temp SOP");
 
@@ -14623,6 +14875,7 @@ mod tests {
                 agent: None,
                 admission_policy: crate::sop::types::SopAdmissionPolicy::Parallel,
                 max_pending_approvals: 0,
+                decision: None,
             }
         }
 

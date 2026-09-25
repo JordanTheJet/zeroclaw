@@ -11,7 +11,8 @@ pub fn handle_command(command: crate::SopCommands, config: &crate::config::Confi
     // authored SOPs.
     let install_root = config.install_root_dir();
     let default_mode = parse_execution_mode(&config.sop.default_execution_mode);
-    let sops = load_sops(&install_root, config.sop.sops_dir.as_deref(), default_mode);
+    let (sops, load_failures) =
+        load_sops_report(&install_root, config.sop.sops_dir.as_deref(), default_mode);
 
     match command {
         crate::SopCommands::List => {
@@ -58,7 +59,29 @@ pub fn handle_command(command: crate::SopCommands, config: &crate::config::Confi
                 None => sops.iter().collect(),
             };
 
+            // A SOP whose files fail to parse or validate never loads; report
+            // it instead of silently leaving it out.
+            let failed: Vec<_> = load_failures
+                .iter()
+                .filter(|(dir, _)| name.as_ref().is_none_or(|n| n == dir))
+                .collect();
+            for (dir, error) in &failed {
+                println!(
+                    "  {}",
+                    get_required_cli_string_with_args(
+                        "cli-sop-load-failed",
+                        &[("name", dir.as_str()), ("error", error.as_str())],
+                    )
+                );
+            }
+
             if targets.is_empty() {
+                if !failed.is_empty() {
+                    anyhow::bail!(get_required_cli_string_with_args(
+                        "cli-sop-load-failed-summary",
+                        &[("count", &failed.len().to_string())],
+                    ));
+                }
                 if let Some(n) = &name {
                     anyhow::bail!("SOP not found: {n}");
                 }
@@ -66,9 +89,18 @@ pub fn handle_command(command: crate::SopCommands, config: &crate::config::Confi
                 return Ok(());
             }
 
-            let mut any_warnings = false;
+            let mut any_warnings = !failed.is_empty();
             for sop in &targets {
-                let warnings = validate_sop(sop);
+                let mut warnings = validate_sop(sop);
+                if let Some(spec) = &sop.decision
+                    && !config.decision_models.contains_key(&spec.model)
+                {
+                    warnings.push(format!(
+                        "[decision] model '{}' is not configured in [decision_models]; \
+                         runs will fall back to the strictest mode",
+                        spec.model
+                    ));
+                }
                 if warnings.is_empty() {
                     println!(
                         "  {}",
@@ -87,6 +119,12 @@ pub fn handle_command(command: crate::SopCommands, config: &crate::config::Confi
                         println!("       - {w}");
                     }
                 }
+            }
+            if !failed.is_empty() {
+                anyhow::bail!(get_required_cli_string_with_args(
+                    "cli-sop-load-failed-summary",
+                    &[("count", &failed.len().to_string())],
+                ));
             }
             if !any_warnings {
                 println!();
@@ -213,7 +251,8 @@ pub fn handle_command(command: crate::SopCommands, config: &crate::config::Confi
         // the gateway in main.rs; they never reach this local handler.
         crate::SopCommands::Approve { .. }
         | crate::SopCommands::Deny { .. }
-        | crate::SopCommands::Pending => anyhow::bail!(
+        | crate::SopCommands::Pending
+        | crate::SopCommands::Logs { .. } => anyhow::bail!(
             "This command talks to the running daemon over the gateway; \
              it is not handled by the local SOP CLI."
         ),
@@ -482,6 +521,7 @@ type = "manual"
             admission_policy: zeroclaw_runtime::sop::types::SopAdmissionPolicy::Parallel,
             max_pending_approvals: 0,
             agent: None,
+            decision: None,
         };
 
         let warnings = validate_sop(&sop);
@@ -517,6 +557,7 @@ type = "manual"
             admission_policy: zeroclaw_runtime::sop::types::SopAdmissionPolicy::Parallel,
             max_pending_approvals: 0,
             agent: None,
+            decision: None,
         };
 
         let warnings = validate_sop(&sop);
