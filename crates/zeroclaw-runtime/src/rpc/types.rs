@@ -1364,6 +1364,11 @@ rpc_type! {
         /// pagination regardless of id ordering.
         #[serde(default)]
         pub until_line_offset: Option<u64>,
+        /// Segment-aware cursor. Set from `LogsQueryResult::next_segment_cursor`
+        /// to paginate across rotated archive files. Takes precedence over
+        /// `until_line_offset` when both are supplied.
+        #[serde(default)]
+        pub until_segment_cursor: Option<String>,
         #[serde(default)]
         pub severity_min: Option<u8>,
         #[serde(default)]
@@ -1376,6 +1381,10 @@ rpc_type! {
         pub outcome: Option<String>,
         #[serde(default)]
         pub trace_id: Option<String>,
+        /// Exact SOP run correlation. Uses the canonical persisted-log
+        /// attribution filter, including its compatibility bridge for older rows.
+        #[serde(default)]
+        pub sop_run_id: Option<String>,
         #[serde(default)]
         pub hide_internal: bool,
         #[serde(default)]
@@ -1401,8 +1410,22 @@ rpc_type! {
         /// Byte offset past the last event on this page. Callers should
         /// pass this back as `until_line_offset` on the next request to
         /// resume without re-scanning already-read bytes.
+        ///
+        /// For multi-segment deployments, this is `None` when the oldest event
+        /// on the page is in an archive file — use `next_segment_cursor` instead.
         pub next_cursor_line_offset: Option<u64>,
+        /// Segment-aware cursor for the oldest event on this page. Pass back
+        /// as `until_segment_cursor` to walk older pages across segment
+        /// boundaries. Supersedes `next_cursor_line_offset` for `rotating`-mode
+        /// deployments with multiple retained segments.
+        pub next_segment_cursor: Option<String>,
         pub at_end: bool,
+        /// True when a retained segment could not be read and was left out of
+        /// this page. `at_end` then means "no older events among the segments
+        /// that could be read", which is weaker than "no older events exist",
+        /// so a client that stops paging on `at_end` should say the history is
+        /// partial rather than present it as complete.
+        pub incomplete: bool,
     }
 }
 
@@ -1929,6 +1952,17 @@ mod tests {
     }
 
     #[test]
+    fn logs_query_params_accepts_sop_run_filter() {
+        let params: LogsQueryParams = serde_json::from_value(json!({
+            "sop_run_id": "run-123-0001",
+            "limit": 25
+        }))
+        .unwrap();
+        assert_eq!(params.sop_run_id.as_deref(), Some("run-123-0001"));
+        assert_eq!(params.limit, Some(25));
+    }
+
+    #[test]
     fn config_section_group_key_is_additive_on_the_wire() {
         let legacy: ConfigSectionEntry = serde_json::from_value(json!({
             "key": "cron",
@@ -2077,7 +2111,9 @@ mod tests {
             log_path: Some("/var/lib/zeroclaw/runtime-trace.jsonl".into()),
             next_cursor: None,
             next_cursor_line_offset: None,
+            next_segment_cursor: None,
             at_end: true,
+            incomplete: false,
         };
 
         let value = serde_json::to_value(result).expect("logs/query result");
