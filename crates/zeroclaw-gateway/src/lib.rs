@@ -931,7 +931,10 @@ pub async fn run_gateway(
     host: &str,
     port: u16,
     config: Config,
-    external_event_tx: Option<tokio::sync::broadcast::Sender<serde_json::Value>>,
+    // The daemon's event bus. The daemon owns the observer broadcast hook, so a
+    // supervised gateway reuses its sender and history and installs nothing;
+    // a standalone gateway (`None`) builds and installs its own.
+    external_event_bus: Option<zeroclaw_runtime::observability::EventBus>,
     // Reload controls owned by the daemon for supervised runs. RPC reloads
     // write to `shutdown_tx` before signalling daemon reload so the listener
     // releases its socket before the replacement gateway binds. /admin/reload
@@ -956,7 +959,7 @@ pub async fn run_gateway(
         host,
         port,
         config,
-        external_event_tx,
+        external_event_bus,
         reload_controls,
         tui_registry,
         canvas_store,
@@ -981,7 +984,7 @@ pub async fn run_gateway_with_plugin_webhooks(
     host: &str,
     port: u16,
     config: Config,
-    external_event_tx: Option<tokio::sync::broadcast::Sender<serde_json::Value>>,
+    external_event_bus: Option<zeroclaw_runtime::observability::EventBus>,
     reload_controls: Option<zeroclaw_runtime::daemon::GatewayReloadControls>,
     tui_registry: Option<Arc<zeroclaw_runtime::rpc::tui_identity::TuiRegistry>>,
     canvas_store: Option<CanvasStore>,
@@ -1417,11 +1420,13 @@ pub async fn run_gateway_with_plugin_webhooks(
     // SSE broadcast channel for real-time events.
     // Use an externally provided sender (e.g. from the daemon) so that other
     // components (cron, heartbeat) can publish events to the same bus.
-    let event_tx = external_event_tx.unwrap_or_else(|| {
-        let (tx, _rx) = tokio::sync::broadcast::channel::<serde_json::Value>(256);
-        tx
-    });
-    let event_buffer = Arc::new(sse::EventBuffer::new(500));
+    // Under the daemon the bus and its observer hook are already live; a
+    // standalone gateway builds and installs its own. Either way there is one
+    // hook, so each observer event is delivered once and buffered once.
+    let (event_bus, broadcast_hook_guard) =
+        zeroclaw_runtime::observability::EventBus::shared_or_installed(external_event_bus);
+    let event_tx = event_bus.sender().clone();
+    let event_buffer = Arc::clone(event_bus.history());
     // WhatsApp channel instances (one per cloud-configured alias), keyed by
     // alias so `/whatsapp/{alias}` webhooks reach the matching instance
     #[cfg(feature = "channel-whatsapp-cloud")]
@@ -1866,16 +1871,10 @@ pub async fn run_gateway_with_plugin_webhooks(
 
     zeroclaw_runtime::health::mark_component_ok("gateway");
 
-    let broadcast_layer: Arc<dyn zeroclaw_runtime::observability::Observer> = Arc::new(
-        sse::BroadcastObserver::new(event_tx.clone(), event_buffer.clone()),
-    );
-    let broadcast_hook_guard =
-        zeroclaw_runtime::observability::set_scoped_broadcast_hook(broadcast_layer);
-
     zeroclaw_log::set_broadcast_hook(event_tx.clone());
 
-    // Bound into AppState. Not a broadcaster — the broadcaster is the
-    // `broadcast_layer` installed above as the global hook. This is the
+    // Bound into AppState. Not a broadcaster — the broadcaster is the event
+    // bus's hook (`EventBus::shared_or_installed` above). This is the
     // configured backend (Log/Prometheus/...) wrapped by `TeeObserver`,
     // which tees events into the hook on every record.
     let state_observer: Arc<dyn zeroclaw_runtime::observability::Observer> = Arc::from(
