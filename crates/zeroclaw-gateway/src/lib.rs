@@ -1916,6 +1916,7 @@ pub async fn run_gateway_with_plugin_webhooks(
         .route("/admin/shutdown", post(handle_admin_shutdown))
         .route("/admin/reload", post(handle_admin_reload))
         .route("/admin/sop/pending", get(api_sop::handle_sop_pending))
+        .route("/admin/sop/logs", get(api_sop::handle_sop_logs))
         .route("/admin/sop/approve", post(api_sop::handle_sop_approve))
         .route("/admin/sop/deny", post(api_sop::handle_sop_deny))
         .route("/admin/paircode", get(handle_admin_paircode))
@@ -1989,6 +1990,10 @@ pub async fn run_gateway_with_plugin_webhooks(
         .route(
             "/api/sops/trigger-sources",
             get(api_sop_author::handle_sop_trigger_sources),
+        )
+        .route(
+            "/api/sops/decision-models",
+            get(api_sop_author::handle_sop_decision_models),
         )
         .route(
             "/api/sops/graph-legend",
@@ -5451,6 +5456,7 @@ path = "{trigger_path}"
         let install_root = state.config.read().install_root_dir();
         let (engine, audit) = zeroclaw_runtime::sop::build_sop_engine(
             sop_config,
+            &std::collections::HashMap::new(),
             &data_dir,
             &install_root,
             Arc::clone(&state.mem),
@@ -5507,6 +5513,7 @@ path = "{trigger_path}"
         let install_root = state.config.read().install_root_dir();
         let (engine, audit) = zeroclaw_runtime::sop::build_sop_engine(
             sop_config,
+            &std::collections::HashMap::new(),
             &data_dir,
             &install_root,
             Arc::clone(&state.mem),

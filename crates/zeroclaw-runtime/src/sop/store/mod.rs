@@ -668,6 +668,7 @@ mod tests {
             llm_calls_saved: 0,
             revision: 0,
             revision_base: 0,
+            decided_mode: None,
         };
         PersistedRun {
             version: SOP_STORE_VERSION,

@@ -52,6 +52,9 @@ while this SOP's execution slots are full:
 | `admission_policy` | `parallel` | How a trigger that cannot admit right now is handled (see below). |
 | `max_pending_approvals` | `0` (unlimited) | Upper bound on runs of this SOP parked at a HITL approval simultaneously. Past the bound, further triggers are deferred (backpressure), never silently dropped (except under `drop`). |
 
+An optional `[decision]` table lets a decision model gate each matched event
+and choose the run's execution mode. See [Decision models](./decision-models.md).
+
 `admission_policy` values (`SopAdmissionPolicy`, snake_case):
 
 - `parallel` (default) - admit up to `max_concurrent`; a trigger that cannot admit

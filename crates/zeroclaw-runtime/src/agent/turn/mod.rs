@@ -1718,16 +1718,6 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             .into());
         }
 
-        let llm_started_at = announce_llm_request(
-            &ctx,
-            &provider_request_messages,
-            active_model_provider,
-            active_model_provider_name,
-            provider_request_model,
-            iteration,
-        )
-        .await;
-
         // Unified path via ModelProvider::chat so provider-specific native tool logic
         // (OpenAI/Anthropic/OpenRouter/compatible adapters) is honored.
         let request_tools = if use_native_tools {
@@ -1735,6 +1725,16 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         } else {
             None
         };
+        let llm_started_at = announce_llm_request(
+            &ctx,
+            &provider_request_messages,
+            request_tools,
+            active_model_provider,
+            active_model_provider_name,
+            provider_request_model,
+            iteration,
+        )
+        .await;
         let request_tool_count = request_tools.map_or(0, <[crate::tools::ToolSpec]>::len);
         let base_provider_supports_native_tools = model_provider
             .capabilities_for_model(dispatch_model)
@@ -3205,9 +3205,17 @@ async fn drive_live_sop_actions(
                                 Some(_) => &mut child_history,
                                 None => &mut *history,
                             };
-                            let step_result = crate::sop::executor::scope_step_call_sink(
-                                step_call_sink.clone(),
-                                Box::pin(run_tool_call_loop(ToolLoop {
+                            // Owned here, not a `&mut None` temporary: the step
+                            // future is built inside the run-attribution scope and
+                            // awaited after it, so a temporary would be dropped
+                            // while the future still borrows it.
+                            let mut nested_memory_preamble: Option<String> = None;
+                            let step_result = ::zeroclaw_log::scope!(
+                                sop_run_id: run_id.as_str(),
+                                =>
+                                crate::sop::executor::scope_step_call_sink(
+                                    step_call_sink.clone(),
+                                    Box::pin(run_tool_call_loop(ToolLoop {
                                     exec: ResolvedAgentExecution::resolve(
                                         ResolvedModelAccess {
                                             model_provider: eff_model_provider,
@@ -3261,7 +3269,7 @@ async fn drive_live_sop_actions(
                                     ),
                                     history: nested_history,
                                     history_has_trim_breadcrumb: &mut nested_crumb_present,
-                                    injected_memory_preamble: &mut None,
+                                    injected_memory_preamble: &mut nested_memory_preamble,
                                     channel_name,
                                     channel_reply_target,
                                     cancellation_token: cancellation_token.clone(),
@@ -3306,7 +3314,8 @@ async fn drive_live_sop_actions(
                                     turn_id: &nested_turn_id,
                                     served_route_sink: None,
                                     sop_reassembly,
-                                })),
+                                    })),
+                                )
                             )
                             .await;
                             // Replay child loop's new messages to the parent's
@@ -5808,6 +5817,7 @@ mod sop_step_reassembly_tests {
             admission_policy: Default::default(),
             max_pending_approvals: 0,
             agent: None,
+            decision: None,
         };
         let mut engine = crate::sop::SopEngine::new(SopConfig::default());
         engine.set_sops_for_test(vec![sop]);
@@ -6622,6 +6632,7 @@ mod sop_step_reassembly_tests {
             admission_policy: Default::default(),
             max_pending_approvals: 0,
             agent: None,
+            decision: None,
         };
         // A step is revisited every other iteration, so the per-step visit
         // bound must stay well above the drive budget for this test to prove

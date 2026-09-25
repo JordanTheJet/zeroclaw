@@ -144,6 +144,7 @@
 - [Standard Operating Procedures](./sop/index.md)
   - [How SOPs run](./sop/how-it-works.md)
   - [Syntax](./sop/syntax.md)
+  - [Decision models](./sop/decision-models.md)
   - [Cookbook](./sop/cookbook.md)
   - [SOP Fan-In](./sop/fan-in/overview.md)
     - [MQTT](./sop/fan-in/mqtt.md)

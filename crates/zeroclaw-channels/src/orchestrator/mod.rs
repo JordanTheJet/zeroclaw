@@ -11267,12 +11267,12 @@ async fn dispatch_channel_sop_event(
         }
         ingress
     }
-    .dispatch(
+    .dispatch_deduplicated(
         zeroclaw_runtime::sop::types::SopTriggerSource::Channel,
         Some(topic),
         Some(&msg.content),
         target_sop.as_deref(),
-        None,
+        msg.id.clone(),
     )
     .await;
     true
@@ -25864,6 +25864,7 @@ BTC is currently around $65,000 based on latest tool output."#
             admission_policy: SopAdmissionPolicy::Parallel,
             max_pending_approvals: 0,
             agent: None,
+            decision: None,
         };
         let mut engine =
             zeroclaw_runtime::sop::SopEngine::new(zeroclaw_config::schema::SopConfig::default());
@@ -51814,6 +51815,7 @@ Done."#;
             admission_policy: SopAdmissionPolicy::Parallel,
             max_pending_approvals: 0,
             agent: None,
+            decision: None,
         }
     }
 

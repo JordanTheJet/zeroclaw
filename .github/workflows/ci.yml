@@ -646,6 +646,19 @@ jobs:
       - name: Run channel egress boundary e2e
         if: steps.changed.outputs.run == 'true' && matrix.features == 'plugins-wasm-cranelift'
         run: cargo test --locked --features plugins-wasm-cranelift --test channel_egress_e2e
+      # The root binary's tests with plugin support compiled in. `mod plugins`,
+      # the plugin registry and the plugin CLI's tests in `main.rs` only
+      # compile under `plugins-wasm`, so the default-feature Test job never sees
+      # them; this is the one required step that runs them. The whole suite
+      # runs rather than a name filter: the ceremony tests in `main.rs` share no
+      # common name, and a filter silently skipped most of them. The component
+      # tests drive the real binary through `plugin info` and `plugin list
+      # --verify` against an installed component that does not load.
+      - name: Run root CLI plugin tests
+        if: steps.changed.outputs.run == 'true' && matrix.suite == 'runtime'
+        run: |
+          cargo test --locked --features plugins-wasm-cranelift --bin zeroclaw
+          cargo test --locked --features plugins-wasm-cranelift --test component -- plugin_info_cli
 
   msrv:
     name: MSRV (declared floor)
