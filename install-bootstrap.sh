@@ -86,17 +86,16 @@ info "Downloading $asset"
 curl -fsSL "${base}/${asset}" -o "$tmp/$asset" \
   || die "no prebuilt launcher for $triple in $version (build from source: cargo build --release -p zeroclaw-bootstrap)"
 
-# Verify against the release SHA256SUMS, exactly as install.sh does for the main
-# binary. A missing SHA256SUMS warns rather than aborts (best-effort releases).
-if curl -fsSL "${base}/SHA256SUMS" -o "$tmp/SHA256SUMS" 2>/dev/null; then
-  expected=$(awk -v f="$asset" '$2 == f {print $1}' "$tmp/SHA256SUMS")
-  [ -n "$expected" ] || die "SHA256SUMS has no entry for $asset"
-  actual=$(sha256_of "$tmp/$asset")
-  [ "$expected" = "$actual" ] || die "checksum mismatch for $asset (expected $expected, got $actual)"
-  info "Checksum verified"
-else
-  warn "could not fetch SHA256SUMS — skipping checksum verification"
-fi
+# Verify against the release SHA256SUMS before anything is extracted or
+# installed. Fail closed: no manifest, no entry, or a mismatch aborts, because
+# the launcher is an executable this script is about to put on PATH.
+curl -fsSL "${base}/SHA256SUMS" -o "$tmp/SHA256SUMS" \
+  || die "could not fetch SHA256SUMS for $version; refusing to install an unverified launcher"
+expected=$(awk -v f="$asset" '$2 == f {print $1}' "$tmp/SHA256SUMS")
+[ -n "$expected" ] || die "SHA256SUMS for $version has no entry for $asset; refusing to install"
+actual=$(sha256_of "$tmp/$asset")
+[ "$expected" = "$actual" ] || die "checksum mismatch for $asset (expected $expected, got $actual)"
+info "Checksum verified"
 
 tar xzf "$tmp/$asset" -C "$tmp"
 [ -f "$tmp/$BIN_NAME" ] || die "archive did not contain $BIN_NAME"
