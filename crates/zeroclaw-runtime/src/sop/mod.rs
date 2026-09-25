@@ -4,6 +4,7 @@ pub mod audit;
 pub mod binding;
 pub mod capability;
 pub mod condition;
+pub mod decision;
 pub mod dispatch;
 pub mod engine;
 pub mod executor;
@@ -31,6 +32,7 @@ pub use binding::{
 pub use capability::{
     CapabilityContext, CapabilityInfo, CapabilityResult, SopCapability, SopCapabilityRegistry,
 };
+pub use decision::{DecisionModel, SopDecision, SopDecisionSpec, SystemOneClient};
 pub use engine::{
     CancelOutcome, MaintenanceSummary, OrphanedRunSettlement, SopEngine,
     err_is_cancellation_persistence_retained, err_is_resume_at_capacity,
@@ -110,6 +112,9 @@ pub struct SopEngineAdapters {
     pub forge: Option<Arc<dyn capability::ForgeCommentAdapter>>,
     /// Runs one bounded model call as a pipeline step (`llm.generate`).
     pub llm: Option<Arc<dyn capability::LlmGenerateAdapter>>,
+    /// Extra decision models by alias, added to (and overriding) the ones built
+    /// from `[decision_models]`. Used by tests and embedders.
+    pub decision: std::collections::HashMap<String, Arc<dyn decision::DecisionModel>>,
 }
 
 /// Build a single shared SopEngine + SopAuditLogger pair.
@@ -130,15 +135,21 @@ pub struct SopEngineAdapters {
 ///   matching manual trigger".
 pub fn build_sop_engine(
     config: SopConfig,
+    decision_models: &std::collections::HashMap<
+        String,
+        zeroclaw_config::schema::SopDecisionModelConfig,
+    >,
     data_dir: &Path,
     install_root: &Path,
     audit_memory: Arc<dyn Memory>,
     adapters: SopEngineAdapters,
 ) -> (Arc<Mutex<SopEngine>>, Arc<SopAuditLogger>) {
+    let mut decision_models = decision::models_from_config(decision_models);
     let SopEngineAdapters {
         route: route_adapter,
         forge: forge_adapter,
         llm: llm_adapter,
+        decision: decision_model_overrides,
     } = adapters;
     // Select the run-state backend from config (default: durable sqlite, so parked
     // HITL runs survive a restart). A backend-open failure must not crash daemon
@@ -177,7 +188,11 @@ pub fn build_sop_engine(
         .with_metrics(SopMetricsCollector::shared())
         .with_run_notifier(run_tx)
         .with_approval_broker(approval_broker)
-        .with_capabilities(Arc::new(capabilities));
+        .with_capabilities(Arc::new(capabilities))
+        .with_decision_models({
+            decision_models.extend(decision_model_overrides);
+            decision_models
+        });
     engine.reload(install_root);
     engine.restore_runs();
     let engine = Arc::new(Mutex::new(engine));
@@ -886,14 +901,29 @@ pub fn load_sops_from_directory(
     sops_dir: &Path,
     default_execution_mode: SopExecutionMode,
 ) -> Vec<Sop> {
-    if !sops_dir.exists() {
-        return Vec::new();
-    }
+    load_sops_from_directory_report(sops_dir, default_execution_mode).0
+}
 
+/// Load all SOPs from the configured directory and also return the ones that
+/// failed to load, as `(directory name, error)`, for `zeroclaw sop validate`.
+pub fn load_sops_report(
+    install_root: &Path,
+    config_dir: Option<&str>,
+    default_execution_mode: SopExecutionMode,
+) -> (Vec<Sop>, Vec<(String, String)>) {
+    let dir = resolve_sops_dir(install_root, config_dir);
+    load_sops_from_directory_report(&dir, default_execution_mode)
+}
+
+fn load_sops_from_directory_report(
+    sops_dir: &Path,
+    default_execution_mode: SopExecutionMode,
+) -> (Vec<Sop>, Vec<(String, String)>) {
     let mut sops = Vec::new();
+    let mut failures = Vec::new();
 
     let Ok(entries) = std::fs::read_dir(sops_dir) else {
-        return sops;
+        return (sops, failures);
     };
 
     for entry in entries.flatten() {
@@ -917,12 +947,15 @@ pub fn load_sops_from_directory(
                         .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
                     &format!("Failed to load SOP from {}", path.display().to_string())
                 );
+                let name = entry.file_name().to_string_lossy().into_owned();
+                failures.push((name, format!("{e:#}")));
             }
         }
     }
 
     sops.sort_by(|a, b| a.name.cmp(&b.name));
-    sops
+    failures.sort();
+    (sops, failures)
 }
 
 /// Load a single SOP from a directory containing SOP.toml and optionally SOP.md.
@@ -982,7 +1015,11 @@ fn load_sop(sop_dir: &Path, default_execution_mode: SopExecutionMode) -> Result<
         admission_policy,
         max_pending_approvals,
         agent,
+        decision: manifest.decision,
     };
+    if let Some(spec) = &sop.decision {
+        spec.validate(&sop.name, sop.deterministic)?;
+    }
     capability::SopCapabilityRegistry::with_builtins().validate_sop(&sop)?;
     Ok(sop)
 }
@@ -1949,6 +1986,14 @@ pub fn validate_sop_strict(sop: &Sop) -> SopValidation {
         }
     }
 
+    // The loader rejects an invalid `[decision]` table, so saving one would
+    // make the SOP disappear on the next reload.
+    if let Some(spec) = &sop.decision
+        && let Err(e) = spec.validate(&sop.name, sop.deterministic)
+    {
+        blocking.push(e.to_string());
+    }
+
     let mut warnings = Vec::new();
     validate_headless_ownership(sop, &mut blocking, &mut warnings);
     validate_planned_call_bindings(sop, &mut blocking, &mut warnings);
@@ -2008,6 +2053,7 @@ mod tests {
             admission_policy: SopAdmissionPolicy::Parallel,
             max_pending_approvals: 0,
             agent: None,
+            decision: None,
         }]);
         let action = engine
             .start_run(
@@ -2187,6 +2233,7 @@ mod tests {
             admission_policy: Default::default(),
             max_pending_approvals: 0,
             agent: None,
+            decision: None,
         }
     }
 
@@ -3263,6 +3310,54 @@ mod tests {
         );
     }
 
+    #[test]
+    fn strict_validation_blocks_an_invalid_decision_table() {
+        let mut sop = authoring_sop(vec![titled_step(1, "a")]);
+        sop.decision = Some(decision::SopDecisionSpec {
+            model: "jev".into(),
+            gate: Some("Is this a refund?".into()),
+            gate_threshold: 1.5,
+            gate_on_error: decision::GateOnError::RunStrict,
+            modes: vec![],
+            mode_instructions: None,
+            min_confidence: 0.7,
+        });
+        let v = validate_sop_strict(&sop);
+        assert!(
+            v.blocking.iter().any(|b| b.contains("gate_threshold")),
+            "{:?}",
+            v.blocking
+        );
+        sop.decision.as_mut().unwrap().gate_threshold = 0.7;
+        assert!(validate_sop_strict(&sop).is_ok());
+    }
+
+    #[test]
+    fn load_report_names_sops_that_fail_to_load() {
+        let tmp = tempfile::tempdir().unwrap();
+        for (dir, decision) in [
+            ("good", "model = \"jev\"\ngate = \"x\""),
+            ("bad", "gate = \"x\""),
+        ] {
+            let d = tmp.path().join(dir);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(
+                d.join("SOP.toml"),
+                format!("[sop]\nname = \"{dir}\"\ndescription = \"t\"\n\n[decision]\n{decision}\n"),
+            )
+            .unwrap();
+            std::fs::write(d.join("SOP.md"), "## Steps\n\n1. **Do it** - do it.\n").unwrap();
+        }
+        let (sops, failures) =
+            load_sops_from_directory_report(tmp.path(), SopExecutionMode::Supervised);
+        assert_eq!(
+            sops.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            ["good"]
+        );
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].0, "bad");
+        assert!(failures[0].1.contains("model"), "{}", failures[0].1);
+    }
     #[test]
     fn parse_steps_keeps_legacy_tools_hint() {
         let steps = parse_steps(

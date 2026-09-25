@@ -2146,6 +2146,7 @@ impl Agent {
                 // engine with a real channel-delivering adapter instead.
                 let (engine, audit) = crate::sop::build_sop_engine(
                     config.sop.clone(),
+                    &config.decision_models,
                     &config.data_dir,
                     &config.install_root_dir(),
                     mem,

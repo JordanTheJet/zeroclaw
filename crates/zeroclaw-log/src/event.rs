@@ -163,6 +163,7 @@ pub const ATTRIBUTION_FIELDS: &[&str] = &[
     "mcp_bundle",
     "peer_group",
     "sop_name",
+    "sop_run_id",
     "model",
     "embedding_provider",
     "owner_tui_id",
@@ -632,6 +633,7 @@ mod tests {
         assert!(is_attribution_field("channel_alias"));
         assert!(is_attribution_field("model_provider_alias"));
         assert!(is_attribution_field("agent_alias"));
+        assert!(is_attribution_field("sop_run_id"));
         assert!(!is_attribution_field("not_a_real_field"));
     }
 
