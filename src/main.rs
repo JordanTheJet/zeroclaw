@@ -17722,6 +17722,7 @@ type = "string"
             )]),
             egress_hosts: hosts.iter().map(|h| (*h).to_string()).collect(),
             egress_allow_private: Vec::new(),
+            tls_profiles: Vec::new(),
         }
     }
 
@@ -17840,6 +17841,7 @@ type = "string"
             config: std::collections::HashMap::new(),
             egress_hosts: vec!["api.example.com".to_string()],
             egress_allow_private: Vec::new(),
+            tls_profiles: Vec::new(),
         }];
 
         let lines = egress_grant_gap_lines(&config, &manifest).expect("gap lines must build");
@@ -18235,6 +18237,7 @@ type = "string"
             config: std::collections::HashMap::new(),
             egress_hosts: vec![" api.example.com ".to_string(), String::new()],
             egress_allow_private: Vec::new(),
+            tls_profiles: Vec::new(),
         }];
         assert!(
             !runtime_accepts_row(&config, &instance_key),
@@ -18296,6 +18299,7 @@ type = "string"
             config: std::collections::HashMap::new(),
             egress_hosts: vec!["api.example.com".to_string(), "10.0.0.5".to_string()],
             egress_allow_private: vec!["10.0.0.5".to_string()],
+            tls_profiles: Vec::new(),
         }];
 
         let install = existing_egress_grant_lines(&config, "weather-tool", &instance_key, &[]);
@@ -18345,6 +18349,7 @@ type = "string"
             config: std::collections::HashMap::new(),
             egress_hosts: vec!["api.example.com".to_string()],
             egress_allow_private: Vec::new(),
+            tls_profiles: Vec::new(),
         }];
         config.security.nat64_prefixes = vec!["2001:db8::/97".to_string()];
         assert!(
@@ -18413,6 +18418,7 @@ type = "string"
             config: std::collections::HashMap::new(),
             egress_hosts: vec!["api.example.com".to_string()],
             egress_allow_private: vec!["other.example.com".to_string()],
+            tls_profiles: Vec::new(),
         }];
         assert!(
             !runtime_accepts_row(&config, &instance_key),
@@ -18466,6 +18472,7 @@ type = "string"
             config: std::collections::HashMap::new(),
             egress_hosts: vec!["*.com".to_string()],
             egress_allow_private: Vec::new(),
+            tls_profiles: Vec::new(),
         }];
         assert!(
             !runtime_accepts_row(&config, &instance_key),
@@ -19154,6 +19161,7 @@ hosts = ["api.example.com", "api2.example.com"]
             config: std::collections::HashMap::new(),
             egress_hosts: hosts.iter().map(|h| (*h).to_string()).collect(),
             egress_allow_private: Vec::new(),
+            tls_profiles: Vec::new(),
         };
 
         let dir_a = tempfile::tempdir().expect("profile a");

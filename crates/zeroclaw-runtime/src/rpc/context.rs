@@ -393,6 +393,7 @@ impl RpcContext {
         sop_audit: Arc<crate::sop::SopAuditLogger>,
         sop_driver_handles: Option<crate::sop::SopDriverHandles>,
     ) -> Arc<Self> {
+        let auth = crate::rpc::auth::RpcInboundAuth::for_tests(&config);
         Arc::new(Self {
             config: Arc::new(RwLock::new(config)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -412,6 +413,7 @@ impl RpcContext {
             hooks: None,
             config_commit_pause: None,
             cert_audit: None,
+            auth,
         })
     }
 
