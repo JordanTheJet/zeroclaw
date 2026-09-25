@@ -266,6 +266,7 @@ pub mod error_codes {
     pub const SESSION_NOT_OWNED: i32 = -32003;
     pub const AUTH_REQUIRED: i32 = -32010;
     pub const VERSION_MISMATCH: i32 = -32011;
+    pub const FORBIDDEN: i32 = -32012;
 
     // SOP authoring
     pub const SOP_ALREADY_EXISTS: i32 = -32020;
@@ -533,6 +534,18 @@ pub struct SopSaveRequest {
     pub sop: serde_json::Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub original_name: Option<String>,
+}
+
+/// Request payload for `sops/rename`: move the SOP stored under `from` to
+/// `to`. Rename is its own operation rather than a side effect of `sops/save`
+/// because saving persists under the submitted SOP's name, so a name change
+/// smuggled through a save would fork the SOP or overwrite a different one.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SopRenameRequest {
+    /// Name the SOP is stored under today.
+    pub from: String,
+    /// Name to move it to. Must not already be taken.
+    pub to: String,
 }
 
 /// Request payload for `fs.list_dir`.
