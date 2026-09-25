@@ -473,4 +473,47 @@ mod tests {
             "the source config must not move when a preview is computed"
         );
     }
+
+    const PLUGIN_KEY: &str = "zpi1_WyJ3ZWF0aGVyLXRvb2wiLCJ0b29sIiwid2VhdGhlci10b29sIl0";
+
+    fn egress_grant_op() -> Vec<PatchOp> {
+        parse_patch_ops(serde_json::json!([{
+            "op": "add",
+            "path": format!("/plugins/entries/{PLUGIN_KEY}/egress_hosts"),
+            "value": ["api.example.com"]
+        }]))
+        .expect("parses")
+    }
+
+    /// The remote writers sharing this engine (the gateway, the agent-facing
+    /// tool) must not create a keyed-list row as a side effect of setting a
+    /// field under it.
+    #[test]
+    fn map_only_patch_does_not_create_a_keyed_list_row() {
+        let mut config = Config::default();
+
+        assert!(
+            apply_patch_ops(&mut config, &egress_grant_op()).is_err(),
+            "a map-only writer must not create the row"
+        );
+        assert!(config.plugins.entries.is_empty(), "no row is left behind");
+    }
+
+    /// The local `config patch` command can create the missing row, which is
+    /// how `plugin list`'s printed egress repair works.
+    #[test]
+    fn map_or_list_patch_creates_a_missing_keyed_list_row() {
+        let mut config = Config::default();
+
+        apply_patch_ops_with(&mut config, &egress_grant_op(), KeyCreation::MapOrList)
+            .expect("the local command creates the row");
+
+        let entry = config
+            .plugins
+            .entries
+            .iter()
+            .find(|entry| entry.name == PLUGIN_KEY)
+            .expect("the row exists under its natural key");
+        assert_eq!(entry.egress_hosts, vec!["api.example.com".to_string()]);
+    }
 }
