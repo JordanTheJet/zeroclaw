@@ -850,3 +850,54 @@ async fn channels_bind_refuses_alike_on_both_surfaces() {
         );
     }
 }
+
+// ── System ───────────────────────────────────────────────────────────────
+//
+// Only refusals and status: a real upgrade would run `zeroclaw update` on the
+// test binary.
+
+#[tokio::test]
+async fn system_upgrade_refuses_alike_when_self_upgrade_is_disabled() {
+    let mut config = Config::default();
+    config.gateway.allow_self_upgrade = false;
+    let state = test_state(config);
+    let (status, http) = body_json(
+        crate::version::handle_version_upgrade(
+            State(state),
+            HeaderMap::new(),
+            axum::body::Bytes::new(),
+        )
+        .await
+        .into_response(),
+    )
+    .await;
+    assert_eq!(status, 403, "{http}");
+    let refusal = zeroclaw_runtime::self_upgrade::start_upgrade(
+        false,
+        crate::version::UpgradeRequest::default(),
+        None,
+    )
+    .unwrap_err();
+    assert_eq!(refusal.http_status, 403);
+    assert_eq!(serde_json::json!({ "error": refusal.message }), http);
+}
+
+#[tokio::test]
+async fn system_upgrade_status_matches_the_status_route() {
+    let state = test_state(Config::default());
+    let (status, http) = body_json(
+        crate::version::handle_version_upgrade_status(
+            State(state),
+            HeaderMap::new(),
+            Query(crate::version::UpgradeStatusQuery { handoff_id: None }),
+        )
+        .await
+        .into_response(),
+    )
+    .await;
+    assert_eq!(status, 200, "{http}");
+    // Both read the one process-wide upgrade slot at the same moment.
+    let rpc = serde_json::to_value(zeroclaw_runtime::self_upgrade::upgrade_status(None).unwrap())
+        .unwrap();
+    assert_eq!(rpc, http);
+}

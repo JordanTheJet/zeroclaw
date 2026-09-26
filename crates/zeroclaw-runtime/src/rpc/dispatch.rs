@@ -229,6 +229,9 @@ pub enum Method {
     ChannelsList,
     ChannelsRelink,
     ChannelsBind,
+    SystemUpgrade,
+    SystemUpgradeStatus,
+    SystemRestart,
 }
 
 impl Method {
@@ -365,6 +368,9 @@ impl Method {
         (Method::ChannelsList, "channels/list"),
         (Method::ChannelsRelink, "channels/relink"),
         (Method::ChannelsBind, "channels/bind"),
+        (Method::SystemUpgrade, "system/upgrade"),
+        (Method::SystemUpgradeStatus, "system/upgrade-status"),
+        (Method::SystemRestart, "system/restart"),
     ];
 
     /// Resolve a wire method name to a variant. Table scan, no hand-written
@@ -501,6 +507,8 @@ impl Method {
             M::PairingNewCode => (Resource::System, Verb::Create),
             M::ChannelsList => (Resource::Channels, Verb::Read),
             M::ChannelsRelink | M::ChannelsBind => (Resource::Channels, Verb::Update),
+            M::SystemUpgrade | M::SystemRestart => (Resource::System, Verb::Execute),
+            M::SystemUpgradeStatus => (Resource::System, Verb::Read),
             M::CanvasList | M::CanvasGet | M::CanvasHistory => (Resource::Canvas, Verb::Read),
             M::CanvasRender => (Resource::Canvas, Verb::Update),
             M::CanvasClear => (Resource::Canvas, Verb::Delete),
@@ -1929,6 +1937,73 @@ impl RpcDispatcher {
         }
     }
 
+    /// `system/{upgrade,upgrade-status,restart}`: the in-app upgrade the
+    /// dashboard's `/api/version/upgrade` routes drive, and restarting a core
+    /// component.
+    ///
+    /// Upgrading replaces the running binary and restarting interrupts every
+    /// session, so both are administrator-only; reading upgrade progress is
+    /// not. Only the daemon restarts today: a gateway is restarted with the
+    /// daemon until the core supervises a separate gateway process.
+    fn handle_system_method(&self, method: Method, params: &Value) -> RpcResult {
+        let refusal = |refusal: crate::self_upgrade::UpgradeRefusal| {
+            let code = match refusal.http_status {
+                400 | 404 => INVALID_PARAMS,
+                _ => INVALID_REQUEST,
+            };
+            rpc_err(code, refusal.message)
+        };
+        match method {
+            Method::SystemUpgrade => {
+                self.require_admin(method)?;
+                let req: zeroclaw_api::jsonrpc::SystemUpgradeRequest = parse_params(params)?;
+                let allow_self_upgrade = self.ctx.config.read().gateway.allow_self_upgrade;
+                // Inside the daemon a self-respawn goes through the daemon's
+                // own shutdown path, so there is no standalone watch to pass.
+                let accepted = crate::self_upgrade::start_upgrade(
+                    allow_self_upgrade,
+                    crate::self_upgrade::UpgradeRequest {
+                        version: req.version,
+                        auto_restart: req.auto_restart,
+                    },
+                    None,
+                )
+                .map_err(refusal)?;
+                Ok(serde_json::to_value(accepted).unwrap_or(Value::Null))
+            }
+            Method::SystemUpgradeStatus => {
+                let req: zeroclaw_api::jsonrpc::SystemUpgradeStatusRequest = parse_params(params)?;
+                let status = crate::self_upgrade::upgrade_status(req.handoff_id.as_deref())
+                    .map_err(refusal)?;
+                Ok(serde_json::to_value(status).unwrap_or(Value::Null))
+            }
+            Method::SystemRestart => {
+                self.require_admin(method)?;
+                let req: zeroclaw_api::jsonrpc::SystemRestartRequest = parse_params(params)?;
+                if req.component != "daemon" {
+                    return Err(rpc_err(
+                        INVALID_PARAMS,
+                        format!(
+                            "cannot restart {:?}; the supported component is \"daemon\"",
+                            req.component
+                        ),
+                    ));
+                }
+                if !self.schedule_daemon_reload("system/restart") {
+                    return Err(rpc_err(
+                        INVALID_REQUEST,
+                        "no daemon supervisor is attached; restart the process instead",
+                    ));
+                }
+                Ok(serde_json::json!({ "component": "daemon", "restarting": true }))
+            }
+            _ => Err(rpc_err(
+                INTERNAL_ERROR,
+                format!("{} is not a system method", method.wire_name()),
+            )),
+        }
+    }
+
     /// Refuse `method` unless the bound principal is an administrator. An
     /// unbound dispatcher is refused.
     fn require_admin(&self, method: Method) -> Result<(), JsonRpcError> {
@@ -3121,6 +3196,9 @@ impl RpcDispatcher {
             | Method::PairingRevokeAll
             | Method::PairingNewCode => {
                 Box::pin(self.handle_pairing_method(method, &req.params)).await
+            }
+            Method::SystemUpgrade | Method::SystemUpgradeStatus | Method::SystemRestart => {
+                self.handle_system_method(method, &req.params)
             }
             Method::ChannelsList | Method::ChannelsRelink | Method::ChannelsBind => {
                 Box::pin(self.handle_channels_method(method, &req.params)).await

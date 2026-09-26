@@ -995,3 +995,116 @@ async fn channels_bind_needs_the_peer_groups_config_write_grant() {
         "the bind never reached the capability"
     );
 }
+
+// ── System ────────────────────────────────────────────────────────────────
+//
+// None of these may start a real upgrade: that would run `zeroclaw update`
+// on the test binary. Only refusals and status are exercised.
+
+#[test]
+fn system_methods_are_classified_and_named() {
+    use zeroclaw_api::grants::{Resource, Verb};
+    for (method, wire, verb) in [
+        (Method::SystemUpgrade, "system/upgrade", Verb::Execute),
+        (Method::SystemRestart, "system/restart", Verb::Execute),
+        (
+            Method::SystemUpgradeStatus,
+            "system/upgrade-status",
+            Verb::Read,
+        ),
+    ] {
+        assert_eq!(method.wire_name(), wire);
+        assert_eq!(Method::from_wire(wire), Some(method));
+        assert_eq!(
+            method.authz(),
+            MethodAuthz::Requires(Resource::System, verb),
+            "{wire}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn system_upgrade_honors_allow_self_upgrade() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let mut config = make_acp_test_config(&tmp);
+    config.gateway.allow_self_upgrade = false;
+    let ctx = enforcement_ctx(config);
+    let (mut operator, mut rx) = local_operator(&ctx).await;
+    let upgraded = rpc(&mut operator, &mut rx, 1, "system/upgrade", json!({})).await;
+    assert_eq!(
+        upgraded["error"]["code"],
+        json!(INVALID_REQUEST),
+        "{upgraded}"
+    );
+    assert!(
+        upgraded["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("allow_self_upgrade")),
+        "{upgraded}"
+    );
+}
+
+#[tokio::test]
+async fn system_restart_restarts_only_the_daemon_and_needs_a_supervisor() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let ctx = enforcement_ctx(make_acp_test_config(&tmp));
+    let (mut operator, mut rx) = local_operator(&ctx).await;
+    let other = rpc(
+        &mut operator,
+        &mut rx,
+        1,
+        "system/restart",
+        json!({"component": "gateway"}),
+    )
+    .await;
+    assert_eq!(other["error"]["code"], json!(INVALID_PARAMS), "{other}");
+    // The minimal context has no reload channel, as a daemon-less process.
+    let daemon = rpc(
+        &mut operator,
+        &mut rx,
+        2,
+        "system/restart",
+        json!({"component": "daemon"}),
+    )
+    .await;
+    assert_eq!(daemon["error"]["code"], json!(INVALID_REQUEST), "{daemon}");
+}
+
+#[tokio::test]
+async fn system_upgrade_and_restart_are_for_administrators() {
+    use std::collections::HashMap;
+    use zeroclaw_api::grants::{Resource, Verb};
+    use zeroclaw_config::schema::{PermissionProfileConfig, UserConfig};
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let mut config = make_acp_test_config(&tmp);
+    config.gateway.allow_self_upgrade = true;
+    config.permission_profiles.insert(
+        "system-exec".into(),
+        PermissionProfileConfig {
+            allowed_agents: vec![zeroclaw_api::grants::WILDCARD.into()],
+            grants: HashMap::from([(Resource::System, vec![Verb::Read, Verb::Execute])]),
+            ..PermissionProfileConfig::default()
+        },
+    );
+    config.users.insert(
+        "scoped".into(),
+        UserConfig {
+            uid: Some(SCOPED),
+            permission_profiles: vec!["system-exec".into()],
+            ..UserConfig::default()
+        },
+    );
+    let ctx = enforcement_ctx(config);
+    let (mut peer, mut rx) = roster_peer(&ctx, SCOPED).await;
+    for (id, method, params) in [
+        (1, "system/upgrade", json!({})),
+        (2, "system/restart", json!({"component": "daemon"})),
+    ] {
+        let response = rpc(&mut peer, &mut rx, id, method, params).await;
+        assert_forbidden(&response, method);
+    }
+    // Reading progress needs only system:read.
+    let status = rpc(&mut peer, &mut rx, 3, "system/upgrade-status", json!({})).await;
+    assert!(status["result"]["state"].is_string(), "{status}");
+}
