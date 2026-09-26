@@ -560,6 +560,22 @@ pub struct ToolsListRequest {
     pub agent: Option<String>,
 }
 
+/// Request payload for `pairing/revoke`: revoke one paired device's bearer
+/// token.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PairingRevokeRequest {
+    pub device_id: String,
+}
+
+/// Request payload for `pairing/new-code`: mint a one-time pairing code,
+/// first revoking every paired token (`rotate: "all"`) or one device's
+/// (`rotate: <device id>`) when given.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PairingNewCodeRequest {
+    #[serde(default)]
+    pub rotate: Option<String>,
+}
+
 /// Request payload for `canvas/get`, `canvas/history` and `canvas/clear`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CanvasIdRequest {

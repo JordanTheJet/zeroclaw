@@ -22,6 +22,7 @@ pub mod control_plane;
 pub mod cost;
 pub mod cron;
 pub mod daemon;
+pub mod devices;
 pub mod doctor;
 pub mod enroll;
 pub mod health;
