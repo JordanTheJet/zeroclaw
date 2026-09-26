@@ -110,6 +110,27 @@ impl ProviderSource for ConfigProviders {
         )?;
         Ok(Arc::from(provider))
     }
+
+    /// The agent's config-snapshot switch recipe, so a capability-built agent
+    /// on these sources switches exactly as an adapter-built agent does. It
+    /// differs from a session start in two places: a matching `model_routes`
+    /// credential is preferred, and a bare-family target takes only the
+    /// root multimodal policy rather than the agent's other options.
+    fn switched_model_provider(
+        &self,
+        request: &ProviderRequest<'_>,
+    ) -> anyhow::Result<Arc<dyn ModelProvider>> {
+        let (Some(provider_ref), Some(model)) = (request.provider_ref, request.model) else {
+            return self.model_provider(request);
+        };
+        let (provider, _resolver) = crate::agent::agent::config_switch_provider(
+            request.config,
+            request.agent_alias,
+            provider_ref,
+            model,
+        )?;
+        Ok(Arc::from(provider))
+    }
 }
 
 /// Opens the agent's memory with the agent provider's credential, which

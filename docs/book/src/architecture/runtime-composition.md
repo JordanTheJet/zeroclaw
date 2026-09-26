@@ -95,6 +95,9 @@ pub struct RuntimeCapabilities {
 pub trait ProviderSource: Send + Sync {
     fn model_provider(&self, request: &ProviderRequest<'_>)
         -> anyhow::Result<Arc<dyn ModelProvider>>;
+    // Defaults to `model_provider`.
+    fn switched_model_provider(&self, request: &ProviderRequest<'_>)
+        -> anyhow::Result<Arc<dyn ModelProvider>>;
 }
 #[async_trait]
 pub trait MemorySource: Send + Sync {
@@ -108,7 +111,7 @@ pub trait ChannelSource: Send + Sync {
 }
 ```
 
-`ProviderRequest` carries the config, the agent alias, an optional explicit provider reference, the model the runtime resolved, and the requesting principal when the entry point knows one (`Option<&PrincipalId>`). The principal is in the request from the start because adding a field to a trait request that embedders implement against is a breaking change later; a source may use it to choose credentials or quotas, and it grants nothing. `MemorySource::memory` is asynchronous because opening a store can touch disk or the network. `MemoryRequest` carries the config and agent alias. `ToolRequest` carries the config, agent alias, resolved `SecurityPolicy`, selected `RuntimeAdapter`, and the agent's memory handle.
+`ProviderRequest` carries the config, the agent alias, an optional explicit provider reference, the model the runtime resolved, and the requesting principal when the entry point knows one (`Option<&PrincipalId>`). The principal is in the request from the start because adding a field to a trait request that embedders implement against is a breaking change later; a source may use it to choose credentials or quotas, and it grants nothing. `ProviderSource::switched_model_provider` serves an agent's mid-session model switch and defaults to `model_provider`; a source overrides it only when a switch resolves credentials or options differently from a session start, as the runtime's config-backed source does to keep the agent's existing switch behavior. `MemorySource::memory` is asynchronous because opening a store can touch disk or the network. `MemoryRequest` carries the config and agent alias. `ToolRequest` carries the config, agent alias, resolved `SecurityPolicy`, selected `RuntimeAdapter`, and the agent's memory handle.
 
 The runtime entry point these feed is proposed as follows. It is **not** in the skeleton, because it cannot exist without an implementation:
 

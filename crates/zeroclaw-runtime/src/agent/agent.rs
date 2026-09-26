@@ -3124,7 +3124,7 @@ impl Agent {
             // switch cannot step outside the embedder's providers.
             (Some(full_config), Some(provider_source)) => provider_source
                 .source
-                .model_provider(&crate::composition::ProviderRequest {
+                .switched_model_provider(&crate::composition::ProviderRequest {
                     config: full_config,
                     agent_alias: &self.agent_alias,
                     provider_ref: Some(&new_model_provider),
@@ -3141,47 +3141,12 @@ impl Agent {
                         ),
                     )
                 }),
-            (Some(full_config), None) => {
-                let target_entry = new_model_provider
-                    .split_once('.')
-                    .and_then(|(family, alias)| full_config.providers.models.find(family, alias));
-                // A dotted target profile is the canonical source of endpoint
-                // and credentials. Falling back to the current agent profile is
-                // only retained for legacy bare-family switch requests.
-                let current_agent_entry = full_config
-                    .resolved_model_provider_for_agent(&self.agent_alias)
-                    .map(|(_ty, _alias, entry)| entry);
-                let target_or_current = target_entry.or(current_agent_entry);
-                let default_api_key = target_or_current.and_then(|entry| entry.api_key.as_deref());
-                let default_base_url = target_or_current.and_then(|entry| entry.uri.as_deref());
-
-                // Prefer a route-specific api_key when the switched
-                // provider/model matches a configured model_route entry.
-                let route_api_key = full_config
-                    .model_routes
-                    .iter()
-                    .find(|r| {
-                        r.model_provider.eq_ignore_ascii_case(&new_model_provider)
-                            && (r.model.eq_ignore_ascii_case(&new_model)
-                                || r.hint.eq_ignore_ascii_case(&new_model))
-                    })
-                    .and_then(|r| r.api_key.as_deref());
-                let api_key = route_api_key.or(default_api_key);
-
-                let runtime_options =
-                    switch_runtime_options(full_config.as_ref(), &new_model_provider);
-
-                zeroclaw_providers::create_routed_model_provider_with_options_and_resolver(
-                    full_config.as_ref(),
-                    &new_model_provider,
-                    api_key,
-                    default_base_url,
-                    &full_config.reliability,
-                    &full_config.model_routes,
-                    &new_model,
-                    &runtime_options,
-                )
-            }
+            (Some(full_config), None) => config_switch_provider(
+                full_config.as_ref(),
+                &self.agent_alias,
+                &new_model_provider,
+                &new_model,
+            ),
             (None, _) => Err(anyhow::Error::msg(
                 "model_switch requested but agent has no provider_switch_config; \
                  cannot rebuild provider safely",
@@ -4553,6 +4518,59 @@ impl Agent {
         listen_handle.abort();
         Ok(())
     }
+}
+
+/// Rebuild an agent's provider for a mid-session model switch from config.
+///
+/// A dotted target profile is the canonical source of endpoint and
+/// credentials; the current agent's profile is the fallback only for a
+/// legacy bare-family switch. A `model_routes` entry naming the switched
+/// provider and model (or hint) supplies the credential first. The
+/// config-backed provider source's switch recipe is this function, so an
+/// agent built from supplied config-backed capabilities switches exactly as
+/// an adapter-built agent does.
+pub(crate) fn config_switch_provider(
+    config: &Config,
+    agent_alias: &str,
+    new_model_provider: &str,
+    new_model: &str,
+) -> Result<(
+    Box<dyn ModelProvider>,
+    Arc<zeroclaw_providers::router::ModelRouteResolver>,
+)> {
+    let target_entry = new_model_provider
+        .split_once('.')
+        .and_then(|(family, alias)| config.providers.models.find(family, alias));
+    let current_agent_entry = config
+        .resolved_model_provider_for_agent(agent_alias)
+        .map(|(_ty, _alias, entry)| entry);
+    let target_or_current = target_entry.or(current_agent_entry);
+    let default_api_key = target_or_current.and_then(|entry| entry.api_key.as_deref());
+    let default_base_url = target_or_current.and_then(|entry| entry.uri.as_deref());
+
+    let route_api_key = config
+        .model_routes
+        .iter()
+        .find(|r| {
+            r.model_provider.eq_ignore_ascii_case(new_model_provider)
+                && (r.model.eq_ignore_ascii_case(new_model)
+                    || r.hint.eq_ignore_ascii_case(new_model))
+        })
+        .and_then(|r| r.api_key.as_deref());
+    let api_key = route_api_key.or(default_api_key);
+
+    let runtime_options = switch_runtime_options(config, new_model_provider);
+
+    zeroclaw_providers::create_routed_model_provider_with_options_and_resolver(
+        config,
+        new_model_provider,
+        api_key,
+        default_base_url,
+        &config.reliability,
+        &config.model_routes,
+        new_model,
+        &runtime_options,
+    )
 }
 
 /// Runtime options for the provider a live model switch rebuilds.
@@ -17372,20 +17390,75 @@ mod capability_construction_tests {
             "the agent's memory comes from the memory source"
         );
 
-        // A model switch asks the same source, still for the same principal.
+        // A model switch asks the same source through its switch entry, still
+        // for the same principal.
         let switched =
             agent.try_apply_model_switch("gpt-4o-mini", "openai.smart".into(), "gpt-4o".into());
         assert_eq!(switched.as_deref(), Some("gpt-4o"));
         assert_eq!(
-            providers.seen.lock().last(),
-            Some(&SeenProviderRequest {
+            *providers.switches.lock(),
+            vec![SeenProviderRequest {
                 agent_alias: "test-agent".into(),
                 provider_ref: Some("openai.smart".into()),
                 model: Some("gpt-4o".into()),
                 principal: Some(principal),
-            })
+            }]
+        );
+        assert_eq!(
+            providers.seen.lock().len(),
+            1,
+            "a switch is not a session-start request"
         );
         assert_eq!(agent.model_provider_name, "openai.smart");
+    }
+
+    /// The config-backed source's switch recipe is the adapter's, so an agent
+    /// built from supplied config-backed capabilities keeps the route-keyed
+    /// bare-family switch an adapter-built agent performs.
+    #[tokio::test]
+    async fn a_config_backed_capability_agent_switches_like_an_adapter_built_agent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = two_provider_config(&tmp);
+        config
+            .model_routes
+            .push(zeroclaw_config::schema::ModelRouteConfig {
+                model_provider: "ollama".to_string(),
+                model: "tinyllama".to_string(),
+                hint: "fast".to_string(),
+                api_key: Some("route-specific-key".to_string()),
+            });
+
+        let mut supplied = Agent::from_config_with_capabilities(
+            &config,
+            "test-agent",
+            &RuntimeCapabilities::config_backed_unobserved(),
+            None,
+        )
+        .await
+        .expect("agent builds from config-backed capabilities");
+        let mut adapter = Agent::from_config(&config, "test-agent")
+            .await
+            .expect("agent builds through the adapter");
+
+        for agent in [&mut supplied, &mut adapter] {
+            let switched = agent.try_apply_model_switch(
+                "gpt-4o-mini",
+                "ollama".to_string(),
+                "tinyllama".to_string(),
+            );
+            assert_eq!(switched.as_deref(), Some("tinyllama"));
+            assert_eq!(agent.model_provider_name, "ollama");
+            assert_eq!(
+                agent.model_route_resolver.resolve("hint:fast"),
+                config_switch_provider(&config, "test-agent", "ollama", "tinyllama")
+                    .expect("the shared switch recipe builds")
+                    .1
+                    .resolve("hint:fast"),
+                "both agents carry the switch recipe's route resolver"
+            );
+        }
+        assert!(supplied.provider_source.is_some());
+        assert!(adapter.provider_source.is_none());
     }
 
     #[tokio::test]
