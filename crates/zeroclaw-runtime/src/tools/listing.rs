@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use zeroclaw_config::schema::Config;
 
-use super::{CanvasStore, Tool, ToolSpec, scoped};
+use super::{CanvasStore, ToolSpec, scoped};
 use crate::platform::RuntimeAdapter;
 use crate::security::SecurityPolicy;
 use crate::sop::{SopAuditLogger, SopEngine};
