@@ -26203,7 +26203,9 @@ mod tests {
                 .permission_profiles
                 .get_mut("config-writer")
                 .expect("the fixture profile exists");
-            profile.allowed_agents = vec!["bot".into()];
+            // Wildcard rather than "bot": naming the deleted agent here would
+            // leave a dangling reference the auth validation refuses to save.
+            profile.allowed_agents = vec![zeroclaw_api::grants::WILDCARD.into()];
             for resource in [Resource::Memory, Resource::Cron, Resource::Sessions] {
                 profile.grants.insert(resource, vec![Verb::Delete]);
             }
