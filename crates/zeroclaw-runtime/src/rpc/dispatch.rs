@@ -16692,10 +16692,13 @@ mod tests {
         }
 
         let history = d.handle_events_history().expect("history is available");
+        // Parallel tests can record into the same process-wide hook; only this
+        // test's turn is asserted on.
         let types: Vec<_> = history["events"]
             .as_array()
             .expect("events array")
             .iter()
+            .filter(|event| event["turn_id"] == json!("g2a-turn"))
             .map(|event| event["type"].clone())
             .collect();
         assert_eq!(
