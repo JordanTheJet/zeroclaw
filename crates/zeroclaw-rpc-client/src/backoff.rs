@@ -6,7 +6,9 @@
 
 use std::time::Duration;
 
-/// Exponential backoff with +-25% jitter, capped.
+/// Exponential backoff with +-25% jitter, capped. Call
+/// [`Backoff::next_delay`] before each retry and [`Backoff::reset`] after a
+/// success.
 #[derive(Debug, Clone)]
 pub struct Backoff {
     initial: Duration,
@@ -16,7 +18,7 @@ pub struct Backoff {
 }
 
 impl Backoff {
-    /// Start at `initial` and double up to `cap` on each [`Backoff::next`].
+    /// Start at `initial` and double up to `cap` on each [`Backoff::next_delay`].
     pub fn new(initial: Duration, cap: Duration) -> Self {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -30,7 +32,7 @@ impl Backoff {
     }
 
     /// The next delay to sleep before retrying, then advance.
-    pub fn next(&mut self) -> Duration {
+    pub fn next_delay(&mut self) -> Duration {
         let base = self.current;
         self.current = (self.current * 2).min(self.cap);
         // xorshift64*: cheap, good enough to de-synchronize retry storms.
@@ -48,7 +50,7 @@ impl Backoff {
         self.current = self.initial;
     }
 
-    /// The undelayed delay the next call to [`Backoff::next`] is based on.
+    /// The undelayed delay the next call to [`Backoff::next_delay`] is based on.
     pub fn current(&self) -> Duration {
         self.current
     }
@@ -63,7 +65,7 @@ mod tests {
         let mut b = Backoff::new(Duration::from_millis(100), Duration::from_millis(1000));
         let mut expected = 100u64;
         for _ in 0..8 {
-            let d = b.next().as_millis() as u64;
+            let d = b.next_delay().as_millis() as u64;
             assert!(
                 d >= expected * 3 / 4 && d <= expected * 5 / 4,
                 "{d} vs {expected}"
