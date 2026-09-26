@@ -1433,7 +1433,7 @@ pub enum SessionUpdateEvent {
     },
 }
 
-/// Wire-stable subset of [`crate::rpc::turn::TurnOutcome`] for
+/// Wire-stable subset of the runtime's `rpc::turn::TurnOutcome` for
 /// `TurnComplete`. `messages` is intentionally not on the wire — the TUI
 /// rebuilds from streamed chunks.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -1487,7 +1487,7 @@ rpc_type! {
         pub storage: Vec<String>,
         /// Picker rows for "Create new model provider" — sourced from
         /// the canonical `zeroclaw_providers::list_model_providers()`
-        /// registry by [`crate::quickstart::snapshot_state`].
+        /// registry by the runtime's `quickstart::snapshot_state`.
         pub model_provider_types: Vec<QuickstartTypeOption>,
         /// Picker rows for "Create new channel" — sourced from the
         /// schema's `ChannelsConfig` by walking its serialised
