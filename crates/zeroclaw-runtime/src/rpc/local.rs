@@ -1127,13 +1127,16 @@ mod tests {
     /// Whether a read result means the daemon closed the connection. Linux
     /// resets a Unix socket that closes with unread data in its receive
     /// buffer, so the peer sees `ConnectionReset` where macOS reports end of
-    /// stream; both mean the same thing here.
-    #[cfg(unix)]
+    /// stream, and a Windows named pipe reports `BrokenPipe` once the server
+    /// closes its end. All of them mean the same thing here.
     fn is_closed_by_peer(read: &std::io::Result<usize>) -> bool {
         match read {
             Ok(0) => true,
             Ok(_) => false,
-            Err(error) => error.kind() == std::io::ErrorKind::ConnectionReset,
+            Err(error) => matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe
+            ),
         }
     }
 
@@ -2863,6 +2866,132 @@ mod tests {
             LocalListenerLimits::from_config(&config).write_timeout,
             LOCAL_PEER_WRITE_TIMEOUT
         );
+    }
+
+    /// Connect to the listener's named pipe, retrying until the server has a
+    /// pending instance ready.
+    #[cfg(windows)]
+    async fn open_pipe_client(pipe_name: &str) -> tokio::net::windows::named_pipe::NamedPipeClient {
+        use tokio::net::windows::named_pipe::ClientOptions;
+
+        for _ in 0..250 {
+            match ClientOptions::new().open(pipe_name) {
+                Ok(client) => return client,
+                Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+            }
+        }
+        panic!("named pipe {pipe_name} never accepted a client");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn pipe_oversized_frame_gets_frame_too_large_then_close() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(tmp.path());
+        let pipe_name = socket_path(&ctx.config.read())
+            .to_string_lossy()
+            .into_owned();
+        let cancel = CancellationToken::new();
+        let server_cancel = cancel.clone();
+        let server_ctx = ctx.clone();
+        let server = zeroclaw_spawn::spawn!(async move {
+            run_local_listener(server_ctx, server_cancel, test_client_count(), None).await
+        });
+
+        let client = open_pipe_client(&pipe_name).await;
+        let (read_half, mut write_half) = tokio::io::split(client);
+        let mut reader = tokio::io::BufReader::new(read_half);
+        let oversized_frame = zeroclaw_spawn::spawn!(async move {
+            let mut frame = vec![b'a'; 9 * 1024 * 1024];
+            frame.push(b'\n');
+            let _ = write_half.write_all(&frame).await;
+            write_half
+        });
+
+        let mut line = String::new();
+        tokio::time::timeout(Duration::from_secs(10), reader.read_line(&mut line))
+            .await
+            .expect("the daemon answers an oversized frame")
+            .expect("read the error frame");
+        let frame: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(
+            frame["error"]["code"],
+            zeroclaw_api::jsonrpc::error_codes::INVALID_REQUEST,
+            "{frame}"
+        );
+        assert_eq!(frame["error"]["data"]["reason"], "frame_too_large");
+        assert!(frame["id"].is_null(), "{frame}");
+
+        let mut rest = String::new();
+        let read = tokio::time::timeout(Duration::from_secs(10), reader.read_line(&mut rest))
+            .await
+            .expect("the pipe closes after the error");
+        assert!(
+            is_closed_by_peer(&read),
+            "the pipe closes after the error: {read:?} {rest}"
+        );
+
+        oversized_frame.abort();
+        cancel.cancel();
+        let _ = server.await;
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn pipe_connections_past_the_ceiling_get_a_diagnostic_and_are_closed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(tmp.path());
+        let pipe_name = socket_path(&ctx.config.read())
+            .to_string_lossy()
+            .into_owned();
+        let cancel = CancellationToken::new();
+        let server_cancel = cancel.clone();
+        let server_ctx = ctx.clone();
+        let server = zeroclaw_spawn::spawn!(async move {
+            run_local_listener_with_limits(
+                server_ctx,
+                server_cancel,
+                test_client_count(),
+                None,
+                LocalListenerLimits {
+                    max_connections: 1,
+                    write_timeout: LOCAL_PEER_WRITE_TIMEOUT,
+                },
+            )
+            .await
+        });
+
+        // The accept loop takes the first client's slot before it creates the
+        // pipe instance the second client can open, so the second is past
+        // the ceiling by the time it is accepted.
+        let first = open_pipe_client(&pipe_name).await;
+        let refused = open_pipe_client(&pipe_name).await;
+        let mut refused = tokio::io::BufReader::new(refused);
+        let mut line = String::new();
+        tokio::time::timeout(Duration::from_secs(5), refused.read_line(&mut line))
+            .await
+            .expect("a refused client is told why")
+            .expect("read the refusal");
+        let frame: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(
+            frame["error"]["code"],
+            zeroclaw_api::jsonrpc::error_codes::CONNECTION_LIMIT_REACHED,
+            "{frame}"
+        );
+        assert_eq!(frame["error"]["data"]["limit"], 1);
+
+        let mut rest = String::new();
+        let read = tokio::time::timeout(Duration::from_secs(5), refused.read_line(&mut rest))
+            .await
+            .expect("the refused pipe closes");
+        assert!(
+            is_closed_by_peer(&read),
+            "the refused pipe closes: {read:?} {rest}"
+        );
+
+        drop(first);
+        cancel.cancel();
+        let _ = server.await;
     }
 
     #[cfg(windows)]

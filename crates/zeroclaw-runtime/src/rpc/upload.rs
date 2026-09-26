@@ -7,10 +7,15 @@
 //! becoming a memory sink: a per-connection upload count, an idle deadline,
 //! and a process-wide byte budget that every staged byte is charged against
 //! when the upload begins.
+//!
+//! The idle deadline is enforced by the budget as well as by the owning
+//! connection. When a reservation does not fit, the budget reclaims every
+//! upload idle past the deadline, freeing its bytes and its reservation,
+//! even while the connection that began it stays open and silent.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
 use zeroclaw_api::jsonrpc::JsonRpcError;
@@ -26,7 +31,8 @@ pub const UPLOAD_CHUNK_BYTES: u64 = 1024 * 1024;
 pub const MAX_UPLOADS_PER_CONNECTION: usize = 4;
 
 /// An upload with no `begin`, `chunk`, or `commit` activity for this long is
-/// discarded the next time its connection touches uploads.
+/// discarded: by its connection the next time that connection touches
+/// uploads, or by the budget when another upload needs the space.
 pub const UPLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 /// Bytes all connections together may hold in staged uploads.
@@ -40,6 +46,10 @@ fn invalid(message: impl Into<String>) -> JsonRpcError {
     }
 }
 
+fn expired(upload_id: &str) -> JsonRpcError {
+    invalid(format!("Unknown or expired upload `{upload_id}`"))
+}
+
 /// A shared ceiling on staged bytes. Space is reserved for an upload's full
 /// declared size when it begins, so chunks never fail for lack of budget
 /// halfway through.
@@ -47,6 +57,9 @@ fn invalid(message: impl Into<String>) -> JsonRpcError {
 pub struct UploadBudget {
     limit: u64,
     used: AtomicU64,
+    /// Every live upload's slot, so idle ones can be reclaimed without their
+    /// connection's help.
+    slots: Mutex<Vec<Weak<Slot>>>,
 }
 
 impl UploadBudget {
@@ -54,6 +67,7 @@ impl UploadBudget {
         Arc::new(Self {
             limit,
             used: AtomicU64::new(0),
+            slots: Mutex::new(Vec::new()),
         })
     }
 
@@ -65,16 +79,56 @@ impl UploadBudget {
             .clone()
     }
 
-    fn reserve(self: &Arc<Self>, bytes: u64) -> Option<BudgetLease> {
+    fn try_charge(&self, bytes: u64) -> bool {
         self.used
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
                 used.checked_add(bytes).filter(|total| *total <= self.limit)
             })
-            .ok()?;
-        Some(BudgetLease {
+            .is_ok()
+    }
+
+    fn lock_slots(&self) -> MutexGuard<'_, Vec<Weak<Slot>>> {
+        self.slots.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Reserve `bytes` for a new upload, reclaiming idle uploads first if
+    /// the budget is full.
+    fn reserve(self: &Arc<Self>, now: Instant, bytes: u64) -> Option<Arc<Slot>> {
+        if !self.try_charge(bytes) {
+            self.reclaim_idle(now);
+            if !self.try_charge(bytes) {
+                return None;
+            }
+        }
+        let slot = Arc::new(Slot {
             budget: Arc::clone(self),
-            bytes,
-        })
+            reserved: bytes,
+            state: Mutex::new(SlotState {
+                data: Vec::with_capacity(usize::try_from(bytes).unwrap_or(0)),
+                last_activity: now,
+                reclaimed: false,
+            }),
+        });
+        let mut slots = self.lock_slots();
+        slots.retain(|slot| slot.strong_count() > 0);
+        slots.push(Arc::downgrade(&slot));
+        Some(slot)
+    }
+
+    /// Release every upload idle past [`UPLOAD_IDLE_TIMEOUT`], wherever its
+    /// connection is.
+    fn reclaim_idle(&self, now: Instant) {
+        let live: Vec<Arc<Slot>> = {
+            let mut slots = self.lock_slots();
+            slots.retain(|slot| slot.strong_count() > 0);
+            slots.iter().filter_map(Weak::upgrade).collect()
+        };
+        for slot in live {
+            let mut state = slot.lock_state();
+            if state.is_idle(now) {
+                slot.release(&mut state);
+            }
+        }
     }
 
     #[cfg(test)]
@@ -83,17 +137,52 @@ impl UploadBudget {
     }
 }
 
-/// Returns its reservation to the budget when the upload is committed,
-/// discarded, or dropped with its connection.
+/// One upload's staged bytes and its budget reservation, shared between the
+/// connection that owns the upload and the budget that may reclaim it.
 #[derive(Debug)]
-struct BudgetLease {
+struct Slot {
     budget: Arc<UploadBudget>,
-    bytes: u64,
+    reserved: u64,
+    state: Mutex<SlotState>,
 }
 
-impl Drop for BudgetLease {
+#[derive(Debug)]
+struct SlotState {
+    data: Vec<u8>,
+    last_activity: Instant,
+    /// Set once the reservation has been returned; the upload is dead.
+    reclaimed: bool,
+}
+
+impl SlotState {
+    fn is_idle(&self, now: Instant) -> bool {
+        !self.reclaimed && now.saturating_duration_since(self.last_activity) >= UPLOAD_IDLE_TIMEOUT
+    }
+}
+
+impl Slot {
+    fn lock_state(&self) -> MutexGuard<'_, SlotState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Return the reservation and free the bytes, once.
+    fn release(&self, state: &mut SlotState) {
+        if state.reclaimed {
+            return;
+        }
+        state.reclaimed = true;
+        state.data = Vec::new();
+        self.budget.used.fetch_sub(self.reserved, Ordering::AcqRel);
+    }
+}
+
+impl Drop for Slot {
     fn drop(&mut self) {
-        self.budget.used.fetch_sub(self.bytes, Ordering::AcqRel);
+        let state = self.state.get_mut().unwrap_or_else(PoisonError::into_inner);
+        if !state.reclaimed {
+            state.reclaimed = true;
+            self.budget.used.fetch_sub(self.reserved, Ordering::AcqRel);
+        }
     }
 }
 
@@ -113,9 +202,7 @@ struct StagedUpload {
     filename: String,
     declared_size: u64,
     expected_sha256: Option<String>,
-    data: Vec<u8>,
-    last_activity: Instant,
-    _lease: BudgetLease,
+    slot: Arc<Slot>,
 }
 
 /// What `begin` needs to know about an upload, after the dispatcher has
@@ -149,9 +236,13 @@ impl UploadStaging {
         }
     }
 
+    /// Drop uploads that are idle past the deadline or were already
+    /// reclaimed by the budget.
     fn evict_idle(&mut self, now: Instant) {
-        self.uploads
-            .retain(|_, upload| now.duration_since(upload.last_activity) < UPLOAD_IDLE_TIMEOUT);
+        self.uploads.retain(|_, upload| {
+            let state = upload.slot.lock_state();
+            !state.reclaimed && !state.is_idle(now)
+        });
     }
 
     /// Stage a new upload and return its id.
@@ -174,14 +265,16 @@ impl UploadStaging {
                  commit them or let them expire before beginning another"
             )));
         }
-        let lease = self.budget.reserve(request.size_bytes).ok_or_else(|| {
-            invalid(
-                "The daemon is staging too many uploads to accept this one now; retry after \
+        let slot = self
+            .budget
+            .reserve(now, request.size_bytes)
+            .ok_or_else(|| {
+                invalid(
+                    "The daemon is staging too many uploads to accept this one now; retry after \
                  in-progress uploads finish",
-            )
-        })?;
+                )
+            })?;
         let upload_id = uuid::Uuid::new_v4().simple().to_string();
-        let capacity = usize::try_from(request.size_bytes).unwrap_or(0);
         self.uploads.insert(
             upload_id.clone(),
             StagedUpload {
@@ -190,9 +283,7 @@ impl UploadStaging {
                 filename: request.filename.unwrap_or_else(|| "upload".to_string()),
                 declared_size: request.size_bytes,
                 expected_sha256,
-                data: Vec::with_capacity(capacity),
-                last_activity: now,
-                _lease: lease,
+                slot,
             },
         );
         Ok(upload_id)
@@ -209,15 +300,19 @@ impl UploadStaging {
         self.evict_idle(now);
         let upload = self
             .uploads
-            .get_mut(upload_id)
-            .ok_or_else(|| invalid(format!("Unknown or expired upload `{upload_id}`")))?;
+            .get(upload_id)
+            .ok_or_else(|| expired(upload_id))?;
         let chunk_len = chunk.len() as u64;
         if chunk_len == 0 || chunk_len > UPLOAD_CHUNK_BYTES {
             return Err(invalid(format!(
                 "A chunk must carry between 1 and {UPLOAD_CHUNK_BYTES} decoded bytes"
             )));
         }
-        let received = upload.data.len() as u64;
+        let mut state = upload.slot.lock_state();
+        if state.reclaimed {
+            return Err(expired(upload_id));
+        }
+        let received = state.data.len() as u64;
         let end = offset
             .checked_add(chunk_len)
             .ok_or_else(|| invalid("Chunk offset overflows"))?;
@@ -227,10 +322,10 @@ impl UploadStaging {
             let same = end <= received
                 && usize::try_from(offset)
                     .ok()
-                    .and_then(|start| upload.data.get(start..start + chunk.len()))
+                    .and_then(|start| state.data.get(start..start + chunk.len()))
                     == Some(chunk);
             if same {
-                upload.last_activity = now;
+                state.last_activity = now;
                 return Ok(received);
             }
             return Err(invalid(format!(
@@ -248,8 +343,8 @@ impl UploadStaging {
                 upload.declared_size
             )));
         }
-        upload.data.extend_from_slice(chunk);
-        upload.last_activity = now;
+        state.data.extend_from_slice(chunk);
+        state.last_activity = now;
         Ok(end)
     }
 
@@ -265,36 +360,48 @@ impl UploadStaging {
         self.evict_idle(now);
         let upload = self
             .uploads
-            .get_mut(upload_id)
-            .ok_or_else(|| invalid(format!("Unknown or expired upload `{upload_id}`")))?;
-        upload.last_activity = now;
-        let received = upload.data.len() as u64;
-        if received != upload.declared_size {
-            return Err(invalid(format!(
-                "Upload has {received} of {} declared bytes; send the rest before committing",
-                upload.declared_size
-            )));
-        }
-        if let Some(expected) = &upload.expected_sha256 {
-            let actual = format!("{:x}", Sha256::digest(&upload.data));
-            if &actual != expected {
-                // The bytes will never match now; discard rather than keep a
-                // dead upload charged against the budget.
-                self.uploads.remove(upload_id);
-                return Err(invalid(
-                    "Upload content does not match the SHA-256 declared at begin; begin again",
-                ));
+            .get(upload_id)
+            .ok_or_else(|| expired(upload_id))?;
+        let bytes = {
+            let mut state = upload.slot.lock_state();
+            if state.reclaimed {
+                return Err(expired(upload_id));
             }
-        }
+            state.last_activity = now;
+            let received = state.data.len() as u64;
+            if received != upload.declared_size {
+                return Err(invalid(format!(
+                    "Upload has {received} of {} declared bytes; send the rest before committing",
+                    upload.declared_size
+                )));
+            }
+            let matches = upload
+                .expected_sha256
+                .as_ref()
+                .is_none_or(|expected| *expected == format!("{:x}", Sha256::digest(&state.data)));
+            if matches {
+                Some(std::mem::take(&mut state.data))
+            } else {
+                None
+            }
+        };
+        // Removing the upload drops its slot, which returns the reservation.
         let upload = self
             .uploads
             .remove(upload_id)
-            .ok_or_else(|| invalid(format!("Unknown or expired upload `{upload_id}`")))?;
+            .ok_or_else(|| expired(upload_id))?;
+        let Some(bytes) = bytes else {
+            // The bytes will never match now; the upload is discarded rather
+            // than kept charged against the budget.
+            return Err(invalid(
+                "Upload content does not match the SHA-256 declared at begin; begin again",
+            ));
+        };
         Ok(CompletedUpload {
             session_id: upload.session_id,
             agent_alias: upload.agent_alias,
             filename: upload.filename,
-            bytes: upload.data,
+            bytes,
         })
     }
 
@@ -466,6 +573,54 @@ mod tests {
         let err = staging.chunk(later, &id, 0, b"a").unwrap_err();
         assert!(err.message.contains("expired"), "{}", err.message);
         assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn an_idle_upload_on_an_open_connection_frees_the_budget_for_others() {
+        let budget = UploadBudget::new(10);
+        let mut silent = UploadStaging::new(Arc::clone(&budget));
+        let mut other = UploadStaging::new(Arc::clone(&budget));
+        let start = Instant::now();
+
+        // The silent connection reserves most of the budget, then never
+        // touches uploads again while it stays open.
+        let held = silent.begin(start, request(8)).unwrap();
+        silent.chunk(start, &held, 0, b"abc").unwrap();
+        assert!(
+            other.begin(start, request(3)).is_err(),
+            "the budget is full"
+        );
+
+        // Past the idle deadline, another connection's reservation reclaims
+        // it without any help from the silent connection.
+        let later = start + UPLOAD_IDLE_TIMEOUT + Duration::from_secs(1);
+        other.begin(later, request(3)).unwrap();
+        assert_eq!(budget.used(), 3, "only the new reservation is charged");
+
+        // The reclaimed upload is gone for its owner too, and dropping the
+        // owner does not release the reservation a second time.
+        let err = silent.chunk(later, &held, 3, b"d").unwrap_err();
+        assert!(err.message.contains("expired"), "{}", err.message);
+        drop(silent);
+        assert_eq!(budget.used(), 3);
+    }
+
+    #[test]
+    fn an_active_upload_is_not_reclaimed() {
+        let budget = UploadBudget::new(10);
+        let mut busy = UploadStaging::new(Arc::clone(&budget));
+        let mut other = UploadStaging::new(Arc::clone(&budget));
+        let start = Instant::now();
+        let id = busy.begin(start, request(8)).unwrap();
+        let recent = start + UPLOAD_IDLE_TIMEOUT - Duration::from_secs(1);
+        busy.chunk(recent, &id, 0, b"a").unwrap();
+
+        let later = start + UPLOAD_IDLE_TIMEOUT + Duration::from_secs(1);
+        assert!(
+            other.begin(later, request(3)).is_err(),
+            "an upload touched within the deadline keeps its reservation"
+        );
+        assert_eq!(busy.chunk(later, &id, 1, b"b").unwrap(), 2);
     }
 
     #[test]
