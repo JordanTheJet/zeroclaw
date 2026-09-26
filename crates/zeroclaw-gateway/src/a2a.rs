@@ -13,7 +13,6 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use uuid::Uuid;
 
-
 use crate::{AppState, api::require_auth, run_gateway_chat_with_tools};
 
 /// Prefixed alias of the catalog under the `/a2a/` namespace, serving the same
