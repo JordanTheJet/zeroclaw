@@ -2943,11 +2943,7 @@ mod tests {
             .await
             .expect_err("a private write cannot convert a shared row");
         assert!(err.to_string().contains("another plane"), "{err}");
-        let planted = mem
-            .get(&planted_key)
-            .await
-            .unwrap()
-            .unwrap();
+        let planted = mem.get(&planted_key).await.unwrap().unwrap();
         assert_eq!(planted.content, "shared-planted");
         assert!(
             planted.principal_id.is_none(),
@@ -3216,7 +3212,12 @@ mod tests {
 
         // Deleting one leaves the other intact.
         mem.forget_for_principal(&scope_a, "k").await.unwrap();
-        assert!(mem.get_for_principal(&scope_a, "k").await.unwrap().is_none());
+        assert!(
+            mem.get_for_principal(&scope_a, "k")
+                .await
+                .unwrap()
+                .is_none()
+        );
         let still_b = mem
             .get_for_principal(&scope_b, "b:k")
             .await
@@ -3239,9 +3240,15 @@ mod tests {
         mem.store_for_principal(&none_tenant, "t", "no-tenant", MemoryCategory::Core, None)
             .await
             .unwrap();
-        mem.store_for_principal(&empty_tenant, "t", "empty-tenant", MemoryCategory::Core, None)
-            .await
-            .unwrap();
+        mem.store_for_principal(
+            &empty_tenant,
+            "t",
+            "empty-tenant",
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             mem.get_for_principal(&none_tenant, "t")
                 .await

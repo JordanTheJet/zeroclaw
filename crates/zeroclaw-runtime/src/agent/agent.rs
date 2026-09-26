@@ -1747,6 +1747,19 @@ impl Agent {
         self.memory_principal.as_deref()
     }
 
+    /// Re-derive the forwarded shell environment for a REUSED session. `env`
+    /// is already filtered for the resuming connection's entitlement (empty
+    /// overlays nothing). A canonical live session keeps the shell tool it was
+    /// built with, whose environment was filtered for the ORIGINAL connection;
+    /// reuse under a re-derived entitlement (a principal that has lost `admin`,
+    /// a WSS reconnect describing another host) must re-derive it here, or the
+    /// resumed session would keep overlaying the first connection's forwarded
+    /// environment onto its subprocesses. Preserves the shell tool's sandbox,
+    /// rate limiter and timeout; only the forwarded environment changes.
+    pub fn rebind_shell_env(&self, env: Option<std::collections::HashMap<String, String>>) {
+        self.tools.rebind_shell_env(env);
+    }
+
     /// Apply a current principal tool ceiling to an existing session. This is
     /// intentionally narrowing-only: session construction already intersects
     /// the principal and agent policies, while a later policy refresh must
@@ -5137,7 +5150,10 @@ mod tests {
             .iter()
             .find(|t| t.name() == "memory_recall")
             .expect("memory_recall present");
-        let result = recall.execute(serde_json::json!({"query": "secret"})).await.unwrap();
+        let result = recall
+            .execute(serde_json::json!({"query": "secret"}))
+            .await
+            .unwrap();
         let text = format!("{result:?}");
         assert!(
             !text.contains("shared-secret"),

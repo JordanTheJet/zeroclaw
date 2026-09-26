@@ -3215,6 +3215,34 @@ impl RpcDispatcher {
         chat_mode: &crate::rpc::types::ChatMode,
         existing: crate::rpc::session::ResumedRpcSession,
     ) -> RpcResult {
+        // The canonical live agent keeps the shell tool it was built with,
+        // whose forwarded environment was filtered for the connection that
+        // FIRST constructed it. This resume may be a different connection —
+        // the same principal after losing `admin`, a WSS reconnect describing
+        // another host — so re-derive the forwarded shell environment against
+        // THIS connection's own registration before the resumed session runs a
+        // command. The registration env was already filtered for this
+        // connection's entitlement at `initialize` (an environment is retained
+        // only for a local operator, dropped and audited otherwise), so
+        // re-installing it neither widens a scoped principal's environment nor
+        // strands a permitted local operator's. A connection with no retained
+        // environment installs `None`, dropping any environment the prior
+        // incarnation carried.
+        //
+        // Like the approval-channel rebind below, this must NOT make the
+        // reconnect wait on an active turn that owns the Agent mutex: install
+        // the re-derived environment as soon as the predecessor releases the
+        // canonical Agent. The rebind is idempotent and the next turn cannot
+        // start a command before its own `session/prompt` acquires the lock, so
+        // applying it after the in-flight turn drains is correct — an in-flight
+        // command keeps the environment it began with.
+        let resumed_env = self
+            .tui_registration()
+            .and_then(|(id, epoch)| self.ctx.tui_registry.env_for_registration(id, epoch));
+        let env_agent = Arc::clone(&existing.agent);
+        zeroclaw_spawn::spawn!(async move {
+            env_agent.lock().await.rebind_shell_env(resumed_env);
+        });
         self.rebind_rpc_approval_channel(Arc::clone(&existing.agent), session_id.clone());
         if matches!(chat_mode, crate::rpc::types::ChatMode::Acp)
             && let Some(plan) = self.ctx.sessions.get_plan(&session_id).await
@@ -3237,15 +3265,30 @@ impl RpcDispatcher {
         let req: SessionNewParams = parse_params(params)?;
         self.selector_session_agent(Method::SessionNew, &req.agent_alias)?;
         let resuming = req.session_id.is_some();
+        // When resuming an existing session, its DURABLE owner is preserved
+        // through restoration: an administrator restoring another principal's
+        // reaped session must not re-label it as their own or redirect its
+        // memory plane. `None` here means either a genuinely new session (the
+        // caller is stamped below) or a legacy unowned record (which stays
+        // unowned). Only a new session adopts the caller as owner.
+        //
+        // A client-supplied session_id that names NOTHING yet is still a new
+        // session, so `restoring_existing` tracks whether a durable/live
+        // record actually existed, distinct from `resuming` (which is merely
+        // "an id was supplied").
+        let mut preserved_owner: Option<String> = None;
+        let mut restoring_existing = false;
         if let Some(existing) = req.session_id.as_deref() {
             // Resuming targets an EXISTING session: enforce its ownership
             // before any store is touched (scoped principals get the
             // uniform not-found-or-not-owned denial; a brand-new id passes
             // because it exists nowhere yet). The live rebind below repeats
             // the check under the store lock against the exact incarnation.
-            if self.resolve_session_record(existing).await?.is_some() {
+            if let Some(record) = self.resolve_session_record(existing).await? {
                 self.authorize_session_owner(existing, Method::SessionNew)
                     .await?;
+                preserved_owner = record.owner;
+                restoring_existing = true;
             }
         }
         let session_id = req
@@ -3626,10 +3669,23 @@ impl RpcDispatcher {
             self.apply_principal_grants_to_agent(grants, &mut agent);
         }
 
+        // The effective owner of the session about to be built: for a
+        // genuine new session (including a client-supplied id that names
+        // nothing yet) it is the caller's durable identity; for a restored
+        // (reaped) session it is the DURABLE owner recorded when the session
+        // was created, so an administrator restoring another principal's
+        // session neither re-labels it nor moves its memory plane (a legacy
+        // unowned record stays unowned).
+        let effective_owner = if restoring_existing {
+            preserved_owner.clone()
+        } else {
+            self.owner_principal_id()
+        };
+
         // The session's memory follows its OWNER: an owned session works on
         // the owner's private plane for its whole life, whoever prompts it
         // later. The shared operator keeps the shared handle.
-        if let Some(owner) = self.owner_principal_id() {
+        if let Some(owner) = effective_owner.clone() {
             agent
                 .route_memory_to_principal(self.memory_scope_for(owner, &req.agent_alias))
                 .map_err(|e| {
@@ -3659,7 +3715,7 @@ impl RpcDispatcher {
         let candidate =
             super::session::RpcSession::new(agent, &req.agent_alias, &cwd, chat_mode.clone())
                 .with_owner(self.tui_id.clone())
-                .with_owner_principal(self.owner_principal_id());
+                .with_owner_principal(effective_owner.clone());
         let candidate_agent = Arc::clone(&candidate.agent);
         // Fresh sessions must claim capacity before creating durable rows.
         // Only a replacement can keep its existing slot throughout preparation.
@@ -3716,11 +3772,12 @@ impl RpcDispatcher {
                         let cwd_owned = cwd.clone();
                         // The durable row is stamped at creation so the session
                         // survives a restart under the same isolation. The
-                        // stamp is the creator's DURABLE identity, not the
-                        // authorization scope: a named administrator's own
-                        // session carries her identity, and only the admin
-                        // bypass is scope-free.
-                        let owner = self.owner_principal_id();
+                        // stamp is the effective owner: for a new session that
+                        // is the creator's DURABLE identity; for a restore the
+                        // preserved durable owner, so an administrator does not
+                        // re-label another principal's session on the Missing
+                        // create path.
+                        let owner = effective_owner.clone();
                         tokio::task::spawn_blocking(move || -> anyhow::Result<AcpSessionNewLoad> {
                             match store_cloned.load_session_for_restore(&sid)? {
                             zeroclaw_infra::acp_session_store::AcpSessionRestore::Restorable(
@@ -3963,7 +4020,7 @@ impl RpcDispatcher {
         // restart as nobody's. An unscoped creator's stamp is attribution
         // only, so its failure is logged and creation proceeds.
         if let (Some(owner), Some(backend)) =
-            (self.owner_principal_id(), self.ctx.session_backend.as_ref())
+            (effective_owner.clone(), self.ctx.session_backend.as_ref())
             && !matches!(chat_mode, crate::rpc::types::ChatMode::Acp)
             && let Err(error) = backend.set_session_principal(&format!("rpc_{session_id}"), &owner)
         {
@@ -13731,6 +13788,27 @@ mod tests {
         result.output.into_string()
     }
 
+    /// Poll the shell environment until `pred` holds or a bounded number of
+    /// yields elapse. The resume path applies its environment rebind in a
+    /// spawned task (so the reconnect never waits on an in-flight turn), so a
+    /// test observing the rebound value must let that task run first.
+    #[cfg(unix)]
+    async fn wait_for_shell_env(
+        ctx: &Arc<RpcContext>,
+        session_id: &str,
+        pred: impl Fn(&str) -> bool,
+    ) -> String {
+        let mut last = String::new();
+        for _ in 0..200 {
+            last = session_shell_env(ctx, session_id).await;
+            if pred(&last) {
+                return last;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        last
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn session_new_ignores_a_foreign_request_tui_id_for_environment() {
@@ -13865,6 +13943,168 @@ mod tests {
         assert!(
             !env.contains("NEW_SOCK"),
             "a superseded registration must not read its successor's environment:\n{env}"
+        );
+    }
+
+    /// Reviewer regression (discussion_r4109687906): reusing a canonical live
+    /// session must re-derive the forwarded shell environment against the
+    /// RESUMING connection, not keep the environment cloned into the shell tool
+    /// at first construction. A local operator creates an environment-bearing
+    /// session; the SAME connection then resumes it after its retained
+    /// environment is gone (reconnect re-registers the id with no environment,
+    /// e.g. the entitlement that kept it was lost). The resumed session's own
+    /// shell tool must stop overlaying the stale sentinel. Environment-free
+    /// reuse stays clean, and an unchanged retained environment survives reuse.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resuming_a_session_re_derives_the_forwarded_shell_environment() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ctx = enforcement_ctx(shell_env_config(&tmp));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let mut client = RpcDispatcher::new(Arc::clone(&ctx), tx, "unix:reuse".into());
+        client.set_authenticated_for_test();
+
+        // ── First connection: env-bearing registration builds the session ──
+        register_tui_env(
+            &ctx,
+            &mut client,
+            "tui_reuse0001",
+            "REUSE_SOCK",
+            "/tmp/reuse.sock",
+        );
+        let response = rpc(
+            &mut client,
+            &mut rx,
+            1,
+            "session/new",
+            json!({"agent_alias": "test-agent", "session_id": "s-reuse"}),
+        )
+        .await;
+        assert_eq!(
+            response["result"]["session_id"],
+            json!("s-reuse"),
+            "{response}"
+        );
+        let first = session_shell_env(&ctx, "s-reuse").await;
+        assert!(
+            first.contains("REUSE_SOCK=/tmp/reuse.sock"),
+            "the building connection's environment reaches the fresh session:\n{first}"
+        );
+        let canonical = ctx.sessions.get_agent("s-reuse").await.unwrap();
+
+        // ── Same session RESUMED after the retained environment is gone ──
+        // The reconnect re-registers the same id under a new epoch carrying no
+        // environment (the value `retained_tui_env` produces once the operator
+        // entitlement that kept it is lost). Resuming must re-derive the shell
+        // tool's environment, not keep the sentinel cloned in at construction.
+        let epoch = ctx
+            .tui_registry
+            .register(crate::rpc::tui_identity::TuiEntry {
+                tui_id: "tui_reuse0001".to_string(),
+                connected_at: chrono::Utc::now(),
+                peer_label: "tui_reuse0001".to_string(),
+                transport: "unix".to_string(),
+                env: std::collections::HashMap::new(),
+            });
+        client.set_tui_registration_for_test(Some(("tui_reuse0001".to_string(), epoch)));
+        let response = rpc(
+            &mut client,
+            &mut rx,
+            2,
+            "session/new",
+            json!({"agent_alias": "test-agent", "session_id": "s-reuse"}),
+        )
+        .await;
+        assert_eq!(
+            response["result"]["session_id"],
+            json!("s-reuse"),
+            "{response}"
+        );
+        assert!(
+            Arc::ptr_eq(
+                &canonical,
+                &ctx.sessions.get_agent("s-reuse").await.unwrap()
+            ),
+            "the resume rebinds the SAME canonical incarnation, not a fresh build"
+        );
+        let after = wait_for_shell_env(&ctx, "s-reuse", |env| !env.contains("REUSE_SOCK")).await;
+        assert!(
+            !after.contains("REUSE_SOCK"),
+            "resuming under a connection with no retained environment must drop the \
+             environment the first incarnation carried:\n{after}"
+        );
+
+        // ── Permitted continuity: re-registering the SAME environment keeps it ──
+        register_tui_env(
+            &ctx,
+            &mut client,
+            "tui_reuse0001",
+            "REUSE_SOCK",
+            "/tmp/reuse.sock",
+        );
+        let response = rpc(
+            &mut client,
+            &mut rx,
+            3,
+            "session/new",
+            json!({"agent_alias": "test-agent", "session_id": "s-reuse"}),
+        )
+        .await;
+        assert_eq!(
+            response["result"]["session_id"],
+            json!("s-reuse"),
+            "{response}"
+        );
+        let restored = wait_for_shell_env(&ctx, "s-reuse", |env| {
+            env.contains("REUSE_SOCK=/tmp/reuse.sock")
+        })
+        .await;
+        assert!(
+            restored.contains("REUSE_SOCK=/tmp/reuse.sock"),
+            "an unchanged retained environment survives reuse:\n{restored}"
+        );
+    }
+
+    /// A session built with NO forwarded environment stays environment-free
+    /// across reuse — the rebind never invents one.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resuming_an_environment_free_session_stays_environment_free() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ctx = enforcement_ctx(shell_env_config(&tmp));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let mut client = RpcDispatcher::new(Arc::clone(&ctx), tx, "unix:reuse-empty".into());
+        client.set_authenticated_for_test();
+        // Register with no sentinel: the connection forwards nothing.
+        let epoch = ctx
+            .tui_registry
+            .register(crate::rpc::tui_identity::TuiEntry {
+                tui_id: "tui_empty0001".to_string(),
+                connected_at: chrono::Utc::now(),
+                peer_label: "tui_empty0001".to_string(),
+                transport: "unix".to_string(),
+                env: std::collections::HashMap::new(),
+            });
+        client.set_tui_registration_for_test(Some(("tui_empty0001".to_string(), epoch)));
+        for id in [1, 2] {
+            let response = rpc(
+                &mut client,
+                &mut rx,
+                id,
+                "session/new",
+                json!({"agent_alias": "test-agent", "session_id": "s-empty"}),
+            )
+            .await;
+            assert_eq!(
+                response["result"]["session_id"],
+                json!("s-empty"),
+                "{response}"
+            );
+        }
+        let env = session_shell_env(&ctx, "s-empty").await;
+        assert!(
+            !env.contains("REUSE_SOCK") && !env.contains("SENTINEL"),
+            "environment-free reuse must not acquire a forwarded environment:\n{env}"
         );
     }
 
@@ -14294,6 +14534,111 @@ mod tests {
             !agent.tool_names().contains(&"calculator"),
             "the queued prompt must execute under the narrowed (empty) ceiling, \
              pruning the session's own tools"
+        );
+    }
+
+    /// Reviewer regression (discussion_r4109687900 follow-up): the ORIGINAL
+    /// coarse-revocation counterexample removed only the `Tools:Execute`
+    /// grant while RETAINING a wildcard tool selector — not the empty-selector
+    /// shape the sibling queued/persisted tests exercise. A wildcard selector
+    /// would resolve to the unrestricted `None` ceiling if the coarse grant
+    /// were not checked first, so this pins that removing `Tools:Execute`
+    /// alone still prunes a queued turn's tools on the session's own agent.
+    #[tokio::test]
+    async fn principal_queued_prompt_prunes_when_only_tools_execute_is_revoked() {
+        use zeroclaw_api::grants::{Resource, Verb};
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Seed unrestricted: wildcard tools AND the coarse Tools:Execute
+        // grant, so the session and first prompt are permitted.
+        let config = principal_test_config(&tmp, &["*"], &["*"]);
+        let (dispatcher, sessions) = make_acp_test_dispatcher(config);
+        let dispatcher = bind_test_principal(dispatcher).await;
+        let params = json!({"agent_alias":"test-agent", "session_id":"coarse-revoke"});
+        dispatcher
+            .handle_session_new_for_test(&params)
+            .await
+            .unwrap();
+        let original = sessions.get_agent("coarse-revoke").await.unwrap();
+        {
+            let mut agent = original.lock().await;
+            assert!(
+                agent.tool_names().contains(&"calculator"),
+                "an unrestricted principal keeps the agent's own tools"
+            );
+            agent.set_model_provider(Box::new(FailingProvider));
+        }
+        // Reattach to the same live session (same binding), then park a prompt.
+        dispatcher
+            .handle_session_new_for_test(&params)
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(
+            &original,
+            &sessions.get_agent("coarse-revoke").await.unwrap()
+        ));
+        let queue_guard = sessions
+            .session_queue
+            .acquire("coarse-revoke")
+            .await
+            .unwrap();
+        let prompt_params = json!({"session_id":"coarse-revoke", "prompt":"exercise admission"});
+        let pending = dispatcher.handle_session_prompt(&prompt_params);
+        tokio::pin!(pending);
+        tokio::select! {
+            result = &mut pending => panic!("prompt bypassed queue: {result:?}"),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
+        }
+        // Remove ONLY the coarse Tools:Execute grant while KEEPING the wildcard
+        // tool selector. This is the reviewer's exact counterexample: the
+        // selector still says "*", but the coarse grant that gates any tool
+        // execution is gone, so the effective ceiling must be empty.
+        {
+            let mut cfg = dispatcher.ctx.config.write();
+            let profile = cfg.permission_profiles.get_mut("principal-test").unwrap();
+            assert_eq!(
+                profile.allowed_tools,
+                vec!["*".to_string()],
+                "the selector stays wildcard; only the coarse grant is revoked"
+            );
+            let sessions_verbs = profile
+                .grants
+                .get(&Resource::Sessions)
+                .cloned()
+                .unwrap_or_default();
+            // Keep Sessions grants (so the queued prompt is still admitted),
+            // drop Tools entirely (removes Tools:Execute).
+            profile.grants =
+                std::collections::HashMap::from([(Resource::Sessions, sessions_verbs)]);
+            dispatcher.ctx.auth.refresh_from_config(&cfg).unwrap();
+        }
+        // NB: `principal_tool_narrowing()` reads the connection's STAMPED
+        // grants, which are re-resolved lazily at the next operation gate, so
+        // it still reports the pre-revocation ceiling here. The load-bearing
+        // proof is below: on release the queued prompt re-resolves at
+        // admission and prunes the session's tools under the empty ceiling.
+        drop(queue_guard);
+        // On release the parked prompt is admitted past auth (owner isolation),
+        // re-narrows the session's own agent to the empty ceiling, then fails
+        // only at the dead provider with a non-auth code.
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), pending)
+            .await
+            .unwrap();
+        assert!(
+            result.is_err(),
+            "the failing provider makes the admitted turn error: {result:?}"
+        );
+        if let Err(e) = &result {
+            assert!(
+                e.code != FORBIDDEN && e.code != AUTH_REQUIRED,
+                "the turn is admitted past auth and fails only at the provider: {e:?}"
+            );
+        }
+        let _ = Verb::Execute; // keep the import meaningful across edits
+        let agent = original.lock().await;
+        assert!(
+            !agent.tool_names().contains(&"calculator"),
+            "revoking Tools:Execute (wildcard selector retained) must still prune \
+             the queued turn's tools on the session's own agent"
         );
     }
 
@@ -15382,6 +15727,159 @@ mod tests {
             .await
             .expect("the shared operator creates a legacy session");
         assert_eq!(acp_store.session_principal("op1").unwrap(), Some(None));
+    }
+
+    /// The reviewer's exact case (discussion_r4109687910): an administrator
+    /// restoring another principal's reaped session THROUGH `session/new`
+    /// (not the rehydration helper) must preserve the durable owner, for both
+    /// ACP and Chat modes, and a legacy NULL-owner row must stay unowned.
+    #[tokio::test]
+    async fn session_new_restoration_by_admin_preserves_the_durable_owner() {
+        use zeroclaw_config::schema::{PermissionProfileConfig, UserConfig};
+        use zeroclaw_infra::session_backend::SessionBackend as _;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = two_user_config(&tmp);
+        config.permission_profiles.insert(
+            "admin".into(),
+            PermissionProfileConfig {
+                admin: true,
+                ..PermissionProfileConfig::default()
+            },
+        );
+        config.users.insert(
+            "carol".into(),
+            UserConfig {
+                principal_id: None,
+                uid: Some(4444),
+                permission_profiles: vec!["admin".into()],
+            },
+        );
+        let data_dir = config.data_dir.clone();
+        let (fixture, sessions, chat_backend, acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        let ctx = Arc::clone(&fixture.ctx);
+        let alice = scoped_dispatcher(&ctx, 4242).await;
+        let bob = scoped_dispatcher(&ctx, 4343).await;
+        let carol = scoped_dispatcher(&ctx, 4444).await;
+
+        // ── ACP: alice's session, reaped, then restored by carol via new ──
+        alice
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "session_id": "acp1",
+                "chat_mode": "acp",
+            }))
+            .await
+            .expect("alice creates her ACP session");
+        assert_eq!(
+            acp_store.session_principal("acp1").unwrap(),
+            Some(Some("user:alice".to_string())),
+            "alice's ACP create stamps alice up front"
+        );
+        assert!(sessions.remove("acp1").await, "reap the live incarnation");
+        assert_eq!(
+            acp_store.session_principal("acp1").unwrap(),
+            Some(Some("user:alice".to_string())),
+            "reaping the live incarnation leaves the durable ACP owner intact"
+        );
+        carol
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "session_id": "acp1",
+                "chat_mode": "acp",
+            }))
+            .await
+            .expect("the administrator restores alice's ACP session via session/new");
+        assert_eq!(
+            acp_store.session_principal("acp1").unwrap(),
+            Some(Some("user:alice".to_string())),
+            "session/new restoration keeps the durable ACP owner, not the restorer"
+        );
+        assert_eq!(
+            sessions.session_owner_principal("acp1").await,
+            Some(Some("user:alice".to_string())),
+            "the live incarnation is re-stamped with the preserved owner"
+        );
+        let err = bob
+            .handle_session_messages_for_test(&json!({"session_id": "acp1"}))
+            .await
+            .expect_err("bob still cannot read alice's restored session");
+        assert_eq!(err.code, FORBIDDEN);
+        alice
+            .handle_session_messages_for_test(&json!({"session_id": "acp1"}))
+            .await
+            .expect("alice still owns her restored ACP session");
+
+        // ── Chat: alice's chat session, reaped, then restored by carol ──
+        alice
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "session_id": "chat1",
+                "chat_mode": "chat",
+            }))
+            .await
+            .expect("alice creates her chat session");
+        assert_eq!(
+            chat_backend
+                .get_session_metadata("rpc_chat1")
+                .and_then(|m| m.principal_id),
+            Some("user:alice".to_string()),
+            "the chat row is stamped with alice"
+        );
+        assert!(sessions.remove("chat1").await, "reap the live incarnation");
+        carol
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "session_id": "chat1",
+                "chat_mode": "chat",
+            }))
+            .await
+            .expect("the administrator restores alice's chat session via session/new");
+        assert_eq!(
+            chat_backend
+                .get_session_metadata("rpc_chat1")
+                .and_then(|m| m.principal_id),
+            Some("user:alice".to_string()),
+            "session/new restoration keeps the durable chat owner, not the restorer"
+        );
+        assert_eq!(
+            sessions.session_owner_principal("chat1").await,
+            Some(Some("user:alice".to_string())),
+            "the live chat incarnation is re-stamped with the preserved owner"
+        );
+        let err = bob
+            .handle_session_messages_for_test(&json!({"session_id": "chat1"}))
+            .await
+            .expect_err("bob cannot read alice's restored chat session");
+        assert_eq!(err.code, FORBIDDEN);
+
+        // ── Legacy NULL-owner row stays unowned across admin restoration ──
+        fixture
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "session_id": "legacy1",
+                "chat_mode": "acp",
+            }))
+            .await
+            .expect("the shared operator creates a legacy session");
+        assert_eq!(acp_store.session_principal("legacy1").unwrap(), Some(None));
+        assert!(
+            sessions.remove("legacy1").await,
+            "reap the live incarnation"
+        );
+        carol
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "session_id": "legacy1",
+                "chat_mode": "acp",
+            }))
+            .await
+            .expect("the administrator restores the legacy session via session/new");
+        assert_eq!(
+            acp_store.session_principal("legacy1").unwrap(),
+            Some(None),
+            "a legacy NULL-owner row is not adopted by the restoring administrator"
+        );
     }
 
     /// Delete destroys the durable record it authorized and reports what

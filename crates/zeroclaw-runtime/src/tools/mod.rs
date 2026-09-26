@@ -223,6 +223,10 @@ impl Tool for ArcToolRef {
         self.0.invocation_triggers()
     }
 
+    fn rebind_forwarded_env(&self, env: Option<std::collections::HashMap<String, String>>) {
+        self.0.rebind_forwarded_env(env);
+    }
+
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         self.0.execute(args).await
     }
@@ -307,6 +311,10 @@ impl Tool for ArcDelegatingTool {
 
     fn invocation_triggers(&self) -> Vec<String> {
         self.inner.invocation_triggers()
+    }
+
+    fn rebind_forwarded_env(&self, env: Option<std::collections::HashMap<String, String>>) {
+        self.inner.rebind_forwarded_env(env);
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {

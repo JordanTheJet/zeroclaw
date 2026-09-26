@@ -2202,6 +2202,7 @@ mod tests {
             .and(http_path("/token"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "access_token": "at-after-retry",
+                "token_type": "Bearer",
                 "expires_in": 3600,
             })))
             .mount(&server)
