@@ -232,6 +232,11 @@ pub struct DelegateTool {
     /// `None` for one-shot / non-daemon callers, which keep the documented
     /// snapshot fallback.
     live_config: Option<Arc<RwLock<Config>>>,
+    /// Capabilities the delegate resolves a target's provider, memory and
+    /// supplied tools through, when its owner was built from supplied
+    /// capabilities. `None` uses the config-backed set, which is the
+    /// construction this tool performed before it took capabilities.
+    capabilities: Option<crate::composition::RuntimeCapabilities>,
     /// Alias of the agent that owns this DelegateTool. Excluded from the
     /// advertised roster so an agent is never offered itself as a
     /// delegation target. Empty when unset (legacy unit-test constructors).
@@ -359,6 +364,7 @@ impl DelegateTool {
             skill_bundles: Arc::new(HashMap::new()),
             root_config: None,
             live_config: None,
+            capabilities: None,
             caller_alias: String::new(),
             task_control_plane: Arc::new(tokio::sync::OnceCell::new()),
         }
@@ -411,6 +417,7 @@ impl DelegateTool {
             skill_bundles: Arc::new(HashMap::new()),
             root_config: None,
             live_config: None,
+            capabilities: None,
             caller_alias: String::new(),
             task_control_plane: Arc::new(tokio::sync::OnceCell::new()),
         }
@@ -537,6 +544,22 @@ impl DelegateTool {
     pub fn with_live_config(mut self, live_config: Option<Arc<RwLock<Config>>>) -> Self {
         self.live_config = live_config;
         self
+    }
+
+    /// Resolve delegate targets' providers, memory and supplied tools through
+    /// `capabilities` instead of the config-backed set.
+    pub fn with_capabilities(
+        mut self,
+        capabilities: crate::composition::RuntimeCapabilities,
+    ) -> Self {
+        self.capabilities = Some(capabilities);
+        self
+    }
+
+    fn target_capabilities(&self) -> crate::composition::RuntimeCapabilities {
+        self.capabilities
+            .clone()
+            .unwrap_or_else(crate::composition::RuntimeCapabilities::config_backed_unobserved)
     }
 
     /// Set the owning agent's alias so it can be excluded from the
@@ -817,13 +840,21 @@ impl DelegateTool {
 
     fn build_target_provider(
         &self,
+        agent_name: &str,
         model_provider: &str,
         provider_type: &str,
         credential: Option<&str>,
     ) -> anyhow::Result<(Box<dyn ModelProvider>, String, String)> {
         if let Some(config) = self.root_config.as_deref() {
             let (provider, provider_name, model_name, _resolver) =
-                crate::agent::agent::build_session_model_provider(config, model_provider, None)?;
+                crate::agent::agent::session_model_provider_from(
+                    &self.target_capabilities(),
+                    config,
+                    agent_name,
+                    model_provider,
+                    None,
+                    None,
+                )?;
             return Ok((provider, provider_name, model_name));
         }
         let provider = zeroclaw_providers::create_model_provider_with_options(
@@ -843,10 +874,8 @@ impl DelegateTool {
             return Ok(self.memory.clone());
         };
 
-        let api_key = config
-            .resolved_model_provider_for_agent(agent_name)
-            .and_then(|(_, _, cfg)| cfg.api_key.as_deref());
-        zeroclaw_memory::create_memory_for_agent(config, agent_name, api_key)
+        self.target_capabilities()
+            .agent_memory(config, agent_name)
             .await
             .map(Some)
     }
@@ -907,13 +936,13 @@ impl DelegateTool {
             .resolved_model_provider_for_agent(agent_name)
             .and_then(|(_, _, provider)| provider.api_key.as_deref());
 
-        let all_tools_result = crate::tools::all_tools_with_runtime(
+        let mut all_tools_result = crate::tools::all_tools_with_runtime(
             Arc::clone(config),
             &target_policy,
             &risk_profile,
             agent_name,
             runtime.clone(),
-            memory,
+            Arc::clone(&memory),
             composio_key,
             composio_entity_id,
             &config.browser,
@@ -937,6 +966,16 @@ impl DelegateTool {
             // lifetime. `None` only when the parent registry itself had no live
             // handle (one-shot callers), which keeps the snapshot fallback.
             self.live_config.clone(),
+        )?;
+        self.target_capabilities().add_source_tools(
+            &mut all_tools_result,
+            &crate::composition::ToolRequest {
+                config,
+                agent_alias: agent_name,
+                security: &target_policy,
+                runtime: &runtime,
+                memory: &memory,
+            },
         )?;
 
         let target_workspace = config.agent_workspace_dir(agent_name);
@@ -2076,6 +2115,7 @@ impl DelegateTool {
 
         // Create model_provider for this agent
         let (model_provider, provider_type, model) = match self.build_target_provider(
+            agent_name,
             &agent_config.model_provider,
             &legacy_provider_type,
             credential.as_deref(),
@@ -2399,6 +2439,7 @@ impl DelegateTool {
         // Carried, not dropped: the background task rebuilds a DelegateTool that
         // will construct its own nested registries.
         let live_config = self.live_config.clone();
+        let capabilities = self.capabilities.clone();
         let caller_alias = self.caller_alias.clone();
         let nested_task_control_plane = Arc::clone(&self.task_control_plane);
         let terminal_store = Arc::clone(&task_control_plane.store);
@@ -2447,6 +2488,7 @@ impl DelegateTool {
                     skill_bundles,
                     root_config,
                     live_config,
+                    capabilities,
                     caller_alias,
                     task_control_plane: nested_task_control_plane,
                 };
@@ -2686,6 +2728,7 @@ impl DelegateTool {
             // Carried, not dropped: each fan-out task rebuilds a DelegateTool
             // that will construct its own nested registries.
             let live_config = self.live_config.clone();
+            let capabilities = self.capabilities.clone();
             let caller_alias = self.caller_alias.clone();
             let session_key = parent_session_key.clone();
             let thread_scope = parent_thread_id.clone();
@@ -2718,6 +2761,7 @@ impl DelegateTool {
                         skill_bundles,
                         root_config,
                         live_config,
+                        capabilities,
                         caller_alias,
                         task_control_plane,
                     };
@@ -3707,6 +3751,7 @@ impl DelegateTool {
                         skill_bundles: Arc::clone(&self.skill_bundles),
                         root_config: self.root_config.clone(),
                         live_config: self.live_config.clone(),
+                        capabilities: self.capabilities.clone(),
                         caller_alias: agent_name.to_string(),
                         task_control_plane: nested_task_control_plane,
                     }) as Box<dyn Tool>

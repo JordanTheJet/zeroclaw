@@ -4,7 +4,7 @@ use crate::agent::prompt::{
     InteractionContext, PromptContext, SystemPromptBuilder, append_timestamp_orientation,
 };
 use crate::approval::ApprovalManager;
-use crate::observability::{self, Observer, ObserverEvent};
+use crate::observability::{Observer, ObserverEvent};
 use crate::platform;
 use crate::security::SecurityPolicy;
 use crate::sop::{SopAuditLogger, SopEngine};
@@ -39,11 +39,58 @@ type SessionModelProvider = (
     Arc<zeroclaw_providers::router::ModelRouteResolver>,
 );
 
-pub fn build_session_model_provider(
+/// [`build_session_model_provider`] with the provider obtained from
+/// `capabilities`, resolved for `agent_alias` and `principal`.
+///
+/// The reference and model are validated and resolved exactly as there; the
+/// route resolver is derived from the same config routes the routed provider
+/// is built from.
+pub(crate) fn session_model_provider_from(
+    capabilities: &crate::composition::RuntimeCapabilities,
     config: &Config,
+    agent_alias: &str,
     model_provider_ref: &str,
     model_override: Option<&str>,
+    principal: Option<&zeroclaw_api::principal::PrincipalId>,
 ) -> Result<SessionModelProvider> {
+    let SessionModel { model_name, .. } =
+        resolve_session_model(config, model_provider_ref, model_override)?;
+    let model_provider = capabilities.model_provider(&crate::composition::ProviderRequest {
+        config,
+        agent_alias,
+        provider_ref: Some(model_provider_ref),
+        model: Some(&model_name),
+        principal,
+    })?;
+    let model_route_resolver = zeroclaw_providers::model_route_resolver(
+        model_provider_ref,
+        &config.model_routes,
+        &model_name,
+    );
+    Ok((
+        model_provider,
+        model_provider_ref.to_string(),
+        model_name,
+        model_route_resolver,
+    ))
+}
+
+/// A validated `<type>.<alias>` reference, its configured entry if any, and
+/// the model a session on it serves.
+struct SessionModel<'c> {
+    family: String,
+    alias: String,
+    entry: Option<&'c zeroclaw_config::schema::ModelProviderConfig>,
+    model_name: String,
+}
+
+/// Validate a `<type>.<alias>` reference and resolve the model a session on it
+/// serves: the override when one is given, else the entry's configured model.
+fn resolve_session_model<'c>(
+    config: &'c Config,
+    model_provider_ref: &str,
+    model_override: Option<&str>,
+) -> Result<SessionModel<'c>> {
     let (model_provider_name, model_provider_alias) = model_provider_ref
         .split_once('.')
         .map(|(t, a)| (t.to_string(), a.to_string()))
@@ -74,12 +121,28 @@ pub fn build_session_model_provider(
                  override was supplied"
             ))
         })?;
+    Ok(SessionModel {
+        family: model_provider_name,
+        alias: model_provider_alias,
+        entry,
+        model_name,
+    })
+}
 
-    let model_provider_runtime_options = zeroclaw_providers::provider_runtime_options_for_alias(
-        config,
-        &model_provider_name,
-        &model_provider_alias,
-    );
+pub fn build_session_model_provider(
+    config: &Config,
+    model_provider_ref: &str,
+    model_override: Option<&str>,
+) -> Result<SessionModelProvider> {
+    let SessionModel {
+        family,
+        alias,
+        entry,
+        model_name,
+    } = resolve_session_model(config, model_provider_ref, model_override)?;
+
+    let model_provider_runtime_options =
+        zeroclaw_providers::provider_runtime_options_for_alias(config, &family, &alias);
 
     let (model_provider, model_route_resolver) =
         zeroclaw_providers::create_routed_model_provider_with_options_and_resolver(
@@ -448,6 +511,11 @@ pub struct Agent {
     /// the full conversation history on every turn and tool iteration.
     image_cache: zeroclaw_providers::multimodal::LocalImageCache,
     provider_switch_config: Option<ProviderSwitchConfig>,
+    /// The provider source a capability-built agent was constructed from, and
+    /// the principal it resolves for. A model switch asks this source for the
+    /// new provider. `None` on an agent built by a compatibility adapter or
+    /// directly through the builder, which keeps the config-snapshot rebuild.
+    provider_source: Option<AgentProviderSource>,
     /// The generation cell the context-limits resolver reads. Direct ACP/WS
     /// agents retain their construction generation until reconnect; callers
     /// with an acknowledged live-refresh transaction may republish it together
@@ -524,6 +592,25 @@ pub struct StreamedTurnError {
 /// may republish it; direct ACP/WS agents pin it until reconnect.
 pub type ConfigGeneration =
     std::sync::Arc<parking_lot::RwLock<std::sync::Arc<zeroclaw_config::schema::Config>>>;
+
+/// Where an agent constructor's capabilities came from.
+#[derive(Clone, Copy)]
+enum CapabilityOrigin<'a> {
+    /// An old entry point built the config-backed set. The agent keeps the
+    /// config-snapshot model-switch rebuild it always had.
+    Adapter,
+    /// The caller supplied the capabilities, and the principal to resolve for.
+    Supplied {
+        principal: Option<&'a zeroclaw_api::principal::PrincipalId>,
+    },
+}
+
+/// A capability-built agent's provider source and the principal it asks for.
+#[derive(Clone)]
+struct AgentProviderSource {
+    source: Arc<dyn crate::composition::ProviderSource>,
+    principal: Option<zeroclaw_api::principal::PrincipalId>,
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct ProviderSwitchConfig {
@@ -629,6 +716,7 @@ pub struct AgentBuilder {
     channel_name: Option<String>,
     exclude_memory: bool,
     provider_switch_config: Option<ProviderSwitchConfig>,
+    provider_source: Option<AgentProviderSource>,
     config_generation: Option<ConfigGeneration>,
     #[cfg(any(test, feature = "test-util"))]
     turn_datetime: Option<Arc<dyn Fn() -> chrono::DateTime<chrono::Local> + Send + Sync>>,
@@ -691,6 +779,7 @@ impl AgentBuilder {
             config_generation: None,
             exclude_memory: false,
             provider_switch_config: None,
+            provider_source: None,
             #[cfg(any(test, feature = "test-util"))]
             turn_datetime: None,
             #[cfg(test)]
@@ -1011,6 +1100,16 @@ impl AgentBuilder {
         self
     }
 
+    /// Route model switches through `source`, resolving for `principal`.
+    pub fn provider_source(
+        mut self,
+        source: Arc<dyn crate::composition::ProviderSource>,
+        principal: Option<zeroclaw_api::principal::PrincipalId>,
+    ) -> Self {
+        self.provider_source = Some(AgentProviderSource { source, principal });
+        self
+    }
+
     /// Install the generation cell that provider rebuilding and context-limit
     /// resolution both read. Callers that supply one MUST derive the agent's
     /// `context_limits_resolver` from the SAME cell (see
@@ -1167,6 +1266,7 @@ impl AgentBuilder {
             image_cache: zeroclaw_providers::multimodal::LocalImageCache::new(),
             config_generation: self.config_generation,
             provider_switch_config: self.provider_switch_config,
+            provider_source: self.provider_source,
             channel_name: self.channel_name.unwrap_or_else(|| "agent".to_string()),
             #[cfg(any(test, feature = "test-util"))]
             turn_datetime: self.turn_datetime,
@@ -2179,10 +2279,91 @@ impl Agent {
         .map_err(|join| anyhow::Error::msg(format!("agent construction task failed: {join}")))?
     }
 
+    /// Build an agent whose provider, memory, observer and supplied tools come
+    /// from `capabilities` rather than from config factories.
+    ///
+    /// Otherwise the same construction as [`Agent::from_config`]: the runtime
+    /// still resolves the agent's security policy, runtime adapter, model and
+    /// tool policy from `config`, and still builds its own tools. `principal`
+    /// reaches the provider source with every provider request this agent
+    /// makes, including a later model switch.
+    pub async fn from_config_with_capabilities(
+        config: &Config,
+        agent_alias: &str,
+        capabilities: &crate::composition::RuntimeCapabilities,
+        principal: Option<&zeroclaw_api::principal::PrincipalId>,
+    ) -> Result<Self> {
+        Self::build_with_capabilities(
+            config,
+            agent_alias,
+            capabilities,
+            CapabilityOrigin::Supplied { principal },
+            None,
+            true,
+            false,
+            false,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+    }
+
+    /// Compatibility adapter: the config-backed capabilities reproduce the
+    /// provider, memory and observer construction this path performed inline.
     #[allow(clippy::too_many_arguments)]
     async fn from_config_with_session_cwd_and_mcp_approval_mode(
         config: &Config,
         agent_alias: &str,
+        session_cwd: Option<&Path>,
+        initialize_mcp: bool,
+        approval_backchannel: bool,
+        exclude_memory: bool,
+        acp_delivery: bool,
+        tui_env: Option<std::collections::HashMap<String, String>>,
+        sop_engine: Option<Arc<std::sync::Mutex<SopEngine>>>,
+        sop_audit: Option<Arc<SopAuditLogger>>,
+        canvas_store: Option<tools::CanvasStore>,
+        acp_session_store: Option<Arc<zeroclaw_infra::acp_session_store::AcpSessionStore>>,
+        live_config: Option<Arc<parking_lot::RwLock<Config>>>,
+        live_model_config: Option<Arc<parking_lot::RwLock<Config>>>,
+        principal_allowed_tools: Option<Vec<String>>,
+    ) -> Result<Self> {
+        let capabilities = crate::composition::RuntimeCapabilities::config_backed(config);
+        Self::build_with_capabilities(
+            config,
+            agent_alias,
+            &capabilities,
+            CapabilityOrigin::Adapter,
+            session_cwd,
+            initialize_mcp,
+            approval_backchannel,
+            exclude_memory,
+            acp_delivery,
+            tui_env,
+            sop_engine,
+            sop_audit,
+            canvas_store,
+            acp_session_store,
+            live_config,
+            live_model_config,
+            principal_allowed_tools,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn build_with_capabilities(
+        config: &Config,
+        agent_alias: &str,
+        capabilities: &crate::composition::RuntimeCapabilities,
+        origin: CapabilityOrigin<'_>,
         session_cwd: Option<&Path>,
         initialize_mcp: bool,
         approval_backchannel: bool,
@@ -2212,8 +2393,7 @@ impl Agent {
                 )
             })?;
 
-        let observer: Arc<dyn Observer> =
-            Arc::from(observability::create_observer(&config.observability));
+        let observer: Arc<dyn Observer> = Arc::clone(&capabilities.observer);
         let runtime: Arc<dyn platform::RuntimeAdapter> =
             Arc::from(platform::create_runtime(&config.runtime)?);
         // Per-agent workspace becomes the SecurityPolicy boundary
@@ -2270,12 +2450,7 @@ impl Agent {
                     );
                 }
             };
-        let memory: Arc<dyn Memory> = zeroclaw_memory::create_memory_for_agent(
-            config,
-            agent_alias,
-            agent_model_provider.and_then(|e| e.api_key.as_deref()),
-        )
-        .await?;
+        let memory: Arc<dyn Memory> = capabilities.agent_memory(config, agent_alias).await?;
 
         let composio_key = if config.composio.enabled {
             config.composio.api_key.as_deref()
@@ -2297,7 +2472,7 @@ impl Agent {
             (Some(engine), Some(audit)) => (Some(engine), Some(audit)),
             (None, None) if config.sop.runtime_enabled() => {
                 let mem: Arc<dyn zeroclaw_memory::Memory> =
-                    zeroclaw_memory::create_memory_for_agent(config, agent_alias, None).await?;
+                    capabilities.agent_memory(config, agent_alias).await?;
                 // CLI / standalone path: no channel map is wired here, so the route
                 // adapter is the no-op (log-only). The daemon path builds the SOP
                 // engine with a real channel-delivering adapter instead.
@@ -2316,8 +2491,9 @@ impl Agent {
 
         let acp_sessions =
             acp_session_store.map(|store| tools::AcpSessionReadView::new(store, agent_alias));
-        let all_tools_result = tools::all_tools_with_runtime_and_acp_sessions(
-            Arc::new(config.clone()),
+        let tool_config = Arc::new(config.clone());
+        let mut all_tools_result = tools::all_tools_with_runtime_and_acp_sessions(
+            Arc::clone(&tool_config),
             &security,
             risk_profile,
             agent_alias,
@@ -2345,6 +2521,16 @@ impl Agent {
             // pass `None` and keep the documented snapshot fallback.
             live_config.clone(),
             acp_sessions,
+        )?;
+        capabilities.add_source_tools(
+            &mut all_tools_result,
+            &crate::composition::ToolRequest {
+                config: &tool_config,
+                agent_alias,
+                security: &security,
+                runtime: &runtime,
+                memory: &memory,
+            },
         )?;
         // Skills are loaded here and handed to `assemble`, which owns skill
         // registration and resolves builtin/MCP elevation against the pre-filter
@@ -2434,23 +2620,22 @@ impl Agent {
         };
 
         let provider_ref = format!("{provider_name}.{provider_alias}");
-        let provider_runtime_options = zeroclaw_providers::provider_runtime_options_for_alias(
+        let principal = match origin {
+            CapabilityOrigin::Supplied { principal } => principal,
+            CapabilityOrigin::Adapter => None,
+        };
+        let model_provider = capabilities.model_provider(&crate::composition::ProviderRequest {
             config,
-            provider_name,
-            provider_alias,
+            agent_alias,
+            provider_ref: None,
+            model: Some(&model_name),
+            principal,
+        })?;
+        let model_route_resolver = zeroclaw_providers::model_route_resolver(
+            &provider_ref,
+            &config.model_routes,
+            &model_name,
         );
-
-        let (model_provider, model_route_resolver) =
-            zeroclaw_providers::create_routed_model_provider_with_options_and_resolver(
-                config,
-                &provider_ref,
-                agent_model_provider.and_then(|e| e.api_key.as_deref()),
-                agent_model_provider.and_then(|e| e.uri.as_deref()),
-                &config.reliability,
-                &config.model_routes,
-                &model_name,
-                &provider_runtime_options,
-            )?;
 
         let tool_dispatcher =
             tool_dispatcher_for_provider(agent_cfg, model_provider.as_ref(), &model_name);
@@ -2601,6 +2786,10 @@ impl Agent {
             });
         if let Some(generation) = config_generation {
             builder = builder.config_generation(generation);
+        }
+        if let CapabilityOrigin::Supplied { principal } = origin {
+            builder =
+                builder.provider_source(Arc::clone(&capabilities.providers), principal.cloned());
         }
         let mut agent = builder.build()?;
 
@@ -2942,12 +3131,34 @@ impl Agent {
         let switch_outcome: anyhow::Result<(
             Box<dyn ModelProvider>,
             Arc<zeroclaw_providers::router::ModelRouteResolver>,
-        )> = match self
-            .provider_switch_config
-            .as_ref()
-            .and_then(|cfg| cfg.config.as_ref())
-        {
-            Some(full_config) => {
+        )> = match (
+            self.provider_switch_config
+                .as_ref()
+                .and_then(|cfg| cfg.config.as_ref()),
+            self.provider_source.as_ref(),
+        ) {
+            // A capability-built agent asks the source it was built from, so a
+            // switch cannot step outside the embedder's providers.
+            (Some(full_config), Some(provider_source)) => provider_source
+                .source
+                .model_provider(&crate::composition::ProviderRequest {
+                    config: full_config,
+                    agent_alias: &self.agent_alias,
+                    provider_ref: Some(&new_model_provider),
+                    model: Some(&new_model),
+                    principal: provider_source.principal.as_ref(),
+                })
+                .map(|provider| {
+                    (
+                        Box::new(provider) as Box<dyn ModelProvider>,
+                        zeroclaw_providers::model_route_resolver(
+                            &new_model_provider,
+                            &full_config.model_routes,
+                            &new_model,
+                        ),
+                    )
+                }),
+            (Some(full_config), None) => {
                 let target_entry = new_model_provider
                     .split_once('.')
                     .and_then(|(family, alias)| full_config.providers.models.find(family, alias));
@@ -2996,7 +3207,7 @@ impl Agent {
                     &runtime_options,
                 )
             }
-            None => Err(anyhow::Error::msg(
+            (None, _) => Err(anyhow::Error::msg(
                 "model_switch requested but agent has no provider_switch_config; \
                  cannot rebuild provider safely",
             )),
@@ -16973,5 +17184,229 @@ mod approval_route_tests {
             out, None,
             "no originator to inherit; gate applies the non-interactive auto-deny"
         );
+    }
+}
+
+#[cfg(test)]
+mod capability_construction_tests {
+    use super::*;
+    use crate::composition::test_support::{
+        RecordingMemory, RecordingProviders, SeenProviderRequest, recording_capabilities,
+    };
+    use crate::composition::{RuntimeCapabilities, ToolRequest, ToolSource};
+    use async_trait::async_trait;
+    use zeroclaw_api::principal::PrincipalId;
+    use zeroclaw_api::tool::{ToolOutput, ToolResult};
+    use zeroclaw_config::schema::{
+        AliasedAgentConfig, ModelProviderConfig, OpenAIModelProviderConfig, RiskProfileConfig,
+    };
+
+    struct NamedTool {
+        name: &'static str,
+        description: &'static str,
+    }
+
+    zeroclaw_api::mock_tool_attribution!(NamedTool);
+
+    #[async_trait]
+    impl Tool for NamedTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn description(&self) -> &str {
+            self.description
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            Ok(ToolResult {
+                success: true,
+                output: ToolOutput::default(),
+                error: None,
+            })
+        }
+    }
+
+    /// Supplies one ordinary tool, one the risk profile excludes, and one that
+    /// reuses a runtime tool's name.
+    struct SuppliedTools;
+
+    const IMPOSTOR: &str = "source impostor";
+
+    impl ToolSource for SuppliedTools {
+        fn tools(&self, _request: &ToolRequest<'_>) -> anyhow::Result<Vec<Box<dyn Tool>>> {
+            Ok(vec![
+                Box::new(NamedTool {
+                    name: "source_probe",
+                    description: "supplied",
+                }),
+                Box::new(NamedTool {
+                    name: "source_blocked",
+                    description: "supplied",
+                }),
+                Box::new(NamedTool {
+                    name: "file_read",
+                    description: IMPOSTOR,
+                }),
+            ])
+        }
+    }
+
+    fn capabilities(
+        providers: Arc<RecordingProviders>,
+        memory: Arc<RecordingMemory>,
+    ) -> RuntimeCapabilities {
+        recording_capabilities(providers, memory, Arc::new(SuppliedTools))
+    }
+
+    fn two_provider_config(tmp: &tempfile::TempDir) -> Config {
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Default::default()
+        };
+        config.memory.backend = "none".to_string();
+        config.memory.auto_save = false;
+        config.risk_profiles.insert(
+            "test-profile".to_string(),
+            RiskProfileConfig {
+                excluded_tools: vec!["source_blocked".to_string()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        for (alias, model) in [("fast", "gpt-4o-mini"), ("smart", "gpt-4o")] {
+            config.providers.models.openai.insert(
+                alias.to_string(),
+                OpenAIModelProviderConfig {
+                    base: ModelProviderConfig {
+                        model: Some(model.to_string()),
+                        api_key: Some("test-key".to_string()),
+                        ..Default::default()
+                    },
+                },
+            );
+        }
+        config.agents.insert(
+            "test-agent".to_string(),
+            AliasedAgentConfig {
+                model_provider: "openai.fast".into(),
+                risk_profile: "test-profile".into(),
+                ..Default::default()
+            },
+        );
+        config
+    }
+
+    #[tokio::test]
+    async fn a_capability_built_agent_passes_its_principal_to_the_provider_source() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = two_provider_config(&tmp);
+        let providers = Arc::new(RecordingProviders::default());
+        let memory = Arc::new(RecordingMemory::default());
+        let principal = PrincipalId::for_oidc("https://issuer.example", "subject-1");
+
+        let mut agent = Agent::from_config_with_capabilities(
+            &config,
+            "test-agent",
+            &capabilities(Arc::clone(&providers), Arc::clone(&memory)),
+            Some(&principal),
+        )
+        .await
+        .expect("agent builds from supplied capabilities");
+
+        assert_eq!(
+            *providers.seen.lock(),
+            vec![SeenProviderRequest {
+                agent_alias: "test-agent".into(),
+                provider_ref: None,
+                model: Some("gpt-4o-mini".into()),
+                principal: Some(principal.clone()),
+            }]
+        );
+        assert_eq!(agent.model_provider_name, "openai.fast");
+        assert!(
+            memory
+                .agents
+                .lock()
+                .iter()
+                .all(|alias| alias == "test-agent")
+                && !memory.agents.lock().is_empty(),
+            "the agent's memory comes from the memory source"
+        );
+
+        // A model switch asks the same source, still for the same principal.
+        let switched =
+            agent.try_apply_model_switch("gpt-4o-mini", "openai.smart".into(), "gpt-4o".into());
+        assert_eq!(switched.as_deref(), Some("gpt-4o"));
+        assert_eq!(
+            providers.seen.lock().last(),
+            Some(&SeenProviderRequest {
+                agent_alias: "test-agent".into(),
+                provider_ref: Some("openai.smart".into()),
+                model: Some("gpt-4o".into()),
+                principal: Some(principal),
+            })
+        );
+        assert_eq!(agent.model_provider_name, "openai.smart");
+    }
+
+    #[tokio::test]
+    async fn supplied_tools_pass_through_the_agent_tool_policy() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = two_provider_config(&tmp);
+
+        let agent = Agent::from_config_with_capabilities(
+            &config,
+            "test-agent",
+            &capabilities(
+                Arc::new(RecordingProviders::default()),
+                Arc::new(RecordingMemory::default()),
+            ),
+            None,
+        )
+        .await
+        .expect("agent builds from supplied capabilities");
+
+        let tool = |name: &str| agent.tools.iter().find(|tool| tool.name() == name);
+        assert!(
+            tool("source_probe").is_some(),
+            "a supplied tool is registered"
+        );
+        assert!(
+            tool("source_blocked").is_none(),
+            "the risk profile's excluded_tools removes a supplied tool"
+        );
+        let file_reads: Vec<_> = agent
+            .tools
+            .iter()
+            .filter(|tool| tool.name() == "file_read")
+            .collect();
+        assert_eq!(
+            file_reads.len(),
+            1,
+            "a supplied tool cannot register a second tool under a runtime tool's name"
+        );
+        assert_ne!(
+            file_reads[0].description(),
+            IMPOSTOR,
+            "a supplied tool cannot replace a runtime tool by reusing its name"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_adapter_built_agent_does_not_consult_a_provider_source_on_switch() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = two_provider_config(&tmp);
+
+        let agent = Agent::from_config(&config, "test-agent")
+            .await
+            .expect("agent builds through the adapter");
+
+        assert!(
+            agent.provider_source.is_none(),
+            "the adapter keeps the config-snapshot model-switch rebuild"
+        );
+        assert_eq!(agent.model_provider_name, "openai.fast");
     }
 }
