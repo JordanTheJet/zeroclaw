@@ -4156,6 +4156,65 @@ mod tests {
         result.output.contains(GATED_BODY_MARKER)
     }
 
+    /// A hook's relative paths resolve against `data_dir`, as the job's own
+    /// shell body does, not against the agent workspace.
+    ///
+    /// An operator could reasonably expect a relative file check in a hook to
+    /// look in the agent's workspace. It does not: hooks and shell bodies share
+    /// one working directory, and this pins it so a change to either is a
+    /// deliberate decision rather than a drift between the two.
+    #[tokio::test]
+    async fn pre_hook_relative_paths_resolve_against_the_data_dir() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        allow_gate_test_commands(&mut config);
+        config
+            .risk_profiles
+            .get_mut(TEST_AGENT)
+            .expect("test agent profile")
+            .allowed_commands
+            .push("cat".into());
+        let job = declarative_gated_job(&mut config, "relative-gate", "cat hook-marker", 30);
+
+        let workspace = config.agent_workspace_dir(TEST_AGENT);
+        assert_ne!(workspace, config.data_dir, "the two locations must differ");
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        // Present only in the data directory: the gate sees it and the job runs.
+        std::fs::write(config.data_dir.join("hook-marker"), "present").unwrap();
+        let result = run_manual_job(
+            &config,
+            &job,
+            CronDeliveryContext::RpcManual,
+            &None,
+            test_agent_executor(),
+        )
+        .await;
+        assert!(
+            result.success && body_ran(&result),
+            "a relative path must resolve against data_dir: {}",
+            result.output
+        );
+
+        // Present only in the agent workspace: the gate does not see it.
+        std::fs::remove_file(config.data_dir.join("hook-marker")).unwrap();
+        std::fs::write(workspace.join("hook-marker"), "present").unwrap();
+        let result = run_manual_job(
+            &config,
+            &job,
+            CronDeliveryContext::RpcManual,
+            &None,
+            test_agent_executor(),
+        )
+        .await;
+        assert_eq!(
+            result.status, STATUS_PRECONDITION_FAILED,
+            "a hook must not resolve relative paths against the agent workspace: {}",
+            result.output
+        );
+        assert!(!body_ran(&result));
+    }
+
     #[tokio::test]
     async fn pre_hook_exit_zero_runs_the_job_and_records_ok() {
         let tmp = TempDir::new().unwrap();

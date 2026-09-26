@@ -15419,6 +15419,11 @@ impl Default for DeliveryConfigDecl {
 pub struct CronPreHookDecl {
     /// Shell command to run before the job body. Must be non-empty; an empty
     /// command is rejected when declarative jobs are synced.
+    ///
+    /// It runs in the daemon's data directory, the same working directory as
+    /// the job's own shell `command`, so relative paths resolve there and not
+    /// in the owning agent's workspace. Use an absolute path to check a file
+    /// anywhere else.
     #[serde(default)]
     pub command: String,
     /// Wall-clock budget for the hook, in seconds. Must be at least `1`; the
