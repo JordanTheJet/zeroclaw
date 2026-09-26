@@ -13,6 +13,7 @@ pub mod identity;
 pub mod migration;
 pub mod util;
 
+pub mod a2a_card;
 pub mod agent;
 pub mod approval;
 pub mod browse;

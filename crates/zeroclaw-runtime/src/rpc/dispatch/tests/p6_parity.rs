@@ -287,3 +287,121 @@ fn workspace_methods_are_classified_and_named() {
         );
     }
 }
+
+#[test]
+fn catalog_methods_are_classified_and_named() {
+    use zeroclaw_api::grants::{Resource, Verb};
+    for (method, wire, resource) in [
+        (
+            Method::IntegrationsList,
+            "integrations/list",
+            Resource::Tools,
+        ),
+        (
+            Method::ToolsCliDiscover,
+            "tools/cli-discover",
+            Resource::Tools,
+        ),
+        (Method::PluginsList, "plugins/list", Resource::Plugins),
+        (Method::A2aIdentity, "a2a/identity", Resource::System),
+    ] {
+        assert_eq!(method.wire_name(), wire);
+        assert_eq!(Method::from_wire(wire), Some(method));
+        assert_eq!(
+            method.authz(),
+            MethodAuthz::Requires(resource, Verb::Read),
+            "{wire}"
+        );
+    }
+}
+
+/// `scoped` holds `system:read` and `tools:read` for agent `alpha` only.
+fn catalog_config(tmp: &tempfile::TempDir) -> zeroclaw_config::schema::Config {
+    use std::collections::HashMap;
+    use zeroclaw_api::grants::{Resource, Verb};
+    use zeroclaw_config::schema::{AliasedAgentConfig, PermissionProfileConfig, UserConfig};
+
+    let mut config = zeroclaw_config::schema::Config {
+        config_path: tmp.path().join("config.toml"),
+        ..zeroclaw_config::schema::Config::default()
+    };
+    config.a2a.server.enabled = true;
+    for alias in ["alpha", "beta"] {
+        let mut agent = AliasedAgentConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        agent.a2a.published = true;
+        config.agents.insert(alias.into(), agent);
+    }
+    config.permission_profiles.insert(
+        "catalog-alpha".into(),
+        PermissionProfileConfig {
+            allowed_agents: vec!["alpha".into()],
+            grants: HashMap::from([
+                (Resource::System, vec![Verb::Read]),
+                (Resource::Tools, vec![Verb::Read]),
+            ]),
+            ..PermissionProfileConfig::default()
+        },
+    );
+    config.users.insert(
+        "scoped".into(),
+        UserConfig {
+            uid: Some(SCOPED),
+            permission_profiles: vec!["catalog-alpha".into()],
+            ..UserConfig::default()
+        },
+    );
+    config
+}
+
+#[tokio::test]
+async fn a2a_identity_holds_a_named_agent_to_the_selector() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let ctx = enforcement_ctx(catalog_config(&tmp));
+    let (mut peer, mut rx) = roster_peer(&ctx, SCOPED).await;
+
+    let own = rpc(
+        &mut peer,
+        &mut rx,
+        1,
+        "a2a/identity",
+        json!({"agent": "alpha"}),
+    )
+    .await;
+    assert_eq!(own["result"]["name"], json!("alpha"), "{own}");
+    let other = rpc(
+        &mut peer,
+        &mut rx,
+        2,
+        "a2a/identity",
+        json!({"agent": "beta"}),
+    )
+    .await;
+    assert_forbidden(&other, "another agent's card");
+    // The catalog lists published agents only, like the unauthenticated
+    // well-known route, so it is not held to the selector.
+    let catalog = rpc(&mut peer, &mut rx, 3, "a2a/identity", json!({})).await;
+    assert_eq!(
+        catalog["result"]["name"],
+        json!("ZeroClaw agents"),
+        "{catalog}"
+    );
+}
+
+#[tokio::test]
+async fn catalog_methods_route_through_the_gate() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let ctx = enforcement_ctx(catalog_config(&tmp));
+    let (mut peer, mut rx) = roster_peer(&ctx, SCOPED).await;
+
+    let integrations = rpc(&mut peer, &mut rx, 1, "integrations/list", json!({})).await;
+    assert!(
+        integrations["result"]["integrations"].is_array(),
+        "{integrations}"
+    );
+    // `plugins:read` is not granted, so the gate refuses before the handler.
+    let plugins = rpc(&mut peer, &mut rx, 2, "plugins/list", json!({})).await;
+    assert_forbidden(&plugins, "plugins/list without plugins:read");
+}
