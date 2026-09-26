@@ -3347,9 +3347,14 @@
             "type": "object"
           },
           {
-            "description": "Emitted whenever older whole turns were dropped from structured history\nto fit a token budget or message cap. Surfaces a user-visible \"context\nwas cut here\" marker so trimming is never silent. `dropped_messages` is\nthe count of conversation messages removed; `kept_turns` is how many\nwhole turns remained after the cut.",
+            "description": "Emitted whenever older whole turns were dropped from structured history\nto fit a token budget or message cap. Surfaces a user-visible \"context\nwas cut here\" marker so trimming is never silent. `dropped_messages` is\nthe count of conversation messages removed; `dropped_turns` and\n`kept_turns` describe the user-facing whole-turn accounting.",
             "properties": {
               "dropped_messages": {
+                "format": "uint",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "dropped_turns": {
                 "format": "uint",
                 "minimum": 0,
                 "type": "integer"
@@ -3430,6 +3435,7 @@
               "type",
               "session_id",
               "dropped_messages",
+              "dropped_turns",
               "kept_turns",
               "reason"
             ],
