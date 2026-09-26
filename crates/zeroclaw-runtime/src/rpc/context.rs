@@ -199,6 +199,10 @@ pub struct RpcContext {
     /// session is the same canvas everywhere.
     pub canvas_store: crate::tools::CanvasStore,
 
+    /// The channel operations behind `channels/*`, registered by a process
+    /// that runs channels. `None` elsewhere, and the methods say so.
+    pub channel_control: Option<Arc<dyn crate::rpc::channels::ChannelControl>>,
+
     /// The daemon's single certificate audit logger — the ONE writer of the
     /// Merkle-chained audit file, shared by enrollment, in-band renewal and
     /// the issued-cert ledger.
@@ -277,6 +281,7 @@ impl RpcContext {
             sop_audit: None,
             hooks: None,
             canvas_store: crate::tools::CanvasStore::default(),
+            channel_control: None,
             #[cfg(test)]
             config_commit_pause: None,
             cert_audit,
@@ -305,6 +310,7 @@ impl RpcContext {
             sop_audit: None,
             hooks: None,
             canvas_store: crate::tools::CanvasStore::default(),
+            channel_control: None,
             #[cfg(test)]
             config_commit_pause: None,
             cert_audit: None,
@@ -342,6 +348,7 @@ impl RpcContext {
             sop_audit: None,
             hooks: None,
             canvas_store: crate::tools::CanvasStore::default(),
+            channel_control: None,
             #[cfg(test)]
             config_commit_pause: None,
             cert_audit,
@@ -374,6 +381,7 @@ impl RpcContext {
             sop_audit: None,
             hooks: None,
             canvas_store: crate::tools::CanvasStore::default(),
+            channel_control: None,
             #[cfg(test)]
             config_commit_pause: None,
             cert_audit: None,
@@ -406,6 +414,7 @@ impl RpcContext {
             sop_audit: None,
             hooks: None,
             canvas_store: crate::tools::CanvasStore::default(),
+            channel_control: None,
             #[cfg(test)]
             config_commit_pause: None,
             cert_audit: None,
@@ -444,6 +453,7 @@ impl RpcContext {
             sop_audit: Some(sop_audit),
             hooks: None,
             canvas_store: crate::tools::CanvasStore::default(),
+            channel_control: None,
             config_commit_pause: None,
             cert_audit: None,
             auth,
@@ -475,6 +485,7 @@ impl RpcContext {
             sop_audit: None,
             hooks: None,
             canvas_store: crate::tools::CanvasStore::default(),
+            channel_control: None,
             #[cfg(test)]
             config_commit_pause: None,
             cert_audit: None,
@@ -507,6 +518,7 @@ impl RpcContext {
             sop_audit: None,
             hooks: None,
             canvas_store: crate::tools::CanvasStore::default(),
+            channel_control: None,
             #[cfg(test)]
             config_commit_pause: None,
             cert_audit: None,
@@ -540,6 +552,7 @@ impl RpcContext {
             sop_audit: None,
             hooks: None,
             canvas_store: crate::tools::CanvasStore::default(),
+            channel_control: None,
             #[cfg(test)]
             config_commit_pause: None,
             cert_audit: None,
@@ -573,6 +586,7 @@ impl RpcContext {
             sop_audit: None,
             hooks: None,
             canvas_store: crate::tools::CanvasStore::default(),
+            channel_control: None,
             #[cfg(test)]
             config_commit_pause: None,
             cert_audit: None,

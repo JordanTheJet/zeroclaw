@@ -769,3 +769,84 @@ async fn pairing_new_code_matches_the_admin_paircode_route() {
         assert_eq!(rpc, http, "{rotate:?}");
     }
 }
+
+// ── Channels ─────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn channels_list_and_relink_match_the_channel_routes() {
+    use zeroclaw_runtime::rpc::channels::ChannelControl;
+    let config = Config::default();
+    let state = test_state(config.clone());
+    let control = zeroclaw_channels::control::ChannelsControl;
+
+    let (status, http) = body_json(
+        crate::api::handle_api_channels(State(state.clone()), HeaderMap::new())
+            .await
+            .into_response(),
+    )
+    .await;
+    assert_eq!(status, 200, "{http}");
+    assert_eq!(control.list(&config, &state.pairing), http);
+
+    let (status, http) = body_json(
+        crate::api::handle_api_channel_relink(
+            State(state.clone()),
+            Path("nosuch.channel".to_string()),
+            HeaderMap::new(),
+        )
+        .await
+        .into_response(),
+    )
+    .await;
+    assert_eq!(status, 404, "{http}");
+    let err = control.relink(&config, "nosuch.channel").unwrap_err();
+    assert_eq!(
+        err.data,
+        Some(http.clone()),
+        "the RPC error carries the route's body"
+    );
+    assert_eq!(serde_json::json!(err.message), http["error"]);
+}
+
+#[tokio::test]
+async fn channels_bind_refuses_alike_on_both_surfaces() {
+    use zeroclaw_runtime::rpc::channels::ChannelControl;
+    let dir = tempfile::tempdir().unwrap();
+    let config = Config {
+        config_path: dir.path().join("config.toml"),
+        ..Config::default()
+    };
+    let state = test_state(config);
+    let control = zeroclaw_channels::control::ChannelsControl;
+    for (channel_type, alias) in [("smtp", "main"), ("telegram", "absent")] {
+        let (status, http) = body_json(
+            crate::api_config::handle_api_channel_bind(
+                State(state.clone()),
+                HeaderMap::new(),
+                Json(crate::api_config::ChannelBindBody {
+                    channel_type: channel_type.into(),
+                    alias: alias.into(),
+                    identity: "@alice".into(),
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_ne!(status, 200, "{channel_type}.{alias}: {http}");
+        let err = control
+            .bind(
+                &state.config,
+                &state.config_write_lock,
+                channel_type,
+                alias,
+                "@alice",
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            http.to_string().contains(&err.message),
+            "{channel_type}.{alias}: route {http} vs rpc {}",
+            err.message
+        );
+    }
+}

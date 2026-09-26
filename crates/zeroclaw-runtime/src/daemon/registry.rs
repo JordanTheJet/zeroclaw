@@ -79,6 +79,8 @@ pub struct DaemonRegistry {
     /// and passed to the RPC context so RPC-built agents and `canvas/*` see
     /// the same canvases.
     canvas_store: Option<crate::tools::CanvasStore>,
+    /// The channel operations behind `channels/*`, from the channels crate.
+    channel_control: Option<Arc<dyn crate::rpc::channels::ChannelControl>>,
 }
 
 /// The SOP wiring one daemon generation hands from `main` into the RPC
@@ -214,6 +216,20 @@ impl DaemonRegistry {
 
     /// The registered canvas store, or a fresh one when none was registered
     /// (an embedder with no gateway or channels to share it with).
+    pub fn set_channel_control(
+        &mut self,
+        control: Arc<dyn crate::rpc::channels::ChannelControl>,
+    ) -> &mut Self {
+        self.channel_control = Some(control);
+        self
+    }
+
+    pub(crate) fn take_channel_control(
+        &mut self,
+    ) -> Option<Arc<dyn crate::rpc::channels::ChannelControl>> {
+        self.channel_control.take()
+    }
+
     pub(crate) fn take_canvas_store(&mut self) -> crate::tools::CanvasStore {
         self.canvas_store.take().unwrap_or_default()
     }

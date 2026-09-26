@@ -226,6 +226,9 @@ pub enum Method {
     PairingRevoke,
     PairingRevokeAll,
     PairingNewCode,
+    ChannelsList,
+    ChannelsRelink,
+    ChannelsBind,
 }
 
 impl Method {
@@ -359,6 +362,9 @@ impl Method {
         (Method::PairingRevoke, "pairing/revoke"),
         (Method::PairingRevokeAll, "pairing/revoke-all"),
         (Method::PairingNewCode, "pairing/new-code"),
+        (Method::ChannelsList, "channels/list"),
+        (Method::ChannelsRelink, "channels/relink"),
+        (Method::ChannelsBind, "channels/bind"),
     ];
 
     /// Resolve a wire method name to a variant. Table scan, no hand-written
@@ -493,6 +499,8 @@ impl Method {
             M::A2aIdentity | M::MetricsScrape | M::PairingList => (Resource::System, Verb::Read),
             M::PairingRevoke | M::PairingRevokeAll => (Resource::System, Verb::Delete),
             M::PairingNewCode => (Resource::System, Verb::Create),
+            M::ChannelsList => (Resource::Channels, Verb::Read),
+            M::ChannelsRelink | M::ChannelsBind => (Resource::Channels, Verb::Update),
             M::CanvasList | M::CanvasGet | M::CanvasHistory => (Resource::Canvas, Verb::Read),
             M::CanvasRender => (Resource::Canvas, Verb::Update),
             M::CanvasClear => (Resource::Canvas, Verb::Delete),
@@ -1873,6 +1881,54 @@ impl RpcDispatcher {
         }
     }
 
+    /// `channels/*`: through the registered [`super::channels::ChannelControl`],
+    /// with the bodies the dashboard's channel routes serve.
+    ///
+    /// `channels/bind` also writes `peer_groups`, granting an outside identity
+    /// access to the agents, so it is held to the config-write selector for
+    /// `peer_groups` as well as `channels:update`. The binding reaches
+    /// channels running on another config copy at the next reload, as it does
+    /// from the dashboard.
+    async fn handle_channels_method(&self, method: Method, params: &Value) -> RpcResult {
+        let Some(control) = self.ctx.channel_control.clone() else {
+            return Err(rpc_err(
+                INVALID_REQUEST,
+                format!(
+                    "{} is not available: this process runs no channels",
+                    method.wire_name()
+                ),
+            ));
+        };
+        match method {
+            Method::ChannelsList => {
+                let config = self.ctx.config.read().clone();
+                Ok(control.list(&config, self.ctx.auth.pairing()))
+            }
+            Method::ChannelsRelink => {
+                let req: zeroclaw_api::jsonrpc::ChannelsRelinkRequest = parse_params(params)?;
+                let config = self.ctx.config.read().clone();
+                control.relink(&config, &req.channel)
+            }
+            Method::ChannelsBind => {
+                let req: zeroclaw_api::jsonrpc::ChannelsBindRequest = parse_params(params)?;
+                self.selector_config_write(method, "peer_groups")?;
+                control
+                    .bind(
+                        &self.ctx.config,
+                        &self.ctx.config_write_lock,
+                        &req.channel_type,
+                        &req.alias,
+                        &req.identity,
+                    )
+                    .await
+            }
+            _ => Err(rpc_err(
+                INTERNAL_ERROR,
+                format!("{} is not a channels method", method.wire_name()),
+            )),
+        }
+    }
+
     /// Refuse `method` unless the bound principal is an administrator. An
     /// unbound dispatcher is refused.
     fn require_admin(&self, method: Method) -> Result<(), JsonRpcError> {
@@ -3065,6 +3121,9 @@ impl RpcDispatcher {
             | Method::PairingRevokeAll
             | Method::PairingNewCode => {
                 Box::pin(self.handle_pairing_method(method, &req.params)).await
+            }
+            Method::ChannelsList | Method::ChannelsRelink | Method::ChannelsBind => {
+                Box::pin(self.handle_channels_method(method, &req.params)).await
             }
             Method::MetricsScrape => {
                 let observability = self.ctx.config.read().observability.clone();
@@ -25355,6 +25414,7 @@ mod tests {
             sop_audit: None,
             hooks: Some(Arc::new(runner)),
             canvas_store: crate::tools::CanvasStore::default(),
+            channel_control: None,
             cert_audit: None,
             auth: crate::rpc::auth::RpcInboundAuth::for_tests(
                 &zeroclaw_config::schema::Config::default(),
@@ -25405,6 +25465,7 @@ mod tests {
             sop_audit: None,
             hooks: Some(Arc::new(runner)),
             canvas_store: crate::tools::CanvasStore::default(),
+            channel_control: None,
             cert_audit: None,
             auth: crate::rpc::auth::RpcInboundAuth::for_tests(
                 &zeroclaw_config::schema::Config::default(),
@@ -25514,6 +25575,7 @@ mod tests {
             sop_audit: None,
             hooks: Some(Arc::new(runner)),
             canvas_store: crate::tools::CanvasStore::default(),
+            channel_control: None,
             cert_audit: None,
             auth: crate::rpc::auth::RpcInboundAuth::for_tests(
                 &zeroclaw_config::schema::Config::default(),
