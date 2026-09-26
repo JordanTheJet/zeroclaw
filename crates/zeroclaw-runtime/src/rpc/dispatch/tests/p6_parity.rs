@@ -5,8 +5,10 @@
 use super::*;
 
 /// Principals bound by peer uid: `scoped` may use agent `alpha` with every
-/// `files` verb, `ungranted` may use `alpha` but holds no `files` grant, and
-/// `wildcard` may use every agent with every `files` verb but is not admin.
+/// `files` verb, `ungranted` may use `alpha` and read sessions but holds no
+/// `files` grant, and `wildcard` may use every agent with every `files` verb
+/// but is not admin. Agents `alpha` and `beta` are configured, since a profile
+/// naming only unconfigured agents grants nothing.
 const SCOPED: u32 = 5101;
 const UNGRANTED: u32 = 5102;
 const WILDCARD_UID: u32 = 5103;
@@ -14,19 +16,32 @@ const WILDCARD_UID: u32 = 5103;
 fn files_config(tmp: &tempfile::TempDir) -> zeroclaw_config::schema::Config {
     use std::collections::HashMap;
     use zeroclaw_api::grants::{Resource, Verb};
-    use zeroclaw_config::schema::{PermissionProfileConfig, UserConfig};
+    use zeroclaw_config::schema::{AliasedAgentConfig, PermissionProfileConfig, UserConfig};
 
     let mut config = zeroclaw_config::schema::Config {
         config_path: tmp.path().join("config.toml"),
         ..zeroclaw_config::schema::Config::default()
     };
+    for alias in ["alpha", "beta"] {
+        config.agents.insert(
+            alias.into(),
+            AliasedAgentConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        );
+    }
     let all_files = HashMap::from([(
         Resource::Files,
         vec![Verb::Create, Verb::Read, Verb::Update, Verb::Delete],
     )]);
     for (name, agents, grants) in [
         ("files-alpha", vec!["alpha"], all_files.clone()),
-        ("alpha-only", vec!["alpha"], HashMap::new()),
+        (
+            "alpha-only",
+            vec!["alpha"],
+            HashMap::from([(Resource::Sessions, vec![Verb::Read])]),
+        ),
         (
             "files-everyone",
             vec![zeroclaw_api::grants::WILDCARD],
