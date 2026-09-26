@@ -12597,6 +12597,9 @@ data: [DONE]\n\n";
 }
 
 #[cfg(test)]
+mod rpc_parity_tests;
+
+#[cfg(test)]
 mod accept_error_tests {
     use super::is_recoverable_accept_error;
     use std::io::{Error, ErrorKind};

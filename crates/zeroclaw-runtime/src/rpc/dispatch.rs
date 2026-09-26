@@ -173,6 +173,12 @@ pub enum Method {
     // Files
     FileAttach,
     FsListDir,
+    WorkspaceList,
+    FsMkdir,
+    FsRmdir,
+    FsRead,
+    FsDelete,
+    FsMove,
 
     // Locales
     LocalesList,
@@ -290,6 +296,12 @@ impl Method {
         // Files
         (Method::FileAttach, "file/attach"),
         (Method::FsListDir, "fs/list_dir"),
+        (Method::WorkspaceList, "workspace/list"),
+        (Method::FsMkdir, "fs/mkdir"),
+        (Method::FsRmdir, "fs/rmdir"),
+        (Method::FsRead, "fs/read"),
+        (Method::FsDelete, "fs/delete"),
+        (Method::FsMove, "fs/move"),
         // Locales
         (Method::LocalesList, "locales/list"),
         (Method::LocalesFetch, "locales/fetch"),
@@ -417,7 +429,10 @@ impl Method {
             M::TuiList => (Resource::Tui, Verb::Read),
 
             M::FileAttach => (Resource::Files, Verb::Create),
-            M::FsListDir => (Resource::Files, Verb::Read),
+            M::FsListDir | M::WorkspaceList | M::FsRead => (Resource::Files, Verb::Read),
+            M::FsMkdir => (Resource::Files, Verb::Create),
+            M::FsMove => (Resource::Files, Verb::Update),
+            M::FsRmdir | M::FsDelete => (Resource::Files, Verb::Delete),
 
             M::LocalesList | M::LocalesFetch => (Resource::Locales, Verb::Read),
 
@@ -1583,6 +1598,98 @@ impl RpcDispatcher {
         )
     }
 
+    /// `workspace/list` and `fs/*`: parse, hold to the agent selector, then
+    /// run the shared browse operation. See [`super::workspace`].
+    fn handle_workspace_method(&self, method: Method, params: &Value) -> RpcResult {
+        // Each arm snapshots the config rather than holding the read lock across
+        // filesystem work, as the HTTP adapter does.
+        match method {
+            Method::WorkspaceList => {
+                let req: zeroclaw_api::jsonrpc::WorkspaceListRequest = parse_params(params)?;
+                self.authorize_workspace_scope(Method::WorkspaceList, req.agent.as_deref())?;
+                let config = self.ctx.config.read().clone();
+                super::workspace::handle_workspace_list(&config, &req)
+            }
+            Method::FsMkdir => {
+                let req: zeroclaw_api::jsonrpc::FsMkdirRequest = parse_params(params)?;
+                self.authorize_workspace_scope(Method::FsMkdir, req.agent.as_deref())?;
+                let config = self.ctx.config.read().clone();
+                super::workspace::handle_fs_mkdir(&config, &req)
+            }
+            Method::FsRmdir => {
+                let req: zeroclaw_api::jsonrpc::FsRmdirRequest = parse_params(params)?;
+                self.authorize_workspace_scope(Method::FsRmdir, None)?;
+                let config = self.ctx.config.read().clone();
+                super::workspace::handle_fs_rmdir(&config, &req)
+            }
+            Method::FsRead => {
+                let req: zeroclaw_api::jsonrpc::FsReadRequest = parse_params(params)?;
+                self.authorize_workspace_scope(Method::FsRead, Some(&req.agent))?;
+                let config = self.ctx.config.read().clone();
+                super::workspace::handle_fs_read(&config, &req)
+            }
+            Method::FsDelete => {
+                let req: zeroclaw_api::jsonrpc::FsDeleteRequest = parse_params(params)?;
+                self.authorize_workspace_scope(Method::FsDelete, Some(&req.agent))?;
+                let config = self.ctx.config.read().clone();
+                super::workspace::handle_fs_delete(&config, &req)
+            }
+            Method::FsMove => {
+                let req: zeroclaw_api::jsonrpc::FsMoveRequest = parse_params(params)?;
+                self.authorize_workspace_scope(Method::FsMove, Some(&req.agent))?;
+                let config = self.ctx.config.read().clone();
+                super::workspace::handle_fs_move(&config, &req)
+            }
+
+            _ => Err(rpc_err(
+                INTERNAL_ERROR,
+                format!("{} is not a workspace method", method.wire_name()),
+            )),
+        }
+    }
+
+    /// Hold a `workspace/list` or `fs/*` operation to the principal's agent
+    /// selector, before anything touches the filesystem, so a refusal does
+    /// not reveal whether a path exists. With `agent`, the principal must be
+    /// entitled to that agent. Without one the operation targets the shared
+    /// area every agent reads, so the principal must be entitled to every
+    /// agent: one scoped to some agents must not change what the others see.
+    /// An unbound dispatcher is refused, as it is for `fs/list_dir`.
+    fn authorize_workspace_scope(
+        &self,
+        method: Method,
+        agent: Option<&str>,
+    ) -> Result<(), JsonRpcError> {
+        let Some(grants) = self.stamped_grants() else {
+            return Err(rpc_err(AUTH_REQUIRED, "First call must be 'initialize'"));
+        };
+        let entitled = grants.may_use_agent(agent.unwrap_or(zeroclaw_api::grants::WILDCARD));
+        if entitled {
+            return Ok(());
+        }
+        let denied = rpc_err(
+            FORBIDDEN,
+            match agent {
+                Some(agent) => format!(
+                    "{} is not permitted for agent {agent:?}",
+                    method.wire_name()
+                ),
+                None => format!(
+                    "{} on the shared area requires access to every agent",
+                    method.wire_name()
+                ),
+            },
+        );
+        self.audit_auth_denial(
+            method,
+            &crate::rpc::auth::AuthDenied {
+                code: denied.code,
+                message: denied.message.clone(),
+            },
+        );
+        Err(denied)
+    }
+
     /// Confine `fs/list_dir` to what the bound principal may read, before the
     /// handler probes the path, so a refusal does not reveal whether the path
     /// exists. The coarse `Files:Read` grant has already passed the gate; see
@@ -2619,6 +2726,12 @@ impl RpcDispatcher {
                 Ok(auth) => super::fs::handle_fs_list_dir(&req.params, &auth).await,
                 Err(denied) => Err(denied),
             },
+            Method::WorkspaceList
+            | Method::FsMkdir
+            | Method::FsRmdir
+            | Method::FsRead
+            | Method::FsDelete
+            | Method::FsMove => self.handle_workspace_method(method, &req.params),
 
             // Locales
             Method::LocalesList => super::locales::handle_locales_list(self.tui_id()),
@@ -9593,6 +9706,8 @@ pub(crate) mod connection_test_support {
 
 #[cfg(test)]
 mod tests {
+    mod p6_parity;
+
     use zeroclaw_api::model_provider::ChatMessage;
 
     /// The personality filename allowlist constrains the name, not its target.
