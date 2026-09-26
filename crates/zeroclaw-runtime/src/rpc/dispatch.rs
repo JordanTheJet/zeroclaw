@@ -1822,6 +1822,9 @@ impl RpcDispatcher {
     /// operator decision, not a grantable one.
     async fn handle_pairing_method(&self, method: Method, params: &Value) -> RpcResult {
         self.require_admin(method)?;
+        if matches!(method, Method::PairingNewCode | Method::PairingRevokeAll) {
+            self.require_local_transport(method)?;
+        }
         let pairing = Arc::clone(self.ctx.auth.pairing());
         let config = Arc::clone(&self.ctx.config);
         let lock = Arc::clone(&self.ctx.config_write_lock);
@@ -1914,11 +1917,17 @@ impl RpcDispatcher {
             }
             Method::ChannelsRelink => {
                 let req: zeroclaw_api::jsonrpc::ChannelsRelinkRequest = parse_params(params)?;
+                self.authorize_channel_owner(method, |info| {
+                    format!("{}.{}", info.channel_type, info.alias) == req.channel
+                })?;
                 let config = self.ctx.config.read().clone();
                 control.relink(&config, &req.channel)
             }
             Method::ChannelsBind => {
                 let req: zeroclaw_api::jsonrpc::ChannelsBindRequest = parse_params(params)?;
+                self.authorize_channel_owner(method, |info| {
+                    info.channel_type == req.channel_type.trim() && info.alias == req.alias.trim()
+                })?;
                 self.selector_config_write(method, "peer_groups")?;
                 control
                     .bind(
@@ -2004,6 +2013,82 @@ impl RpcDispatcher {
         }
     }
 
+    /// Refuse `method` unless this connection arrived on the local socket or
+    /// pipe. Minting a pairing code and revoking every paired token are
+    /// loopback-only over HTTP (`/admin/paircode/new`), and stay so here: a
+    /// remote administrator can revoke devices one at a time, but cannot mint
+    /// a credential or clear every other one from afar.
+    fn require_local_transport(&self, method: Method) -> Result<(), JsonRpcError> {
+        if self.transport_kind == crate::rpc::transport::TransportKind::Local {
+            return Ok(());
+        }
+        let denied = rpc_err(
+            FORBIDDEN,
+            format!(
+                "{} is only available on the local socket, as /admin/paircode/new is only \
+                 available from localhost",
+                method.wire_name()
+            ),
+        );
+        self.audit_auth_denial(
+            method,
+            &crate::rpc::auth::AuthDenied {
+                code: denied.code,
+                message: denied.message.clone(),
+            },
+        );
+        Err(denied)
+    }
+
+    /// Refuse `method` unless the bound principal may use every agent: for a
+    /// surface shared by all agents, where a principal scoped to some of them
+    /// must not change what the others see. An unbound dispatcher is refused.
+    fn authorize_every_agent(&self, method: Method, surface: &str) -> Result<(), JsonRpcError> {
+        let Some(grants) = self.stamped_grants() else {
+            return Err(rpc_err(AUTH_REQUIRED, "First call must be 'initialize'"));
+        };
+        if grants.may_use_agent(zeroclaw_api::grants::WILDCARD) {
+            return Ok(());
+        }
+        let denied = rpc_err(
+            FORBIDDEN,
+            format!(
+                "{} on {surface} requires access to every agent",
+                method.wire_name()
+            ),
+        );
+        self.audit_auth_denial(
+            method,
+            &crate::rpc::auth::AuthDenied {
+                code: denied.code,
+                message: denied.message.clone(),
+            },
+        );
+        Err(denied)
+    }
+
+    /// Hold a channel operation to the agent that owns the channel alias. A
+    /// channel with no owner, or no such channel, needs access to every agent,
+    /// so an unknown channel is refused the same way as a forbidden one.
+    fn authorize_channel_owner(
+        &self,
+        method: Method,
+        matches: impl Fn(&zeroclaw_config::schema::ChannelAliasInfo) -> bool,
+    ) -> Result<(), JsonRpcError> {
+        let owner = self
+            .ctx
+            .config
+            .read()
+            .channels_by_alias()
+            .into_iter()
+            .find(|info| matches(info))
+            .and_then(|info| info.owning_agent);
+        match owner {
+            Some(agent) => self.authorize_agent_selector(method, &agent),
+            None => self.authorize_every_agent(method, "an unowned channel"),
+        }
+    }
+
     /// Refuse `method` unless the bound principal is an administrator. An
     /// unbound dispatcher is refused.
     fn require_admin(&self, method: Method) -> Result<(), JsonRpcError> {
@@ -2031,6 +2116,11 @@ impl RpcDispatcher {
     /// the `/api/canvas` routes use. See [`super::canvas`].
     fn handle_canvas_method(&self, method: Method, params: &Value) -> RpcResult {
         use zeroclaw_api::jsonrpc::{CanvasIdRequest, CanvasRenderRequest};
+        // Canvas ids are chosen by agents and not namespaced, and every agent,
+        // the dashboard and every `canvas:*` holder share the one store. A
+        // principal scoped to some agents would otherwise read, overwrite or
+        // clear canvases drawn by agents it may not use.
+        self.authorize_every_agent(method, "the shared canvas store")?;
         let store = &self.ctx.canvas_store;
         match method {
             Method::CanvasList => Ok(super::canvas::list_body(store)),
