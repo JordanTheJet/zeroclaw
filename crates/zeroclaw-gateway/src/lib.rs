@@ -890,12 +890,15 @@ pub async fn run_gateway_with_plugin_webhooks(
     // The in-process RPC seam: dial the daemon's dispatcher when a
     // supervised run provides its connector, and hand the handle to every
     // request as an extension so routes can migrate onto RPC one at a time.
+    // The gateway has no credential of its own yet, so the dial is refused
+    // and the seam stays idle until that credential exists; it never rides
+    // the daemon's anonymous compatibility path.
     let core_rpc = core_rpc::CoreRpc::default();
     if let Some(connector) = reload_controls
         .as_ref()
         .and_then(|controls| controls.inproc.clone())
     {
-        core_rpc.attach_inproc(connector);
+        core_rpc.attach_inproc(connector, zeroclaw_rpc_client::ConnectOptions::default());
     }
     // ── Security: warn on public bind without tunnel or explicit opt-in ──
     if is_public_bind(host)

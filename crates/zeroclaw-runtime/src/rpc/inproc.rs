@@ -6,12 +6,15 @@
 //! gateway still runs in the daemon process, and the cut-over later swaps the
 //! duplex for the real socket without touching the routes.
 //!
-//! An in-process connection is classified [`TransportKind::Local`] and
-//! presents [`Credential::None`]: it goes through the same `initialize` rules
-//! as a socket client with no peer credential, so with no roster it is the
-//! shared operator (the compatibility path) and with a roster it must
-//! present a token. It never becomes the trusted daemon uid, because it
-//! carries no peer uid for `security.trust_daemon_uid` to match.
+//! An in-process connection is classified [`TransportKind::Inproc`] and
+//! presents [`Credential::None`]. Unlike a socket client, it is never eligible
+//! for the local compatibility path: with or without a roster, and whatever
+//! `require_pairing` says, an `initialize` that carries no explicit credential
+//! is refused with `AUTH_REQUIRED`. Running inside the daemon process vouches
+//! for nothing, and no peer uid exists for `security.trust_daemon_uid` to
+//! match, so an anonymous in-process caller can neither become the shared
+//! operator nor the trusted daemon uid. The credential the gateway presents
+//! arrives with later work (its service key, or a forwarded user bearer).
 //!
 //! In-process connections are counted separately from socket clients, so an
 //! `--ephemeral` daemon still exits when its last real client leaves.
@@ -33,8 +36,9 @@ use crate::security::auth_provider::Credential;
 /// Bytes buffered in each direction of the duplex before a writer parks.
 const DUPLEX_BUFFER_BYTES: usize = 64 * 1024;
 
-/// Peer label reported for every in-process connection.
-pub const PEER_LABEL: &str = "inproc";
+/// Peer label reported for every in-process connection. The `proto:` prefix
+/// is what the TUI registry reads as the connection's transport name.
+pub const PEER_LABEL: &str = "inproc:gateway";
 
 /// Server side of one in-process connection.
 pub struct InprocTransport {
@@ -81,7 +85,9 @@ impl RpcTransport for InprocTransport {
     }
 
     fn kind(&self) -> TransportKind {
-        TransportKind::Local
+        // Its own class, not `Local`: the authenticator refuses the
+        // no-credential compatibility path for it.
+        TransportKind::Inproc
     }
 
     fn credential(&self) -> Credential {
@@ -267,9 +273,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn duplex_initialize_without_a_token_takes_the_local_compatibility_path() {
+    async fn duplex_initialize_without_a_credential_is_refused_even_with_no_roster() {
+        // A socket client with no roster takes the local compatibility path
+        // and becomes the shared operator. The duplex must not: an anonymous
+        // in-process caller gets AUTH_REQUIRED whatever `require_pairing` says.
         let tmp = tempfile::tempdir().unwrap();
-        let ctx = ctx_for(base_config(tmp.path()));
+        let mut config = base_config(tmp.path());
+        config.gateway.require_pairing = false;
+        assert!(
+            config.users.is_empty(),
+            "this test is about the no-roster case"
+        );
+        let ctx = ctx_for(config);
         let cancel = CancellationToken::new();
         let connector = InprocConnector::new(cancel.clone());
         assert!(!connector.is_bound());
@@ -283,6 +298,42 @@ mod tests {
 
         writer
             .write_all(rpc_request(Method::Initialize, &initialize_params(), 1).as_bytes())
+            .await
+            .unwrap();
+        let frame = read_frame(&mut reader).await;
+        assert!(
+            frame["error"].is_object(),
+            "an anonymous duplex initialize must be refused: {frame}"
+        );
+        assert_eq!(
+            frame["error"]["code"],
+            zeroclaw_api::jsonrpc::error_codes::AUTH_REQUIRED
+        );
+        cancel.cancel();
+        drop(writer);
+    }
+
+    #[tokio::test]
+    async fn duplex_initialize_with_a_paired_token_is_accepted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = base_config(tmp.path());
+        config.gateway.require_pairing = true;
+        config.gateway.paired_tokens = vec!["zc_inproc_test_token".to_string()];
+        let ctx = ctx_for(config);
+        let cancel = CancellationToken::new();
+        let connector = InprocConnector::new(cancel.clone());
+        connector.bind(ctx);
+
+        let stream = connector.connect().await.expect("bound connector connects");
+        let (read_half, mut writer) = tokio::io::split(stream);
+        let mut reader = BufReader::new(read_half);
+
+        let params = InitializeParams {
+            auth_token: Some("zc_inproc_test_token".to_string()),
+            ..initialize_params()
+        };
+        writer
+            .write_all(rpc_request(Method::Initialize, &params, 1).as_bytes())
             .await
             .unwrap();
         let frame = read_frame(&mut reader).await;
@@ -348,13 +399,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn duplex_transport_is_local_and_presents_no_peer_credential() {
+    async fn duplex_transport_has_its_own_class_and_presents_no_peer_credential() {
         let (_client_half, server_half) = tokio::io::duplex(1024);
         let cancel = CancellationToken::new();
         let transport = InprocTransport::new(server_half, cancel.clone());
-        assert_eq!(transport.kind(), TransportKind::Local);
+        assert_eq!(transport.kind(), TransportKind::Inproc);
         assert!(matches!(transport.credential(), Credential::None));
         assert_eq!(transport.peer_label(), PEER_LABEL);
+        assert!(
+            PEER_LABEL.starts_with("inproc:"),
+            "the TUI registry derives the transport name from the label prefix"
+        );
         cancel.cancel();
     }
 

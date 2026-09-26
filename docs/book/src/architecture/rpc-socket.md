@@ -210,7 +210,7 @@ layer in `crates/zeroclaw-runtime/src/rpc/`:
 | `session.rs` | `RpcSession`, `SessionStore` |
 | `dispatch.rs` | `RpcDispatcher` method routing and `Method::authz` classification |
 | `local.rs` | `LocalTransport` + listener (Unix socket / Windows named pipe) |
-| `inproc.rs` | `InprocTransport` + `InprocConnector`: in-memory duplex connections for the supervised gateway, classified local with no peer credential |
+| `inproc.rs` | `InprocTransport` + `InprocConnector`: in-memory duplex connections for the supervised gateway; their own transport class, no peer credential, and no anonymous compatibility path, so every in-process `initialize` needs an explicit credential |
 | `wss.rs` | WSS (WebSocket Secure) transport + TLS acceptor |
 | `attachments.rs` | File upload processing, dedup, marker generation |
 
