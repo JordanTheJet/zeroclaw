@@ -420,15 +420,17 @@ impl Method {
             }
             M::PersonalityPut => (Resource::Personality, Verb::Update),
 
+            // `subscription/cancel` ends only a subscription this connection
+            // opened (the id is looked up in the connection's own registry).
+            // It takes the same grant as the subscribe methods that create
+            // subscriptions, so whoever could open one can end it. A future
+            // source under a different grant must revisit this arm.
             M::LogsSubscribe
             | M::LogsQuery
             | M::LogsGet
             | M::EventsHistory
-            | M::EventsSubscribe => (Resource::Logs, Verb::Read),
-            // Ends only a subscription this connection opened (the id is looked
-            // up in the connection's own registry), so it needs no more than
-            // any authenticated caller holds.
-            M::SubscriptionCancel => (Resource::System, Verb::Read),
+            | M::EventsSubscribe
+            | M::SubscriptionCancel => (Resource::Logs, Verb::Read),
 
             M::TuiList => (Resource::Tui, Verb::Read),
 
@@ -7821,33 +7823,23 @@ impl RpcDispatcher {
     // ── Logs handler ─────────────────────────────────────────────
 
     fn handle_logs_subscribe(&self, params: &Value) -> RpcResult {
-        let (subscription_id, seq) = self.open_subscription(
+        to_result(self.open_subscription(
             crate::rpc::subscription::Source::Logs,
             Method::LogsSubscribe,
             notification::LOGS_EVENT,
             params,
-        )?;
-        to_result(LogsSubscribeResult {
-            subscribed: true,
-            subscription_id,
-            seq,
-        })
+        )?)
     }
 
     /// Observer frames only (agent, tool, LLM, history-trim, error): the
     /// live twin of `events/history`, from the daemon's bus.
     fn handle_events_subscribe(&self, params: &Value) -> RpcResult {
-        let (subscription_id, seq) = self.open_subscription(
+        to_result(self.open_subscription(
             crate::rpc::subscription::Source::Events,
             Method::EventsSubscribe,
             notification::EVENTS_EVENT,
             params,
-        )?;
-        to_result(LogsSubscribeResult {
-            subscribed: true,
-            subscription_id,
-            seq,
-        })
+        )?)
     }
 
     fn handle_subscription_cancel(&self, params: &Value) -> RpcResult {
@@ -7879,7 +7871,7 @@ impl RpcDispatcher {
         method: Method,
         notification_method: &'static str,
         params: &Value,
-    ) -> Result<(String, u64), JsonRpcError> {
+    ) -> Result<LogsSubscribeResult, JsonRpcError> {
         let p: SubscribeParams = if params.is_null() {
             SubscribeParams::default()
         } else {
@@ -7893,9 +7885,25 @@ impl RpcDispatcher {
         let hub = Arc::clone(&self.ctx.subscriptions);
         hub.attach_bus(event_tx);
         let head = hub.head_seq(source);
-        let cursor = p
-            .since_seq
-            .map_or(head + 1, |since| since.saturating_add(1));
+        // Sequence numbers are scoped to the hub's epoch; a new hub (daemon
+        // restart or reload) starts again at 1. `since_seq` resumes only
+        // against the epoch it came from. Any other epoch, or none, cannot be
+        // lined up with this hub's numbers: replay what this hub still holds
+        // and say that continuity broke.
+        let (cursor, epoch_changed) = match p.since_seq {
+            None => (head + 1, false),
+            Some(since) if p.epoch.as_deref() == Some(hub.epoch()) => {
+                if since > head {
+                    return Err(rpc_err(
+                        INVALID_PARAMS,
+                        format!("since_seq {since} is ahead of this stream (newest is {head})"),
+                    ));
+                }
+                (since + 1, false)
+            }
+            Some(_) => (hub.oldest_seq(source), true),
+        };
+        let epoch = hub.epoch().to_string();
         let subscription_id = uuid::Uuid::new_v4().to_string();
         let cancel = self.connection_cancel.child_token();
         self.subscriptions
@@ -7906,6 +7914,7 @@ impl RpcDispatcher {
             source,
             subscription_id: subscription_id.clone(),
             cursor,
+            epoch_changed,
             rpc: self.rpc.clone(),
             cancel,
             notification_method,
@@ -7915,7 +7924,12 @@ impl RpcDispatcher {
             registry: Arc::clone(&self.subscriptions),
         };
         zeroclaw_spawn::spawn!(deliver_subscription(delivery));
-        Ok((subscription_id, head))
+        Ok(LogsSubscribeResult {
+            subscribed: true,
+            subscription_id,
+            seq: head,
+            epoch,
+        })
     }
 
     /// Recent observer frames (agent, tool, LLM, history-trim, error), oldest
@@ -9143,6 +9157,9 @@ struct SubscriptionDelivery {
     source: crate::rpc::subscription::Source,
     subscription_id: String,
     cursor: u64,
+    /// The client's `since_seq` came from another hub epoch; `cursor` is the
+    /// oldest frame still buffered here.
+    epoch_changed: bool,
     rpc: Arc<RpcOutbound>,
     cancel: CancellationToken,
     notification_method: &'static str,
@@ -9161,6 +9178,7 @@ async fn deliver_subscription(delivery: SubscriptionDelivery) {
         source,
         subscription_id,
         mut cursor,
+        epoch_changed,
         rpc,
         cancel,
         notification_method,
@@ -9169,95 +9187,133 @@ async fn deliver_subscription(delivery: SubscriptionDelivery) {
         binding,
         registry,
     } = delivery;
-    let lagged = |from_seq: u64, resume_seq: u64| {
+    let lagged = |from_seq: u64, resume_seq: u64, epoch_changed: bool| {
         serde_json::to_string(&JsonRpcNotification::new(
             notification::SUBSCRIPTION_LAGGED,
             serde_json::json!(SubscriptionLagged {
                 subscription_id: subscription_id.clone(),
                 from_seq,
                 resume_seq,
+                epoch_changed,
             }),
         ))
         .ok()
     };
     let mut checked_generation = binding.as_ref().map(|auth| auth.generation);
 
-    // A `since_seq` past the head means this hub started after the client's
-    // last frame (a daemon restart): continuity is broken, so say so.
-    let next = hub.head_seq(source) + 1;
-    if cursor > next {
-        if let Some(json) = lagged(cursor, next)
-            && !rpc.send_raw(json).await
-        {
-            registry.lock().remove(&subscription_id);
-            return;
-        }
-        cursor = next;
-    }
-
-    'deliver: loop {
-        let notified = hub.notifier(source).notified();
-        tokio::pin!(notified);
-        notified.as_mut().enable();
-        match hub.read(source, cursor, READ_BATCH) {
-            Read::Lagged {
-                from_seq,
-                resume_seq,
-            } => {
-                let Some(json) = lagged(from_seq, resume_seq) else {
-                    break 'deliver;
-                };
-                if !rpc.send_raw(json).await {
-                    break 'deliver;
-                }
-                cursor = resume_seq;
-                continue;
+    'deliver: {
+        // The client's numbers belong to another epoch: nothing it saw can be
+        // matched here. Everything before `cursor` in this epoch is gone; from
+        // `cursor` on, every buffered frame is replayed.
+        if epoch_changed {
+            if !still_authorized(&inbound, binding.as_ref(), method, &mut checked_generation) {
+                break 'deliver;
             }
-            Read::Frames(frames) if !frames.is_empty() => {
-                for (seq, frame) in frames {
-                    if cancel.is_cancelled() {
+            let Some(json) = lagged(1, cursor, true) else {
+                break 'deliver;
+            };
+            if !rpc.send_raw(json).await {
+                break 'deliver;
+            }
+        }
+
+        loop {
+            let notified = hub.notifier(source).notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            match hub.read(source, cursor, READ_BATCH) {
+                Read::Lagged {
+                    from_seq,
+                    resume_seq,
+                } => {
+                    if !still_authorized(
+                        &inbound,
+                        binding.as_ref(),
+                        method,
+                        &mut checked_generation,
+                    ) {
                         break 'deliver;
                     }
-                    if let Some(auth) = binding.as_ref() {
-                        let generation = inbound.generation();
-                        let authority = if checked_generation == Some(generation) {
-                            credential_is_live(&inbound, auth)
-                        } else {
-                            current_authority(&inbound, auth, method).map(|_| ())
-                        };
-                        if let Err(denied) = authority {
-                            audit_denial(Some(auth), method, &denied);
-                            break 'deliver;
-                        }
-                        checked_generation = Some(generation);
-                    }
-                    let mut params = (*frame).clone();
-                    if let Some(object) = params.as_object_mut() {
-                        object.insert("subscription_id".into(), serde_json::json!(subscription_id));
-                        object.insert("seq".into(), serde_json::json!(seq));
-                    }
-                    let notification = JsonRpcNotification::new(notification_method, params);
-                    let Ok(json) = serde_json::to_string(&notification) else {
+                    let Some(json) = lagged(from_seq, resume_seq, false) else {
                         break 'deliver;
                     };
                     if !rpc.send_raw(json).await {
                         break 'deliver;
                     }
-                    cursor = seq + 1;
+                    cursor = resume_seq;
+                    continue;
                 }
-                tokio::task::yield_now().await;
-                continue;
+                Read::Frames(frames) if !frames.is_empty() => {
+                    for (seq, frame) in frames {
+                        if cancel.is_cancelled()
+                            || !still_authorized(
+                                &inbound,
+                                binding.as_ref(),
+                                method,
+                                &mut checked_generation,
+                            )
+                        {
+                            break 'deliver;
+                        }
+                        let mut params = (*frame).clone();
+                        if let Some(object) = params.as_object_mut() {
+                            object.insert(
+                                "subscription_id".into(),
+                                serde_json::json!(subscription_id),
+                            );
+                            object.insert("seq".into(), serde_json::json!(seq));
+                        }
+                        let notification = JsonRpcNotification::new(notification_method, params);
+                        let Ok(json) = serde_json::to_string(&notification) else {
+                            break 'deliver;
+                        };
+                        if !rpc.send_raw(json).await {
+                            break 'deliver;
+                        }
+                        cursor = seq + 1;
+                    }
+                    tokio::task::yield_now().await;
+                    continue;
+                }
+                Read::Frames(_) => {}
             }
-            Read::Frames(_) => {}
-        }
-        tokio::select! {
-            biased;
-            () = cancel.cancelled() => break,
-            () = rpc.closed() => break,
-            () = &mut notified => {}
+            tokio::select! {
+                biased;
+                () = cancel.cancelled() => break 'deliver,
+                () = rpc.closed() => break 'deliver,
+                () = &mut notified => {}
+            }
         }
     }
     registry.lock().remove(&subscription_id);
+}
+
+/// Hold one delivery (a frame or a `lagged` notice) to the connection's
+/// authority. The credential must still be live, and whenever the accepted
+/// policy generation has moved, the principal is resolved again against
+/// `method`. A refusal is audited. An unbound dispatcher (the direct
+/// unit-test handlers) has nothing to recheck.
+fn still_authorized(
+    inbound: &crate::rpc::auth::RpcInboundAuth,
+    binding: Option<&crate::rpc::auth::ConnectionAuth>,
+    method: Method,
+    checked_generation: &mut Option<u64>,
+) -> bool {
+    let Some(auth) = binding else {
+        return true;
+    };
+    let generation = inbound.generation();
+    let authority = if *checked_generation == Some(generation) {
+        credential_is_live(inbound, auth)
+    } else {
+        current_authority(inbound, auth, method).map(|_| ())
+    };
+    if let Err(denied) = authority {
+        audit_denial(Some(auth), method, &denied);
+        return false;
+    }
+    *checked_generation = Some(generation);
+    true
 }
 
 fn parse_params<T: DeserializeOwned>(params: &Value) -> Result<T, JsonRpcError> {
@@ -16756,9 +16812,10 @@ mod tests {
         }
 
         let opened = d
-            .handle_events_subscribe(&json!({"since_seq": 6}))
+            .handle_events_subscribe(&json!({"since_seq": 6, "epoch": hub.epoch()}))
             .expect("subscribe");
         assert_eq!(opened["seq"], json!(10));
+        assert_eq!(opened["epoch"], json!(hub.epoch()));
         let id = opened["subscription_id"].as_str().expect("id").to_string();
 
         let replay = notifications(&mut rx, 4).await;
@@ -16785,7 +16842,7 @@ mod tests {
         }
 
         let opened = d
-            .handle_logs_subscribe(&json!({"since_seq": 0}))
+            .handle_logs_subscribe(&json!({"since_seq": 0, "epoch": hub.epoch()}))
             .expect("subscribe");
         let id = opened["subscription_id"].as_str().expect("id").to_string();
 
@@ -16796,7 +16853,12 @@ mod tests {
         );
         assert_eq!(
             frames[0]["params"],
-            json!({"subscription_id": id, "from_seq": 1, "resume_seq": 7})
+            json!({
+                "subscription_id": id,
+                "from_seq": 1,
+                "resume_seq": 7,
+                "epoch_changed": false,
+            })
         );
         assert_eq!(seqs(&frames[1..]), [7, 8, 9, 10]);
 
@@ -16804,22 +16866,90 @@ mod tests {
         assert_eq!(seqs(&notifications(&mut rx, 1).await), [11]);
     }
 
-    /// A `since_seq` past the head (a client from before a restart) cannot be
-    /// satisfied; it is reported as a gap rather than silently skipped.
+    /// Within one epoch, a `since_seq` ahead of the newest frame cannot come
+    /// from this stream: it is refused, not turned into a notice.
     #[tokio::test]
-    async fn a_since_seq_past_the_head_is_reported() {
+    async fn a_future_since_seq_in_the_same_epoch_is_refused() {
         use crate::rpc::subscription::Source;
-        let (d, mut rx, hub) = subscription_dispatcher(64);
+        let (d, _rx, hub) = subscription_dispatcher(64);
         hub.publish(Source::Logs, json!({"n": 1}));
-        d.handle_logs_subscribe(&json!({"since_seq": 40}))
-            .expect("subscribe");
-        let frames = notifications(&mut rx, 1).await;
-        assert_eq!(
-            frames[0]["method"],
-            json!(notification::SUBSCRIPTION_LAGGED)
+        let refused = d.handle_logs_subscribe(&json!({"since_seq": 40, "epoch": hub.epoch()}));
+        assert!(
+            matches!(&refused, Err(error) if error.code == INVALID_PARAMS),
+            "{refused:?}"
         );
-        assert_eq!(frames[0]["params"]["from_seq"], json!(41));
-        assert_eq!(frames[0]["params"]["resume_seq"], json!(2));
+    }
+
+    /// Sequence numbers restart in a new hub (daemon restart or reload). A
+    /// `since_seq` from another epoch is never lined up by number, whether the
+    /// new hub holds fewer frames than it or more: the client is told its
+    /// continuity broke (`epoch_changed`, a forward range) and gets every
+    /// frame the new hub still buffers.
+    #[tokio::test]
+    async fn a_since_seq_from_another_epoch_replays_the_new_hub() {
+        use crate::rpc::subscription::Source;
+        for (published, since_seq) in [(3_u64, 40_u64), (10, 6)] {
+            let (d, mut rx, hub) = subscription_dispatcher(64);
+            for n in 1..=published {
+                hub.publish(Source::Logs, json!({ "n": n }));
+            }
+            let opened = d
+                .handle_logs_subscribe(&json!({
+                    "since_seq": since_seq,
+                    "epoch": "an-epoch-from-before-the-restart",
+                }))
+                .expect("subscribe");
+            assert_ne!(opened["epoch"], json!("an-epoch-from-before-the-restart"));
+
+            let count = usize::try_from(published).expect("small") + 1;
+            let frames = notifications(&mut rx, count).await;
+            assert_eq!(
+                frames[0]["method"],
+                json!(notification::SUBSCRIPTION_LAGGED)
+            );
+            assert_eq!(frames[0]["params"]["from_seq"], json!(1));
+            assert_eq!(frames[0]["params"]["resume_seq"], json!(1));
+            assert_eq!(frames[0]["params"]["epoch_changed"], json!(true));
+            assert_eq!(
+                seqs(&frames[1..]),
+                (1..=published).collect::<Vec<_>>(),
+                "published {published}, since_seq {since_seq}"
+            );
+            assert_quiet(&mut rx).await;
+        }
+    }
+
+    /// A principal granted only `Logs:Read` can open a subscription and end
+    /// it through the real authorization gate.
+    #[tokio::test]
+    async fn a_logs_reader_can_cancel_its_own_subscription() {
+        use zeroclaw_api::grants::{Resource, Verb};
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+        let mut config = roster_config(4242);
+        let reader = config
+            .permission_profiles
+            .get_mut("reader")
+            .expect("the fixture profile exists");
+        reader.grants.clear();
+        reader.grants.insert(Resource::Logs, vec![Verb::Read]);
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let (event_tx, _rx0) = tokio::sync::broadcast::channel(16);
+        let ctx = RpcContext::minimal_with_event_tx(config, sessions, event_tx);
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+
+        let opened = rpc(&mut alice, &mut rx, 1, "logs/subscribe", json!({})).await;
+        let id = opened["result"]["subscription_id"].clone();
+        assert!(id.is_string(), "{opened}");
+        let cancelled = rpc(
+            &mut alice,
+            &mut rx,
+            2,
+            "subscription/cancel",
+            json!({"subscription_id": id}),
+        )
+        .await;
+        assert_eq!(cancelled["result"]["cancelled"], json!(true), "{cancelled}");
     }
 
     #[tokio::test]

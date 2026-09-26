@@ -259,10 +259,15 @@ RPC streams do not read the broadcast channel directly. A `SubscriptionHub` (`ze
 
 - **Bounds:** each ring is capped at 2,048 frames and 4 MiB, and all rings share a 16 MiB process-wide budget. Over budget, the oldest frame across all rings is evicted.
 - **Producers never wait for a subscriber;** a slow subscriber only falls behind.
-- **Sequence numbers:** start at 1 per source. Every notification carries `subscription_id` and its `seq`. The subscribe result returns the newest `seq`.
-- **Resume:** `X/subscribe{since_seq}` replays the frames after `since_seq` that are still buffered, then continues live.
-- **Gaps:** a gap is reported, never skipped. A cursor that points at frames that are gone (evicted by the caps or the budget, overrun on the bus, or from before a daemon restart) receives `subscription/lagged{subscription_id, from_seq, resume_seq}` and continues at `resume_seq`.
-- **Cancel:** `subscription/cancel{subscription_id}` ends one subscription on the calling connection. Closing the connection ends them all.
+- **Sequence numbers:** start at 1 per source. Every notification carries `subscription_id` and its `seq`. The subscribe result returns the newest `seq` and the hub's `epoch`.
+- **Epochs:** every hub (every daemon start or reload) gets a new random `epoch`, and numbering restarts at 1, so a sequence number means nothing outside its epoch.
+- **Resume:** `X/subscribe{since_seq, epoch}` replays the frames after `since_seq` that are still buffered, then continues live, but only when `epoch` matches.
+  - With a different epoch, or none, the client gets `subscription/lagged` with `epoch_changed: true`, then every frame the new hub still buffers.
+  - A `since_seq` ahead of the newest frame in the same epoch is refused with `INVALID_PARAMS`.
+- **Gaps:** a gap is reported, never skipped. A cursor that points at frames that are gone (evicted by the caps or the budget, or overrun on the bus) receives `subscription/lagged{subscription_id, from_seq, resume_seq}` and continues at `resume_seq`. `from_seq` is never greater than `resume_seq`.
+- **Cancel:** `subscription/cancel{subscription_id}` (grant `Logs:Read`, the same as subscribing) ends one subscription on the calling connection. Closing the connection ends them all.
+- **Authority:** every delivery, whether a frame or a `lagged` notice, is rechecked against the caller's live credential and current grants.
+- **Replay reach:** a `Logs:Read` holder can replay frames from before it connected (up to the ring caps). That is the same reach `logs/query` and `events/history` already give that grant.
 - **Pairing credentials** are dropped before they reach a ring, so neither stream can deliver or replay them.
 
 ## Reader cursors span the active file and retained archives

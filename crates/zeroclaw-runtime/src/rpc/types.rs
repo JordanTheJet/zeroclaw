@@ -1335,6 +1335,13 @@ rpc_type! {
         /// for live frames only.
         #[serde(default)]
         pub since_seq: Option<u64>,
+        /// The `epoch` the client's `since_seq` came from (returned by the
+        /// subscribe result). Sequence numbers restart in every hub, so
+        /// `since_seq` resumes only when this matches the current epoch;
+        /// otherwise, or when omitted, every frame still buffered is replayed
+        /// after a `subscription/lagged` with `epoch_changed: true`.
+        #[serde(default)]
+        pub epoch: Option<String>,
     }
 }
 
@@ -1345,6 +1352,8 @@ rpc_type! {
         pub subscribed: bool,
         pub subscription_id: String,
         pub seq: u64,
+        /// The hub's epoch: pass it back with `since_seq` to resume.
+        pub epoch: String,
     }
 }
 
@@ -1369,6 +1378,12 @@ rpc_type! {
         pub subscription_id: String,
         pub from_seq: u64,
         pub resume_seq: u64,
+        /// The client's `since_seq` came from another epoch (the daemon
+        /// restarted or reloaded). Nothing it saw can be matched here: this
+        /// epoch's frames from `resume_seq` on are replayed, and those before
+        /// it are gone.
+        #[serde(default)]
+        pub epoch_changed: bool,
     }
 }
 
