@@ -162,6 +162,21 @@ pub trait ProviderSource: Send + Sync {
         &self,
         request: &ProviderRequest<'_>,
     ) -> anyhow::Result<Arc<dyn ModelProvider>>;
+
+    /// Return the provider an agent switches to mid-session. `provider_ref`
+    /// and `model` name the switch target, and `principal` is the one the
+    /// agent was built for.
+    ///
+    /// Defaults to [`Self::model_provider`]. Override it only when a switch
+    /// selects credentials or options differently from starting a session on
+    /// the same reference, as the runtime's config-backed source does to keep
+    /// the agent's existing switch behavior.
+    fn switched_model_provider(
+        &self,
+        request: &ProviderRequest<'_>,
+    ) -> anyhow::Result<Arc<dyn ModelProvider>> {
+        self.model_provider(request)
+    }
 }
 
 /// What the runtime is asking a [`MemorySource`] for.
@@ -237,10 +252,23 @@ pub(crate) mod test_support {
         pub(crate) principal: Option<PrincipalId>,
     }
 
-    /// Records every request and serves [`StubProvider`].
+    /// Records every request and serves [`StubProvider`]. Session requests
+    /// land in `seen`, model-switch requests in `switches`.
     #[derive(Default)]
     pub(crate) struct RecordingProviders {
         pub(crate) seen: Mutex<Vec<SeenProviderRequest>>,
+        pub(crate) switches: Mutex<Vec<SeenProviderRequest>>,
+    }
+
+    impl SeenProviderRequest {
+        fn from_request(request: &ProviderRequest<'_>) -> Self {
+            Self {
+                agent_alias: request.agent_alias.to_string(),
+                provider_ref: request.provider_ref.map(str::to_string),
+                model: request.model.map(str::to_string),
+                principal: request.principal.cloned(),
+            }
+        }
     }
 
     impl ProviderSource for RecordingProviders {
@@ -248,12 +276,19 @@ pub(crate) mod test_support {
             &self,
             request: &ProviderRequest<'_>,
         ) -> anyhow::Result<Arc<dyn ModelProvider>> {
-            self.seen.lock().push(SeenProviderRequest {
-                agent_alias: request.agent_alias.to_string(),
-                provider_ref: request.provider_ref.map(str::to_string),
-                model: request.model.map(str::to_string),
-                principal: request.principal.cloned(),
-            });
+            self.seen
+                .lock()
+                .push(SeenProviderRequest::from_request(request));
+            Ok(Arc::new(StubProvider))
+        }
+
+        fn switched_model_provider(
+            &self,
+            request: &ProviderRequest<'_>,
+        ) -> anyhow::Result<Arc<dyn ModelProvider>> {
+            self.switches
+                .lock()
+                .push(SeenProviderRequest::from_request(request));
             Ok(Arc::new(StubProvider))
         }
     }
