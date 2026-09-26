@@ -552,6 +552,22 @@ pub struct SopRenameRequest {
     pub to: String,
 }
 
+/// Request payload for `canvas/get`, `canvas/history` and `canvas/clear`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CanvasIdRequest {
+    pub canvas_id: String,
+}
+
+/// Request payload for `canvas/render`: push content to a canvas.
+/// `content_type` defaults to `html`; it must be one the canvas tool accepts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CanvasRenderRequest {
+    pub canvas_id: String,
+    #[serde(default)]
+    pub content_type: Option<String>,
+    pub content: String,
+}
+
 /// Request payload for `a2a/identity`. With `agent`, the per-alias A2A agent
 /// card; without it, the discovery catalog card listing every published
 /// agent.

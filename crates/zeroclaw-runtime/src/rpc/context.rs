@@ -194,6 +194,11 @@ pub struct RpcContext {
     /// Lifecycle hook runner. `None` when hooks are disabled in config.
     pub hooks: Option<Arc<crate::hooks::HookRunner>>,
 
+    /// The daemon's one canvas store. The canvas tool of every agent the core
+    /// builds writes here and `canvas/*` reads it, so a canvas drawn in any
+    /// session is the same canvas everywhere.
+    pub canvas_store: crate::tools::CanvasStore,
+
     /// The daemon's single certificate audit logger — the ONE writer of the
     /// Merkle-chained audit file, shared by enrollment, in-band renewal and
     /// the issued-cert ledger.
@@ -271,6 +276,7 @@ impl RpcContext {
             sop_driver_handles: None,
             sop_audit: None,
             hooks: None,
+            canvas_store: crate::tools::CanvasStore::default(),
             #[cfg(test)]
             config_commit_pause: None,
             cert_audit,
@@ -298,6 +304,7 @@ impl RpcContext {
             sop_driver_handles: None,
             sop_audit: None,
             hooks: None,
+            canvas_store: crate::tools::CanvasStore::default(),
             #[cfg(test)]
             config_commit_pause: None,
             cert_audit: None,
@@ -334,6 +341,7 @@ impl RpcContext {
             sop_driver_handles: None,
             sop_audit: None,
             hooks: None,
+            canvas_store: crate::tools::CanvasStore::default(),
             #[cfg(test)]
             config_commit_pause: None,
             cert_audit,
@@ -365,6 +373,7 @@ impl RpcContext {
             sop_driver_handles: None,
             sop_audit: None,
             hooks: None,
+            canvas_store: crate::tools::CanvasStore::default(),
             #[cfg(test)]
             config_commit_pause: None,
             cert_audit: None,
@@ -396,6 +405,7 @@ impl RpcContext {
             sop_driver_handles: Some(crate::sop::SopDriverHandles::default()),
             sop_audit: None,
             hooks: None,
+            canvas_store: crate::tools::CanvasStore::default(),
             #[cfg(test)]
             config_commit_pause: None,
             cert_audit: None,
@@ -433,6 +443,7 @@ impl RpcContext {
             sop_driver_handles,
             sop_audit: Some(sop_audit),
             hooks: None,
+            canvas_store: crate::tools::CanvasStore::default(),
             config_commit_pause: None,
             cert_audit: None,
             auth,
@@ -463,6 +474,7 @@ impl RpcContext {
             sop_driver_handles: None,
             sop_audit: None,
             hooks: None,
+            canvas_store: crate::tools::CanvasStore::default(),
             #[cfg(test)]
             config_commit_pause: None,
             cert_audit: None,
@@ -494,6 +506,7 @@ impl RpcContext {
             sop_driver_handles: None,
             sop_audit: None,
             hooks: None,
+            canvas_store: crate::tools::CanvasStore::default(),
             #[cfg(test)]
             config_commit_pause: None,
             cert_audit: None,
@@ -526,6 +539,7 @@ impl RpcContext {
             sop_driver_handles: None,
             sop_audit: None,
             hooks: None,
+            canvas_store: crate::tools::CanvasStore::default(),
             #[cfg(test)]
             config_commit_pause: None,
             cert_audit: None,
@@ -558,6 +572,7 @@ impl RpcContext {
             sop_driver_handles: None,
             sop_audit: None,
             hooks: None,
+            canvas_store: crate::tools::CanvasStore::default(),
             #[cfg(test)]
             config_commit_pause: None,
             cert_audit: None,

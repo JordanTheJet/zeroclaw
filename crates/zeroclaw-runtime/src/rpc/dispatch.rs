@@ -215,6 +215,11 @@ pub enum Method {
     IntegrationsList,
     PluginsList,
     A2aIdentity,
+    CanvasList,
+    CanvasGet,
+    CanvasHistory,
+    CanvasRender,
+    CanvasClear,
 }
 
 impl Method {
@@ -337,6 +342,11 @@ impl Method {
         (Method::IntegrationsList, "integrations/list"),
         (Method::PluginsList, "plugins/list"),
         (Method::A2aIdentity, "a2a/identity"),
+        (Method::CanvasList, "canvas/list"),
+        (Method::CanvasGet, "canvas/get"),
+        (Method::CanvasHistory, "canvas/history"),
+        (Method::CanvasRender, "canvas/render"),
+        (Method::CanvasClear, "canvas/clear"),
     ];
 
     /// Resolve a wire method name to a variant. Table scan, no hand-written
@@ -469,6 +479,9 @@ impl Method {
             }
             M::PluginsList => (Resource::Plugins, Verb::Read),
             M::A2aIdentity => (Resource::System, Verb::Read),
+            M::CanvasList | M::CanvasGet | M::CanvasHistory => (Resource::Canvas, Verb::Read),
+            M::CanvasRender => (Resource::Canvas, Verb::Update),
+            M::CanvasClear => (Resource::Canvas, Verb::Delete),
         };
         MethodAuthz::Requires(resource, verb)
     }
@@ -1692,6 +1705,41 @@ impl RpcDispatcher {
         }
     }
 
+    /// `canvas/*`: the daemon's one canvas store, with the bodies and failures
+    /// the `/api/canvas` routes use. See [`super::canvas`].
+    fn handle_canvas_method(&self, method: Method, params: &Value) -> RpcResult {
+        use zeroclaw_api::jsonrpc::{CanvasIdRequest, CanvasRenderRequest};
+        let store = &self.ctx.canvas_store;
+        match method {
+            Method::CanvasList => Ok(super::canvas::list_body(store)),
+            Method::CanvasGet => {
+                let req: CanvasIdRequest = parse_params(params)?;
+                Ok(super::canvas::get_body(store, &req.canvas_id)?)
+            }
+            Method::CanvasHistory => {
+                let req: CanvasIdRequest = parse_params(params)?;
+                Ok(super::canvas::history_body(store, &req.canvas_id))
+            }
+            Method::CanvasRender => {
+                let req: CanvasRenderRequest = parse_params(params)?;
+                Ok(super::canvas::render_body(
+                    store,
+                    &req.canvas_id,
+                    req.content_type.as_deref(),
+                    &req.content,
+                )?)
+            }
+            Method::CanvasClear => {
+                let req: CanvasIdRequest = parse_params(params)?;
+                Ok(super::canvas::clear_body(store, &req.canvas_id))
+            }
+            _ => Err(rpc_err(
+                INTERNAL_ERROR,
+                format!("{} is not a canvas method", method.wire_name()),
+            )),
+        }
+    }
+
     /// Refuse `method` unless the bound principal may use agent `alias`. An
     /// unbound dispatcher is refused.
     fn authorize_agent_selector(&self, method: Method, alias: &str) -> Result<(), JsonRpcError> {
@@ -2820,6 +2868,11 @@ impl RpcDispatcher {
             | Method::IntegrationsList
             | Method::PluginsList
             | Method::A2aIdentity => self.handle_catalog_method(method, &req.params).await,
+            Method::CanvasList
+            | Method::CanvasGet
+            | Method::CanvasHistory
+            | Method::CanvasRender
+            | Method::CanvasClear => self.handle_canvas_method(method, &req.params),
         };
 
         if is_notification {
@@ -3706,6 +3759,7 @@ impl RpcDispatcher {
                     tui_env,
                     self.ctx.sop_engine.clone(),
                     self.ctx.sop_audit.clone(),
+                    Some(self.ctx.canvas_store.clone()),
                     store,
                     self.principal_tool_narrowing(),
                 )
@@ -3720,6 +3774,7 @@ impl RpcDispatcher {
                     tui_env,
                     self.ctx.sop_engine.clone(),
                     self.ctx.sop_audit.clone(),
+                    Some(self.ctx.canvas_store.clone()),
                     self.principal_tool_narrowing(),
                 )
                 .await
@@ -4520,6 +4575,7 @@ impl RpcDispatcher {
                 tui_env,
                 self.ctx.sop_engine.clone(),
                 self.ctx.sop_audit.clone(),
+                Some(self.ctx.canvas_store.clone()),
                 store,
                 self.principal_tool_narrowing(),
             )
@@ -25093,6 +25149,7 @@ mod tests {
             sop_driver_handles: None,
             sop_audit: None,
             hooks: Some(Arc::new(runner)),
+            canvas_store: crate::tools::CanvasStore::default(),
             cert_audit: None,
             auth: crate::rpc::auth::RpcInboundAuth::for_tests(
                 &zeroclaw_config::schema::Config::default(),
@@ -25142,6 +25199,7 @@ mod tests {
             sop_driver_handles: None,
             sop_audit: None,
             hooks: Some(Arc::new(runner)),
+            canvas_store: crate::tools::CanvasStore::default(),
             cert_audit: None,
             auth: crate::rpc::auth::RpcInboundAuth::for_tests(
                 &zeroclaw_config::schema::Config::default(),
@@ -25250,6 +25308,7 @@ mod tests {
             sop_driver_handles: None,
             sop_audit: None,
             hooks: Some(Arc::new(runner)),
+            canvas_store: crate::tools::CanvasStore::default(),
             cert_audit: None,
             auth: crate::rpc::auth::RpcInboundAuth::for_tests(
                 &zeroclaw_config::schema::Config::default(),

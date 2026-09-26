@@ -405,3 +405,180 @@ async fn catalog_methods_route_through_the_gate() {
     let plugins = rpc(&mut peer, &mut rx, 2, "plugins/list", json!({})).await;
     assert_forbidden(&plugins, "plugins/list without plugins:read");
 }
+
+// ── Canvas ────────────────────────────────────────────────────────────────
+
+/// Before the daemon's canvas store reached the RPC context, an RPC-built
+/// agent's canvas tool wrote to a private store no reader could see.
+#[tokio::test]
+async fn a_canvas_drawn_by_an_rpc_built_agent_is_the_one_canvas_rpc_serves() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let ctx = enforcement_ctx(make_acp_test_config(&tmp));
+    let (mut operator, mut rx) = local_operator(&ctx).await;
+    let created = rpc(
+        &mut operator,
+        &mut rx,
+        1,
+        "session/new",
+        json!({"agent_alias": "test-agent", "session_id": "s-canvas"}),
+    )
+    .await;
+    assert_eq!(
+        created["result"]["session_id"],
+        json!("s-canvas"),
+        "{created}"
+    );
+
+    let agent = ctx
+        .sessions
+        .get_agent("s-canvas")
+        .await
+        .expect("session exists");
+    let drawn = agent
+        .lock()
+        .await
+        .execute_tool_for_test(
+            "canvas",
+            json!({
+                "action": "render",
+                "canvas_id": "board",
+                "content_type": "text",
+                "content": "drawn by the agent",
+            }),
+        )
+        .await
+        .expect("the agent has the canvas tool")
+        .expect("the canvas tool runs");
+    assert!(drawn.success, "{drawn:?}");
+
+    let got = rpc(
+        &mut operator,
+        &mut rx,
+        2,
+        "canvas/get",
+        json!({"canvas_id": "board"}),
+    )
+    .await;
+    assert_eq!(
+        got["result"]["frame"]["content"],
+        json!("drawn by the agent"),
+        "{got}"
+    );
+    let listed = rpc(&mut operator, &mut rx, 3, "canvas/list", json!({})).await;
+    assert_eq!(listed["result"]["canvases"], json!(["board"]), "{listed}");
+}
+
+#[tokio::test]
+async fn canvas_render_refuses_what_the_route_refuses() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let ctx = enforcement_ctx(make_acp_test_config(&tmp));
+    let (mut operator, mut rx) = local_operator(&ctx).await;
+
+    let eval = rpc(
+        &mut operator,
+        &mut rx,
+        1,
+        "canvas/render",
+        json!({"canvas_id": "c", "content_type": "eval", "content": "alert(1)"}),
+    )
+    .await;
+    assert_eq!(eval["error"]["code"], json!(INVALID_PARAMS), "{eval}");
+    let huge = "x".repeat(crate::tools::MAX_CONTENT_SIZE + 1);
+    let too_large = rpc(
+        &mut operator,
+        &mut rx,
+        2,
+        "canvas/render",
+        json!({"canvas_id": "c", "content": huge}),
+    )
+    .await;
+    assert_eq!(
+        too_large["error"]["code"],
+        json!(INVALID_PARAMS),
+        "{too_large}"
+    );
+    let missing = rpc(
+        &mut operator,
+        &mut rx,
+        3,
+        "canvas/get",
+        json!({"canvas_id": "nope"}),
+    )
+    .await;
+    assert_eq!(
+        missing["error"]["message"],
+        json!("Canvas 'nope' not found"),
+        "{missing}"
+    );
+    assert!(ctx.canvas_store.list().is_empty(), "nothing was rendered");
+
+    let rendered = rpc(
+        &mut operator,
+        &mut rx,
+        4,
+        "canvas/render",
+        json!({"canvas_id": "c", "content": "<p>ok</p>"}),
+    )
+    .await;
+    assert_eq!(
+        rendered["result"]["frame"]["content_type"],
+        json!("html"),
+        "{rendered}"
+    );
+    let cleared = rpc(
+        &mut operator,
+        &mut rx,
+        5,
+        "canvas/clear",
+        json!({"canvas_id": "c"}),
+    )
+    .await;
+    assert_eq!(
+        cleared["result"],
+        json!({"canvas_id": "c", "status": "cleared"}),
+        "{cleared}"
+    );
+}
+
+#[tokio::test]
+async fn canvas_methods_need_a_canvas_grant() {
+    // `files-alpha` grants files only, so every canvas method is refused.
+    let tmp = tempfile::TempDir::new().unwrap();
+    let ctx = enforcement_ctx(files_config(&tmp));
+    let (mut peer, mut rx) = roster_peer(&ctx, SCOPED).await;
+    for (id, method, params) in [
+        (1, "canvas/list", json!({})),
+        (2, "canvas/get", json!({"canvas_id": "c"})),
+        (3, "canvas/history", json!({"canvas_id": "c"})),
+        (
+            4,
+            "canvas/render",
+            json!({"canvas_id": "c", "content": "x"}),
+        ),
+        (5, "canvas/clear", json!({"canvas_id": "c"})),
+    ] {
+        let response = rpc(&mut peer, &mut rx, id, method, params).await;
+        assert_forbidden(&response, method);
+    }
+    assert!(ctx.canvas_store.list().is_empty());
+}
+
+#[test]
+fn canvas_methods_are_classified_and_named() {
+    use zeroclaw_api::grants::{Resource, Verb};
+    for (method, wire, verb) in [
+        (Method::CanvasList, "canvas/list", Verb::Read),
+        (Method::CanvasGet, "canvas/get", Verb::Read),
+        (Method::CanvasHistory, "canvas/history", Verb::Read),
+        (Method::CanvasRender, "canvas/render", Verb::Update),
+        (Method::CanvasClear, "canvas/clear", Verb::Delete),
+    ] {
+        assert_eq!(method.wire_name(), wire);
+        assert_eq!(Method::from_wire(wire), Some(method));
+        assert_eq!(
+            method.authz(),
+            MethodAuthz::Requires(Resource::Canvas, verb),
+            "{wire}"
+        );
+    }
+}

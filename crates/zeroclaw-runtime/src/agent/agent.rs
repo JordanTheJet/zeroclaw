@@ -2078,6 +2078,7 @@ impl Agent {
             sop_engine,
             sop_audit,
             None,
+            None,
         )
         .await
     }
@@ -2094,6 +2095,7 @@ impl Agent {
         tui_env: Option<std::collections::HashMap<String, String>>,
         sop_engine: Option<Arc<std::sync::Mutex<SopEngine>>>,
         sop_audit: Option<Arc<SopAuditLogger>>,
+        canvas_store: Option<tools::CanvasStore>,
         principal_allowed_tools: Option<Vec<String>>,
     ) -> Result<Self> {
         // Stack-budget boundary for the daemon-backed construction paths
@@ -2126,7 +2128,7 @@ impl Agent {
                 tui_env,
                 sop_engine,
                 sop_audit,
-                None,
+                canvas_store,
                 None,
                 Some(Arc::clone(&live_config)),
                 Some(live_config),
@@ -2149,6 +2151,7 @@ impl Agent {
         tui_env: Option<std::collections::HashMap<String, String>>,
         sop_engine: Option<Arc<std::sync::Mutex<SopEngine>>>,
         sop_audit: Option<Arc<SopAuditLogger>>,
+        canvas_store: Option<tools::CanvasStore>,
         acp_session_store: Arc<zeroclaw_infra::acp_session_store::AcpSessionStore>,
         principal_allowed_tools: Option<Vec<String>>,
     ) -> Result<Self> {
@@ -2168,7 +2171,7 @@ impl Agent {
                 tui_env,
                 sop_engine,
                 sop_audit,
-                None,
+                canvas_store,
                 Some(acp_session_store),
                 Some(Arc::clone(&live_config)),
                 Some(live_config),

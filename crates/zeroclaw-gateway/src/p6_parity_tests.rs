@@ -455,3 +455,122 @@ async fn a2a_identity_refuses_where_the_routes_return_not_found() {
     assert_eq!(status, 404);
     assert!(zeroclaw_runtime::rpc::catalog::a2a_identity(&disabled, None).is_err());
 }
+
+// ── Canvas ───────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn canvas_methods_match_the_canvas_routes() {
+    use zeroclaw_runtime::rpc::canvas as rpc_canvas;
+    let state = test_state(Config::default());
+    let store = state.canvas_store.clone();
+
+    // render: success, then the two refusals, over both surfaces.
+    let (status, http) = body_json(
+        crate::canvas::handle_canvas_post(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("board".to_string()),
+            Json(crate::canvas::CanvasPostBody {
+                content_type: Some("text".into()),
+                content: "one".into(),
+            }),
+        )
+        .await
+        .into_response(),
+    )
+    .await;
+    assert_eq!(status, 201, "{http}");
+    assert_eq!(http["canvas_id"], "board");
+    assert_eq!(http["frame"]["content"], "one");
+
+    for (content_type, content, expected) in [
+        (Some("eval"), "alert(1)".to_string(), 400),
+        (
+            None,
+            "x".repeat(zeroclaw_runtime::tools::MAX_CONTENT_SIZE + 1),
+            413,
+        ),
+    ] {
+        let (status, http) = body_json(
+            crate::canvas::handle_canvas_post(
+                State(state.clone()),
+                HeaderMap::new(),
+                Path("board".to_string()),
+                Json(crate::canvas::CanvasPostBody {
+                    content_type: content_type.map(str::to_string),
+                    content: content.clone(),
+                }),
+            )
+            .await
+            .into_response(),
+        )
+        .await;
+        assert_eq!(status, expected, "{http}");
+        let failure = rpc_canvas::render_body(&store, "board", content_type, &content).unwrap_err();
+        assert_eq!(failure.http_status(), expected);
+        assert_eq!(serde_json::json!({ "error": failure.message() }), http);
+    }
+
+    // list, get, history against the same store.
+    let (_, http) = body_json(
+        crate::canvas::handle_canvas_list(State(state.clone()), HeaderMap::new())
+            .await
+            .into_response(),
+    )
+    .await;
+    assert_eq!(rpc_canvas::list_body(&store), http, "list");
+    let (_, http) = body_json(
+        crate::canvas::handle_canvas_get(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("board".to_string()),
+        )
+        .await
+        .into_response(),
+    )
+    .await;
+    assert_eq!(rpc_canvas::get_body(&store, "board").unwrap(), http, "get");
+    let (_, http) = body_json(
+        crate::canvas::handle_canvas_history(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("board".to_string()),
+        )
+        .await
+        .into_response(),
+    )
+    .await;
+    assert_eq!(rpc_canvas::history_body(&store, "board"), http, "history");
+
+    // A missing canvas: 404 and the same message.
+    let (status, http) = body_json(
+        crate::canvas::handle_canvas_get(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("absent".to_string()),
+        )
+        .await
+        .into_response(),
+    )
+    .await;
+    assert_eq!(status, 404);
+    let failure = rpc_canvas::get_body(&store, "absent").unwrap_err();
+    assert_eq!(serde_json::json!({ "error": failure.message() }), http);
+
+    // clear.
+    let (_, http) = body_json(
+        crate::canvas::handle_canvas_clear(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("board".to_string()),
+        )
+        .await
+        .into_response(),
+    )
+    .await;
+    assert_eq!(
+        http,
+        serde_json::json!({"canvas_id": "board", "status": "cleared"})
+    );
+    assert_eq!(rpc_canvas::clear_body(&store, "board"), http, "clear");
+}
