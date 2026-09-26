@@ -38483,4 +38483,254 @@ mod tests {
             "the transcript stays in the durable store after the close"
         );
     }
+
+    // ── Turns with no viewer, and detached turns ──────────────────────
+    //
+    // An RPC turn's viewer is the connection that prompted it. A viewer can
+    // stop reading (its writer is gone) while the connection stays up; the
+    // turn then runs on with nobody receiving its notifications, and abort
+    // and cancel must still end it. Closing the connection detaches the turn,
+    // which is cancelled as `connection_closed` and must leave no live
+    // handles behind for abort, cancel, steer, or the running filter.
+
+    /// Wait until the session has no registered turn.
+    async fn await_turn_end(ctx: &Arc<RpcContext>, sid: &str) {
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            while ctx.sessions.has_inflight_turn(sid) {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the turn must end");
+    }
+
+    fn durable_turn_state(
+        backend: &Arc<zeroclaw_infra::session_sqlite::SqliteSessionBackend>,
+        sid: &str,
+    ) -> Option<String> {
+        zeroclaw_infra::session_backend::SessionBackend::get_session_state(
+            backend.as_ref(),
+            &format!("rpc_{sid}"),
+        )
+        .expect("the state row is readable")
+        .map(|state| state.state)
+    }
+
+    /// Drain `rx` until the session's TurnComplete arrives or the writer
+    /// closes, and return that TurnComplete.
+    async fn drain_to_turn_complete(
+        rx: &mut tokio::sync::mpsc::Receiver<String>,
+        sid: &str,
+    ) -> Value {
+        loop {
+            let frame = tokio::time::timeout(std::time::Duration::from_secs(15), rx.recv())
+                .await
+                .expect("a frame within 15s")
+                .unwrap_or_else(|| panic!("the writer closed before TurnComplete for {sid}"));
+            let value: Value = serde_json::from_str(&frame).expect("valid JSON-RPC frame");
+            if value["method"] == notification::SESSION_UPDATE
+                && value["params"]["type"] == "turn_complete"
+                && value["params"]["session_id"] == sid
+            {
+                return value;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn session_abort_ends_a_turn_whose_viewer_stopped_reading() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sid = "s-abort-viewerless";
+        let (ctx, backend, (mut started, _release, _requests)) =
+            turn_parity_fixture(&tmp, sid, Some("owning-tui")).await;
+        let (mut driver, driver_rx) = local_operator(&ctx).await;
+        let (mut operator, mut operator_rx) = local_operator(&ctx).await;
+
+        send_prompt(&mut driver, 1, sid, 1).await;
+        await_provider_start(&mut started).await;
+        assert_eq!(
+            durable_turn_state(&backend, sid).as_deref(),
+            Some("running")
+        );
+        // The viewer is gone; its connection is not closed, so nothing
+        // cancels the turn on its behalf.
+        drop(driver_rx);
+
+        let aborted = rpc(
+            &mut operator,
+            &mut operator_rx,
+            2,
+            "session/abort",
+            json!({"session_id": sid}),
+        )
+        .await;
+        assert_eq!(aborted["result"]["cancelled"], json!(true), "{aborted}");
+        await_turn_end(&ctx, sid).await;
+        assert_eq!(
+            durable_turn_state(&backend, sid).as_deref(),
+            Some("idle"),
+            "a viewerless cancel still settles the durable state"
+        );
+
+        let again = rpc(
+            &mut operator,
+            &mut operator_rx,
+            3,
+            "session/abort",
+            json!({"session_id": sid}),
+        )
+        .await;
+        assert_eq!(again["error"]["code"], json!(SESSION_NOT_FOUND), "{again}");
+        driver.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn session_cancel_by_the_owning_client_ends_a_viewerless_turn() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sid = "s-cancel-viewerless";
+        let (ctx, backend, (mut started, _release, _requests)) =
+            turn_parity_fixture(&tmp, sid, Some("owning-tui")).await;
+        let (mut driver, driver_rx) = local_operator(&ctx).await;
+        let (mut owner, mut owner_rx) = local_operator(&ctx).await;
+        owner.set_tui_id_for_test(Some("owning-tui".into()));
+
+        send_prompt(&mut driver, 1, sid, 1).await;
+        await_provider_start(&mut started).await;
+        drop(driver_rx);
+
+        let cancelled = rpc(
+            &mut owner,
+            &mut owner_rx,
+            2,
+            "session/cancel",
+            json!({"session_id": sid}),
+        )
+        .await;
+        assert_eq!(cancelled["result"]["cancelled"], json!(true), "{cancelled}");
+        await_turn_end(&ctx, sid).await;
+        assert_eq!(durable_turn_state(&backend, sid).as_deref(), Some("idle"));
+
+        let again = rpc(
+            &mut owner,
+            &mut owner_rx,
+            3,
+            "session/cancel",
+            json!({"session_id": sid}),
+        )
+        .await;
+        assert_eq!(again["error"]["code"], json!(SESSION_NOT_FOUND), "{again}");
+        driver.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_detached_turn_is_cancelled_and_leaves_no_live_turn_handles() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sid = "s-detached";
+        let (ctx, backend, (mut started, _release, _requests)) =
+            turn_parity_fixture(&tmp, sid, Some("owning-tui")).await;
+        let (mut driver, mut driver_rx) = local_operator(&ctx).await;
+        let (mut operator, mut operator_rx) = local_operator(&ctx).await;
+        let (mut owner, mut owner_rx) = local_operator(&ctx).await;
+        owner.set_tui_id_for_test(Some("owning-tui".into()));
+
+        send_prompt(&mut driver, 1, sid, 1).await;
+        await_provider_start(&mut started).await;
+
+        // Closing the prompting connection detaches the turn; shutdown joins
+        // the prompt task, so the turn has fully ended when it returns.
+        tokio::time::timeout(std::time::Duration::from_secs(15), driver.shutdown())
+            .await
+            .expect("closing the connection must end its detached turn");
+        assert!(!ctx.sessions.has_inflight_turn(sid));
+        assert_eq!(durable_turn_state(&backend, sid).as_deref(), Some("idle"));
+        let done = drain_to_turn_complete(&mut driver_rx, sid).await;
+        assert_eq!(done["params"]["outcome"], json!("cancelled"), "{done}");
+        assert!(
+            done["params"]["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("connection_closed")),
+            "a detached turn is attributed to the closed connection: {done}"
+        );
+
+        let abort = rpc(
+            &mut operator,
+            &mut operator_rx,
+            2,
+            "session/abort",
+            json!({"session_id": sid}),
+        )
+        .await;
+        assert_eq!(abort["error"]["code"], json!(SESSION_NOT_FOUND), "{abort}");
+        let cancel = rpc(
+            &mut owner,
+            &mut owner_rx,
+            3,
+            "session/cancel",
+            json!({"session_id": sid}),
+        )
+        .await;
+        assert_eq!(
+            cancel["error"]["code"],
+            json!(SESSION_NOT_FOUND),
+            "{cancel}"
+        );
+        let steer = rpc(
+            &mut operator,
+            &mut operator_rx,
+            4,
+            "session/steer",
+            json!({"session_id": sid, "content": "anyone there?"}),
+        )
+        .await;
+        assert_eq!(
+            steer["error"]["code"],
+            json!(SESSION_NOT_FOUND),
+            "a detached turn's steering channel is closed with it: {steer}"
+        );
+        let running = rpc(
+            &mut operator,
+            &mut operator_rx,
+            5,
+            "session/list",
+            json!({"running": true}),
+        )
+        .await;
+        assert!(listed_session_ids(&running).is_empty(), "{running}");
+        assert!(
+            ctx.sessions.get_agent(sid).await.is_some(),
+            "detaching ends the turn, not the session"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_abort_before_the_viewer_disconnects_keeps_its_attribution() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sid = "s-abort-then-close";
+        let (ctx, _backend, (mut started, _release, _requests)) =
+            turn_parity_fixture(&tmp, sid, None).await;
+        let (mut driver, mut driver_rx) = local_operator(&ctx).await;
+        let (mut operator, mut operator_rx) = local_operator(&ctx).await;
+
+        send_prompt(&mut driver, 1, sid, 1).await;
+        await_provider_start(&mut started).await;
+        let aborted = rpc(
+            &mut operator,
+            &mut operator_rx,
+            2,
+            "session/abort",
+            json!({"session_id": sid}),
+        )
+        .await;
+        assert_eq!(aborted["result"]["cancelled"], json!(true), "{aborted}");
+        tokio::time::timeout(std::time::Duration::from_secs(15), driver.shutdown())
+            .await
+            .expect("shutdown joins the aborted turn");
+
+        let done = drain_to_turn_complete(&mut driver_rx, sid).await;
+        let content = done["params"]["content"].as_str().unwrap_or_default();
+        assert!(
+            content.contains("operator_abort") && !content.contains("connection_closed"),
+            "the disconnect must not overwrite the operator's cause: {done}"
+        );
+    }
 }
