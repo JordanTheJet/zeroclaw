@@ -14300,7 +14300,6 @@ dependencies = [
  "zeroclaw-api",
  "zeroclaw-channels",
  "zeroclaw-config",
- "zeroclaw-hardware",
  "zeroclaw-infra",
  "zeroclaw-log",
  "zeroclaw-memory",
