@@ -90,7 +90,7 @@ async fn maintain(connector: InprocConnector, slot: Arc<RwLock<Option<Arc<RpcCli
                 return;
             }
             Err(error) => {
-                let delay = backoff.next();
+                let delay = backoff.next_delay();
                 ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
