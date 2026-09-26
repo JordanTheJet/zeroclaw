@@ -13,6 +13,12 @@
 //!
 //! Sequence numbers start at 1 per source and are never reused within a hub,
 //! so a client can resume with `since_seq` (the last sequence it saw).
+//!
+//! Besides the fixed daemon streams, each session can have its own ring
+//! ([`SubscriptionHub::session_source`]). A session-lifetime turn publishes
+//! its `session/update` frames there, and every attached viewer reads them
+//! through a cursor like any other subscriber, so a turn never waits on a
+//! viewer and a viewer that reconnects resumes with `since_seq`.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -21,6 +27,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use parking_lot::Mutex;
 use serde_json::Value;
 use tokio::sync::Notify;
+use tokio_util::sync::CancellationToken;
 
 /// A subscribable stream.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -30,6 +37,11 @@ pub enum Source {
     /// Observer frames only: agent, tool, LLM, history-trim, error
     /// (`events/subscribe`).
     Events,
+    /// One session's `session/update` frames (`session/attach`). The number
+    /// is the hub's handle for the session id, from
+    /// [`SubscriptionHub::session_source`]; it is never reused, so a session
+    /// recreated under the same id gets a fresh ring.
+    Session(u64),
 }
 
 impl Source {
@@ -103,10 +115,35 @@ struct HubState {
     next_arrival: u64,
 }
 
+/// A viewer attached to a session ring.
+struct Viewer {
+    /// The connection that attached it (see [`SubscriptionHub::add_viewer`]).
+    connection: u64,
+    cancel: CancellationToken,
+}
+
+/// Per-session bookkeeping: the ring handle, its viewers, and whether a turn
+/// is currently delivering through the ring.
+struct SessionEntry {
+    id: u64,
+    viewers: HashMap<String, Viewer>,
+    routed: usize,
+}
+
+#[derive(Default)]
+struct Sessions {
+    by_id: HashMap<String, SessionEntry>,
+    next_id: u64,
+}
+
 /// The process's subscription sources. Cheap to share behind an `Arc`.
 pub struct SubscriptionHub {
     state: Mutex<HubState>,
-    notify: HashMap<Source, Notify>,
+    notify: Mutex<HashMap<Source, Arc<Notify>>>,
+    sessions: Mutex<Sessions>,
+    /// Signalled whenever a session's viewer set changes.
+    viewers_changed: Notify,
+    session_ring: RingLimits,
     byte_budget: usize,
     bus_attached: AtomicBool,
 }
@@ -136,10 +173,15 @@ impl SubscriptionHub {
                 total_bytes: 0,
                 next_arrival: 0,
             }),
-            notify: Source::ALL
-                .into_iter()
-                .map(|source| (source, Notify::new()))
-                .collect(),
+            notify: Mutex::new(
+                Source::ALL
+                    .into_iter()
+                    .map(|source| (source, Arc::new(Notify::new())))
+                    .collect(),
+            ),
+            sessions: Mutex::new(Sessions::default()),
+            viewers_changed: Notify::new(),
+            session_ring: ring,
             byte_budget,
             bus_attached: AtomicBool::new(false),
         }
@@ -154,10 +196,11 @@ impl SubscriptionHub {
             let arrival = state.next_arrival;
             state.next_arrival += 1;
             let mut evicted = 0;
+            let session_ring = self.session_ring;
             let ring = state
                 .rings
-                .get_mut(&source)
-                .expect("every source has a ring");
+                .entry(source)
+                .or_insert_with(|| Ring::new(session_ring));
             let seq = ring.next_seq;
             ring.next_seq += 1;
             ring.entries.push_back(Entry {
@@ -178,7 +221,7 @@ impl SubscriptionHub {
             Self::enforce_budget(&mut state, self.byte_budget);
             seq
         };
-        self.notify[&source].notify_waiters();
+        self.notifier(source).notify_waiters();
         seq
     }
 
@@ -207,26 +250,35 @@ impl SubscriptionHub {
         if count == 0 {
             return;
         }
+        let session_ring = self.session_ring;
         self.state
             .lock()
             .rings
-            .get_mut(&source)
-            .expect("every source has a ring")
+            .entry(source)
+            .or_insert_with(|| Ring::new(session_ring))
             .next_seq += count;
-        self.notify[&source].notify_waiters();
+        self.notifier(source).notify_waiters();
     }
 
     /// The sequence number of the newest frame (0 before the first).
     #[must_use]
     pub fn head_seq(&self, source: Source) -> u64 {
-        self.state.lock().rings[&source].next_seq - 1
+        self.state
+            .lock()
+            .rings
+            .get(&source)
+            .map_or(0, |ring| ring.next_seq - 1)
     }
 
     /// Up to `max` frames at or after `cursor`, or the gap the cursor is in.
     #[must_use]
     pub fn read(&self, source: Source, cursor: u64, max: usize) -> Read {
         let state = self.state.lock();
-        let ring = &state.rings[&source];
+        // A session ring exists from its first frame; before that there is
+        // nothing to read and no gap.
+        let Some(ring) = state.rings.get(&source) else {
+            return Read::Frames(Vec::new());
+        };
         let first = ring.entries.partition_point(|entry| entry.seq < cursor);
         match ring.entries.get(first) {
             Some(entry) if entry.seq > cursor => Read::Lagged {
@@ -250,8 +302,157 @@ impl SubscriptionHub {
 
     /// The wakeup for `source`, signalled on every publish and loss.
     #[must_use]
-    pub fn notifier(&self, source: Source) -> &Notify {
-        &self.notify[&source]
+    pub fn notifier(&self, source: Source) -> Arc<Notify> {
+        Arc::clone(
+            self.notify
+                .lock()
+                .entry(source)
+                .or_insert_with(|| Arc::new(Notify::new())),
+        )
+    }
+
+    /// The ring for `session_id`, created on first use.
+    pub fn session_source(&self, session_id: &str) -> Source {
+        let mut sessions = self.sessions.lock();
+        if let Some(entry) = sessions.by_id.get(session_id) {
+            return Source::Session(entry.id);
+        }
+        sessions.next_id += 1;
+        let id = sessions.next_id;
+        sessions.by_id.insert(
+            session_id.to_string(),
+            SessionEntry {
+                id,
+                viewers: HashMap::new(),
+                routed: 0,
+            },
+        );
+        Source::Session(id)
+    }
+
+    /// Record a viewer of `session_id` whose delivery ends when `cancel`
+    /// fires. `connection` identifies the attaching connection, so a
+    /// connection can tell whether it already views the session.
+    pub fn add_viewer(
+        &self,
+        session_id: &str,
+        subscription_id: &str,
+        connection: u64,
+        cancel: CancellationToken,
+    ) {
+        let source = self.session_source(session_id);
+        let mut sessions = self.sessions.lock();
+        if let Some(entry) = sessions
+            .by_id
+            .get_mut(session_id)
+            .filter(|entry| Source::Session(entry.id) == source)
+        {
+            entry
+                .viewers
+                .insert(subscription_id.to_string(), Viewer { connection, cancel });
+        }
+        drop(sessions);
+        self.viewers_changed.notify_waiters();
+    }
+
+    /// Forget a viewer when its delivery ends.
+    pub fn remove_viewer(&self, session_id: &str, subscription_id: &str) {
+        let removed = self
+            .sessions
+            .lock()
+            .by_id
+            .get_mut(session_id)
+            .and_then(|entry| entry.viewers.remove(subscription_id))
+            .is_some();
+        if removed {
+            self.viewers_changed.notify_waiters();
+        }
+    }
+
+    /// How many viewers `session_id` has.
+    #[must_use]
+    pub fn viewer_count(&self, session_id: &str) -> usize {
+        self.sessions
+            .lock()
+            .by_id
+            .get(session_id)
+            .map_or(0, |entry| entry.viewers.len())
+    }
+
+    /// Whether `connection` already views `session_id`.
+    #[must_use]
+    pub fn viewed_by(&self, session_id: &str, connection: u64) -> bool {
+        self.sessions
+            .lock()
+            .by_id
+            .get(session_id)
+            .is_some_and(|entry| {
+                entry
+                    .viewers
+                    .values()
+                    .any(|viewer| viewer.connection == connection)
+            })
+    }
+
+    /// Resolves once `session_id` has no viewers. Returns at once when it
+    /// has none now.
+    pub async fn viewers_gone(&self, session_id: &str) {
+        loop {
+            let changed = self.viewers_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self.viewer_count(session_id) == 0 {
+                return;
+            }
+            changed.await;
+        }
+    }
+
+    /// Deliver `session_id`'s turn notifications through its ring until the
+    /// returned guard drops.
+    pub fn route_session(self: &Arc<Self>, session_id: &str) -> SessionRoute {
+        let _ = self.session_source(session_id);
+        if let Some(entry) = self.sessions.lock().by_id.get_mut(session_id) {
+            entry.routed += 1;
+        }
+        SessionRoute {
+            hub: Arc::clone(self),
+            session_id: session_id.to_string(),
+        }
+    }
+
+    /// The session's ring, when a turn is delivering through it now.
+    #[must_use]
+    pub fn routed_source(&self, session_id: &str) -> Option<Source> {
+        self.sessions
+            .lock()
+            .by_id
+            .get(session_id)
+            .filter(|entry| entry.routed > 0)
+            .map(|entry| Source::Session(entry.id))
+    }
+
+    /// Drop a session's ring and end its viewers' deliveries. Called when
+    /// the session itself goes away; a later session under the same id gets
+    /// a fresh ring.
+    pub fn release_session(&self, session_id: &str) {
+        let Some(entry) = self.sessions.lock().by_id.remove(session_id) else {
+            return;
+        };
+        let source = Source::Session(entry.id);
+        for viewer in entry.viewers.values() {
+            viewer.cancel.cancel();
+        }
+        {
+            let mut state = self.state.lock();
+            if let Some(ring) = state.rings.remove(&source) {
+                state.total_bytes -= ring.bytes;
+            }
+        }
+        if let Some(notify) = self.notify.lock().remove(&source) {
+            notify.notify_waiters();
+        }
+        self.viewers_changed.notify_waiters();
     }
 
     /// Total bytes held across all rings.
@@ -300,6 +501,21 @@ impl SubscriptionHub {
                 }
             }
         });
+    }
+}
+
+/// Keeps a session's turn notifications on its ring while held. See
+/// [`SubscriptionHub::route_session`].
+pub struct SessionRoute {
+    hub: Arc<SubscriptionHub>,
+    session_id: String,
+}
+
+impl Drop for SessionRoute {
+    fn drop(&mut self) {
+        if let Some(entry) = self.hub.sessions.lock().by_id.get_mut(&self.session_id) {
+            entry.routed = entry.routed.saturating_sub(1);
+        }
     }
 }
 
@@ -442,6 +658,66 @@ mod tests {
                 resume_seq: 8
             }
         );
+    }
+
+    #[test]
+    fn session_rings_are_created_on_first_use_and_released_with_the_session() {
+        let hub = Arc::new(small_hub(64));
+        let source = hub.session_source("s1");
+        assert_eq!(hub.session_source("s1"), source, "one ring per session id");
+        assert_eq!(hub.head_seq(source), 0);
+        assert_eq!(frames(hub.read(source, 1, 64)), Vec::<u64>::new());
+
+        hub.publish(source, json!({"type": "agent_message_chunk"}));
+        hub.publish(source, json!({"type": "turn_complete"}));
+        assert_eq!(frames(hub.read(source, 1, 64)), [1, 2]);
+        assert!(hub.total_bytes() > 0);
+
+        let viewer = CancellationToken::new();
+        hub.add_viewer("s1", "sub-1", 7, viewer.clone());
+        assert_eq!(hub.viewer_count("s1"), 1);
+        assert!(hub.viewed_by("s1", 7));
+        assert!(!hub.viewed_by("s1", 8));
+
+        hub.release_session("s1");
+        assert!(viewer.is_cancelled(), "release ends the session's viewers");
+        assert_eq!(hub.viewer_count("s1"), 0);
+        assert_eq!(hub.total_bytes(), 0, "the ring's bytes are returned");
+        assert_ne!(
+            hub.session_source("s1"),
+            source,
+            "a session recreated under the same id starts a fresh ring"
+        );
+    }
+
+    #[test]
+    fn a_route_lasts_as_long_as_its_guard() {
+        let hub = Arc::new(small_hub(64));
+        assert_eq!(hub.routed_source("s1"), None);
+        let route = hub.route_session("s1");
+        assert_eq!(hub.routed_source("s1"), Some(hub.session_source("s1")));
+        drop(route);
+        assert_eq!(hub.routed_source("s1"), None);
+    }
+
+    #[tokio::test]
+    async fn viewers_gone_resolves_when_the_last_viewer_leaves() {
+        let hub = Arc::new(small_hub(64));
+        hub.viewers_gone("s1").await; // none attached: immediate
+        hub.add_viewer("s1", "a", 1, CancellationToken::new());
+        hub.add_viewer("s1", "b", 2, CancellationToken::new());
+        let waiter = {
+            let hub = Arc::clone(&hub);
+            tokio::spawn(async move { hub.viewers_gone("s1").await })
+        };
+        hub.remove_viewer("s1", "a");
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished(), "one viewer is still attached");
+        hub.remove_viewer("s1", "b");
+        tokio::time::timeout(std::time::Duration::from_secs(2), waiter)
+            .await
+            .expect("the last viewer leaving wakes the waiter")
+            .unwrap();
     }
 
     #[tokio::test]

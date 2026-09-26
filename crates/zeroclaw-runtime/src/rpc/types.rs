@@ -122,6 +122,43 @@ rpc_type! {
         /// field.
         #[serde(default)]
         pub commands: Vec<CommandDescriptor>,
+        /// The turn lifetime this connection's prompts run under, echoed from
+        /// `clientCapabilities.turn_lifetime`. Absent from older daemons,
+        /// which only ever ran connection-lifetime turns.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub turn_lifetime: Option<TurnLifetime>,
+    }
+}
+
+/// Who owns a prompted turn, chosen per connection at `initialize` through
+/// `clientCapabilities.turn_lifetime`.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnLifetime {
+    /// The prompting connection owns the turn: its `session/update` frames go
+    /// to that connection only, and closing it cancels the turn. The default,
+    /// and the only behaviour protocol-1 clients have ever seen.
+    #[default]
+    Connection,
+    /// The session owns the turn: frames go to the session's ring and every
+    /// attached viewer (`session/attach`) reads them; closing a connection
+    /// only detaches a viewer. Only `session/cancel`, `session/abort`, and
+    /// session close/kill/delete end the turn.
+    Session,
+}
+
+impl TurnLifetime {
+    /// Read `clientCapabilities.turn_lifetime`. Anything but `"session"`
+    /// keeps the connection lifetime.
+    #[must_use]
+    pub fn from_client_capabilities(caps: Option<&serde_json::Value>) -> Self {
+        match caps
+            .and_then(|caps| caps.get("turn_lifetime"))
+            .and_then(serde_json::Value::as_str)
+        {
+            Some("session") => Self::Session,
+            _ => Self::Connection,
+        }
     }
 }
 
@@ -312,6 +349,31 @@ rpc_type! {
     pub struct SessionCancelResult {
         pub session_id: String,
         pub cancelled: bool,
+    }
+}
+
+rpc_type! {
+    /// `session/attach` params: view a session's turns from this connection.
+    pub struct SessionAttachParams {
+        pub session_id: String,
+        /// Resume after this sequence number: buffered frames from
+        /// `since_seq + 1` are replayed before live delivery, and a gap is
+        /// reported as `subscription/lagged`. Omit for live frames only.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub since_seq: Option<u64>,
+    }
+}
+
+rpc_type! {
+    /// Every `session/update` delivered to the viewer carries
+    /// `subscription_id` and its `seq`; `subscription/cancel` detaches.
+    pub struct SessionAttachResult {
+        pub session_id: String,
+        pub subscription_id: String,
+        /// Newest sequence number on the session's ring at attach time.
+        pub seq: u64,
+        /// Whether a turn is running on the session now.
+        pub running: bool,
     }
 }
 
