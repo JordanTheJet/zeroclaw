@@ -654,7 +654,13 @@ impl Enrollment {
         }
         let token: EnrolledToken = serde_json::from_value(serde_json::Value::Object(raw))
             .context("token response is missing required fields")?;
-        Ok(token)
+        // The access token is what the gateway actually presents. As with the
+        // device and client-credentials flows, a syntactically valid HTTP 200
+        // that carries a blank access_token or a missing/unsupported token_type
+        // must not reach the success page or the CLI success path. Optional
+        // id_token claim validation above does not substitute for validating the
+        // access token being exported.
+        token.validated()
     }
 }
 
@@ -1678,6 +1684,7 @@ mod tests {
             )))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "access_token": "at-pkce",
+                "token_type": "Bearer",
                 "expires_in": 3600,
                 "id_token": id_token_with(valid_claims(&flow)),
             })))
@@ -1778,6 +1785,77 @@ mod tests {
                 .unwrap_err();
             assert!(err.to_string().contains("id_token"), "{label}: {err}");
         }
+    }
+
+    #[tokio::test]
+    async fn pkce_exchange_validates_the_returned_access_token() {
+        // A syntactically valid HTTP 200 whose access token is unusable must
+        // not reach the gateway success page. Mirrors the device and
+        // client-credentials negative coverage: blank access_token, missing
+        // token_type, and an unsupported (non-Bearer) token_type all fail the
+        // exchange. No id_token is present, so this exercises the access-token
+        // validation path specifically.
+        for (label, response, needle) in [
+            (
+                "empty access_token",
+                serde_json::json!({"access_token": "", "token_type": "Bearer"}),
+                "empty access_token",
+            ),
+            (
+                "missing token_type",
+                serde_json::json!({"access_token": "at-pkce"}),
+                "no token_type",
+            ),
+            (
+                "unsupported token_type",
+                serde_json::json!({"access_token": "at-pkce", "token_type": "MAC"}),
+                "unsupported token_type",
+            ),
+        ] {
+            let server = idp_with_pkce(Some(serde_json::json!(["S256"]))).await;
+            let enrollment = Enrollment::new("corp", config(&server.uri(), None)).unwrap();
+            let flow = enrollment
+                .pkce_start("http://127.0.0.1:7777/callback")
+                .await
+                .unwrap();
+            Mock::given(method("POST"))
+                .and(path("/token"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(response))
+                .mount(&server)
+                .await;
+            let err = enrollment
+                .pkce_exchange(&flow, "auth-code-1")
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains(needle), "{label}: {err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn pkce_exchange_accepts_a_valid_bearer_without_an_id_token() {
+        // A well-formed Bearer access token with no id_token is a legitimate
+        // response and must pass. Guards against the validation above rejecting
+        // the happy path when the provider omits the optional id_token.
+        let server = idp_with_pkce(Some(serde_json::json!(["S256"]))).await;
+        let enrollment = Enrollment::new("corp", config(&server.uri(), None)).unwrap();
+        let flow = enrollment
+            .pkce_start("http://127.0.0.1:7777/callback")
+            .await
+            .unwrap();
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "at-pkce",
+                "token_type": "Bearer",
+                "expires_in": 3600,
+            })))
+            .mount(&server)
+            .await;
+        let token = enrollment
+            .pkce_exchange(&flow, "auth-code-1")
+            .await
+            .unwrap();
+        assert_eq!(token.access_token, "at-pkce");
     }
 
     #[tokio::test]

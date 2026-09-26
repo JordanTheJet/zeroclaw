@@ -60,6 +60,55 @@ impl ScopedToolRegistry {
         self.0.retain(f);
     }
 
+    /// Rebind the memory-backed tools of an ALREADY-sealed registry to a new
+    /// backend handle. Session memory follows its owner: when a session is
+    /// pinned to a principal's private plane the memory tools — which each
+    /// captured a clone of the shared handle at assembly — must be re-pointed
+    /// at the routed handle, or an owned session would keep issuing shared-plane
+    /// recall/store/export/delete while the agent reports its memory as private.
+    ///
+    /// This replaces the SAME named memory tools in place with fresh instances
+    /// over `memory`; it never introduces a new tool name, so the surface the
+    /// seal admitted is unchanged. Any memory tool already withdrawn by policy
+    /// narrowing stays withdrawn (only tools currently present are rebound).
+    pub(crate) fn rebind_memory_tools(
+        &mut self,
+        memory: Arc<dyn zeroclaw_memory::Memory>,
+        security: Arc<SecurityPolicy>,
+    ) {
+        use zeroclaw_tools::{
+            memory_export::MemoryExportTool, memory_forget::MemoryForgetTool,
+            memory_purge::MemoryPurgeTool, memory_recall::MemoryRecallTool,
+            memory_store::MemoryStoreTool,
+        };
+        for tool in self.0.iter_mut() {
+            let replacement: Option<Box<dyn Tool>> = match tool.name() {
+                "memory_store" => Some(Box::new(MemoryStoreTool::new(
+                    Arc::clone(&memory),
+                    Arc::clone(&security),
+                ))),
+                "memory_recall" => {
+                    Some(Box::new(MemoryRecallTool::new(Arc::clone(&memory))))
+                }
+                "memory_forget" => Some(Box::new(MemoryForgetTool::new(
+                    Arc::clone(&memory),
+                    Arc::clone(&security),
+                ))),
+                "memory_export" => {
+                    Some(Box::new(MemoryExportTool::new(Arc::clone(&memory))))
+                }
+                "memory_purge" => Some(Box::new(MemoryPurgeTool::new(
+                    Arc::clone(&memory),
+                    Arc::clone(&security),
+                ))),
+                _ => None,
+            };
+            if let Some(replacement) = replacement {
+                *tool = replacement;
+            }
+        }
+    }
+
     /// Test-only constructor that mints a registry directly from raw tools,
     /// bypassing [`Self::assemble`]. Gated to `test` (this crate's own unit
     /// tests) OR the `test-util` feature (so OTHER crates' test builds -

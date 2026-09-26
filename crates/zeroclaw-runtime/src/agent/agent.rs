@@ -355,6 +355,11 @@ pub struct Agent {
     /// `assemble()` (the seal).
     tools: crate::tools::scoped::ScopedToolRegistry,
     memory: Arc<dyn Memory>,
+    /// The security policy the memory-backed tools were assembled with. Kept so
+    /// that [`Agent::route_memory_to_principal`] can rebuild those tools over a
+    /// principal-scoped handle without re-deriving policy: session memory must
+    /// follow its owner across the tools too, not only the `memory` field.
+    memory_security: Arc<SecurityPolicy>,
     observer: Arc<dyn Observer>,
     prompt_builder: SystemPromptBuilder,
     tool_dispatcher: Box<dyn ToolDispatcher>,
@@ -596,6 +601,7 @@ pub struct AgentBuilder {
     model_provider: Option<Box<dyn ModelProvider>>,
     tools: Option<crate::tools::scoped::ScopedToolRegistry>,
     memory: Option<Arc<dyn Memory>>,
+    memory_security: Option<Arc<SecurityPolicy>>,
     observer: Option<Arc<dyn Observer>>,
     prompt_builder: Option<SystemPromptBuilder>,
     tool_dispatcher: Option<Box<dyn ToolDispatcher>>,
@@ -658,6 +664,7 @@ impl AgentBuilder {
             model_provider: None,
             tools: None,
             memory: None,
+            memory_security: None,
             observer: None,
             prompt_builder: None,
             tool_dispatcher: None,
@@ -722,6 +729,15 @@ impl AgentBuilder {
 
     pub fn memory(mut self, memory: Arc<dyn Memory>) -> Self {
         self.memory = Some(memory);
+        self
+    }
+
+    /// The security policy the memory tools were assembled with, retained so a
+    /// later `route_memory_to_principal` can rebind those tools to the routed
+    /// handle. Defaults to a permissive policy if unset (test builders); the
+    /// production constructor always supplies the agent's real policy.
+    pub fn memory_security(mut self, security: Arc<SecurityPolicy>) -> Self {
+        self.memory_security = Some(security);
         self
     }
 
@@ -1088,6 +1104,9 @@ impl AgentBuilder {
             })?,
             tools,
             memory: memory.clone(),
+            memory_security: self
+                .memory_security
+                .unwrap_or_else(|| Arc::new(SecurityPolicy::default())),
             observer: self.observer.ok_or_else(|| {
                 ::zeroclaw_log::record!(
                     ERROR,
@@ -1709,7 +1728,15 @@ impl Agent {
             Arc::clone(&self.memory),
             scope.clone(),
         ));
-        self.memory = routed;
+        self.memory = Arc::clone(&routed);
+        // The memory-backed tools each captured a clone of the shared handle at
+        // assembly. Swapping only `self.memory` would leave those tools writing
+        // and reading the shared plane while the agent reports its memory as
+        // private — so rebind them to the routed handle here, before any prompt
+        // exercises them. This never adds a tool name: memory tools already
+        // withdrawn by policy narrowing stay withdrawn.
+        self.tools
+            .rebind_memory_tools(routed, Arc::clone(&self.memory_security));
         self.memory_principal = Some(scope.principal_id);
         Ok(())
     }
@@ -2579,6 +2606,7 @@ impl Agent {
             .allowed_tools(principal_allowed_tools)
             .tools(tools)
             .memory(memory.clone())
+            .memory_security(Arc::clone(&security))
             .observer(observer)
             .response_cache(response_cache)
             .tool_dispatcher(tool_dispatcher)
@@ -5020,6 +5048,105 @@ mod tests {
         let mut agent = blank_input_agent(model_provider);
         let err = agent.turn("").await.expect_err("blank turn must fail");
         assert_eq!(err.to_string(), BLANK_TURN_ERROR);
+    }
+
+    /// Regression for the memory-handle binding order: `route_memory_to_principal`
+    /// must rebind the actual memory TOOLS to the owner's private plane, not only
+    /// the `Agent.memory` field. Exercises the real `memory_store`/`memory_recall`
+    /// tools against owner / other-owner / shared sentinels — asserting tool
+    /// BEHAVIOUR, not merely the `memory_principal()` marker.
+    #[tokio::test]
+    async fn routing_rebinds_the_memory_tools_to_the_owners_private_plane() {
+        use zeroclaw_api::memory_traits::PrincipalScope;
+        use zeroclaw_tools::memory_recall::MemoryRecallTool;
+        use zeroclaw_tools::memory_store::MemoryStoreTool;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let shared: Arc<dyn Memory> = Arc::new(
+            zeroclaw_memory::SqliteMemory::new("sqlite", tmp.path()).expect("sqlite memory"),
+        );
+
+        // Seed a sentinel on the SHARED plane and one on ANOTHER owner's plane.
+        shared
+            .store("s", "shared-secret", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        let mallory = PrincipalScope::new("user:mallory");
+        shared
+            .store_for_principal(&mallory, "m", "mallory-secret", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let security = Arc::new(crate::security::SecurityPolicy::default());
+        let raw_tools: Vec<Box<dyn Tool>> = vec![
+            Box::new(MemoryStoreTool::new(
+                Arc::clone(&shared),
+                Arc::clone(&security),
+            )),
+            Box::new(MemoryRecallTool::new(Arc::clone(&shared))),
+        ];
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = Agent::builder()
+            .model_provider(Box::new(MockModelProvider {
+                responses: Mutex::new(Vec::new()),
+            }))
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                raw_tools,
+            ))
+            .memory(Arc::clone(&shared))
+            .memory_security(Arc::clone(&security))
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(tmp.path().to_path_buf())
+            .build()
+            .expect("agent builds");
+
+        // Pin the session to alice's private plane; this must rebind the tools.
+        agent
+            .route_memory_to_principal(PrincipalScope::new("user:alice"))
+            .unwrap();
+
+        // The store tool must write to ALICE's private plane, not the shared one.
+        let store = agent
+            .tools
+            .iter()
+            .find(|t| t.name() == "memory_store")
+            .expect("memory_store present");
+        store
+            .execute(serde_json::json!({"key": "note", "content": "alice-note"}))
+            .await
+            .unwrap();
+
+        // Shared plane is untouched by the owned session's store.
+        assert!(
+            shared.get("note").await.unwrap().is_none(),
+            "an owned session's memory_store must not land on the shared plane"
+        );
+        // It DID land on alice's private plane.
+        let on_alice = shared
+            .get_for_principal(&PrincipalScope::new("user:alice"), "note")
+            .await
+            .unwrap()
+            .expect("alice's private plane holds the note");
+        assert_eq!(on_alice.content, "alice-note");
+
+        // The recall tool must read ONLY alice's plane: neither the shared
+        // sentinel nor mallory's sentinel is reachable through the tool.
+        let recall = agent
+            .tools
+            .iter()
+            .find(|t| t.name() == "memory_recall")
+            .expect("memory_recall present");
+        let result = recall.execute(serde_json::json!({"query": "secret"})).await.unwrap();
+        let text = format!("{result:?}");
+        assert!(
+            !text.contains("shared-secret"),
+            "recall leaked the shared plane: {text}"
+        );
+        assert!(
+            !text.contains("mallory-secret"),
+            "recall leaked another owner's plane: {text}"
+        );
     }
 
     #[tokio::test]

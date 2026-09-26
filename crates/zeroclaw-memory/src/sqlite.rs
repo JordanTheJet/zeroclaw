@@ -1490,13 +1490,39 @@ impl SqliteMemory {
     /// authoritative predicates on every private-plane statement, and
     /// legacy-plane statements filter `principal_id IS NULL`, so the prefix
     /// is storage layout, not an authorization mechanism.
+    ///
+    /// The encoding is length-prefixed (`<byte-len>:<bytes>` per segment) so
+    /// the mapping from (owner, namespace, tenant, key) to physical key is
+    /// injective: no choice of colon-bearing owner/namespace/tenant/key can
+    /// produce the same string as a different tuple, and an absent tenant
+    /// (`None`, encoded as `-`) is distinct from an empty one (`Some("")`,
+    /// encoded as `0:`). Without this a colliding physical key would let one
+    /// scope's upsert silently move or overwrite another scope's row.
+    fn encode_segment(out: &mut String, seg: &str) {
+        // Length in bytes, a colon, then the raw bytes. Because the length is
+        // an unambiguous prefix, the reader knows exactly where the segment
+        // ends regardless of any colons the segment itself contains.
+        out.push_str(&seg.len().to_string());
+        out.push(':');
+        out.push_str(seg);
+    }
+
     fn principal_physical_prefix(scope: &PrincipalScope) -> String {
-        format!(
-            "p:{}:{}:{}:",
-            scope.principal_id,
-            Self::scope_namespace(scope),
-            scope.tenant_id.as_deref().unwrap_or("")
-        )
+        // `p|` marks the private plane; each dimension is length-prefixed.
+        // Tenant distinguishes absent (`-`) from present (`t` + segment) so
+        // `None` and `Some("")` never collide.
+        let mut prefix = String::from("p|");
+        Self::encode_segment(&mut prefix, &scope.principal_id);
+        Self::encode_segment(&mut prefix, Self::scope_namespace(scope));
+        match scope.tenant_id.as_deref() {
+            None => prefix.push('-'),
+            Some(tenant) => {
+                prefix.push('t');
+                Self::encode_segment(&mut prefix, tenant);
+            }
+        }
+        prefix.push('|');
+        prefix
     }
 
     /// Physical storage key for a private-plane row.
@@ -1515,7 +1541,7 @@ impl SqliteMemory {
     /// The reserved prefix of private-plane physical keys. Shared-plane
     /// writes refuse it outright so a shared caller can never name a private
     /// row's physical key.
-    const PRIVATE_KEY_PREFIX: &'static str = "p:";
+    const PRIVATE_KEY_PREFIX: &'static str = "p|";
 
     /// The agent alias a scope resolves to (`None` = the default agent).
     fn scope_agent_alias(scope: &PrincipalScope) -> &str {
@@ -1863,13 +1889,16 @@ impl Memory for SqliteMemory {
             // first write, the same way the shared plane ensures aliases.
             zeroclaw_config::schema::v2::sqlite_ensure_agent_uuid(&conn, &agent_alias)?;
             // Every scope dimension travels in the statement that stores the
-            // row (atomic predicate). The physical key embeds the principal,
-            // namespace and tenant so a conflict is normally this scope's own
-            // row, but the UNIQUE(agent_id, key) constraint knows nothing
-            // about planes: the update is guarded on the existing row being
-            // THIS owner's, so a shared row that happens to carry the
-            // physical key is never converted to private, and a zero-row
-            // outcome is refused rather than reported as stored.
+            // row (atomic predicate). The physical key is an injective encoding
+            // of (owner, namespace, tenant, key), so a conflict on the
+            // UNIQUE(agent_id, key) constraint is this exact scope's own row.
+            // The UPDATE is nonetheless guarded on the full scope — owner AND
+            // namespace AND tenant of the existing row must match the incoming
+            // one — so that even a hypothetical key collision can never
+            // silently move or overwrite a row that belongs to a different
+            // scope dimension: the guard fails the update to zero rows and the
+            // write is refused rather than reported as stored. `IS` is used
+            // throughout so a NULL tenant compares equal to a NULL tenant.
             let changed = conn.execute(
                 "INSERT INTO memories (
                     id, key, content, category, created_at, updated_at,
@@ -1887,7 +1916,9 @@ impl Memory for SqliteMemory {
                     session_id = excluded.session_id,
                     namespace = excluded.namespace,
                     tenant_id = excluded.tenant_id
-                 WHERE memories.principal_id IS excluded.principal_id",
+                 WHERE memories.principal_id IS excluded.principal_id
+                   AND memories.namespace IS excluded.namespace
+                   AND memories.tenant_id IS excluded.tenant_id",
                 params![
                     id,
                     physical_key,
@@ -2871,8 +2902,14 @@ mod tests {
 
         // Shared plane -> private row: the reserved prefix is refused before
         // any statement runs, so the private row and its owner are untouched.
+        // The physical key is the exact injective encoding of alice's `note`.
+        let alice_physical = SqliteMemory::principal_physical_key(&alice, "note");
+        assert!(
+            alice_physical.starts_with("p|"),
+            "private keys carry the reserved marker: {alice_physical}"
+        );
         let err = mem
-            .store("p:user:alice:note", "hijack", MemoryCategory::Core, None)
+            .store(&alice_physical, "hijack", MemoryCategory::Core, None)
             .await
             .expect_err("a shared write cannot name a private physical key");
         assert!(err.to_string().contains("reserved"), "{err}");
@@ -2886,26 +2923,28 @@ mod tests {
 
         // Private plane -> shared row: a shared row that happens to carry the
         // physical key (planted below the prefix check, as a migration or a
-        // foreign tool could) is never converted; the write is refused.
+        // foreign tool could) is never converted; the write is refused. The
+        // planted key is the exact injective encoding of bob's `secret` scope.
+        let bob = PrincipalScope::new("user:bob");
+        let planted_key = SqliteMemory::principal_physical_key(&bob, "secret");
         {
             let conn = mem.conn.lock();
             conn.execute(
                 "INSERT INTO memories (id, key, content, category, created_at, updated_at, \
-                 namespace, importance, agent_id) VALUES ('planted', 'p:user:bob:default::secret', \
+                 namespace, importance, agent_id) VALUES ('planted', ?1, \
                  'shared-planted', 'core', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', \
                  'default', 0.5, (SELECT id FROM agents WHERE alias = 'default' LIMIT 1))",
-                [],
+                rusqlite::params![planted_key],
             )
             .unwrap();
         }
-        let bob = PrincipalScope::new("user:bob");
         let err = mem
             .store_for_principal(&bob, "secret", "bob-private", MemoryCategory::Core, None)
             .await
             .expect_err("a private write cannot convert a shared row");
         assert!(err.to_string().contains("another plane"), "{err}");
         let planted = mem
-            .get("p:user:bob:default::secret")
+            .get(&planted_key)
             .await
             .unwrap()
             .unwrap();
@@ -3127,6 +3166,98 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(listed.len(), 1);
+    }
+
+    /// The physical key is an injective encoding of the full scope, so inputs
+    /// that a naive colon-join would collide are kept as independent rows:
+    /// reads, exports and deletes act on exactly one of them. Also asserts an
+    /// absent tenant (`None`) is distinct from an empty one (`Some("")`).
+    #[tokio::test]
+    async fn private_keys_are_unambiguous_across_scope_dimensions() {
+        let (_tmp, mem) = temp_sqlite();
+        let owner = "user:alice";
+
+        // A naive `p:{owner}:{ns}:{tenant}:{key}` join collides these two:
+        //   ns="a", tenant="b",  key="k"      -> p:user:alice:a:b:k
+        //   ns="a", tenant="",   key="b:k"    -> p:user:alice:a::b:k  (close)
+        //   ns="a:b", tenant="", key="k"      -> p:user:alice:a:b::k
+        // The cleanest witness: a colon in the namespace vs. a colon in the
+        // key. Under length-prefixed encoding these are provably distinct.
+        let scope_a = PrincipalScope::new(owner)
+            .with_namespace(Some("a:b".to_string()))
+            .with_tenant(None);
+        let scope_b = PrincipalScope::new(owner)
+            .with_namespace(Some("a".to_string()))
+            .with_tenant(None);
+
+        mem.store_for_principal(&scope_a, "k", "content-A", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        mem.store_for_principal(&scope_b, "b:k", "content-B", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        // Distinct physical keys — no silent overwrite.
+        assert_ne!(
+            SqliteMemory::principal_physical_key(&scope_a, "k"),
+            SqliteMemory::principal_physical_key(&scope_b, "b:k"),
+            "colon-bearing namespace/key must not collapse to one physical key"
+        );
+
+        // Independent reads.
+        let a = mem.get_for_principal(&scope_a, "k").await.unwrap().unwrap();
+        let b = mem
+            .get_for_principal(&scope_b, "b:k")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(a.content, "content-A");
+        assert_eq!(b.content, "content-B");
+
+        // Deleting one leaves the other intact.
+        mem.forget_for_principal(&scope_a, "k").await.unwrap();
+        assert!(mem.get_for_principal(&scope_a, "k").await.unwrap().is_none());
+        let still_b = mem
+            .get_for_principal(&scope_b, "b:k")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(still_b.content, "content-B", "the sibling row survives");
+
+        // Absent tenant is distinct from an empty tenant.
+        let none_tenant = PrincipalScope::new(owner)
+            .with_namespace(Some("n".to_string()))
+            .with_tenant(None);
+        let empty_tenant = PrincipalScope::new(owner)
+            .with_namespace(Some("n".to_string()))
+            .with_tenant(Some(String::new()));
+        assert_ne!(
+            SqliteMemory::principal_physical_key(&none_tenant, "t"),
+            SqliteMemory::principal_physical_key(&empty_tenant, "t"),
+            "None tenant and Some(\"\") tenant must not collide"
+        );
+        mem.store_for_principal(&none_tenant, "t", "no-tenant", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        mem.store_for_principal(&empty_tenant, "t", "empty-tenant", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            mem.get_for_principal(&none_tenant, "t")
+                .await
+                .unwrap()
+                .unwrap()
+                .content,
+            "no-tenant"
+        );
+        assert_eq!(
+            mem.get_for_principal(&empty_tenant, "t")
+                .await
+                .unwrap()
+                .unwrap()
+                .content,
+            "empty-tenant"
+        );
     }
 
     #[tokio::test]
