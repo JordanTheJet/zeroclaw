@@ -363,7 +363,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let connector = InprocConnector::new(cancel.clone());
         let waiter = connector.clone();
-        let pending = tokio::spawn(async move { waiter.connect().await.is_some() });
+        let pending = zeroclaw_spawn::spawn!(async move { waiter.connect().await.is_some() });
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert!(
             !pending.is_finished(),
