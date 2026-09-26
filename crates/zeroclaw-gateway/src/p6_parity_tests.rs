@@ -694,8 +694,9 @@ fn pairing_state(dir: &tempfile::TempDir) -> crate::AppState {
         &[PAIRED_BEARER.to_string()],
         config.gateway.pairing_code,
     ));
+    // A private registry with its schema, never the process-wide instance.
     state.device_registry = Some(std::sync::Arc::new(
-        zeroclaw_runtime::devices::DeviceRegistry::with_db_path(dir.path().join("devices.db")),
+        zeroclaw_runtime::devices::DeviceRegistry::new(&config.data_dir),
     ));
     state
 }
