@@ -253,12 +253,14 @@ mod tests {
                     .build()
                     .expect("parity runtime");
                 runtime.block_on(async {
-                    let adapter = tokio::time::timeout(Duration::from_secs(60), run_turn(false))
-                        .await
-                        .expect("adapter turn timed out");
-                    let default = tokio::time::timeout(Duration::from_secs(60), run_turn(true))
-                        .await
-                        .expect("default-capability turn timed out");
+                    let adapter =
+                        tokio::time::timeout(Duration::from_secs(60), Box::pin(run_turn(false)))
+                            .await
+                            .expect("adapter turn timed out");
+                    let default =
+                        tokio::time::timeout(Duration::from_secs(60), Box::pin(run_turn(true)))
+                            .await
+                            .expect("default-capability turn timed out");
 
                     assert!(
                         adapter.0.contains(REPLY),
