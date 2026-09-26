@@ -531,15 +531,24 @@ fn remember_dispatch_start(
 
 // ── Core dispatch ───────────────────────────────────────────────
 
+/// What the decision model settled for one SOP's run: the execution mode it
+/// chose (if any) and its p(yes) for each conditional-part step.
+#[derive(Default)]
+struct RunDecision {
+    mode: Option<SopExecutionMode>,
+    parts: std::collections::BTreeMap<u32, f64>,
+}
+
 /// Consult the engine's decision model for each matched SOP that declares a
 /// `[decision]` table. Returns the names that should still start; declined
-/// SOPs are pushed to `results` as `Skipped`, and chosen modes land in
-/// `decided_modes`. SOPs without a `[decision]` table pass through untouched.
+/// SOPs are pushed to `results` as `Skipped`, and the chosen mode and part
+/// answers land in `decided`. SOPs without a `[decision]` table pass through
+/// untouched.
 async fn apply_decisions(
     engine: &Arc<Mutex<SopEngine>>,
     event: &SopEvent,
     matched_names: Vec<String>,
-    decided_modes: &mut HashMap<String, SopExecutionMode>,
+    decided: &mut HashMap<String, RunDecision>,
     results: &mut Vec<DispatchResult>,
 ) -> Vec<String> {
     let gated = match engine.lock() {
@@ -572,6 +581,7 @@ async fn apply_decisions(
                     "sop_name": sop.name,
                     "start": decision.start,
                     "mode": decision.mode.map(|m| m.to_string()),
+                    "parts": decision.parts,
                     "input_tokens": decision.input_tokens,
                 })
             ),
@@ -586,8 +596,14 @@ async fn apply_decisions(
                 reason: format!("decision gate declined: {}", decision.rationale),
             });
             declined.push(sop.name);
-        } else if let Some(mode) = decision.mode {
-            decided_modes.insert(sop.name, mode);
+        } else {
+            decided.insert(
+                sop.name,
+                RunDecision {
+                    mode: decision.mode,
+                    parts: decision.parts,
+                },
+            );
         }
     }
     matched_names
@@ -754,15 +770,9 @@ async fn dispatch_sop_event_filtered(
     // this event should start them and in which mode. Awaited with no engine
     // lock held; a declined SOP is reported as Skipped and never reserves a slot.
     let mut results = Vec::new();
-    let mut decided_modes = HashMap::new();
-    let matched_names = apply_decisions(
-        engine,
-        &event,
-        matched_names,
-        &mut decided_modes,
-        &mut results,
-    )
-    .await;
+    let mut decided: HashMap<String, RunDecision> = HashMap::new();
+    let matched_names =
+        apply_decisions(engine, &event, matched_names, &mut decided, &mut results).await;
     if matched_names.is_empty() {
         return results;
     }
@@ -1031,7 +1041,9 @@ async fn dispatch_sop_event_filtered(
             for sop_name in &admit_names {
                 match eng.reserve_run_slot(sop_name) {
                     Ok(mut reservation) => {
-                        reservation.set_decided_mode(decided_modes.get(sop_name).copied());
+                        let decision = decided.remove(sop_name).unwrap_or_default();
+                        reservation.set_decided_mode(decision.mode);
+                        reservation.set_decisions(decision.parts);
                         reservations.push(reservation);
                     }
                     Err(e) => {
@@ -1188,10 +1200,12 @@ async fn dispatch_sop_event_filtered(
                     }
                     SopAdmission::Admit => {}
                 }
+                let decision = decided.remove(sop_name).unwrap_or_default();
                 match eng.start_run_with_mode(
                     sop_name,
                     event.clone(),
-                    decided_modes.get(sop_name).copied(),
+                    decision.mode,
+                    decision.parts,
                 ) {
                     Ok(action) => {
                         let result =
@@ -3782,6 +3796,7 @@ mod tests {
                 ],
                 mode_instructions: None,
                 min_confidence: 0.7,
+                part_threshold: 0.5,
             }
         }
 
