@@ -248,6 +248,23 @@ Typed observer events (`agent_start`, `agent_end`, `llm_request`, `tool_call`, `
 
 Log-layer frames sent directly on the channel are live-only; the history buffer holds observer frames only.
 
+## RPC subscriptions are replayable and never end silently
+
+RPC streams do not read the broadcast channel directly. A `SubscriptionHub` (`zeroclaw_runtime::rpc::subscription`) copies the bus into bounded rings, one per source, and every subscriber is just a cursor into a ring. Two sources exist today:
+
+| Method | Ring | Notification |
+|---|---|---|
+| `logs/subscribe` | every bus frame | `logs/event` |
+| `events/subscribe` | observer frames only | `events/event` |
+
+- **Bounds:** each ring is capped at 2,048 frames and 4 MiB, and all rings share a 16 MiB process-wide budget. Over budget, the oldest frame across all rings is evicted.
+- **Producers never wait for a subscriber;** a slow subscriber only falls behind.
+- **Sequence numbers:** start at 1 per source. Every notification carries `subscription_id` and its `seq`. The subscribe result returns the newest `seq`.
+- **Resume:** `X/subscribe{since_seq}` replays the frames after `since_seq` that are still buffered, then continues live.
+- **Gaps:** a gap is reported, never skipped. A cursor that points at frames that are gone (evicted by the caps or the budget, overrun on the bus, or from before a daemon restart) receives `subscription/lagged{subscription_id, from_seq, resume_seq}` and continues at `resume_seq`.
+- **Cancel:** `subscription/cancel{subscription_id}` ends one subscription on the calling connection. Closing the connection ends them all.
+- **Pairing credentials** are dropped before they reach a ring, so neither stream can deliver or replay them.
+
 ## Reader cursors span the active file and retained archives
 
 `GET /api/logs` and `logs/query` call `reader::query_log_page`, which owns segment
