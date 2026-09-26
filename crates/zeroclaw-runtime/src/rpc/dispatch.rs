@@ -7219,10 +7219,9 @@ impl RpcDispatcher {
             // Every other aliased section (agents, channels, profiles, ...)
             // goes through the same cascade as the HTTP delete: soft
             // references are scrubbed, hard ones refuse, and an agent also
-            // refuses while it has live ACP sessions.
-            return self
-                .delete_alias_with_cascade(req, kind, config_write_guard)
-                .await;
+            // refuses while it has live ACP sessions. Heap-pinned so the
+            // cascade's large future does not inflate every map-key delete.
+            return Box::pin(self.delete_alias_with_cascade(req, kind, config_write_guard)).await;
         } else {
             let mut working = self.ctx.config.read().clone();
             let deleted = delete_plain(&mut working)?;
