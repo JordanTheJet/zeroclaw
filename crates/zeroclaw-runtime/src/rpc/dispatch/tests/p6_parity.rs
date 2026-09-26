@@ -1,6 +1,6 @@
 //! Dispatcher-level tests for the core-parity methods: routing, the coarse
 //! `Method::authz()` gate, and each method's selector. Body parity with the
-//! HTTP routes is covered by the gateway's `rpc_parity_tests`.
+//! HTTP routes is covered by the gateway's `p6_parity_tests`.
 
 use super::*;
 

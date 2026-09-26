@@ -13,8 +13,6 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use uuid::Uuid;
 
-use zeroclaw_config::schema::Config;
-use zeroclaw_runtime::skills::SkillsService;
 
 use crate::{AppState, api::require_auth, run_gateway_chat_with_tools};
 
