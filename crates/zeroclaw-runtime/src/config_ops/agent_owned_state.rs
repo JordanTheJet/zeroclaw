@@ -32,7 +32,9 @@ pub struct OwnedStateReport {
     pub warnings: Vec<String>,
 }
 
-async fn write_json(path: &Path, bytes: Vec<u8>) {
+/// Write one archive file. Returns whether it landed, so a caller never
+/// removes rows whose only copy failed to reach the archive.
+async fn write_json(path: &Path, bytes: Vec<u8>) -> bool {
     if let Err(err) = tokio::fs::write(path, bytes).await {
         ::zeroclaw_log::record!(
             WARN,
@@ -41,7 +43,9 @@ async fn write_json(path: &Path, bytes: Vec<u8>) {
                 .with_attrs(::serde_json::json!({"path": path.display().to_string(), "err": err.to_string()})),
             "owned-state cascade: failed to write archive file"
         );
+        return false;
     }
+    true
 }
 
 pub async fn cascade_owned_state(
@@ -58,41 +62,59 @@ pub async fn cascade_owned_state(
     // ── memory: export → archive → purge. Failures are SURFACED in `warnings`,
     // not masked as 0 (markdown/none have no DB rows — their memory lives in the
     // archived workspace — but a real backend error must stay visible). ────────
-    let mem_rows = match mem.export_agent(alias).await {
-        Ok(rows) => rows,
+    // The purge runs only once the export is archived: a failed export or
+    // archive write keeps the rows rather than destroying their only copy.
+    let memory_archived = match mem.export_agent(alias).await {
+        Ok(rows) => match serde_json::to_vec_pretty(&rows) {
+            Ok(bytes) => write_json(&cascade_dir.join("memory.json"), bytes).await,
+            Err(e) => {
+                warnings.push(format!("memory export encode: {e}"));
+                false
+            }
+        },
         Err(e) => {
             warnings.push(format!("memory export: {e}"));
-            Vec::new()
+            false
         }
     };
-    if let Ok(bytes) = serde_json::to_vec_pretty(&mem_rows) {
-        write_json(&cascade_dir.join("memory.json"), bytes).await;
-    }
-    let memory_purged = match mem.purge_agent(alias).await {
-        Ok(n) => n,
-        Err(e) => {
-            warnings.push(format!("memory purge: {e}"));
-            0
+    let memory_purged = if memory_archived {
+        match mem.purge_agent(alias).await {
+            Ok(n) => n,
+            Err(e) => {
+                warnings.push(format!("memory purge: {e}"));
+                0
+            }
         }
+    } else {
+        warnings.push("memory purge skipped: export was not archived".to_string());
+        0
     };
 
     // ── cron: list → archive → remove (cron_runs cascade off job_id) ─────────
-    let cron_jobs = match crate::cron::list_jobs_by_agent(config, alias) {
-        Ok(jobs) => jobs,
+    let cron_archived = match crate::cron::list_jobs_by_agent(config, alias) {
+        Ok(jobs) => match serde_json::to_vec_pretty(&jobs) {
+            Ok(bytes) => write_json(&cascade_dir.join("cron.json"), bytes).await,
+            Err(e) => {
+                warnings.push(format!("cron export encode: {e}"));
+                false
+            }
+        },
         Err(e) => {
             warnings.push(format!("cron list: {e}"));
-            Vec::new()
+            false
         }
     };
-    if let Ok(bytes) = serde_json::to_vec_pretty(&cron_jobs) {
-        write_json(&cascade_dir.join("cron.json"), bytes).await;
-    }
-    let cron_removed = match crate::cron::remove_jobs_by_agent(config, alias) {
-        Ok(n) => n,
-        Err(e) => {
-            warnings.push(format!("cron remove: {e}"));
-            0
+    let cron_removed = if cron_archived {
+        match crate::cron::remove_jobs_by_agent(config, alias) {
+            Ok(n) => n,
+            Err(e) => {
+                warnings.push(format!("cron remove: {e}"));
+                0
+            }
         }
+    } else {
+        warnings.push("cron remove skipped: jobs were not archived".to_string());
+        0
     };
 
     // ── acp: list → archive → delete (only killed sessions remain) ───────────
@@ -116,7 +138,7 @@ pub async fn cascade_owned_state(
                 })
                 .collect();
             if let Ok(bytes) = serde_json::to_vec_pretty(&json) {
-                write_json(&cascade_dir.join("acp.json"), bytes).await;
+                let _ = write_json(&cascade_dir.join("acp.json"), bytes).await;
             }
             match store.delete_sessions_by_agent(alias) {
                 Ok(n) => acp_removed = n,
@@ -167,7 +189,7 @@ pub async fn cascade_owned_state(
         "warnings": report.warnings,
     });
     if let Ok(bytes) = serde_json::to_vec_pretty(&manifest) {
-        write_json(&archive_dir.join("manifest.json"), bytes).await;
+        let _ = write_json(&archive_dir.join("manifest.json"), bytes).await;
     }
 
     report

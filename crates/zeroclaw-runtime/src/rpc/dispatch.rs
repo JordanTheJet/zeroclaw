@@ -7239,6 +7239,47 @@ impl RpcDispatcher {
         })
     }
 
+    /// An agent delete also removes the agent's memory, cron jobs, sessions
+    /// and workspace. A config grant alone must not reach that data, so the
+    /// caller needs the same authority the direct methods require: the agent
+    /// itself, plus delete on memory, cron and sessions. Checked against
+    /// grants re-resolved after the config write lock, before any side effect.
+    fn authorize_agent_owned_state_delete(&self, alias: &str) -> Result<(), JsonRpcError> {
+        use zeroclaw_api::grants::{Resource, Verb};
+        let method = Method::ConfigMapKeyDelete;
+        let Some(grants) = self.recheck_authority_after_admission(method)? else {
+            return Err(rpc_err(AUTH_REQUIRED, "First call must be 'initialize'"));
+        };
+        self.selector_session_agent_with_grants(method, &grants, alias)?;
+        let missing: Vec<&str> = [
+            (Resource::Memory, "memory"),
+            (Resource::Cron, "cron"),
+            (Resource::Sessions, "sessions"),
+        ]
+        .into_iter()
+        .filter(|(resource, _)| !grants.permits(*resource, Verb::Delete))
+        .map(|(_, name)| name)
+        .collect();
+        if missing.is_empty() {
+            return Ok(());
+        }
+        let denied = rpc_err(
+            FORBIDDEN,
+            format!(
+                "Deleting agent {alias:?} removes its owned state; principal lacks delete on: {}",
+                missing.join(", ")
+            ),
+        );
+        self.audit_auth_denial(
+            method,
+            &crate::rpc::auth::AuthDenied {
+                code: denied.code,
+                message: denied.message.clone(),
+            },
+        );
+        Err(denied)
+    }
+
     /// Alias delete with the shared reference cascade. The scrub can touch
     /// paths outside `<path>.<key>` (for example `heartbeat.agent`), so each
     /// touched path is authorized before the commit. An agent delete then
@@ -7252,6 +7293,9 @@ impl RpcDispatcher {
     ) -> RpcResult {
         use crate::config_ops::delete;
         let is_agent = matches!(kind, zeroclaw_config::alias_refs::AliasKind::Agent);
+        if is_agent {
+            self.authorize_agent_owned_state_delete(&req.key)?;
+        }
         // The owned-state cascade needs the memory backend. The daemon leaves
         // it unset when it booted with no agents, so open it from config then;
         // if that fails, refuse before mutating rather than orphan the
@@ -26144,12 +26188,26 @@ mod tests {
 
     /// Roster config whose agent `bot` is also named by a disabled heartbeat,
     /// a soft reference outside `agents.bot` that the delete cascade scrubs.
+    /// `owned_state` also grants what an agent delete needs beyond config:
+    /// the agent itself and delete on memory, cron and sessions.
     async fn agent_with_heartbeat_roster_config(
         tmp: &tempfile::TempDir,
         write_paths: &[&str],
         heartbeat_enabled: bool,
+        owned_state: bool,
     ) -> zeroclaw_config::schema::Config {
+        use zeroclaw_api::grants::{Resource, Verb};
         let mut config = config_write_roster_config(tmp, 4242, write_paths);
+        if owned_state {
+            let profile = config
+                .permission_profiles
+                .get_mut("config-writer")
+                .expect("the fixture profile exists");
+            profile.allowed_agents = vec!["bot".into()];
+            for resource in [Resource::Memory, Resource::Cron, Resource::Sessions] {
+                profile.grants.insert(resource, vec![Verb::Delete]);
+            }
+        }
         config.memory.backend = "none".into();
         config
             .create_map_key("agents", "bot")
@@ -26214,7 +26272,7 @@ mod tests {
         run_on_a_large_stack(|| async move {
             let tmp = tempfile::TempDir::new().unwrap();
             let config_path = tmp.path().join("config.toml");
-            let config = agent_with_heartbeat_roster_config(&tmp, &["agents.*"], false).await;
+            let config = agent_with_heartbeat_roster_config(&tmp, &["agents.*"], false, true).await;
             let ctx = enforcement_ctx(config);
             let (alice, _rx) = roster_peer(&ctx, 4242).await;
             let before = std::fs::read_to_string(&config_path).unwrap();
@@ -26236,7 +26294,8 @@ mod tests {
         run_on_a_large_stack(|| async move {
             let tmp = tempfile::TempDir::new().unwrap();
             let config =
-                agent_with_heartbeat_roster_config(&tmp, &["agents.*", "heartbeat.*"], false).await;
+                agent_with_heartbeat_roster_config(&tmp, &["agents.*", "heartbeat.*"], false, true)
+                    .await;
             let workspace = config.agent_workspace_dir("bot");
             std::fs::create_dir_all(&workspace).unwrap();
             std::fs::write(workspace.join("IDENTITY.md"), "bot").unwrap();
@@ -26262,11 +26321,52 @@ mod tests {
     }
 
     #[test]
+    fn config_map_key_delete_agent_needs_owned_state_authority_beyond_config() {
+        run_on_a_large_stack(|| async move {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config_path = tmp.path().join("config.toml");
+            let config = agent_with_heartbeat_roster_config(
+                &tmp,
+                &["agents.*", "heartbeat.*"],
+                false,
+                false,
+            )
+            .await;
+            let workspace = config.agent_workspace_dir("bot");
+            std::fs::create_dir_all(&workspace).unwrap();
+            let ctx = enforcement_ctx(config);
+            let (alice, _rx) = roster_peer(&ctx, 4242).await;
+            let before = std::fs::read_to_string(&config_path).unwrap();
+
+            let err = alice
+                .handle_config_map_key_delete(&json!({"path": "agents", "key": "bot"}))
+                .await
+                .expect_err("a config grant alone must not reach the agent's owned state");
+
+            assert_eq!(err.code, FORBIDDEN, "{err:?}");
+            assert!(ctx.config.read().agents.contains_key("bot"));
+            assert_eq!(ctx.config.read().heartbeat.agent, "bot");
+            assert_eq!(std::fs::read_to_string(&config_path).unwrap(), before);
+            assert!(workspace.exists(), "the workspace must not be archived");
+            assert!(
+                !ctx.config
+                    .read()
+                    .data_dir
+                    .join("agents")
+                    .join("_deleted")
+                    .exists(),
+                "no archive may be created"
+            );
+        });
+    }
+
+    #[test]
     fn config_map_key_delete_agent_refuses_a_hard_reference() {
         run_on_a_large_stack(|| async move {
             let tmp = tempfile::TempDir::new().unwrap();
             let config =
-                agent_with_heartbeat_roster_config(&tmp, &["agents.*", "heartbeat.*"], true).await;
+                agent_with_heartbeat_roster_config(&tmp, &["agents.*", "heartbeat.*"], true, true)
+                    .await;
             let ctx = enforcement_ctx(config);
             let (alice, _rx) = roster_peer(&ctx, 4242).await;
 
