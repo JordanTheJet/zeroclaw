@@ -2337,7 +2337,7 @@
             ]
           },
           "model_provider_types": {
-            "description": "Picker rows for \"Create new model provider\" — sourced from\nthe canonical `zeroclaw_providers::list_model_providers()`\nregistry by [`crate::quickstart::snapshot_state`].",
+            "description": "Picker rows for \"Create new model provider\" — sourced from\nthe canonical `zeroclaw_providers::list_model_providers()`\nregistry by the runtime's `quickstart::snapshot_state`.",
             "items": {
               "$ref": "#/components/schemas/QuickstartTypeOption"
             },
@@ -3752,7 +3752,7 @@
         "type": "object"
       },
       "TurnCompletionOutcome": {
-        "description": "Wire-stable subset of [`crate::rpc::turn::TurnOutcome`] for\n`TurnComplete`. `messages` is intentionally not on the wire — the TUI\nrebuilds from streamed chunks.",
+        "description": "Wire-stable subset of the runtime's `rpc::turn::TurnOutcome` for\n`TurnComplete`. `messages` is intentionally not on the wire — the TUI\nrebuilds from streamed chunks.",
         "enum": [
           "completed",
           "cancelled",
