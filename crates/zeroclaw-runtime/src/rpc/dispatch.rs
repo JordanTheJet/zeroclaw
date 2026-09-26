@@ -8069,6 +8069,23 @@ impl RpcDispatcher {
         Ok((agent_alias, upload_root))
     }
 
+    /// Chunked uploads are served on local connections only. The staging
+    /// budget is shared process-wide, so a remote principal must not be able
+    /// to occupy it, and remote clients already have `file/attach`, which
+    /// carries a whole file in one frame under WSS's larger envelope.
+    fn require_local_upload(&self, method: Method) -> Result<(), JsonRpcError> {
+        if self.transport_kind == crate::rpc::transport::TransportKind::Local {
+            return Ok(());
+        }
+        Err(rpc_err(
+            FORBIDDEN,
+            format!(
+                "`{}` is available on local connections only",
+                method.wire_name()
+            ),
+        ))
+    }
+
     fn upload_staging(&self) -> std::sync::MutexGuard<'_, super::upload::UploadStaging> {
         self.uploads
             .lock()
@@ -8080,6 +8097,7 @@ impl RpcDispatcher {
     async fn handle_file_upload_begin(&self, params: &Value) -> RpcResult {
         use super::upload::{BeginRequest, UPLOAD_CHUNK_BYTES};
 
+        self.require_local_upload(Method::FileUploadBegin)?;
         let req: FileUploadBeginParams = parse_params(params)?;
         let (agent_alias, _) = self
             .upload_destination(Method::FileUploadBegin, &req.session_id)
@@ -8104,6 +8122,7 @@ impl RpcDispatcher {
     fn handle_file_upload_chunk(&self, params: &Value) -> RpcResult {
         use base64::{Engine, engine::general_purpose::STANDARD};
 
+        self.require_local_upload(Method::FileUploadChunk)?;
         let req: FileUploadChunkParams = parse_params(params)?;
         let chunk = STANDARD
             .decode(&req.data_b64)
@@ -8118,6 +8137,7 @@ impl RpcDispatcher {
     }
 
     async fn handle_file_upload_commit(&self, params: &Value) -> RpcResult {
+        self.require_local_upload(Method::FileUploadCommit)?;
         let req: FileUploadCommitParams = parse_params(params)?;
         let (session_id, begun_for) =
             self.upload_staging()
@@ -12832,6 +12852,48 @@ mod tests {
         )
         .await;
         assert_eq!(commit["error"]["code"], json!(INVALID_PARAMS), "{commit}");
+    }
+
+    #[tokio::test]
+    async fn chunked_upload_methods_are_refused_on_remote_connections() {
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().to_path_buf(),
+            config_path: tmp.path().join("config.toml"),
+            ..Default::default()
+        };
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let ctx = RpcContext::minimal(config, sessions);
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let remote = RpcDispatcher::new(ctx, tx, "wss:192.0.2.1:9781".to_string()).with_transport(
+            crate::rpc::transport::TransportKind::Wss,
+            crate::security::auth_provider::Credential::None,
+        );
+
+        // The transport gate runs before any session lookup or staging, so a
+        // remote peer learns nothing about sessions and stages nothing.
+        let begin = remote
+            .handle_file_upload_begin(&json!({"session_id": "s", "size_bytes": 1}))
+            .await
+            .unwrap_err();
+        assert_eq!(begin.code, FORBIDDEN, "{}", begin.message);
+        assert!(
+            begin.message.contains("local connections only"),
+            "{}",
+            begin.message
+        );
+        let chunk = remote
+            .handle_file_upload_chunk(&json!({"upload_id": "u", "offset": 0, "data_b64": "eA=="}))
+            .unwrap_err();
+        assert_eq!(chunk.code, FORBIDDEN, "{}", chunk.message);
+        let commit = remote
+            .handle_file_upload_commit(&json!({"upload_id": "u"}))
+            .await
+            .unwrap_err();
+        assert_eq!(commit.code, FORBIDDEN, "{}", commit.message);
     }
 
     /// `session_cwd_config` with alice also granted `Files:Create`, plus a

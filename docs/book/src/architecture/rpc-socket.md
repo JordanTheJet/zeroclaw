@@ -55,7 +55,7 @@ The local endpoint bounds what one client can hold:
 | Limit | Value | What the client sees |
 |---|---|---|
 | Frame size | 8 MiB per line | One `-32600` error with `id: null` and `data: {"reason": "frame_too_large", "limit_bytes": 8388608}`, then end of stream. The rest of the oversized line is never read, so the connection cannot continue. |
-| Write stall | 30 s per frame | A client that stops reading for 30 s while the daemon has output queued for it is disconnected. Other connections are unaffected. Disconnecting ends the turns that connection started, as any other disconnect does. |
+| Write stall | 30 s per frame | A client that stops reading for 30 s while the daemon has output queued for it is disconnected. Other connections are unaffected. Disconnecting ends the turns that connection started, as any other disconnect does. That includes a suspended client: a zerocode stopped with Ctrl-Z, or frozen with Ctrl-S, while a turn streams has that turn cancelled after 30 s, where before it finished once the client resumed. |
 | Open connections | `rpc.max_local_connections`, default 512 | A connection past the ceiling receives one `-32004` error with `id: null` and `data: {"reason": "connection_limit", "limit": N}`, then end of stream. The daemon logs one warning when it starts refusing. The value is read when the listener starts. |
 
 Payloads larger than a frame travel as a chunked upload rather than in one
@@ -163,11 +163,18 @@ deduplicated per session, with the same marker in the result.
    A declared `sha256` must match. The result is a `file/attach` file entry.
 
 An upload belongs to the connection that began it: no other connection can
-name it, and it is discarded when that connection closes. A connection may
-stage four uploads at a time, an upload idle for five minutes is discarded,
-and the daemon stages at most 256 MiB across all connections. The three
-methods need the `files:create` grant, and `begin` and `commit` each check
-that the principal may use the session's agent, so a grant withdrawn
+name it, and it is discarded when that connection closes. The limits:
+
+- A connection may stage four uploads at a time.
+- The daemon stages at most 256 MiB across all connections.
+- An upload idle for five minutes is discarded. When a new upload does not
+  fit in the budget, the daemon first reclaims every upload idle past that
+  deadline, even one whose connection is still open, so a silent client
+  cannot hold the budget.
+
+The three methods are served on local connections only; a WSS peer gets
+`-32012`. They need the `files:create` grant, and `begin` and `commit` each
+check that the principal may use the session's agent, so a grant withdrawn
 mid-upload stops the commit before anything is written.
 
 ## Ephemeral mode
