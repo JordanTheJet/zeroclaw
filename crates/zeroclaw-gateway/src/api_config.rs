@@ -948,8 +948,8 @@ pub async fn handle_delete_map_key(
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
-    // Acquired before this read-for-modify and held through the swap; an
-    // agent delete releases it before its slow post-commit cascade.
+    // Acquired before this read-for-modify and held through the swap and, for
+    // an agent, through its owned-state cleanup.
     let cfg_guard = Arc::clone(&state.config_write_lock).lock_owned().await;
     let mut working = state.config.read().clone();
     if let Some(kind) = zeroclaw_config::alias_refs::alias_kind_for_map_path(&q.path) {
@@ -979,8 +979,8 @@ pub async fn handle_delete_map_key(
 }
 
 /// Aliased delete through the shared cascade: refuse on hard references (and,
-/// for an agent, on live ACP sessions), scrub soft ones, persist, then release
-/// the lock before an agent's workspace archive and owned-state removal.
+/// for an agent, on live ACP sessions), scrub soft ones and persist. An agent's
+/// workspace archive and owned-state removal run before the lock is released.
 async fn delete_alias_cascade(
     state: &AppState,
     mut working: zeroclaw_config::schema::Config,
@@ -996,7 +996,9 @@ async fn delete_alias_cascade(
     if let Err(e) = persist_and_swap(state, working, &guard).await {
         return error_response(e);
     }
-    drop(guard);
+    // The lock stays held through the owned-state cleanup: released earlier,
+    // a concurrent create could re-add the same alias and have its fresh
+    // workspace and state removed by this delete.
     let mut warnings = Vec::new();
     if let Some(workspace) = prepared.agent_workspace {
         // Config is durably committed: the agent is gone from the persisted
@@ -1018,6 +1020,7 @@ async fn delete_alias_cascade(
             "alias deleted with config-ref cascade"
         );
     }
+    drop(guard);
     let path = if matches!(kind, zeroclaw_config::alias_refs::AliasKind::Agent) {
         "agents"
     } else {
@@ -1831,8 +1834,7 @@ pub async fn handle_migrate(State(state): State<AppState>, headers: HeaderMap) -
     };
     match migrate_config_file(&config_path, data_dir, |_| Ok(())).await {
         Ok(outcome) => {
-            if let Some(new_cfg) = outcome.migrated_config {
-                *state.config.write() = new_cfg;
+            if outcome.needs_reload {
                 state
                     .pending_reload
                     .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -2582,7 +2584,7 @@ mod tests {
         assert_eq!(
             live_schema_version,
             zeroclaw_config::migration::CURRENT_SCHEMA_VERSION,
-            "migration must publish the upgraded schema version live"
+            "the live config stays on the current schema; the rewritten file loads on reload"
         );
         assert_eq!(
             disk_value

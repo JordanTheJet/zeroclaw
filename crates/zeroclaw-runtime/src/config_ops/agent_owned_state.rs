@@ -140,9 +140,19 @@ pub async fn cascade_owned_state(
             if let Ok(bytes) = serde_json::to_vec_pretty(&json) {
                 let _ = write_json(&cascade_dir.join("acp.json"), bytes).await;
             }
-            match store.delete_sessions_by_agent(alias) {
+            // ACP session creation does not take the config write lock, so a
+            // session can start between the delete's live-session check and
+            // here. Only ended sessions are removed; a live one is reported.
+            match store.delete_killed_sessions_by_agent(alias) {
                 Ok(n) => acp_removed = n,
                 Err(e) => warnings.push(format!("acp delete: {e}")),
+            }
+            match store.count_live_sessions_by_agent(alias) {
+                Ok(0) => {}
+                Ok(n) => warnings.push(format!(
+                    "acp: kept {n} live session(s) that started during the delete"
+                )),
+                Err(e) => warnings.push(format!("acp live count: {e}")),
             }
         }
         Err(e) => warnings.push(format!("acp store open: {e}")),

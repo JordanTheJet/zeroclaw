@@ -1363,6 +1363,37 @@ impl RpcDispatcher {
             })
     }
 
+    /// Re-authorize every path a write touched, with grants re-resolved after
+    /// the config write lock was granted. Loops over paths known only after
+    /// the mutation (cascade scrubs, initialized sections, dirtied paths)
+    /// must use this rather than [`Self::selector_config_write`], whose
+    /// grants date from the gate, before the lock wait.
+    fn recheck_config_write_paths<'p>(
+        &self,
+        method: Method,
+        paths: impl IntoIterator<Item = &'p str>,
+        _guard: &ConfigWriteGuard,
+    ) -> Result<(), JsonRpcError> {
+        use crate::rpc::auth::AuthDenied;
+        let Some(grants) = self.recheck_authority_after_admission(method)? else {
+            let denied = AuthDenied::auth_required(crate::i18n::get_required_cli_string(
+                "rpc-auth-first-call-initialize",
+            ));
+            self.audit_auth_denial(method, &denied);
+            return Err(rpc_err(denied.code, denied.message));
+        };
+        for path in paths {
+            if !grants.may_write_config(path) {
+                let denied = AuthDenied::forbidden(format!(
+                    "Principal is not granted config write access to {path:?}"
+                ));
+                self.audit_auth_denial(method, &denied);
+                return Err(rpc_err(denied.code, denied.message));
+            }
+        }
+        Ok(())
+    }
+
     /// Re-establish the caller's authority to write `path` after the config
     /// write lock has been granted: [`Self::recheck_authority_after_admission`]
     /// followed by the concrete path selector.
@@ -6843,9 +6874,11 @@ impl RpcDispatcher {
             crate::config_ops::document::apply_init(&mut working, req.section.as_deref())
                 .map_err(config_api_err)?;
         if !initialized.is_empty() {
-            for section in &initialized {
-                self.selector_config_write(Method::ConfigInit, section)?;
-            }
+            self.recheck_config_write_paths(
+                Method::ConfigInit,
+                initialized.iter().map(String::as_str),
+                &config_write_guard,
+            )?;
             self.save_and_swap_config(working, &config_write_guard)
                 .await?;
         }
@@ -6878,8 +6911,10 @@ impl RpcDispatcher {
             })
             .await
             .map_err(config_api_err)?;
-        if let Some(migrated) = outcome.migrated_config {
-            self.install_saved_config(migrated);
+        if outcome.needs_reload {
+            self.ctx
+                .pending_reload
+                .store(true, std::sync::atomic::Ordering::Relaxed);
         }
         to_result(outcome.response)
     }
@@ -6953,9 +6988,11 @@ impl RpcDispatcher {
             .map_err(config_api_err)?;
         if outcome.needs_persist {
             let dirty: Vec<String> = working.dirty_paths.iter().cloned().collect();
-            for path in &dirty {
-                self.selector_config_write(Method::ConfigSectionSelect, path)?;
-            }
+            self.recheck_config_write_paths(
+                Method::ConfigSectionSelect,
+                dirty.iter().map(String::as_str),
+                &config_write_guard,
+            )?;
             self.save_and_swap_config(working, &config_write_guard)
                 .await?;
         }
@@ -7201,6 +7238,12 @@ impl RpcDispatcher {
                 for path in cascade.dirty_paths() {
                     working.mark_dirty(&path);
                 }
+                // The scrub can reach referrers outside the deleted key.
+                self.recheck_config_write_paths(
+                    Method::ConfigMapKeyDelete,
+                    working.dirty_paths.iter().map(String::as_str),
+                    &config_write_guard,
+                )?;
                 // Scope on the new (post-delete) provider ref is moot — the
                 // alias is gone, so resolve_provider_ref returns None for every
                 // session whose provider ref matched it. Use ModelRoutes as the
@@ -7283,8 +7326,8 @@ impl RpcDispatcher {
     /// Alias delete with the shared reference cascade. The scrub can touch
     /// paths outside `<path>.<key>` (for example `heartbeat.agent`), so each
     /// touched path is authorized before the commit. An agent delete then
-    /// archives the workspace and removes its owned state after the config
-    /// write lock is released.
+    /// archives the workspace and removes its owned state, still under the
+    /// config write lock.
     async fn delete_alias_with_cascade(
         &self,
         req: ConfigMapKeyDeleteParams,
@@ -7324,12 +7367,16 @@ impl RpcDispatcher {
         let mut working = self.ctx.config.read().clone();
         let prepared = delete::prepare_alias_delete(&mut working, &kind, &req.path, &req.key)
             .map_err(config_api_err)?;
-        for path in &prepared.dirty_paths {
-            self.selector_config_write(Method::ConfigMapKeyDelete, path)?;
-        }
+        self.recheck_config_write_paths(
+            Method::ConfigMapKeyDelete,
+            working.dirty_paths.iter().map(String::as_str),
+            &config_write_guard,
+        )?;
         self.save_and_swap_config(working, &config_write_guard)
             .await?;
-        drop(config_write_guard);
+        // The lock stays held through the owned-state cleanup: released
+        // earlier, a concurrent create could re-add the same alias and have
+        // its fresh workspace and state removed by this delete.
         let mut warnings = Vec::new();
         if let (Some(workspace), Some(memory)) = (prepared.agent_workspace, memory) {
             let committed = self.ctx.config.read().clone();
@@ -7342,6 +7389,7 @@ impl RpcDispatcher {
             )
             .await;
         }
+        drop(config_write_guard);
         to_result(ConfigMapKeyDeleteResult {
             path: req.path,
             key: req.key,
@@ -7500,6 +7548,12 @@ impl RpcDispatcher {
                 for path in &report.dirty_paths {
                     working.mark_dirty(path);
                 }
+                // The rename rewrites referrers outside both endpoints.
+                self.recheck_config_write_paths(
+                    Method::ConfigMapKeyRename,
+                    working.dirty_paths.iter().map(String::as_str),
+                    &config_write_guard,
+                )?;
                 if let Some(family) = model_provider_family.as_ref() {
                     Box::pin(self.commit_config_with_live_session_refresh(
                         working.clone(),
@@ -26359,6 +26413,75 @@ mod tests {
                     .exists(),
                 "no archive may be created"
             );
+        });
+    }
+
+    #[test]
+    fn config_map_key_delete_scrub_is_rechecked_with_grants_narrowed_while_queued() {
+        run_on_a_large_stack(|| async move {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config =
+                agent_with_heartbeat_roster_config(&tmp, &["agents.*", "heartbeat.*"], false, true)
+                    .await;
+            let ctx = enforcement_ctx(config);
+            let (alice, _rx) = roster_peer(&ctx, 4242).await;
+
+            let params = json!({"path": "agents", "key": "bot"});
+            let result = rpc_result_after_midwait_policy_change(
+                Arc::clone(&ctx),
+                async move { alice.handle_config_map_key_delete(&params).await },
+                |ctx| {
+                    let mut narrowed = ctx.config.read().clone();
+                    narrowed
+                        .permission_profiles
+                        .get_mut("config-writer")
+                        .expect("the fixture profile exists")
+                        .config_write_paths = vec!["agents.*".into()];
+                    ctx.auth
+                        .refresh_from_config(&narrowed)
+                        .expect("the narrowed policy compiles");
+                },
+            )
+            .await;
+
+            let err = result.expect_err("heartbeat.* was revoked while the delete queued");
+            assert_eq!(err.code, FORBIDDEN, "{err:?}");
+            assert!(err.message.contains("heartbeat.agent"), "{err:?}");
+            assert!(ctx.config.read().agents.contains_key("bot"));
+            assert_eq!(ctx.config.read().heartbeat.agent, "bot");
+        });
+    }
+
+    #[test]
+    fn config_alias_rename_refuses_a_referrer_outside_the_selector() {
+        run_on_a_large_stack(|| async move {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let mut config = config_write_roster_config(&tmp, 4242, &["providers.*"]);
+            config
+                .create_map_key("agents", "bot")
+                .expect("create agents.bot");
+            config
+                .agents
+                .get_mut("bot")
+                .expect("agents.bot exists")
+                .model_provider = "openai.default".into();
+            let ctx = enforcement_ctx(config);
+            let (alice, _rx) = roster_peer(&ctx, 4242).await;
+
+            let err = alice
+                .handle_config_map_key_rename(&json!({
+                    "path": "providers.models.openai",
+                    "from": "default",
+                    "to": "renamed"
+                }))
+                .await
+                .expect_err("the rename rewrites agents.bot, outside the selector");
+
+            assert_eq!(err.code, FORBIDDEN, "{err:?}");
+            assert!(err.message.contains("agents.bot"), "{err:?}");
+            let live = ctx.config.read().clone();
+            assert_eq!(live.agents["bot"].model_provider.as_str(), "openai.default");
+            assert!(live.providers.models.openai.contains_key("default"));
         });
     }
 

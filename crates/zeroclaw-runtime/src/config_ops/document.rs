@@ -92,9 +92,11 @@ pub fn apply_init(
 /// Result of [`migrate_config_file`].
 pub struct MigrateOutcome {
     pub response: MigrateResponse,
-    /// The migrated config, already durable on disk, for the caller to
-    /// install as live and flag for reload. `None` when already current.
-    pub migrated_config: Option<Config>,
+    /// Set when the file was rewritten. The caller flags a daemon reload and
+    /// does not install the parsed file as live: that parse skips secret
+    /// decryption and env overrides, which only the normal loader applies,
+    /// and the live config was already migrated in memory when it loaded.
+    pub needs_reload: bool,
 }
 
 /// Migrate the on-disk config at `config_path` to the current schema:
@@ -239,7 +241,7 @@ pub async fn migrate_config_file(
                     backup_path: Some(backup_path.display().to_string()),
                     schema_version: zeroclaw_config::migration::CURRENT_SCHEMA_VERSION,
                 },
-                migrated_config: Some(new_cfg),
+                needs_reload: true,
             })
         }
         None => Ok(MigrateOutcome {
@@ -248,7 +250,7 @@ pub async fn migrate_config_file(
                 backup_path: None,
                 schema_version: zeroclaw_config::migration::CURRENT_SCHEMA_VERSION,
             },
-            migrated_config: None,
+            needs_reload: false,
         }),
     }
 }
