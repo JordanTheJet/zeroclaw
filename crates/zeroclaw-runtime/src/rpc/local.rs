@@ -1124,6 +1124,19 @@ mod tests {
         panic!("socket never appeared at {}", path.display());
     }
 
+    /// Whether a read result means the daemon closed the connection. Linux
+    /// resets a Unix socket that closes with unread data in its receive
+    /// buffer, so the peer sees `ConnectionReset` where macOS reports end of
+    /// stream; both mean the same thing here.
+    #[cfg(unix)]
+    fn is_closed_by_peer(read: &std::io::Result<usize>) -> bool {
+        match read {
+            Ok(0) => true,
+            Ok(_) => false,
+            Err(error) => error.kind() == std::io::ErrorKind::ConnectionReset,
+        }
+    }
+
     /// Wait for the server-side client count to reach `expected`, or fail with
     /// the value actually observed.
     ///
@@ -2672,9 +2685,11 @@ mod tests {
         let mut rest = String::new();
         let read = tokio::time::timeout(Duration::from_secs(10), reader.read_line(&mut rest))
             .await
-            .expect("the connection closes after the error")
-            .expect("read end of stream");
-        assert_eq!(read, 0, "end of stream follows the error: {rest}");
+            .expect("the connection closes after the error");
+        assert!(
+            is_closed_by_peer(&read),
+            "the connection closes after the error: {read:?} {rest}"
+        );
 
         oversized_frame.abort();
         cancel.cancel();
@@ -2736,13 +2751,18 @@ mod tests {
         // one stays open.
         wait_for_client_count(&count, 1).await;
         let mut drained = Vec::new();
-        tokio::time::timeout(
+        let read = tokio::time::timeout(
             Duration::from_secs(10),
             stalled_reader.read_to_end(&mut drained),
         )
         .await
-        .expect("the stalled client reaches end of stream")
-        .expect("drain the stalled client");
+        .expect("the stalled client reaches end of stream");
+        // `read_to_end` reports the byte count it drained, so only an error
+        // other than a reset means the connection was not closed.
+        assert!(
+            read.is_ok() || is_closed_by_peer(&read),
+            "the stalled client's connection is closed: {read:?}"
+        );
         writer
             .write_all(rpc_request(Method::Status, &serde_json::json!({}), 3).as_bytes())
             .await
