@@ -2301,7 +2301,8 @@ impl Agent {
         .await
     }
 
-    /// [`Agent::from_live_config_with_tui_env_and_acp_sessions`] with the
+    /// The ACP-session RPC constructor
+    /// (`Agent::from_live_config_with_tui_env_and_acp_sessions`) with the
     /// agent's capabilities supplied, resolving for `principal`.
     #[allow(clippy::too_many_arguments)]
     pub async fn from_live_config_with_tui_env_and_acp_sessions_and_capabilities(
