@@ -12,7 +12,7 @@ use axum::{
     body::to_bytes,
     extract::{Path, Query, State},
     http::HeaderMap,
-    response::Response,
+    response::{IntoResponse, Response},
 };
 use serde_json::Value;
 use zeroclaw_api::jsonrpc::{
@@ -332,4 +332,126 @@ async fn an_escaping_agent_alias_is_refused_alike_on_both_surfaces() {
     .unwrap_err();
     assert_eq!(err.code, zeroclaw_api::jsonrpc::error_codes::INVALID_PARAMS);
     assert_eq!(rpc_error_body(&err), http);
+}
+
+// ── Catalogs: integrations, CLI tools, plugins, A2A identity ─────────────
+
+#[tokio::test]
+async fn integrations_list_matches_the_integrations_route() {
+    let config = Config::default();
+    let state = test_state(config.clone());
+    let (status, http) = body_json(
+        crate::api::handle_api_integrations(State(state), HeaderMap::new())
+            .await
+            .into_response(),
+    )
+    .await;
+    assert_eq!(status, 200, "{http}");
+    assert_eq!(
+        zeroclaw_runtime::rpc::catalog::integrations_body(&config),
+        http
+    );
+}
+
+#[tokio::test]
+async fn cli_discover_matches_the_cli_tools_route() {
+    let state = test_state(Config::default());
+    let (status, http) = body_json(
+        crate::api::handle_api_cli_tools(State(state), HeaderMap::new())
+            .await
+            .into_response(),
+    )
+    .await;
+    assert_eq!(status, 200, "{http}");
+    // Both scan the same PATH in the same process, so the lists match.
+    assert_eq!(zeroclaw_runtime::rpc::catalog::cli_tools_body().await, http);
+}
+
+#[cfg(feature = "plugins-wasm")]
+#[tokio::test]
+async fn plugins_list_matches_the_plugins_route() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = Config::default();
+    config.plugins.enabled = true;
+    config.plugins.plugins_dir = dir.path().join("plugins").to_string_lossy().to_string();
+    std::fs::create_dir_all(dir.path().join("plugins")).unwrap();
+    let state = test_state(config.clone());
+    let (status, http) = body_json(
+        crate::api_plugins::plugin_routes::list_plugins(State(state), HeaderMap::new())
+            .await
+            .into_response(),
+    )
+    .await;
+    assert_eq!(status, 200, "{http}");
+    assert_eq!(zeroclaw_runtime::rpc::catalog::plugins_body(&config), http);
+}
+
+fn a2a_config(published: bool) -> Config {
+    let mut config = Config::default();
+    config.a2a.server.enabled = true;
+    let mut agent = zeroclaw_config::schema::AliasedAgentConfig {
+        enabled: true,
+        ..Default::default()
+    };
+    agent.a2a.published = published;
+    config.agents.insert(AGENT.into(), agent);
+    config
+}
+
+async fn get_route(state: crate::AppState, uri: &str) -> (u16, Option<Value>) {
+    use tower::ServiceExt;
+    let response = crate::a2a::a2a_routes()
+        .with_state(state)
+        .oneshot(
+            axum::http::Request::get(uri)
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status().as_u16();
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    (status, serde_json::from_slice(&bytes).ok())
+}
+
+#[tokio::test]
+async fn a2a_identity_matches_the_well_known_card_routes() {
+    let config = a2a_config(true);
+    let state = test_state(config.clone());
+
+    let (status, http) =
+        get_route(state.clone(), zeroclaw_runtime::a2a_card::CATALOG_CARD_PATH).await;
+    assert_eq!(status, 200);
+    let rpc = zeroclaw_runtime::rpc::catalog::a2a_identity(&config, None).unwrap();
+    assert_eq!(Some(rpc), http, "catalog card");
+
+    let (status, http) =
+        get_route(state, &format!("/a2a/{AGENT}/.well-known/agent-card.json")).await;
+    assert_eq!(status, 200);
+    let rpc = zeroclaw_runtime::rpc::catalog::a2a_identity(&config, Some(AGENT)).unwrap();
+    assert_eq!(Some(rpc), http, "per-alias card");
+}
+
+#[tokio::test]
+async fn a2a_identity_refuses_where_the_routes_return_not_found() {
+    // An unpublished agent: 404 over HTTP, an error over RPC.
+    let config = a2a_config(false);
+    let (status, _) = get_route(
+        test_state(config.clone()),
+        &format!("/a2a/{AGENT}/.well-known/agent-card.json"),
+    )
+    .await;
+    assert_eq!(status, 404);
+    assert!(zeroclaw_runtime::rpc::catalog::a2a_identity(&config, Some(AGENT)).is_err());
+
+    // The A2A server disabled: every card route 404s, every RPC call errors.
+    let mut disabled = a2a_config(true);
+    disabled.a2a.server.enabled = false;
+    let (status, _) = get_route(
+        test_state(disabled.clone()),
+        zeroclaw_runtime::a2a_card::CATALOG_CARD_PATH,
+    )
+    .await;
+    assert_eq!(status, 404);
+    assert!(zeroclaw_runtime::rpc::catalog::a2a_identity(&disabled, None).is_err());
 }

@@ -211,6 +211,10 @@ pub enum Method {
     SopsGraphDraft,
     SopsTriggerSources,
     ToolsParamOptions,
+    ToolsCliDiscover,
+    IntegrationsList,
+    PluginsList,
+    A2aIdentity,
 }
 
 impl Method {
@@ -329,6 +333,10 @@ impl Method {
         (Method::SopsGraphDraft, "sops/graph-draft"),
         (Method::SopsTriggerSources, "sops/trigger-sources"),
         (Method::ToolsParamOptions, "tools/param-options"),
+        (Method::ToolsCliDiscover, "tools/cli-discover"),
+        (Method::IntegrationsList, "integrations/list"),
+        (Method::PluginsList, "plugins/list"),
+        (Method::A2aIdentity, "a2a/identity"),
     ];
 
     /// Resolve a wire method name to a variant. Table scan, no hand-written
@@ -456,7 +464,11 @@ impl Method {
                 (Resource::Sops, Verb::Execute)
             }
 
-            M::ToolsParamOptions => (Resource::Tools, Verb::Read),
+            M::ToolsParamOptions | M::ToolsCliDiscover | M::IntegrationsList => {
+                (Resource::Tools, Verb::Read)
+            }
+            M::PluginsList => (Resource::Plugins, Verb::Read),
+            M::A2aIdentity => (Resource::System, Verb::Read),
         };
         MethodAuthz::Requires(resource, verb)
     }
@@ -1648,6 +1660,44 @@ impl RpcDispatcher {
         }
     }
 
+    /// `integrations/list`, `tools/cli-discover`, `plugins/list` and
+    /// `a2a/identity`: the bodies the matching HTTP routes serve. See
+    /// [`super::catalog`].
+    async fn handle_catalog_method(&self, method: Method, params: &Value) -> RpcResult {
+        match method {
+            Method::IntegrationsList => {
+                let config = self.ctx.config.read().clone();
+                Ok(super::catalog::integrations_body(&config))
+            }
+            Method::ToolsCliDiscover => Ok(super::catalog::cli_tools_body().await),
+            Method::PluginsList => {
+                let config = self.ctx.config.read().clone();
+                Ok(super::catalog::plugins_body(&config))
+            }
+            Method::A2aIdentity => {
+                let req: zeroclaw_api::jsonrpc::A2aIdentityRequest = parse_params(params)?;
+                // The catalog card lists only A2A-published agents and is what
+                // the gateway serves unauthenticated, so only a named agent is
+                // held to the agent selector.
+                if let Some(agent) = req.agent.as_deref() {
+                    self.authorize_agent_selector(method, agent)?;
+                }
+                let config = self.ctx.config.read().clone();
+                super::catalog::a2a_identity(&config, req.agent.as_deref())
+            }
+            _ => Err(rpc_err(
+                INTERNAL_ERROR,
+                format!("{} is not a catalog method", method.wire_name()),
+            )),
+        }
+    }
+
+    /// Refuse `method` unless the bound principal may use agent `alias`. An
+    /// unbound dispatcher is refused.
+    fn authorize_agent_selector(&self, method: Method, alias: &str) -> Result<(), JsonRpcError> {
+        self.authorize_workspace_scope(method, Some(alias))
+    }
+
     /// Hold a `workspace/list` or `fs/*` operation to the principal's agent
     /// selector, before anything touches the filesystem, so a refusal does
     /// not reveal whether a path exists. With `agent`, the principal must be
@@ -2766,6 +2816,10 @@ impl RpcDispatcher {
             Method::SopsGraphDraft => self.handle_sops_graph_draft(&req.params),
             Method::SopsTriggerSources => self.handle_sops_trigger_sources(),
             Method::ToolsParamOptions => self.handle_tools_param_options(&req.params),
+            Method::ToolsCliDiscover
+            | Method::IntegrationsList
+            | Method::PluginsList
+            | Method::A2aIdentity => self.handle_catalog_method(method, &req.params).await,
         };
 
         if is_notification {

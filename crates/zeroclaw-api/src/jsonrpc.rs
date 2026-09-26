@@ -552,6 +552,15 @@ pub struct SopRenameRequest {
     pub to: String,
 }
 
+/// Request payload for `a2a/identity`. With `agent`, the per-alias A2A agent
+/// card; without it, the discovery catalog card listing every published
+/// agent.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct A2aIdentityRequest {
+    #[serde(default)]
+    pub agent: Option<String>,
+}
+
 /// Request payload for `workspace/list`: one directory level.
 ///
 /// With `agent`, `path` is relative to that agent's workspace; without it,

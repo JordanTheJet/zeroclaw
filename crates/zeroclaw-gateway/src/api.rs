@@ -14,20 +14,8 @@ use zeroclaw_memory::MemoryEntry;
 
 const MEMORY_API_CONTENT_MAX_CHARS: usize = 4096;
 
-fn integration_entry_json(
-    entry: &zeroclaw_runtime::integrations::IntegrationEntry,
-) -> serde_json::Value {
-    serde_json::json!({
-        "name": &entry.name,
-        "description": &entry.description,
-        "category": entry.category,
-        "category_label": entry.category.label(),
-        "status": entry.status,
-        // Canonical config map key (provider family key / ChannelsConfig map
-        // key) for deep links; null when the entry has no config section.
-        "key": &entry.key,
-    })
-}
+#[cfg(test)]
+use zeroclaw_runtime::rpc::catalog::integration_entry_json;
 
 // ── Bearer token auth extractor ─────────────────────────────────
 
@@ -914,11 +902,7 @@ pub async fn handle_api_integrations(
     }
 
     let config = state.config.read().clone();
-    let entries = zeroclaw_runtime::integrations::registry::all_integrations(&config);
-
-    let integrations: Vec<serde_json::Value> = entries.iter().map(integration_entry_json).collect();
-
-    Json(serde_json::json!({"integrations": integrations})).into_response()
+    Json(zeroclaw_runtime::rpc::catalog::integrations_body(&config)).into_response()
 }
 
 /// GET /api/integrations/settings — return per-integration settings (enabled + category)
@@ -1247,29 +1231,7 @@ pub async fn handle_api_cli_tools(
         return e.into_response();
     }
 
-    // `discover_cli_tools` spawns child processes and blocks; keep it off the
-    // async executor so a slow PATH scan can't stall other gateway requests.
-    let tools = match tokio::task::spawn_blocking(|| {
-        zeroclaw_tools::cli_discovery::discover_cli_tools(&[], &[])
-    })
-    .await
-    {
-        Ok(tools) => tools,
-        Err(e) => {
-            // The blocking task panicked; degrade to an empty list rather
-            // than failing the request, but record why it was empty.
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                "cli-tools discovery task failed; returning empty list"
-            );
-            Vec::new()
-        }
-    };
-
-    Json(serde_json::json!({"cli_tools": tools})).into_response()
+    Json(zeroclaw_runtime::rpc::catalog::cli_tools_body().await).into_response()
 }
 
 /// GET /api/channels — list configured channels with status
