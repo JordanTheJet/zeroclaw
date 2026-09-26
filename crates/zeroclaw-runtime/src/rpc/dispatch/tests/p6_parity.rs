@@ -658,3 +658,36 @@ async fn tools_list_holds_the_agent_to_the_selector() {
     .await;
     assert_forbidden(&other, "another agent's tools");
 }
+
+// ── Metrics ───────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn metrics_scrape_reports_the_hint_without_the_prometheus_backend() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let ctx = enforcement_ctx(make_acp_test_config(&tmp));
+    let (mut operator, mut rx) = local_operator(&ctx).await;
+    let scraped = rpc(&mut operator, &mut rx, 1, "metrics/scrape", json!({})).await;
+    assert_eq!(
+        scraped["result"]["text"],
+        json!(crate::observability::PROMETHEUS_DISABLED_HINT),
+        "{scraped}"
+    );
+    assert_eq!(
+        scraped["result"]["content_type"],
+        json!(crate::observability::PROMETHEUS_CONTENT_TYPE)
+    );
+}
+
+#[test]
+fn metrics_scrape_is_classified_and_named() {
+    use zeroclaw_api::grants::{Resource, Verb};
+    assert_eq!(Method::MetricsScrape.wire_name(), "metrics/scrape");
+    assert_eq!(
+        Method::from_wire("metrics/scrape"),
+        Some(Method::MetricsScrape)
+    );
+    assert_eq!(
+        Method::MetricsScrape.authz(),
+        MethodAuthz::Requires(Resource::System, Verb::Read)
+    );
+}

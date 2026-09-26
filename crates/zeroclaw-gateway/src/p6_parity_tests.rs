@@ -618,3 +618,53 @@ async fn tools_list_body_matches_the_tools_route() {
     assert_eq!(status, 200, "{http}");
     assert_eq!(zeroclaw_runtime::rpc::catalog::tools_body(&specs), http);
 }
+
+// ── Metrics ──────────────────────────────────────────────────────────────
+
+async fn metrics_route_text(state: crate::AppState) -> String {
+    use tower::ServiceExt;
+    let response = axum::Router::new()
+        .route("/metrics", axum::routing::get(crate::handle_metrics))
+        .with_state(state)
+        .oneshot(
+            axum::http::Request::get("/metrics")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    String::from_utf8(bytes.to_vec()).unwrap()
+}
+
+/// The gateway is set up the way production builds it: its observer comes
+/// from `create_observer`, which hands out the process's shared Prometheus
+/// registry, so the route and the RPC method scrape the same registry.
+#[cfg(feature = "observability-prometheus")]
+#[tokio::test]
+async fn metrics_scrape_equals_the_metrics_route_with_prometheus() {
+    let mut config = Config::default();
+    config.observability.backend = zeroclaw_config::schema::ObservabilityBackend::Prometheus;
+    let mut state = test_state(config.clone());
+    state.observer = std::sync::Arc::from(zeroclaw_runtime::observability::create_observer(
+        &config.observability,
+    ));
+    state
+        .observer
+        .record_event(&zeroclaw_runtime::observability::ObserverEvent::HeartbeatTick);
+    let http = metrics_route_text(state).await;
+    let rpc = zeroclaw_runtime::observability::prometheus_exposition(&config.observability);
+    assert_eq!(rpc, http);
+    assert!(http.contains("heartbeat"), "{http}");
+}
+
+#[tokio::test]
+async fn metrics_scrape_equals_the_metrics_route_without_prometheus() {
+    let config = Config::default();
+    let state = test_state(config.clone());
+    let http = metrics_route_text(state).await;
+    assert_eq!(
+        zeroclaw_runtime::observability::prometheus_exposition(&config.observability),
+        http
+    );
+}

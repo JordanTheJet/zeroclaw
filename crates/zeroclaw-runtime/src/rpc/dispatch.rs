@@ -221,6 +221,7 @@ pub enum Method {
     CanvasHistory,
     CanvasRender,
     CanvasClear,
+    MetricsScrape,
 }
 
 impl Method {
@@ -349,6 +350,7 @@ impl Method {
         (Method::CanvasHistory, "canvas/history"),
         (Method::CanvasRender, "canvas/render"),
         (Method::CanvasClear, "canvas/clear"),
+        (Method::MetricsScrape, "metrics/scrape"),
     ];
 
     /// Resolve a wire method name to a variant. Table scan, no hand-written
@@ -480,7 +482,7 @@ impl Method {
                 (Resource::Tools, Verb::Read)
             }
             M::PluginsList => (Resource::Plugins, Verb::Read),
-            M::A2aIdentity => (Resource::System, Verb::Read),
+            M::A2aIdentity | M::MetricsScrape => (Resource::System, Verb::Read),
             M::CanvasList | M::CanvasGet | M::CanvasHistory => (Resource::Canvas, Verb::Read),
             M::CanvasRender => (Resource::Canvas, Verb::Update),
             M::CanvasClear => (Resource::Canvas, Verb::Delete),
@@ -2939,6 +2941,13 @@ impl RpcDispatcher {
             | Method::PluginsList
             | Method::A2aIdentity => self.handle_catalog_method(method, &req.params).await,
             Method::ToolsList => Box::pin(self.handle_tools_list(&req.params)).await,
+            Method::MetricsScrape => {
+                let observability = self.ctx.config.read().observability.clone();
+                Ok(serde_json::json!({
+                    "content_type": crate::observability::PROMETHEUS_CONTENT_TYPE,
+                    "text": crate::observability::prometheus_exposition(&observability),
+                }))
+            }
             Method::CanvasList
             | Method::CanvasGet
             | Method::CanvasHistory

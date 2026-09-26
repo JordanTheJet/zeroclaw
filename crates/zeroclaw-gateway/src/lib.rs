@@ -2496,9 +2496,7 @@ async fn handle_health(State(state): State<AppState>) -> impl IntoResponse {
 const PROMETHEUS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
 
 fn prometheus_disabled_hint() -> String {
-    String::from(
-        "# Prometheus backend not enabled. Set [observability] backend = \"prometheus\" in config.\n",
-    )
+    zeroclaw_runtime::observability::PROMETHEUS_DISABLED_HINT.to_string()
 }
 
 #[cfg(feature = "observability-prometheus")]
