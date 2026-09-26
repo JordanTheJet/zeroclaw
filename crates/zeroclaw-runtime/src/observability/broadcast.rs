@@ -804,15 +804,20 @@ mod tests {
 
         factory_observer().record_event(&sentinel_tool_call("SENTINEL-ONCE"));
 
-        let first = rx
-            .try_recv()
-            .expect("the observer event must reach the bus");
-        assert_eq!(first["tool"], "SENTINEL-ONCE");
-        assert!(
-            rx.try_recv().is_err(),
+        // Tests running in parallel can record into the same process-wide
+        // hook, so count only this test's sentinel.
+        let delivered = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter(|frame| frame["tool"] == "SENTINEL-ONCE")
+            .count();
+        assert_eq!(
+            delivered, 1,
             "the event must be delivered once, not once per installer"
         );
-        assert_eq!(history_events(daemon_bus.history()).len(), 1);
+        let buffered = history_events(daemon_bus.history())
+            .into_iter()
+            .filter(|frame| frame["tool"] == "SENTINEL-ONCE")
+            .count();
+        assert_eq!(buffered, 1);
 
         crate::observability::clear_broadcast_hook();
     }
@@ -829,15 +834,19 @@ mod tests {
         let mut rx = bus.sender().subscribe();
 
         factory_observer().record_event(&sentinel_tool_call("SENTINEL-STANDALONE"));
-        assert_eq!(
-            rx.try_recv().expect("the standalone hook delivers")["tool"],
-            "SENTINEL-STANDALONE"
+        // Parallel tests can share the process-wide hook; look for this
+        // test's sentinel rather than asserting on the next frame.
+        assert!(
+            std::iter::from_fn(|| rx.try_recv().ok())
+                .any(|frame| frame["tool"] == "SENTINEL-STANDALONE"),
+            "the standalone hook delivers"
         );
 
         drop(hook);
         factory_observer().record_event(&sentinel_tool_call("SENTINEL-AFTER-DROP"));
         assert!(
-            rx.try_recv().is_err(),
+            !std::iter::from_fn(|| rx.try_recv().ok())
+                .any(|frame| frame["tool"] == "SENTINEL-AFTER-DROP"),
             "dropping the guard must uninstall the hook"
         );
 
