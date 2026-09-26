@@ -212,6 +212,7 @@ pub enum Method {
     SopsTriggerSources,
     ToolsParamOptions,
     ToolsCliDiscover,
+    ToolsList,
     IntegrationsList,
     PluginsList,
     A2aIdentity,
@@ -339,6 +340,7 @@ impl Method {
         (Method::SopsTriggerSources, "sops/trigger-sources"),
         (Method::ToolsParamOptions, "tools/param-options"),
         (Method::ToolsCliDiscover, "tools/cli-discover"),
+        (Method::ToolsList, "tools/list"),
         (Method::IntegrationsList, "integrations/list"),
         (Method::PluginsList, "plugins/list"),
         (Method::A2aIdentity, "a2a/identity"),
@@ -474,7 +476,7 @@ impl Method {
                 (Resource::Sops, Verb::Execute)
             }
 
-            M::ToolsParamOptions | M::ToolsCliDiscover | M::IntegrationsList => {
+            M::ToolsParamOptions | M::ToolsCliDiscover | M::ToolsList | M::IntegrationsList => {
                 (Resource::Tools, Verb::Read)
             }
             M::PluginsList => (Resource::Plugins, Verb::Read),
@@ -1705,6 +1707,74 @@ impl RpcDispatcher {
         }
     }
 
+    /// `tools/list`: the tools an agent would see, assembled on request from
+    /// live config rather than from a registry built once at startup.
+    ///
+    /// A named agent is held to the agent selector, and so is the default
+    /// agent a request without one describes. An alias that does not resolve
+    /// is refused; the dashboard route instead falls back to the default
+    /// agent's tools, which would show a principal an agent it may not use.
+    ///
+    /// Assembly is the same deep build a turn does, so it runs on a blocking
+    /// worker, as agent construction does, and the caller's stack pays only
+    /// for dispatch.
+    async fn handle_tools_list(&self, params: &Value) -> RpcResult {
+        let req: zeroclaw_api::jsonrpc::ToolsListRequest = parse_params(params)?;
+        let config = self.ctx.config.read().clone();
+        let alias = match req.agent {
+            Some(agent) => agent,
+            None => match crate::tools::listing::default_listing_alias(&config) {
+                Some(alias) => alias,
+                None => return Ok(super::catalog::tools_body(&[])),
+            },
+        };
+        self.authorize_agent_selector(Method::ToolsList, &alias)?;
+        // The dashboard builds listings for enabled agents only.
+        if !config.agents.get(&alias).is_some_and(|agent| agent.enabled) {
+            return Err(rpc_err(
+                INVALID_PARAMS,
+                format!("agent {alias:?} does not resolve to a configured agent"),
+            ));
+        }
+        let runtime: Arc<dyn crate::platform::RuntimeAdapter> =
+            match crate::platform::create_runtime(&config.runtime) {
+                Ok(runtime) => Arc::from(runtime),
+                Err(_) => Arc::new(crate::platform::NativeRuntime::new()),
+            };
+        let memory: Arc<dyn zeroclaw_memory::Memory> = match self.ctx.memory.as_ref() {
+            Some(memory) => Arc::clone(memory),
+            None => Arc::new(zeroclaw_memory::NoneMemory::new("none")),
+        };
+        let deps = crate::tools::listing::ToolListingDeps {
+            runtime,
+            memory,
+            canvas_store: self.ctx.canvas_store.clone(),
+            sop_engine: self.ctx.sop_engine.clone(),
+            sop_audit: self.ctx.sop_audit.clone(),
+        };
+        let handle = tokio::runtime::Handle::current();
+        let listed = tokio::task::spawn_blocking(move || {
+            handle
+                .block_on(crate::tools::listing::agent_tool_specs(
+                    &config, &alias, &deps,
+                ))
+                .map(|specs| (alias, specs))
+        })
+        .await
+        .map_err(|join| rpc_err(INTERNAL_ERROR, format!("tool listing task failed: {join}")))?;
+        match listed {
+            Ok((_, Some(specs))) => Ok(super::catalog::tools_body(&specs)),
+            Ok((alias, None)) => Err(rpc_err(
+                INVALID_PARAMS,
+                format!("agent {alias:?} does not resolve to a configured agent"),
+            )),
+            Err(e) => Err(rpc_err(
+                INTERNAL_ERROR,
+                format!("failed to assemble the tool listing: {e}"),
+            )),
+        }
+    }
+
     /// `canvas/*`: the daemon's one canvas store, with the bodies and failures
     /// the `/api/canvas` routes use. See [`super::canvas`].
     fn handle_canvas_method(&self, method: Method, params: &Value) -> RpcResult {
@@ -2868,6 +2938,7 @@ impl RpcDispatcher {
             | Method::IntegrationsList
             | Method::PluginsList
             | Method::A2aIdentity => self.handle_catalog_method(method, &req.params).await,
+            Method::ToolsList => Box::pin(self.handle_tools_list(&req.params)).await,
             Method::CanvasList
             | Method::CanvasGet
             | Method::CanvasHistory

@@ -574,3 +574,47 @@ async fn canvas_methods_match_the_canvas_routes() {
     );
     assert_eq!(rpc_canvas::clear_body(&store, "board"), http, "clear");
 }
+
+// ── Tool listing ─────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn tools_list_body_matches_the_tools_route() {
+    let mut config = Config::default();
+    config.agents.insert(
+        AGENT.into(),
+        zeroclaw_config::schema::AliasedAgentConfig {
+            enabled: true,
+            ..Default::default()
+        },
+    );
+    let mut state = test_state(config.clone());
+    let deps = zeroclaw_runtime::tools::listing::ToolListingDeps {
+        runtime: std::sync::Arc::new(zeroclaw_runtime::platform::NativeRuntime::new()),
+        memory: std::sync::Arc::new(zeroclaw_memory::NoneMemory::new("none")),
+        canvas_store: state.canvas_store.clone(),
+        sop_engine: None,
+        sop_audit: None,
+    };
+    let specs = zeroclaw_runtime::tools::listing::agent_tool_specs(&config, AGENT, &deps)
+        .await
+        .unwrap()
+        .unwrap_or_default();
+    state.tools_registry_by_agent = std::sync::Arc::new(std::collections::HashMap::from([(
+        AGENT.to_string(),
+        std::sync::Arc::new(specs.clone()),
+    )]));
+    let (status, http) = body_json(
+        crate::api::handle_api_tools(
+            State(state),
+            HeaderMap::new(),
+            Query(crate::api::ToolsQuery {
+                agent: Some(AGENT.into()),
+            }),
+        )
+        .await
+        .into_response(),
+    )
+    .await;
+    assert_eq!(status, 200, "{http}");
+    assert_eq!(zeroclaw_runtime::rpc::catalog::tools_body(&specs), http);
+}

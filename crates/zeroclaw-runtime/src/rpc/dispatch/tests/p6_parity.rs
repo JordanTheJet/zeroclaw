@@ -582,3 +582,79 @@ fn canvas_methods_are_classified_and_named() {
         );
     }
 }
+
+// ── Tool listing ──────────────────────────────────────────────────────────
+
+#[test]
+fn tools_list_is_classified_and_named() {
+    use zeroclaw_api::grants::{Resource, Verb};
+    assert_eq!(Method::ToolsList.wire_name(), "tools/list");
+    assert_eq!(Method::from_wire("tools/list"), Some(Method::ToolsList));
+    assert_eq!(
+        Method::ToolsList.authz(),
+        MethodAuthz::Requires(Resource::Tools, Verb::Read)
+    );
+}
+
+#[tokio::test]
+async fn tools_list_assembles_the_agents_tools_on_request() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let ctx = enforcement_ctx(make_acp_test_config(&tmp));
+    let (mut operator, mut rx) = local_operator(&ctx).await;
+
+    for (id, params) in [(1, json!({"agent": "test-agent"})), (2, json!({}))] {
+        let listed = rpc(&mut operator, &mut rx, id, "tools/list", params).await;
+        let names: Vec<&str> = listed["result"]["tools"]
+            .as_array()
+            .unwrap_or_else(|| panic!("tools array: {listed}"))
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect();
+        for expected in ["canvas", "calculator"] {
+            assert!(names.contains(&expected), "{expected} in {names:?}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn tools_list_refuses_an_agent_that_does_not_resolve() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let mut config = make_acp_test_config(&tmp);
+    let mut disabled = config.agents["test-agent"].clone();
+    disabled.enabled = false;
+    config.agents.insert("dormant".into(), disabled);
+    let ctx = enforcement_ctx(config);
+    let (mut operator, mut rx) = local_operator(&ctx).await;
+    for (id, agent) in [(1, "nobody"), (2, "dormant")] {
+        let response = rpc(
+            &mut operator,
+            &mut rx,
+            id,
+            "tools/list",
+            json!({"agent": agent}),
+        )
+        .await;
+        assert_eq!(
+            response["error"]["code"],
+            json!(INVALID_PARAMS),
+            "{agent}: {response}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn tools_list_holds_the_agent_to_the_selector() {
+    // `catalog-alpha` holds tools:read for agent alpha only.
+    let tmp = tempfile::TempDir::new().unwrap();
+    let ctx = enforcement_ctx(catalog_config(&tmp));
+    let (mut peer, mut rx) = roster_peer(&ctx, SCOPED).await;
+    let other = rpc(
+        &mut peer,
+        &mut rx,
+        1,
+        "tools/list",
+        json!({"agent": "beta"}),
+    )
+    .await;
+    assert_forbidden(&other, "another agent's tools");
+}

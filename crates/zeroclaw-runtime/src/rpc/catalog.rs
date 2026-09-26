@@ -36,6 +36,31 @@ pub fn integrations_body(config: &Config) -> Value {
     serde_json::json!({ "integrations": integrations })
 }
 
+/// One tool spec as the dashboard lists it: name, description and parameter
+/// schema, plus its output schema and parameter domains when it has them.
+#[must_use]
+pub fn tool_spec_json(spec: &zeroclaw_api::tool::ToolSpec) -> Value {
+    let mut tool = serde_json::json!({
+        "name": spec.name,
+        "description": spec.description,
+        "parameters": spec.parameters,
+    });
+    if let Some(output) = &spec.output {
+        tool["output"] = output.clone();
+    }
+    if !spec.param_domains.is_empty() {
+        tool["param_domains"] = serde_json::json!(spec.param_domains);
+    }
+    tool
+}
+
+/// The `tools/list` body for a set of specs.
+#[must_use]
+pub fn tools_body(specs: &[zeroclaw_api::tool::ToolSpec]) -> Value {
+    let tools: Vec<Value> = specs.iter().map(tool_spec_json).collect();
+    serde_json::json!({ "tools": tools })
+}
+
 /// The `tools/cli-discover` body: CLI tools found on the daemon's `PATH`.
 ///
 /// Discovery spawns child processes and blocks, so it runs on a blocking

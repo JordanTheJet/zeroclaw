@@ -644,12 +644,7 @@ fn normalize_max_keys(configured: usize, fallback: usize) -> usize {
 }
 
 fn default_agent_alias(config: &Config) -> Option<String> {
-    config
-        .agents
-        .iter()
-        .filter(|(_, a)| a.enabled)
-        .map(|(alias, _)| alias.clone())
-        .min()
+    zeroclaw_runtime::tools::listing::default_listing_alias(config)
 }
 
 /// Owned guard for [`AppState::config_write_lock`]. Owned (not borrowed) so
@@ -1201,88 +1196,32 @@ pub async fn run_gateway_with_plugin_webhooks(
         .map(|(alias, _)| alias.clone())
         .collect();
     other_aliases.sort();
+    // The per-agent listings come from the same function `tools/list` uses,
+    // so the dashboard and the RPC method list the same tools for an agent.
+    let listing_deps = zeroclaw_runtime::tools::listing::ToolListingDeps {
+        runtime: Arc::clone(&runtime),
+        memory: Arc::clone(&mem),
+        canvas_store: canvas_store.clone(),
+        sop_engine: sop_engine.clone(),
+        sop_audit: sop_audit.clone(),
+    };
     for alias in other_aliases {
-        let Some(risk_profile) = config.risk_profile_for_agent(&alias) else {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"agent_alias": alias})),
-                "Gateway: agent risk_profile does not resolve; skipping its /api/tools listing."
-            );
-            continue;
-        };
-        let risk_profile = risk_profile.clone();
-        let security = match SecurityPolicy::for_agent(&config, &alias) {
-            Ok(s) => Arc::new(s),
-            Err(e) => {
+        match zeroclaw_runtime::tools::listing::agent_tool_specs(&config, &alias, &listing_deps)
+            .await?
+        {
+            Some(specs) => {
+                tools_registry_by_agent.insert(alias, Arc::new(specs));
+            }
+            None => {
                 ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                         .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(
-                            ::serde_json::json!({"agent_alias": alias, "error": format!("{e}")})
-                        ),
-                    "Gateway: agent SecurityPolicy failed to build; skipping its /api/tools listing."
+                        .with_attrs(::serde_json::json!({"agent_alias": alias})),
+                    "Gateway: agent risk_profile or SecurityPolicy does not resolve; skipping its /api/tools listing."
                 );
-                continue;
             }
-        };
-        let agent_tools_result = tools::all_tools_with_runtime(
-            Arc::new(config.clone()),
-            &security,
-            &risk_profile,
-            &alias,
-            Arc::clone(&runtime),
-            Arc::clone(&mem),
-            composio_key,
-            composio_entity_id,
-            &config.browser,
-            &config.http_request,
-            &config.web_fetch,
-            &config.data_dir,
-            &config.agents,
-            config
-                .model_provider_for_agent(&alias)
-                .and_then(|e| e.api_key.as_deref()),
-            &config,
-            Some(canvas_store.clone()),
-            false,
-            None,
-            sop_engine.clone(),
-            sop_audit.clone(),
-            None,
-        )?;
-        // Same gated seam as the dashboard seed above, so this listing shows
-        // the agent's policy-filtered set (filter + MCP). The tools are only
-        // enumerated for their specs, never invoked, so the returned channel
-        // handles, deferred section, and activation handle are unused.
-        let assembled = scoped::ScopedToolRegistry::assemble(scoped::ScopedAssembly {
-            config: &config,
-            agent_alias: &alias,
-            security: &security,
-            built: agent_tools_result,
-            // Same divergence note as the dashboard seed: no skills on the
-            // gateway until Epic F unifies the loaders.
-            skills: &[],
-            runtime: Arc::clone(&runtime),
-            caller_allowed: None,
-            connect_mcp: true,
-            // Gateway tool-listing path: short-lived, no cross-turn reuse
-            // contract, so the per-call connect is correct.
-            mcp_registry: None,
-            // Same as the seed: never open hardware for a listing (and
-            // `config.peripherals` is global - N per-agent opens of the same
-            // boards would fail against the first holder anyway).
-            connect_peripherals: false,
-            emit_assembly_logs: false,
-            exclude_memory: false,
-            acp_delivery: false,
-            list_deferred_mcp_specs: true,
-        })
-        .await;
-        let specs: Vec<ToolSpec> = assembled.registry.iter().map(|t| t.spec()).collect();
-        tools_registry_by_agent.insert(alias, Arc::new(specs));
+        }
     }
     let tools_registry_by_agent: Arc<HashMap<String, Arc<Vec<ToolSpec>>>> =
         Arc::new(tools_registry_by_agent);

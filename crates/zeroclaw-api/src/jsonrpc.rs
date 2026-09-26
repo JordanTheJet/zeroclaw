@@ -552,6 +552,14 @@ pub struct SopRenameRequest {
     pub to: String,
 }
 
+/// Request payload for `tools/list`: the tools agent `agent` would see, or the
+/// default agent's (the smallest enabled alias) without one.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ToolsListRequest {
+    #[serde(default)]
+    pub agent: Option<String>,
+}
+
 /// Request payload for `canvas/get`, `canvas/history` and `canvas/clear`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CanvasIdRequest {
