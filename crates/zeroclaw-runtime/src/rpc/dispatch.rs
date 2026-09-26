@@ -17253,11 +17253,14 @@ mod tests {
             );
         }
 
+        // The hook is process-wide, so turns other tests run in parallel land
+        // in this history too; judge only this turn's frames.
         let history = d.handle_events_history().expect("history is available");
         let types: Vec<_> = history["events"]
             .as_array()
             .expect("events array")
             .iter()
+            .filter(|event| event["turn_id"] == json!("g2a-turn"))
             .map(|event| event["type"].clone())
             .collect();
         assert_eq!(
