@@ -401,25 +401,7 @@ pub async fn handle_api_tools(
         .and_then(|alias| state.tools_registry_by_agent.get(alias).cloned())
         .unwrap_or_else(|| std::sync::Arc::clone(&state.tools_registry));
 
-    let tools: Vec<serde_json::Value> = registry
-        .iter()
-        .map(|spec| {
-            let mut tool = serde_json::json!({
-                "name": spec.name,
-                "description": spec.description,
-                "parameters": spec.parameters,
-            });
-            if let Some(output) = &spec.output {
-                tool["output"] = output.clone();
-            }
-            if !spec.param_domains.is_empty() {
-                tool["param_domains"] = serde_json::json!(spec.param_domains);
-            }
-            tool
-        })
-        .collect();
-
-    Json(serde_json::json!({"tools": tools})).into_response()
+    Json(zeroclaw_runtime::rpc::catalog::tools_body(&registry)).into_response()
 }
 
 /// GET /api/cron — list cron jobs
