@@ -14127,6 +14127,68 @@ type = "manual"
     }
 
     #[test]
+    fn deterministic_decision_part_is_skipped_and_its_input_passed_on() {
+        let mut sop = deterministic_sop_all_execute("det-parts");
+        sop.decision = Some(
+            toml::from_str::<crate::sop::decision::SopDecisionSpec>("model = \"jev\"").unwrap(),
+        );
+        sop.steps[1].decide = Some("Needs step two?".into());
+        let mut three = sop.steps[1].clone();
+        three.number = 3;
+        three.title = "Step three".into();
+        three.decide = None;
+        sop.steps.push(three);
+        let mut engine = engine_with_sops(vec![sop]);
+
+        let action = engine
+            .start_run_with_mode(
+                "det-parts",
+                manual_event(),
+                None,
+                BTreeMap::from([(2, 0.1)]),
+            )
+            .unwrap();
+        let run_id = extract_run_id(&action).to_string();
+        assert!(
+            matches!(action, SopRunAction::DeterministicStep { ref step, .. } if step.number == 1)
+        );
+
+        let action = engine
+            .advance_deterministic_step(&run_id, serde_json::json!({"a": 1}), None)
+            .unwrap();
+        let SopRunAction::DeterministicStep { step, input, .. } = action else {
+            panic!("expected step 3, got {action:?}");
+        };
+        assert_eq!(step.number, 3);
+        assert_eq!(
+            input,
+            serde_json::json!({"a": 1}),
+            "step 1's output passes over the skip"
+        );
+
+        let action = engine
+            .advance_deterministic_step(&run_id, serde_json::json!({"b": 2}), None)
+            .unwrap();
+        assert!(
+            matches!(action, SopRunAction::Completed { .. }),
+            "{action:?}"
+        );
+        let statuses: Vec<_> = engine.finished_runs(Some("det-parts"))[0]
+            .step_results
+            .iter()
+            .map(|r| (r.step_number, r.status))
+            .collect();
+        assert_eq!(
+            statuses,
+            vec![
+                (1, SopStepStatus::Completed),
+                (2, SopStepStatus::Skipped),
+                (3, SopStepStatus::Completed),
+            ]
+        );
+    }
+
+    #[test]
     fn deterministic_run_drives_to_completion_through_advance_step() {
         let mut engine = engine_with_sops(vec![deterministic_sop_all_execute("det-run")]);
         let action = engine.start_run("det-run", manual_event()).unwrap();

@@ -4018,6 +4018,62 @@ mod tests {
             assert_eq!(jev.calls.load(Ordering::SeqCst), 0);
         }
 
+        /// A part SOP: no gate or modes, step 1 asks its own question.
+        fn part_sop() -> Sop {
+            let spec = SopDecisionSpec {
+                gate: None,
+                modes: vec![],
+                ..spec()
+            };
+            let mut sop = webhook_sop("review", SopExecutionMode::Auto, Some(spec));
+            sop.steps[0].decide = Some("Does this touch security?".into());
+            let mut compose = sop.steps[0].clone();
+            compose.number = 2;
+            compose.decide = None;
+            sop.steps.push(compose);
+            sop
+        }
+
+        fn active_run(engine: &Arc<Mutex<SopEngine>>) -> SopRun {
+            engine
+                .lock()
+                .unwrap()
+                .active_runs()
+                .values()
+                .next()
+                .cloned()
+                .expect("a run started")
+        }
+
+        #[tokio::test]
+        async fn one_model_call_decides_which_steps_run() {
+            let model = Arc::new(Scripted {
+                answers: Some(Answers {
+                    model: None,
+                    answers: BTreeMap::from([("part_1".to_string(), Answer::Noul { noul: 0.1 })]),
+                    usage: None,
+                }),
+                calls: AtomicUsize::new(0),
+            });
+            let engine = engine_with(vec![part_sop()], Some(model.clone()));
+            dispatch_sop_event(&engine, &test_audit(), ticket("typo fix")).await;
+            let run = active_run(&engine);
+            assert_eq!(run.decisions, BTreeMap::from([(1, 0.1)]));
+            assert_eq!(run.current_step, 2, "step 1 was answered no and skipped");
+            assert_eq!(run.step_results[0].status, SopStepStatus::Skipped);
+            assert_eq!(model.calls.load(Ordering::SeqCst), 1);
+        }
+
+        #[tokio::test]
+        async fn model_outage_runs_every_step() {
+            let engine = engine_with(vec![part_sop()], Some(Scripted::down()));
+            dispatch_sop_event(&engine, &test_audit(), ticket("typo fix")).await;
+            let run = active_run(&engine);
+            assert!(run.decisions.is_empty());
+            assert_eq!(run.current_step, 1, "no answer: the conditional step runs");
+            assert!(run.step_results.is_empty());
+        }
+
         #[tokio::test]
         async fn sops_without_decision_table_never_call_the_model() {
             let model = Scripted::answering(0.0, "step_by_step", 0.9);

@@ -997,6 +997,155 @@ mod tests {
         assert!(bad.validate("s", false, true).is_err());
     }
 
+    /// Build the configured client for `alias` exactly as the daemon does.
+    fn configured_model(toml_src: &str, alias: &str) -> std::sync::Arc<dyn DecisionModel> {
+        let cfg: zeroclaw_config::schema::Config = toml::from_str(toml_src).unwrap();
+        models_from_config(&cfg.decision_models)
+            .remove(alias)
+            .expect("alias configured")
+    }
+
+    fn pr_event() -> SopEvent {
+        SopEvent {
+            source: crate::sop::types::SopTriggerSource::Webhook,
+            topic: Some("/sop/pr-intake".into()),
+            payload: Some(r#"{"number":1,"title":"docs: fix a typo"}"#.into()),
+            timestamp: "t".into(),
+        }
+    }
+
+    fn gated_parts_spec() -> SopDecisionSpec {
+        SopDecisionSpec {
+            modes: vec![],
+            ..spec()
+        }
+    }
+
+    #[tokio::test]
+    async fn laya_over_http_sends_no_key_and_decides_parts() {
+        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/systemone"))
+            .and(body_partial_json(json!({
+                "model": "laya",
+                "questions": {
+                    "start_sop": {"type": "noul"},
+                    "part_1": {"type": "noul"}
+                },
+                "state": {"event": {"source": "webhook"}}
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "model": "laya",
+                "answers": {
+                    "start_sop": {"type": "noul", "noul": 0.9},
+                    "part_1": {"type": "noul", "noul": 0.2}
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let model = configured_model(
+            &format!(
+                "[decision_models.local]\nprovider = \"laya\"\nbase_url = \"{}\"\n",
+                server.uri()
+            ),
+            "local",
+        );
+        assert_eq!(model.id(), "laya");
+
+        let sop = parts_sop(Some(gated_parts_spec()));
+        let d = decide(model.as_ref(), &sop, &gated_parts_spec(), &pr_event()).await;
+        assert!(d.start, "{}", d.rationale);
+        assert_eq!(d.parts, BTreeMap::from([(1, 0.2)]));
+
+        let received = server.received_requests().await.unwrap();
+        assert!(
+            received[0].headers.get("authorization").is_none(),
+            "a keyless model must not send an Authorization header"
+        );
+    }
+
+    #[tokio::test]
+    async fn jev_over_http_sends_the_bearer_key() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/systemone"))
+            .and(header("authorization", "Bearer test-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "answers": {"start_sop": {"type": "noul", "noul": 0.1}},
+                "usage": {"input_tokens": 42}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let model = configured_model(
+            &format!(
+                "[decision_models.jev]\napi_key = \"test-key\"\nbase_url = \"{}\"\n",
+                server.uri()
+            ),
+            "jev",
+        );
+        let sop = parts_sop(Some(gated_parts_spec()));
+        let d = decide(model.as_ref(), &sop, &gated_parts_spec(), &pr_event()).await;
+        assert!(!d.start, "gate p(yes) 0.1 is below 0.7: {}", d.rationale);
+        assert_eq!(d.input_tokens, 42);
+    }
+
+    #[tokio::test]
+    async fn http_error_fails_closed_without_echoing_the_body() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("secret-echo"))
+            .mount(&server)
+            .await;
+        let model = configured_model(
+            &format!(
+                "[decision_models.lab]\nprovider = \"custom\"\nbase_url = \"{}\"\n",
+                server.uri()
+            ),
+            "lab",
+        );
+        let sop = parts_sop(Some(gated_parts_spec()));
+        let d = decide(model.as_ref(), &sop, &gated_parts_spec(), &pr_event()).await;
+        // gate_on_error = run_strict: the run starts, every part runs.
+        assert!(d.start);
+        assert!(d.parts.is_empty());
+        assert!(d.rationale.contains("HTTP 500"), "{}", d.rationale);
+        assert!(!d.rationale.contains("secret-echo"));
+    }
+
+    #[tokio::test]
+    async fn malformed_answer_set_fails_closed() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"not": "answers"})))
+            .mount(&server)
+            .await;
+        let model = configured_model(
+            &format!(
+                "[decision_models.lab]\nprovider = \"custom\"\nbase_url = \"{}\"\n",
+                server.uri()
+            ),
+            "lab",
+        );
+        let spec = SopDecisionSpec {
+            gate_on_error: GateOnError::Skip,
+            ..gated_parts_spec()
+        };
+        let sop = parts_sop(Some(spec.clone()));
+        let d = decide(model.as_ref(), &sop, &spec, &pr_event()).await;
+        assert!(!d.start, "gate_on_error = skip declines: {}", d.rationale);
+        assert!(d.parts.is_empty());
+    }
+
     #[test]
     fn spec_parses_from_toml() {
         let parsed: SopDecisionSpec = toml::from_str(
