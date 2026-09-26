@@ -1,6 +1,6 @@
 # Runtime composition contract (proposal)
 
-**Status:** proposed, not implemented. This page is the composition-API proposal that [#10993](https://github.com/zeroclaw-labs/zeroclaw/issues/10993) asks for before any caller moves. It delivers the first acceptance item of that issue and the design half of [#7432](https://github.com/zeroclaw-labs/zeroclaw/issues/7432) R1. The only code that accompanies it is the type skeleton in `crates/zeroclaw-runtime/src/composition.rs`, which nothing consumes yet.
+**Status:** proposed; step 2 implemented. This page is the composition-API proposal that [#10993](https://github.com/zeroclaw-labs/zeroclaw/issues/10993) asks for before any caller moves. It delivers the first acceptance item of that issue and the design half of [#7432](https://github.com/zeroclaw-labs/zeroclaw/issues/7432) R1. The contract lives in `crates/zeroclaw-runtime/src/composition.rs`. The runtime entry points listed under step 2 take it through `*_with_capabilities` forms, and their old signatures are adapters over a config-backed set; no caller has moved yet.
 
 The goal is the one RFC [#5574](https://github.com/zeroclaw-labs/zeroclaw/issues/5574) set for Phase 2 D1: an agent runtime that an embedder can run with capabilities it supplies, where the runtime "has no knowledge of Telegram, Discord, Anthropic, or any specific tool implementation", and where the binary becomes a thin wiring layer.
 
@@ -96,8 +96,9 @@ pub trait ProviderSource: Send + Sync {
     fn model_provider(&self, request: &ProviderRequest<'_>)
         -> anyhow::Result<Arc<dyn ModelProvider>>;
 }
+#[async_trait]
 pub trait MemorySource: Send + Sync {
-    fn memory(&self, request: &MemoryRequest<'_>) -> anyhow::Result<Arc<dyn Memory>>;
+    async fn memory(&self, request: &MemoryRequest<'_>) -> anyhow::Result<Arc<dyn Memory>>;
 }
 pub trait ToolSource: Send + Sync {
     fn tools(&self, request: &ToolRequest<'_>) -> anyhow::Result<Vec<Box<dyn Tool>>>;
@@ -107,7 +108,7 @@ pub trait ChannelSource: Send + Sync {
 }
 ```
 
-`ProviderRequest` carries the config, the agent alias, and an optional explicit provider reference. `MemoryRequest` carries the config and agent alias. `ToolRequest` carries the config, agent alias, resolved `SecurityPolicy`, selected `RuntimeAdapter`, and the agent's memory handle.
+`ProviderRequest` carries the config, the agent alias, an optional explicit provider reference, the model the runtime resolved, and the requesting principal when the entry point knows one (`Option<&PrincipalId>`). The principal is in the request from the start because adding a field to a trait request that embedders implement against is a breaking change later; a source may use it to choose credentials or quotas, and it grants nothing. `MemorySource::memory` is asynchronous because opening a store can touch disk or the network. `MemoryRequest` carries the config and agent alias. `ToolRequest` carries the config, agent alias, resolved `SecurityPolicy`, selected `RuntimeAdapter`, and the agent's memory handle.
 
 The runtime entry point these feed is proposed as follows. It is **not** in the skeleton, because it cannot exist without an implementation:
 
@@ -182,7 +183,7 @@ Every step keeps existing configuration and effective permissions. Old entry poi
 | --- | --- | --- |
 | 0 | This proposal and the skeleton. No callers. | Review of the API boundary |
 | 1 | `DefaultCapabilities::from_config`: sources that wrap today's `create_*` functions unchanged | Parity tests for provider, memory, and tool-set resolution per agent |
-| 2 | Runtime entry points gain `*_with_capabilities` forms: `agent::loop_::run`, `process_message_shared`, `Agent::from_config*`, `assemble_owned_execution`. Old signatures delegate through `DefaultCapabilities` | Existing agent tests pass unchanged; policy-propagation regression tests |
+| 2 | Runtime entry points gain `*_with_capabilities` forms: `agent::loop_::run`, `process_message_shared`, `Agent::from_config*`, `assemble_owned_execution`, the delegate tool's target construction, and cron agent jobs. Old signatures delegate through a config-backed set that reproduces today's construction | Existing agent tests pass unchanged; policy-propagation regression tests; a stub `ProviderSource` receives the principal |
 | 3 | `src/main.rs` builds `DefaultCapabilities` once and calls the new forms for `agent` and `daemon` | Startup, cancellation, and shutdown regression coverage for CLI and daemon |
 | 4 | `DaemonRegistry` starters receive the capabilities. The gateway drops its own provider, memory, observer, and tool construction | Gateway parity; no `create_*` calls left in `zeroclaw-gateway` |
 | 5 | Channels orchestrator's per-sender provider cache becomes a `ProviderSource` implementation; ACP moves to the new forms. Sequenced with #11012 | No `create_*` calls left in `zeroclaw-channels` |
@@ -210,4 +211,4 @@ The issue asks for any retained dependency to be explained rather than hidden be
 ## Open decisions
 
 1. **`run_turn` versus waiting for `RuntimeIngress`.** Shipping `run_turn` first unblocks the independent-consumer criterion but adds a surface that must later defer to ingress.
-2. **Whether `ProviderSource` also receives the requesting principal** once principal-scoped tool selection lands. It is left out here because it is not yet a resolved input.
+2. ~~Whether `ProviderSource` also receives the requesting principal.~~ Settled: `ProviderRequest.principal: Option<&PrincipalId>` ships with the first implementation slice, so the request shape does not break when principal-aware routing lands.
