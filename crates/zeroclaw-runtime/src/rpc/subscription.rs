@@ -708,7 +708,7 @@ mod tests {
         hub.add_viewer("s1", "b", 2, CancellationToken::new());
         let waiter = {
             let hub = Arc::clone(&hub);
-            tokio::spawn(async move { hub.viewers_gone("s1").await })
+            zeroclaw_spawn::spawn!(async move { hub.viewers_gone("s1").await })
         };
         hub.remove_viewer("s1", "a");
         tokio::task::yield_now().await;
