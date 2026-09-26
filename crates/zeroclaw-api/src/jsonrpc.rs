@@ -552,6 +552,58 @@ pub struct SopRenameRequest {
     pub to: String,
 }
 
+/// Request payload for `workspace/list`: one directory level.
+///
+/// With `agent`, `path` is relative to that agent's workspace; without it,
+/// `path` is relative to the shared area under `<install>/shared/` that every
+/// agent reads. An empty or absent `path` lists the root.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceListRequest {
+    #[serde(default)]
+    pub agent: Option<String>,
+    #[serde(default)]
+    pub path: Option<String>,
+}
+
+/// Request payload for `fs/mkdir`. `agent` selects the agent workspace as in
+/// [`WorkspaceListRequest`]; absent targets the shared area.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FsMkdirRequest {
+    #[serde(default)]
+    pub agent: Option<String>,
+    pub path: String,
+}
+
+/// Request payload for `fs/rmdir`: recursively remove a directory in the
+/// shared area. Agent-workspace entries are removed with `fs/delete`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FsRmdirRequest {
+    pub path: String,
+}
+
+/// Request payload for `fs/read`: read one file from an agent workspace.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FsReadRequest {
+    pub agent: String,
+    pub path: String,
+}
+
+/// Request payload for `fs/delete`: remove a file or directory from an agent
+/// workspace.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FsDeleteRequest {
+    pub agent: String,
+    pub path: String,
+}
+
+/// Request payload for `fs/move`: move or rename within an agent workspace.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FsMoveRequest {
+    pub agent: String,
+    pub from: String,
+    pub to: String,
+}
+
 /// Request payload for `fs.list_dir`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FsListDirRequest {
