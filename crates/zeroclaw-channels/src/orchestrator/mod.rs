@@ -16569,9 +16569,9 @@ pub async fn start_channels_with_plugin_webhooks(
             transcription_config: config.transcription.clone(),
             agent_transcription_provider: agent.transcription_provider.as_str().to_string(),
             hooks: if config.hooks.enabled {
-                Some(Arc::new(zeroclaw_runtime::hooks::HookRunner::from_config(
-                    &config.hooks,
-                )))
+                Some(Arc::new(
+                    zeroclaw_runtime::hooks::HookRunner::from_root_config(&config),
+                ))
             } else {
                 None
             },
@@ -30235,7 +30235,8 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[tokio::test]
-    async fn process_channel_message_persists_model_switch_with_route_credential() {
+    async fn process_channel_message_preserves_trim_provenance_and_route_credential_across_model_switch()
+     {
         let channel_impl = Arc::new(TelegramRecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
         let mut channels_by_name = HashMap::new();
@@ -30278,6 +30279,22 @@ BTC is currently around $65,000 based on latest tool output."#
         // later resolved by the channel switch handler.
         let prompt_config = {
             let mut cfg = zeroclaw_config::schema::Config::default();
+            cfg.runtime_profiles.insert(
+                "trim-switch".to_string(),
+                zeroclaw_config::schema::RuntimeProfileConfig {
+                    max_context_tokens: Some(8_000),
+                    ..Default::default()
+                },
+            );
+            cfg.agents.insert(
+                "test-agent".to_string(),
+                zeroclaw_config::schema::AliasedAgentConfig {
+                    runtime_profile: zeroclaw_config::providers::RuntimeProfileRef::from(
+                        "trim-switch",
+                    ),
+                    ..Default::default()
+                },
+            );
             {
                 let entry = cfg
                     .providers
@@ -30369,7 +30386,7 @@ BTC is currently around $65,000 based on latest tool output."#
             cost_tracking: None,
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
-            context_token_budget: 0,
+            context_token_budget: 8_000,
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
@@ -30382,6 +30399,19 @@ BTC is currently around $65,000 based on latest tool output."#
             sop_audit: None,
             sop_driver_sink: None,
         });
+
+        let route_key = "telegram_chat-1_alice";
+        runtime_ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(
+                route_key.to_string(),
+                vec![
+                    ChatMessage::user("old request ".repeat(4_000)),
+                    ChatMessage::assistant("old response"),
+                ],
+            );
 
         process_channel_message(
             runtime_ctx.clone(),
@@ -30422,9 +30452,21 @@ BTC is currently around $65,000 based on latest tool output."#
             );
         }
 
+        let trim_events = observer
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| matches!(event, ObserverEvent::HistoryTrimmed { .. }))
+            .count();
+        assert_eq!(
+            trim_events, 1,
+            "the model-switch retry must preserve breadcrumb provenance instead of trimming \
+             the same synthetic row again"
+        );
+
         // After the switch handler runs, the route override must be
         // persisted for this sender with the resolved api_key.
-        let route_key = "telegram_chat-1_alice";
         let persisted = runtime_ctx
             .route_overrides
             .lock()
@@ -43955,7 +43997,16 @@ BTC is currently around $65,000 based on latest tool output."#
                 interruption_scope_id: None,
                 attachments: vec![zeroclaw_api::media::MediaAttachment {
                     file_name: "sticker.png".to_string(),
-                    data: vec![1, 2, 3, 4],
+                    // A real 1x1 PNG: content validation drops undecodable
+                    // bytes, so a placeholder never survives to the provider.
+                    data: vec![
+                        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D,
+                        0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+                        0x08, 0x02, 0x00, 0x00, 0x00, 0x90, 0x77, 0x53, 0xDE, 0x00, 0x00, 0x00,
+                        0x0C, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0xF8, 0xCF, 0xC0, 0x00,
+                        0x00, 0x03, 0x01, 0x01, 0x00, 0xC9, 0xFE, 0x92, 0xEF, 0x00, 0x00, 0x00,
+                        0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+                    ],
                     mime_type: Some("image/png".to_string()),
                     marker: None,
                 }],
@@ -43994,7 +44045,7 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(turns[0].content.contains("[Image: sticker.png attached"));
         assert!(turns[0].content.contains("please inspect this"));
         assert!(turns[0].content.contains("[IMAGE:data:"));
-        assert!(turns[0].content.contains("AQIDBA"));
+        assert!(turns[0].content.contains("iVBORw0KGgoAAAANSUhEUg"));
     }
 
     #[tokio::test]
@@ -47090,7 +47141,9 @@ This is an example JSON object for profile settings."#;
         let vision_server = MockServer::start().await;
         let _vision_mock = Mock::given(method("POST"))
             .and(path("/chat/completions"))
-            .and(body_string_contains("data:image/png;base64,AQIDBA=="))
+            .and(body_string_contains(
+                "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1Pe",
+            ))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "choices": [
                     {
@@ -47146,7 +47199,17 @@ This is an example JSON object for profile settings."#;
                 interruption_scope_id: None,
                 attachments: vec![zeroclaw_api::media::MediaAttachment {
                     file_name: "route.png".to_string(),
-                    data: vec![1, 2, 3, 4],
+                    // A real 1x1 PNG: content validation rejects bytes that are
+                    // not decodable, so a placeholder would never reach the
+                    // vision route this test exercises.
+                    data: vec![
+                        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D,
+                        0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+                        0x08, 0x02, 0x00, 0x00, 0x00, 0x90, 0x77, 0x53, 0xDE, 0x00, 0x00, 0x00,
+                        0x0C, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0xF8, 0xCF, 0xC0, 0x00,
+                        0x00, 0x03, 0x01, 0x01, 0x00, 0xC9, 0xFE, 0x92, 0xEF, 0x00, 0x00, 0x00,
+                        0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+                    ],
                     mime_type: Some("image/png".to_string()),
                     marker: None,
                 }],
@@ -47195,7 +47258,7 @@ This is an example JSON object for profile settings."#;
         assert!(
             vision_body
                 .to_string()
-                .contains("data:image/png;base64,AQIDBA=="),
+                .contains("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1Pe"),
             "vision provider request must contain the preserved attachment bytes: {vision_body}"
         );
     }

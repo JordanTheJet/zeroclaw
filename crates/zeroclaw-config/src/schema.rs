@@ -3747,11 +3747,6 @@ impl Default for DelegateToolConfig {
 
 // ── Aliased Agents ───────────────────────────────────────────────
 
-/// Default fraction of `max_history_messages` that a whole-turn history trim
-/// drops the history to. Strictly below 1.0 so a trim leaves headroom and
-/// the next turns do not immediately trigger another trim.
-pub const DEFAULT_HISTORY_TRIM_LOW_WATER: f32 = 0.7;
-
 /// Runtime tunables resolved from the agent's runtime profile. Populated
 /// by `Config::resolved_agent_config`; never deserialized from the agent
 /// table. The runtime profile is the sole config surface for these.
@@ -3759,10 +3754,9 @@ pub const DEFAULT_HISTORY_TRIM_LOW_WATER: f32 = 0.7;
 pub struct ResolvedRuntime {
     pub compact_context: bool,
     pub max_tool_iterations: usize,
+    /// History retention limit. Structured Agent and legacy loop sessions
+    /// interpret this as complete turns; channel caches retain message rows.
     pub max_history_messages: usize,
-    /// Fraction of `max_history_messages` a whole-turn trim drops to
-    /// (hysteresis low-water mark; 1.0 disables hysteresis).
-    pub history_trim_low_water: f32,
     /// Optional operator context budget from `runtime_profiles.<name>.max_context_tokens`.
     /// Without an opt-in ratio, `None` preserves the legacy 32,000-token budget.
     /// With a ratio, `Some(n)` clamps the model-relative threshold down to `n`.
@@ -3931,7 +3925,6 @@ impl Default for ResolvedRuntime {
             compact_context: true,
             max_tool_iterations: 10,
             max_history_messages: 50,
-            history_trim_low_water: DEFAULT_HISTORY_TRIM_LOW_WATER,
             max_context_tokens: None,
             model_context_window: 32_000,
             model_context_window_source: ModelContextWindowSource::CompatibilityFallback,
@@ -4549,37 +4542,14 @@ impl Config {
             .unwrap_or(50)
     }
 
-    /// Resolve the fraction of the history cap that a whole-turn trim drops
-    /// to (hysteresis low-water mark). Same resolution chain as
-    /// `effective_max_history_messages`: the agent's runtime profile value
-    /// when set, otherwise [`DEFAULT_HISTORY_TRIM_LOW_WATER`].
-    #[must_use]
-    pub fn effective_history_trim_low_water(&self, agent_alias: &str) -> f32 {
-        self.runtime_profile_for_agent(agent_alias)
-            .and_then(|p| p.history_trim_low_water)
-            .unwrap_or(DEFAULT_HISTORY_TRIM_LOW_WATER)
-    }
-
     /// Resolve the whole-turn history cap used by structured `Agent` sessions.
     ///
-    /// An explicit runtime-profile cap remains authoritative. When omitted, the
-    /// cap scales with the profile's tool-iteration limit while preserving the
-    /// legacy floor of 50 messages.
+    /// The legacy config key is named `max_history_messages`, but structured
+    /// Agent sessions enforce it at complete user-turn boundaries. Tool-call
+    /// and tool-result rows therefore do not consume independent slots there.
     #[must_use]
     pub fn effective_structured_max_history_messages(&self, agent_alias: &str) -> usize {
-        if let Some(max_history_messages) = self
-            .runtime_profile_for_agent(agent_alias)
-            .and_then(|p| p.max_history_messages)
-        {
-            return max_history_messages;
-        }
-
-        // Each tool iteration adds two structural messages; user/final assistant
-        // add two more, while the floor preserves the structured default cap of 50.
-        self.effective_max_tool_iterations(agent_alias)
-            .saturating_mul(2)
-            .saturating_add(2)
-            .max(50)
+        self.effective_max_history_messages(agent_alias)
     }
 
     #[must_use]
@@ -4837,7 +4807,6 @@ impl Config {
         let mut resolved = ResolvedRuntime {
             max_tool_iterations: self.effective_max_tool_iterations(agent_alias),
             max_history_messages: self.effective_max_history_messages(agent_alias),
-            history_trim_low_water: self.effective_history_trim_low_water(agent_alias),
             // Absolute operator budget. In opt-in ratio mode it also caps the
             // model-derived threshold (see `effective_context_budget`).
             max_context_tokens: self.effective_max_context_tokens(agent_alias),
@@ -14505,13 +14474,10 @@ pub struct RuntimeProfileConfig {
     /// Agentic delegate run timeout in seconds. `None` inherits global.
     pub agentic_timeout_secs: Option<u64>,
     // ── Per-agent runtime tunables (also live on AliasedAgentConfig) ─
-    /// Maximum conversation history messages retained per session. `None` inherits.
+    /// History retention limit per session. Structured Agent and legacy loop
+    /// sessions count complete turns; channel caches count message rows. `None`
+    /// inherits the default of 50.
     pub max_history_messages: Option<usize>,
-    /// Fraction of `max_history_messages` that a whole-turn history trim
-    /// drops the history to (the hysteresis low-water mark). Valid range is
-    /// `(0.0, 1.0]`; `1.0` disables hysteresis and trims straight back to
-    /// the cap. `None` inherits the default (0.7).
-    pub history_trim_low_water: Option<f32>,
     /// Maximum estimated tokens before proactive history trimming. `None`
     /// preserves the legacy 32,000-token default when `context_compact_ratio`
     /// is unset. In ratio mode this remains an optional downward cap. Every
@@ -14576,7 +14542,6 @@ impl Default for RuntimeProfileConfig {
             delegation_timeout_secs: None,
             agentic_timeout_secs: None,
             max_history_messages: None,
-            history_trim_low_water: None,
             max_context_tokens: None,
             context_compact_ratio: None,
             compact_context: None,
@@ -17954,6 +17919,15 @@ pub struct WhatsAppConfig {
     #[tab(Behavior)]
     #[serde(default)]
     pub passive_group_context: bool,
+    /// Attach a first-page preview and page count to PDF documents sent over
+    /// WhatsApp Web, so phones show the page on the document card. Rendered
+    /// with `pdftoppm` and `pdfinfo` (poppler-utils) found on `PATH`; the
+    /// larger preview is uploaded next to the document. Default: `false`.
+    /// When the tools are missing, fail, or take too long, the document is
+    /// sent without a preview.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub document_thumbnails: bool,
     /// Cancel an in-flight response from this channel sender when a newer
     /// WhatsApp message arrives. Default: `false`.
     #[serde(default)]
@@ -24824,25 +24798,6 @@ impl Config {
                 "delegate.agentic_timeout_secs",
                 "delegate.agentic_timeout_secs must be greater than 0"
             );
-        }
-
-        // Per-profile validation: the whole-turn history-trim hysteresis
-        // fraction must be in (0.0, 1.0]. Zero or negative would request an
-        // empty refill target; anything above 1.0 would trim deeper than the
-        // cap itself. Sorted iteration keeps error ordering stable.
-        let mut profile_aliases: Vec<&String> = self.runtime_profiles.keys().collect();
-        profile_aliases.sort();
-        for palias in profile_aliases {
-            let Some(low_water) = self.runtime_profiles[palias].history_trim_low_water else {
-                continue;
-            };
-            if !low_water.is_finite() || low_water <= 0.0 || low_water > 1.0 {
-                validation_bail!(
-                    InvalidNumericRange,
-                    format!("runtime_profiles.{palias}.history_trim_low_water"),
-                    "runtime_profiles.{palias}.history_trim_low_water must be a finite number in (0.0, 1.0] (got {low_water})",
-                );
-            }
         }
 
         // Per-profile validation: the context-compression summarizer provider
@@ -32936,7 +32891,6 @@ reasoning_effort = "turbo"
         assert!(cfg.resolved.compact_context);
         assert_eq!(cfg.resolved.max_tool_iterations, 10);
         assert_eq!(cfg.resolved.max_history_messages, 50);
-        assert_eq!(cfg.resolved.history_trim_low_water, 0.7);
         assert!(!cfg.resolved.parallel_tools);
         assert_eq!(cfg.resolved.tool_dispatcher, "auto");
         assert!(!cfg.resolved.strict_tool_parsing);
@@ -33042,7 +32996,7 @@ runtime_profile = "fast"
     }
 
     #[test]
-    async fn runtime_profile_structured_history_cap_scales_when_omitted() {
+    async fn runtime_profile_structured_history_cap_counts_turns_when_omitted() {
         let raw = r#"
 [runtime_profiles.long_turn]
 max_tool_iterations = 100
@@ -33054,7 +33008,7 @@ runtime_profile = "long_turn"
         assert_eq!(parsed.effective_max_history_messages("default"), 50);
         assert_eq!(
             parsed.effective_structured_max_history_messages("default"),
-            202
+            50
         );
         let agent = parsed.resolved_agent_config("default").unwrap();
         assert_eq!(agent.resolved.max_history_messages, 50);
@@ -33101,7 +33055,7 @@ runtime_profile = "long_turn"
     }
 
     #[test]
-    async fn runtime_profile_history_cap_saturates_at_usize_max() {
+    async fn runtime_profile_tool_iterations_do_not_change_history_turn_limit() {
         let mut config = Config::default();
         config.runtime_profiles.insert(
             "long_turn".to_string(),
@@ -33120,7 +33074,7 @@ runtime_profile = "long_turn"
 
         assert_eq!(
             config.effective_structured_max_history_messages("default"),
-            usize::MAX
+            50
         );
         assert_eq!(config.effective_max_history_messages("default"), 50);
     }
@@ -33135,106 +33089,6 @@ runtime_profile = "long_turn"
             50
         );
     }
-
-    #[test]
-    async fn default_history_trim_low_water_is_seven_tenths() {
-        let raw = r#"
-[runtime_profiles.plain]
-
-[agents.default]
-runtime_profile = "plain"
-"#;
-        let parsed = parse_test_config(raw);
-        assert_eq!(parsed.effective_history_trim_low_water("default"), 0.7);
-        let agent = parsed.resolved_agent_config("default").unwrap();
-        assert_eq!(agent.resolved.history_trim_low_water, 0.7);
-    }
-
-    #[test]
-    async fn runtime_profile_history_trim_low_water_is_honored() {
-        let raw = r#"
-[runtime_profiles.mem_saver]
-history_trim_low_water = 0.9
-
-[agents.default]
-runtime_profile = "mem_saver"
-"#;
-        let parsed = parse_test_config(raw);
-        assert_eq!(parsed.effective_history_trim_low_water("default"), 0.9);
-        let agent = parsed.resolved_agent_config("default").unwrap();
-        assert_eq!(agent.resolved.history_trim_low_water, 0.9);
-    }
-
-    #[test]
-    async fn validate_accepts_history_trim_low_water_of_one() {
-        let raw = r#"
-[runtime_profiles.no_hysteresis]
-history_trim_low_water = 1.0
-"#;
-        let parsed = parse_test_config(raw);
-        assert_eq!(
-            parsed
-                .runtime_profiles
-                .get("no_hysteresis")
-                .and_then(|p| p.history_trim_low_water),
-            Some(1.0)
-        );
-        parsed
-            .validate()
-            .expect("history_trim_low_water = 1.0 must be accepted");
-    }
-
-    #[test]
-    async fn validate_rejects_zero_history_trim_low_water() {
-        let raw = r#"
-[runtime_profiles.mem_saver]
-history_trim_low_water = 0.0
-"#;
-        let parsed = parse_test_config(raw);
-        let error = parsed
-            .validate()
-            .expect_err("history_trim_low_water = 0.0 must be rejected");
-        assert!(
-            error
-                .to_string()
-                .contains("runtime_profiles.mem_saver.history_trim_low_water")
-        );
-    }
-
-    #[test]
-    async fn validate_rejects_history_trim_low_water_above_one() {
-        let raw = r#"
-[runtime_profiles.mem_saver]
-history_trim_low_water = 1.5
-"#;
-        let parsed = parse_test_config(raw);
-        let error = parsed
-            .validate()
-            .expect_err("history_trim_low_water above 1.0 must be rejected");
-        assert!(
-            error
-                .to_string()
-                .contains("runtime_profiles.mem_saver.history_trim_low_water")
-        );
-    }
-
-    #[test]
-    async fn validate_rejects_non_finite_history_trim_low_water() {
-        let raw = r#"
-[runtime_profiles.mem_saver]
-history_trim_low_water = nan
-"#;
-        let parsed = parse_test_config(raw);
-        let error = parsed
-            .validate()
-            .expect_err("non-finite history_trim_low_water must be rejected");
-        assert!(
-            error
-                .to_string()
-                .contains("runtime_profiles.mem_saver.history_trim_low_water")
-        );
-    }
-
     #[test]
     async fn pacing_config_defaults_are_all_none_or_empty() {
         let cfg = PacingConfig::default();
@@ -34745,6 +34599,7 @@ bot_token = "xoxb-tok"
             push_name: None,
             mention_only: false,
             passive_group_context: false,
+            document_thumbnails: false,
             interrupt_on_new_message: false,
             mode: WhatsAppWebMode::default(),
             dm_policy: WhatsAppChatPolicy::default(),
@@ -34781,6 +34636,7 @@ bot_token = "xoxb-tok"
             push_name: None,
             mention_only: false,
             passive_group_context: false,
+            document_thumbnails: false,
             interrupt_on_new_message: false,
             mode: WhatsAppWebMode::default(),
             dm_policy: WhatsAppChatPolicy::default(),
@@ -34877,6 +34733,7 @@ allowed_numbers = ["+1", "+2"]
             push_name: None,
             mention_only: false,
             passive_group_context: false,
+            document_thumbnails: false,
             interrupt_on_new_message: false,
             mode: WhatsAppWebMode::default(),
             dm_policy: WhatsAppChatPolicy::default(),
@@ -34910,6 +34767,7 @@ allowed_numbers = ["+1", "+2"]
             push_name: None,
             mention_only: false,
             passive_group_context: false,
+            document_thumbnails: false,
             interrupt_on_new_message: false,
             mode: WhatsAppWebMode::default(),
             dm_policy: WhatsAppChatPolicy::default(),
@@ -34990,6 +34848,7 @@ allowed_numbers = ["+1", "+2"]
                     push_name: None,
                     mention_only: false,
                     passive_group_context: false,
+                    document_thumbnails: false,
                     interrupt_on_new_message: false,
                     mode: WhatsAppWebMode::default(),
                     dm_policy: WhatsAppChatPolicy::default(),
