@@ -245,6 +245,7 @@ async fn workspace_methods_require_the_files_grant() {
             json!({"agent": "alpha", "from": "notes", "to": "n"}),
         ),
         (5, "fs/delete", json!({"agent": "alpha", "path": "notes"})),
+        (6, "fs/rmdir", json!({"path": "made"})),
     ] {
         let response = rpc(&mut peer, &mut rx, id, method, params).await;
         assert_forbidden(&response, method);
@@ -1122,4 +1123,49 @@ async fn system_upgrade_and_restart_are_for_administrators() {
     // Reading progress needs only system:read.
     let status = rpc(&mut peer, &mut rx, 3, "system/upgrade-status", json!({})).await;
     assert!(status["result"]["state"].is_string(), "{status}");
+}
+
+/// A principal with `files:delete` for its agent cannot reach that agent's
+/// workspace root, or the shared root, by folding `..` into the path.
+#[tokio::test]
+async fn fs_delete_and_rmdir_refuse_a_path_that_resolves_to_the_root() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let ctx = enforcement_ctx(files_config(&tmp));
+    let (mut scoped, mut rx) = roster_peer(&ctx, SCOPED).await;
+    for (id, path) in [(1, "notes/.."), (2, "x/..")] {
+        let response = rpc(
+            &mut scoped,
+            &mut rx,
+            id,
+            "fs/delete",
+            json!({"agent": "alpha", "path": path}),
+        )
+        .await;
+        assert_eq!(
+            response["error"]["code"],
+            json!(zeroclaw_api::jsonrpc::error_codes::FS_PERMISSION_DENIED),
+            "{path}: {response}"
+        );
+    }
+    assert!(
+        tmp.path()
+            .join("agents/alpha/workspace/notes/todo.md")
+            .exists()
+    );
+
+    let (mut wildcard, mut wildcard_rx) = roster_peer(&ctx, WILDCARD_UID).await;
+    let response = rpc(
+        &mut wildcard,
+        &mut wildcard_rx,
+        3,
+        "fs/rmdir",
+        json!({"path": "made/.."}),
+    )
+    .await;
+    assert_eq!(
+        response["error"]["code"],
+        json!(zeroclaw_api::jsonrpc::error_codes::FS_PERMISSION_DENIED),
+        "{response}"
+    );
+    assert!(tmp.path().join("shared").exists());
 }
