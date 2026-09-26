@@ -32,7 +32,7 @@ fn workspace_root() -> PathBuf {
 
 fn generator() -> SchemaGenerator {
     let mut settings = SchemaSettings::draft2020_12();
-    settings.definitions_path = DEFINITIONS_PATH.to_owned();
+    settings.definitions_path = DEFINITIONS_PATH.into();
     settings.inline_subschemas = false;
     settings.into_generator()
 }
@@ -122,8 +122,10 @@ pub fn render() -> anyhow::Result<String> {
         .iter()
         .map(|(name, payload)| match payload {
             Some(payload) => {
-                let schema = schema::subschema_for_named(&mut generator, payload)
-                    .unwrap_or_else(|| json!({ "description": format!("`{payload}` (no exported schema)") }).into());
+                let schema = schema::subschema_for_named(&mut generator, payload).map_or_else(
+                    || json!({ "description": format!("`{payload}` (no exported schema)") }),
+                    Value::from,
+                );
                 json!({ "name": name, "params": { "name": "params", "schema": schema } })
             }
             None => json!({
