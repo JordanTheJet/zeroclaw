@@ -14,9 +14,6 @@ use zeroclaw_channels::control::{
     CHANNEL_LISTENER_HEALTH_MAX_AGE_SECS, ChannelReadinessState, channel_readiness,
     channel_readiness_summary, compiled_readiness_key_for_alias,
 };
-#[cfg(test)]
-use zeroclaw_config::schema::ChannelAliasInfo;
-use zeroclaw_config::schema::Config;
 use zeroclaw_memory::MemoryEntry;
 
 const MEMORY_API_CONTENT_MAX_CHARS: usize = 4096;
