@@ -560,6 +560,32 @@ pub struct ToolsListRequest {
     pub agent: Option<String>,
 }
 
+/// Request payload for `system/upgrade`: upgrade via `zeroclaw update` to
+/// `version` (latest when absent), then, with `auto_restart`, exit so the
+/// detected supervisor relaunches the new binary.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SystemUpgradeRequest {
+    #[serde(default)]
+    pub version: Option<String>,
+    #[serde(default)]
+    pub auto_restart: bool,
+}
+
+/// Request payload for `system/upgrade-status`. A `handoff_id` that names
+/// another upgrade is refused.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SystemUpgradeStatusRequest {
+    #[serde(default)]
+    pub handoff_id: Option<String>,
+}
+
+/// Request payload for `system/restart`. `component` is what to restart;
+/// `daemon` reloads the daemon in place, as `/admin/reload` does.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SystemRestartRequest {
+    pub component: String,
+}
+
 /// Request payload for `channels/relink`. `channel` is the composite
 /// `<type>.<alias>` name `channels/list` reports.
 #[derive(Debug, Clone, Serialize, Deserialize)]

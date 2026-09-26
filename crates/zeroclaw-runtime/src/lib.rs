@@ -44,6 +44,7 @@ pub mod restart;
 pub mod routines;
 pub mod rpc;
 pub mod security;
+pub mod self_upgrade;
 pub mod service;
 pub mod skills;
 pub mod sop;
