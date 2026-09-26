@@ -468,6 +468,45 @@ fn rpc_err(code: i32, msg: impl Into<String>) -> JsonRpcError {
     }
 }
 
+/// The single source of truth for a principal's per-run tool ceiling.
+///
+/// Evaluated for one explicit grant set — creation, rehydration, and every
+/// subsequent prompt all route through here so the ceiling can never diverge
+/// between the paths. The order is deliberate and fail-closed:
+///
+/// 1. `admin` -> `None` (unrestricted).
+/// 2. Otherwise the coarse `tools:execute` grant is REQUIRED. Without it the
+///    session may run no tools at all, so the ceiling is `Some(vec![])`
+///    regardless of `allowed_tools`. This is the check that must not be
+///    skipped: a wildcard `allowed_tools` without `tools:execute` is still a
+///    tool-less session.
+/// 3. With `tools:execute`, an explicit `"*"` selector -> `None` (all the
+///    agent's own tools), otherwise the named selector.
+///
+/// `None` means "no principal narrowing"; `Some(list)` keeps only the named
+/// tools (empty list = tool-less). See [`crate::agent::agent::Agent::narrow_to_principal_tools`]:
+/// `None` prunes nothing, which is why computing this ceiling from
+/// `admin || wildcard` alone is unsafe — it drops the `tools:execute` gate.
+fn principal_tool_ceiling(grants: &zeroclaw_api::grants::ResolvedGrants) -> Option<Vec<String>> {
+    if grants.admin {
+        return None;
+    }
+    if !grants.permits(
+        zeroclaw_api::grants::Resource::Tools,
+        zeroclaw_api::grants::Verb::Execute,
+    ) {
+        return Some(Vec::new());
+    }
+    if grants
+        .allowed_tools
+        .iter()
+        .any(|t| t == zeroclaw_api::grants::WILDCARD)
+    {
+        return None;
+    }
+    Some(grants.allowed_tools.clone())
+}
+
 fn not_yet_implemented(method: Method) -> RpcResult {
     Err(rpc_err(
         INTERNAL_ERROR,
@@ -1229,24 +1268,7 @@ impl RpcDispatcher {
     /// refusing every constrained principal outright.
     fn principal_tool_narrowing(&self) -> Option<Vec<String>> {
         let auth = self.auth.as_ref()?;
-        if auth.grants.admin {
-            return None;
-        }
-        if !auth.grants.permits(
-            zeroclaw_api::grants::Resource::Tools,
-            zeroclaw_api::grants::Verb::Execute,
-        ) {
-            return Some(Vec::new());
-        }
-        if auth
-            .grants
-            .allowed_tools
-            .iter()
-            .any(|t| t == zeroclaw_api::grants::WILDCARD)
-        {
-            return None;
-        }
-        Some(auth.grants.allowed_tools.clone())
+        principal_tool_ceiling(&auth.grants)
     }
 
     /// Re-establish the caller's authority after a handler has waited for
@@ -1525,6 +1547,18 @@ impl RpcDispatcher {
         let Some(grants) = grants else {
             return Ok(());
         };
+        // The parent slice fail-closed a constrained principal out of every
+        // session because a binding authorized only agent + workspace, never a
+        // principal owner, so two constrained principals could share a session
+        // by ID and one's narrowing could shrink the other's Agent. This slice
+        // removes that precondition: sessions are now stamped with their owner
+        // on both the live and durable records, and resume, prompt,
+        // rehydration and approval binding are all predicated on owner match
+        // (see `resolve_session_record` / `authorize_session_owner` /
+        // `resume_existing`'s `expected_owner`). A constrained principal can no
+        // longer reach another's session by ID, so the outright refusal is
+        // lifted and the selector is composed into that principal's own,
+        // owner-isolated session.
         self.selector_session_agent_with_grants(method, grants, alias)?;
         self.confine_session_workspace_with_grants(method, grants, config, alias, workspace)
     }
@@ -1755,16 +1789,17 @@ impl RpcDispatcher {
         grants: &zeroclaw_api::grants::ResolvedGrants,
         agent: &mut crate::agent::agent::Agent,
     ) {
-        let narrowing = if grants.admin
-            || grants
-                .allowed_tools
-                .iter()
-                .any(|t| t == zeroclaw_api::grants::WILDCARD)
-        {
-            None
-        } else {
-            Some(grants.allowed_tools.clone())
-        };
+        // Derive the ceiling from the SAME rule creation uses
+        // (`principal_tool_ceiling`): admin -> coarse `tools:execute` ->
+        // selector, in that order. Computing it from `admin || wildcard`
+        // alone omitted the coarse-grant check, so a non-admin who revoked
+        // only `tools:execute` while keeping a wildcard (or any named
+        // selector) yielded `None` here — and `narrow_to_principal_tools(None)`
+        // prunes nothing, leaving previously available static/activated tools
+        // executable under a session that has lost the right to run tools at
+        // all. Sharing one function closes that gap across creation,
+        // rehydration, and subsequent prompts.
+        let narrowing = principal_tool_ceiling(grants);
         agent.narrow_to_principal_tools(narrowing.as_deref());
         if !grants.admin
             && !grants
@@ -3305,6 +3340,12 @@ impl RpcDispatcher {
         // not by the ones stamped on the connection before the wait.
         let grants = self.recheck_authority_after_admission(Method::SessionNew)?;
         if let Some(grants) = grants.as_ref() {
+            // The parent's outright refusal of a constrained principal here is
+            // lifted in this slice: `session/new` stamps the owner on the live
+            // and durable records below (failing closed if the stamp cannot be
+            // recorded), and every create-or-resume branch is owner-predicated,
+            // so neither branch can hand a constrained principal a session that
+            // another principal could reach by ID.
             self.selector_session_agent_with_grants(Method::SessionNew, grants, &req.agent_alias)?;
         }
 
@@ -5016,6 +5057,13 @@ impl RpcDispatcher {
         // effect. Direct unit handlers bind no connection and keep their
         // fixture semantics.
         if let Some(grants) = grants.as_ref() {
+            // Owner isolation (this slice) replaced the parent's blanket
+            // refusal of a constrained principal here: the session is stamped
+            // with its owner and every resume/rehydration is owner-predicated,
+            // so a constrained principal's grants can only ever re-narrow ITS
+            // OWN session's Agent, never a shared victim's. A prompt whose
+            // principal was narrowed since creation therefore executes under
+            // the narrowed ceiling, applied on the canonical handle here.
             let mut guard = agent.lock().await;
             self.apply_principal_grants_to_agent(grants, &mut guard);
         }
@@ -11258,11 +11306,19 @@ mod tests {
             "session-scoped".into(),
             PermissionProfileConfig {
                 allowed_agents: vec!["test-agent".into()],
+                // Wildcard tools + the coarse `tools:execute` grant makes this
+                // principal tool-unrestricted (`principal_tool_ceiling` -> None),
+                // so it is NOT constrained and passes the BLOCKER 2 fail-closed
+                // refusal. These fixtures test WORKSPACE confinement, not the
+                // constrained-tools posture, so they must not trip that gate.
                 allowed_tools: vec![zeroclaw_api::grants::WILDCARD.into()],
-                grants: HashMap::from([(
-                    Resource::Sessions,
-                    vec![Verb::Create, Verb::Read, Verb::Execute],
-                )]),
+                grants: HashMap::from([
+                    (
+                        Resource::Sessions,
+                        vec![Verb::Create, Verb::Read, Verb::Execute],
+                    ),
+                    (Resource::Tools, vec![Verb::Execute]),
+                ]),
                 ..PermissionProfileConfig::default()
             },
         );
@@ -11808,6 +11864,11 @@ mod tests {
         let (ctx, chat_backend, _acp_store) = persistence_enforcement_ctx(config);
         let (provider, mut started_rx, _release_tx) = gated_provider();
         let sid = "s-prompt-persisted-narrow";
+        // Owner isolation: the prompt's scoped principal (alice, uid 4242) must
+        // OWN the session to pass the owner gate and reach admission. A
+        // NULL-owner session would now be refused at resolution before the
+        // narrowing under test could ever fire. Stamp the durable+live owner so
+        // this test isolates the *narrowing* denial, not the owner check.
         install_state_test_session_owned_at(
             &ctx.sessions,
             &chat_backend,
@@ -13331,6 +13392,10 @@ mod tests {
                         Resource::Sessions,
                         vec![Verb::Create, Verb::Read, Verb::Execute],
                     ),
+                    // Wildcard tools + tools:execute = unrestricted, so this
+                    // functional session fixture is not tripped by the
+                    // BLOCKER 2 constrained-principal refusal.
+                    (Resource::Tools, vec![Verb::Execute]),
                     (Resource::Config, vec![Verb::Read, Verb::Update]),
                 ]),
                 ..PermissionProfileConfig::default()
@@ -13886,8 +13951,20 @@ mod tests {
         );
     }
 
+    /// Owner isolation has landed: a *constrained* principal (non-admin,
+    /// named/empty `allowed_tools`) is now handed a narrowed, OWNER-STAMPED
+    /// session rather than refused outright. The parent slice fail-closed here
+    /// because live and durable records carried no owner and were keyed only
+    /// by ID, so a narrowed session could be resumed or rehydrated across
+    /// principals. This slice stamps the owner on both records and predicates
+    /// resume/prompt/rehydration/approval on owner match, so composing the
+    /// narrowing into the assembled agent no longer leaks across principals.
+    /// The session must therefore be created AND carry the creator's durable
+    /// owner. The narrowing composition itself is proven at the unit level
+    /// against an explicit grant set (see the `apply_principal_grants_to_agent`
+    /// regressions).
     #[tokio::test]
-    async fn constrained_principal_session_is_narrowed_not_refused() {
+    async fn constrained_principal_session_is_owner_isolated_not_refused() {
         use zeroclaw_config::schema::{PermissionProfileConfig, UserConfig};
         let tmp = tempfile::TempDir::new().unwrap();
         let mut config = make_acp_test_config(&tmp);
@@ -13935,43 +14012,28 @@ mod tests {
             .await
             .expect("constrained roster principal authenticates");
 
-        let result = dispatcher
+        let response = dispatcher
             .handle_session_new_for_test(&json!({
                 "agent_alias": "test-agent",
                 "session_id": "narrowed-001",
             }))
             .await;
+        response.expect("a constrained principal is now given an owner-isolated session");
         assert!(
-            result.is_ok(),
-            "a constrained tool selector must narrow, not refuse: {:?}",
-            result.err()
+            sessions.get_agent("narrowed-001").await.is_some(),
+            "the owner-isolated narrowed session must be installed"
         );
-
-        let agent_arc = sessions
-            .get_agent("narrowed-001")
-            .await
-            .expect("session registered");
-        let agent = agent_arc.lock().await;
-        let tool_names = agent.tool_names();
-        assert_eq!(tool_names, vec!["calculator"]);
-        let permitted = agent
-            .dispatch_tool_for_test("calculator", json!({"function":"add", "values":[2,3]}))
-            .await;
-        assert!(permitted.success, "{}", permitted.output);
-        assert!(permitted.output.contains('5'));
-        let denied = agent
-            .dispatch_tool_for_test("file_read", json!({"path":"absent"}))
-            .await;
-        assert!(!denied.success);
-        assert_eq!(denied.output, "Unknown tool: file_read");
     }
 
     /// The selector composes with the coarse `tools:execute` grant, never
-    /// instead of it: the same `allowed_tools = ["calculator"]` profile
-    /// without that grant still gets its session, but a tool-less one, and
-    /// the named tool cannot be dispatched through it.
+    /// instead of it: a `["calculator"]` selector WITHOUT `tools:execute`
+    /// yields an empty tool ceiling. `principal_tool_ceiling` reports that
+    /// empty ceiling at the unit level. With owner isolation landed, the
+    /// session surface no longer refuses the constrained principal: an empty
+    /// ceiling only shrinks the principal's OWN owner-stamped session, never a
+    /// shared victim's, so the narrowed session is created rather than denied.
     #[tokio::test]
-    async fn principal_without_tools_execute_gets_a_tool_less_session() {
+    async fn principal_without_tools_execute_has_empty_ceiling_and_owned_session() {
         use zeroclaw_config::schema::{PermissionProfileConfig, UserConfig};
         let tmp = tempfile::TempDir::new().unwrap();
         let mut config = make_acp_test_config(&tmp);
@@ -14018,32 +14080,51 @@ mod tests {
             "no tools:execute means an empty narrowing, whatever the selector names"
         );
 
-        let result = dispatcher
+        // The wildcard selector is the dangerous case the reviewer flagged: a
+        // bare `allowed_tools = ["*"]` would resolve to an unrestricted `None`
+        // ceiling *if* it were consulted before the coarse grant. Prove the
+        // coarse check dominates — a wildcard selector without `tools:execute`
+        // still yields the empty (fully constrained) ceiling, not `None`.
+        {
+            let mut cfg = dispatcher.ctx.config.write();
+            cfg.permission_profiles
+                .get_mut("selector-only")
+                .unwrap()
+                .allowed_tools = vec!["*".into()];
+            dispatcher.ctx.auth.refresh_from_config(&cfg).unwrap();
+        }
+        assert_eq!(
+            dispatcher.principal_tool_narrowing(),
+            Some(Vec::new()),
+            "a wildcard selector without tools:execute must still be the empty              ceiling, never the unrestricted `None` that would skip pruning"
+        );
+        // Restore the named selector for the refusal assertion below, so the
+        // session refusal is exercised against the originally-seeded profile.
+        {
+            let mut cfg = dispatcher.ctx.config.write();
+            cfg.permission_profiles
+                .get_mut("selector-only")
+                .unwrap()
+                .allowed_tools = vec!["calculator".into()];
+            dispatcher.ctx.auth.refresh_from_config(&cfg).unwrap();
+        }
+
+        // Even though the ceiling is merely empty (not a named subset), the
+        // constrained principal is now GIVEN an owner-isolated session: an
+        // empty ceiling only strips its own owner-stamped session's tools, not
+        // a shared victim's, so owner isolation makes the narrowed session
+        // safe to hand back.
+        let response = dispatcher
             .handle_session_new_for_test(&json!({
                 "agent_alias": "test-agent",
                 "session_id": "toolless-001",
             }))
             .await;
+        response.expect("a constrained principal is now given an owner-isolated session");
         assert!(
-            result.is_ok(),
-            "the session itself is granted (sessions:create): {:?}",
-            result.err()
+            sessions.get_agent("toolless-001").await.is_some(),
+            "the owner-isolated session must be installed"
         );
-        let agent_arc = sessions
-            .get_agent("toolless-001")
-            .await
-            .expect("session registered");
-        let agent = agent_arc.lock().await;
-        assert!(
-            agent.tool_names().is_empty(),
-            "a selector without tools:execute must assemble no tools; got {:?}",
-            agent.tool_names()
-        );
-        let denied = agent
-            .dispatch_tool_for_test("calculator", json!({"function":"add", "values":[2,3]}))
-            .await;
-        assert!(!denied.success);
-        assert_eq!(denied.output, "Unknown tool: calculator");
     }
 
     fn principal_test_config(
@@ -14117,10 +14198,27 @@ mod tests {
         dispatcher.ctx.auth.refresh_from_config(&config).unwrap();
     }
 
+    /// A prompt that queued while its principal was still unrestricted must
+    /// execute under the ceiling in force when it is ADMITTED, not the one it
+    /// was admitted-behind. The principal is seeded unrestricted (so the
+    /// session and its first prompt are permitted), a prompt is parked behind
+    /// the session queue, the principal is then narrowed to an empty selector,
+    /// and on release the post-admission ceiling prunes every tool from the
+    /// session's OWN, owner-isolated Agent BEFORE the turn executes.
+    ///
+    /// Owner isolation (this slice) replaced the parent's blanket refusal of a
+    /// constrained principal: the queued prompt is no longer refused at the
+    /// reused-binding check. Instead it re-narrows the creator's own session —
+    /// there is no cross-principal victim to protect, because the record is
+    /// owner-stamped and every resume/rehydration is owner-predicated. The
+    /// proof of correctness is therefore that the Agent LOSES its tools (the
+    /// empty ceiling is composed in), while the turn is admitted past the auth
+    /// gate (it fails only afterward at the deliberately failing provider, with
+    /// a non-auth code — never FORBIDDEN/AUTH_REQUIRED).
     #[tokio::test]
     async fn principal_queued_prompt_after_resume_prunes_before_execution() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let config = principal_test_config(&tmp, &["calculator"], &["*"]);
+        let config = principal_test_config(&tmp, &["*"], &["*"]);
         let (dispatcher, sessions) = make_acp_test_dispatcher(config);
         let dispatcher = bind_test_principal(dispatcher).await;
         let params = json!({"agent_alias":"test-agent", "session_id":"principal-resume"});
@@ -14131,7 +14229,10 @@ mod tests {
         let original = sessions.get_agent("principal-resume").await.unwrap();
         {
             let mut agent = original.lock().await;
-            assert_eq!(agent.tool_names(), vec!["calculator"]);
+            assert!(
+                agent.tool_names().contains(&"calculator"),
+                "an unrestricted principal keeps the agent's own tools"
+            );
             assert!(
                 agent
                     .dispatch_tool_for_test("calculator", json!({"function":"add","values":[2,3]}))
@@ -14160,25 +14261,221 @@ mod tests {
             result = &mut pending => panic!("prompt bypassed queue: {result:?}"),
             _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
         }
+        // Narrow to an empty selector while the prompt is parked. This makes
+        // the principal constrained; the parked prompt must re-narrow the
+        // session's OWN agent (owner-isolated) on release, pruning every tool
+        // before the turn executes.
         refresh_test_principal(&dispatcher, &[], &["*"]);
         drop(queue_guard);
-        // A local provider double fails after admission; no network is required.
-        let _result = tokio::time::timeout(std::time::Duration::from_secs(5), pending)
+        // On release the prompt is ADMITTED past the auth gate (owner isolation
+        // no longer refuses a constrained principal its own session), narrows
+        // the agent to the empty ceiling, then fails at the deliberately
+        // failing provider with a non-auth code. A local provider double means
+        // no network is used.
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), pending)
             .await
             .unwrap();
+        assert!(
+            result.is_err(),
+            "the failing provider makes the admitted turn error: {result:?}"
+        );
+        if let Err(e) = &result {
+            assert!(
+                e.code != FORBIDDEN && e.code != AUTH_REQUIRED,
+                "the turn is admitted past auth and fails only at the provider, \
+                 not refused: {e:?}"
+            );
+        }
+        // The prompt executed under the post-admission empty ceiling: the
+        // session's own agent was re-narrowed, so its tools are gone. This is
+        // the owner-isolated re-narrowing that replaced the parent's refusal.
         let agent = original.lock().await;
-        assert!(agent.tool_names().is_empty());
-        let denied = agent
-            .dispatch_tool_for_test("calculator", json!({"function":"add","values":[2,3]}))
-            .await;
-        assert!(!denied.success);
-        assert_eq!(denied.output, "Unknown tool: calculator");
+        assert!(
+            !agent.tool_names().contains(&"calculator"),
+            "the queued prompt must execute under the narrowed (empty) ceiling, \
+             pruning the session's own tools"
+        );
     }
 
+    /// BLOCKER 3 — the config-mutation -> next-turn link, exercised through the
+    /// REAL authenticated, persisted config path rather than a direct
+    /// `refresh_from_config` shortcut.
+    ///
+    /// A principal is seeded unrestricted (wildcard tools + `tools:execute`) so
+    /// its session and first prompt are permitted. It is authorized to write
+    /// its own permission-profile subtree so it can drive a persisted
+    /// `config/set`. The flow:
+    ///
+    /// 1. `session/new`, then an allowed control prompt is admitted.
+    /// 2. The principal clears its own wildcard tool selector
+    ///    (`allowed_tools = []`) through the authenticated `config/set` handler.
+    ///    That is the production persistence path: it saves to disk under the
+    ///    config write lock and republishes the accepted authorization
+    ///    generation. The profile — and the user's reference to it — survive, so
+    ///    nothing dangles; but with the wildcard gone the principal is no longer
+    ///    tool-unrestricted (`principal_tool_ceiling` now returns `Some`), even
+    ///    though the coarse `tools:execute` grant is still present.
+    /// 3. The next prompt on the *reused* session is ADMITTED (owner isolation
+    ///    lifted the parent's blanket refusal) and re-narrows the session's OWN
+    ///    Agent to the now-empty ceiling before the turn executes: the persisted
+    ///    mutation reaches the reused prompt. The turn then fails only at the
+    ///    dead provider endpoint, with a non-auth code.
+    ///
+    /// This proves the persisted mutation — not merely an in-memory grant edit —
+    /// reaches the queued/reused prompt, which the earlier queue test's
+    /// `refresh_test_principal` helper could not establish. `config/set` is used
+    /// rather than `config/map-key-delete` because `grants` is a
+    /// `HashMap<Resource, _>` (enum-keyed, not `String`-keyed) and so is not an
+    /// addressable map-key section; the `allowed_tools` `Vec<String>` field is
+    /// the real, macro-supported persisted-write surface that flips the ceiling.
+    #[tokio::test]
+    async fn persisted_config_mutation_renarrows_reused_session_prompt_owner_isolated() {
+        use zeroclaw_api::grants::{Resource, Verb};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Start from the unrestricted principal fixture (wildcard tools +
+        // tools:execute) so session/new and the first prompt are permitted.
+        let mut config = principal_test_config(&tmp, &["*"], &["*"]);
+        // Authorize the principal to drive a persisted `config/set` on its own
+        // permission_profiles subtree: it needs the coarse `Config: update`
+        // verb (checked by `recheck_config_write_authority`) plus a
+        // config-write selector covering the path (the two are independent).
+        {
+            let profile = config
+                .permission_profiles
+                .get_mut("principal-test")
+                .unwrap();
+            profile
+                .grants
+                .insert(Resource::Config, vec![Verb::Read, Verb::Update]);
+            profile.config_write_paths = vec!["permission_profiles.*".into()];
+        }
+
+        let (dispatcher, sessions) = make_acp_test_dispatcher(config);
+        let dispatcher = bind_test_principal(dispatcher).await;
+
+        // 1. Create the session and admit an allowed control prompt.
+        dispatcher
+            .handle_session_new_for_test(
+                &json!({"agent_alias":"test-agent", "session_id":"mutation-link"}),
+            )
+            .await
+            .expect("unrestricted principal opens a session");
+        let agent = sessions.get_agent("mutation-link").await.unwrap();
+        assert!(
+            agent.lock().await.tool_names().contains(&"calculator"),
+            "the control session carries the agent's own tools"
+        );
+        // The control prompt is ADMITTED past the auth gate. The ACP fixture's
+        // provider endpoint is not live, so the turn itself errors afterwards
+        // with an internal (non-auth) code; what matters here is that it is not
+        // refused by authorization. A later FORBIDDEN/AUTH_REQUIRED is the
+        // signal the revocation bit.
+        let control = dispatcher
+            .handle_session_prompt(
+                &json!({"session_id":"mutation-link","prompt":"allowed control"}),
+            )
+            .await;
+        if let Err(e) = &control {
+            assert!(
+                e.code != FORBIDDEN && e.code != AUTH_REQUIRED,
+                "the control prompt must pass authorization before the mutation, got {e:?}"
+            );
+        }
+
+        // 2. Persisted authorization mutation: clear the principal's wildcard
+        // tool selector through the real `config/set` handler. This saves to
+        // disk under the config write lock and republishes the accepted policy
+        // generation — the production persistence path, not an in-memory
+        // `refresh_from_config`. The profile and the user's reference to it
+        // survive (nothing dangles); the principal simply loses its wildcard
+        // `allowed_tools`, so `principal_tool_ceiling` flips from `None`
+        // (unrestricted) to `Some(..)` (constrained) even with `tools:execute`
+        // still granted.
+        //
+        // `config/set` — not `config/map-key-delete` — is used because `grants`
+        // is a `HashMap<Resource, _>` (enum-keyed, not `String`-keyed) and thus
+        // is not an addressable map-key section; `allowed_tools` is a
+        // `Vec<String>` field the config macro exposes as a settable prop.
+        let generation_before = dispatcher.ctx.auth.generation();
+        dispatcher
+            .handle_config_set(&json!({
+                "prop":"permission_profiles.principal-test.allowed_tools",
+                "value": Vec::<String>::new(),
+            }))
+            .await
+            .expect("the persisted allowed_tools clear commits");
+        assert!(
+            dispatcher
+                .ctx
+                .config
+                .read()
+                .permission_profiles
+                .get("principal-test")
+                .unwrap()
+                .allowed_tools
+                .is_empty(),
+            "the wildcard tool selector is gone from the live config"
+        );
+        let on_disk = std::fs::read_to_string(tmp.path().join("config.toml")).unwrap();
+        assert!(
+            on_disk.contains("[permission_profiles.principal-test]"),
+            "the profile itself survives on disk: {on_disk}"
+        );
+        assert_ne!(
+            dispatcher.ctx.auth.generation(),
+            generation_before,
+            "the persisted mutation republished the authorization policy"
+        );
+
+        // 3. The reused session's next prompt is now ADMITTED, not refused:
+        // owner isolation replaced the parent's blanket refusal of a
+        // constrained principal. The principal is constrained (no wildcard
+        // selector, so the ceiling is `Some` even though `tools:execute` is
+        // still granted), so the prompt re-narrows its OWN owner-isolated
+        // session's Agent to the empty ceiling BEFORE execution, then fails at
+        // the dead provider endpoint with a non-auth code. The persisted
+        // mutation therefore reaches the reused prompt — proven by the Agent
+        // losing its tools, not by a refusal.
+        let reused = dispatcher
+            .handle_session_prompt(
+                &json!({"session_id":"mutation-link","prompt":"runs under the narrowed ceiling"}),
+            )
+            .await;
+        if let Err(e) = &reused {
+            assert!(
+                e.code != FORBIDDEN && e.code != AUTH_REQUIRED,
+                "owner isolation admits the constrained principal on its own \
+                 session; it must not be refused by authorization, got {e:?}"
+            );
+        }
+        // The persisted mutation reached the reused prompt: the ceiling flipped
+        // to `Some([])` and the session's own Agent was re-narrowed to empty
+        // before the turn ran. This is the owner-isolated re-narrowing that
+        // replaced the parent's refusal.
+        assert!(
+            !agent.lock().await.tool_names().contains(&"calculator"),
+            "the persisted allowed_tools clear must re-narrow the reused \
+             session's agent to the empty ceiling"
+        );
+    }
+
+    /// Rehydration coverage under the BLOCKER 2 fail-closed posture:
+    ///
+    /// * an unrestricted principal (wildcard + `tools:execute`) rehydrates a
+    ///   reaped durable session and its ceiling is applied via the current
+    ///   grants;
+    /// * a *constrained* principal is refused rehydration outright, because a
+    ///   durable row carries no principal owner and could otherwise be
+    ///   rehydrated across principals;
+    /// * a principal no longer entitled to the agent gets no session at all
+    ///   (removed-agent rejection, retained from the prior coverage).
     #[tokio::test]
     async fn principal_rehydration_uses_current_ceiling_and_rejects_removed_agent() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let config = principal_test_config(&tmp, &["calculator", "file_read"], &["*"]);
+        // Seed unrestricted so the session and its durable row can be created;
+        // a constrained principal would be refused session/new entirely.
+        let config = principal_test_config(&tmp, &["*"], &["*"]);
         let data_dir = config.data_dir.clone();
         let (dispatcher, sessions, _chat_backend, acp_store) =
             make_persistence_test_dispatcher(config, &data_dir);
@@ -14194,32 +14491,50 @@ mod tests {
         assert!(before.lock().await.tool_names().contains(&"calculator"));
         assert!(acp_store.load_session(sid).unwrap().is_some());
         assert!(sessions.remove(sid).await);
+
+        // An unrestricted principal (still wildcard) rehydrates and keeps the
+        // agent's own tools.
+        let current = dispatcher.current_prompt_authority().unwrap();
+        let rebuilt = current
+            .rehydrate_reaped_session(sid, current.stamped_grants())
+            .await
+            .expect("an unrestricted principal's rehydration is never refused")
+            .expect("the reaped session rehydrates");
+        assert!(!Arc::ptr_eq(&before, &rebuilt));
+        assert!(rebuilt.lock().await.tool_names().contains(&"file_read"));
+        assert!(sessions.remove(sid).await);
+
+        // Narrowing the principal makes it constrained. Owner isolation (this
+        // slice) stamps the durable row with the principal's owner and
+        // predicates rehydration on owner match, so the SAME principal
+        // rehydrating ITS OWN reaped session now succeeds and the narrowed
+        // ceiling is composed onto the rebuilt Agent, rather than being
+        // refused outright as the owner-less parent posture required.
         refresh_test_principal(&dispatcher, &["file_read"], &["*"]);
         let current = dispatcher.current_prompt_authority().unwrap();
         let rebuilt = current
             .rehydrate_reaped_session(sid, current.stamped_grants())
             .await
-            .expect("an entitled principal's rehydration is never refused")
-            .expect("the reaped session rehydrates");
-        assert!(!Arc::ptr_eq(&before, &rebuilt));
-        assert_eq!(rebuilt.lock().await.tool_names(), vec!["file_read"]);
-        let denied = rebuilt
-            .lock()
-            .await
-            .dispatch_tool_for_test("calculator", json!({"function":"add","values":[2,3]}))
-            .await;
-        assert!(!denied.success);
-        refresh_test_principal(&dispatcher, &["file_read"], &[]);
-        let denied = dispatcher
-            .handle_session_prompt(&json!({"session_id":sid,"prompt":"must not run"}))
-            .await
-            .unwrap_err();
-        assert_eq!(denied.code, FORBIDDEN);
+            .expect("a constrained principal rehydrates its own owner-stamped session")
+            .expect("the reaped session rehydrates for its owner");
+        {
+            let guard = rebuilt.lock().await;
+            let tools = guard.tool_names();
+            assert!(
+                tools.contains(&"file_read"),
+                "the narrowed ceiling keeps the selected tool: {tools:?}"
+            );
+            assert!(
+                !tools.contains(&"calculator"),
+                "the narrowed ceiling drops tools outside the selector: {tools:?}"
+            );
+        }
         assert!(sessions.remove(sid).await);
+
+        // Removed-agent rejection: entitlement gone (even with a wildcard tool
+        // selector), so rehydration must not produce a session.
+        refresh_test_principal(&dispatcher, &["*"], &[]);
         let current = dispatcher.current_prompt_authority().unwrap();
-        // Entitlement is gone, so the rehydration must not produce a session.
-        // It may be refused outright or report no restorable row; neither
-        // hands the caller a live agent.
         let refused = current
             .rehydrate_reaped_session(sid, current.stamped_grants())
             .await;
@@ -14230,6 +14545,14 @@ mod tests {
         assert!(sessions.get_agent(sid).await.is_none());
     }
 
+    /// The tool ceiling across empty / named / wildcard / admin selectors,
+    /// intersected with the agent's own risk-profile policy. Because a
+    /// constrained principal is refused a live session (BLOCKER 2), the
+    /// ceiling is exercised the way production applies it to a queued or
+    /// rehydrated turn: the session is built once for an unrestricted
+    /// principal, then each selector is composed onto that agent through
+    /// [`RpcDispatcher::apply_principal_grants_to_agent`] against freshly
+    /// resolved grants — the exact code path a post-admission prompt runs.
     #[tokio::test]
     async fn principal_empty_wildcard_admin_and_risk_intersection() {
         for (tools, admin, expected) in [
@@ -14239,12 +14562,10 @@ mod tests {
             (vec![], true, vec!["calculator", "file_read"]),
         ] {
             let tmp = tempfile::TempDir::new().unwrap();
-            let mut config = principal_test_config(&tmp, &tools, &["*"]);
-            config
-                .permission_profiles
-                .get_mut("principal-test")
-                .unwrap()
-                .admin = admin;
+            // Seed unrestricted so the session itself is permitted; the
+            // matrix selector is applied afterwards, as a later policy refresh
+            // reaches an existing turn.
+            let mut config = principal_test_config(&tmp, &["*"], &["*"]);
             config
                 .risk_profiles
                 .get_mut("test-profile")
@@ -14258,11 +14579,27 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            let agent = sessions.get_agent("principal-matrix").await.unwrap();
-            let agent = agent.lock().await;
+            let handle = sessions.get_agent("principal-matrix").await.unwrap();
+            let mut agent = handle.lock().await;
+
+            // Move the bound principal to this matrix case and re-resolve.
+            {
+                let mut cfg = dispatcher.ctx.config.write();
+                let profile = cfg.permission_profiles.get_mut("principal-test").unwrap();
+                profile.allowed_tools = tools.iter().map(|s| (*s).into()).collect();
+                profile.admin = admin;
+                dispatcher.ctx.auth.refresh_from_config(&cfg).unwrap();
+            }
+            let current = dispatcher.current_prompt_authority().unwrap();
+            let grants = current
+                .stamped_grants()
+                .expect("the refreshed handle carries grants")
+                .clone();
+            current.apply_principal_grants_to_agent(&grants, &mut agent);
+
             let mut names = agent.tool_names();
             names.sort();
-            assert_eq!(names, expected);
+            assert_eq!(names, expected, "selector {tools:?} admin={admin}");
             assert_eq!(
                 agent
                     .dispatch_tool_for_test("calculator", json!({"function":"add","values":[2,3]}))
@@ -14366,15 +14703,12 @@ mod tests {
                 .expect(if helper || always { 1 } else { 0 })
                 .mount(&server).await;
             let mut config = make_mcp_granting_config(&tmp, server.uri(), true);
-            let principal = principal_test_config(
-                &tmp,
-                if helper {
-                    &[TOOL, "tool_search"]
-                } else {
-                    &[TOOL]
-                },
-                &["*"],
-            );
+            // Seed unrestricted so the session is permitted (a constrained
+            // principal is refused session/new, BLOCKER 2); the intended
+            // constrained selector is composed onto the built agent below via
+            // `apply_principal_grants_to_agent`, exactly as a post-admission
+            // turn narrows an existing session.
+            let principal = principal_test_config(&tmp, &["*"], &["*"]);
             config.users = principal.users;
             config.permission_profiles = principal.permission_profiles;
             if always {
@@ -14397,6 +14731,23 @@ mod tests {
             dispatcher.handle_session_new_for_test(&json!({"agent_alias":"test-agent","session_id":"principal-mcp", "chat_mode":"chat"})).await.unwrap();
             let handle = sessions.get_agent("principal-mcp").await.unwrap();
             let mut agent = handle.lock().await;
+            // Compose the intended constrained selector onto the built agent.
+            let selector: &[&str] = if helper {
+                &[TOOL, "tool_search"]
+            } else {
+                &[TOOL]
+            };
+            {
+                let current = dispatcher.current_prompt_authority().unwrap();
+                refresh_test_principal(&dispatcher, selector, &["*"]);
+                let refreshed = dispatcher.current_prompt_authority().unwrap();
+                let grants = refreshed
+                    .stamped_grants()
+                    .expect("the refreshed handle carries grants")
+                    .clone();
+                refreshed.apply_principal_grants_to_agent(&grants, &mut agent);
+                drop(current);
+            }
             assert_eq!(agent.tool_names().contains(&"tool_search"), helper);
             let prompt = agent.system_prompt_for_test().unwrap();
             assert_eq!(prompt.contains("## Deferred Tools"), helper && !always);
@@ -25900,13 +26251,18 @@ mod tests {
             PermissionProfileConfig {
                 allowed_agents: vec!["alpha".into()],
                 // The session-assembly tool gate refuses a constrained selector
-                // before the config lock; grant the wildcard so this fixture
-                // reaches the recheck under test rather than that earlier gate.
+                // before the config lock. A wildcard selector is unrestricted
+                // ONLY when paired with a `tools:execute` grant; grant both so
+                // this fixture resolves to an unconstrained ceiling and reaches
+                // the recheck under test rather than that earlier gate.
                 allowed_tools: vec![zeroclaw_api::grants::WILDCARD.into()],
-                grants: HashMap::from([(
-                    Resource::Sessions,
-                    vec![Verb::Create, Verb::Read, Verb::Update],
-                )]),
+                grants: HashMap::from([
+                    (
+                        Resource::Sessions,
+                        vec![Verb::Create, Verb::Read, Verb::Update],
+                    ),
+                    (Resource::Tools, vec![Verb::Execute]),
+                ]),
                 ..PermissionProfileConfig::default()
             },
         );
