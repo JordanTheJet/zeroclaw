@@ -222,6 +222,10 @@ pub enum Method {
     CanvasRender,
     CanvasClear,
     MetricsScrape,
+    PairingList,
+    PairingRevoke,
+    PairingRevokeAll,
+    PairingNewCode,
 }
 
 impl Method {
@@ -351,6 +355,10 @@ impl Method {
         (Method::CanvasRender, "canvas/render"),
         (Method::CanvasClear, "canvas/clear"),
         (Method::MetricsScrape, "metrics/scrape"),
+        (Method::PairingList, "pairing/list"),
+        (Method::PairingRevoke, "pairing/revoke"),
+        (Method::PairingRevokeAll, "pairing/revoke-all"),
+        (Method::PairingNewCode, "pairing/new-code"),
     ];
 
     /// Resolve a wire method name to a variant. Table scan, no hand-written
@@ -482,7 +490,9 @@ impl Method {
                 (Resource::Tools, Verb::Read)
             }
             M::PluginsList => (Resource::Plugins, Verb::Read),
-            M::A2aIdentity | M::MetricsScrape => (Resource::System, Verb::Read),
+            M::A2aIdentity | M::MetricsScrape | M::PairingList => (Resource::System, Verb::Read),
+            M::PairingRevoke | M::PairingRevokeAll => (Resource::System, Verb::Delete),
+            M::PairingNewCode => (Resource::System, Verb::Create),
             M::CanvasList | M::CanvasGet | M::CanvasHistory => (Resource::Canvas, Verb::Read),
             M::CanvasRender => (Resource::Canvas, Verb::Update),
             M::CanvasClear => (Resource::Canvas, Verb::Delete),
@@ -549,6 +559,16 @@ fn principal_tool_ceiling(grants: &zeroclaw_api::grants::ResolvedGrants) -> Opti
         return None;
     }
     Some(grants.allowed_tools.clone())
+}
+
+/// The JSON-RPC code for a paired-device failure the dashboard reports with
+/// HTTP `status`.
+fn pairing_error_code(status: u16) -> i32 {
+    match status {
+        404 => INVALID_PARAMS,
+        400 | 503 => INVALID_REQUEST,
+        _ => INTERNAL_ERROR,
+    }
 }
 
 fn not_yet_implemented(method: Method) -> RpcResult {
@@ -1777,6 +1797,105 @@ impl RpcDispatcher {
         }
     }
 
+    /// `pairing/*`: the core's authority over paired devices (the device
+    /// list, revocation and one-time codes), with the bodies the dashboard's
+    /// device routes and `/admin/paircode/new` serve.
+    ///
+    /// Administrators only. A pairing code yields a bearer credential for the
+    /// dashboard, so minting one or deciding whose credential survives is an
+    /// operator decision, not a grantable one.
+    async fn handle_pairing_method(&self, method: Method, params: &Value) -> RpcResult {
+        self.require_admin(method)?;
+        let pairing = Arc::clone(self.ctx.auth.pairing());
+        let config = Arc::clone(&self.ctx.config);
+        let lock = Arc::clone(&self.ctx.config_write_lock);
+        let registry = {
+            let current = config.read();
+            crate::devices::registry_for(&current, &pairing)
+        };
+        let device_error = |failure: crate::devices::DeviceFailure| {
+            rpc_err(pairing_error_code(failure.http_status), failure.message)
+        };
+        let code_result = |(status, body): (u16, Value)| {
+            if status == 200 {
+                Ok(body)
+            } else {
+                let message = body["message"]
+                    .as_str()
+                    .unwrap_or("pairing failed")
+                    .to_string();
+                Err(rpc_err(pairing_error_code(status), message))
+            }
+        };
+        match method {
+            Method::PairingList => {
+                crate::devices::list_devices_body(registry.as_deref()).map_err(device_error)
+            }
+            Method::PairingRevoke => {
+                let req: zeroclaw_api::jsonrpc::PairingRevokeRequest = parse_params(params)?;
+                crate::devices::revoke_device(
+                    registry.as_deref(),
+                    &pairing,
+                    config,
+                    lock,
+                    &req.device_id,
+                )
+                .await
+                .map_err(device_error)
+            }
+            Method::PairingRevokeAll => code_result(
+                crate::devices::new_pairing_code(
+                    registry.as_deref(),
+                    &pairing,
+                    config,
+                    lock,
+                    Some("all"),
+                )
+                .await,
+            ),
+            Method::PairingNewCode => {
+                let req: zeroclaw_api::jsonrpc::PairingNewCodeRequest = parse_params(params)?;
+                code_result(
+                    crate::devices::new_pairing_code(
+                        registry.as_deref(),
+                        &pairing,
+                        config,
+                        lock,
+                        req.rotate.as_deref(),
+                    )
+                    .await,
+                )
+            }
+            _ => Err(rpc_err(
+                INTERNAL_ERROR,
+                format!("{} is not a pairing method", method.wire_name()),
+            )),
+        }
+    }
+
+    /// Refuse `method` unless the bound principal is an administrator. An
+    /// unbound dispatcher is refused.
+    fn require_admin(&self, method: Method) -> Result<(), JsonRpcError> {
+        let Some(grants) = self.stamped_grants() else {
+            return Err(rpc_err(AUTH_REQUIRED, "First call must be 'initialize'"));
+        };
+        if grants.admin {
+            return Ok(());
+        }
+        let denied = rpc_err(
+            FORBIDDEN,
+            format!("{} requires an administrator", method.wire_name()),
+        );
+        self.audit_auth_denial(
+            method,
+            &crate::rpc::auth::AuthDenied {
+                code: denied.code,
+                message: denied.message.clone(),
+            },
+        );
+        Err(denied)
+    }
+
     /// `canvas/*`: the daemon's one canvas store, with the bodies and failures
     /// the `/api/canvas` routes use. See [`super::canvas`].
     fn handle_canvas_method(&self, method: Method, params: &Value) -> RpcResult {
@@ -2941,6 +3060,12 @@ impl RpcDispatcher {
             | Method::PluginsList
             | Method::A2aIdentity => self.handle_catalog_method(method, &req.params).await,
             Method::ToolsList => Box::pin(self.handle_tools_list(&req.params)).await,
+            Method::PairingList
+            | Method::PairingRevoke
+            | Method::PairingRevokeAll
+            | Method::PairingNewCode => {
+                Box::pin(self.handle_pairing_method(method, &req.params)).await
+            }
             Method::MetricsScrape => {
                 let observability = self.ctx.config.read().observability.clone();
                 Ok(serde_json::json!({

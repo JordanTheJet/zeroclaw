@@ -668,3 +668,104 @@ async fn metrics_scrape_equals_the_metrics_route_without_prometheus() {
         http
     );
 }
+
+// ── Pairing ──────────────────────────────────────────────────────────────
+
+fn pairing_state(dir: &tempfile::TempDir) -> (crate::AppState, Config) {
+    let mut config = Config::default();
+    config.data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&config.data_dir).unwrap();
+    config.config_path = dir.path().join("config.toml");
+    config.gateway.require_pairing = true;
+    let mut state = test_state(config.clone());
+    state.pairing = std::sync::Arc::new(zeroclaw_config::pairing::PairingGuard::new(
+        true,
+        &[],
+        config.gateway.pairing_code,
+    ));
+    state.device_registry = Some(std::sync::Arc::new(
+        zeroclaw_runtime::devices::DeviceRegistry::with_db_path(dir.path().join("devices.db")),
+    ));
+    (state, config)
+}
+
+async fn text_body(response: Response) -> (u16, String) {
+    let status = response.status().as_u16();
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    (status, String::from_utf8(bytes.to_vec()).unwrap())
+}
+
+#[tokio::test]
+async fn pairing_list_and_revoke_match_the_device_routes() {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, _config) = pairing_state(&dir);
+    let registry = state.device_registry.clone();
+
+    let (status, http) = body_json(
+        crate::api_pairing::list_devices(State(state.clone()), HeaderMap::new())
+            .await
+            .into_response(),
+    )
+    .await;
+    assert_eq!(status, 200, "{http}");
+    assert_eq!(
+        zeroclaw_runtime::devices::list_devices_body(registry.as_deref()).unwrap(),
+        http
+    );
+
+    let (status, http) = text_body(
+        crate::api_pairing::revoke_device(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("no-such-device".to_string()),
+        )
+        .await
+        .into_response(),
+    )
+    .await;
+    let failure = zeroclaw_runtime::devices::revoke_device(
+        registry.as_deref(),
+        &state.pairing,
+        state.config.clone(),
+        state.config_write_lock.clone(),
+        "no-such-device",
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(status, failure.http_status);
+    assert_eq!(http, failure.message);
+}
+
+#[tokio::test]
+async fn pairing_new_code_matches_the_admin_paircode_route() {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, _config) = pairing_state(&dir);
+    let loopback = axum::extract::ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 9)));
+    for rotate in [None, Some("all")] {
+        let response = crate::handle_admin_paircode_new(
+            State(state.clone()),
+            loopback,
+            Query(crate::AdminPaircodeQuery {
+                rotate: rotate.map(str::to_string),
+            }),
+        )
+        .await
+        .map(IntoResponse::into_response)
+        .unwrap_or_else(IntoResponse::into_response);
+        let (status, mut http) = body_json(response).await;
+        let (rpc_status, mut rpc) = zeroclaw_runtime::devices::new_pairing_code(
+            state.device_registry.as_deref(),
+            &state.pairing,
+            state.config.clone(),
+            state.config_write_lock.clone(),
+            rotate,
+        )
+        .await;
+        assert_eq!(status, rpc_status, "{rotate:?}");
+        // Each call mints its own code; everything else must match.
+        assert!(http["pairing_code"].is_string() && rpc["pairing_code"].is_string());
+        http["pairing_code"] = Value::Null;
+        rpc["pairing_code"] = Value::Null;
+        assert_eq!(rpc, http, "{rotate:?}");
+    }
+}

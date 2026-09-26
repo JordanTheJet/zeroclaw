@@ -1741,7 +1741,7 @@ pub async fn run_gateway_with_plugin_webhooks(
 
     // Device registry and pairing store (only when pairing is required)
     let device_registry = if config.gateway.require_pairing {
-        let registry = Arc::new(api_pairing::DeviceRegistry::new(&config.data_dir));
+        let registry = api_pairing::DeviceRegistry::shared(&config.data_dir);
         // Reconcile the registry against the canonical paired-token set so that
         // tokens paired via the legacy `/pair` route (and any other historical
         // orphans) become visible and revocable in the management UI. The token
@@ -2683,28 +2683,7 @@ pub(crate) async fn persist_pairing_tokens(
     pairing: &PairingGuard,
     config_write_lock: Arc<tokio::sync::Mutex<()>>,
 ) -> Result<()> {
-    // Self-contained: no caller pre-reads config for modify, so this
-    // acquires the witness itself rather than taking it as a param. Held
-    // across the whole read-modify-save-swap below.
-    let _guard = Arc::clone(&config_write_lock).lock_owned().await;
-    debug_assert!(
-        config_write_lock.try_lock().is_err(),
-        "persist_pairing_tokens must hold config_write_lock across its read-modify-save-swap"
-    );
-    let paired_tokens = pairing.tokens();
-    // This is needed because parking_lot's guard is not Send so we clone the inner
-    // this should be removed once async mutexes are used everywhere
-    let mut updated_cfg = { config.read().clone() };
-    updated_cfg.gateway.paired_tokens = paired_tokens;
-    updated_cfg.mark_dirty("gateway.paired_tokens");
-    updated_cfg
-        .save_dirty()
-        .await
-        .context("Failed to persist paired tokens to config.toml")?;
-
-    // Keep shared runtime config in sync with persisted tokens.
-    *config.write() = updated_cfg;
-    Ok(())
+    zeroclaw_runtime::devices::persist_pairing_tokens(config, pairing, config_write_lock).await
 }
 
 /// Result of a gateway chat turn.
@@ -4728,147 +4707,16 @@ async fn handle_admin_paircode_new(
     Query(params): Query<AdminPaircodeQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     require_localhost(&peer)?;
-
-    if !state.pairing.require_pairing() {
-        let body = serde_json::json!({
-            "success": false,
-            "pairing_required": false,
-            "pairing_code": null,
-            "message": "Pairing is disabled for this gateway"
-        });
-        return Ok((StatusCode::BAD_REQUEST, Json(body)));
-    }
-
-    let rotate = params
-        .rotate
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
-
-    let revocation_message = match rotate {
-        Some("all") => {
-            let revoked = state.pairing.revoke_all_tokens();
-            if let Some(registry) = state.device_registry.as_ref() {
-                if let Err(e) = registry.clear() {
-                    let body = serde_json::json!({
-                        "success": false,
-                        "pairing_required": true,
-                        "pairing_code": null,
-                        "message": format!("Tokens revoked in memory but device registry clear failed: {e}"),
-                    });
-                    return Ok((StatusCode::INTERNAL_SERVER_ERROR, Json(body)));
-                }
-            }
-            if let Err(e) = persist_pairing_tokens(
-                state.config.clone(),
-                &state.pairing,
-                state.config_write_lock.clone(),
-            )
-            .await
-            {
-                let body = serde_json::json!({
-                    "success": false,
-                    "pairing_required": true,
-                    "pairing_code": null,
-                    "message": format!("Tokens revoked in memory but config persist failed: {e}"),
-                });
-                return Ok((StatusCode::INTERNAL_SERVER_ERROR, Json(body)));
-            }
-            ::zeroclaw_log::record!(
-                INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_attrs(::serde_json::json!({"revoked": revoked})),
-                "all paired tokens revoked via admin endpoint"
-            );
-            Some(format!(
-                "Revoked all {revoked} paired token(s) and cleared the device registry."
-            ))
-        }
-        Some(device_id) => {
-            let Some(registry) = state.device_registry.as_ref() else {
-                let body = serde_json::json!({
-                    "success": false,
-                    "pairing_required": true,
-                    "pairing_code": null,
-                    "message": "Device registry is disabled; cannot rotate a single device.",
-                });
-                return Ok((StatusCode::SERVICE_UNAVAILABLE, Json(body)));
-            };
-            let token_hash = match registry.revoke(device_id) {
-                Ok(Some(hash)) => hash,
-                Ok(None) => {
-                    let body = serde_json::json!({
-                        "success": false,
-                        "pairing_required": true,
-                        "pairing_code": null,
-                        "message": format!("Device '{device_id}' not found; nothing revoked."),
-                    });
-                    return Ok((StatusCode::NOT_FOUND, Json(body)));
-                }
-                Err(e) => {
-                    let body = serde_json::json!({
-                        "success": false,
-                        "pairing_required": true,
-                        "pairing_code": null,
-                        "message": format!("Device registry error: {e}"),
-                    });
-                    return Ok((StatusCode::INTERNAL_SERVER_ERROR, Json(body)));
-                }
-            };
-            state.pairing.revoke_token_hash(&token_hash);
-            if let Err(e) = persist_pairing_tokens(
-                state.config.clone(),
-                &state.pairing,
-                state.config_write_lock.clone(),
-            )
-            .await
-            {
-                let body = serde_json::json!({
-                    "success": false,
-                    "pairing_required": true,
-                    "pairing_code": null,
-                    "message": format!("Token revoked in memory but config persist failed: {e}"),
-                });
-                return Ok((StatusCode::INTERNAL_SERVER_ERROR, Json(body)));
-            }
-            ::zeroclaw_log::record!(
-                INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-                "single device token revoked via admin endpoint"
-            );
-            Some(format!(
-                "Revoked the bearer token for device '{device_id}'."
-            ))
-        }
-        None => None,
-    };
-
-    let code = state
-        .pairing
-        .generate_new_pairing_code(live_pairing_code_policy(&state))
-        .expect("require_pairing checked above");
-    if rotate.is_none() {
-        ::zeroclaw_log::record!(
-            INFO,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-            "new pairing code generated via admin endpoint"
-        );
-    }
-
-    let message = match revocation_message {
-        Some(revoked) => {
-            format!("{revoked} Use this one-time code to re-pair.")
-        }
-        None => "New pairing code generated — use this one-time code to pair".to_string(),
-    };
-
-    let body = serde_json::json!({
-        "success": true,
-        "pairing_required": true,
-        "pairing_code": code,
-        "message": message,
-    });
-    Ok((StatusCode::OK, Json(body)))
+    let (status, body) = zeroclaw_runtime::devices::new_pairing_code(
+        state.device_registry.as_deref(),
+        &state.pairing,
+        state.config.clone(),
+        state.config_write_lock.clone(),
+        params.rotate.as_deref(),
+    )
+    .await;
+    let status = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    Ok((status, Json(body)))
 }
 
 async fn handle_pair_code(State(state): State<AppState>) -> impl IntoResponse {

@@ -691,3 +691,137 @@ fn metrics_scrape_is_classified_and_named() {
         MethodAuthz::Requires(Resource::System, Verb::Read)
     );
 }
+
+// ── Pairing ───────────────────────────────────────────────────────────────
+
+/// A config with pairing required and its data directory (where the device
+/// registry lives) inside `tmp`, never the real home directory.
+fn pairing_config(
+    tmp: &tempfile::TempDir,
+    require_pairing: bool,
+) -> zeroclaw_config::schema::Config {
+    let mut config = make_acp_test_config(tmp);
+    config.data_dir = tmp.path().join("data");
+    std::fs::create_dir_all(&config.data_dir).unwrap();
+    config.config_path = tmp.path().join("config.toml");
+    config.gateway.require_pairing = require_pairing;
+    config
+}
+
+#[test]
+fn pairing_methods_are_classified_and_named() {
+    use zeroclaw_api::grants::{Resource, Verb};
+    for (method, wire, verb) in [
+        (Method::PairingList, "pairing/list", Verb::Read),
+        (Method::PairingRevoke, "pairing/revoke", Verb::Delete),
+        (Method::PairingRevokeAll, "pairing/revoke-all", Verb::Delete),
+        (Method::PairingNewCode, "pairing/new-code", Verb::Create),
+    ] {
+        assert_eq!(method.wire_name(), wire);
+        assert_eq!(Method::from_wire(wire), Some(method));
+        assert_eq!(
+            method.authz(),
+            MethodAuthz::Requires(Resource::System, verb),
+            "{wire}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_administrator_manages_pairing_over_rpc() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let ctx = enforcement_ctx(pairing_config(&tmp, true));
+    let (mut operator, mut rx) = local_operator(&ctx).await;
+
+    let code = rpc(&mut operator, &mut rx, 1, "pairing/new-code", json!({})).await;
+    assert_eq!(code["result"]["success"], json!(true), "{code}");
+    assert!(code["result"]["pairing_code"].is_string(), "{code}");
+
+    let listed = rpc(&mut operator, &mut rx, 2, "pairing/list", json!({})).await;
+    assert_eq!(listed["result"]["count"], json!(0), "{listed}");
+
+    let missing = rpc(
+        &mut operator,
+        &mut rx,
+        3,
+        "pairing/revoke",
+        json!({"device_id": "no-such-device"}),
+    )
+    .await;
+    assert_eq!(missing["error"]["code"], json!(INVALID_PARAMS), "{missing}");
+    assert_eq!(missing["error"]["message"], json!("Device not found"));
+
+    let rotated = rpc(&mut operator, &mut rx, 4, "pairing/revoke-all", json!({})).await;
+    assert_eq!(rotated["result"]["success"], json!(true), "{rotated}");
+    assert!(
+        rotated["result"]["message"]
+            .as_str()
+            .is_some_and(|m| m.starts_with("Revoked all")),
+        "{rotated}"
+    );
+}
+
+#[tokio::test]
+async fn pairing_methods_refuse_a_principal_that_is_not_an_administrator() {
+    use std::collections::HashMap;
+    use zeroclaw_api::grants::{Resource, Verb};
+    use zeroclaw_config::schema::{PermissionProfileConfig, UserConfig};
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let mut config = pairing_config(&tmp, true);
+    config.permission_profiles.insert(
+        "system-everything".into(),
+        PermissionProfileConfig {
+            allowed_agents: vec![zeroclaw_api::grants::WILDCARD.into()],
+            grants: HashMap::from([(
+                Resource::System,
+                vec![
+                    Verb::Create,
+                    Verb::Read,
+                    Verb::Update,
+                    Verb::Delete,
+                    Verb::Execute,
+                ],
+            )]),
+            ..PermissionProfileConfig::default()
+        },
+    );
+    config.users.insert(
+        "scoped".into(),
+        UserConfig {
+            uid: Some(SCOPED),
+            permission_profiles: vec!["system-everything".into()],
+            ..UserConfig::default()
+        },
+    );
+    let ctx = enforcement_ctx(config);
+    let (mut peer, mut rx) = roster_peer(&ctx, SCOPED).await;
+    for (id, method, params) in [
+        (1, "pairing/list", json!({})),
+        (2, "pairing/revoke", json!({"device_id": "d"})),
+        (3, "pairing/revoke-all", json!({})),
+        (4, "pairing/new-code", json!({})),
+    ] {
+        let response = rpc(&mut peer, &mut rx, id, method, params).await;
+        assert_forbidden(&response, method);
+        assert!(
+            response["error"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("administrator")),
+            "{method} is refused by the administrator check, not the grant gate: {response}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn pairing_new_code_reports_pairing_disabled() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let ctx = enforcement_ctx(pairing_config(&tmp, false));
+    let (mut operator, mut rx) = local_operator(&ctx).await;
+    let code = rpc(&mut operator, &mut rx, 1, "pairing/new-code", json!({})).await;
+    assert_eq!(code["error"]["code"], json!(INVALID_REQUEST), "{code}");
+    assert_eq!(
+        code["error"]["message"],
+        json!("Pairing is disabled for this gateway")
+    );
+}
