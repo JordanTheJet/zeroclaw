@@ -140,6 +140,20 @@ pub async fn run(runtime: Runtime) -> anyhow::Result<DaemonExit>;
 5. **The observer is process-level per generation.** It is an instance, not a source, because it is not resolved per agent.
 6. **Outbound only.** `ChannelSource` covers channels the runtime sends through: replies by alias, scheduled delivery, and approval prompts. Inbound turns arrive through `RuntimeIngress`, not through this contract.
 
+### Which principal each caller passes
+
+`ProviderRequest.principal` is the principal the entry point resolved for the turn, and `None` when it has none. It never widens what a turn may do; a source may use it only to choose credentials or quotas. As callers move onto the contract, each passes:
+
+| Caller | Principal |
+| --- | --- |
+| CLI `agent` (interactive and one-shot) | `None`, as today |
+| RPC sessions (`session/new`, rehydration, model changes) | The connection's resolved principal |
+| Cron agent jobs | `None`: a job records no owning principal today. When job ownership lands, the job's owner |
+| SOP drivers and the heartbeat worker | `None`: they run as the daemon, not for a caller |
+| Channels orchestrator | `None` until inbound principal resolution supplies one through `RuntimeIngress` |
+
+With config-backed sources, a `None` principal constructs and switches exactly as the compatibility adapters do, which is what makes each move a no-op for existing configurations.
+
 ### Security policy stays with the runtime
 
 The issue requires resolved security policy to remain explicit across the boundary. The rule is:

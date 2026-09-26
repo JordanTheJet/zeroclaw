@@ -26963,6 +26963,7 @@ BTC is currently around $65,000 based on latest tool output."#
             escalate_handle: None,
             channel_room_handle: None,
             unfiltered_tool_arcs: Vec::new(),
+            delegate_capabilities: None,
         }
     }
 

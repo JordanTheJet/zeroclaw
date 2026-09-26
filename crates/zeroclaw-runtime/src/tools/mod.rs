@@ -563,6 +563,13 @@ pub const BUILTIN_TOOL_INTEGRATIONS: &[(&str, &str)] = &[
 pub use shell_env::ForwardedEnvironment;
 
 /// Bundled return values from tool registry construction.
+/// Where a registry's delegate tool reads the capabilities it resolves
+/// delegate targets through. Empty until the entry point that owns the
+/// registry binds its capabilities; the delegate falls back to the
+/// config-backed set while it is empty.
+pub type DelegateCapabilitiesSlot =
+    Arc<std::sync::OnceLock<crate::composition::RuntimeCapabilities>>;
+
 /// Named struct to avoid an ever-growing positional tuple that's painful
 /// to destructure across many callers.
 #[allow(clippy::type_complexity)]
@@ -589,6 +596,11 @@ pub struct AllToolsResult {
     /// Pre-boxed Arcs of every tool (before policy filter). Used by
     /// skill-scoped builtin elevation to resolve targets at registration.
     pub unfiltered_tool_arcs: Vec<Arc<dyn Tool>>,
+    /// The capability slot of the delegate tool this factory registered, so
+    /// the entry point that owns the registry can bind its capabilities
+    /// (`RuntimeCapabilities::bind_registry`) and delegated targets resolve
+    /// through them. `None` when no delegate was registered.
+    pub delegate_capabilities: Option<DelegateCapabilitiesSlot>,
     /// The exact `DelegateTool` this factory registered, in its concrete type.
     ///
     /// Test-only. `tools`/`unfiltered_tool_arcs` erase the type behind
@@ -623,6 +635,7 @@ impl AllToolsResult {
             poll_handle: None,
             escalate_handle: None,
             unfiltered_tool_arcs: Vec::new(),
+            delegate_capabilities: None,
             #[cfg(test)]
             delegate_tool: None,
         }
@@ -2172,6 +2185,7 @@ fn all_tools_with_runtime_on_thread(
                     unfiltered_tool_arcs: tool_arcs.clone(),
                     tools: boxed_registry_from_arcs(tool_arcs),
                     delegate_handle: None,
+                    delegate_capabilities: None,
                     #[cfg(test)]
                     delegate_tool: None,
                     ask_user_handle,
@@ -2252,6 +2266,7 @@ fn all_tools_with_runtime_on_thread(
 
     #[cfg(test)]
     let mut built_delegate_tool: Option<Arc<DelegateTool>> = None;
+    let mut delegate_capabilities: Option<DelegateCapabilitiesSlot> = None;
     let delegate_handle: Option<DelegateParentToolsHandle> = if agents.is_empty() {
         None
     } else {
@@ -2295,6 +2310,7 @@ fn all_tools_with_runtime_on_thread(
         // `live_config` argument this function received.
         .with_live_config(live_config.clone())
         .with_caller_alias(agent_alias);
+        delegate_capabilities = Some(delegate_tool.capabilities_slot());
         let delegate_tool = Arc::new(delegate_tool);
         #[cfg(test)]
         {
@@ -2389,6 +2405,7 @@ fn all_tools_with_runtime_on_thread(
         unfiltered_tool_arcs: tool_arcs.clone(),
         tools: boxed_registry_from_arcs(tool_arcs),
         delegate_handle,
+        delegate_capabilities,
         ask_user_handle,
         channel_room_handle,
         reaction_handle,

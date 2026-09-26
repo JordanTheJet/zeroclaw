@@ -2,7 +2,9 @@
 //!
 //! These sources reproduce the construction the entry points performed inline
 //! before they took capabilities, so an adapter that routes through them
-//! builds the same provider, memory and observer it did before.
+//! builds the same provider, memory and observer it did before. They are
+//! public through [`super::defaults`] so the application layer composes the
+//! same recipe instead of copying it.
 
 use std::sync::Arc;
 
@@ -18,28 +20,31 @@ use super::{
     RuntimeCapabilities, ToolRequest, ToolSource,
 };
 
-pub(super) fn capabilities(config: &Config) -> RuntimeCapabilities {
+pub(super) fn capabilities_with_observer(
+    observer: Arc<dyn zeroclaw_api::observability_traits::Observer>,
+) -> RuntimeCapabilities {
     RuntimeCapabilities {
         providers: Arc::new(ConfigProviders),
         memory: Arc::new(ConfigMemory),
         tools: Arc::new(NoSuppliedTools),
         channels: Arc::new(NoOutboundChannels),
-        observer: Arc::from(crate::observability::create_observer(&config.observability)),
+        observer,
     }
+}
+
+pub(super) fn capabilities(config: &Config) -> RuntimeCapabilities {
+    capabilities_with_observer(Arc::from(crate::observability::create_observer(
+        &config.observability,
+    )))
 }
 
 pub(super) fn unobserved_capabilities() -> RuntimeCapabilities {
-    RuntimeCapabilities {
-        providers: Arc::new(ConfigProviders),
-        memory: Arc::new(ConfigMemory),
-        tools: Arc::new(NoSuppliedTools),
-        channels: Arc::new(NoOutboundChannels),
-        observer: Arc::new(crate::observability::NoopObserver),
-    }
+    capabilities_with_observer(Arc::new(crate::observability::NoopObserver))
 }
 
-/// Builds the routed, resilient provider the turn loop and the agent built.
-struct ConfigProviders;
+/// Builds the routed, resilient provider the turn loop and the agent built,
+/// and the agent's config-snapshot provider on a model switch.
+pub struct ConfigProviders;
 
 impl ProviderSource for ConfigProviders {
     fn model_provider(
@@ -135,7 +140,7 @@ impl ProviderSource for ConfigProviders {
 
 /// Opens the agent's memory with the agent provider's credential, which
 /// embedding resolution inherits when `[memory]` names none of its own.
-struct ConfigMemory;
+pub struct ConfigMemory;
 
 #[async_trait]
 impl MemorySource for ConfigMemory {
@@ -150,7 +155,7 @@ impl MemorySource for ConfigMemory {
 
 /// Every tool is still built by the runtime's own registry, so the
 /// config-backed set supplies none of its own.
-struct NoSuppliedTools;
+pub struct NoSuppliedTools;
 
 impl ToolSource for NoSuppliedTools {
     fn tools(&self, _request: &ToolRequest<'_>) -> anyhow::Result<Vec<Box<dyn Tool>>> {
@@ -159,7 +164,7 @@ impl ToolSource for NoSuppliedTools {
 }
 
 /// No entry point sends through `ChannelSource` yet.
-struct NoOutboundChannels;
+pub struct NoOutboundChannels;
 
 impl ChannelSource for NoOutboundChannels {
     fn channel(&self, _alias: &str) -> Option<Arc<dyn Channel>> {
