@@ -3,6 +3,7 @@
 pub mod approval_channel;
 pub mod attachments;
 pub mod auth;
+pub mod canvas;
 pub mod catalog;
 pub mod context;
 pub mod dispatch;
