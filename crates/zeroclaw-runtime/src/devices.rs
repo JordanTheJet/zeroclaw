@@ -126,8 +126,10 @@ impl DeviceRegistry {
         }
     }
 
-    /// A private registry over an explicit database file, for tests and
-    /// tools that must not share the process's instance.
+    /// A private registry over an explicit database file, for tests that
+    /// must not share the process's instance. It opens the file as is and
+    /// creates no schema.
+    #[cfg(any(test, feature = "test-util"))]
     pub fn with_db_path(db_path: PathBuf) -> Self {
         Self {
             cache: Mutex::new(HashMap::new()),

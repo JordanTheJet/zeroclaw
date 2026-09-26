@@ -1169,3 +1169,185 @@ async fn fs_delete_and_rmdir_refuse_a_path_that_resolves_to_the_root() {
     );
     assert!(tmp.path().join("shared").exists());
 }
+
+// ── Review hardening ──────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn minting_and_clearing_pairing_credentials_is_local_only() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let ctx = enforcement_ctx(pairing_config(&tmp, true));
+    let (writer, _rx) = tokio::sync::mpsc::channel(8);
+    let remote = RpcDispatcher::new(Arc::clone(&ctx), writer, "wss:test".into()).with_transport(
+        crate::rpc::transport::TransportKind::Wss,
+        crate::security::auth_provider::Credential::None,
+    );
+    for method in [Method::PairingNewCode, Method::PairingRevokeAll] {
+        let refused = remote.require_local_transport(method).unwrap_err();
+        assert_eq!(refused.code, FORBIDDEN, "{}", method.wire_name());
+    }
+    let (writer, _rx) = tokio::sync::mpsc::channel(8);
+    let local = RpcDispatcher::new(Arc::clone(&ctx), writer, "local:test".into());
+    assert!(
+        local
+            .require_local_transport(Method::PairingNewCode)
+            .is_ok()
+    );
+}
+
+const PAIRED_TOKEN: &str = "p6-paired-token";
+
+fn paired_ctx(tmp: &tempfile::TempDir) -> Arc<RpcContext> {
+    let mut config = pairing_config(tmp, true);
+    config.gateway.paired_tokens = vec![PAIRED_TOKEN.to_string()];
+    let ctx = enforcement_ctx(config);
+    assert!(
+        ctx.auth.pairing().is_authenticated(PAIRED_TOKEN),
+        "the fixture token is paired"
+    );
+    ctx
+}
+
+#[tokio::test]
+async fn pairing_revoke_invalidates_a_registered_devices_token() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let ctx = paired_ctx(&tmp);
+    let now = chrono::Utc::now();
+    crate::devices::DeviceRegistry::shared(&ctx.config.read().data_dir)
+        .register(
+            zeroclaw_config::pairing::PairingGuard::token_hash(PAIRED_TOKEN),
+            crate::devices::DeviceInfo {
+                id: "device-1".into(),
+                name: Some("phone".into()),
+                device_type: None,
+                paired_at: now,
+                last_seen: now,
+                ip_address: None,
+                capabilities: None,
+            },
+        )
+        .unwrap();
+    let (mut operator, mut rx) = local_operator(&ctx).await;
+
+    let listed = rpc(&mut operator, &mut rx, 1, "pairing/list", json!({})).await;
+    assert_eq!(listed["result"]["count"], json!(1), "{listed}");
+    let revoked = rpc(
+        &mut operator,
+        &mut rx,
+        2,
+        "pairing/revoke",
+        json!({"device_id": "device-1"}),
+    )
+    .await;
+    assert_eq!(
+        revoked["result"]["device_id"],
+        json!("device-1"),
+        "{revoked}"
+    );
+    assert!(
+        !ctx.auth.pairing().is_authenticated(PAIRED_TOKEN),
+        "the revoked device's bearer no longer authenticates"
+    );
+}
+
+#[tokio::test]
+async fn pairing_revoke_all_invalidates_every_paired_token() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let ctx = paired_ctx(&tmp);
+    let (mut operator, mut rx) = local_operator(&ctx).await;
+    let rotated = rpc(&mut operator, &mut rx, 1, "pairing/revoke-all", json!({})).await;
+    assert_eq!(rotated["result"]["success"], json!(true), "{rotated}");
+    assert!(!ctx.auth.pairing().is_authenticated(PAIRED_TOKEN));
+}
+
+#[tokio::test]
+async fn system_restart_signals_the_daemon_supervisor() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let mut ctx = enforcement_ctx(make_acp_test_config(&tmp));
+    let (reload_tx, mut reload_rx) = tokio::sync::watch::channel(false);
+    Arc::get_mut(&mut ctx)
+        .expect("a fresh context is unshared")
+        .reload_tx = Some(reload_tx);
+    let (mut operator, mut rx) = local_operator(&ctx).await;
+    let restarted = rpc(
+        &mut operator,
+        &mut rx,
+        1,
+        "system/restart",
+        json!({"component": "daemon"}),
+    )
+    .await;
+    assert_eq!(
+        restarted["result"],
+        json!({"component": "daemon", "restarting": true}),
+        "{restarted}"
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(5), reload_rx.changed())
+        .await
+        .expect("the supervisor is signalled")
+        .expect("the reload channel stays open");
+    assert!(*reload_rx.borrow());
+}
+
+/// A principal scoped to one agent, with `channels:*` and `canvas:read`.
+fn one_agent_config(tmp: &tempfile::TempDir) -> zeroclaw_config::schema::Config {
+    use std::collections::HashMap;
+    use zeroclaw_api::grants::{Resource, Verb};
+    use zeroclaw_config::schema::{PermissionProfileConfig, UserConfig};
+
+    let mut config = make_acp_test_config(tmp);
+    config.permission_profiles.insert(
+        "one-agent".into(),
+        PermissionProfileConfig {
+            allowed_agents: vec!["test-agent".into()],
+            grants: HashMap::from([
+                (Resource::Channels, vec![Verb::Read, Verb::Update]),
+                (Resource::Canvas, vec![Verb::Read]),
+            ]),
+            ..PermissionProfileConfig::default()
+        },
+    );
+    config.users.insert(
+        "scoped".into(),
+        UserConfig {
+            uid: Some(SCOPED),
+            permission_profiles: vec!["one-agent".into()],
+            ..UserConfig::default()
+        },
+    );
+    config
+}
+
+#[tokio::test]
+async fn channels_relink_of_a_channel_the_principal_does_not_own_is_refused() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (ctx, channels) = with_channels(one_agent_config(&tmp));
+    let (mut peer, mut rx) = roster_peer(&ctx, SCOPED).await;
+    let relinked = rpc(
+        &mut peer,
+        &mut rx,
+        1,
+        "channels/relink",
+        json!({"channel": "telegram.unowned"}),
+    )
+    .await;
+    assert_forbidden(&relinked, "relink of a channel no agent of theirs owns");
+    assert!(
+        channels.calls.lock().is_empty(),
+        "the capability was never reached"
+    );
+}
+
+#[tokio::test]
+async fn canvas_needs_access_to_every_agent() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let ctx = enforcement_ctx(one_agent_config(&tmp));
+    let (mut peer, mut rx) = roster_peer(&ctx, SCOPED).await;
+    let listed = rpc(&mut peer, &mut rx, 1, "canvas/list", json!({})).await;
+    assert_forbidden(&listed, "canvas/list scoped to one agent");
+    assert!(
+        listed["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("every agent")),
+        "refused by the shared-store check, not the grant gate: {listed}"
+    );
+}
