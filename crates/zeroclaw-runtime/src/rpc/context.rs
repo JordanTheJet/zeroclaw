@@ -165,6 +165,10 @@ pub struct RpcContext {
     /// when there is no daemon event bus.
     pub event_history: Option<Arc<crate::observability::EventBuffer>>,
 
+    /// Replayable, bounded subscription sources (`logs/subscribe`,
+    /// `events/subscribe`). The daemon feeds it from its event bus.
+    pub subscriptions: Arc<crate::rpc::subscription::SubscriptionHub>,
+
     /// Write `true` to trigger a daemon-level config reload. Mirrors
     /// the gateway's `/admin/reload` mechanism.
     pub reload_tx: Option<tokio::sync::watch::Sender<bool>>,
@@ -267,6 +271,7 @@ impl RpcContext {
             cost_tracker: None,
             event_tx: None,
             event_history: None,
+            subscriptions: Arc::new(crate::rpc::subscription::SubscriptionHub::new()),
             reload_tx: None,
             gateway_shutdown_tx: None,
             approval_pending: Arc::new(ApprovalPendingMap::default()),
@@ -295,6 +300,7 @@ impl RpcContext {
             cost_tracker: None,
             event_tx: None,
             event_history: None,
+            subscriptions: Arc::new(crate::rpc::subscription::SubscriptionHub::new()),
             reload_tx: None,
             gateway_shutdown_tx: None,
             approval_pending: Arc::new(ApprovalPendingMap::default()),
@@ -332,6 +338,7 @@ impl RpcContext {
             cost_tracker: None,
             event_tx: None,
             event_history: None,
+            subscriptions: Arc::new(crate::rpc::subscription::SubscriptionHub::new()),
             reload_tx: None,
             gateway_shutdown_tx: None,
             approval_pending: Arc::new(ApprovalPendingMap::default()),
@@ -354,7 +361,25 @@ impl RpcContext {
         sessions: Arc<SessionStore>,
         event_tx: tokio::sync::broadcast::Sender<Value>,
     ) -> Arc<Self> {
-        Self::minimal_with_events(config, sessions, event_tx, None)
+        Self::minimal_with_events(
+            config,
+            sessions,
+            event_tx,
+            None,
+            Arc::new(crate::rpc::subscription::SubscriptionHub::new()),
+        )
+    }
+
+    /// Like [`Self::minimal_with_event_tx`] with a caller-built hub, so a test
+    /// can use small ring caps.
+    #[cfg(test)]
+    pub fn minimal_with_subscription_hub(
+        config: Config,
+        sessions: Arc<SessionStore>,
+        event_tx: tokio::sync::broadcast::Sender<Value>,
+        hub: Arc<crate::rpc::subscription::SubscriptionHub>,
+    ) -> Arc<Self> {
+        Self::minimal_with_events(config, sessions, event_tx, None, hub)
     }
 
     /// Like [`Self::minimal_with_event_tx`], wired to a whole daemon-style
@@ -370,6 +395,7 @@ impl RpcContext {
             sessions,
             bus.sender().clone(),
             Some(Arc::clone(bus.history())),
+            Arc::new(crate::rpc::subscription::SubscriptionHub::new()),
         )
     }
 
@@ -379,6 +405,7 @@ impl RpcContext {
         sessions: Arc<SessionStore>,
         event_tx: tokio::sync::broadcast::Sender<Value>,
         event_history: Option<Arc<crate::observability::EventBuffer>>,
+        subscriptions: Arc<crate::rpc::subscription::SubscriptionHub>,
     ) -> Arc<Self> {
         let auth = crate::rpc::auth::RpcInboundAuth::for_tests(&config);
         Arc::new(Self {
@@ -390,6 +417,7 @@ impl RpcContext {
             cost_tracker: None,
             event_tx: Some(event_tx),
             event_history,
+            subscriptions,
             reload_tx: None,
             gateway_shutdown_tx: None,
             approval_pending: Arc::new(ApprovalPendingMap::default()),
@@ -422,6 +450,7 @@ impl RpcContext {
             cost_tracker: None,
             event_tx: None,
             event_history: None,
+            subscriptions: Arc::new(crate::rpc::subscription::SubscriptionHub::new()),
             reload_tx: None,
             gateway_shutdown_tx: None,
             approval_pending: Arc::new(ApprovalPendingMap::default()),
@@ -460,6 +489,7 @@ impl RpcContext {
             cost_tracker: None,
             event_tx: None,
             event_history: None,
+            subscriptions: Arc::new(crate::rpc::subscription::SubscriptionHub::new()),
             reload_tx: None,
             gateway_shutdown_tx: None,
             approval_pending: Arc::new(ApprovalPendingMap::default()),
@@ -491,6 +521,7 @@ impl RpcContext {
             cost_tracker: None,
             event_tx: None,
             event_history: None,
+            subscriptions: Arc::new(crate::rpc::subscription::SubscriptionHub::new()),
             reload_tx: None,
             gateway_shutdown_tx: None,
             approval_pending: Arc::new(ApprovalPendingMap::default()),
@@ -523,6 +554,7 @@ impl RpcContext {
             cost_tracker: Some(cost_tracker),
             event_tx: None,
             event_history: None,
+            subscriptions: Arc::new(crate::rpc::subscription::SubscriptionHub::new()),
             reload_tx: None,
             gateway_shutdown_tx: None,
             approval_pending: Arc::new(ApprovalPendingMap::default()),
@@ -556,6 +588,7 @@ impl RpcContext {
             cost_tracker: None,
             event_tx: None,
             event_history: None,
+            subscriptions: Arc::new(crate::rpc::subscription::SubscriptionHub::new()),
             reload_tx: None,
             gateway_shutdown_tx: None,
             approval_pending: Arc::new(ApprovalPendingMap::default()),
@@ -589,6 +622,7 @@ impl RpcContext {
             cost_tracker: None,
             event_tx: None,
             event_history: None,
+            subscriptions: Arc::new(crate::rpc::subscription::SubscriptionHub::new()),
             reload_tx,
             gateway_shutdown_tx,
             approval_pending: Arc::new(ApprovalPendingMap::default()),

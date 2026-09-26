@@ -836,6 +836,11 @@ pub async fn run(
             ),
             event_tx: Some(event_tx.clone()),
             event_history: Some(std::sync::Arc::clone(event_bus.history())),
+            subscriptions: {
+                let hub = std::sync::Arc::new(crate::rpc::subscription::SubscriptionHub::new());
+                hub.attach_bus(&event_tx);
+                hub
+            },
             reload_tx: Some(reload_tx.clone()),
             gateway_shutdown_tx: Some(gateway_shutdown_tx.clone()),
             approval_pending: std::sync::Arc::new(
