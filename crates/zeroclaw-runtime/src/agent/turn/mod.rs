@@ -2774,7 +2774,7 @@ pub(crate) async fn assemble_owned_execution_with_capabilities(
         sop_audit,
         None,
     )?;
-    capabilities.add_source_tools(
+    capabilities.bind_registry(
         &mut built,
         &crate::composition::ToolRequest {
             config: &tool_config,
@@ -2833,7 +2833,7 @@ pub(crate) async fn assemble_owned_execution_with_capabilities(
             ))
         })?;
     let (model_provider, provider_name, model, _model_route_resolver) =
-        crate::agent::agent::session_model_provider_from(
+        crate::agent::agent::build_session_model_provider_with_capabilities(
             capabilities,
             config,
             alias,

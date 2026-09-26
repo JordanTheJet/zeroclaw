@@ -1508,7 +1508,7 @@ pub async fn run_with_capabilities(
             sop_audit,
             None,
         )?;
-        capabilities.add_source_tools(
+        capabilities.bind_registry(
             &mut all_tools_result,
             &crate::composition::ToolRequest {
                 config: &tool_config,
@@ -3202,7 +3202,7 @@ pub async fn process_message_with_capabilities(
             sop_audit,
             None,
         )?;
-        capabilities.add_source_tools(
+        capabilities.bind_registry(
             &mut all_tools_result_pm,
             &crate::composition::ToolRequest {
                 config: &config,
@@ -14937,6 +14937,7 @@ Let me check the result."#;
             escalate_handle: None,
             channel_room_handle: None,
             unfiltered_tool_arcs: Vec::new(),
+            delegate_capabilities: None,
             delegate_tool: None,
         };
         let skill = crate::skills::Skill {

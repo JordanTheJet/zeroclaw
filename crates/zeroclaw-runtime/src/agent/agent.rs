@@ -40,12 +40,13 @@ type SessionModelProvider = (
 );
 
 /// [`build_session_model_provider`] with the provider obtained from
-/// `capabilities`, resolved for `agent_alias` and `principal`.
+/// `capabilities`, resolved for `agent_alias` and `principal`. For session
+/// surfaces (RPC) that swap a session's provider for a connection principal.
 ///
 /// The reference and model are validated and resolved exactly as there; the
 /// route resolver is derived from the same config routes the routed provider
 /// is built from.
-pub(crate) fn session_model_provider_from(
+pub fn build_session_model_provider_with_capabilities(
     capabilities: &crate::composition::RuntimeCapabilities,
     config: &Config,
     agent_alias: &str,
@@ -591,6 +592,18 @@ pub struct StreamedTurnError {
 /// may republish it; direct ACP/WS agents pin it until reconnect.
 pub type ConfigGeneration =
     std::sync::Arc<parking_lot::RwLock<std::sync::Arc<zeroclaw_config::schema::Config>>>;
+
+/// How a snapshot or live-config constructor obtains its capabilities.
+enum CapabilityBinding {
+    /// Build the config-backed set from the construction snapshot: the
+    /// compatibility adapter.
+    ConfigBacked,
+    /// Use the caller's capabilities, resolving for `principal`.
+    Supplied {
+        capabilities: crate::composition::RuntimeCapabilities,
+        principal: Option<zeroclaw_api::principal::PrincipalId>,
+    },
+}
 
 /// Where an agent constructor's capabilities came from.
 #[derive(Clone, Copy)]
@@ -1960,6 +1973,7 @@ impl Agent {
             None,
             None,
             None,
+            CapabilityBinding::ConfigBacked,
         )
         .await
     }
@@ -1991,6 +2005,7 @@ impl Agent {
             None,
             None,
             None,
+            CapabilityBinding::ConfigBacked,
         )
         .await
     }
@@ -2023,6 +2038,7 @@ impl Agent {
             None,
             None,
             None,
+            CapabilityBinding::ConfigBacked,
         )
         .await
     }
@@ -2058,6 +2074,7 @@ impl Agent {
             Some(live_config),
             None,
             None,
+            CapabilityBinding::ConfigBacked,
         )
         .await
     }
@@ -2118,6 +2135,7 @@ impl Agent {
             Some(live_config),
             None,
             None,
+            CapabilityBinding::ConfigBacked,
         )
         .await
     }
@@ -2153,6 +2171,7 @@ impl Agent {
             None,
             None,
             None,
+            CapabilityBinding::ConfigBacked,
         )
         .await
     }
@@ -2198,6 +2217,142 @@ impl Agent {
         sop_audit: Option<Arc<SopAuditLogger>>,
         principal_allowed_tools: Option<Vec<String>>,
     ) -> Result<Self> {
+        Self::from_live_config_bound(
+            live_config,
+            agent_alias,
+            session_cwd,
+            initialize_mcp,
+            exclude_memory,
+            tui_env,
+            sop_engine,
+            sop_audit,
+            None,
+            principal_allowed_tools,
+            CapabilityBinding::ConfigBacked,
+        )
+        .await
+    }
+
+    /// [`Agent::from_live_config_with_tui_env_and_principal_tools`] with the
+    /// agent's provider, memory, observer and supplied tools taken from
+    /// `capabilities`, resolving for `principal` (the RPC connection's).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn from_live_config_with_tui_env_and_principal_tools_and_capabilities(
+        live_config: Arc<parking_lot::RwLock<Config>>,
+        agent_alias: &str,
+        session_cwd: Option<&Path>,
+        initialize_mcp: bool,
+        exclude_memory: bool,
+        tui_env: Option<std::collections::HashMap<String, String>>,
+        sop_engine: Option<Arc<std::sync::Mutex<SopEngine>>>,
+        sop_audit: Option<Arc<SopAuditLogger>>,
+        principal_allowed_tools: Option<Vec<String>>,
+        capabilities: crate::composition::RuntimeCapabilities,
+        principal: Option<zeroclaw_api::principal::PrincipalId>,
+    ) -> Result<Self> {
+        Self::from_live_config_bound(
+            live_config,
+            agent_alias,
+            session_cwd,
+            initialize_mcp,
+            exclude_memory,
+            tui_env,
+            sop_engine,
+            sop_audit,
+            None,
+            principal_allowed_tools,
+            CapabilityBinding::Supplied {
+                capabilities,
+                principal,
+            },
+        )
+        .await
+    }
+
+    /// Build a daemon-backed ACP TUI Agent with access to the shared durable
+    /// session store. The store is a read view for session tools; TUI turns do
+    /// not gain ACP file-delivery authority.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn from_live_config_with_tui_env_and_acp_sessions(
+        live_config: Arc<parking_lot::RwLock<Config>>,
+        agent_alias: &str,
+        session_cwd: Option<&Path>,
+        initialize_mcp: bool,
+        exclude_memory: bool,
+        tui_env: Option<std::collections::HashMap<String, String>>,
+        sop_engine: Option<Arc<std::sync::Mutex<SopEngine>>>,
+        sop_audit: Option<Arc<SopAuditLogger>>,
+        acp_session_store: Arc<zeroclaw_infra::acp_session_store::AcpSessionStore>,
+        principal_allowed_tools: Option<Vec<String>>,
+    ) -> Result<Self> {
+        Self::from_live_config_bound(
+            live_config,
+            agent_alias,
+            session_cwd,
+            initialize_mcp,
+            exclude_memory,
+            tui_env,
+            sop_engine,
+            sop_audit,
+            Some(acp_session_store),
+            principal_allowed_tools,
+            CapabilityBinding::ConfigBacked,
+        )
+        .await
+    }
+
+    /// [`Agent::from_live_config_with_tui_env_and_acp_sessions`] with the
+    /// agent's capabilities supplied, resolving for `principal`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn from_live_config_with_tui_env_and_acp_sessions_and_capabilities(
+        live_config: Arc<parking_lot::RwLock<Config>>,
+        agent_alias: &str,
+        session_cwd: Option<&Path>,
+        initialize_mcp: bool,
+        exclude_memory: bool,
+        tui_env: Option<std::collections::HashMap<String, String>>,
+        sop_engine: Option<Arc<std::sync::Mutex<SopEngine>>>,
+        sop_audit: Option<Arc<SopAuditLogger>>,
+        acp_session_store: Arc<zeroclaw_infra::acp_session_store::AcpSessionStore>,
+        principal_allowed_tools: Option<Vec<String>>,
+        capabilities: crate::composition::RuntimeCapabilities,
+        principal: Option<zeroclaw_api::principal::PrincipalId>,
+    ) -> Result<Self> {
+        Self::from_live_config_bound(
+            live_config,
+            agent_alias,
+            session_cwd,
+            initialize_mcp,
+            exclude_memory,
+            tui_env,
+            sop_engine,
+            sop_audit,
+            Some(acp_session_store),
+            principal_allowed_tools,
+            CapabilityBinding::Supplied {
+                capabilities,
+                principal,
+            },
+        )
+        .await
+    }
+
+    /// The daemon-backed live-config construction both RPC constructor
+    /// families share.
+    #[allow(clippy::too_many_arguments)]
+    async fn from_live_config_bound(
+        live_config: Arc<parking_lot::RwLock<Config>>,
+        agent_alias: &str,
+        session_cwd: Option<&Path>,
+        initialize_mcp: bool,
+        exclude_memory: bool,
+        tui_env: Option<std::collections::HashMap<String, String>>,
+        sop_engine: Option<Arc<std::sync::Mutex<SopEngine>>>,
+        sop_audit: Option<Arc<SopAuditLogger>>,
+        acp_session_store: Option<Arc<zeroclaw_infra::acp_session_store::AcpSessionStore>>,
+        principal_allowed_tools: Option<Vec<String>>,
+        binding: CapabilityBinding,
+    ) -> Result<Self> {
         // Stack-budget boundary for the daemon-backed construction paths
         // (`session/new`, rehydration, plugin agents). The whole incarnation
         // build — config snapshot, security policy, provider + route
@@ -2229,52 +2384,11 @@ impl Agent {
                 sop_engine,
                 sop_audit,
                 None,
-                None,
+                acp_session_store,
                 Some(Arc::clone(&live_config)),
                 Some(live_config),
                 principal_allowed_tools,
-            ))
-        })
-        .await
-        .map_err(|join| anyhow::Error::msg(format!("agent construction task failed: {join}")))?
-    }
-
-    /// Build a daemon-backed ACP TUI Agent with access to the shared durable
-    /// session store. The store is a read view for session tools; TUI turns do
-    /// not gain ACP file-delivery authority.
-    pub(crate) async fn from_live_config_with_tui_env_and_acp_sessions(
-        live_config: Arc<parking_lot::RwLock<Config>>,
-        agent_alias: &str,
-        session_cwd: Option<&Path>,
-        initialize_mcp: bool,
-        exclude_memory: bool,
-        tui_env: Option<std::collections::HashMap<String, String>>,
-        sop_engine: Option<Arc<std::sync::Mutex<SopEngine>>>,
-        sop_audit: Option<Arc<SopAuditLogger>>,
-        acp_session_store: Arc<zeroclaw_infra::acp_session_store::AcpSessionStore>,
-        principal_allowed_tools: Option<Vec<String>>,
-    ) -> Result<Self> {
-        let handle = tokio::runtime::Handle::current();
-        let agent_alias = agent_alias.to_string();
-        let session_cwd = session_cwd.map(|p| p.to_path_buf());
-        tokio::task::spawn_blocking(move || {
-            let config = live_config.read().clone();
-            handle.block_on(Self::from_config_with_session_cwd_and_mcp_approval_mode(
-                &config,
-                &agent_alias,
-                session_cwd.as_deref(),
-                initialize_mcp,
-                true,
-                exclude_memory,
-                false,
-                tui_env,
-                sop_engine,
-                sop_audit,
-                None,
-                Some(acp_session_store),
-                Some(Arc::clone(&live_config)),
-                Some(live_config),
-                principal_allowed_tools,
+                binding,
             ))
         })
         .await
@@ -2317,8 +2431,10 @@ impl Agent {
         .await
     }
 
-    /// Compatibility adapter: the config-backed capabilities reproduce the
-    /// provider, memory and observer construction this path performed inline.
+    /// The snapshot constructors' shared builder. With
+    /// [`CapabilityBinding::ConfigBacked`] it is the compatibility adapter:
+    /// the config-backed capabilities reproduce the provider, memory and
+    /// observer construction this path performed inline.
     #[allow(clippy::too_many_arguments)]
     async fn from_config_with_session_cwd_and_mcp_approval_mode(
         config: &Config,
@@ -2336,13 +2452,31 @@ impl Agent {
         live_config: Option<Arc<parking_lot::RwLock<Config>>>,
         live_model_config: Option<Arc<parking_lot::RwLock<Config>>>,
         principal_allowed_tools: Option<Vec<String>>,
+        binding: CapabilityBinding,
     ) -> Result<Self> {
-        let capabilities = crate::composition::RuntimeCapabilities::config_backed(config);
+        let (capabilities, principal, supplied) = match binding {
+            CapabilityBinding::ConfigBacked => (
+                crate::composition::RuntimeCapabilities::config_backed(config),
+                None,
+                false,
+            ),
+            CapabilityBinding::Supplied {
+                capabilities,
+                principal,
+            } => (capabilities, principal, true),
+        };
+        let origin = if supplied {
+            CapabilityOrigin::Supplied {
+                principal: principal.as_ref(),
+            }
+        } else {
+            CapabilityOrigin::Adapter
+        };
         Self::build_with_capabilities(
             config,
             agent_alias,
             &capabilities,
-            CapabilityOrigin::Adapter,
+            origin,
             session_cwd,
             initialize_mcp,
             approval_backchannel,
@@ -2524,7 +2658,7 @@ impl Agent {
             live_config.clone(),
             acp_sessions,
         )?;
-        capabilities.add_source_tools(
+        capabilities.bind_registry(
             &mut all_tools_result,
             &crate::composition::ToolRequest {
                 config: &tool_config,
@@ -17250,6 +17384,7 @@ mod capability_construction_tests {
     };
     use crate::composition::{RuntimeCapabilities, ToolRequest, ToolSource};
     use async_trait::async_trait;
+    use zeroclaw_api::attribution::Attributable;
     use zeroclaw_api::principal::PrincipalId;
     use zeroclaw_api::tool::{ToolOutput, ToolResult};
     use zeroclaw_config::schema::{
@@ -17412,11 +17547,13 @@ mod capability_construction_tests {
         assert_eq!(agent.model_provider_name, "openai.smart");
     }
 
-    /// The config-backed source's switch recipe is the adapter's, so an agent
-    /// built from supplied config-backed capabilities keeps the route-keyed
-    /// bare-family switch an adapter-built agent performs.
+    /// Supplied config-backed capabilities with no principal construct and
+    /// switch exactly as the adapter does: same provider, model, route
+    /// resolver, memory store and tool registry at construction, and the
+    /// adapter's route-keyed bare-family switch. K2 moves real callers onto
+    /// this path, so this is the invariant that makes the move invisible.
     #[tokio::test]
-    async fn a_config_backed_capability_agent_switches_like_an_adapter_built_agent() {
+    async fn config_backed_capabilities_construct_and_switch_like_the_adapter() {
         let tmp = tempfile::TempDir::new().unwrap();
         let mut config = two_provider_config(&tmp);
         config
@@ -17440,6 +17577,25 @@ mod capability_construction_tests {
             .await
             .expect("agent builds through the adapter");
 
+        let construction = |agent: &Agent| {
+            let mut tools: Vec<String> = agent
+                .tools
+                .iter()
+                .map(|tool| tool.name().to_string())
+                .collect();
+            tools.sort();
+            (
+                agent.model_provider_name.clone(),
+                agent.model_name.clone(),
+                agent.model_provider.alias().to_string(),
+                ["hint:fast", "hint:missing", "gpt-4o-mini"]
+                    .map(|selector| agent.model_route_resolver.resolve(selector)),
+                agent.memory.name().to_string(),
+                tools,
+            )
+        };
+        assert_eq!(construction(&supplied), construction(&adapter));
+
         for agent in [&mut supplied, &mut adapter] {
             let switched = agent.try_apply_model_switch(
                 "gpt-4o-mini",
@@ -17457,8 +17613,57 @@ mod capability_construction_tests {
                 "both agents carry the switch recipe's route resolver"
             );
         }
+        assert_eq!(
+            supplied.model_provider.alias(),
+            adapter.model_provider.alias(),
+            "both switches build the same provider"
+        );
         assert!(supplied.provider_source.is_some());
         assert!(adapter.provider_source.is_none());
+    }
+
+    /// A capability-built RPC agent with a live model generation switches
+    /// against the refreshed snapshot, as an adapter-built one does.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_live_capability_agent_switches_against_the_refreshed_config() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let live = Arc::new(parking_lot::RwLock::new(two_provider_config(&tmp)));
+        let providers = Arc::new(RecordingProviders::default());
+        let principal = PrincipalId::for_oidc("https://issuer.example", "subject-3");
+
+        let mut agent = Agent::from_live_config_with_tui_env_and_principal_tools_and_capabilities(
+            Arc::clone(&live),
+            "test-agent",
+            None,
+            false,
+            false,
+            None,
+            None,
+            None,
+            None,
+            capabilities(Arc::clone(&providers), Arc::new(RecordingMemory::default())),
+            Some(principal.clone()),
+        )
+        .await
+        .expect("live agent builds from supplied capabilities");
+        assert!(agent.provider_source.is_some());
+
+        // The operator retargets the switch profile; the RPC refresh
+        // transaction republishes the generation.
+        if let Some(smart) = live.write().providers.models.openai.get_mut("smart") {
+            smart.base.model = Some("gpt-4.1".to_string());
+        }
+        agent.sync_config_generation();
+
+        let switched =
+            agent.try_apply_model_switch("gpt-4o-mini", "openai.smart".into(), "gpt-4.1".into());
+        assert_eq!(switched.as_deref(), Some("gpt-4.1"));
+        assert_eq!(
+            *providers.switch_target_models.lock(),
+            vec![Some("gpt-4.1".to_string())],
+            "the switch request carries the refreshed config, not the construction snapshot"
+        );
+        assert_eq!(providers.switches.lock()[0].principal, Some(principal));
     }
 
     #[tokio::test]

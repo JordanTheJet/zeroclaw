@@ -30,6 +30,14 @@ use zeroclaw_config::schema::Config;
 
 mod config_backed;
 
+/// The config-backed sources the compatibility adapters use, for an
+/// application layer that composes the same recipe.
+pub mod defaults {
+    pub use super::config_backed::{
+        ConfigMemory, ConfigProviders, NoOutboundChannels, NoSuppliedTools,
+    };
+}
+
 /// Every capability the runtime obtains from outside itself, for one config
 /// generation.
 ///
@@ -60,6 +68,14 @@ impl RuntimeCapabilities {
     /// before; the application layer's own set replaces it as callers move.
     pub(crate) fn config_backed(config: &Config) -> Self {
         config_backed::capabilities(config)
+    }
+
+    /// The config-backed sources ([`defaults`]) with `observer`: the set the
+    /// compatibility adapters build, for an application layer that owns the
+    /// observer's lifetime. Every provider, memory and tool request resolves
+    /// exactly as it does through an adapter.
+    pub fn config_backed_with_observer(observer: Arc<dyn Observer>) -> Self {
+        config_backed::capabilities_with_observer(observer)
     }
 
     /// The config-backed set with a no-op observer, for an adapter whose
@@ -94,20 +110,28 @@ impl RuntimeCapabilities {
             .await
     }
 
-    /// Add the tool source's tools to a registry the runtime built, before
-    /// the registry reaches `ScopedToolRegistry::assemble`.
+    /// Bind a registry the runtime built to these capabilities, before the
+    /// registry reaches `ScopedToolRegistry::assemble`.
     ///
-    /// They join `tools` only, so the agent's `allowed_tools` and
-    /// `excluded_tools` filter and the caller's selector apply to them exactly
-    /// as to runtime tools. They stay out of `unfiltered_tool_arcs`, which
-    /// skill elevation resolves against, so a skill cannot raise a source tool
-    /// past that filter. A source tool whose name the runtime already
-    /// registered is dropped: the runtime's own tool keeps the name.
-    pub(crate) fn add_source_tools(
+    /// The registry's delegate tool, if any, resolves delegated targets
+    /// through these capabilities from now on, so a delegated sub-agent does
+    /// not step outside the entry point's providers.
+    ///
+    /// The tool source's tools join `tools` only, so the agent's
+    /// `allowed_tools` and `excluded_tools` filter and the caller's selector
+    /// apply to them exactly as to runtime tools. They stay out of
+    /// `unfiltered_tool_arcs`, which skill elevation resolves against, so a
+    /// skill cannot raise a source tool past that filter. A source tool whose
+    /// name the runtime already registered is dropped: the runtime's own tool
+    /// keeps the name.
+    pub(crate) fn bind_registry(
         &self,
         built: &mut crate::tools::AllToolsResult,
         request: &ToolRequest<'_>,
     ) -> anyhow::Result<()> {
+        if let Some(slot) = built.delegate_capabilities.as_ref() {
+            let _ = slot.set(self.clone());
+        }
         let supplied = self.tools.tools(request)?;
         for tool in supplied {
             if built
@@ -258,6 +282,9 @@ pub(crate) mod test_support {
     pub(crate) struct RecordingProviders {
         pub(crate) seen: Mutex<Vec<SeenProviderRequest>>,
         pub(crate) switches: Mutex<Vec<SeenProviderRequest>>,
+        /// For each switch, the model the request's config configures on the
+        /// switch target, which shows which config generation the switch saw.
+        pub(crate) switch_target_models: Mutex<Vec<Option<String>>>,
     }
 
     impl SeenProviderRequest {
@@ -289,6 +316,12 @@ pub(crate) mod test_support {
             self.switches
                 .lock()
                 .push(SeenProviderRequest::from_request(request));
+            let target_model = request
+                .provider_ref
+                .and_then(|provider_ref| provider_ref.split_once('.'))
+                .and_then(|(family, alias)| request.config.providers.models.find(family, alias))
+                .and_then(|entry| entry.model.clone());
+            self.switch_target_models.lock().push(target_model);
             Ok(Arc::new(StubProvider))
         }
     }

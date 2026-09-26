@@ -233,10 +233,12 @@ pub struct DelegateTool {
     /// snapshot fallback.
     live_config: Option<Arc<RwLock<Config>>>,
     /// Capabilities the delegate resolves a target's provider, memory and
-    /// supplied tools through, when its owner was built from supplied
-    /// capabilities. `None` uses the config-backed set, which is the
-    /// construction this tool performed before it took capabilities.
-    capabilities: Option<crate::composition::RuntimeCapabilities>,
+    /// supplied tools through. Bound once, by `with_capabilities` or by the
+    /// entry point that owns the registry this tool was built into; while
+    /// empty the tool uses the config-backed set, which is the construction
+    /// it performed before it took capabilities. Shared with the copies this
+    /// tool rebuilds for background and parallel delegation.
+    capabilities: crate::tools::DelegateCapabilitiesSlot,
     /// Alias of the agent that owns this DelegateTool. Excluded from the
     /// advertised roster so an agent is never offered itself as a
     /// delegation target. Empty when unset (legacy unit-test constructors).
@@ -364,7 +366,7 @@ impl DelegateTool {
             skill_bundles: Arc::new(HashMap::new()),
             root_config: None,
             live_config: None,
-            capabilities: None,
+            capabilities: Arc::new(std::sync::OnceLock::new()),
             caller_alias: String::new(),
             task_control_plane: Arc::new(tokio::sync::OnceCell::new()),
         }
@@ -417,7 +419,7 @@ impl DelegateTool {
             skill_bundles: Arc::new(HashMap::new()),
             root_config: None,
             live_config: None,
-            capabilities: None,
+            capabilities: Arc::new(std::sync::OnceLock::new()),
             caller_alias: String::new(),
             task_control_plane: Arc::new(tokio::sync::OnceCell::new()),
         }
@@ -548,17 +550,24 @@ impl DelegateTool {
 
     /// Resolve delegate targets' providers, memory and supplied tools through
     /// `capabilities` instead of the config-backed set.
-    pub fn with_capabilities(
-        mut self,
-        capabilities: crate::composition::RuntimeCapabilities,
-    ) -> Self {
-        self.capabilities = Some(capabilities);
+    ///
+    /// The first binding wins, so a tool built with capabilities is not
+    /// rebound by a later registry binding.
+    pub fn with_capabilities(self, capabilities: crate::composition::RuntimeCapabilities) -> Self {
+        let _ = self.capabilities.set(capabilities);
         self
+    }
+
+    /// The slot this tool reads its capabilities from, for the registry that
+    /// builds it to hand to the owning entry point.
+    pub(crate) fn capabilities_slot(&self) -> crate::tools::DelegateCapabilitiesSlot {
+        Arc::clone(&self.capabilities)
     }
 
     fn target_capabilities(&self) -> crate::composition::RuntimeCapabilities {
         self.capabilities
-            .clone()
+            .get()
+            .cloned()
             .unwrap_or_else(crate::composition::RuntimeCapabilities::config_backed_unobserved)
     }
 
@@ -847,7 +856,7 @@ impl DelegateTool {
     ) -> anyhow::Result<(Box<dyn ModelProvider>, String, String)> {
         if let Some(config) = self.root_config.as_deref() {
             let (provider, provider_name, model_name, _resolver) =
-                crate::agent::agent::session_model_provider_from(
+                crate::agent::agent::build_session_model_provider_with_capabilities(
                     &self.target_capabilities(),
                     config,
                     agent_name,
@@ -967,7 +976,7 @@ impl DelegateTool {
             // handle (one-shot callers), which keeps the snapshot fallback.
             self.live_config.clone(),
         )?;
-        self.target_capabilities().add_source_tools(
+        self.target_capabilities().bind_registry(
             &mut all_tools_result,
             &crate::composition::ToolRequest {
                 config,
