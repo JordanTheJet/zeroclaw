@@ -46,6 +46,10 @@ The runtime depends only on these traits, not on concrete implementations. This 
 
 The wire contract of the daemon RPC: the `Method` enum with its single wire-name table and per-method params/result contract, every wire-stable request, response and notification payload type, the notification names and the error codes. Pure data with serde derives; it depends on `zeroclaw-api`, `zeroclaw-config` and `zeroclaw-sop-graph` and never on the runtime or on async I/O, so an RPC client can link it without linking the daemon. `cargo generate openrpc` renders it into the tracked OpenRPC document (see [RPC socket](rpc-socket.md#contract-document)). The authorization classification of each method stays in the runtime.
 
+### `zeroclaw-rpc-client`
+
+The client half of the daemon RPC: dials the local socket, a named pipe or any byte stream, runs the `initialize` handshake, multiplexes requests, notifications and server-initiated requests, and backs off between reconnects. Depends on `zeroclaw-api` and `zeroclaw-rpc-proto` plus tokio, never on the runtime. The supervised gateway uses it today over the daemon's in-process duplex (`zeroclaw_runtime::rpc::inproc`), which is the seam the gateway split migrates routes through; a separate gateway process later dials the socket with the same client.
+
 ## Layer: Edge
 
 ### `zeroclaw-providers`
