@@ -180,7 +180,7 @@ static CHECK_CACHE: Mutex<Option<(Instant, CliCheck)>> = Mutex::new(None);
 /// `error` is populated; on a soft failure the handler returns
 /// `{ current_version, latest_version: null, is_newer: false, error }` so the
 /// dashboard version badge degrades gracefully. This is the single source of
-/// truth the generated web client derives from — see [`crate::openapi`].
+/// truth the generated web client derives from — see the gateway's `openapi` module.
 #[derive(Debug, Serialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct VersionCheckResponse {
@@ -341,7 +341,7 @@ pub struct UpgradeStatusQuery {
 /// Response body for `GET /api/version/upgrade/status`. When no upgrade has run
 /// this process only `state: "idle"` is set; during/after a run the remaining
 /// fields carry the live phase, log tail, and restart metadata. Single source
-/// of truth for the generated web client — see [`crate::openapi`].
+/// of truth for the generated web client — see the gateway's `openapi` module.
 #[derive(Debug, Serialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct UpgradeStatusResponse {

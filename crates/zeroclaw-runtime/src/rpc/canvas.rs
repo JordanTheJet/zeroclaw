@@ -11,7 +11,7 @@ use zeroclaw_api::jsonrpc::{JsonRpcError, error_codes};
 use crate::tools::{ALLOWED_CONTENT_TYPES, CanvasStore, MAX_CONTENT_SIZE};
 
 /// Why a canvas operation was refused. The message is identical on both
-/// surfaces; [`Self::http_status`] and [`Self::rpc_code`] give each surface its
+/// surfaces; [`CanvasFailure::http_status`] and [`CanvasFailure::rpc_code`] give each surface its
 /// code.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CanvasFailure {
