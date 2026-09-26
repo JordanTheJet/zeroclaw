@@ -825,3 +825,173 @@ async fn pairing_new_code_reports_pairing_disabled() {
         json!("Pairing is disabled for this gateway")
     );
 }
+
+// ── Channels ──────────────────────────────────────────────────────────────
+
+/// Records the calls it receives and answers each with a fixed body.
+#[derive(Default)]
+struct RecordingChannels {
+    calls: parking_lot::Mutex<Vec<String>>,
+}
+
+#[async_trait::async_trait]
+impl crate::rpc::channels::ChannelControl for RecordingChannels {
+    fn list(
+        &self,
+        _config: &zeroclaw_config::schema::Config,
+        _pairing: &zeroclaw_config::pairing::PairingGuard,
+    ) -> Value {
+        self.calls.lock().push("list".into());
+        json!({"channels": []})
+    }
+
+    fn relink(
+        &self,
+        _config: &zeroclaw_config::schema::Config,
+        channel: &str,
+    ) -> Result<Value, JsonRpcError> {
+        self.calls.lock().push(format!("relink {channel}"));
+        Ok(json!({"channel": channel, "outcome": "nothing_to_clear"}))
+    }
+
+    async fn bind(
+        &self,
+        _config: &Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>,
+        _config_write_lock: &Arc<tokio::sync::Mutex<()>>,
+        channel_type: &str,
+        alias: &str,
+        identity: &str,
+    ) -> Result<Value, JsonRpcError> {
+        self.calls
+            .lock()
+            .push(format!("bind {channel_type}.{alias} {identity}"));
+        Ok(json!({"saved": true, "already_bound": false}))
+    }
+}
+
+fn with_channels(
+    config: zeroclaw_config::schema::Config,
+) -> (Arc<RpcContext>, Arc<RecordingChannels>) {
+    let mut ctx = enforcement_ctx(config);
+    let channels = Arc::new(RecordingChannels::default());
+    Arc::get_mut(&mut ctx)
+        .expect("a fresh context is unshared")
+        .channel_control =
+        Some(Arc::clone(&channels) as Arc<dyn crate::rpc::channels::ChannelControl>);
+    (ctx, channels)
+}
+
+#[test]
+fn channels_methods_are_classified_and_named() {
+    use zeroclaw_api::grants::{Resource, Verb};
+    for (method, wire, verb) in [
+        (Method::ChannelsList, "channels/list", Verb::Read),
+        (Method::ChannelsRelink, "channels/relink", Verb::Update),
+        (Method::ChannelsBind, "channels/bind", Verb::Update),
+    ] {
+        assert_eq!(method.wire_name(), wire);
+        assert_eq!(Method::from_wire(wire), Some(method));
+        assert_eq!(
+            method.authz(),
+            MethodAuthz::Requires(Resource::Channels, verb),
+            "{wire}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn channels_methods_route_to_the_registered_capability() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (ctx, channels) = with_channels(make_acp_test_config(&tmp));
+    let (mut operator, mut rx) = local_operator(&ctx).await;
+
+    let listed = rpc(&mut operator, &mut rx, 1, "channels/list", json!({})).await;
+    assert_eq!(listed["result"], json!({"channels": []}), "{listed}");
+    let relinked = rpc(
+        &mut operator,
+        &mut rx,
+        2,
+        "channels/relink",
+        json!({"channel": "whatsapp.main"}),
+    )
+    .await;
+    assert_eq!(
+        relinked["result"]["outcome"],
+        json!("nothing_to_clear"),
+        "{relinked}"
+    );
+    let bound = rpc(
+        &mut operator,
+        &mut rx,
+        3,
+        "channels/bind",
+        json!({"channel_type": "telegram", "alias": "main", "identity": "@alice"}),
+    )
+    .await;
+    assert_eq!(bound["result"]["saved"], json!(true), "{bound}");
+    assert_eq!(
+        *channels.calls.lock(),
+        vec![
+            "list".to_string(),
+            "relink whatsapp.main".to_string(),
+            "bind telegram.main @alice".to_string(),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn channels_methods_say_so_when_no_channels_run() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let ctx = enforcement_ctx(make_acp_test_config(&tmp));
+    let (mut operator, mut rx) = local_operator(&ctx).await;
+    let listed = rpc(&mut operator, &mut rx, 1, "channels/list", json!({})).await;
+    assert_eq!(listed["error"]["code"], json!(INVALID_REQUEST), "{listed}");
+}
+
+#[tokio::test]
+async fn channels_bind_needs_the_peer_groups_config_write_grant() {
+    use std::collections::HashMap;
+    use zeroclaw_api::grants::{Resource, Verb};
+    use zeroclaw_config::schema::{PermissionProfileConfig, UserConfig};
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let mut config = make_acp_test_config(&tmp);
+    config.permission_profiles.insert(
+        "channels-only".into(),
+        PermissionProfileConfig {
+            allowed_agents: vec![zeroclaw_api::grants::WILDCARD.into()],
+            grants: HashMap::from([(Resource::Channels, vec![Verb::Read, Verb::Update])]),
+            ..PermissionProfileConfig::default()
+        },
+    );
+    config.users.insert(
+        "scoped".into(),
+        UserConfig {
+            uid: Some(SCOPED),
+            permission_profiles: vec!["channels-only".into()],
+            ..UserConfig::default()
+        },
+    );
+    let (ctx, channels) = with_channels(config);
+    let (mut peer, mut rx) = roster_peer(&ctx, SCOPED).await;
+
+    let listed = rpc(&mut peer, &mut rx, 1, "channels/list", json!({})).await;
+    assert!(
+        listed["result"].is_object(),
+        "channels:read suffices to list: {listed}"
+    );
+    let bound = rpc(
+        &mut peer,
+        &mut rx,
+        2,
+        "channels/bind",
+        json!({"channel_type": "telegram", "alias": "main", "identity": "@mallory"}),
+    )
+    .await;
+    assert_forbidden(&bound, "bind without a peer_groups config write grant");
+    assert_eq!(
+        *channels.calls.lock(),
+        vec!["list".to_string()],
+        "the bind never reached the capability"
+    );
+}

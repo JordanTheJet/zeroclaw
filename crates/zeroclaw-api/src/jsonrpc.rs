@@ -560,6 +560,22 @@ pub struct ToolsListRequest {
     pub agent: Option<String>,
 }
 
+/// Request payload for `channels/relink`. `channel` is the composite
+/// `<type>.<alias>` name `channels/list` reports.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelsRelinkRequest {
+    pub channel: String,
+}
+
+/// Request payload for `channels/bind`: authorize an operator-named identity
+/// on one channel alias, as `zeroclaw channel bind-<type>` does.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelsBindRequest {
+    pub channel_type: String,
+    pub alias: String,
+    pub identity: String,
+}
+
 /// Request payload for `pairing/revoke`: revoke one paired device's bearer
 /// token.
 #[derive(Debug, Clone, Serialize, Deserialize)]
