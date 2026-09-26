@@ -66,7 +66,7 @@ RFC #5574 sketched one `Registry` with `register_channel`, `register_tool`, `set
 | Lifetime | One config generation | One daemon run or reload iteration |
 | Consumed by | Every agent turn | `daemon::run` supervision |
 
-The runtime holds both. Subsystem starters receive the generation's capabilities instead of constructing their own, which is what removes the parallel construction in the gateway and channels orchestrator.
+The runtime holds both. Subsystem starters receive the generation's capabilities instead of constructing their own, which is what removes the parallel construction in the channels orchestrator. The gateway is the exception: its starter is deleted at the v0.9.0 gateway split, so it is never migrated onto this contract (step 4).
 
 ### Sources, not instances
 
@@ -151,7 +151,7 @@ Parity tests in the first implementation slice must show that the effective tool
 `DaemonRegistry` is incorporated, not replaced:
 
 - It keeps its role and its current registration methods.
-- The starter types gain access to the generation's `RuntimeCapabilities`, so the gateway and channels orchestrator stop building providers, memory, and tools of their own. That signature change is its own slice (step 4 below).
+- The channels, cron, SOP, and `RpcContext` starters gain access to the generation's `RuntimeCapabilities`, so they stop building providers, memory, and tools of their own. That signature change is its own slice (step 4 below). The gateway starter receives no capabilities: it is deleted at the v0.9.0 cut, and its own construction disappears as its routes move to RPC.
 - The shared SOP engine and audit logger it carries today are capability-shaped state. They stay where they are in this proposal and are listed as a follow-up to move behind the capability generation.
 
 ### Relationship to other work
@@ -184,17 +184,17 @@ Every step keeps existing configuration and effective permissions. Old entry poi
 | 1 | `DefaultCapabilities::from_config`: sources that wrap today's `create_*` functions unchanged | Parity tests for provider, memory, and tool-set resolution per agent |
 | 2 | Runtime entry points gain `*_with_capabilities` forms: `agent::loop_::run`, `process_message_shared`, `Agent::from_config*`, `assemble_owned_execution`. Old signatures delegate through `DefaultCapabilities` | Existing agent tests pass unchanged; policy-propagation regression tests |
 | 3 | `src/main.rs` builds `DefaultCapabilities` once and calls the new forms for `agent` and `daemon` | Startup, cancellation, and shutdown regression coverage for CLI and daemon |
-| 4 | `DaemonRegistry` starters receive the capabilities. The gateway drops its own provider, memory, observer, and tool construction | Gateway parity; no `create_*` calls left in `zeroclaw-gateway` |
+| 4 | The channels starter, cron scheduler, SOP drivers, and `RpcContext` receive the generation's `RuntimeCapabilities`. The gateway starter is deleted at the v0.9.0 cut and receives no capabilities; its own construction disappears as its routes move to RPC | Parity for each migrated starter; no `create_*` calls left in the migrated starters. The gateway is not migrated in place: the check that it cannot re-couple is the dependency ratchet in step 7, not a rule |
 | 5 | Channels orchestrator's per-sender provider cache becomes a `ProviderSource` implementation; ACP moves to the new forms. Sequenced with #11012 | No `create_*` calls left in `zeroclaw-channels` |
 | 6 | Internal callers: delegate, cron, heartbeat, subagents, SOP tool specs | No `create_*` calls left in the runtime outside `DefaultCapabilities` |
-| 7 | `DefaultCapabilities` and optional-tool assembly move to the application layer; the runtime drops `zeroclaw-tools` (with #10998) | A dependency ratchet test over `cargo metadata`, plus an independent consumer running a real agent turn |
+| 7 | `DefaultCapabilities` and tier-3 (optional) tool assembly move to the application layer behind its `ToolSource`. Tier-1 (core) and tier-2 (host-coupled) tools stay runtime-constructed, and the runtime keeps `zeroclaw-tools` as an explained dependency through v0.9.0 (see below); dropping it is v1.0.0 work. Tools are grouped under three coarse Cargo features, `tools-core` (always on), `tools-host`, and `tools-extra` (both default on), plus per-integration features for heavy dependencies (with #10998) | A dependency ratchet test over `cargo metadata` with three rules: the runtime (its `zeroclaw-tools` edge explained), the gateway (no runtime, channels, tools, providers, memory, plugins, config, hardware, or sop-graph), and rpc-proto (api, config, and sop-graph only, no tokio I/O). An independent consumer running a real agent turn through `Runtime::run_turn` with a `ToolSource` that returns an empty tier 3. Size evidence comparing `--no-default-features --features agent-runtime,tools-core` against dist per target (#10998 AC5) |
 | 8 | Remove the compatibility adapters | Removal is mechanical once no caller remains |
 
 ## Dependencies that remain, and why
 
 The issue asks for any retained dependency to be explained rather than hidden behind an unused feature. The expected end state is:
 
-- **`zeroclaw-tools`: removed** in step 7. The runtime keeps its own core tools (delegate, file access, delivery, and similar) because they depend on runtime internals. Optional tools move behind the application's `ToolSource`.
+- **`zeroclaw-tools`: retained through v0.9.0, as an explained edge.** Tier-1 core tools are split across the two crates today (`shell` and `file_read` in the runtime; `file_write`, `file_edit`, `glob_search`, `content_search`, the memory tools, `git_operations`, and `web_fetch` in `zeroclaw-tools`), and tier-2 tools need runtime internals (the scheduler, canvas store, ask-user handle, SOP engine, session backend, and live config) that `ToolRequest` does not carry. Moving either behind an application `ToolSource` would leak those internals into a public contract. So step 7 moves only tier 3, and the ratchet names this edge. Dropping the dependency is v1.0.0 work.
 - **`zeroclaw-providers` and `zeroclaw-memory`: expected to remain for now**, for reasons outside turn composition: `doctor`, `quickstart`, `migration`, and vision routing construct providers or memory directly and are still hosted in this crate. Each is a separate extraction candidate under the holding-crate plan. Step 7's ratchet should allow exactly these edges and name them, so a new use fails the check.
 
 ## Acceptance mapping
@@ -207,7 +207,9 @@ The issue asks for any retained dependency to be explained rather than hidden be
 | CLI and daemon use the shared contract, with policy, startup, cancellation, and shutdown coverage | Steps 2 and 3 |
 | Implementation PRs and evidence linked to #7432 R1 | Each step's PR |
 
-## Open decisions
+## Settled decisions
 
-1. **`run_turn` versus waiting for `RuntimeIngress`.** Shipping `run_turn` first unblocks the independent-consumer criterion but adds a surface that must later defer to ingress.
-2. **Whether `ProviderSource` also receives the requesting principal** once principal-scoped tool selection lands. It is left out here because it is not yet a resolved input.
+These were open when this page was first proposed. The v0.9.0 architecture review settled both.
+
+1. **`run_turn` versus waiting for `RuntimeIngress`.** `run_turn` ships and stays minimal, as a client of the same session actor that `session/prompt` uses. It does not wait for #11012.
+2. **Whether `ProviderSource` receives the requesting principal.** Yes, from the first implementation slice: `ProviderRequest` gains `principal: Option<&PrincipalId>` when the capability-taking constructors land. Adding a field to an embedder-implemented request type later would be a breaking change. The skeleton on this page does not carry the field yet.
