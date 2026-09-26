@@ -16678,12 +16678,18 @@ mod tests {
             }
         }
         assert_eq!(kinds, ["agent_start", "llm_request", "tool_call"]);
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(100), writer_rx.recv())
-                .await
-                .is_err(),
-            "each observer event must be delivered once"
-        );
+        // The observer hook is process-wide, so tests running in parallel can
+        // put their own frames on this bus. Only a second copy of this test's
+        // turn would be a duplicate.
+        let quiet_until = tokio::time::Instant::now() + std::time::Duration::from_millis(150);
+        while let Ok(Some(frame)) = tokio::time::timeout_at(quiet_until, writer_rx.recv()).await {
+            let frame: Value = serde_json::from_str(&frame).expect("notification is JSON");
+            assert_ne!(
+                frame["params"]["turn_id"],
+                json!("g2a-turn"),
+                "each observer event must be delivered once: {frame}"
+            );
+        }
 
         let history = d.handle_events_history().expect("history is available");
         let types: Vec<_> = history["events"]
