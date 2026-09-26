@@ -672,10 +672,13 @@ async fn metrics_scrape_equals_the_metrics_route_without_prometheus() {
 // ── Pairing ──────────────────────────────────────────────────────────────
 
 fn pairing_state(dir: &tempfile::TempDir) -> (crate::AppState, Config) {
-    let mut config = Config::default();
-    config.data_dir = dir.path().join("data");
-    std::fs::create_dir_all(&config.data_dir).unwrap();
-    config.config_path = dir.path().join("config.toml");
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let mut config = Config {
+        data_dir,
+        config_path: dir.path().join("config.toml"),
+        ..Config::default()
+    };
     config.gateway.require_pairing = true;
     let mut state = test_state(config.clone());
     state.pairing = std::sync::Arc::new(zeroclaw_config::pairing::PairingGuard::new(
