@@ -254,10 +254,10 @@ pub fn exposed_skills(config: &Config, alias: &str) -> Vec<AgentSkill> {
                     .is_some_and(|bundle| bundle.admits_skill(s.r#ref.name()))
         }) {
             let mut tags = vec![summary.r#ref.bundle().to_string()];
-            if let Some(category) = &summary.frontmatter.category {
-                if !category.is_empty() {
-                    tags.push(category.clone());
-                }
+            if let Some(category) = &summary.frontmatter.category
+                && !category.is_empty()
+            {
+                tags.push(category.clone());
             }
             out.push(AgentSkill {
                 id: summary.r#ref.name().to_string(),

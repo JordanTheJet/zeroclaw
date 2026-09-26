@@ -2142,6 +2142,7 @@ impl Agent {
     /// Build a daemon-backed ACP TUI Agent with access to the shared durable
     /// session store. The store is a read view for session tools; TUI turns do
     /// not gain ACP file-delivery authority.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn from_live_config_with_tui_env_and_acp_sessions(
         live_config: Arc<parking_lot::RwLock<Config>>,
         agent_alias: &str,
