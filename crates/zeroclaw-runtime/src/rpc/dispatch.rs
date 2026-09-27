@@ -32505,7 +32505,13 @@ mod tests {
                     zeroclaw_api::grants::Verb::Update,
                 ],
             );
-        let workspace = config.agent_workspace_dir("test-agent");
+        // A scoped prompt needs the resolved workspace, as `session/new`
+        // stores it; the raw temp-dir spelling can be an alias (`/var` on
+        // macOS).
+        let workspace = config
+            .agent_workspace_dir("test-agent")
+            .canonicalize()
+            .unwrap();
         let (ctx, chat_backend, _acp_store) = persistence_enforcement_ctx(config);
         let (provider, (mut started, _release, _requests)) = scripted_turn_provider();
         install_state_test_session_owned_at(
