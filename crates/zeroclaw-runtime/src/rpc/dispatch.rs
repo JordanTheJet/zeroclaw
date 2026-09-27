@@ -2769,7 +2769,7 @@ impl RpcDispatcher {
 
         match result {
             Ok(v) => self.send_result(req_id, v).await,
-            Err(e) => self.send_error(req_id, e.code, &e.message).await,
+            Err(e) => self.send_rpc_error(req_id, e).await,
         }
     }
 
@@ -7282,35 +7282,26 @@ impl RpcDispatcher {
         })
     }
 
-    /// An agent delete also removes the agent's memory, cron jobs, sessions
-    /// and workspace. A config grant alone must not reach that data, so the
-    /// caller needs the same authority the direct methods require: the agent
-    /// itself, plus delete on memory, cron and sessions. Checked against
-    /// grants re-resolved after the config write lock, before any side effect.
-    fn authorize_agent_owned_state_delete(&self, alias: &str) -> Result<(), JsonRpcError> {
-        use zeroclaw_api::grants::{Resource, Verb};
+    /// An agent delete removes the agent's memory, cron jobs, ACP sessions
+    /// with their transcripts, session attribution and workspace, for every
+    /// principal that used the agent. No scoped grant bounds that: the direct
+    /// session methods only ever reach the caller's own sessions. So an agent
+    /// delete is an operator action, as it is over HTTP, and needs admin.
+    /// Checked against grants re-resolved after the config write lock, before
+    /// any side effect.
+    fn authorize_agent_delete(&self, alias: &str) -> Result<(), JsonRpcError> {
         let method = Method::ConfigMapKeyDelete;
         let Some(grants) = self.recheck_authority_after_admission(method)? else {
             return Err(rpc_err(AUTH_REQUIRED, "First call must be 'initialize'"));
         };
-        self.selector_session_agent_with_grants(method, &grants, alias)?;
-        let missing: Vec<&str> = [
-            (Resource::Memory, "memory"),
-            (Resource::Cron, "cron"),
-            (Resource::Sessions, "sessions"),
-        ]
-        .into_iter()
-        .filter(|(resource, _)| !grants.permits(*resource, Verb::Delete))
-        .map(|(_, name)| name)
-        .collect();
-        if missing.is_empty() {
+        if grants.admin {
             return Ok(());
         }
         let denied = rpc_err(
             FORBIDDEN,
             format!(
-                "Deleting agent {alias:?} removes its owned state; principal lacks delete on: {}",
-                missing.join(", ")
+                "Deleting agent {alias:?} removes its memory, cron jobs, sessions and workspace \
+                 for every principal; only an admin principal may delete an agent"
             ),
         );
         self.audit_auth_denial(
@@ -7321,6 +7312,35 @@ impl RpcDispatcher {
             },
         );
         Err(denied)
+    }
+
+    /// Refuse an agent delete while RPC sessions still run on the agent: their
+    /// turns would keep using state the cleanup removes. The caller holds the
+    /// config write lock, which session creation also takes from its config
+    /// read through insertion, so no session can be added after this check.
+    async fn refuse_agent_delete_with_live_sessions(
+        &self,
+        path: &str,
+        alias: &str,
+        _guard: &ConfigWriteGuard,
+    ) -> Result<(), JsonRpcError> {
+        let active = self
+            .ctx
+            .sessions
+            .count_by_agent()
+            .await
+            .get(alias)
+            .copied()
+            .unwrap_or(0);
+        if active > 0 {
+            return Err(rpc_err(
+                INVALID_PARAMS,
+                format!(
+                    "{path}.{alias}: cannot delete agent with {active} active RPC session(s); close those sessions first"
+                ),
+            ));
+        }
+        Ok(())
     }
 
     /// Alias delete with the shared reference cascade. The scrub can touch
@@ -7337,7 +7357,9 @@ impl RpcDispatcher {
         use crate::config_ops::delete;
         let is_agent = matches!(kind, zeroclaw_config::alias_refs::AliasKind::Agent);
         if is_agent {
-            self.authorize_agent_owned_state_delete(&req.key)?;
+            self.authorize_agent_delete(&req.key)?;
+            self.refuse_agent_delete_with_live_sessions(&req.path, &req.key, &config_write_guard)
+                .await?;
         }
         // The owned-state cascade needs the memory backend. The daemon leaves
         // it unset when it booted with no agents, so open it from config then;
@@ -8471,14 +8493,24 @@ impl RpcDispatcher {
     }
 
     async fn send_error(&self, id: Value, code: i32, message: &str) {
-        let resp = JsonRpcResponse {
-            jsonrpc: JSONRPC_VERSION,
-            result: None,
-            error: Some(JsonRpcError {
+        self.send_rpc_error(
+            id,
+            JsonRpcError {
                 code,
                 message: message.to_string(),
                 data: None,
-            }),
+            },
+        )
+        .await;
+    }
+
+    /// Send a handler's error as-is, keeping its structured `data` (the config
+    /// methods carry the HTTP error body there).
+    async fn send_rpc_error(&self, id: Value, error: JsonRpcError) {
+        let resp = JsonRpcResponse {
+            jsonrpc: JSONRPC_VERSION,
+            result: None,
+            error: Some(error),
             id,
         };
         if let Ok(json) = serde_json::to_string(&resp) {
@@ -26242,28 +26274,20 @@ mod tests {
 
     /// Roster config whose agent `bot` is also named by a disabled heartbeat,
     /// a soft reference outside `agents.bot` that the delete cascade scrubs.
-    /// `owned_state` also grants what an agent delete needs beyond config:
-    /// the agent itself and delete on memory, cron and sessions.
+    /// `admin` makes the roster principal an admin, which an agent delete
+    /// needs because its cleanup reaches every principal's state.
     async fn agent_with_heartbeat_roster_config(
         tmp: &tempfile::TempDir,
         write_paths: &[&str],
         heartbeat_enabled: bool,
-        owned_state: bool,
+        admin: bool,
     ) -> zeroclaw_config::schema::Config {
-        use zeroclaw_api::grants::{Resource, Verb};
         let mut config = config_write_roster_config(tmp, 4242, write_paths);
-        if owned_state {
-            let profile = config
-                .permission_profiles
-                .get_mut("config-writer")
-                .expect("the fixture profile exists");
-            // Wildcard rather than "bot": naming the deleted agent here would
-            // leave a dangling reference the auth validation refuses to save.
-            profile.allowed_agents = vec![zeroclaw_api::grants::WILDCARD.into()];
-            for resource in [Resource::Memory, Resource::Cron, Resource::Sessions] {
-                profile.grants.insert(resource, vec![Verb::Delete]);
-            }
-        }
+        config
+            .permission_profiles
+            .get_mut("config-writer")
+            .expect("the fixture profile exists")
+            .admin = admin;
         config.memory.backend = "none".into();
         config
             .create_map_key("agents", "bot")
@@ -26323,30 +26347,55 @@ mod tests {
         });
     }
 
+    /// Roster principal writing `write_paths` whose agent `bot` names
+    /// `openai.default` as its classifier, a soft reference outside
+    /// `providers.*` that deleting the provider alias scrubs.
+    fn provider_with_classifier_roster_config(
+        tmp: &tempfile::TempDir,
+        write_paths: &[&str],
+    ) -> zeroclaw_config::schema::Config {
+        let mut config = config_write_roster_config(tmp, 4242, write_paths);
+        config
+            .create_map_key("agents", "bot")
+            .expect("create agents.bot");
+        config
+            .agents
+            .get_mut("bot")
+            .expect("agents.bot exists")
+            .classifier_provider = "openai.default".into();
+        config
+    }
+
     #[test]
-    fn config_map_key_delete_agent_refuses_a_scrub_outside_the_selector() {
+    fn config_map_key_delete_alias_refuses_a_scrub_outside_the_selector() {
         run_on_a_large_stack(|| async move {
             let tmp = tempfile::TempDir::new().unwrap();
-            let config_path = tmp.path().join("config.toml");
-            let config = agent_with_heartbeat_roster_config(&tmp, &["agents.*"], false, true).await;
-            let ctx = enforcement_ctx(config);
+            let ctx = enforcement_ctx(provider_with_classifier_roster_config(
+                &tmp,
+                &["providers.*"],
+            ));
             let (alice, _rx) = roster_peer(&ctx, 4242).await;
-            let before = std::fs::read_to_string(&config_path).unwrap();
 
             let err = alice
-                .handle_config_map_key_delete(&json!({"path": "agents", "key": "bot"}))
+                .handle_config_map_key_delete(
+                    &json!({"path": "providers.models.openai", "key": "default"}),
+                )
                 .await
-                .expect_err("scrubbing heartbeat.agent is outside the selector");
+                .expect_err("scrubbing agents.bot is outside the selector");
 
             assert_eq!(err.code, FORBIDDEN, "{err:?}");
-            assert!(err.message.contains("heartbeat.agent"), "{err:?}");
-            assert!(ctx.config.read().agents.contains_key("bot"));
-            assert_eq!(std::fs::read_to_string(&config_path).unwrap(), before);
+            assert!(err.message.contains("agents.bot"), "{err:?}");
+            let live = ctx.config.read().clone();
+            assert!(live.providers.models.openai.contains_key("default"));
+            assert_eq!(
+                live.agents["bot"].classifier_provider.as_str(),
+                "openai.default"
+            );
         });
     }
 
     #[test]
-    fn config_map_key_delete_agent_cascades_inside_the_selector() {
+    fn config_map_key_delete_agent_cascades_for_an_admin() {
         run_on_a_large_stack(|| async move {
             let tmp = tempfile::TempDir::new().unwrap();
             let config =
@@ -26361,7 +26410,7 @@ mod tests {
             let result = alice
                 .handle_config_map_key_delete(&json!({"path": "agents", "key": "bot"}))
                 .await
-                .expect("the cascade is inside the selector");
+                .expect("an admin may delete an agent");
 
             assert_eq!(result["deleted"], json!(true), "{result}");
             let live = ctx.config.read().clone();
@@ -26377,17 +26426,46 @@ mod tests {
     }
 
     #[test]
-    fn config_map_key_delete_agent_needs_owned_state_authority_beyond_config() {
+    fn config_map_key_delete_agent_is_admin_only_and_keeps_foreign_sessions() {
         run_on_a_large_stack(|| async move {
+            use zeroclaw_api::grants::{Resource, Verb};
+            use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage};
             let tmp = tempfile::TempDir::new().unwrap();
             let config_path = tmp.path().join("config.toml");
-            let config = agent_with_heartbeat_roster_config(
+            // Every scoped grant an agent delete could plausibly need: the
+            // agent selector, both config paths, and delete on memory, cron and
+            // sessions. Still not admin.
+            let mut config = agent_with_heartbeat_roster_config(
                 &tmp,
                 &["agents.*", "heartbeat.*"],
                 false,
                 false,
             )
             .await;
+            let profile = config
+                .permission_profiles
+                .get_mut("config-writer")
+                .expect("the fixture profile exists");
+            profile.allowed_agents = vec![zeroclaw_api::grants::WILDCARD.into()];
+            for resource in [Resource::Memory, Resource::Cron, Resource::Sessions] {
+                profile.grants.insert(resource, vec![Verb::Delete]);
+            }
+            // Another principal's ended ACP session on `bot`, with a transcript.
+            let store =
+                zeroclaw_infra::acp_session_store::AcpSessionStore::new(&config.data_dir).unwrap();
+            store
+                .create_session("foreign-ended", "bot", "/tmp/foreign", Some("someone-else"))
+                .unwrap();
+            store
+                .append_turn(
+                    "foreign-ended",
+                    &[
+                        ConversationMessage::Chat(ChatMessage::user("hello")),
+                        ConversationMessage::Chat(ChatMessage::assistant("hi")),
+                    ],
+                )
+                .unwrap();
+            assert!(store.mark_session_killed("foreign-ended").unwrap());
             let workspace = config.agent_workspace_dir("bot");
             std::fs::create_dir_all(&workspace).unwrap();
             let ctx = enforcement_ctx(config);
@@ -26397,27 +26475,66 @@ mod tests {
             let err = alice
                 .handle_config_map_key_delete(&json!({"path": "agents", "key": "bot"}))
                 .await
-                .expect_err("a config grant alone must not reach the agent's owned state");
+                .expect_err("a scoped principal must not reach other principals' state");
 
             assert_eq!(err.code, FORBIDDEN, "{err:?}");
+            assert!(err.message.contains("admin"), "{err:?}");
             assert!(ctx.config.read().agents.contains_key("bot"));
-            assert_eq!(ctx.config.read().heartbeat.agent, "bot");
             assert_eq!(std::fs::read_to_string(&config_path).unwrap(), before);
             assert!(workspace.exists(), "the workspace must not be archived");
-            assert!(
-                !ctx.config
-                    .read()
-                    .data_dir
-                    .join("agents")
-                    .join("_deleted")
-                    .exists(),
-                "no archive may be created"
-            );
+            let foreign = store
+                .load_session("foreign-ended")
+                .unwrap()
+                .expect("the foreign session survives");
+            assert_eq!(foreign.principal_id.as_deref(), Some("someone-else"));
+            assert_eq!(foreign.messages.len(), 2, "its transcript survives");
         });
     }
 
     #[test]
     fn config_map_key_delete_scrub_is_rechecked_with_grants_narrowed_while_queued() {
+        run_on_a_large_stack(|| async move {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let ctx = enforcement_ctx(provider_with_classifier_roster_config(
+                &tmp,
+                &["providers.*", "agents.*"],
+            ));
+            let (alice, _rx) = roster_peer(&ctx, 4242).await;
+
+            let params = json!({"path": "providers.models.openai", "key": "default"});
+            let result = rpc_result_after_midwait_policy_change(
+                Arc::clone(&ctx),
+                async move { alice.handle_config_map_key_delete(&params).await },
+                |ctx| {
+                    let mut narrowed = ctx.config.read().clone();
+                    narrowed
+                        .permission_profiles
+                        .get_mut("config-writer")
+                        .expect("the fixture profile exists")
+                        .config_write_paths = vec!["providers.*".into()];
+                    ctx.auth
+                        .refresh_from_config(&narrowed)
+                        .expect("the narrowed policy compiles");
+                },
+            )
+            .await;
+
+            let err = result.expect_err("agents.* was revoked while the delete queued");
+            assert_eq!(err.code, FORBIDDEN, "{err:?}");
+            assert!(err.message.contains("agents.bot"), "{err:?}");
+            assert!(
+                ctx.config
+                    .read()
+                    .providers
+                    .models
+                    .openai
+                    .contains_key("default")
+            );
+        });
+    }
+
+    #[test]
+    fn config_map_key_delete_agent_rechecks_admin_after_the_lock_wait() {
         run_on_a_large_stack(|| async move {
             let tmp = tempfile::TempDir::new().unwrap();
             let config =
@@ -26431,22 +26548,21 @@ mod tests {
                 Arc::clone(&ctx),
                 async move { alice.handle_config_map_key_delete(&params).await },
                 |ctx| {
-                    let mut narrowed = ctx.config.read().clone();
-                    narrowed
+                    let mut demoted = ctx.config.read().clone();
+                    demoted
                         .permission_profiles
                         .get_mut("config-writer")
                         .expect("the fixture profile exists")
-                        .config_write_paths = vec!["agents.*".into()];
+                        .admin = false;
                     ctx.auth
-                        .refresh_from_config(&narrowed)
-                        .expect("the narrowed policy compiles");
+                        .refresh_from_config(&demoted)
+                        .expect("the demoted policy compiles");
                 },
             )
             .await;
 
-            let err = result.expect_err("heartbeat.* was revoked while the delete queued");
+            let err = result.expect_err("admin was revoked while the delete queued");
             assert_eq!(err.code, FORBIDDEN, "{err:?}");
-            assert!(err.message.contains("heartbeat.agent"), "{err:?}");
             assert!(ctx.config.read().agents.contains_key("bot"));
             assert_eq!(ctx.config.read().heartbeat.agent, "bot");
         });
@@ -26505,6 +26621,75 @@ mod tests {
             assert_eq!(data["code"], json!("validation_failed"), "{data}");
             assert!(ctx.config.read().agents.contains_key("bot"));
         });
+    }
+
+    #[tokio::test]
+    async fn config_map_key_delete_agent_refuses_active_rpc_sessions() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, sessions, _chat_backend, _acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+
+        dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "session_id": "live-agent-session"
+            }))
+            .await
+            .expect("session/new should succeed");
+        assert_eq!(sessions.count_by_agent().await.get("test-agent"), Some(&1));
+
+        let err = Box::pin(dispatcher.handle_config_map_key_delete(&json!({
+            "path": "agents",
+            "key": "test-agent"
+        })))
+        .await
+        .expect_err("an agent delete must refuse while its RPC sessions run");
+
+        assert_eq!(err.code, INVALID_PARAMS, "{err:?}");
+        assert!(err.message.contains("active RPC session"), "{err:?}");
+        assert!(
+            dispatcher
+                .ctx
+                .config
+                .read()
+                .agents
+                .contains_key("test-agent")
+        );
+        assert_eq!(sessions.count_by_agent().await.get("test-agent"), Some(&1));
+    }
+
+    #[tokio::test]
+    async fn config_error_data_reaches_the_wire() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ctx = enforcement_ctx(make_two_provider_test_config(&tmp));
+        let (mut operator, mut rx) = local_operator(&ctx).await;
+
+        let response = rpc(
+            &mut operator,
+            &mut rx,
+            1,
+            "config/section-picker",
+            json!({"section": "hardware"}),
+        )
+        .await;
+
+        assert_eq!(
+            response["error"]["code"],
+            json!(INVALID_PARAMS),
+            "{response}"
+        );
+        assert_eq!(
+            response["error"]["data"]["code"],
+            json!("path_not_found"),
+            "{response}"
+        );
+        assert_eq!(
+            response["error"]["data"]["path"],
+            json!("hardware"),
+            "{response}"
+        );
     }
 
     #[test]
