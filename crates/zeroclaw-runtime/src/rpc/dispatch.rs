@@ -10240,21 +10240,22 @@ async fn deliver_subscription(delivery: SubscriptionDelivery) {
         // matched here. Everything before `cursor` in this epoch is gone; from
         // `cursor` on, every buffered frame is replayed.
         if epoch_changed {
-            if !still_authorized(
+            let Some(json) = lagged(1, cursor, true) else {
+                break 'deliver;
+            };
+            if !disclose(
+                json,
+                &rpc,
+                &cancel,
                 &inbound,
                 binding.as_ref(),
                 method,
                 &mut checked_generation,
                 &mut grants,
-                viewer.is_none(),
-            ) || !viewer_may_see(viewer.as_ref(), binding.as_ref(), grants.as_ref()).await
+                viewer.as_ref(),
+            )
+            .await
             {
-                break 'deliver;
-            }
-            let Some(json) = lagged(1, cursor, true) else {
-                break 'deliver;
-            };
-            if !rpc.send_raw(json).await {
                 break 'deliver;
             }
         }
@@ -10269,22 +10270,22 @@ async fn deliver_subscription(delivery: SubscriptionDelivery) {
                     from_seq,
                     resume_seq,
                 } => {
-                    if !still_authorized(
+                    let Some(json) = lagged(from_seq, resume_seq, false) else {
+                        break 'deliver;
+                    };
+                    if !disclose(
+                        json,
+                        &rpc,
+                        &cancel,
                         &inbound,
                         binding.as_ref(),
                         method,
                         &mut checked_generation,
                         &mut grants,
-                        viewer.is_none(),
-                    ) || !viewer_may_see(viewer.as_ref(), binding.as_ref(), grants.as_ref())
-                        .await
+                        viewer.as_ref(),
+                    )
+                    .await
                     {
-                        break 'deliver;
-                    }
-                    let Some(json) = lagged(from_seq, resume_seq, false) else {
-                        break 'deliver;
-                    };
-                    if !rpc.send_raw(json).await {
                         break 'deliver;
                     }
                     cursor = resume_seq;
@@ -10292,23 +10293,7 @@ async fn deliver_subscription(delivery: SubscriptionDelivery) {
                 }
                 Read::Frames(frames) if !frames.is_empty() => {
                     for (seq, frame) in frames {
-                        // Every disclosure is held to the authority in force
-                        // when it happens, not when the stream was opened: a
-                        // revoked grant, and for a session viewer a lost
-                        // ownership or a replaced session, ends the stream
-                        // before the next frame, buffered ones included.
-                        if cancel.is_cancelled()
-                            || !still_authorized(
-                                &inbound,
-                                binding.as_ref(),
-                                method,
-                                &mut checked_generation,
-                                &mut grants,
-                                viewer.is_none(),
-                            )
-                            || !viewer_may_see(viewer.as_ref(), binding.as_ref(), grants.as_ref())
-                                .await
-                        {
+                        if cancel.is_cancelled() {
                             break 'deliver;
                         }
                         let mut params = (*frame).clone();
@@ -10323,7 +10308,19 @@ async fn deliver_subscription(delivery: SubscriptionDelivery) {
                         let Ok(json) = serde_json::to_string(&notification) else {
                             break 'deliver;
                         };
-                        if !rpc.send_raw(json).await {
+                        if !disclose(
+                            json,
+                            &rpc,
+                            &cancel,
+                            &inbound,
+                            binding.as_ref(),
+                            method,
+                            &mut checked_generation,
+                            &mut grants,
+                            viewer.as_ref(),
+                        )
+                        .await
+                        {
                             break 'deliver;
                         }
                         cursor = seq + 1;
@@ -10342,6 +10339,51 @@ async fn deliver_subscription(delivery: SubscriptionDelivery) {
         }
     }
     finish();
+}
+
+/// Enqueue one subscription line only if the connection may still see it at
+/// the moment it is enqueued.
+///
+/// Writer room is reserved first, and that wait ends early on cancellation.
+/// Only then is the disclosure held to the authority in force: the credential
+/// and, after a policy change, the re-resolved grants; for a session viewer,
+/// also the session's current owner and incarnation. Checking before a wait
+/// for room would let a line queued behind a full writer go out after the
+/// viewer lost access, so the check sits between the reservation and the
+/// commit. Returns `false` when the stream must end.
+#[allow(clippy::too_many_arguments)]
+async fn disclose(
+    json: String,
+    rpc: &RpcOutbound,
+    cancel: &CancellationToken,
+    inbound: &crate::rpc::auth::RpcInboundAuth,
+    binding: Option<&crate::rpc::auth::ConnectionAuth>,
+    method: Method,
+    checked_generation: &mut Option<u64>,
+    grants: &mut Option<zeroclaw_api::grants::ResolvedGrants>,
+    viewer: Option<&SessionViewer>,
+) -> bool {
+    let permit = tokio::select! {
+        biased;
+        () = cancel.cancelled() => return false,
+        permit = rpc.reserve() => match permit {
+            Some(permit) => permit,
+            None => return false,
+        },
+    };
+    if !still_authorized(
+        inbound,
+        binding,
+        method,
+        checked_generation,
+        grants,
+        viewer.is_none(),
+    ) || !viewer_may_see(viewer, binding, grants.as_ref()).await
+    {
+        return false;
+    }
+    permit.send(json);
+    true
 }
 
 /// A viewer of one session's ring. Attach authorized it against the session
@@ -33066,5 +33108,100 @@ mod tests {
             ctx.sessions.get_agent("s-bobs").await.is_some(),
             "run-once must not touch a session it did not create"
         );
+    }
+
+    #[tokio::test]
+    async fn a_frame_waiting_for_writer_room_is_not_sent_after_the_viewer_loses_access() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sid = "s-bob-backpressure";
+        let mut config = session_cwd_config(&tmp, 4242, None);
+        config
+            .permission_profiles
+            .get_mut("session-scoped")
+            .expect("the fixture profile exists")
+            .admin = true;
+        let workspace = config.agent_workspace_dir("test-agent");
+        let (ctx, chat_backend, _acp_store) = persistence_enforcement_ctx(config);
+        let (provider, _handles) = scripted_turn_provider();
+        install_state_test_session_owned_at(
+            &ctx.sessions,
+            &chat_backend,
+            sid,
+            provider,
+            None,
+            Some("user:bob"),
+            &workspace,
+        )
+        .await;
+
+        // A writer with room for exactly one line, so the second frame has to
+        // wait for the reader.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(1);
+        let mut alice = RpcDispatcher::new(Arc::clone(&ctx), tx, "unix:uid=4242".into())
+            .with_transport(
+                crate::rpc::transport::TransportKind::Local,
+                crate::security::auth_provider::Credential::Peercred { uid: 4242 },
+            );
+        alice
+            .handle_initialize(&json!({}))
+            .await
+            .expect("roster uid authenticates");
+        alice
+            .handle_session_attach(&json!({"session_id": sid}))
+            .await
+            .expect("an administrator may view another principal's session");
+        while rx.try_recv().is_ok() {}
+
+        let source = ctx.subscriptions.session_source(sid);
+        ctx.subscriptions.publish(
+            source,
+            json!({"type": "agent_message_chunk", "session_id": sid, "text": "fill"}),
+        );
+        ctx.subscriptions.publish(
+            source,
+            json!({"type": "agent_message_chunk", "session_id": sid, "text": "secret"}),
+        );
+        // Let delivery enqueue the first frame and park on the second, waiting
+        // for room while Alice is still an administrator.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let mut narrowed = ctx.config.read().clone();
+        narrowed
+            .permission_profiles
+            .get_mut("session-scoped")
+            .expect("the fixture profile exists")
+            .admin = false;
+        ctx.auth
+            .refresh_from_config(&narrowed)
+            .expect("the narrowed policy compiles");
+
+        let first = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("the frame enqueued while still admin")
+            .expect("writer open");
+        assert!(first.contains("fill"), "{first}");
+
+        let leaked = tokio::time::timeout(std::time::Duration::from_millis(300), async {
+            loop {
+                match rx.recv().await {
+                    Some(frame) if frame.contains("secret") => return Some(frame),
+                    Some(_) => {}
+                    None => return None,
+                }
+            }
+        })
+        .await;
+        assert!(
+            !matches!(leaked, Ok(Some(_))),
+            "a frame that waited for writer room must be checked again before it is sent: \
+             {leaked:?}"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while ctx.subscriptions.viewer_count(sid) != 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the demoted viewer is detached");
     }
 }
