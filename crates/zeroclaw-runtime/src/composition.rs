@@ -59,6 +59,26 @@ pub struct RuntimeCapabilities {
     pub observer: Arc<dyn Observer>,
 }
 
+/// Capabilities bound to the principal an entry point resolved for.
+///
+/// This is what an operation started from inside a turn inherits: a
+/// delegate target, a spawned sub-agent, a peer agent's turn, or a
+/// cross-agent SOP step. Carrying the pair keeps such an operation on the
+/// entry point's sources and identity instead of falling back to
+/// config-backed sources and no principal.
+#[derive(Clone)]
+pub struct BoundCapabilities {
+    /// The capabilities the originating entry point was given.
+    pub capabilities: RuntimeCapabilities,
+    /// The principal the originating entry point resolved for, if any.
+    pub principal: Option<PrincipalId>,
+}
+
+/// Where a tool that starts child operations reads the capabilities it
+/// inherits. Empty until the entry point that owns the tool's registry binds
+/// it; while empty the tool keeps its pre-capability behavior.
+pub type CapabilitySlot = Arc<std::sync::OnceLock<BoundCapabilities>>;
+
 impl RuntimeCapabilities {
     /// The capabilities today's `create_*` factories produce for `config`.
     ///
@@ -110,12 +130,13 @@ impl RuntimeCapabilities {
             .await
     }
 
-    /// Bind a registry the runtime built to these capabilities, before the
-    /// registry reaches `ScopedToolRegistry::assemble`.
+    /// Bind a registry the runtime built to these capabilities and to
+    /// `principal`, before the registry reaches `ScopedToolRegistry::assemble`.
     ///
-    /// The registry's delegate tool, if any, resolves delegated targets
-    /// through these capabilities from now on, so a delegated sub-agent does
-    /// not step outside the entry point's providers.
+    /// Every tool in the registry that starts child operations (the delegate,
+    /// `spawn_subagent`, `send_message_to_peer`) runs them through these
+    /// capabilities and for this principal from now on, so a child does not
+    /// step outside the entry point's providers or lose its identity.
     ///
     /// The tool source's tools join `tools` only, so the agent's
     /// `allowed_tools` and `excluded_tools` filter and the caller's selector
@@ -128,9 +149,13 @@ impl RuntimeCapabilities {
         &self,
         built: &mut crate::tools::AllToolsResult,
         request: &ToolRequest<'_>,
+        principal: Option<&PrincipalId>,
     ) -> anyhow::Result<()> {
-        if let Some(slot) = built.delegate_capabilities.as_ref() {
-            let _ = slot.set(self.clone());
+        for slot in &built.capability_slots {
+            let _ = slot.set(BoundCapabilities {
+                capabilities: self.clone(),
+                principal: principal.cloned(),
+            });
         }
         let supplied = self.tools.tools(request)?;
         for tool in supplied {
@@ -382,6 +407,41 @@ pub(crate) mod test_support {
         async fn memory(&self, request: &MemoryRequest<'_>) -> anyhow::Result<Arc<dyn Memory>> {
             self.agents.lock().push(request.agent_alias.to_string());
             Ok(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
+        }
+    }
+
+    /// Serves [`StubProvider`] only to a request that names a principal, as
+    /// a source that scopes credentials by principal would; an anonymous
+    /// request is refused. Records every principal it served.
+    #[derive(Default)]
+    pub(crate) struct PrincipalRequiredProviders {
+        pub(crate) served: Mutex<Vec<PrincipalId>>,
+    }
+
+    impl ProviderSource for PrincipalRequiredProviders {
+        fn model_provider(
+            &self,
+            request: &ProviderRequest<'_>,
+        ) -> anyhow::Result<Arc<dyn ModelProvider>> {
+            let Some(principal) = request.principal else {
+                anyhow::bail!("this source serves only a named principal");
+            };
+            self.served.lock().push(principal.clone());
+            Ok(Arc::new(StubProvider))
+        }
+    }
+
+    /// Refuses every provider request, naming the agent it refused.
+    pub(crate) struct RefusingProviders;
+
+    pub(crate) const REFUSAL: &str = "the supplied provider source refuses agent";
+
+    impl ProviderSource for RefusingProviders {
+        fn model_provider(
+            &self,
+            request: &ProviderRequest<'_>,
+        ) -> anyhow::Result<Arc<dyn ModelProvider>> {
+            anyhow::bail!("{REFUSAL} {}", request.agent_alias)
         }
     }
 

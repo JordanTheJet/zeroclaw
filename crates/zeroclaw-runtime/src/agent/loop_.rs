@@ -1420,6 +1420,12 @@ pub async fn run_with_capabilities(
         let eff_max_system_prompt_chars = agent.resolved.max_system_prompt_chars;
         let eff_prompt_injection_mode = agent.resolved.prompt_injection_mode;
         let observer: Arc<dyn Observer> = Arc::clone(&capabilities.observer);
+        // What operations started inside this turn inherit: a spawned
+        // sub-agent, a delegate, a peer turn, a cross-agent SOP step.
+        let bound_capabilities = crate::composition::BoundCapabilities {
+            capabilities: capabilities.clone(),
+            principal: principal.clone(),
+        };
         let turn_id = uuid::Uuid::new_v4().to_string();
         let channel_name = if interactive { "cli" } else { "daemon" };
         let _flush_guard = interactive.then(|| observability::FlushGuard::new(observer.clone()));
@@ -1545,6 +1551,7 @@ pub async fn run_with_capabilities(
                 runtime: &runtime,
                 memory: &mem,
             },
+            principal.as_ref(),
         )?;
         let skills = crate::skills::load_skills_for_agent_from_config(&config, agent_alias);
         // Route the per-agent tool registry through the one gated seam
@@ -2199,6 +2206,7 @@ pub async fn run_with_capabilities(
                                 served_route_sink: None,
                                 sop_reassembly: Some(crate::agent::turn::SopStepReassembly {
                                     config: &config,
+                                    capabilities: Some(&bound_capabilities),
                                     live_config: None,
                                 }),
                             }),
@@ -2793,6 +2801,7 @@ pub async fn run_with_capabilities(
                                     served_route_sink: None,
                                     sop_reassembly: Some(crate::agent::turn::SopStepReassembly {
                                         config: &config,
+                                        capabilities: Some(&bound_capabilities),
                                         live_config: None,
                                     }),
                                 }),
@@ -3081,8 +3090,13 @@ pub async fn process_message(
     origin: TurnOrigin,
     internal_principal: Option<zeroclaw_api::ingress::InternalPrincipal>,
 ) -> Result<String> {
-    process_message_shared(
-        Arc::new(config),
+    let config = Arc::new(config);
+    let capabilities = RuntimeCapabilities::config_backed(&config);
+    process_message_inner(
+        config,
+        None,
+        capabilities,
+        None,
         agent_alias,
         message,
         session_id,
@@ -3097,43 +3111,21 @@ pub async fn process_message(
 /// avoids placing or cloning the large [`Config`] value in detached task
 /// futures.
 ///
-/// Compatibility adapter for [`process_message_with_capabilities`] over the
-/// config-backed capabilities. Returns the inner future directly, for the
-/// same recursion-limit reason as [`run`].
+/// Compatibility adapter over the config-backed capabilities. Returns the
+/// inner future directly, for the same recursion-limit reason as [`run`].
 pub(crate) fn process_message_shared<'a>(
     config: Arc<Config>,
     agent_alias: &'a str,
     message: &'a str,
     session_id: Option<&'a str>,
     origin: TurnOrigin,
+    internal_principal: Option<zeroclaw_api::ingress::InternalPrincipal>,
 ) -> impl std::future::Future<Output = Result<String>> + 'a {
     let capabilities = RuntimeCapabilities::config_backed(&config);
-    process_message_with_capabilities(
-        config,
-        capabilities,
-        None,
-        agent_alias,
-        message,
-        session_id,
-        origin,
-    )
-}
-
-/// Process a single message with supplied capabilities: the provider, the
-/// agent's memory, the observer and any source-supplied tools come from
-/// `capabilities`, and `principal` reaches the provider source.
-pub async fn process_message_with_capabilities(
-    config: Arc<Config>,
-    capabilities: RuntimeCapabilities,
-    principal: Option<PrincipalId>,
-    agent_alias: &str,
-    message: &str,
-    session_id: Option<&str>,
-    origin: TurnOrigin,
-    internal_principal: Option<zeroclaw_api::ingress::InternalPrincipal>,
-) -> Result<String> {
     process_message_inner(
         config,
+        None,
+        capabilities,
         None,
         agent_alias,
         message,
@@ -3141,7 +3133,62 @@ pub async fn process_message_with_capabilities(
         origin,
         internal_principal,
     )
-    .await
+}
+
+/// Process a single message with supplied capabilities: the provider, the
+/// agent's memory, the observer and any source-supplied tools come from
+/// `capabilities`, and `principal` reaches the provider source.
+/// `internal_principal` is the in-process sender's envelope, as for
+/// [`process_message`].
+#[allow(clippy::too_many_arguments)]
+pub fn process_message_with_capabilities<'a>(
+    config: Arc<Config>,
+    capabilities: RuntimeCapabilities,
+    principal: Option<PrincipalId>,
+    agent_alias: &'a str,
+    message: &'a str,
+    session_id: Option<&'a str>,
+    origin: TurnOrigin,
+    internal_principal: Option<zeroclaw_api::ingress::InternalPrincipal>,
+) -> impl std::future::Future<Output = Result<String>> + 'a {
+    process_message_inner(
+        config,
+        None,
+        capabilities,
+        principal,
+        agent_alias,
+        message,
+        session_id,
+        origin,
+        internal_principal,
+    )
+}
+
+/// [`process_message_with_capabilities`] that also keeps the daemon's live
+/// tool-policy source, for in-process callers that hold one.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn process_message_shared_with_capabilities<'a>(
+    config: Arc<Config>,
+    live_config: Option<Arc<parking_lot::RwLock<Config>>>,
+    capabilities: RuntimeCapabilities,
+    principal: Option<PrincipalId>,
+    agent_alias: &'a str,
+    message: &'a str,
+    session_id: Option<&'a str>,
+    origin: TurnOrigin,
+    internal_principal: Option<zeroclaw_api::ingress::InternalPrincipal>,
+) -> impl std::future::Future<Output = Result<String>> + 'a {
+    process_message_inner(
+        config,
+        live_config,
+        capabilities,
+        principal,
+        agent_alias,
+        message,
+        session_id,
+        origin,
+        internal_principal,
+    )
 }
 
 /// Shared-snapshot variant that also preserves the daemon's live tool-policy source.
@@ -3154,9 +3201,12 @@ pub(crate) async fn process_message_shared_with_live_config(
     origin: TurnOrigin,
     internal_principal: Option<zeroclaw_api::ingress::InternalPrincipal>,
 ) -> Result<String> {
+    let capabilities = RuntimeCapabilities::config_backed(&config);
     process_message_inner(
         config,
         Some(live_config),
+        capabilities,
+        None,
         agent_alias,
         message,
         session_id,
@@ -3176,9 +3226,13 @@ pub async fn process_message_with_live_config(
     session_id: Option<&str>,
     origin: TurnOrigin,
 ) -> Result<String> {
+    let config = Arc::new(config);
+    let capabilities = RuntimeCapabilities::config_backed(&config);
     process_message_inner(
-        Arc::new(config),
+        config,
         Some(live_config),
+        capabilities,
+        None,
         agent_alias,
         message,
         session_id,
@@ -3188,9 +3242,16 @@ pub async fn process_message_with_live_config(
     .await
 }
 
+/// The single-message turn every entry point above shares: the provider, the
+/// agent's memory, the observer and any source-supplied tools come from
+/// `capabilities`, `principal` reaches the provider source, and `live_config`,
+/// when present, is the live tool-policy source.
+#[allow(clippy::too_many_arguments)]
 async fn process_message_inner(
     config: Arc<Config>,
     live_config: Option<Arc<parking_lot::RwLock<Config>>>,
+    capabilities: RuntimeCapabilities,
+    principal: Option<PrincipalId>,
     agent_alias: &str,
     message: &str,
     session_id: Option<&str>,
@@ -3249,6 +3310,12 @@ async fn process_message_inner(
         let eff_prompt_injection_mode = agent.resolved.prompt_injection_mode;
 
         let observer: Arc<dyn Observer> = Arc::clone(&capabilities.observer);
+        // What operations started inside this turn inherit: a spawned
+        // sub-agent, a delegate, a peer turn, a cross-agent SOP step.
+        let bound_capabilities = crate::composition::BoundCapabilities {
+            capabilities: capabilities.clone(),
+            principal: principal.clone(),
+        };
         let runtime: Arc<dyn platform::RuntimeAdapter> =
             Arc::from(platform::create_runtime(&config.runtime)?);
         let security = Arc::new(SecurityPolicy::for_agent(&config, agent_alias)?);
@@ -3336,6 +3403,7 @@ async fn process_message_inner(
                 runtime: &runtime,
                 memory: &mem,
             },
+            principal.as_ref(),
         )?;
         let skills = crate::skills::load_skills_for_agent_from_config(&config, agent_alias);
         let assembled = scoped::ScopedToolRegistry::assemble(scoped::ScopedAssembly {
@@ -3761,6 +3829,7 @@ async fn process_message_inner(
                     Some(&turn_id),
                     Some(SopStepReassembly {
                         config: &config,
+                        capabilities: Some(&bound_capabilities),
                         live_config,
                     }),
                 ),
@@ -15536,7 +15605,7 @@ Let me check the result."#;
             escalate_handle: None,
             channel_room_handle: None,
             unfiltered_tool_arcs: Vec::new(),
-            delegate_capabilities: None,
+            capability_slots: Vec::new(),
             delegate_tool: None,
         };
         let skill = crate::skills::Skill {
@@ -22190,6 +22259,7 @@ mod capability_entry_point_tests {
             "hello",
             None,
             TurnOrigin::SubTurn,
+            None,
         )
         .await
         .expect("the turn completes on the supplied provider");

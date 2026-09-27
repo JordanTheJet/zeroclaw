@@ -629,11 +629,12 @@ pub struct Agent {
     /// the full conversation history on every turn and tool iteration.
     image_cache: zeroclaw_providers::multimodal::LocalImageCache,
     provider_switch_config: Option<ProviderSwitchConfig>,
-    /// The provider source a capability-built agent was constructed from, and
-    /// the principal it resolves for. A model switch asks this source for the
-    /// new provider. `None` on an agent built by a compatibility adapter or
+    /// The capabilities a capability-built agent was constructed from, and
+    /// the principal it resolves for. A model switch asks their provider
+    /// source for the new provider, and a cross-agent SOP step re-assembles
+    /// through them. `None` on an agent built by a compatibility adapter or
     /// directly through the builder, which keeps the config-snapshot rebuild.
-    provider_source: Option<AgentProviderSource>,
+    supplied_capabilities: Option<crate::composition::BoundCapabilities>,
     /// The generation cell the context-limits resolver reads. Direct ACP/WS
     /// agents retain their construction generation until reconnect; callers
     /// with an acknowledged live-refresh transaction may republish it together
@@ -737,11 +738,15 @@ enum CapabilityOrigin<'a> {
     },
 }
 
-/// A capability-built agent's provider source and the principal it asks for.
-#[derive(Clone)]
-struct AgentProviderSource {
-    source: Arc<dyn crate::composition::ProviderSource>,
-    principal: Option<zeroclaw_api::principal::PrincipalId>,
+impl<'a> CapabilityOrigin<'a> {
+    /// The principal the constructor resolves for: the supplied one, or
+    /// none on the adapter path.
+    fn principal(self) -> Option<&'a zeroclaw_api::principal::PrincipalId> {
+        match self {
+            CapabilityOrigin::Supplied { principal } => principal,
+            CapabilityOrigin::Adapter => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -852,7 +857,7 @@ pub struct AgentBuilder {
     channel_name: Option<String>,
     exclude_memory: bool,
     provider_switch_config: Option<ProviderSwitchConfig>,
-    provider_source: Option<AgentProviderSource>,
+    supplied_capabilities: Option<crate::composition::BoundCapabilities>,
     config_generation: Option<ConfigGeneration>,
     #[cfg(any(test, feature = "test-util"))]
     turn_datetime: Option<Arc<dyn Fn() -> chrono::DateTime<chrono::Local> + Send + Sync>>,
@@ -919,7 +924,7 @@ impl AgentBuilder {
             config_generation: None,
             exclude_memory: false,
             provider_switch_config: None,
-            provider_source: None,
+            supplied_capabilities: None,
             #[cfg(any(test, feature = "test-util"))]
             turn_datetime: None,
             #[cfg(test)]
@@ -1258,13 +1263,11 @@ impl AgentBuilder {
         self
     }
 
-    /// Route model switches through `source`, resolving for `principal`.
-    pub fn provider_source(
-        mut self,
-        source: Arc<dyn crate::composition::ProviderSource>,
-        principal: Option<zeroclaw_api::principal::PrincipalId>,
-    ) -> Self {
-        self.provider_source = Some(AgentProviderSource { source, principal });
+    /// Mark the agent as built from supplied capabilities: model switches ask
+    /// their provider source, and cross-agent SOP steps re-assemble through
+    /// them, all for the bound principal.
+    pub fn supplied_capabilities(mut self, bound: crate::composition::BoundCapabilities) -> Self {
+        self.supplied_capabilities = Some(bound);
         self
     }
 
@@ -1435,7 +1438,7 @@ impl AgentBuilder {
             image_cache: zeroclaw_providers::multimodal::LocalImageCache::new(),
             config_generation: self.config_generation,
             provider_switch_config: self.provider_switch_config,
-            provider_source: self.provider_source,
+            supplied_capabilities: self.supplied_capabilities,
             channel_name: self.channel_name.unwrap_or_else(|| "agent".to_string()),
             #[cfg(any(test, feature = "test-util"))]
             turn_datetime: self.turn_datetime,
@@ -3008,6 +3011,7 @@ impl Agent {
                 runtime: &runtime,
                 memory: &memory,
             },
+            origin.principal(),
         )?;
         // Skills are loaded here and handed to `assemble`, which owns skill
         // registration and resolves builtin/MCP elevation against the pre-filter
@@ -3097,10 +3101,7 @@ impl Agent {
         };
 
         let provider_ref = format!("{provider_name}.{provider_alias}");
-        let principal = match origin {
-            CapabilityOrigin::Supplied { principal } => principal,
-            CapabilityOrigin::Adapter => None,
-        };
+        let principal = origin.principal();
         let model_provider = capabilities.model_provider(&crate::composition::ProviderRequest {
             config,
             agent_alias,
@@ -3256,8 +3257,10 @@ impl Agent {
             builder = builder.config_generation(generation);
         }
         if let CapabilityOrigin::Supplied { principal } = origin {
-            builder =
-                builder.provider_source(Arc::clone(&capabilities.providers), principal.cloned());
+            builder = builder.supplied_capabilities(crate::composition::BoundCapabilities {
+                capabilities: capabilities.clone(),
+                principal: principal.cloned(),
+            });
         }
         let mut agent = builder.build()?;
 
@@ -3602,18 +3605,19 @@ impl Agent {
             self.provider_switch_config
                 .as_ref()
                 .and_then(|cfg| cfg.config.as_ref()),
-            self.provider_source.as_ref(),
+            self.supplied_capabilities.as_ref(),
         ) {
             // A capability-built agent asks the source it was built from, so a
             // switch cannot step outside the embedder's providers.
-            (Some(full_config), Some(provider_source)) => provider_source
-                .source
+            (Some(full_config), Some(supplied)) => supplied
+                .capabilities
+                .providers
                 .switched_model_provider(&crate::composition::ProviderRequest {
                     config: full_config,
                     agent_alias: &self.agent_alias,
                     provider_ref: Some(&new_model_provider),
                     model: Some(&new_model),
-                    principal: provider_source.principal.as_ref(),
+                    principal: supplied.principal.as_ref(),
                 })
                 .map(|provider| {
                     (
@@ -4134,6 +4138,7 @@ impl Agent {
                                 crate::agent::turn::SopStepReassembly {
                                     config,
                                     live_config: c.live_config.clone(),
+                                    capabilities: self.supplied_capabilities.as_ref(),
                                 }
                             })
                         }),
@@ -4732,6 +4737,7 @@ impl Agent {
                                     crate::agent::turn::SopStepReassembly {
                                         config,
                                         live_config: c.live_config.clone(),
+                                        capabilities: self.supplied_capabilities.as_ref(),
                                     }
                                 })
                             }),
@@ -18607,8 +18613,103 @@ mod capability_construction_tests {
             adapter.model_provider.alias(),
             "both switches build the same provider"
         );
-        assert!(supplied.provider_source.is_some());
-        assert!(adapter.provider_source.is_none());
+        assert!(supplied.supplied_capabilities.is_some());
+        assert!(adapter.supplied_capabilities.is_none());
+    }
+
+    /// A sub-agent spawned from a capability-built agent runs on the parent's
+    /// provider and memory sources for the parent's principal. The configured
+    /// endpoint is unroutable, so a child that fell back to config would fail.
+    #[tokio::test]
+    async fn a_spawned_subagent_inherits_the_parents_capabilities_and_principal() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = two_provider_config(&tmp);
+        for entry in config.providers.models.openai.values_mut() {
+            entry.base.uri = Some("http://127.0.0.1:9".to_string());
+        }
+        let providers = Arc::new(RecordingProviders::default());
+        let memory = Arc::new(RecordingMemory::default());
+        let principal = PrincipalId::for_oidc("https://issuer.example", "subject-spawn");
+
+        let agent = Agent::from_config_with_capabilities(
+            &config,
+            "test-agent",
+            &capabilities(Arc::clone(&providers), Arc::clone(&memory)),
+            Some(&principal),
+        )
+        .await
+        .expect("agent builds from supplied capabilities");
+        let spawn = agent
+            .tools
+            .iter()
+            .find(|tool| tool.name() == crate::tools::SpawnSubagentTool::NAME)
+            .expect("spawn_subagent is registered");
+        let memory_requests_before = memory.agents.lock().len();
+
+        let result = spawn
+            .execute(serde_json::json!({"prompt": "Summarize this private task"}))
+            .await
+            .expect("spawn returns a result");
+
+        assert!(result.success, "child failed: {:?}", result.error);
+        assert!(
+            result
+                .output
+                .contains(crate::composition::test_support::STUB_REPLY)
+        );
+        let seen = providers.seen.lock();
+        assert_eq!(
+            seen.len(),
+            2,
+            "parent and child both ask the source: {seen:?}"
+        );
+        assert_eq!(seen[1].agent_alias, "test-agent");
+        assert_eq!(seen[1].principal, Some(principal));
+        assert!(
+            memory.agents.lock().len() > memory_requests_before,
+            "the child's memory comes from the memory source"
+        );
+    }
+
+    /// The registry's delegate resolves targets for the requesting principal,
+    /// through a source that refuses anonymous requests.
+    #[tokio::test]
+    async fn a_delegate_resolves_its_target_for_the_requesting_principal() {
+        use crate::composition::test_support::PrincipalRequiredProviders;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = two_provider_config(&tmp);
+        let providers = Arc::new(PrincipalRequiredProviders::default());
+        let principal = PrincipalId::for_oidc("https://issuer.example", "subject-delegate");
+        let supplied = RuntimeCapabilities {
+            providers: Arc::clone(&providers) as Arc<dyn crate::composition::ProviderSource>,
+            ..recording_capabilities(
+                Arc::new(RecordingProviders::default()),
+                Arc::new(RecordingMemory::default()),
+                Arc::new(SuppliedTools),
+            )
+        };
+
+        let agent = Agent::from_config_with_capabilities(
+            &config,
+            "test-agent",
+            &supplied,
+            Some(&principal),
+        )
+        .await
+        .expect("agent builds for the principal");
+        let delegate = agent
+            .delegate_tool
+            .as_ref()
+            .expect("the registry built a delegate");
+
+        delegate
+            .build_target_provider("test-agent", "openai.smart", "openai", None)
+            .expect("the target resolves for the requesting principal");
+        assert_eq!(
+            *providers.served.lock(),
+            vec![principal.clone(), principal],
+            "the parent and the delegated target are both served for the same principal"
+        );
     }
 
     /// A capability-built RPC agent with a live model generation switches
@@ -18635,7 +18736,7 @@ mod capability_construction_tests {
         )
         .await
         .expect("live agent builds from supplied capabilities");
-        assert!(agent.provider_source.is_some());
+        assert!(agent.supplied_capabilities.is_some());
 
         // The operator retargets the switch profile; the RPC refresh
         // transaction republishes the generation.
@@ -18708,7 +18809,7 @@ mod capability_construction_tests {
             .expect("agent builds through the adapter");
 
         assert!(
-            agent.provider_source.is_none(),
+            agent.supplied_capabilities.is_none(),
             "the adapter keeps the config-snapshot model-switch rebuild"
         );
         assert_eq!(agent.model_provider_name, "openai.fast");

@@ -2741,7 +2741,11 @@ mod tests {
         assert_eq!(seen[0].agent_alias, TEST_AGENT);
         assert_eq!(seen[0].principal, None);
         drop(seen);
-        assert!(memory.agents.lock().iter().all(|alias| alias == TEST_AGENT));
+        let agents = memory.agents.lock();
+        assert!(
+            !agents.is_empty() && agents.iter().all(|alias| alias == TEST_AGENT),
+            "the job's memory comes from the memory source: {agents:?}"
+        );
     }
 
     #[tokio::test]

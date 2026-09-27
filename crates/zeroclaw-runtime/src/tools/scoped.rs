@@ -303,7 +303,7 @@ impl ScopedToolRegistry {
             unfiltered_tool_arcs,
             // Bound to the owning entry point's capabilities before the
             // registry reaches `assemble`; nothing here reads it.
-            delegate_capabilities: _,
+            capability_slots: _,
             // Test-only capture of the concrete delegate instance; `assemble`
             // has no use for it and must keep destructuring exhaustively so a
             // new field cannot be silently dropped here.
@@ -813,7 +813,7 @@ mod tests {
             escalate_handle: None,
             channel_room_handle: None,
             unfiltered_tool_arcs: Vec::new(),
-            delegate_capabilities: None,
+            capability_slots: Vec::new(),
             delegate_tool: None,
         }
     }
@@ -845,7 +845,7 @@ mod tests {
             escalate_handle: None,
             channel_room_handle: None,
             unfiltered_tool_arcs,
-            delegate_capabilities: None,
+            capability_slots: Vec::new(),
             delegate_tool: None,
         }
     }

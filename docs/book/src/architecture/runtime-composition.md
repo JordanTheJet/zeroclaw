@@ -230,4 +230,4 @@ The issue asks for any retained dependency to be explained rather than hidden be
 These were open when this page was first proposed. The v0.9.0 architecture review settled both.
 
 1. **`run_turn` versus waiting for `RuntimeIngress`.** `run_turn` ships and stays minimal, as a client of the same session actor that `session/prompt` uses. It does not wait for #11012.
-2. **Whether `ProviderSource` receives the requesting principal.** Yes, from the first implementation slice: `ProviderRequest` gains `principal: Option<&PrincipalId>` when the capability-taking constructors land. Adding a field to an embedder-implemented request type later would be a breaking change. The skeleton on this page does not carry the field yet.
+2. **Whether `ProviderSource` receives the requesting principal.** Yes, from the first implementation slice: `ProviderRequest` gains `principal: Option<&PrincipalId>` when the capability-taking constructors land. Adding a field to an embedder-implemented request type later would be a breaking change. The capability-taking constructors carry it.

@@ -340,7 +340,7 @@ pub struct DelegateTool {
     /// empty the tool uses the config-backed set, which is the construction
     /// it performed before it took capabilities. Shared with the copies this
     /// tool rebuilds for background and parallel delegation.
-    capabilities: crate::tools::DelegateCapabilitiesSlot,
+    capabilities: crate::composition::CapabilitySlot,
     /// Alias of the agent that owns this DelegateTool. Excluded from the
     /// advertised roster so an agent is never offered itself as a
     /// delegation target. Empty when unset (legacy unit-test constructors).
@@ -682,26 +682,42 @@ impl DelegateTool {
     }
 
     /// Resolve delegate targets' providers, memory and supplied tools through
-    /// `capabilities` instead of the config-backed set.
+    /// `capabilities` instead of the config-backed set, and ask the provider
+    /// source for them on behalf of `principal`, the requesting principal.
     ///
     /// The first binding wins, so a tool built with capabilities is not
     /// rebound by a later registry binding.
-    pub fn with_capabilities(self, capabilities: crate::composition::RuntimeCapabilities) -> Self {
-        let _ = self.capabilities.set(capabilities);
+    pub fn with_capabilities(
+        self,
+        capabilities: crate::composition::RuntimeCapabilities,
+        principal: Option<zeroclaw_api::principal::PrincipalId>,
+    ) -> Self {
+        let _ = self
+            .capabilities
+            .set(crate::composition::BoundCapabilities {
+                capabilities,
+                principal,
+            });
         self
     }
 
     /// The slot this tool reads its capabilities from, for the registry that
     /// builds it to hand to the owning entry point.
-    pub(crate) fn capabilities_slot(&self) -> crate::tools::DelegateCapabilitiesSlot {
+    pub(crate) fn capabilities_slot(&self) -> crate::composition::CapabilitySlot {
         Arc::clone(&self.capabilities)
     }
 
-    fn target_capabilities(&self) -> crate::composition::RuntimeCapabilities {
+    /// The capabilities and requesting principal delegated targets resolve
+    /// through: the owner's binding, or the config-backed set with no
+    /// principal when nothing bound this tool.
+    fn target_binding(&self) -> crate::composition::BoundCapabilities {
         self.capabilities
             .get()
             .cloned()
-            .unwrap_or_else(crate::composition::RuntimeCapabilities::config_backed_unobserved)
+            .unwrap_or_else(|| crate::composition::BoundCapabilities {
+                capabilities: crate::composition::RuntimeCapabilities::config_backed_unobserved(),
+                principal: None,
+            })
     }
 
     /// Set the owning agent's alias so it can be excluded from the
@@ -1174,7 +1190,7 @@ impl DelegateTool {
         })
     }
 
-    fn build_target_provider(
+    pub(crate) fn build_target_provider(
         &self,
         agent_name: &str,
         model_provider: &str,
@@ -1182,14 +1198,19 @@ impl DelegateTool {
         credential: Option<&str>,
     ) -> anyhow::Result<(Box<dyn ModelProvider>, String, String)> {
         if let Some(config) = self.root_config.as_deref() {
+            // The target is resolved for the principal that asked for the
+            // delegation, not anonymously: a source that scopes credentials
+            // or quotas by principal must see the same caller it saw for the
+            // parent.
+            let binding = self.target_binding();
             let (provider, provider_name, model_name, _resolver) =
                 crate::agent::agent::build_session_model_provider_with_capabilities(
-                    &self.target_capabilities(),
+                    &binding.capabilities,
                     config,
                     agent_name,
                     model_provider,
                     None,
-                    None,
+                    binding.principal.as_ref(),
                 )?;
             return Ok((provider, provider_name, model_name));
         }
@@ -1210,7 +1231,8 @@ impl DelegateTool {
             return Ok(self.memory.clone());
         };
 
-        self.target_capabilities()
+        self.target_binding()
+            .capabilities
             .agent_memory(config, agent_name)
             .await
             .map(Some)
@@ -1303,7 +1325,8 @@ impl DelegateTool {
             // handle (one-shot callers), which keeps the snapshot fallback.
             self.live_config.clone(),
         )?;
-        self.target_capabilities().bind_registry(
+        let binding = self.target_binding();
+        binding.capabilities.bind_registry(
             &mut all_tools_result,
             &crate::composition::ToolRequest {
                 config,
@@ -1312,6 +1335,7 @@ impl DelegateTool {
                 runtime: &runtime,
                 memory: &memory,
             },
+            binding.principal.as_ref(),
         )?;
 
         let target_workspace = config.agent_workspace_dir(agent_name);
