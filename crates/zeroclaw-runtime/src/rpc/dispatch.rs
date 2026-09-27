@@ -7543,6 +7543,17 @@ impl RpcDispatcher {
         let req: ConfigMapKeyDeleteParams = parse_params(params)?;
         let key_path = format!("{}.{}", req.path, req.key);
         self.selector_config_write(Method::ConfigMapKeyDelete, &key_path)?;
+        if matches!(
+            zeroclaw_config::alias_refs::alias_kind_for_map_path(&req.path),
+            Some(zeroclaw_config::alias_refs::AliasKind::Agent)
+        ) {
+            // Admission; rechecked with the same predicate after the lock.
+            let Some(grants) = self.stamped_grants() else {
+                return Err(rpc_err(AUTH_REQUIRED, "First call must be 'initialize'"));
+            };
+            let snapshot = self.ctx.config.read().clone();
+            self.agent_delete_predicate(grants, &req.key, &snapshot)?;
+        }
         let config_write_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
         self.recheck_config_write_authority(
             Method::ConfigMapKeyDelete,
@@ -7648,36 +7659,70 @@ impl RpcDispatcher {
         })
     }
 
-    /// An agent delete removes the agent's memory, cron jobs, ACP sessions
-    /// with their transcripts, session attribution and workspace, for every
-    /// principal that used the agent. No scoped grant bounds that: the direct
-    /// session methods only ever reach the caller's own sessions. So an agent
-    /// delete is an operator action, as it is over HTTP, and needs admin.
-    /// Checked against grants re-resolved after the config write lock, before
-    /// any side effect.
-    fn authorize_agent_delete(&self, alias: &str) -> Result<(), JsonRpcError> {
+    /// The complete predicate for deleting agent `alias`, evaluated at
+    /// admission on the connection's grants and a config snapshot, and again
+    /// after the config write lock on freshly resolved grants and a fresh
+    /// read of the agent's sessions. One function, so the recheck can never
+    /// test less than admission did.
+    ///
+    /// An admin or unscoped caller is not limited. A scoped caller needs the
+    /// agent, delete on memory, cron and sessions (the cleanup removes all
+    /// three), and must own every ACP session of the agent: the cleanup
+    /// deletes transcripts, and `session/delete` would refuse another
+    /// principal's. Returns the owner the cleanup must act for, or `None`
+    /// when unlimited.
+    fn agent_delete_predicate(
+        &self,
+        grants: &zeroclaw_api::grants::ResolvedGrants,
+        alias: &str,
+        config: &zeroclaw_config::schema::Config,
+    ) -> Result<Option<String>, JsonRpcError> {
+        use zeroclaw_api::grants::{Resource, Verb};
         let method = Method::ConfigMapKeyDelete;
-        let Some(grants) = self.recheck_authority_after_admission(method)? else {
+        let Some(auth) = self.auth.as_ref() else {
             return Err(rpc_err(AUTH_REQUIRED, "First call must be 'initialize'"));
         };
-        if grants.admin {
-            return Ok(());
+        if grants.admin || !auth.principal.is_authenticated() {
+            return Ok(None);
         }
-        let denied = rpc_err(
-            FORBIDDEN,
-            format!(
-                "Deleting agent {alias:?} removes its memory, cron jobs, sessions and workspace \
-                 for every principal; only an admin principal may delete an agent"
-            ),
-        );
-        self.audit_auth_denial(
-            method,
-            &crate::rpc::auth::AuthDenied {
-                code: denied.code,
-                message: denied.message.clone(),
-            },
-        );
-        Err(denied)
+        let refuse = |message: String| -> JsonRpcError {
+            let denied = rpc_err(FORBIDDEN, message);
+            self.audit_auth_denial(
+                method,
+                &crate::rpc::auth::AuthDenied {
+                    code: denied.code,
+                    message: denied.message.clone(),
+                },
+            );
+            denied
+        };
+        self.selector_session_agent_with_grants(method, grants, alias)?;
+        let missing: Vec<&str> = [
+            (Resource::Memory, "memory"),
+            (Resource::Cron, "cron"),
+            (Resource::Sessions, "sessions"),
+        ]
+        .into_iter()
+        .filter(|(resource, _)| !grants.permits(*resource, Verb::Delete))
+        .map(|(_, name)| name)
+        .collect();
+        if !missing.is_empty() {
+            return Err(refuse(format!(
+                "Deleting agent {alias:?} removes its owned state; principal lacks delete on: {}",
+                missing.join(", ")
+            )));
+        }
+        let owner = auth.principal.id.as_str().to_owned();
+        let foreign = crate::config_ops::delete::foreign_agent_sessions(config, alias, &owner)
+            .map_err(config_api_err)?;
+        if !foreign.is_empty() {
+            return Err(refuse(format!(
+                "Deleting agent {alias:?} would delete {} session(s) owned by other principals; \
+                 only their owners or an admin may delete them",
+                foreign.len()
+            )));
+        }
+        Ok(Some(owner))
     }
 
     /// Refuse an agent delete while RPC sessions still run on the agent: their
@@ -7722,11 +7767,22 @@ impl RpcDispatcher {
     ) -> RpcResult {
         use crate::config_ops::delete;
         let is_agent = matches!(kind, zeroclaw_config::alias_refs::AliasKind::Agent);
-        if is_agent {
-            self.authorize_agent_delete(&req.key)?;
+        let owner = if is_agent {
+            // The recheck: fresh grants and a fresh read of the agent's
+            // sessions, under the lock the commit and cleanup run under.
+            let Some(grants) =
+                self.recheck_authority_after_admission(Method::ConfigMapKeyDelete)?
+            else {
+                return Err(rpc_err(AUTH_REQUIRED, "First call must be 'initialize'"));
+            };
+            let live = self.ctx.config.read().clone();
+            let owner = self.agent_delete_predicate(&grants, &req.key, &live)?;
             self.refuse_agent_delete_with_live_sessions(&req.path, &req.key, &config_write_guard)
                 .await?;
-        }
+            owner
+        } else {
+            None
+        };
         // The owned-state cascade needs the memory backend. The daemon leaves
         // it unset when it booted with no agents, so open it from config then;
         // if that fails, refuse before mutating rather than orphan the
@@ -7774,6 +7830,7 @@ impl RpcDispatcher {
                 self.ctx.session_backend.as_ref(),
                 &req.key,
                 &workspace,
+                owner.as_deref(),
             )
             .await;
         }
@@ -27810,47 +27867,60 @@ mod tests {
         });
     }
 
+    /// A scoped roster principal holding every grant an agent delete needs
+    /// short of admin: the agent (by wildcard, so deleting `bot` leaves no
+    /// dangling profile reference), both config paths, and delete on memory,
+    /// cron and sessions.
+    async fn scoped_agent_deleter_config(
+        tmp: &tempfile::TempDir,
+    ) -> zeroclaw_config::schema::Config {
+        use zeroclaw_api::grants::{Resource, Verb};
+        let mut config =
+            agent_with_heartbeat_roster_config(tmp, &["agents.*", "heartbeat.*"], false, false)
+                .await;
+        let profile = config
+            .permission_profiles
+            .get_mut("config-writer")
+            .expect("the fixture profile exists");
+        profile.allowed_agents = vec![zeroclaw_api::grants::WILDCARD.into()];
+        for resource in [Resource::Memory, Resource::Cron, Resource::Sessions] {
+            profile.grants.insert(resource, vec![Verb::Delete]);
+        }
+        config
+    }
+
+    /// An ended ACP session on `bot` owned by `owner`, with a two-message
+    /// transcript.
+    fn seed_ended_bot_session(
+        store: &zeroclaw_infra::acp_session_store::AcpSessionStore,
+        id: &str,
+        owner: &str,
+    ) {
+        use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage};
+        store
+            .create_session(id, "bot", "/tmp/bot-session", Some(owner))
+            .unwrap();
+        store
+            .append_turn(
+                id,
+                &[
+                    ConversationMessage::Chat(ChatMessage::user("hello")),
+                    ConversationMessage::Chat(ChatMessage::assistant("hi")),
+                ],
+            )
+            .unwrap();
+        assert!(store.mark_session_killed(id).unwrap());
+    }
+
     #[test]
-    fn config_map_key_delete_agent_is_admin_only_and_keeps_foreign_sessions() {
+    fn config_map_key_delete_agent_refuses_a_scoped_caller_with_foreign_sessions() {
         run_on_a_large_stack(|| async move {
-            use zeroclaw_api::grants::{Resource, Verb};
-            use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage};
             let tmp = tempfile::TempDir::new().unwrap();
             let config_path = tmp.path().join("config.toml");
-            // Every scoped grant an agent delete could plausibly need: the
-            // agent selector, both config paths, and delete on memory, cron and
-            // sessions. Still not admin.
-            let mut config = agent_with_heartbeat_roster_config(
-                &tmp,
-                &["agents.*", "heartbeat.*"],
-                false,
-                false,
-            )
-            .await;
-            let profile = config
-                .permission_profiles
-                .get_mut("config-writer")
-                .expect("the fixture profile exists");
-            profile.allowed_agents = vec![zeroclaw_api::grants::WILDCARD.into()];
-            for resource in [Resource::Memory, Resource::Cron, Resource::Sessions] {
-                profile.grants.insert(resource, vec![Verb::Delete]);
-            }
-            // Another principal's ended ACP session on `bot`, with a transcript.
+            let config = scoped_agent_deleter_config(&tmp).await;
             let store =
                 zeroclaw_infra::acp_session_store::AcpSessionStore::new(&config.data_dir).unwrap();
-            store
-                .create_session("foreign-ended", "bot", "/tmp/foreign", Some("someone-else"))
-                .unwrap();
-            store
-                .append_turn(
-                    "foreign-ended",
-                    &[
-                        ConversationMessage::Chat(ChatMessage::user("hello")),
-                        ConversationMessage::Chat(ChatMessage::assistant("hi")),
-                    ],
-                )
-                .unwrap();
-            assert!(store.mark_session_killed("foreign-ended").unwrap());
+            seed_ended_bot_session(&store, "foreign-ended", "someone-else");
             let workspace = config.agent_workspace_dir("bot");
             std::fs::create_dir_all(&workspace).unwrap();
             let ctx = enforcement_ctx(config);
@@ -27860,10 +27930,10 @@ mod tests {
             let err = alice
                 .handle_config_map_key_delete(&json!({"path": "agents", "key": "bot"}))
                 .await
-                .expect_err("a scoped principal must not reach other principals' state");
+                .expect_err("another principal's transcript is not the caller's to delete");
 
             assert_eq!(err.code, FORBIDDEN, "{err:?}");
-            assert!(err.message.contains("admin"), "{err:?}");
+            assert!(err.message.contains("owned by other principals"), "{err:?}");
             assert!(ctx.config.read().agents.contains_key("bot"));
             assert_eq!(std::fs::read_to_string(&config_path).unwrap(), before);
             assert!(workspace.exists(), "the workspace must not be archived");
@@ -27873,6 +27943,75 @@ mod tests {
                 .expect("the foreign session survives");
             assert_eq!(foreign.principal_id.as_deref(), Some("someone-else"));
             assert_eq!(foreign.messages.len(), 2, "its transcript survives");
+        });
+    }
+
+    #[test]
+    fn config_map_key_delete_agent_by_its_scoped_owner_removes_its_sessions() {
+        run_on_a_large_stack(|| async move {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config = scoped_agent_deleter_config(&tmp).await;
+            let data_dir = config.data_dir.clone();
+            let ctx = enforcement_ctx(config);
+            let (alice, _rx) = roster_peer(&ctx, 4242).await;
+            let alice_id = alice
+                .auth
+                .as_ref()
+                .expect("alice is bound")
+                .principal
+                .id
+                .as_str()
+                .to_owned();
+            let store = zeroclaw_infra::acp_session_store::AcpSessionStore::new(&data_dir).unwrap();
+            seed_ended_bot_session(&store, "alice-ended", &alice_id);
+
+            let result = alice
+                .handle_config_map_key_delete(&json!({"path": "agents", "key": "bot"}))
+                .await
+                .expect("a scoped caller may delete an agent whose sessions are all its own");
+
+            assert_eq!(result["deleted"], json!(true), "{result}");
+            assert!(!ctx.config.read().agents.contains_key("bot"));
+            assert!(
+                store.load_session("alice-ended").unwrap().is_none(),
+                "the owner's ended session is removed"
+            );
+        });
+    }
+
+    #[test]
+    fn config_map_key_delete_agent_foreign_session_added_after_admission_is_refused() {
+        run_on_a_large_stack(|| async move {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config = scoped_agent_deleter_config(&tmp).await;
+            let data_dir = config.data_dir.clone();
+            let ctx = enforcement_ctx(config);
+            let (alice, _rx) = roster_peer(&ctx, 4242).await;
+
+            // Admission sees no foreign session; one appears while the delete
+            // waits for the config write lock.
+            let params = json!({"path": "agents", "key": "bot"});
+            let store_dir = data_dir.clone();
+            let result = rpc_result_after_midwait_policy_change(
+                Arc::clone(&ctx),
+                async move { alice.handle_config_map_key_delete(&params).await },
+                move |_ctx| {
+                    let store = zeroclaw_infra::acp_session_store::AcpSessionStore::new(&store_dir)
+                        .unwrap();
+                    seed_ended_bot_session(&store, "late-foreign", "someone-else");
+                },
+            )
+            .await;
+
+            let err = result.expect_err("the recheck reads the agent's sessions again");
+            assert_eq!(err.code, FORBIDDEN, "{err:?}");
+            assert!(ctx.config.read().agents.contains_key("bot"));
+            let store = zeroclaw_infra::acp_session_store::AcpSessionStore::new(&data_dir).unwrap();
+            let late = store
+                .load_session("late-foreign")
+                .unwrap()
+                .expect("the late foreign session survives");
+            assert_eq!(late.messages.len(), 2, "its transcript survives");
         });
     }
 

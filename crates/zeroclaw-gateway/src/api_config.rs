@@ -1037,6 +1037,28 @@ async fn delete_alias_cascade(
     guard: ConfigWriteGuard,
 ) -> Response {
     let is_agent = matches!(kind, zeroclaw_config::alias_refs::AliasKind::Agent);
+    // An agent delete removes the agent's transcripts. A scoped principal may
+    // delete it only when it owns every one; read under the lock the commit
+    // and cleanup run under, and the owner also rides the delete statement.
+    let owner = if is_agent {
+        crate::principal_gate::scoped_principal_id(principal)
+    } else {
+        None
+    };
+    if let Some(owner) = owner.as_deref() {
+        match zeroclaw_runtime::config_ops::delete::foreign_agent_sessions(&working, key, owner) {
+            Ok(foreign) if foreign.is_empty() => {}
+            Ok(foreign) => {
+                return crate::principal_gate::WriteDenied::new(format!(
+                    "Deleting agent `{key}` would delete {} session(s) owned by other principals; \
+                     only their owners or an admin may delete them",
+                    foreign.len()
+                ))
+                .into_response();
+            }
+            Err(e) => return error_response(e),
+        }
+    }
     let before = state.config.read().clone();
     let prepared = match prepare_alias_delete(&mut working, kind, path, key) {
         Ok(prepared) => prepared,
@@ -1068,6 +1090,7 @@ async fn delete_alias_cascade(
             state.session_backend.as_ref(),
             key,
             &workspace,
+            owner.as_deref(),
         )
         .await;
     } else {

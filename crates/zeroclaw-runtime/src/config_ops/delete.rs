@@ -121,6 +121,35 @@ pub fn build_delete_plan(
     })
 }
 
+/// The ACP sessions of agent `alias` that `owner` does not own, including
+/// unowned legacy rows. An agent delete removes the agent's transcripts, so
+/// a scoped caller may delete it only when this is empty; an admin or
+/// unscoped caller is not limited by it. Fails closed when the session store
+/// cannot be read.
+pub fn foreign_agent_sessions(
+    config: &Config,
+    alias: &str,
+    owner: &str,
+) -> Result<Vec<String>, ConfigApiError> {
+    let unreadable = |e: anyhow::Error| {
+        ConfigApiError::new(
+            ConfigApiCode::ValidationFailed,
+            format!(
+                "cannot delete agent `{alias}`: could not verify who owns its sessions ({e}); refusing"
+            ),
+        )
+        .with_path(format!("agents.{alias}"))
+    };
+    let store = zeroclaw_infra::acp_session_store::AcpSessionStore::new(&config.data_dir)
+        .map_err(unreadable)?;
+    let sessions = store.list_sessions_by_agent(alias).map_err(unreadable)?;
+    Ok(sessions
+        .into_iter()
+        .filter(|session| session.principal_id.as_deref() != Some(owner))
+        .map(|session| session.session_uuid)
+        .collect())
+}
+
 /// Map a config-cascade failure onto the shared config error vocabulary.
 pub fn cascade_error(path: &str, key: &str, err: CascadeError) -> ConfigApiError {
     let (code, msg) = match err {
@@ -244,6 +273,7 @@ pub async fn finish_agent_delete(
     session_backend: Option<&Arc<dyn SessionBackend>>,
     alias: &str,
     workspace: &std::path::Path,
+    owner: Option<&str>,
 ) -> Vec<String> {
     let ts = chrono::Utc::now().format("%Y%m%d%H%M%S");
     let archive_dir = committed
@@ -277,7 +307,8 @@ pub async fn finish_agent_delete(
         }
     }
 
-    let owned = cascade_owned_state(committed, mem, session_backend, alias, &archive_dir).await;
+    let owned =
+        cascade_owned_state(committed, mem, session_backend, alias, &archive_dir, owner).await;
     // Combine per-side-effect failures (archive dir / workspace rename) with
     // the per-store failures surfaced by `cascade_owned_state`, so the operator
     // sees the FULL partial-failure picture in the response, not just the

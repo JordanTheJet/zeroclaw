@@ -160,6 +160,13 @@ fn forbidden(message: impl Into<String>) -> Response {
 #[derive(Debug)]
 pub struct WriteDenied(String);
 
+impl WriteDenied {
+    /// A refusal a handler decides itself, after the write-set check.
+    pub fn new(message: impl Into<String>) -> Self {
+        Self(message.into())
+    }
+}
+
 impl IntoResponse for WriteDenied {
     fn into_response(self) -> Response {
         forbidden(self.0)
@@ -380,6 +387,19 @@ pub fn authorize_config_write(
         enforced: Some(writes),
         authority,
     })
+}
+
+/// The principal a scoped request acts as: an authenticated, non-admin
+/// principal. `None` when nothing limits the request (the open posture, an
+/// admin, or no principal), the same exemptions [`authorize_config_write`]
+/// grants.
+pub fn scoped_principal_id(request: &RequestPrincipal) -> Option<String> {
+    let axum::Extension(request) = request.as_ref()?;
+    let conn = request.principal.as_ref()?;
+    if conn.grants.admin || !conn.principal.is_authenticated() {
+        return None;
+    }
+    Some(conn.principal.id.as_str().to_owned())
 }
 
 /// A rewrite whose write set cannot be enumerated before it runs (a schema
@@ -1016,6 +1036,50 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(agent_model(&router, "beta").await.0, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn scoped_agent_delete_is_refused_while_other_principals_own_its_sessions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let idp = introspection_idp(&["ops"]).await;
+        let config = editor_config(
+            &tmp,
+            &idp.uri(),
+            &[Verb::Create, Verb::Update, Verb::Delete],
+            &["agents.*"],
+        );
+        let data_dir = config.data_dir.clone();
+        let router = router_for(config);
+        create_agent(&router, "beta").await;
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let store = zeroclaw_infra::acp_session_store::AcpSessionStore::new(&data_dir).unwrap();
+        store
+            .create_session("theirs", "beta", "/tmp/beta", Some("someone-else"))
+            .unwrap();
+        assert!(store.mark_session_killed("theirs").unwrap());
+
+        let (status, body) = send(
+            &router,
+            "DELETE",
+            "/api/config/map-key?path=agents&key=beta",
+            SCOPED.0,
+            SCOPED.1,
+            None,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert!(
+            body["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("owned by other principals")),
+            "{body}"
+        );
+        assert_eq!(agent_model(&router, "beta").await.0, StatusCode::OK);
+        assert!(
+            store.load_session("theirs").unwrap().is_some(),
+            "the other principal's session survives"
+        );
     }
 
     #[tokio::test]

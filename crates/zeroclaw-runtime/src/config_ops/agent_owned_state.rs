@@ -48,12 +48,16 @@ async fn write_json(path: &Path, bytes: Vec<u8>) -> bool {
     true
 }
 
+/// `owner` is the scoped principal the delete acts for, or `None` for an
+/// admin or unscoped caller. A scoped delete removes only that principal's
+/// ended ACP sessions; the owner rides the delete statement.
 pub async fn cascade_owned_state(
     config: &Config,
     mem: &Arc<dyn Memory>,
     session_backend: Option<&Arc<dyn SessionBackend>>,
     alias: &str,
     archive_dir: &Path,
+    owner: Option<&str>,
 ) -> OwnedStateReport {
     let cascade_dir = archive_dir.join("cascade");
     let _ = tokio::fs::create_dir_all(&cascade_dir).await;
@@ -143,7 +147,11 @@ pub async fn cascade_owned_state(
             // ACP session creation does not take the config write lock, so a
             // session can start between the delete's live-session check and
             // here. Only ended sessions are removed; a live one is reported.
-            match store.delete_killed_sessions_by_agent(alias) {
+            let deleted = match owner {
+                Some(owner) => store.delete_killed_sessions_by_agent_owned(alias, owner),
+                None => store.delete_killed_sessions_by_agent(alias),
+            };
+            match deleted {
                 Ok(n) => acp_removed = n,
                 Err(e) => warnings.push(format!("acp delete: {e}")),
             }
