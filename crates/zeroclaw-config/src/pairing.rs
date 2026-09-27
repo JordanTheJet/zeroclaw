@@ -781,6 +781,71 @@ pub fn constant_time_eq(a: &str, b: &str) -> bool {
     (len_diff == 0) & (byte_diff == 0)
 }
 
+/// Request header that carries the gateway admin secret on the pairing-code
+/// admin routes (`/admin/paircode`, `/admin/paircode/new`).
+pub const GATEWAY_ADMIN_TOKEN_HEADER: &str = "x-zeroclaw-admin-token";
+
+const GATEWAY_ADMIN_TOKEN_FILE: &str = "gateway-admin.token";
+
+/// Where a gateway whose data directory is `data_dir` keeps its admin secret.
+///
+/// The secret is what proves a caller is local. A loopback TCP peer is not
+/// proof: a reverse proxy or tunnel on the same host relays remote callers
+/// from loopback too, with or without forwarding headers. Reading this
+/// owner-only file requires running as the gateway's user on its host.
+pub fn gateway_admin_token_path(data_dir: &std::path::Path) -> std::path::PathBuf {
+    data_dir.join(GATEWAY_ADMIN_TOKEN_FILE)
+}
+
+/// Mint a fresh admin secret and write it owner-only (mode `0o600` on Unix),
+/// replacing any previous one. The gateway calls this once per start, so a
+/// secret from an earlier run stops working. Returns the new secret.
+pub fn write_gateway_admin_token(data_dir: &std::path::Path) -> std::io::Result<String> {
+    use std::io::Write;
+
+    let token = generate_token();
+    std::fs::create_dir_all(data_dir)?;
+    let path = gateway_admin_token_path(data_dir);
+    let staging = path.with_extension("token.tmp");
+    // A leftover staging file from a crash would make `create_new` fail.
+    match std::fs::remove_file(&staging) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&staging)?;
+        file.write_all(token.as_bytes())?;
+        file.sync_all()?;
+    }
+    std::fs::rename(&staging, &path)?;
+    Ok(token)
+}
+
+/// Read the current admin secret, or `None` when no gateway has written one
+/// or the caller cannot read it.
+pub fn read_gateway_admin_token(data_dir: &std::path::Path) -> Option<String> {
+    let raw = std::fs::read_to_string(gateway_admin_token_path(data_dir)).ok()?;
+    let token = raw.trim();
+    (!token.is_empty()).then(|| token.to_string())
+}
+
+/// True only when `presented` equals the admin secret currently on disk,
+/// compared in constant time. An absent or unreadable secret matches nothing.
+pub fn gateway_admin_token_matches(data_dir: &std::path::Path, presented: &str) -> bool {
+    let presented = presented.trim();
+    !presented.is_empty()
+        && read_gateway_admin_token(data_dir)
+            .is_some_and(|secret| constant_time_eq(presented, &secret))
+}
+
 /// Check if a host string represents a non-localhost bind address.
 pub fn is_public_bind(host: &str) -> bool {
     !matches!(
@@ -1409,6 +1474,56 @@ mod tests {
                 "serde must emit config_name {name:?}; got: {serialized}"
             );
         }
+    }
+
+    #[test]
+    async fn gateway_admin_token_round_trips_and_matches_only_itself() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+
+        assert_eq!(read_gateway_admin_token(&data_dir), None);
+        assert!(!gateway_admin_token_matches(&data_dir, "anything"));
+
+        let secret = write_gateway_admin_token(&data_dir).expect("write admin token");
+        assert_eq!(
+            read_gateway_admin_token(&data_dir).as_deref(),
+            Some(secret.as_str())
+        );
+        assert!(gateway_admin_token_matches(&data_dir, &secret));
+        assert!(!gateway_admin_token_matches(&data_dir, ""));
+        assert!(!gateway_admin_token_matches(&data_dir, "zc_wrong"));
+    }
+
+    #[test]
+    async fn gateway_admin_token_is_replaced_on_each_write() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let first = write_gateway_admin_token(tmp.path()).unwrap();
+        let second = write_gateway_admin_token(tmp.path()).unwrap();
+
+        assert_ne!(first, second);
+        assert!(
+            !gateway_admin_token_matches(tmp.path(), &first),
+            "a secret from an earlier gateway start must stop working"
+        );
+        assert!(gateway_admin_token_matches(tmp.path(), &second));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    async fn gateway_admin_token_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_gateway_admin_token(tmp.path()).unwrap();
+        let mode = std::fs::metadata(gateway_admin_token_path(tmp.path()))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "the admin secret must be owner-only, got {mode:o}"
+        );
     }
 
     #[test]

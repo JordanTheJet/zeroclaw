@@ -6762,6 +6762,7 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                     rotate_device,
                     port,
                     host,
+                    json,
                 }) => {
                     let (port, host) = resolve_gateway_addr(&config, port, host);
                     let endpoint = format!("{host}:{port}");
@@ -6777,14 +6778,26 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                     };
                     let rotating = action.is_rotation();
 
-                    match fetch_paircode(
+                    let fetched = fetch_paircode(
                         &host,
                         port,
                         config.gateway.path_prefix.as_deref(),
+                        &config.data_dir,
                         &action,
                     )
-                    .await
-                    {
+                    .await;
+                    if json {
+                        let (code, message) = match fetched? {
+                            PaircodeResult::Code { code, message } => (Some(code), message),
+                            PaircodeResult::NoCode { message } => (None, message),
+                        };
+                        println!(
+                            "{}",
+                            serde_json::json!({ "pairing_code": code, "message": message })
+                        );
+                        return Ok(());
+                    }
+                    match fetched {
                         Ok(PaircodeResult::Code { code, message }) => {
                             println!(
                                 "{}",
@@ -10698,8 +10711,19 @@ async fn fetch_paircode(
     host: &str,
     port: u16,
     path_prefix: Option<&str>,
+    data_dir: &std::path::Path,
     action: &PaircodeAction,
 ) -> Result<PaircodeResult> {
+    // The pairing-code admin routes accept only this run's admin token, which
+    // the gateway writes owner-only into its data directory at startup.
+    let admin_token =
+        zeroclaw_config::pairing::read_gateway_admin_token(data_dir).ok_or_else(|| {
+            anyhow::Error::msg(format!(
+                "No gateway admin token at {}. Run this on the gateway host, as the user that \
+             runs the gateway, while the gateway is running.",
+                zeroclaw_config::pairing::gateway_admin_token_path(data_dir).display()
+            ))
+        })?;
     let client = reqwest::Client::new();
 
     let response = if action.mints_code() {
@@ -10710,6 +10734,10 @@ async fn fetch_paircode(
         }
         client
             .post(&url)
+            .header(
+                zeroclaw_config::pairing::GATEWAY_ADMIN_TOKEN_HEADER,
+                &admin_token,
+            )
             .timeout(std::time::Duration::from_secs(5))
             .send()
             .await
@@ -10717,6 +10745,10 @@ async fn fetch_paircode(
         let url = gateway_admin_url(host, port, path_prefix, "/admin/paircode");
         client
             .get(&url)
+            .header(
+                zeroclaw_config::pairing::GATEWAY_ADMIN_TOKEN_HEADER,
+                &admin_token,
+            )
             .timeout(std::time::Duration::from_secs(5))
             .send()
             .await
@@ -10746,6 +10778,12 @@ async fn fetch_paircode(
         );
         anyhow::Error::msg(format!("Gateway responded with status {status}: {e}"))
     })?;
+
+    if status == reqwest::StatusCode::FORBIDDEN
+        && let Some(error) = json.get("error").and_then(|v| v.as_str())
+    {
+        anyhow::bail!("{error}");
+    }
 
     let message = json
         .get("message")
@@ -14663,6 +14701,7 @@ mod tests {
                         rotate_device,
                         port,
                         host,
+                        json,
                     }),
             } => {
                 assert!(new);
@@ -14670,6 +14709,7 @@ mod tests {
                 assert_eq!(rotate_device, None);
                 assert_eq!(port, Some(3001));
                 assert_eq!(host.as_deref(), Some("192.168.1.20"));
+                assert!(!json, "text output is the default");
             }
             other => panic!("expected gateway get-paircode command, got {other:?}"),
         }
