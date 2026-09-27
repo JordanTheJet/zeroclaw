@@ -8,7 +8,7 @@ use serde::Serialize;
 use zeroclaw_config::schema::{Config, SopDecisionProvider};
 
 use super::audit::SopAuditLogger;
-use super::dispatch::{DispatchResult, dispatch_untrusted_fan_in};
+use super::dispatch::{DispatchResult, SopAdmissionCheck, SopIngress, SopIngressOutcome};
 use super::engine::SopEngine;
 use super::executor::SopDriverHandles;
 use super::types::{SopRunAction, SopTriggerSource};
@@ -68,6 +68,11 @@ pub enum WebhookDispatch {
 /// a reload drains it; without them (a context with no generation) it is
 /// detached. The caller authenticates the delivery and applies idempotency
 /// before calling this.
+///
+/// `admission_check`, when given, is the caller's authority over each
+/// procedure, evaluated at run admission on the normalized match set and
+/// after any decision-model wait (see [`SopAdmissionCheck`]). A procedure it
+/// refuses is reported as skipped with a `not authorized` reason.
 pub async fn dispatch_webhook_event(
     engine: &Arc<Mutex<SopEngine>>,
     audit: &Arc<SopAuditLogger>,
@@ -75,16 +80,20 @@ pub async fn dispatch_webhook_event(
     config: &Config,
     path: &str,
     payload: Option<&str>,
+    admission_check: Option<SopAdmissionCheck<'_>>,
 ) -> WebhookDispatch {
-    let results = dispatch_untrusted_fan_in(
-        engine,
-        audit,
-        SopTriggerSource::Webhook,
-        Some(path),
-        payload,
-        None,
-    )
-    .await;
+    let mut ingress = SopIngress::new(Some(engine), Some(audit.as_ref()));
+    if let Some(check) = admission_check {
+        ingress = ingress.with_admission_check(check);
+    }
+    let results = match ingress
+        .dispatch(SopTriggerSource::Webhook, Some(path), payload, None, None)
+        .await
+    {
+        SopIngressOutcome::Dispatched(results) => results,
+        SopIngressOutcome::NotInterested => return WebhookDispatch::NoMatch,
+        SopIngressOutcome::Unavailable(_) => return WebhookDispatch::Unavailable,
+    };
     if results.is_empty() {
         return WebhookDispatch::Unavailable;
     }

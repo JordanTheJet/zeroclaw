@@ -9612,6 +9612,46 @@ impl RpcDispatcher {
         Ok(())
     }
 
+    /// [`Self::authorize_sop_agents`] for an executing procedure, evaluated
+    /// against an explicit, freshly resolved grant set instead of the grants
+    /// stamped on the connection: the constrained-tool-selector refusal and
+    /// the agent selector for every agent the procedure runs as.
+    fn authorize_sop_execution_with_grants(
+        &self,
+        method: Method,
+        sop: &crate::sop::Sop,
+        grants: &zeroclaw_api::grants::ResolvedGrants,
+    ) -> Result<(), JsonRpcError> {
+        if !grants.admin
+            && !grants
+                .allowed_tools
+                .iter()
+                .any(|tool| tool == zeroclaw_api::grants::WILDCARD)
+        {
+            let denied = rpc_err(
+                FORBIDDEN,
+                "Principal has a constrained tool selector; procedures run outside per-session \
+                 tool narrowing and are refused to it",
+            );
+            self.audit_auth_denial(
+                method,
+                &crate::rpc::auth::AuthDenied {
+                    code: denied.code,
+                    message: denied.message.clone(),
+                },
+            );
+            return Err(denied);
+        }
+        let agents = {
+            let config = self.ctx.config.read();
+            Self::sop_executing_agents(sop, &config)
+        };
+        for alias in &agents {
+            self.selector_session_agent_with_grants(method, grants, alias)?;
+        }
+        Ok(())
+    }
+
     /// Refuse a procedure run by a principal whose tool selector names a
     /// subset of the tools rather than the wildcard.
     ///
@@ -10438,25 +10478,38 @@ impl RpcDispatcher {
             return Err(rpc_err(INTERNAL_ERROR, "SOP subsystem not enabled"));
         };
         // Every procedure the event starts runs as its own agents, so the
-        // principal must be entitled to all of them before anything starts.
+        // principal must be entitled to all of them. This preflight refuses
+        // early, and it matches on the topic as dispatch normalizes it: the
+        // raw path can differ from the matched one in characters the
+        // normalization removes. It is not the enforcement point, because a
+        // decision model can deliberate between here and the start; the
+        // admission check below is.
         if self.stamped_grants().is_some() {
-            let probe = crate::sop::SopEvent {
-                source: crate::sop::SopTriggerSource::Webhook,
-                topic: Some(path.to_string()),
-                payload: None,
-                timestamp: crate::sop::engine::now_iso8601(),
-            };
-            let matched: Vec<crate::sop::Sop> = engine
-                .lock()
-                .map_err(|_| rpc_err(INTERNAL_ERROR, "SOP engine lock poisoned"))?
-                .match_trigger(&probe)
-                .into_iter()
-                .cloned()
-                .collect();
+            let matched = crate::sop::dispatch::untrusted_topic_matches(
+                engine,
+                crate::sop::SopTriggerSource::Webhook,
+                path,
+            )
+            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "SOP engine lock poisoned"))?;
             for sop in &matched {
                 self.authorize_sop_agents(Method::SopsDispatchEvent, sop, true)?;
             }
         }
+        // Re-resolve the caller's authority for each procedure at the moment
+        // its run is admitted, after any decision-model wait, so a grant or
+        // agent entitlement revoked in the meantime starts nothing.
+        let admission_check = |sop: &crate::sop::Sop| -> Result<(), String> {
+            let grants = self
+                .recheck_authority_after_admission(Method::SopsDispatchEvent)
+                .map_err(|denied| denied.message)?;
+            match grants {
+                Some(grants) => self
+                    .authorize_sop_execution_with_grants(Method::SopsDispatchEvent, sop, &grants)
+                    .map_err(|denied| denied.message),
+                // Only the direct unit-test handlers run unbound.
+                None => Ok(()),
+            }
+        };
         let payload = req
             .payload
             .filter(|value| !value.is_null())
@@ -10469,6 +10522,7 @@ impl RpcDispatcher {
             &config,
             path,
             payload.as_deref(),
+            Some(&admission_check),
         )
         .await;
         let (status, results) = match dispatched {
@@ -10480,6 +10534,21 @@ impl RpcDispatcher {
                 (if blocked { "blocked" } else { "accepted" }, results)
             }
         };
+        // Every match refused at admission: the caller lost the authority the
+        // preflight saw. Report that as the refusal it is.
+        let refused = |result: &Value| {
+            result["status"] == "skipped"
+                && result["reason"].as_str().is_some_and(|reason| {
+                    reason.starts_with(crate::sop::dispatch::NOT_AUTHORIZED_PREFIX)
+                })
+        };
+        if !results.is_empty() && results.iter().all(refused) {
+            let reason = results[0]["reason"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            return Err(rpc_err(FORBIDDEN, reason));
+        }
         to_result(serde_json::json!({
             "status": status,
             "source": "webhook",
@@ -21744,6 +21813,257 @@ mod tests {
             .await
             .expect_err("an empty path is refused");
         assert_eq!(empty.code, INVALID_PARAMS);
+    }
+
+    /// A roster config for the dispatch-event authority tests: alice (uid
+    /// 4242) holds `sops:read`/`execute` with a wildcard tool selector and the
+    /// agents in `agents`.
+    fn dispatch_event_roster(agents: &[&str]) -> zeroclaw_config::schema::Config {
+        use zeroclaw_config::schema::{AliasedAgentConfig, PermissionProfileConfig, UserConfig};
+        let mut config = zeroclaw_config::schema::Config::default();
+        // Agent selectors resolve against configured agents only.
+        for alias in ["alpha", "beta"] {
+            config.agents.insert(
+                alias.into(),
+                AliasedAgentConfig {
+                    enabled: true,
+                    ..AliasedAgentConfig::default()
+                },
+            );
+        }
+        config.permission_profiles.insert(
+            "dispatcher".into(),
+            PermissionProfileConfig {
+                allowed_agents: agents.iter().map(|agent| (*agent).to_string()).collect(),
+                allowed_tools: vec!["*".into()],
+                grants: std::collections::HashMap::from([(
+                    zeroclaw_api::grants::Resource::Sops,
+                    vec![
+                        zeroclaw_api::grants::Verb::Read,
+                        zeroclaw_api::grants::Verb::Execute,
+                    ],
+                )]),
+                ..PermissionProfileConfig::default()
+            },
+        );
+        config.users.insert(
+            "alice".into(),
+            UserConfig {
+                principal_id: None,
+                uid: Some(4242),
+                permission_profiles: vec!["dispatcher".into()],
+            },
+        );
+        config
+    }
+
+    /// A deterministic no-op procedure run as `agent`, triggered by a
+    /// webhook on `/sop/deploy`.
+    fn deploy_hook_sop(name: &str, agent: &str) -> crate::sop::types::Sop {
+        let mut sop = manual_sop(
+            name,
+            true,
+            crate::sop::types::SopStep {
+                number: 1,
+                title: "No-op".to_string(),
+                kind: crate::sop::types::SopStepKind::Capability,
+                capability: Some("noop".to_string()),
+                ..crate::sop::types::SopStep::default()
+            },
+        );
+        sop.agent = Some(agent.to_string());
+        sop.triggers = vec![crate::sop::types::SopTrigger::Webhook {
+            path: "/sop/deploy".into(),
+        }];
+        sop
+    }
+
+    /// A context over `engine` with an audit logger and the roster `config`.
+    fn dispatch_event_ctx(
+        config: zeroclaw_config::schema::Config,
+        engine: &Arc<std::sync::Mutex<crate::sop::SopEngine>>,
+        temp: &tempfile::TempDir,
+    ) -> Arc<RpcContext> {
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(
+            16,
+            Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
+                4, 10, 60,
+            )),
+        ));
+        let mem_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "sqlite".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let memory: Arc<dyn zeroclaw_api::memory_traits::Memory> =
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, temp.path(), None).unwrap());
+        RpcContext::minimal_with_sop_engine_and_audit(
+            config,
+            sessions,
+            Arc::clone(engine),
+            Arc::new(crate::sop::SopAuditLogger::new(memory)),
+            Some(crate::sop::SopDriverHandles::default()),
+        )
+    }
+
+    fn started_run_count(engine: &Arc<std::sync::Mutex<crate::sop::SopEngine>>) -> usize {
+        let engine = engine.lock().unwrap();
+        engine.active_runs().len() + engine.finished_runs(None).len()
+    }
+
+    /// The dispatch path folds zero-width characters out of an untrusted
+    /// topic before it matches triggers. A principal entitled only to agent
+    /// `alpha` sending `/sop/de<U+200B>ploy` must not start the `beta`
+    /// procedure that the normalized `/sop/deploy` matches: the preflight
+    /// matches on the normalized topic and refuses, and nothing starts.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sops_dispatch_event_authorizes_the_normalized_topic() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut engine = crate::sop::SopEngine::new(zeroclaw_config::schema::SopConfig::default());
+        engine.set_sops_for_test(vec![deploy_hook_sop("beta-deploy", "beta")]);
+        let engine = Arc::new(std::sync::Mutex::new(engine));
+        let ctx = dispatch_event_ctx(dispatch_event_roster(&["alpha"]), &engine, &temp);
+        let alice = scoped_dispatcher(&ctx, 4242).await;
+
+        let error = alice
+            .handle_sops_dispatch_event(&json!({ "path": "/sop/de\u{200b}ploy" }))
+            .await
+            .expect_err("a topic that normalizes onto a forbidden procedure is refused");
+        assert_eq!(error.code, FORBIDDEN, "{}", error.message);
+        assert_eq!(started_run_count(&engine), 0, "no procedure may start");
+    }
+
+    /// A decision model that signals when it is consulted and answers "start"
+    /// only once released, so a test can change policy mid-deliberation.
+    struct HeldDecision {
+        consulted: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::sop::decision::DecisionModel for HeldDecision {
+        fn id(&self) -> &str {
+            "held"
+        }
+        async fn ask(
+            &self,
+            _state: Value,
+            _questions: std::collections::BTreeMap<String, crate::sop::decision::Question>,
+        ) -> anyhow::Result<crate::sop::decision::Answers> {
+            use crate::sop::decision::{Answer, Answers};
+            self.consulted.notify_one();
+            self.release.notified().await;
+            let probabilities = ["auto", "supervised", "step_by_step"]
+                .iter()
+                .map(|mode| {
+                    (
+                        (*mode).to_string(),
+                        if *mode == "auto" { 0.9 } else { 0.05 },
+                    )
+                })
+                .collect();
+            Ok(Answers {
+                model: None,
+                answers: std::collections::BTreeMap::from([
+                    ("start_sop".to_string(), Answer::Noul { noul: 0.95 }),
+                    (
+                        "execution_mode".to_string(),
+                        Answer::Choice {
+                            choice: "auto".into(),
+                            probabilities,
+                            confidence: 0.95,
+                        },
+                    ),
+                ]),
+                usage: None,
+            })
+        }
+    }
+
+    /// Dispatch `/sop/deploy` as alice to a procedure gated by a held decision
+    /// model. `revoke`, when set, is published as the new policy while the
+    /// model deliberates. Returns the call's result and the engine.
+    async fn dispatch_through_held_decision(
+        revoke: Option<zeroclaw_config::schema::Config>,
+    ) -> (
+        RpcResult,
+        Arc<std::sync::Mutex<crate::sop::SopEngine>>,
+        tempfile::TempDir,
+    ) {
+        use crate::sop::decision::{GateOnError, SopDecisionSpec};
+        use crate::sop::types::SopExecutionMode;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let consulted = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let model: Arc<dyn crate::sop::decision::DecisionModel> = Arc::new(HeldDecision {
+            consulted: Arc::clone(&consulted),
+            release: Arc::clone(&release),
+        });
+        let mut sop = deploy_hook_sop("gated-deploy", "alpha");
+        sop.decision = Some(SopDecisionSpec {
+            model: "held".into(),
+            gate: Some("Should this deploy start?".into()),
+            gate_threshold: 0.7,
+            gate_on_error: GateOnError::RunStrict,
+            modes: vec![
+                SopExecutionMode::Auto,
+                SopExecutionMode::Supervised,
+                SopExecutionMode::StepByStep,
+            ],
+            mode_instructions: None,
+            min_confidence: 0.7,
+        });
+        let mut engine = crate::sop::SopEngine::new(zeroclaw_config::schema::SopConfig::default())
+            .with_decision_models(std::collections::HashMap::from([(
+                "held".to_string(),
+                model,
+            )]));
+        engine.set_sops_for_test(vec![sop]);
+        let engine = Arc::new(std::sync::Mutex::new(engine));
+        let ctx = dispatch_event_ctx(dispatch_event_roster(&["alpha"]), &engine, &temp);
+        let alice = scoped_dispatcher(&ctx, 4242).await;
+
+        let policy_change = async {
+            consulted.notified().await;
+            if let Some(revoked) = &revoke {
+                ctx.auth
+                    .refresh_from_config(revoked)
+                    .expect("the narrowed policy publishes");
+            }
+            release.notify_one();
+        };
+        let params = json!({
+            "path": "/sop/deploy",
+            "payload": { "ref": "main" },
+        });
+        let (result, ()) = tokio::join!(alice.handle_sops_dispatch_event(&params), policy_change);
+        (result, engine, temp)
+    }
+
+    /// Authority is re-established at run admission, after the decision
+    /// model has answered. With the policy unchanged the gated procedure
+    /// starts; when alice's entitlement to its agent is revoked while the
+    /// model deliberates, the call is refused and nothing starts.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sops_dispatch_event_rechecks_authority_after_the_decision_model() {
+        let (unchanged, engine, _temp) = dispatch_through_held_decision(None).await;
+        let unchanged = unchanged.expect("an entitled caller's gated dispatch starts");
+        assert_eq!(unchanged["status"], "accepted");
+        assert_eq!(unchanged["results"][0]["status"], "started");
+        assert_eq!(started_run_count(&engine), 1);
+
+        let (revoked, engine, _temp) =
+            dispatch_through_held_decision(Some(dispatch_event_roster(&["beta"]))).await;
+        let error = revoked.expect_err("a caller revoked mid-decision starts nothing");
+        assert_eq!(error.code, FORBIDDEN, "{}", error.message);
+        assert!(
+            error
+                .message
+                .starts_with(crate::sop::dispatch::NOT_AUTHORIZED_PREFIX),
+            "{}",
+            error.message
+        );
+        assert_eq!(started_run_count(&engine), 0, "no run may be admitted");
     }
 
     #[test]
