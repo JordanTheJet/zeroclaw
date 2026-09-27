@@ -877,7 +877,12 @@ impl crate::rpc::channels::ChannelControl for RecordingChannels {
         channel_type: &str,
         alias: &str,
         identity: &str,
+        authorize_write: &(dyn for<'p> Fn(&'p str) -> Result<(), JsonRpcError> + Send + Sync),
     ) -> Result<Value, JsonRpcError> {
+        // The path the real capability writes for a channel's own group.
+        authorize_write(&format!(
+            "peer_groups.{channel_type}_{alias}.external_peers"
+        ))?;
         self.calls
             .lock()
             .push(format!("bind {channel_type}.{alias} {identity}"));
@@ -1383,22 +1388,46 @@ async fn a_scoped_principal_cannot_follow_a_link_into_another_agents_workspace()
     assert!(beta.join("secret.md").exists(), "beta's file survives");
 }
 
-/// A bind queued behind another config writer re-resolves its authority
-/// once it holds the lock: a grant withdrawn while it waited stops it before
-/// anything is written.
-#[tokio::test]
-async fn a_bind_queued_behind_a_config_writer_is_refused_once_its_grant_is_withdrawn() {
+/// A principal that may bind on `telegram.main`, owned by agent
+/// `test-agent`: `scoped` holds `channels:update`, the agents in `agents`,
+/// and config write access to `paths`. Agent `beta` is configured too, so the
+/// channel can be handed to an agent the principal may not use.
+fn binder_config(
+    tmp: &tempfile::TempDir,
+    agents: &[&str],
+    paths: &[&str],
+) -> zeroclaw_config::schema::Config {
     use std::collections::HashMap;
     use zeroclaw_api::grants::{Resource, Verb};
-    use zeroclaw_config::schema::{PermissionProfileConfig, UserConfig};
+    use zeroclaw_config::schema::{
+        AliasedAgentConfig, PermissionProfileConfig, TelegramConfig, UserConfig,
+    };
 
-    let tmp = tempfile::TempDir::new().unwrap();
-    let mut config = make_acp_test_config(&tmp);
+    let mut config = make_acp_test_config(tmp);
+    config.channels.telegram.insert(
+        "main".into(),
+        TelegramConfig {
+            enabled: true,
+            ..TelegramConfig::default()
+        },
+    );
+    config
+        .agents
+        .get_mut("test-agent")
+        .expect("the base fixture configures test-agent")
+        .channels = vec!["telegram.main".into()];
+    config.agents.insert(
+        "beta".into(),
+        AliasedAgentConfig {
+            enabled: true,
+            ..Default::default()
+        },
+    );
     config.permission_profiles.insert(
         "binder".into(),
         PermissionProfileConfig {
-            allowed_agents: vec![zeroclaw_api::grants::WILDCARD.into()],
-            config_write_paths: vec!["peer_groups.*".into()],
+            allowed_agents: agents.iter().map(|a| (*a).to_string()).collect(),
+            config_write_paths: paths.iter().map(|p| (*p).to_string()).collect(),
             grants: HashMap::from([(Resource::Channels, vec![Verb::Read, Verb::Update])]),
             ..PermissionProfileConfig::default()
         },
@@ -1411,36 +1440,60 @@ async fn a_bind_queued_behind_a_config_writer_is_refused_once_its_grant_is_withd
             ..UserConfig::default()
         },
     );
-    let (ctx, channels) = with_channels(config);
-    let (mut peer, mut rx) = roster_peer(&ctx, SCOPED).await;
+    config
+}
 
-    // Another writer holds the config write lock.
+/// Send a `channels/bind` for `telegram.main` while another writer holds the
+/// config write lock, apply `change` to the config and publish it as the
+/// accepted policy while the bind waits, then release the lock and return
+/// the bind's response.
+async fn bind_while_parked(
+    ctx: &Arc<RpcContext>,
+    peer: &mut RpcDispatcher,
+    rx: &mut tokio::sync::mpsc::Receiver<String>,
+    change: impl FnOnce(&mut zeroclaw_config::schema::Config),
+) -> Value {
     let held = Arc::clone(&ctx.config_write_lock).lock_owned().await;
     let bind = rpc(
-        &mut peer,
-        &mut rx,
+        peer,
+        rx,
         1,
         "channels/bind",
         json!({"channel_type": "telegram", "alias": "main", "identity": "123456789"}),
     );
-    let withdraw = async {
+    let change_the_world = async {
         // Let the bind pass its entry checks and park on the lock.
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        let mut narrowed = ctx.config.read().clone();
-        narrowed
+        let mut changed = ctx.config.read().clone();
+        change(&mut changed);
+        *ctx.config.write() = changed.clone();
+        let revision = ctx.auth.accepted_revision().saturating_add(1);
+        ctx.auth
+            .publish_accepted(&changed, revision)
+            .expect("the changed policy publishes");
+        drop(held);
+    };
+    let (response, ()) = tokio::join!(bind, change_the_world);
+    response
+}
+
+/// A bind queued behind another config writer re-resolves its authority
+/// once it holds the lock: a grant withdrawn while it waited stops it before
+/// anything is written.
+#[tokio::test]
+async fn channels_bind_narrowed_after_admission_has_no_effect() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (ctx, channels) = with_channels(binder_config(&tmp, &["*"], &["peer_groups.*"]));
+    let (mut peer, mut rx) = roster_peer(&ctx, SCOPED).await;
+    let response = bind_while_parked(&ctx, &mut peer, &mut rx, |config| {
+        config
             .permission_profiles
             .get_mut("binder")
             .expect("the fixture profile exists")
             .config_write_paths
             .clear();
-        *ctx.config.write() = narrowed.clone();
-        let revision = ctx.auth.accepted_revision().saturating_add(1);
-        ctx.auth
-            .publish_accepted(&narrowed, revision)
-            .expect("the narrowed policy publishes");
-        drop(held);
-    };
-    let (response, ()) = tokio::join!(bind, withdraw);
+    })
+    .await;
     assert_forbidden(
         &response,
         "a bind whose grant was withdrawn while it waited",
@@ -1449,4 +1502,95 @@ async fn a_bind_queued_behind_a_config_writer_is_refused_once_its_grant_is_withd
         channels.calls.lock().is_empty(),
         "nothing reached the bind after authority was withdrawn"
     );
+}
+
+/// The recheck resolves the principal again rather than comparing against
+/// what it held at admission: a grant added while the bind waited leaves it
+/// free to proceed.
+#[tokio::test]
+async fn channels_bind_widened_after_admission_is_honoured() {
+    use zeroclaw_api::grants::{Resource, Verb};
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (ctx, channels) = with_channels(binder_config(&tmp, &["test-agent"], &["peer_groups.*"]));
+    let (mut peer, mut rx) = roster_peer(&ctx, SCOPED).await;
+    let response = bind_while_parked(&ctx, &mut peer, &mut rx, |config| {
+        config
+            .permission_profiles
+            .get_mut("binder")
+            .expect("the fixture profile exists")
+            .grants
+            .insert(Resource::Canvas, vec![Verb::Read]);
+    })
+    .await;
+    assert_eq!(response["result"]["saved"], json!(true), "{response}");
+    assert_eq!(
+        *channels.calls.lock(),
+        vec!["bind telegram.main 123456789".to_string()]
+    );
+}
+
+/// The channel's owner is read again after the wait: a channel handed to an
+/// agent the principal may not use while the bind waited is refused.
+#[tokio::test]
+async fn channels_bind_resource_reowned_after_admission_is_refused() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (ctx, channels) = with_channels(binder_config(&tmp, &["test-agent"], &["peer_groups.*"]));
+    let (mut peer, mut rx) = roster_peer(&ctx, SCOPED).await;
+    let response = bind_while_parked(&ctx, &mut peer, &mut rx, |config| {
+        config
+            .agents
+            .get_mut("test-agent")
+            .unwrap()
+            .channels
+            .clear();
+        config.agents.get_mut("beta").unwrap().channels = vec!["telegram.main".into()];
+    })
+    .await;
+    assert_forbidden(&response, "a bind on a channel re-owned while it waited");
+    assert!(
+        channels.calls.lock().is_empty(),
+        "nothing reached the bind after the channel changed hands"
+    );
+}
+
+/// The write is authorized on the path it touches, as the dashboard route
+/// authorizes it: a grant scoped to the channel's own peer group suffices,
+/// and one scoped to another group does not.
+#[tokio::test]
+async fn channels_bind_authorizes_the_peer_group_it_writes() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (ctx, channels) = with_channels(binder_config(
+        &tmp,
+        &["test-agent"],
+        &["peer_groups.telegram_main.*"],
+    ));
+    let (mut peer, mut rx) = roster_peer(&ctx, SCOPED).await;
+    let bound = rpc(
+        &mut peer,
+        &mut rx,
+        1,
+        "channels/bind",
+        json!({"channel_type": "telegram", "alias": "main", "identity": "123456789"}),
+    )
+    .await;
+    assert_eq!(bound["result"]["saved"], json!(true), "{bound}");
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (ctx, other) = with_channels(binder_config(
+        &tmp,
+        &["test-agent"],
+        &["peer_groups.telegram_other.*"],
+    ));
+    let (mut peer, mut rx) = roster_peer(&ctx, SCOPED).await;
+    let refused = rpc(
+        &mut peer,
+        &mut rx,
+        1,
+        "channels/bind",
+        json!({"channel_type": "telegram", "alias": "main", "identity": "123456789"}),
+    )
+    .await;
+    assert_forbidden(&refused, "a grant scoped to another channel's group");
+    assert_eq!(channels.calls.lock().len(), 1);
+    assert!(other.calls.lock().is_empty());
 }

@@ -29,6 +29,10 @@ pub trait ChannelControl: Send + Sync {
     /// Authorize `identity` on one channel alias's peer allowlist, saving
     /// and swapping `config`. The caller holds the config write lock and has
     /// rechecked its authority under it; `config_write_guard` is that guard.
+    ///
+    /// Before anything is saved, `authorize_write` is called with the
+    /// concrete config path the bind will write, and a refusal stops it. An
+    /// identity that is already bound writes nothing and is not checked.
     async fn bind(
         &self,
         config: &Arc<RwLock<Config>>,
@@ -36,5 +40,6 @@ pub trait ChannelControl: Send + Sync {
         channel_type: &str,
         alias: &str,
         identity: &str,
+        authorize_write: &(dyn for<'p> Fn(&'p str) -> Result<(), JsonRpcError> + Send + Sync),
     ) -> Result<Value, JsonRpcError>;
 }

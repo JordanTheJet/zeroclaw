@@ -528,19 +528,38 @@ impl zeroclaw_runtime::rpc::channels::ChannelControl for ChannelsControl {
         channel_type: &str,
         alias: &str,
         identity: &str,
+        authorize_write: &(
+             dyn for<'p> Fn(&'p str) -> Result<(), zeroclaw_api::jsonrpc::JsonRpcError>
+                 + Send
+                 + Sync
+         ),
     ) -> Result<Value, zeroclaw_api::jsonrpc::JsonRpcError> {
         use zeroclaw_api::jsonrpc::error_codes;
-        bind(config, config_write_guard, channel_type, alias, identity)
+        let to_rpc = |failure: BindFailure| zeroclaw_api::jsonrpc::JsonRpcError {
+            code: match failure.kind {
+                BindFailureKind::ValidationFailed | BindFailureKind::PathNotFound => {
+                    error_codes::INVALID_PARAMS
+                }
+                BindFailureKind::ReloadFailed => error_codes::INTERNAL_ERROR,
+            },
+            message: failure.message,
+            data: None,
+        };
+        match prepare_bind(config, config_write_guard, channel_type, alias, identity)
             .await
-            .map_err(|failure| zeroclaw_api::jsonrpc::JsonRpcError {
-                code: match failure.kind {
-                    BindFailureKind::ValidationFailed | BindFailureKind::PathNotFound => {
-                        error_codes::INVALID_PARAMS
-                    }
-                    BindFailureKind::ReloadFailed => error_codes::INTERNAL_ERROR,
-                },
-                message: failure.message,
-                data: None,
-            })
+            .map_err(to_rpc)?
+        {
+            BindPlan::AlreadyBound(body) => Ok(body),
+            BindPlan::Write {
+                working,
+                group,
+                channel,
+            } => {
+                authorize_write(&BindPlan::write_path(&group))?;
+                commit_bind(config, config_write_guard, *working, group, channel, |_| {})
+                    .await
+                    .map_err(to_rpc)
+            }
+        }
     }
 }

@@ -1426,12 +1426,15 @@ impl RpcDispatcher {
     /// `None` on a surface that has no path selector to repeat (Quickstart
     /// applies a whole submission); the liveness, generation and coarse-grant
     /// checks still run there.
+    ///
+    /// Returns the grants it resolved, for a handler whose own selectors must
+    /// run on them before it writes.
     fn recheck_config_write_authority(
         &self,
         method: Method,
         path: Option<&str>,
         _guard: &ConfigWriteGuard,
-    ) -> Result<(), JsonRpcError> {
+    ) -> Result<zeroclaw_api::grants::ResolvedGrants, JsonRpcError> {
         use crate::rpc::auth::AuthDenied;
 
         let refuse = |denied: AuthDenied| -> JsonRpcError {
@@ -1450,7 +1453,7 @@ impl RpcDispatcher {
                 "Principal is not granted config write access to {path:?}"
             ))));
         }
-        Ok(())
+        Ok(grants)
     }
 
     /// Fine-grained agent selector for surfaces that address an agent: cron
@@ -2002,18 +2005,24 @@ impl RpcDispatcher {
                 let is_channel = |info: &zeroclaw_config::schema::ChannelAliasInfo| {
                     info.channel_type == req.channel_type.trim() && info.alias == req.alias.trim()
                 };
-                // Refuse early on the stamped grants, before waiting.
-                self.authorize_channel_owner(method, is_channel)?;
-                self.selector_config_write(method, "peer_groups")?;
+                // Refuse early on the stamped grants, before waiting. The
+                // peer group the bind writes is not known yet: it is chosen
+                // from the persisted policy, read under the lock.
+                let Some(stamped) = self.stamped_grants().cloned() else {
+                    return Err(rpc_err(AUTH_REQUIRED, "First call must be 'initialize'"));
+                };
+                self.check_channel_bind(method, &stamped, &is_channel, None)?;
                 // The bind waits for the config write lock, and a policy change
                 // committed while it waited must be seen: re-resolve authority
-                // under the lock, against the policy and config in force now,
-                // and hold the lock through the write.
+                // under the lock and run the same predicate on the fresh grants,
+                // the config in force now, and the path the write will touch.
+                // The lock is held through the write, so nothing publishes in
+                // between.
                 let guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
-                self.recheck_config_write_authority(method, Some("peer_groups"), &guard)?;
-                if let Some(grants) = self.recheck_authority_after_admission(method)? {
-                    self.check_channel_owner(method, &grants, is_channel)?;
-                }
+                let grants = self.recheck_config_write_authority(method, None, &guard)?;
+                self.check_channel_bind(method, &grants, &is_channel, None)?;
+                let authorize_write =
+                    |path: &str| self.check_channel_bind(method, &grants, &is_channel, Some(path));
                 let bound = control
                     .bind(
                         &self.ctx.config,
@@ -2021,6 +2030,7 @@ impl RpcDispatcher {
                         &req.channel_type,
                         &req.alias,
                         &req.identity,
+                        &authorize_write,
                     )
                     .await?;
                 // One accepted persistence, one revision, as every config
@@ -2226,6 +2236,31 @@ impl RpcDispatcher {
             },
         );
         Err(denied)
+    }
+
+    /// The whole `channels/bind` predicate: the channel's owning agent and,
+    /// once the bind has chosen it, config write access to the path it writes,
+    /// the one the dashboard route authorizes. Admission and the check under
+    /// the config write lock both call this, with different grants.
+    fn check_channel_bind(
+        &self,
+        method: Method,
+        grants: &zeroclaw_api::grants::ResolvedGrants,
+        is_channel: &impl Fn(&zeroclaw_config::schema::ChannelAliasInfo) -> bool,
+        write_path: Option<&str>,
+    ) -> Result<(), JsonRpcError> {
+        self.check_channel_owner(method, grants, is_channel)?;
+        let Some(path) = write_path else {
+            return Ok(());
+        };
+        if grants.may_write_config(path) {
+            return Ok(());
+        }
+        let denied = crate::rpc::auth::AuthDenied::forbidden(format!(
+            "Principal is not granted config write access to {path:?}"
+        ));
+        self.audit_auth_denial(method, &denied);
+        Err(rpc_err(denied.code, denied.message))
     }
 
     /// Refuse `method` unless the bound principal is an administrator. An

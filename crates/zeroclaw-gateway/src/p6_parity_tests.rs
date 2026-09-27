@@ -866,7 +866,14 @@ async fn channels_bind_refuses_alike_on_both_surfaces() {
             .lock_owned()
             .await;
         let err = control
-            .bind(&state.config, &guard, channel_type, alias, "@alice")
+            .bind(
+                &state.config,
+                &guard,
+                channel_type,
+                alias,
+                "@alice",
+                &|_: &str| Ok(()),
+            )
             .await
             .unwrap_err();
         assert!(
