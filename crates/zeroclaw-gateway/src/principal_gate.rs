@@ -57,25 +57,37 @@ use zeroclaw_runtime::security::auth_provider::Credential;
 /// means the native pairing provider, exactly as before this layer.
 pub const AUTH_PROVIDER_HEADER: &str = "x-zeroclaw-auth-provider";
 
-/// The gateway's inbound-auth authority: the same provider registry and
-/// principal resolver the RPC layer uses, built from the same config and
-/// the daemon's canonical pairing guard.
+/// The gateway's inbound-auth authority: the provider registry and
+/// principal resolver the RPC layer uses.
+///
+/// Under the daemon it is the RPC context's own authority
+/// ([`Self::from_shared`]): one accepted policy per daemon generation, into
+/// which both surfaces publish under the process-wide config write lock. A
+/// revocation persisted through the gateway or through RPC therefore binds
+/// the other surface before the writer returns. A standalone gateway builds
+/// its own from config ([`Self::from_config`]).
 ///
 /// The accepted policy (providers, their verification settings, profile
-/// mappings, grants) is compiled at construction and thereafter only by
-/// `publish_persisted`, which the persist boundary calls for the
-/// configuration it has just written. The daemon's RPC surface holds its
-/// own live configuration and reaches the same state through the reload
-/// every gateway mutation flags.
+/// mappings, grants) is compiled at construction and thereafter only by a
+/// persist boundary publishing the configuration it has just written: the
+/// gateway's `publish_persisted`, or the RPC context's save.
 pub struct GatewayInboundAuth {
-    inner: RpcInboundAuth,
+    inner: Arc<RpcInboundAuth>,
 }
 
 impl GatewayInboundAuth {
+    /// A standalone gateway's own authority, compiled from `config`.
     pub fn from_config(config: &Config, pairing: Arc<PairingGuard>) -> anyhow::Result<Self> {
         Ok(Self {
-            inner: RpcInboundAuth::from_config(config, pairing)?,
+            inner: Arc::new(RpcInboundAuth::from_config(config, pairing)?),
         })
+    }
+
+    /// The daemon generation's authority, shared with the RPC context. The
+    /// gateway then authenticates against, and publishes into, the same
+    /// accepted policy RPC does.
+    pub fn from_shared(inner: Arc<RpcInboundAuth>) -> Self {
+        Self { inner }
     }
 
     fn pairing(&self) -> &Arc<PairingGuard> {
@@ -90,10 +102,11 @@ impl GatewayInboundAuth {
     /// Publish the policy compiled from a configuration the persist
     /// boundary has just written, as the next accepted revision.
     ///
-    /// Callers hold the gateway's config write lock, so revisions are
-    /// issued in persist order. A writer that was slower to publish can
-    /// never reinstall policy a later persist superseded: a revision that
-    /// is not newer than the accepted one is refused as a no-op.
+    /// Callers hold the process-wide config write lock, the same lock the
+    /// RPC context's save holds, so revisions from both surfaces are issued
+    /// in one persist order. A writer that was slower to publish can never
+    /// reinstall policy a later persist superseded: a revision that is not
+    /// newer than the accepted one is refused as a no-op.
     fn publish_persisted(&self, persisted: &Config) -> anyhow::Result<u64> {
         let revision = self.inner.accepted_revision().saturating_add(1);
         self.inner.publish_accepted(persisted, revision)
@@ -540,6 +553,40 @@ mod tests {
                 .expect("inbound auth builds from a valid config"),
         );
         (crate::config_admin_router(&auth).with_state(state), auth)
+    }
+
+    /// The route group wired the way the daemon wires a supervised gateway:
+    /// its authority is the RPC context's (`from_shared`) and its
+    /// configuration state is the RPC context's live configuration. Returns
+    /// the router with the two RPC-side handles a test drives directly.
+    fn router_sharing_rpc_authority(
+        config: Config,
+    ) -> (
+        Router,
+        Arc<RpcInboundAuth>,
+        Arc<parking_lot::RwLock<Config>>,
+    ) {
+        let pairing = Arc::new(PairingGuard::new(
+            config.gateway.require_pairing,
+            &config.gateway.paired_tokens,
+            zeroclaw_config::pairing::PairingCodePolicy::default(),
+        ));
+        let rpc_auth = Arc::new(
+            RpcInboundAuth::from_config(&config, Arc::clone(&pairing))
+                .expect("inbound auth builds from a valid config"),
+        );
+        let live_config = Arc::new(parking_lot::RwLock::new(config.clone()));
+        let state = AppState {
+            pairing,
+            config: Arc::clone(&live_config),
+            ..crate::api::tests::test_state(config)
+        };
+        let auth = Arc::new(GatewayInboundAuth::from_shared(Arc::clone(&rpc_auth)));
+        (
+            crate::config_admin_router(&auth).with_state(state),
+            rpc_auth,
+            live_config,
+        )
     }
 
     async fn send(
@@ -1213,5 +1260,88 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    /// A revocation persisted through RPC binds the gateway's next request
+    /// with no reload: the supervised gateway authenticates against the RPC
+    /// context's accepted policy, not a second copy compiled when it started.
+    #[tokio::test]
+    async fn rpc_revocation_binds_the_gateway_without_a_reload() {
+        let tmp = tempfile::tempdir().unwrap();
+        let idp = introspection_idp(&["ops"]).await;
+        let (router, rpc_auth, live_config) =
+            router_sharing_rpc_authority(editor_config(&tmp, &idp.uri(), &[Verb::Read], &[]));
+
+        let (status, _) = send(
+            &router,
+            "GET",
+            "/api/quickstart/state",
+            SCOPED.0,
+            SCOPED.1,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        // The RPC context's save, in the order `save_and_swap_config` runs
+        // it: swap the live configuration, then publish the policy compiled
+        // from it as the next accepted revision. The mapped profile keeps a
+        // grant but loses Config.
+        let mut revoked = live_config.read().clone();
+        revoked.permission_profiles.insert(
+            "config-reader".into(),
+            PermissionProfileConfig {
+                grants: HashMap::from([(Resource::Sessions, vec![Verb::Read])]),
+                ..PermissionProfileConfig::default()
+            },
+        );
+        *live_config.write() = revoked.clone();
+        let revision = rpc_auth.accepted_revision().saturating_add(1);
+        rpc_auth
+            .publish_accepted(&revoked, revision)
+            .expect("the revoked policy compiles");
+
+        let (status, _) = send(
+            &router,
+            "GET",
+            "/api/quickstart/state",
+            SCOPED.0,
+            SCOPED.1,
+            None,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "the gateway must enforce a revocation persisted through RPC"
+        );
+    }
+
+    /// The reverse direction: a gateway persist publishes into the RPC
+    /// context's own authority, so established RPC connections see the new
+    /// generation at their next privileged operation, with no reload.
+    #[tokio::test]
+    async fn gateway_persist_publishes_into_the_rpc_authority() {
+        let tmp = tempfile::tempdir().unwrap();
+        let idp = introspection_idp(&["ops"]).await;
+        let (router, rpc_auth, _live_config) =
+            router_sharing_rpc_authority(editor_config(&tmp, &idp.uri(), &[Verb::Read], &[]));
+        let generation = rpc_auth.generation();
+
+        let (status, body) = send(
+            &router,
+            "PUT",
+            "/api/config/prop",
+            OPERATOR.0,
+            OPERATOR.1,
+            Some(serde_json::json!({ "path": "oidc.test.claim_path", "value": "roles" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            rpc_auth.generation(),
+            generation + 1,
+            "the gateway persist published into the RPC context's authority"
+        );
     }
 }

@@ -944,10 +944,10 @@ pub async fn run_gateway(
     // Shared SOP engine from the daemon. `None` when standalone — sessions build their own.
     sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
-    // The daemon's canonical live pairing authority, shared with the RPC
-    // native auth provider. `None` (standalone gateway) constructs a
-    // local guard from config as before.
-    shared_pairing: Option<PairingGuard>,
+    // The daemon generation's one inbound-auth state (pairing guard,
+    // accepted policy, live configuration), shared with the RPC context.
+    // `None` (standalone gateway) builds all three locally from config.
+    daemon_authority: Option<zeroclaw_runtime::daemon::DaemonInboundAuthority>,
     // The daemon generation's driver supervisor set: approval surfaces
     // register resumed headless drivers here so reload drains them.
     sop_driver_handles: Option<zeroclaw_runtime::sop::SopDriverHandles>,
@@ -963,7 +963,7 @@ pub async fn run_gateway(
         canvas_store,
         sop_engine,
         sop_audit,
-        shared_pairing,
+        daemon_authority,
         GatewaySupervision::new(
             readiness,
             Arc::new(zeroclaw_api::webhook::PluginWebhookRegistry::new()),
@@ -988,10 +988,11 @@ pub async fn run_gateway_with_plugin_webhooks(
     canvas_store: Option<CanvasStore>,
     sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
-    // The daemon's canonical live pairing authority, shared with the RPC
-    // inbound-auth layer so pairing and revocation reach both surfaces.
-    // Standalone runs pass `None` and build their own guard from config.
-    shared_pairing: Option<PairingGuard>,
+    // The daemon generation's one inbound-auth state, shared with the RPC
+    // context so pairing, revocation and policy changes persisted through
+    // either surface bind both. Standalone runs pass `None` and build their
+    // own guard, authority and configuration state from config.
+    daemon_authority: Option<zeroclaw_runtime::daemon::DaemonInboundAuthority>,
     supervision: GatewaySupervision,
 ) -> Result<()> {
     let GatewaySupervision {
@@ -999,6 +1000,14 @@ pub async fn run_gateway_with_plugin_webhooks(
         plugin_webhooks,
         sop_driver_handles,
     } = supervision;
+    let (shared_pairing, shared_inbound_auth, shared_config) = match daemon_authority {
+        Some(authority) => (
+            Some(authority.pairing),
+            Some(authority.inbound_auth),
+            Some(authority.config),
+        ),
+        None => (None, None, None),
+    };
     // ── Security: warn on public bind without tunnel or explicit opt-in ──
     if is_public_bind(host)
         && config.tunnel.tunnel_provider == "none"
@@ -1014,7 +1023,10 @@ pub async fn run_gateway_with_plugin_webhooks(
              Docker/VM: if you are running inside a container or VM, this is expected."
         );
     }
-    let config_state = Arc::new(RwLock::new(config.clone()));
+    // Supervised runs read and write the daemon's live configuration, the
+    // one the RPC context holds, so a persist through either surface is the
+    // state the other next reads and compiles policy from.
+    let config_state = shared_config.unwrap_or_else(|| Arc::new(RwLock::new(config.clone())));
 
     // ── Hooks ──────────────────────────────────────────────────────
     let hooks: Option<std::sync::Arc<zeroclaw_runtime::hooks::HookRunner>> = if config.hooks.enabled
@@ -1946,13 +1958,16 @@ pub async fn run_gateway_with_plugin_webhooks(
         None
     };
 
-    // The gateway's inbound-auth authority: same registry/resolver stack
-    // as the RPC layer, same canonical pairing guard. Its accepted policy
-    // moves only when a config mutation persists (see `persist_and_swap`).
-    let inbound_auth = Arc::new(principal_gate::GatewayInboundAuth::from_config(
-        &config,
-        Arc::clone(&pairing),
-    )?);
+    // The gateway's inbound-auth authority. Supervised runs share the
+    // daemon's accepted policy with the RPC context, so a revocation
+    // persisted through either surface binds this one without a reload.
+    // Standalone runs build their own from config and the local pairing
+    // guard. Either way the policy moves only when a config mutation
+    // persists (see `persist_and_swap`).
+    let inbound_auth = Arc::new(match shared_inbound_auth {
+        Some(shared) => principal_gate::GatewayInboundAuth::from_shared(shared),
+        None => principal_gate::GatewayInboundAuth::from_config(&config, Arc::clone(&pairing))?,
+    });
 
     let state = AppState {
         config: config_state,

@@ -7146,7 +7146,7 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                           tx,
                           reload_controls,
                           tui_registry,
-                          pairing,
+                          daemon_authority,
                           ready_tx| {
                         let canvas_store = canvas_store_for_gateway.clone();
                         let sop_engine = sop_e.clone();
@@ -7164,7 +7164,7 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                                 Some(canvas_store),
                                 sop_engine,
                                 sop_audit,
-                                pairing,
+                                daemon_authority,
                                 zeroclaw_gateway::GatewaySupervision::new(
                                     ready_tx,
                                     plugin_webhooks,
