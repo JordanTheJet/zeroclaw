@@ -169,8 +169,7 @@ use zeroclaw_runtime::i18n;
 use zeroclaw_runtime::platform;
 use zeroclaw_runtime::security::pairing::{
     GATEWAY_ADMIN_TOKEN_HEADER, PairingCodePolicy, PairingGuard, constant_time_eq,
-    gateway_admin_token_matches, gateway_admin_token_path, is_public_bind,
-    write_gateway_admin_token,
+    gateway_admin_token_path, is_public_bind,
 };
 use zeroclaw_runtime::tools;
 use zeroclaw_runtime::tools::CanvasStore;
@@ -1800,11 +1799,13 @@ pub async fn run_gateway_with_plugin_webhooks(
              (`./install.sh --source` on Linux/macOS, `setup.bat` on Windows) to build it"
         );
     }
-    // Mint this run's admin secret. The pairing-code admin routes accept only
-    // callers that present it; when it cannot be written they refuse everyone,
-    // and the banner below stays the way to read the first-run code.
+    // Start this run's admin-token generation. The pairing-code admin routes
+    // accept only the token the guard holds in memory. If the file cannot be
+    // written the guard holds none, so they refuse everyone (fail closed) and
+    // no file left by an earlier run is honoured; the banner below stays the
+    // way to read the first-run code.
     let admin_token_path = gateway_admin_token_path(&config.data_dir);
-    if let Err(e) = write_gateway_admin_token(&config.data_dir) {
+    if let Err(e) = pairing.rotate_admin_token(&config.data_dir) {
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
@@ -4678,18 +4679,19 @@ fn require_localhost(peer: &SocketAddr) -> Result<(), (StatusCode, Json<serde_js
 /// secret. [`require_localhost`] alone is not enough for these routes: a reverse
 /// proxy or tunnel on the same host relays remote callers from loopback, and
 /// a code read or minted here is exchanged at `/pair` for a shared-operator
-/// bearer. The secret lives in an owner-only file, so presenting it proves the
-/// caller runs as the gateway's user on its host.
+/// bearer. The secret reaches local clients through an owner-only file, so
+/// presenting it proves the caller runs as the gateway's user on its host.
+/// Admission compares against the token the pairing guard holds for this
+/// run, never the file, so a stale file or a failed rotation matches nothing.
 fn require_gateway_admin_token(
     state: &AppState,
     headers: &HeaderMap,
 ) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
-    let data_dir = state.config.read().data_dir.clone();
     let presented = headers
         .get(GATEWAY_ADMIN_TOKEN_HEADER)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    if gateway_admin_token_matches(&data_dir, presented) {
+    if state.pairing.admin_token_matches(presented) {
         Ok(())
     } else {
         Err((
@@ -6034,7 +6036,10 @@ path = "{trigger_path}"
     /// gateway start mints it.
     fn admin_headers(state: &AppState) -> HeaderMap {
         let data_dir = state.config.read().data_dir.clone();
-        let secret = write_gateway_admin_token(&data_dir).expect("write admin token");
+        let secret = state
+            .pairing
+            .rotate_admin_token(&data_dir)
+            .expect("rotate admin token");
         let mut headers = HeaderMap::new();
         headers.insert(
             GATEWAY_ADMIN_TOKEN_HEADER,
@@ -6174,6 +6179,33 @@ path = "{trigger_path}"
         .await;
 
         assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    /// A rotation that cannot write its file must fail closed: the token that
+    /// worked before, still sitting in the file, is refused afterwards.
+    #[tokio::test]
+    async fn failed_admin_token_rotation_refuses_the_token_left_on_disk() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = admin_paircode_state(&tmp, true, false);
+        let working = admin_headers(&state);
+        let data_dir = state.config.read().data_dir.clone();
+        let on_disk = std::fs::read_to_string(gateway_admin_token_path(&data_dir)).unwrap();
+
+        let unwritable = tmp.path().join("not-a-dir");
+        std::fs::write(&unwritable, b"x").unwrap();
+        assert!(state.pairing.rotate_admin_token(&unwritable).is_err());
+        assert_eq!(
+            std::fs::read_to_string(gateway_admin_token_path(&data_dir)).unwrap(),
+            on_disk,
+            "the previous token file is still in place"
+        );
+
+        let (status, json) = admin_paircode_response_json(
+            handle_admin_paircode(State(state), test_connect_info(), working).await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{json}");
+        assert!(json.get("pairing_code").is_none(), "{json}");
     }
 
     /// The composed attack from review A1: a remote caller relayed from

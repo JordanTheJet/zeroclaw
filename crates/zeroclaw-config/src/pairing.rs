@@ -353,6 +353,11 @@ pub struct PairingGuard {
     paired_tokens: Arc<Mutex<HashSet<String>>>,
     /// Brute-force protection: per-client failed attempt state + last sweep timestamp.
     failed_attempts: Arc<Mutex<(HashMap<String, FailedAttemptState>, Instant)>>,
+    /// The admin token this gateway run accepts on the pairing-code admin
+    /// routes. This is the authority; the token file is only how local
+    /// clients learn it. `None` until a rotation fully succeeds, so a failed
+    /// rotation refuses every caller rather than honouring an older file.
+    admin_token: Arc<Mutex<Option<String>>>,
 }
 
 /// A successfully matched pairing code whose final token is not yet committed.
@@ -431,7 +436,33 @@ impl PairingGuard {
             pairing_code: Arc::new(Mutex::new(code)),
             paired_tokens: Arc::new(Mutex::new(tokens)),
             failed_attempts: Arc::new(Mutex::new((HashMap::new(), Instant::now()))),
+            admin_token: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Start a new admin-token generation: forget the current token, mint a
+    /// fresh one, write it owner-only into `data_dir`, and accept it only
+    /// once the file is in place. On any failure the guard accepts no admin
+    /// token at all, and whatever file an earlier run left behind never
+    /// matches, so the pairing-code admin routes fail closed.
+    pub fn rotate_admin_token(&self, data_dir: &std::path::Path) -> std::io::Result<String> {
+        let mut current = self.admin_token.lock();
+        *current = None;
+        let token = write_gateway_admin_token(data_dir)?;
+        *current = Some(token.clone());
+        Ok(token)
+    }
+
+    /// True only when `presented` equals this run's admin token, compared in
+    /// constant time. With no successful rotation, nothing matches.
+    pub fn admin_token_matches(&self, presented: &str) -> bool {
+        let presented = presented.trim();
+        !presented.is_empty()
+            && self
+                .admin_token
+                .lock()
+                .as_deref()
+                .is_some_and(|token| constant_time_eq(presented, token))
     }
 
     /// The one-time pairing code (generated only on first startup when no tokens exist).
@@ -798,9 +829,9 @@ pub fn gateway_admin_token_path(data_dir: &std::path::Path) -> std::path::PathBu
 }
 
 /// Mint a fresh admin secret and write it owner-only (mode `0o600` on Unix),
-/// replacing any previous one. The gateway calls this once per start, so a
-/// secret from an earlier run stops working. Returns the new secret.
-pub fn write_gateway_admin_token(data_dir: &std::path::Path) -> std::io::Result<String> {
+/// replacing any previous file. Only [`PairingGuard::rotate_admin_token`]
+/// calls this: the guard, not the file, decides what is accepted.
+fn write_gateway_admin_token(data_dir: &std::path::Path) -> std::io::Result<String> {
     use std::io::Write;
 
     let token = generate_token();
@@ -835,15 +866,6 @@ pub fn read_gateway_admin_token(data_dir: &std::path::Path) -> Option<String> {
     let raw = std::fs::read_to_string(gateway_admin_token_path(data_dir)).ok()?;
     let token = raw.trim();
     (!token.is_empty()).then(|| token.to_string())
-}
-
-/// True only when `presented` equals the admin secret currently on disk,
-/// compared in constant time. An absent or unreadable secret matches nothing.
-pub fn gateway_admin_token_matches(data_dir: &std::path::Path, presented: &str) -> bool {
-    let presented = presented.trim();
-    !presented.is_empty()
-        && read_gateway_admin_token(data_dir)
-            .is_some_and(|secret| constant_time_eq(presented, &secret))
 }
 
 /// Check if a host string represents a non-localhost bind address.
@@ -1477,35 +1499,70 @@ mod tests {
     }
 
     #[test]
-    async fn gateway_admin_token_round_trips_and_matches_only_itself() {
+    async fn admin_token_rotation_publishes_the_token_and_matches_only_it() {
         let tmp = tempfile::TempDir::new().unwrap();
         let data_dir = tmp.path().join("data");
+        let guard = new_guard(true, &[]);
 
+        assert!(
+            !guard.admin_token_matches("anything"),
+            "before any rotation the guard accepts no admin token"
+        );
         assert_eq!(read_gateway_admin_token(&data_dir), None);
-        assert!(!gateway_admin_token_matches(&data_dir, "anything"));
 
-        let secret = write_gateway_admin_token(&data_dir).expect("write admin token");
+        let token = guard
+            .rotate_admin_token(&data_dir)
+            .expect("rotate admin token");
         assert_eq!(
             read_gateway_admin_token(&data_dir).as_deref(),
-            Some(secret.as_str())
+            Some(token.as_str()),
+            "local clients learn the token from the file"
         );
-        assert!(gateway_admin_token_matches(&data_dir, &secret));
-        assert!(!gateway_admin_token_matches(&data_dir, ""));
-        assert!(!gateway_admin_token_matches(&data_dir, "zc_wrong"));
+        assert!(guard.admin_token_matches(&token));
+        assert!(!guard.admin_token_matches(""));
+        assert!(!guard.admin_token_matches("zc_wrong"));
     }
 
     #[test]
-    async fn gateway_admin_token_is_replaced_on_each_write() {
+    async fn admin_token_from_an_earlier_rotation_stops_matching() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let first = write_gateway_admin_token(tmp.path()).unwrap();
-        let second = write_gateway_admin_token(tmp.path()).unwrap();
+        let guard = new_guard(true, &[]);
+        let first = guard.rotate_admin_token(tmp.path()).unwrap();
+        let second = guard.rotate_admin_token(tmp.path()).unwrap();
 
         assert_ne!(first, second);
+        assert!(!guard.admin_token_matches(&first));
+        assert!(guard.admin_token_matches(&second));
+    }
+
+    #[test]
+    async fn failed_admin_token_rotation_fails_closed_despite_an_older_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        // An earlier run left a valid-looking token file behind.
+        let previous_run = new_guard(true, &[]);
+        let stale = previous_run.rotate_admin_token(&data_dir).unwrap();
+
+        // This run cannot write: its data dir path is a regular file.
+        let unwritable = tmp.path().join("not-a-dir");
+        std::fs::write(&unwritable, b"x").unwrap();
+        let guard = new_guard(true, &[]);
+        let last_good = guard.rotate_admin_token(&data_dir).unwrap();
+        assert!(guard.rotate_admin_token(&unwritable).is_err());
+
         assert!(
-            !gateway_admin_token_matches(tmp.path(), &first),
-            "a secret from an earlier gateway start must stop working"
+            !guard.admin_token_matches(&stale),
+            "a file from an earlier run must never be honoured"
         );
-        assert!(gateway_admin_token_matches(tmp.path(), &second));
+        assert_eq!(
+            read_gateway_admin_token(&data_dir).as_deref(),
+            Some(last_good.as_str()),
+            "the last good token is still on disk"
+        );
+        assert!(
+            !guard.admin_token_matches(&last_good),
+            "after a failed rotation even the last good token on disk is refused"
+        );
     }
 
     #[cfg(unix)]
@@ -1514,7 +1571,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let tmp = tempfile::TempDir::new().unwrap();
-        write_gateway_admin_token(tmp.path()).unwrap();
+        new_guard(true, &[]).rotate_admin_token(tmp.path()).unwrap();
         let mode = std::fs::metadata(gateway_admin_token_path(tmp.path()))
             .unwrap()
             .permissions()
