@@ -9596,52 +9596,30 @@ impl RpcDispatcher {
             return Ok(());
         };
         if executes {
-            self.refuse_constrained_tool_selector_for_sop(method)?;
+            return self.authorize_sop_execution_with_grants(method, sop, grants);
         }
         let agents = {
             let config = self.ctx.config.read();
             Self::sop_executing_agents(sop, &config)
         };
         for alias in &agents {
-            if executes {
-                self.selector_session_agent_with_grants(method, grants, alias)?;
-            } else {
-                self.selector_agent(method, alias)?;
-            }
+            self.selector_agent(method, alias)?;
         }
         Ok(())
     }
 
-    /// [`Self::authorize_sop_agents`] for an executing procedure, evaluated
-    /// against an explicit, freshly resolved grant set instead of the grants
-    /// stamped on the connection: the constrained-tool-selector refusal and
-    /// the agent selector for every agent the procedure runs as.
+    /// The one predicate for running a procedure: the constrained-tool-selector
+    /// refusal and the agent selector for every agent the procedure runs as,
+    /// evaluated against `grants`. Admission passes the grants stamped on the
+    /// connection; a recheck after a wait passes freshly resolved grants.
+    /// Both sides call this function so they cannot test different things.
     fn authorize_sop_execution_with_grants(
         &self,
         method: Method,
         sop: &crate::sop::Sop,
         grants: &zeroclaw_api::grants::ResolvedGrants,
     ) -> Result<(), JsonRpcError> {
-        if !grants.admin
-            && !grants
-                .allowed_tools
-                .iter()
-                .any(|tool| tool == zeroclaw_api::grants::WILDCARD)
-        {
-            let denied = rpc_err(
-                FORBIDDEN,
-                "Principal has a constrained tool selector; procedures run outside per-session \
-                 tool narrowing and are refused to it",
-            );
-            self.audit_auth_denial(
-                method,
-                &crate::rpc::auth::AuthDenied {
-                    code: denied.code,
-                    message: denied.message.clone(),
-                },
-            );
-            return Err(denied);
-        }
+        self.refuse_constrained_tool_selector_for_sop(method, grants)?;
         let agents = {
             let config = self.ctx.config.read();
             Self::sop_executing_agents(sop, &config)
@@ -9666,13 +9644,13 @@ impl RpcDispatcher {
     ///
     /// A wildcard selector passes: the principal may already name any tool, so
     /// the engine assembling the agent's own set is not an escalation past it.
-    fn refuse_constrained_tool_selector_for_sop(&self, method: Method) -> Result<(), JsonRpcError> {
-        let Some(auth) = self.auth.as_ref() else {
-            return Ok(());
-        };
-        if auth.grants.admin
-            || auth
-                .grants
+    fn refuse_constrained_tool_selector_for_sop(
+        &self,
+        method: Method,
+        grants: &zeroclaw_api::grants::ResolvedGrants,
+    ) -> Result<(), JsonRpcError> {
+        if grants.admin
+            || grants
                 .allowed_tools
                 .iter()
                 .any(|tool| tool == zeroclaw_api::grants::WILDCARD)
@@ -21819,6 +21797,20 @@ mod tests {
     /// 4242) holds `sops:read`/`execute` with a wildcard tool selector and the
     /// agents in `agents`.
     fn dispatch_event_roster(agents: &[&str]) -> zeroclaw_config::schema::Config {
+        dispatch_event_roster_with(
+            agents,
+            &[
+                zeroclaw_api::grants::Verb::Read,
+                zeroclaw_api::grants::Verb::Execute,
+            ],
+        )
+    }
+
+    /// [`dispatch_event_roster`] with an explicit `sops` verb set.
+    fn dispatch_event_roster_with(
+        agents: &[&str],
+        verbs: &[zeroclaw_api::grants::Verb],
+    ) -> zeroclaw_config::schema::Config {
         use zeroclaw_config::schema::{AliasedAgentConfig, PermissionProfileConfig, UserConfig};
         let mut config = zeroclaw_config::schema::Config::default();
         // Agent selectors resolve against configured agents only.
@@ -21838,10 +21830,7 @@ mod tests {
                 allowed_tools: vec!["*".into()],
                 grants: std::collections::HashMap::from([(
                     zeroclaw_api::grants::Resource::Sops,
-                    vec![
-                        zeroclaw_api::grants::Verb::Read,
-                        zeroclaw_api::grants::Verb::Execute,
-                    ],
+                    verbs.to_vec(),
                 )]),
                 ..PermissionProfileConfig::default()
             },
@@ -21979,27 +21968,22 @@ mod tests {
         }
     }
 
-    /// Dispatch `/sop/deploy` as alice to a procedure gated by a held decision
-    /// model. `revoke`, when set, is published as the new policy while the
-    /// model deliberates. Returns the call's result and the engine.
-    async fn dispatch_through_held_decision(
-        revoke: Option<zeroclaw_config::schema::Config>,
-    ) -> (
-        RpcResult,
-        Arc<std::sync::Mutex<crate::sop::SopEngine>>,
-        tempfile::TempDir,
-    ) {
+    /// What changes while a `sops/dispatch-event` call is parked at the
+    /// decision wait: after admission was won, before the run starts.
+    enum WhileParked {
+        Nothing,
+        /// Publish this policy (a roster config) as the new generation.
+        Publish(Box<zeroclaw_config::schema::Config>),
+        /// Replace the loaded procedure with this definition.
+        ReplaceSop(Box<crate::sop::types::Sop>),
+    }
+
+    /// The gated procedure: `gated-deploy`, run as `agent`, on `/sop/deploy`,
+    /// asking the held decision model before it starts.
+    fn gated_deploy_sop(agent: &str) -> crate::sop::types::Sop {
         use crate::sop::decision::{GateOnError, SopDecisionSpec};
         use crate::sop::types::SopExecutionMode;
-
-        let temp = tempfile::TempDir::new().unwrap();
-        let consulted = Arc::new(tokio::sync::Notify::new());
-        let release = Arc::new(tokio::sync::Notify::new());
-        let model: Arc<dyn crate::sop::decision::DecisionModel> = Arc::new(HeldDecision {
-            consulted: Arc::clone(&consulted),
-            release: Arc::clone(&release),
-        });
-        let mut sop = deploy_hook_sop("gated-deploy", "alpha");
+        let mut sop = deploy_hook_sop("gated-deploy", agent);
         sop.decision = Some(SopDecisionSpec {
             model: "held".into(),
             gate: Some("Should this deploy start?".into()),
@@ -22013,22 +21997,55 @@ mod tests {
             mode_instructions: None,
             min_confidence: 0.7,
         });
+        sop
+    }
+
+    /// Admit a `sops/dispatch-event` as alice (entitled to `alpha`), park it
+    /// at the decision wait, apply `change`, release it, and return the
+    /// call's result and the engine for side-effect probes.
+    ///
+    /// The decision model is consulted only after the preflight has admitted
+    /// the call, so reaching the park proves the change lands after admission
+    /// was won; the returned result is asserted to have parked, and a stalled
+    /// park fails the test instead of hanging it.
+    async fn dispatch_parked_at_the_decision(
+        change: WhileParked,
+    ) -> (
+        RpcResult,
+        Arc<std::sync::Mutex<crate::sop::SopEngine>>,
+        tempfile::TempDir,
+    ) {
+        let temp = tempfile::TempDir::new().unwrap();
+        let consulted = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let model: Arc<dyn crate::sop::decision::DecisionModel> = Arc::new(HeldDecision {
+            consulted: Arc::clone(&consulted),
+            release: Arc::clone(&release),
+        });
         let mut engine = crate::sop::SopEngine::new(zeroclaw_config::schema::SopConfig::default())
             .with_decision_models(std::collections::HashMap::from([(
                 "held".to_string(),
                 model,
             )]));
-        engine.set_sops_for_test(vec![sop]);
+        engine.set_sops_for_test(vec![gated_deploy_sop("alpha")]);
         let engine = Arc::new(std::sync::Mutex::new(engine));
         let ctx = dispatch_event_ctx(dispatch_event_roster(&["alpha"]), &engine, &temp);
         let alice = scoped_dispatcher(&ctx, 4242).await;
 
-        let policy_change = async {
+        let parked = std::sync::atomic::AtomicBool::new(false);
+        let change_while_parked = async {
             consulted.notified().await;
-            if let Some(revoked) = &revoke {
-                ctx.auth
-                    .refresh_from_config(revoked)
-                    .expect("the narrowed policy publishes");
+            parked.store(true, std::sync::atomic::Ordering::SeqCst);
+            match change {
+                WhileParked::Nothing => {}
+                WhileParked::Publish(config) => {
+                    ctx.auth
+                        .refresh_from_config(&config)
+                        .expect("the new policy publishes");
+                }
+                WhileParked::ReplaceSop(sop) => {
+                    engine.lock().unwrap().set_sops_for_test(vec![*sop]);
+                }
             }
             release.notify_one();
         };
@@ -22036,25 +22053,26 @@ mod tests {
             "path": "/sop/deploy",
             "payload": { "ref": "main" },
         });
-        let (result, ()) = tokio::join!(alice.handle_sops_dispatch_event(&params), policy_change);
+        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            tokio::join!(
+                alice.handle_sops_dispatch_event(&params),
+                change_while_parked
+            )
+        })
+        .await
+        .expect("the call reaches the decision wait and completes");
+        assert!(
+            parked.load(std::sync::atomic::Ordering::SeqCst),
+            "the change must land while parked after admission, or the test is vacuous"
+        );
         (result, engine, temp)
     }
 
-    /// Authority is re-established at run admission, after the decision
-    /// model has answered. With the policy unchanged the gated procedure
-    /// starts; when alice's entitlement to its agent is revoked while the
-    /// model deliberates, the call is refused and nothing starts.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn sops_dispatch_event_rechecks_authority_after_the_decision_model() {
-        let (unchanged, engine, _temp) = dispatch_through_held_decision(None).await;
-        let unchanged = unchanged.expect("an entitled caller's gated dispatch starts");
-        assert_eq!(unchanged["status"], "accepted");
-        assert_eq!(unchanged["results"][0]["status"], "started");
-        assert_eq!(started_run_count(&engine), 1);
-
-        let (revoked, engine, _temp) =
-            dispatch_through_held_decision(Some(dispatch_event_roster(&["beta"]))).await;
-        let error = revoked.expect_err("a caller revoked mid-decision starts nothing");
+    fn assert_refused_with_no_run(
+        result: RpcResult,
+        engine: &Arc<std::sync::Mutex<crate::sop::SopEngine>>,
+    ) {
+        let error = result.expect_err("the call must be refused at run admission");
         assert_eq!(error.code, FORBIDDEN, "{}", error.message);
         assert!(
             error
@@ -22063,7 +22081,70 @@ mod tests {
             "{}",
             error.message
         );
-        assert_eq!(started_run_count(&engine), 0, "no run may be admitted");
+        assert_eq!(started_run_count(engine), 0, "no run may be admitted");
+    }
+
+    /// Control: with nothing changed while parked, the gated procedure starts.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sop_run_start_unchanged_after_admission_starts() {
+        let (result, engine, _temp) = dispatch_parked_at_the_decision(WhileParked::Nothing).await;
+        let result = result.expect("an entitled caller's gated dispatch starts");
+        assert_eq!(result["status"], "accepted");
+        assert_eq!(result["results"][0]["status"], "started");
+        assert_eq!(started_run_count(&engine), 1);
+    }
+
+    /// The coarse `sops:execute` grant is removed while the decision model
+    /// deliberates: nothing starts.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sop_run_start_revoked_after_admission_has_no_effect() {
+        let revoked = dispatch_event_roster_with(&["alpha"], &[zeroclaw_api::grants::Verb::Read]);
+        let (result, engine, _temp) =
+            dispatch_parked_at_the_decision(WhileParked::Publish(Box::new(revoked))).await;
+        assert_refused_with_no_run(result, &engine);
+    }
+
+    /// Alice's agent selector is narrowed away from the procedure's agent
+    /// while the decision model deliberates: nothing starts.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sop_run_start_narrowed_after_admission_has_no_effect() {
+        let (result, engine, _temp) = dispatch_parked_at_the_decision(WhileParked::Publish(
+            Box::new(dispatch_event_roster(&["beta"])),
+        ))
+        .await;
+        assert_refused_with_no_run(result, &engine);
+    }
+
+    /// A new policy generation that keeps what the run needs and adds more
+    /// is honoured: the recheck re-resolves rather than refusing because the
+    /// generation moved.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sop_run_start_widened_after_admission_is_honoured() {
+        let widened = dispatch_event_roster_with(
+            &["alpha", "beta"],
+            &[
+                zeroclaw_api::grants::Verb::Read,
+                zeroclaw_api::grants::Verb::Execute,
+                zeroclaw_api::grants::Verb::Update,
+            ],
+        );
+        let (result, engine, _temp) =
+            dispatch_parked_at_the_decision(WhileParked::Publish(Box::new(widened))).await;
+        let result = result.expect("a widened policy still admits the run");
+        assert_eq!(result["results"][0]["status"], "started");
+        assert_eq!(started_run_count(&engine), 1);
+    }
+
+    /// The procedure is redefined to run as an agent alice is not entitled
+    /// to while the decision model deliberates: the recheck reads the live
+    /// definition, not the one admitted, and nothing starts.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sop_run_start_resource_reowned_after_admission_is_refused() {
+        let (result, engine, _temp) = dispatch_parked_at_the_decision(WhileParked::ReplaceSop(
+            Box::new(gated_deploy_sop("beta")),
+        ))
+        .await;
+        assert_refused_with_no_run(result, &engine);
     }
 
     #[test]
