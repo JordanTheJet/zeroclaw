@@ -2573,10 +2573,14 @@ impl RpcDispatcher {
                 let mut handle = self.spawn_handle();
                 let detached = self.turn_lifetime == TurnLifetime::Session;
                 if detached {
-                    // A session-lifetime turn belongs to the session, so it
-                    // must not keep this connection counted for the reload
-                    // drain, and teardown must neither join nor abort it.
-                    handle.connection_activity = None;
+                    // A session-lifetime turn belongs to the session, not this
+                    // connection: teardown neither joins nor aborts it, and it
+                    // does not keep the connection counted. The generation
+                    // owns it instead, counting it in the same drain the
+                    // daemon waits on before a replacement generation is
+                    // admitted, for the whole handler including the durable
+                    // writes after the turn.
+                    handle.connection_activity = self.ctx.session_turns.activity();
                 }
                 let id_clone = req_id.clone();
                 let params_clone = req.params.clone();
@@ -5263,10 +5267,10 @@ impl RpcDispatcher {
                 channel: "rpc",
             },
             cost_context,
-            // A session-lifetime turn does not keep the connection counted.
-            (!session_lifetime)
-                .then(|| self.connection_activity.clone())
-                .flatten(),
+            // For a session-lifetime turn this is the generation's token (see
+            // the session/prompt dispatch), so the turn task counts in the
+            // generation drain.
+            self.connection_activity.clone(),
             Some(steering_rx),
             move |event| {
                 let sink = sink.clone();
@@ -5301,9 +5305,21 @@ impl RpcDispatcher {
         tokio::pin!(turn);
         // Only a connection-lifetime turn ends with its connection. A
         // session-lifetime turn runs on when the prompting connection closes;
-        // only session/cancel, session/abort, and session removal stop it.
+        // session/cancel, session/abort, session removal, and the retirement
+        // of this daemon generation stop it.
         let outcome = if session_lifetime {
-            turn.await
+            tokio::select! {
+                biased;
+                () = self.ctx.session_turns.cancelled() => {
+                    self.ctx.sessions.record_cancel_cause_if_absent(
+                        sid,
+                        crate::rpc::session::CancelCause::DaemonRetired,
+                    );
+                    cancel.cancel();
+                    turn.await
+                }
+                outcome = &mut turn => outcome,
+            }
         } else {
             tokio::select! {
                 biased;
@@ -6103,6 +6119,22 @@ impl RpcDispatcher {
         let admitted = self
             .revalidate_admitted_session(sid, authorized.as_ref())
             .await?;
+        // The queue wait can be as long as the turn ahead of it. Re-resolve
+        // the caller's authority against the policy in force now: a revoked
+        // grant or credential refuses the append before either write, and a
+        // principal that lost administrator scope while it waited is held to
+        // ownership again.
+        let grants = self.recheck_authority_after_admission(Method::SessionAppend)?;
+        if let Some(grants) = grants.as_ref()
+            && !grants.admin
+            && let Some(me) = self.owner_principal_id()
+            && admitted.as_ref().and_then(|rec| rec.owner.as_deref()) != Some(me.as_str())
+        {
+            return Err(rpc_err(
+                FORBIDDEN,
+                "Session not found or not owned by this principal",
+            ));
+        }
         let key = Self::durable_chat_key(admitted, Method::SessionAppend)?;
         let message = zeroclaw_providers::ChatMessage::assistant(&req.content);
         backend.append(&key, &message).map_err(|e| {
@@ -26135,6 +26167,7 @@ mod tests {
             event_tx: None,
             event_history: None,
             subscriptions: Arc::new(crate::rpc::subscription::SubscriptionHub::new()),
+            session_turns: crate::rpc::context::SessionTurnOwner::default(),
             reload_tx: None,
             gateway_shutdown_tx: None,
             approval_pending: Arc::new(crate::rpc::context::ApprovalPendingMap::default()),
@@ -26186,6 +26219,7 @@ mod tests {
             event_tx: None,
             event_history: None,
             subscriptions: Arc::new(crate::rpc::subscription::SubscriptionHub::new()),
+            session_turns: crate::rpc::context::SessionTurnOwner::default(),
             reload_tx: None,
             gateway_shutdown_tx: None,
             approval_pending: Arc::new(crate::rpc::context::ApprovalPendingMap::default()),
@@ -26296,6 +26330,7 @@ mod tests {
             event_tx: None,
             event_history: None,
             subscriptions: Arc::new(crate::rpc::subscription::SubscriptionHub::new()),
+            session_turns: crate::rpc::context::SessionTurnOwner::default(),
             reload_tx: None,
             gateway_shutdown_tx: None,
             approval_pending: Arc::new(crate::rpc::context::ApprovalPendingMap::default()),
@@ -31023,5 +31058,249 @@ mod tests {
         .await;
         assert_eq!(closed["result"]["closed"], json!(true), "{closed}");
         assert_eq!(ctx.subscriptions.viewer_count(sid), 0);
+    }
+
+    // ── Authority held at the moment an operation runs ────────────────
+    //
+    // Each of these grants authority at entry, then waits (a turn, a queue, a
+    // live stream). The authority that matters is the one in force when the
+    // work happens, so each test changes it mid-flight.
+
+    fn with_session_turns(
+        ctx: Arc<RpcContext>,
+        owner: crate::rpc::context::SessionTurnOwner,
+    ) -> Arc<RpcContext> {
+        let mut ctx = Arc::try_unwrap(ctx)
+            .ok()
+            .expect("the fixture context is uniquely owned");
+        ctx.session_turns = owner;
+        Arc::new(ctx)
+    }
+
+    #[tokio::test]
+    async fn a_detached_turn_counts_in_the_generation_drain_and_ends_at_retirement() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sid = "s-generation";
+        let (ctx, backend, (mut started, _release, _requests)) =
+            parity_fixture(&tmp, sid, None).await;
+        let retire = tokio_util::sync::CancellationToken::new();
+        let drain = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let ctx = with_session_turns(
+            ctx,
+            crate::rpc::context::SessionTurnOwner::new(retire.clone(), Arc::clone(&drain)),
+        );
+        let (mut driver, _driver_rx, _) = session_lifetime_operator(&ctx).await;
+
+        send_prompt(&mut driver, 1, sid, 1).await;
+        await_provider_start(&mut started).await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), driver.shutdown())
+            .await
+            .expect("teardown does not wait for a session-owned turn");
+        assert!(
+            drain.load(std::sync::atomic::Ordering::Relaxed) >= 1,
+            "a detached turn must keep the generation drain above zero"
+        );
+
+        let (mut viewer, mut viewer_rx) = local_operator(&ctx).await;
+        let attached = rpc(
+            &mut viewer,
+            &mut viewer_rx,
+            2,
+            "session/attach",
+            json!({"session_id": sid}),
+        )
+        .await;
+        assert!(attached.get("error").is_none(), "{attached}");
+
+        // Retire the generation, as a reload does.
+        retire.cancel();
+        let done = drain_to_turn_complete(&mut viewer_rx, sid).await;
+        assert_eq!(done["params"]["outcome"], json!("cancelled"), "{done}");
+        assert!(
+            done["params"]["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("daemon_retired")),
+            "{done}"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            while drain.load(std::sync::atomic::Ordering::Relaxed) != 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the drain reaches zero only once the retired turn has fully ended");
+        assert!(!ctx.sessions.has_inflight_turn(sid));
+        assert_eq!(durable_turn_state(&backend, sid).as_deref(), Some("idle"));
+    }
+
+    #[tokio::test]
+    async fn an_attached_viewer_loses_the_stream_when_it_loses_admin_scope() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sid = "s-bob-viewed";
+        let mut config = session_cwd_config(&tmp, 4242, None);
+        config
+            .permission_profiles
+            .get_mut("session-scoped")
+            .expect("the fixture profile exists")
+            .admin = true;
+        let workspace = config.agent_workspace_dir("test-agent");
+        let (ctx, chat_backend, _acp_store) = persistence_enforcement_ctx(config);
+        let (provider, _handles) = scripted_turn_provider();
+        install_state_test_session_owned_at(
+            &ctx.sessions,
+            &chat_backend,
+            sid,
+            provider,
+            None,
+            Some("user:bob"),
+            &workspace,
+        )
+        .await;
+        let (mut alice, mut alice_rx) = roster_peer(&ctx, 4242).await;
+        let attached = rpc(
+            &mut alice,
+            &mut alice_rx,
+            1,
+            "session/attach",
+            json!({"session_id": sid}),
+        )
+        .await;
+        assert!(
+            attached.get("error").is_none(),
+            "an administrator may view another principal's session: {attached}"
+        );
+
+        let source = ctx.subscriptions.session_source(sid);
+        ctx.subscriptions.publish(
+            source,
+            json!({"type": "agent_message_chunk", "session_id": sid, "text": "before"}),
+        );
+        let seen = tokio::time::timeout(std::time::Duration::from_secs(5), alice_rx.recv())
+            .await
+            .expect("a frame while still admin")
+            .expect("writer open");
+        assert!(seen.contains("before"), "{seen}");
+
+        // Drop admin, keep sessions:read: a fresh attach would now fail
+        // ownership, so the open stream must stop too.
+        let mut narrowed = ctx.config.read().clone();
+        narrowed
+            .permission_profiles
+            .get_mut("session-scoped")
+            .expect("the fixture profile exists")
+            .admin = false;
+        ctx.auth
+            .refresh_from_config(&narrowed)
+            .expect("the narrowed policy compiles");
+        ctx.subscriptions.publish(
+            source,
+            json!({"type": "agent_message_chunk", "session_id": sid, "text": "after"}),
+        );
+
+        let leaked = tokio::time::timeout(std::time::Duration::from_millis(300), async {
+            loop {
+                match alice_rx.recv().await {
+                    Some(frame) if frame.contains("after") => return Some(frame),
+                    Some(_) => {}
+                    None => return None,
+                }
+            }
+        })
+        .await;
+        assert!(
+            !matches!(leaked, Ok(Some(_))),
+            "a demoted viewer must not receive Bob's next frame: {leaked:?}"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while ctx.subscriptions.viewer_count(sid) != 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the demoted viewer is detached");
+    }
+
+    #[tokio::test]
+    async fn a_queued_append_is_refused_when_its_grant_is_revoked_while_it_waits() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sid = "s-append-revoked";
+        let mut config = session_cwd_config(&tmp, 4242, None);
+        config
+            .permission_profiles
+            .get_mut("session-scoped")
+            .expect("the fixture profile exists")
+            .grants
+            .insert(
+                zeroclaw_api::grants::Resource::Sessions,
+                vec![
+                    zeroclaw_api::grants::Verb::Create,
+                    zeroclaw_api::grants::Verb::Read,
+                    zeroclaw_api::grants::Verb::Execute,
+                    zeroclaw_api::grants::Verb::Update,
+                ],
+            );
+        let workspace = config.agent_workspace_dir("test-agent");
+        let (ctx, chat_backend, _acp_store) = persistence_enforcement_ctx(config);
+        let (provider, _handles) = scripted_turn_provider();
+        let key = install_state_test_session_owned_at(
+            &ctx.sessions,
+            &chat_backend,
+            sid,
+            provider,
+            None,
+            Some("user:alice"),
+            &workspace,
+        )
+        .await;
+        let (alice, _rx) = roster_peer(&ctx, 4242).await;
+
+        let result = rpc_result_after_midwait_session_admission(
+            Arc::clone(&ctx),
+            sid,
+            async move {
+                alice
+                    .handle_session_append(&json!({
+                        "session_id": "s-append-revoked",
+                        "content": "operator-approved instructions",
+                    }))
+                    .await
+            },
+            |ctx| {
+                let mut narrowed = ctx.config.read().clone();
+                narrowed
+                    .permission_profiles
+                    .get_mut("session-scoped")
+                    .expect("the fixture profile exists")
+                    .grants
+                    .insert(
+                        zeroclaw_api::grants::Resource::Sessions,
+                        vec![zeroclaw_api::grants::Verb::Read],
+                    );
+                ctx.auth
+                    .refresh_from_config(&narrowed)
+                    .expect("the narrowed policy compiles");
+            },
+        )
+        .await;
+
+        let err = result.expect_err("a revoked grant must refuse the queued append");
+        assert_eq!(err.code, FORBIDDEN, "{err:?}");
+        assert!(
+            zeroclaw_infra::session_backend::SessionBackend::load(chat_backend.as_ref(), &key)
+                .is_empty(),
+            "nothing may be written to the durable transcript"
+        );
+        let agent = ctx
+            .sessions
+            .get_agent(sid)
+            .await
+            .expect("the session is live");
+        assert!(
+            !agent.lock().await.history().iter().any(|message| matches!(
+                message,
+                ConversationMessage::Chat(chat) if chat.content.contains("operator-approved")
+            )),
+            "nothing may reach the live agent"
+        );
     }
 }

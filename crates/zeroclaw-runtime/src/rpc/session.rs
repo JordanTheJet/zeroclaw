@@ -47,6 +47,9 @@ pub enum CancelCause {
     /// `session/abort` from an operator connection that need not own the
     /// session's client.
     OperatorAbort,
+    /// The daemon generation that owned a session-lifetime turn retired
+    /// (reload or shutdown).
+    DaemonRetired,
     /// The session was explicitly removed/torn down while a turn was live.
     SessionRemoved,
     /// The RPC connection generation that accepted the turn was closed.
@@ -61,6 +64,7 @@ impl CancelCause {
             CancelCause::ClientRpc => "client_rpc",
             CancelCause::AdminKill => "admin_kill",
             CancelCause::OperatorAbort => "operator_abort",
+            CancelCause::DaemonRetired => "daemon_retired",
             CancelCause::SessionRemoved => "session_removed",
             CancelCause::ConnectionClosed => "connection_closed",
         }
