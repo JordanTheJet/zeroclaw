@@ -16081,8 +16081,6 @@ pub async fn start_channels_with_plugin_webhooks(
         return Ok(());
     }
 
-    zeroclaw_providers::pricing::spawn_refresher(config_arc.clone());
-
     let enabled_agents = enabled_agent_aliases(&config);
     if enabled_agents.is_empty() {
         anyhow::bail!("start_channels requires at least one enabled [agents.<alias>] entry");
