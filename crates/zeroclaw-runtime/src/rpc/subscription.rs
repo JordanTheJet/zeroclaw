@@ -256,13 +256,20 @@ impl SubscriptionHub {
                 from_seq: cursor,
                 resume_seq: entry.seq,
             },
-            Some(_) => Read::Frames(
-                ring.entries
+            Some(_) => {
+                // Stop at the first gap inside the batch (a recorded loss) so
+                // the next read reports it as `Lagged` instead of the cursor
+                // jumping over it.
+                let frames = ring
+                    .entries
                     .range(first..)
                     .take(max)
-                    .map(|entry| (entry.seq, Arc::clone(&entry.frame)))
-                    .collect(),
-            ),
+                    .zip(cursor..)
+                    .take_while(|(entry, expected)| entry.seq == *expected)
+                    .map(|(entry, _)| (entry.seq, Arc::clone(&entry.frame)))
+                    .collect();
+                Read::Frames(frames)
+            }
             None if cursor < ring.next_seq => Read::Lagged {
                 from_seq: cursor,
                 resume_seq: ring.next_seq,
@@ -461,7 +468,9 @@ mod tests {
         hub.publish(Source::Logs, json!({"n": 1}));
         hub.note_loss(Source::Logs, 3);
         hub.publish(Source::Logs, json!({"n": 5}));
-        assert_eq!(frames(hub.read(Source::Logs, 1, 1)), [1]);
+        // A full-size batch (the production READ_BATCH) stops before the gap
+        // rather than returning [1, 5] and letting the cursor jump to 6.
+        assert_eq!(frames(hub.read(Source::Logs, 1, READ_BATCH)), [1]);
         assert_eq!(
             hub.read(Source::Logs, 2, 64),
             Read::Lagged {
