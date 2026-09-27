@@ -2014,7 +2014,7 @@ impl RpcDispatcher {
                 if let Some(grants) = self.recheck_authority_after_admission(method)? {
                     self.check_channel_owner(method, &grants, is_channel)?;
                 }
-                control
+                let bound = control
                     .bind(
                         &self.ctx.config,
                         &guard,
@@ -2022,7 +2022,27 @@ impl RpcDispatcher {
                         &req.alias,
                         &req.identity,
                     )
-                    .await
+                    .await?;
+                // One accepted persistence, one revision, as every config
+                // writer publishes: the policy compiled from what was just
+                // saved, still under the write lock.
+                if bound["saved"] == Value::Bool(true) {
+                    let persisted = self.ctx.config.read().clone();
+                    let revision = self.ctx.auth.accepted_revision().saturating_add(1);
+                    if let Err(error) = self.ctx.auth.publish_accepted(&persisted, revision) {
+                        ::zeroclaw_log::record!(
+                            ERROR,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({ "error": format!("{error}") })),
+                            "channels/bind: persisted configuration did not publish as an accepted policy"
+                        );
+                    }
+                }
+                Ok(bound)
             }
             _ => Err(rpc_err(
                 INTERNAL_ERROR,
