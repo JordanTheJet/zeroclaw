@@ -210,7 +210,10 @@ An upload belongs to the connection that began it: no other connection can
 name it, and it is discarded when that connection closes. The limits:
 
 - A connection may stage four uploads at a time.
-- The daemon stages at most 256 MiB across all connections.
+- The daemon stages at most 256 MiB across all connections. The charge covers
+  each upload's payload and the metadata it keeps (session id, agent, filename,
+  declared hash), so an empty payload cannot hold memory for free. A
+  `filename` longer than 255 bytes is refused.
 - An upload idle for five minutes is discarded. When a new upload does not
   fit in the budget, the daemon first reclaims every upload idle past that
   deadline, even one whose connection is still open, so a silent client

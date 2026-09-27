@@ -54,7 +54,12 @@ pub struct LocalListenerLimits {
 impl LocalListenerLimits {
     pub fn from_config(config: &Config) -> Self {
         Self {
-            max_connections: config.rpc.max_local_connections.max(1),
+            // `Semaphore::new` panics above `MAX_PERMITS`, so an absurd
+            // configured value is clamped rather than taking the listener down.
+            max_connections: config
+                .rpc
+                .max_local_connections
+                .clamp(1, tokio::sync::Semaphore::MAX_PERMITS),
             write_timeout: LOCAL_PEER_WRITE_TIMEOUT,
         }
     }
@@ -2866,6 +2871,11 @@ mod tests {
             LocalListenerLimits::from_config(&config).write_timeout,
             LOCAL_PEER_WRITE_TIMEOUT
         );
+        config.rpc.max_local_connections = usize::MAX;
+        let limits = LocalListenerLimits::from_config(&config);
+        assert_eq!(limits.max_connections, tokio::sync::Semaphore::MAX_PERMITS);
+        // The clamped value must build the semaphore the listener uses.
+        let _ = tokio::sync::Semaphore::new(limits.max_connections);
     }
 
     /// Connect to the listener's named pipe, retrying until the server has a

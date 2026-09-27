@@ -1350,6 +1350,7 @@ rpc_type! {
     /// Parameters for `file/upload/begin`: announce one upload for a session.
     pub struct FileUploadBeginParams {
         pub session_id: String,
+        /// Display name, at most 255 bytes; storage is content-addressed.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub filename: Option<String>,
         /// Exact decoded size of the whole payload.

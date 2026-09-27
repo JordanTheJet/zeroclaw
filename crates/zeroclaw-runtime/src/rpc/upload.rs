@@ -35,8 +35,14 @@ pub const MAX_UPLOADS_PER_CONNECTION: usize = 4;
 /// uploads, or by the budget when another upload needs the space.
 pub const UPLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
-/// Bytes all connections together may hold in staged uploads.
+/// Bytes all connections together may hold in staged uploads, counting
+/// both the payload and the metadata each upload retains.
 pub const PROCESS_STAGED_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Longest filename, in bytes, an upload may carry. The name is only a
+/// display label (storage is content-addressed); this is the usual limit
+/// for one path component.
+pub const MAX_UPLOAD_FILENAME_BYTES: usize = 255;
 
 fn invalid(message: impl Into<String>) -> JsonRpcError {
     JsonRpcError {
@@ -91,9 +97,15 @@ impl UploadBudget {
         self.slots.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Reserve `bytes` for a new upload, reclaiming idle uploads first if
-    /// the budget is full.
-    fn reserve(self: &Arc<Self>, now: Instant, bytes: u64) -> Option<Arc<Slot>> {
+    /// Reserve room for a new upload's payload and the metadata it keeps,
+    /// reclaiming idle uploads first if the budget is full.
+    fn reserve(
+        self: &Arc<Self>,
+        now: Instant,
+        payload: u64,
+        meta: UploadMeta,
+    ) -> Option<Arc<Slot>> {
+        let bytes = payload.saturating_add(meta.retained_bytes());
         if !self.try_charge(bytes) {
             self.reclaim_idle(now);
             if !self.try_charge(bytes) {
@@ -104,7 +116,8 @@ impl UploadBudget {
             budget: Arc::clone(self),
             reserved: bytes,
             state: Mutex::new(SlotState {
-                data: Vec::with_capacity(usize::try_from(bytes).unwrap_or(0)),
+                meta: Some(meta),
+                data: Vec::with_capacity(usize::try_from(payload).unwrap_or(0)),
                 last_activity: now,
                 reclaimed: false,
             }),
@@ -137,8 +150,31 @@ impl UploadBudget {
     }
 }
 
-/// One upload's staged bytes and its budget reservation, shared between the
-/// connection that owns the upload and the budget that may reclaim it.
+/// What an upload remembers about itself until it is committed.
+#[derive(Debug)]
+struct UploadMeta {
+    session_id: String,
+    agent_alias: String,
+    filename: String,
+    expected_sha256: Option<String>,
+}
+
+impl UploadMeta {
+    /// Heap bytes this metadata keeps resident, charged to the budget with
+    /// the payload so metadata cannot stand in for bytes it never counted.
+    fn retained_bytes(&self) -> u64 {
+        let len = self.session_id.len()
+            + self.agent_alias.len()
+            + self.filename.len()
+            + self.expected_sha256.as_ref().map_or(0, String::len);
+        len as u64
+    }
+}
+
+/// One upload's metadata, staged bytes, and budget reservation, shared
+/// between the connection that owns the upload and the budget that may
+/// reclaim it. Reclaiming frees all of it; the owning connection keeps only
+/// the upload id until it next touches uploads.
 #[derive(Debug)]
 struct Slot {
     budget: Arc<UploadBudget>,
@@ -148,6 +184,8 @@ struct Slot {
 
 #[derive(Debug)]
 struct SlotState {
+    /// Taken on commit, cleared on reclaim.
+    meta: Option<UploadMeta>,
     data: Vec<u8>,
     last_activity: Instant,
     /// Set once the reservation has been returned; the upload is dead.
@@ -171,6 +209,7 @@ impl Slot {
             return;
         }
         state.reclaimed = true;
+        state.meta = None;
         state.data = Vec::new();
         self.budget.used.fetch_sub(self.reserved, Ordering::AcqRel);
     }
@@ -197,11 +236,7 @@ pub struct CompletedUpload {
 
 #[derive(Debug)]
 struct StagedUpload {
-    session_id: String,
-    agent_alias: String,
-    filename: String,
     declared_size: u64,
-    expected_sha256: Option<String>,
     slot: Arc<Slot>,
 }
 
@@ -255,6 +290,14 @@ impl UploadStaging {
                 MAX_FILE_BYTES / (1024 * 1024)
             )));
         }
+        if let Some(filename) = &request.filename
+            && filename.len() > MAX_UPLOAD_FILENAME_BYTES
+        {
+            return Err(invalid(format!(
+                "`filename` is {} bytes; the limit is {MAX_UPLOAD_FILENAME_BYTES}",
+                filename.len()
+            )));
+        }
         let expected_sha256 = request
             .sha256
             .map(|hex| normalize_sha256(&hex))
@@ -265,9 +308,15 @@ impl UploadStaging {
                  commit them or let them expire before beginning another"
             )));
         }
+        let meta = UploadMeta {
+            session_id: request.session_id,
+            agent_alias: request.agent_alias,
+            filename: request.filename.unwrap_or_else(|| "upload".to_string()),
+            expected_sha256,
+        };
         let slot = self
             .budget
-            .reserve(now, request.size_bytes)
+            .reserve(now, request.size_bytes, meta)
             .ok_or_else(|| {
                 invalid(
                     "The daemon is staging too many uploads to accept this one now; retry after \
@@ -278,11 +327,7 @@ impl UploadStaging {
         self.uploads.insert(
             upload_id.clone(),
             StagedUpload {
-                session_id: request.session_id,
-                agent_alias: request.agent_alias,
-                filename: request.filename.unwrap_or_else(|| "upload".to_string()),
                 declared_size: request.size_bytes,
-                expected_sha256,
                 slot,
             },
         );
@@ -362,7 +407,7 @@ impl UploadStaging {
             .uploads
             .get(upload_id)
             .ok_or_else(|| expired(upload_id))?;
-        let bytes = {
+        let completed = {
             let mut state = upload.slot.lock_state();
             if state.reclaimed {
                 return Err(expired(upload_id));
@@ -375,42 +420,41 @@ impl UploadStaging {
                     upload.declared_size
                 )));
             }
-            let matches = upload
-                .expected_sha256
+            let matches = state
+                .meta
                 .as_ref()
+                .and_then(|meta| meta.expected_sha256.as_ref())
                 .is_none_or(|expected| *expected == format!("{:x}", Sha256::digest(&state.data)));
             if matches {
-                Some(std::mem::take(&mut state.data))
+                let bytes = std::mem::take(&mut state.data);
+                state.meta.take().map(|meta| CompletedUpload {
+                    session_id: meta.session_id,
+                    agent_alias: meta.agent_alias,
+                    filename: meta.filename,
+                    bytes,
+                })
             } else {
                 None
             }
         };
         // Removing the upload drops its slot, which returns the reservation.
-        let upload = self
-            .uploads
-            .remove(upload_id)
-            .ok_or_else(|| expired(upload_id))?;
-        let Some(bytes) = bytes else {
+        self.uploads.remove(upload_id);
+        completed.ok_or_else(|| {
             // The bytes will never match now; the upload is discarded rather
             // than kept charged against the budget.
-            return Err(invalid(
-                "Upload content does not match the SHA-256 declared at begin; begin again",
-            ));
-        };
-        Ok(CompletedUpload {
-            session_id: upload.session_id,
-            agent_alias: upload.agent_alias,
-            filename: upload.filename,
-            bytes,
+            invalid("Upload content does not match the SHA-256 declared at begin; begin again")
         })
     }
 
     /// The session and agent an upload was begun for, for re-authorization
     /// before commit.
     pub fn binding(&self, upload_id: &str) -> Option<(String, String)> {
-        self.uploads
-            .get(upload_id)
-            .map(|upload| (upload.session_id.clone(), upload.agent_alias.clone()))
+        let upload = self.uploads.get(upload_id)?;
+        let state = upload.slot.lock_state();
+        state
+            .meta
+            .as_ref()
+            .map(|meta| (meta.session_id.clone(), meta.agent_alias.clone()))
     }
 }
 
@@ -436,6 +480,20 @@ mod tests {
         }
     }
 
+    /// Bytes of metadata `request` retains: session, agent, and filename.
+    const REQUEST_META_BYTES: u64 = ("s1".len() + "default".len() + "notes.txt".len()) as u64;
+
+    /// A request that retains no metadata, for exact budget arithmetic.
+    fn bare(size_bytes: u64) -> BeginRequest {
+        BeginRequest {
+            session_id: String::new(),
+            agent_alias: String::new(),
+            filename: Some(String::new()),
+            size_bytes,
+            sha256: None,
+        }
+    }
+
     fn staging(limit: u64) -> (UploadStaging, Arc<UploadBudget>) {
         let budget = UploadBudget::new(limit);
         (UploadStaging::new(Arc::clone(&budget)), budget)
@@ -446,7 +504,11 @@ mod tests {
         let (mut staging, budget) = staging(1024);
         let now = Instant::now();
         let id = staging.begin(now, request(6)).unwrap();
-        assert_eq!(budget.used(), 6);
+        assert_eq!(
+            budget.used(),
+            6 + REQUEST_META_BYTES,
+            "the payload and the retained metadata are both charged"
+        );
         assert_eq!(staging.chunk(now, &id, 0, b"abc").unwrap(), 3);
         assert_eq!(staging.chunk(now, &id, 3, b"def").unwrap(), 6);
         let done = staging.take_complete(now, &id).unwrap();
@@ -550,10 +612,10 @@ mod tests {
         let mut first = UploadStaging::new(Arc::clone(&budget));
         let mut second = UploadStaging::new(Arc::clone(&budget));
         let now = Instant::now();
-        first.begin(now, request(8)).unwrap();
-        let err = second.begin(now, request(3)).unwrap_err();
+        first.begin(now, bare(8)).unwrap();
+        let err = second.begin(now, bare(3)).unwrap_err();
         assert!(err.message.contains("too many uploads"), "{}", err.message);
-        second.begin(now, request(2)).unwrap();
+        second.begin(now, bare(2)).unwrap();
 
         drop(first);
         assert_eq!(
@@ -561,7 +623,7 @@ mod tests {
             2,
             "dropping a connection's staging releases it"
         );
-        second.begin(now, request(8)).unwrap();
+        second.begin(now, bare(8)).unwrap();
     }
 
     #[test]
@@ -584,17 +646,14 @@ mod tests {
 
         // The silent connection reserves most of the budget, then never
         // touches uploads again while it stays open.
-        let held = silent.begin(start, request(8)).unwrap();
+        let held = silent.begin(start, bare(8)).unwrap();
         silent.chunk(start, &held, 0, b"abc").unwrap();
-        assert!(
-            other.begin(start, request(3)).is_err(),
-            "the budget is full"
-        );
+        assert!(other.begin(start, bare(3)).is_err(), "the budget is full");
 
         // Past the idle deadline, another connection's reservation reclaims
         // it without any help from the silent connection.
         let later = start + UPLOAD_IDLE_TIMEOUT + Duration::from_secs(1);
-        other.begin(later, request(3)).unwrap();
+        other.begin(later, bare(3)).unwrap();
         assert_eq!(budget.used(), 3, "only the new reservation is charged");
 
         // The reclaimed upload is gone for its owner too, and dropping the
@@ -611,16 +670,88 @@ mod tests {
         let mut busy = UploadStaging::new(Arc::clone(&budget));
         let mut other = UploadStaging::new(Arc::clone(&budget));
         let start = Instant::now();
-        let id = busy.begin(start, request(8)).unwrap();
+        let id = busy.begin(start, bare(8)).unwrap();
         let recent = start + UPLOAD_IDLE_TIMEOUT - Duration::from_secs(1);
         busy.chunk(recent, &id, 0, b"a").unwrap();
 
         let later = start + UPLOAD_IDLE_TIMEOUT + Duration::from_secs(1);
         assert!(
-            other.begin(later, request(3)).is_err(),
+            other.begin(later, bare(3)).is_err(),
             "an upload touched within the deadline keeps its reservation"
         );
         assert_eq!(busy.chunk(later, &id, 1, b"b").unwrap(), 2);
+    }
+
+    #[test]
+    fn a_filename_over_the_limit_is_refused_before_staging() {
+        let (mut staging, budget) = staging(u64::MAX);
+        let now = Instant::now();
+        let mut req = request(0);
+        req.filename = Some("a".repeat(MAX_UPLOAD_FILENAME_BYTES + 1));
+        let err = staging.begin(now, req).unwrap_err();
+        assert!(err.message.contains("filename"), "{}", err.message);
+        assert_eq!(budget.used(), 0, "nothing is staged or charged");
+
+        let mut req = request(0);
+        req.filename = Some("a".repeat(MAX_UPLOAD_FILENAME_BYTES));
+        staging.begin(now, req).unwrap();
+    }
+
+    #[test]
+    fn retained_metadata_is_charged_even_for_empty_payloads() {
+        // The case a zero-byte payload used to hide: metadata was resident
+        // but never counted. Oversized session ids stand in for any retained
+        // field, since the filename is capped separately.
+        let big = |size: u64| BeginRequest {
+            session_id: "s".repeat(4000),
+            agent_alias: String::new(),
+            filename: Some(String::new()),
+            size_bytes: size,
+            sha256: None,
+        };
+        let budget = UploadBudget::new(10_000);
+        let mut owners: Vec<UploadStaging> = (0..3)
+            .map(|_| UploadStaging::new(Arc::clone(&budget)))
+            .collect();
+        let now = Instant::now();
+        owners[0].begin(now, big(0)).unwrap();
+        owners[1].begin(now, big(0)).unwrap();
+        assert_eq!(budget.used(), 8000);
+        let err = owners[2].begin(now, big(0)).unwrap_err();
+        assert!(err.message.contains("too many uploads"), "{}", err.message);
+
+        owners.clear();
+        assert_eq!(
+            budget.used(),
+            0,
+            "dropping the owners releases the metadata charge"
+        );
+    }
+
+    #[test]
+    fn reclaiming_an_idle_upload_frees_its_metadata() {
+        let budget = UploadBudget::new(5000);
+        let mut silent = UploadStaging::new(Arc::clone(&budget));
+        let mut other = UploadStaging::new(Arc::clone(&budget));
+        let start = Instant::now();
+        let mut held_req = bare(0);
+        held_req.session_id = "s".repeat(4000);
+        let held = silent.begin(start, held_req).unwrap();
+        assert!(silent.binding(&held).is_some());
+
+        let later = start + UPLOAD_IDLE_TIMEOUT + Duration::from_secs(1);
+        let mut next = bare(0);
+        next.session_id = "t".repeat(2000);
+        other.begin(later, next).unwrap();
+        assert_eq!(
+            budget.used(),
+            2000,
+            "the idle upload's metadata is released"
+        );
+        assert!(
+            silent.binding(&held).is_none(),
+            "the silent owner no longer holds the reclaimed metadata"
+        );
     }
 
     #[test]

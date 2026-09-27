@@ -8294,7 +8294,8 @@ fn default_wss_incomplete_message_timeout_secs() -> u64 {
 pub struct RpcConfig {
     /// Ceiling on concurrently open local IPC connections (default: 512).
     /// A connection past the ceiling receives one error frame naming this
-    /// setting and is closed. Values below 1 are treated as 1. Read when the
+    /// setting and is closed. Values below 1 are treated as 1, and values
+    /// above the runtime's semaphore ceiling are clamped to it. Read when the
     /// local listener starts, so a change applies at the next daemon restart
     /// or reload.
     #[serde(default = "default_rpc_max_local_connections")]
