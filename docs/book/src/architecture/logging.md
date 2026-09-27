@@ -264,10 +264,11 @@ RPC streams do not read the broadcast channel directly. A `SubscriptionHub` (`ze
 - **Resume:** `X/subscribe{since_seq, epoch}` replays the frames after `since_seq` that are still buffered, then continues live, but only when `epoch` matches.
   - With a different epoch, or none, the client gets `subscription/lagged` with `epoch_changed: true`, then every frame the new hub still buffers.
   - A `since_seq` ahead of the newest frame in the same epoch is refused with `INVALID_PARAMS`.
-- **Gaps:** a gap is reported, never skipped. A cursor that points at frames that are gone (evicted by the caps or the budget, or overrun on the bus) receives `subscription/lagged{subscription_id, from_seq, resume_seq}` and continues at `resume_seq`. `from_seq` is never greater than `resume_seq`.
+- **Gaps:** a gap is reported, never skipped. A cursor that points at frames that are gone (evicted by the caps or the budget, or overrun on the bus) receives `subscription/lagged{subscription_id, from_seq, resume_seq}` and continues at `resume_seq`. `from_seq` is never greater than `resume_seq`. A replay batch stops at a gap, so the cursor never jumps over a recorded loss.
 - **Cancel:** `subscription/cancel{subscription_id}` (grant `Logs:Read`, the same as subscribing) ends one subscription on the calling connection. Closing the connection ends them all.
-- **Authority:** every delivery, whether a frame or a `lagged` notice, is rechecked against the caller's live credential and current grants.
-- **Replay reach:** a `Logs:Read` holder can replay frames from before it connected (up to the ring caps). That is the same reach `logs/query` and `events/history` already give that grant.
+- **Authority:** these streams and `events/history` are unscoped-only. Their frames come from every agent, and many (log lines, cron results) name no owner, so they cannot be filtered per agent. The caller needs `Logs:Read` and must reach every agent (admin, or the `*` agent selector). A principal scoped to some agents is refused.
+- **Recheck:** every delivery, whether a frame or a `lagged` notice, is rechecked against the caller's live credential. When the policy changes, the principal is resolved again, and narrowing it or removing `Logs:Read` ends the stream.
+- **Replay reach:** an unscoped `Logs:Read` holder can replay frames from before it connected, up to the ring caps.
 - **Pairing credentials** are dropped before they reach a ring, so neither stream can deliver or replay them.
 
 ## Reader cursors span the active file and retained archives

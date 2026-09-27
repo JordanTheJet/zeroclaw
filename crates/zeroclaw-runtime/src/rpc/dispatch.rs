@@ -8838,6 +8838,22 @@ impl RpcDispatcher {
     /// accepted policy has moved, the principal is resolved again against
     /// `method`. The first refusal ends the stream. An unbound dispatcher (the
     /// direct unit-test handlers) has nothing to recheck.
+    /// Refuse the global streams to a principal that does not reach every
+    /// agent, using its current grants rather than the bind-time copy. An
+    /// unbound dispatcher (the direct unit-test handlers) is not checked.
+    fn require_global_stream_access(&self, method: Method) -> Result<(), JsonRpcError> {
+        let Some(auth) = self.auth.as_ref() else {
+            return Ok(());
+        };
+        let denied = match current_authority(&self.ctx.auth, auth, method) {
+            Ok(grants) if sees_every_agent(&grants) => return Ok(()),
+            Ok(_) => crate::rpc::auth::AuthDenied::forbidden(GLOBAL_STREAM_SCOPED_DENIAL),
+            Err(denied) => denied,
+        };
+        audit_denial(Some(auth), method, &denied);
+        Err(rpc_err(denied.code, denied.message))
+    }
+
     fn open_subscription(
         &self,
         source: crate::rpc::subscription::Source,
@@ -8845,6 +8861,7 @@ impl RpcDispatcher {
         notification_method: &'static str,
         params: &Value,
     ) -> Result<LogsSubscribeResult, JsonRpcError> {
+        self.require_global_stream_access(method)?;
         let p: SubscribeParams = if params.is_null() {
             SubscribeParams::default()
         } else {
@@ -8943,6 +8960,7 @@ impl RpcDispatcher {
     /// the daemon's bus so it works without the gateway. Pairing credentials
     /// are never replayed.
     fn handle_events_history(&self) -> RpcResult {
+        self.require_global_stream_access(Method::EventsHistory)?;
         let history = self
             .ctx
             .event_history
@@ -10228,6 +10246,7 @@ async fn deliver_subscription(delivery: SubscriptionDelivery) {
                 method,
                 &mut checked_generation,
                 &mut grants,
+                viewer.is_none(),
             ) || !viewer_may_see(viewer.as_ref(), binding.as_ref(), grants.as_ref()).await
             {
                 break 'deliver;
@@ -10256,6 +10275,7 @@ async fn deliver_subscription(delivery: SubscriptionDelivery) {
                         method,
                         &mut checked_generation,
                         &mut grants,
+                        viewer.is_none(),
                     ) || !viewer_may_see(viewer.as_ref(), binding.as_ref(), grants.as_ref())
                         .await
                     {
@@ -10284,6 +10304,7 @@ async fn deliver_subscription(delivery: SubscriptionDelivery) {
                                 method,
                                 &mut checked_generation,
                                 &mut grants,
+                                viewer.is_none(),
                             )
                             || !viewer_may_see(viewer.as_ref(), binding.as_ref(), grants.as_ref())
                                 .await
@@ -10396,6 +10417,23 @@ impl TurnSink {
     }
 }
 
+/// The daemon-wide log and event streams, and the event history, carry
+/// frames from every agent, and many (log lines, cron results) name no owner,
+/// so they cannot be filtered per agent. Until frames carry reliable
+/// ownership they are unscoped-only, like the memory writes above: the
+/// caller must reach every agent (admin, or the wildcard agent selector).
+fn sees_every_agent(grants: &zeroclaw_api::grants::ResolvedGrants) -> bool {
+    grants.admin
+        || grants
+            .allowed_agents
+            .iter()
+            .any(|alias| alias.as_str() == zeroclaw_api::grants::WILDCARD)
+}
+
+const GLOBAL_STREAM_SCOPED_DENIAL: &str = "Scoped principals cannot read the daemon-wide log \
+     and event streams: their frames are not attributed to an owning agent, so these \
+     streams and the event history remain unscoped-only";
+
 /// Hold one delivery (a frame or a `lagged` notice) to the connection's
 /// authority. The credential must still be live, and whenever the accepted
 /// policy generation has moved, the principal is resolved again against
@@ -10407,16 +10445,29 @@ fn still_authorized(
     method: Method,
     checked_generation: &mut Option<u64>,
     grants: &mut Option<zeroclaw_api::grants::ResolvedGrants>,
+    global: bool,
 ) -> bool {
     let Some(auth) = binding else {
         return true;
     };
     let generation = inbound.generation();
+    // A moved policy generation re-resolves the principal: it must still
+    // hold `method`'s grant and, on a daemon-wide stream, still reach every
+    // agent, so narrowing a principal ends its stream.
     let authority = if *checked_generation == Some(generation) {
         credential_is_live(inbound, auth)
     } else {
-        current_authority(inbound, auth, method).map(|resolved| {
+        current_authority(inbound, auth, method).and_then(|resolved| {
+            // The daemon-wide streams need a principal that reaches every
+            // agent. A session viewer is held to the session's ownership
+            // instead (`viewer_may_see`), so a scoped owner keeps its own.
+            if global && !sees_every_agent(&resolved) {
+                return Err(crate::rpc::auth::AuthDenied::forbidden(
+                    GLOBAL_STREAM_SCOPED_DENIAL,
+                ));
+            }
             *grants = Some(resolved);
+            Ok(())
         })
     };
     if let Err(denied) = authority {
@@ -19039,12 +19090,7 @@ mod tests {
         );
 
         let mut granted_config = roster_config(4242);
-        granted_config
-            .permission_profiles
-            .get_mut("reader")
-            .expect("the fixture profile exists")
-            .grants
-            .insert(Resource::Logs, vec![Verb::Read]);
+        grant_global_log_reads(&mut granted_config);
         let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
         let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
         let ctx = RpcContext::minimal_with_event_bus(granted_config, sessions, &bus);
@@ -19251,6 +19297,7 @@ mod tests {
             .expect("the fixture profile exists");
         reader.grants.clear();
         reader.grants.insert(Resource::Logs, vec![Verb::Read]);
+        reader.allowed_agents = vec![zeroclaw_api::grants::WILDCARD.into()];
         let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
         let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
         let (event_tx, _rx0) = tokio::sync::broadcast::channel(16);
@@ -19316,6 +19363,129 @@ mod tests {
         assert_eq!(response["error"]["code"], json!(FORBIDDEN), "{response}");
     }
 
+    /// Give the fixture `reader` profile `Logs:Read` and every agent: the
+    /// global streams are unscoped-only.
+    fn grant_global_log_reads(config: &mut zeroclaw_config::schema::Config) {
+        use zeroclaw_api::grants::{Resource, Verb};
+        let reader = config
+            .permission_profiles
+            .get_mut("reader")
+            .expect("the fixture profile exists");
+        reader.grants.insert(Resource::Logs, vec![Verb::Read]);
+        reader.allowed_agents = vec![zeroclaw_api::grants::WILDCARD.into()];
+    }
+
+    /// Configure an `alpha` agent so a profile can be scoped to it (policy
+    /// rejects an `allowed_agents` entry naming an unconfigured agent).
+    fn configure_agent_alpha(config: &mut zeroclaw_config::schema::Config) {
+        use zeroclaw_config::schema::{AliasedAgentConfig, RiskProfileConfig};
+        config
+            .risk_profiles
+            .insert("scoped-profile".into(), RiskProfileConfig::default());
+        config.agents.insert(
+            "alpha".into(),
+            AliasedAgentConfig {
+                enabled: true,
+                risk_profile: "scoped-profile".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+    }
+
+    /// Frames on the global streams are not attributed to an owning agent,
+    /// so a principal scoped to some agents is refused all three, even with
+    /// `Logs:Read`.
+    #[tokio::test]
+    async fn global_streams_refuse_a_scoped_principal() {
+        use zeroclaw_api::grants::{Resource, Verb};
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+        let mut config = roster_config(4242);
+        configure_agent_alpha(&mut config);
+        let reader = config
+            .permission_profiles
+            .get_mut("reader")
+            .expect("the fixture profile exists");
+        reader.grants.insert(Resource::Logs, vec![Verb::Read]);
+        reader.allowed_agents = vec!["alpha".into()];
+        let bus = crate::observability::EventBus::with_capacities(16, 16);
+        bus.history()
+            .push(json!({"type": "tool_call", "source": "observability", "tool": "SENTINEL"}));
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let ctx = RpcContext::minimal_with_event_bus(config, sessions, &bus);
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+
+        for (id, method) in [
+            (1, "logs/subscribe"),
+            (2, "events/subscribe"),
+            (3, "events/history"),
+        ] {
+            let response = rpc(&mut alice, &mut rx, id, method, json!({})).await;
+            assert_eq!(
+                response["error"]["code"],
+                json!(FORBIDDEN),
+                "{method}: {response}"
+            );
+            assert!(
+                !response.to_string().contains("SENTINEL"),
+                "{method} must not disclose frames: {response}"
+            );
+        }
+    }
+
+    /// Narrowing a live subscriber to some agents (it keeps `Logs:Read`) ends
+    /// its stream at the next delivery; the grant is rechecked, not only the
+    /// verb.
+    #[tokio::test]
+    async fn narrowing_a_subscriber_to_one_agent_ends_its_stream() {
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+        let mut config = roster_config(4242);
+        configure_agent_alpha(&mut config);
+        grant_global_log_reads(&mut config);
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let (event_tx, _rx0) = tokio::sync::broadcast::channel(16);
+        let ctx = RpcContext::minimal_with_event_tx(config.clone(), sessions, event_tx.clone());
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+
+        let subscribed = rpc(&mut alice, &mut rx, 1, "logs/subscribe", json!({})).await;
+        assert_eq!(
+            subscribed["result"]["subscribed"],
+            json!(true),
+            "{subscribed}"
+        );
+        event_tx
+            .send(json!({"source": "observability", "tool": "SENTINEL-WIDE"}))
+            .expect("send the first frame");
+        assert!(
+            next_frame_containing(&mut rx, "SENTINEL-WIDE", std::time::Duration::from_secs(2))
+                .await,
+            "an unscoped subscriber receives frames"
+        );
+
+        let mut narrowed = config;
+        narrowed
+            .permission_profiles
+            .get_mut("reader")
+            .expect("the fixture profile exists")
+            .allowed_agents = vec!["alpha".into()];
+        ctx.auth
+            .refresh_from_config(&narrowed)
+            .expect("the narrowed policy compiles");
+        event_tx
+            .send(json!({"source": "observability", "tool": "SENTINEL-NARROWED"}))
+            .expect("send the second frame");
+        assert!(
+            !next_frame_containing(
+                &mut rx,
+                "SENTINEL-NARROWED",
+                std::time::Duration::from_millis(500)
+            )
+            .await,
+            "a subscriber narrowed to one agent must stop receiving global frames"
+        );
+    }
+
     async fn next_frame_containing(
         rx: &mut tokio::sync::mpsc::Receiver<String>,
         needle: &str,
@@ -19334,15 +19504,10 @@ mod tests {
 
     #[tokio::test]
     async fn logs_subscription_stops_once_the_principal_loses_the_grant() {
-        use zeroclaw_api::grants::{Resource, Verb};
+        use zeroclaw_api::grants::Resource;
         use zeroclaw_infra::session_queue::SessionActorQueue;
         let mut config = roster_config(4242);
-        config
-            .permission_profiles
-            .get_mut("reader")
-            .expect("the fixture profile exists")
-            .grants
-            .insert(Resource::Logs, vec![Verb::Read]);
+        grant_global_log_reads(&mut config);
         let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
         let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
         let (event_tx, _rx0) = tokio::sync::broadcast::channel(16);
