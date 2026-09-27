@@ -6614,19 +6614,80 @@ mod tests {
         wait_for(2).await;
         sleep(Duration::from_millis(50)).await;
         assert_eq!(
-            seen.lock().unwrap().len(),
-            2,
-            "each gateway start fires the hook exactly once"
+            *seen.lock().unwrap(),
+            vec![
+                ("0.0.0.0".to_string(), 43210),
+                ("0.0.0.0".to_string(), 43211),
+            ],
+            "each gateway start fires the hook exactly once, with its own bound port"
         );
     }
 
     #[test]
     fn gateway_start_hook_reporter_is_a_passthrough_when_hooks_are_disabled() {
         assert!(gateway_start_hook_reporter(None, "127.0.0.1".to_string(), None).is_none());
-        let inner = GatewayReadinessReporter::new(|_addr| {});
-        assert!(
-            gateway_start_hook_reporter(None, "127.0.0.1".to_string(), Some(inner)).is_some(),
-            "with hooks disabled the readiness reporter is returned unchanged"
+        let reported = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let inner = {
+            let reported = reported.clone();
+            GatewayReadinessReporter::new(move |addr| reported.lock().unwrap().push(addr))
+        };
+        let wrapped = gateway_start_hook_reporter(None, "127.0.0.1".to_string(), Some(inner))
+            .expect("with hooks disabled the readiness reporter is kept");
+        let addr: std::net::SocketAddr = "127.0.0.1:42617".parse().unwrap();
+        wrapped.report_ready(addr);
+        assert_eq!(
+            *reported.lock().unwrap(),
+            vec![addr],
+            "with hooks disabled every readiness report still reaches the daemon"
         );
+    }
+
+    /// The daemon wraps each gateway start's readiness reporter with the hook
+    /// when hooks are enabled. With startup feedback off there is no inner
+    /// reporter, so the gateway starter receives one only through that
+    /// wrapper; removing the daemon's wiring makes it arrive as `None`.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn daemon_hands_the_gateway_a_hook_reporter_when_hooks_are_enabled() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU8, Ordering};
+        use tokio::time::{Duration, Instant, sleep};
+
+        let _broadcast_guard = hold_log_broadcast();
+        for (hooks_enabled, expect_reporter) in [(true, true), (false, false)] {
+            let tmp = TempDir::new().unwrap();
+            let mut config = test_config(&tmp);
+            config.hooks.enabled = hooks_enabled;
+
+            // 0 = not started, 1 = started without a reporter, 2 = with one.
+            let received = Arc::new(AtomicU8::new(0));
+            let mut registry = DaemonRegistry::new();
+            {
+                let received = received.clone();
+                registry.register_gateway(Box::new(
+                    move |_host, _port, _config, _event_tx, _reload, _tui, _pairing, readiness| {
+                        received.store(if readiness.is_some() { 2 } else { 1 }, Ordering::SeqCst);
+                        Box::pin(std::future::pending::<Result<()>>())
+                    },
+                ));
+            }
+
+            // Startup feedback off: no readiness reporter of the daemon's own.
+            let daemon = run(config, "127.0.0.1".to_string(), 0, registry, false, false);
+            tokio::pin!(daemon);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while received.load(Ordering::SeqCst) == 0 {
+                assert!(Instant::now() < deadline, "the gateway starter must run");
+                tokio::select! {
+                    result = &mut daemon => panic!("daemon exited early: {result:?}"),
+                    () = sleep(Duration::from_millis(10)) => {}
+                }
+            }
+            assert_eq!(
+                received.load(Ordering::SeqCst) == 2,
+                expect_reporter,
+                "hooks enabled = {hooks_enabled}: the gateway starter's readiness reporter"
+            );
+        }
     }
 }

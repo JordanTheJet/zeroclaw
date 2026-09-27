@@ -8565,6 +8565,10 @@ Add pricing to the active provider profile or supply a catalog entry."
                     _ => None,
                 };
 
+                // With no daemon, this command owns the live-pricing refresher,
+                // as the daemon does when it runs the channels.
+                zeroclaw_runtime::daemon::spawn_pricing_refresher(&config);
+
                 let result = Box::pin(channels::start_channels(
                     config,
                     None,

@@ -1397,6 +1397,11 @@ pub async fn run_gateway_with_plugin_webhooks(
     // process that owns this listener (the daemon, or the standalone
     // `zeroclaw gateway` command), not to the listener: the refresher must run
     // with the gateway disabled, and the hook fires from the readiness report.
+    // The gateway does own the live config handle its config API writes in
+    // place, so it points the refresher at that handle. An operator's change
+    // (an opt-out, a new endpoint or model) then reaches the next refresh
+    // without a reload.
+    zeroclaw_providers::pricing::bind_config(config_state.clone());
 
     // SSE broadcast channel for real-time events.
     // Use an externally provided sender (e.g. from the daemon) so that other
@@ -4981,6 +4986,12 @@ async fn handle_pair_code(State(state): State<AppState>) -> impl IntoResponse {
     (StatusCode::OK, Json(body))
 }
 
+/// Serializes tests that start `run_gateway`, which binds the process-global
+/// pricing config handle, so a test that reads that handle sees its own bind.
+#[cfg(test)]
+pub(crate) static PRICING_BINDING_TEST_LOCK: tokio::sync::Mutex<()> =
+    tokio::sync::Mutex::const_new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6072,6 +6083,8 @@ path = "{trigger_path}"
 
     #[tokio::test]
     async fn run_gateway_starts_with_zero_agents() {
+        // `run_gateway` binds the process-global pricing config handle.
+        let _pricing_binding = crate::PRICING_BINDING_TEST_LOCK.lock().await;
         // Isolate data_dir so parallel nextest runs don't race on the
         // real ~/.zeroclaw/data
         let tmp = tempfile::TempDir::new().unwrap();
@@ -6138,6 +6151,8 @@ path = "{trigger_path}"
 
     #[tokio::test]
     async fn run_gateway_starts_with_unresolved_agent_risk_profile() {
+        // `run_gateway` binds the process-global pricing config handle.
+        let _pricing_binding = crate::PRICING_BINDING_TEST_LOCK.lock().await;
         use zeroclaw_config::schema::AliasedAgentConfig;
 
         // Isolate data_dir so parallel nextest runs don't race on the
@@ -6202,6 +6217,8 @@ path = "{trigger_path}"
 
     #[tokio::test]
     async fn run_gateway_starts_with_mismatched_provider_api_key() {
+        // `run_gateway` binds the process-global pricing config handle.
+        let _pricing_binding = crate::PRICING_BINDING_TEST_LOCK.lock().await;
         let mut config = Config::default();
         config.providers.models.anthropic.insert(
             "default".to_string(),
@@ -6259,6 +6276,8 @@ path = "{trigger_path}"
 
     #[tokio::test]
     async fn daemon_startup_gateway_reports_ready_and_uses_external_shutdown_sender() {
+        // `run_gateway` binds the process-global pricing config handle.
+        let _pricing_binding = crate::PRICING_BINDING_TEST_LOCK.lock().await;
         let port_probe = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = port_probe.local_addr().unwrap().port();
         drop(port_probe);
@@ -6336,6 +6355,8 @@ path = "{trigger_path}"
 
     #[tokio::test]
     async fn daemon_startup_gateway_does_not_report_ready_when_tls_setup_fails() {
+        // `run_gateway` binds the process-global pricing config handle.
+        let _pricing_binding = crate::PRICING_BINDING_TEST_LOCK.lock().await;
         let tmp = tempfile::TempDir::new().unwrap();
         let mut config = zeroclaw_config::schema::Config {
             data_dir: tmp.path().join("workspace"),
@@ -12648,5 +12669,105 @@ mod accept_error_tests {
         assert!(!is_recoverable_accept_error(&Error::from(
             ErrorKind::InvalidInput
         )));
+    }
+
+    /// The gateway points the pricing refresher at the live config handle its
+    /// config API writes. An operator opt-out made through `PUT
+    /// /api/config/prop` on a running standalone gateway must therefore reach
+    /// the refresher without a restart, instead of being lost on a private
+    /// copy of the startup config.
+    #[tokio::test]
+    async fn a_config_api_opt_out_reaches_the_pricing_refresher_without_a_restart() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let _pricing_binding = crate::PRICING_BINDING_TEST_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        config.gateway.require_pairing = false;
+        config.providers.models.ollama.insert(
+            "priced".to_string(),
+            zeroclaw_config::schema::OllamaModelProviderConfig {
+                base: zeroclaw_config::schema::ModelProviderConfig {
+                    uri: Some("http://127.0.0.1:9".to_string()),
+                    model: Some("priced-model".to_string()),
+                    live_pricing: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+
+        // The exact property path the config API accepts for this flag, taken
+        // from the schema rather than spelled by hand.
+        let live_pricing_path = config
+            .prop_fields()
+            .into_iter()
+            .map(|field| field.name)
+            .find(|name| name.contains(".priced.") && name.contains("live"))
+            .expect("the schema exposes the provider's live-pricing flag");
+
+        let (addr_tx, addr_rx) = tokio::sync::oneshot::channel();
+        let addr_tx = std::sync::Mutex::new(Some(addr_tx));
+        let readiness = zeroclaw_runtime::daemon::GatewayReadinessReporter::new(move |addr| {
+            if let Some(tx) = addr_tx.lock().unwrap().take() {
+                let _ = tx.send(addr);
+            }
+        });
+        let server = zeroclaw_spawn::spawn!(async move {
+            crate::run_gateway(
+                "127.0.0.1",
+                0,
+                config,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(readiness),
+            )
+            .await
+        });
+        let addr = tokio::time::timeout(std::time::Duration::from_secs(10), addr_rx)
+            .await
+            .expect("the gateway reports readiness")
+            .expect("the readiness sender is kept until it fires");
+        assert!(
+            zeroclaw_providers::pricing::live_pricing_enabled(),
+            "the refresher is bound to the gateway's config, which opts in"
+        );
+
+        let body = serde_json::json!({
+            "path": live_pricing_path,
+            "value": false,
+        })
+        .to_string();
+        let request = format!(
+            "PUT /api/config/prop HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.unwrap();
+        assert!(
+            response.starts_with("HTTP/1.1 200"),
+            "the config API accepts the opt-out: {response}"
+        );
+
+        assert!(
+            !zeroclaw_providers::pricing::live_pricing_enabled(),
+            "the opt-out written through the config API must reach the refresher \
+             without a restart"
+        );
+        server.abort();
     }
 }
