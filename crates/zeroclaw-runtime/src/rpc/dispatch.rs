@@ -447,15 +447,17 @@ impl Method {
             }
             M::PersonalityPut => (Resource::Personality, Verb::Update),
 
+            // `subscription/cancel` ends only a subscription this connection
+            // opened (the id is looked up in the connection's own registry).
+            // It takes the same grant as the subscribe methods that create
+            // subscriptions, so whoever could open one can end it. A future
+            // source under a different grant must revisit this arm.
             M::LogsSubscribe
             | M::LogsQuery
             | M::LogsGet
             | M::EventsHistory
-            | M::EventsSubscribe => (Resource::Logs, Verb::Read),
-            // Ends only a subscription this connection opened (the id is looked
-            // up in the connection's own registry), so it needs no more than
-            // any authenticated caller holds.
-            M::SubscriptionCancel => (Resource::System, Verb::Read),
+            | M::EventsSubscribe
+            | M::SubscriptionCancel => (Resource::Logs, Verb::Read),
 
             M::TuiList => (Resource::Tui, Verb::Read),
 
@@ -4754,13 +4756,16 @@ impl RpcDispatcher {
             .apply_model_provider(
                 session_id,
                 session_generation,
-                provider,
-                provider_name,
-                model,
-                resolver,
-                dispatcher,
-                config_generation,
-                Some(temperature),
+                crate::rpc::session::ModelProviderUpdate {
+                    model_provider: provider,
+                    model_provider_name: provider_name,
+                    model_name: model,
+                    model_route_resolver: resolver,
+                    tool_dispatcher: dispatcher,
+                    config_generation: Arc::clone(&config_generation),
+                    temperature: Some(temperature),
+                    multimodal_config: config_generation.multimodal.clone(),
+                },
             )
             .await
     }
@@ -4886,7 +4891,8 @@ impl RpcDispatcher {
         // The queue wait was unbounded: the incarnation authorized before it
         // may have been replaced under the same id. Bind this prompt to the
         // exact record present now, under the permit, or refuse it.
-        self.revalidate_admitted_session(sid, authorized.as_ref())
+        let admitted = self
+            .revalidate_admitted_session(sid, authorized.as_ref())
             .await?;
 
         // A session-lifetime turn delivers through the session's ring from
@@ -4904,7 +4910,12 @@ impl RpcDispatcher {
                     Method::SessionPrompt,
                     notification::SESSION_UPDATE,
                     Some(head),
-                    Some(sid),
+                    Some(hub.epoch()),
+                    Some(SessionViewer {
+                        session_id: sid.to_string(),
+                        sessions: Arc::clone(&self.ctx.sessions),
+                        live_generation: admitted.as_ref().and_then(|rec| rec.live_generation),
+                    }),
                 );
             }
             hub.route_session(sid)
@@ -5807,15 +5818,18 @@ impl RpcDispatcher {
                 .apply_model_provider(
                     &req.session_id,
                     session_generation,
-                    model_provider,
-                    model_provider_name,
-                    model_name,
-                    model_route_resolver,
-                    tool_dispatcher,
-                    config_generation,
-                    // Temperature is already committed through
-                    // `set_overrides_gated` on this path.
-                    None,
+                    crate::rpc::session::ModelProviderUpdate {
+                        model_provider,
+                        model_provider_name,
+                        model_name,
+                        model_route_resolver,
+                        tool_dispatcher,
+                        config_generation: Arc::clone(&config_generation),
+                        // Temperature is already committed through
+                        // `set_overrides_gated` on this path.
+                        temperature: None,
+                        multimodal_config: config_generation.multimodal.clone(),
+                    },
                 )
                 .await
                 .then_some(())
@@ -5979,22 +5993,28 @@ impl RpcDispatcher {
         let record = self
             .authorize_session_owner(&req.session_id, Method::SessionAttach)
             .await?;
-        if record.is_none() {
+        let Some(record) = record else {
             return Err(rpc_err(SESSION_NOT_FOUND, "Session not found"));
-        }
+        };
         let source = self.ctx.subscriptions.session_source(&req.session_id);
-        let (subscription_id, seq) = self.start_subscription(
+        let opened = self.start_subscription(
             source,
             Method::SessionAttach,
             notification::SESSION_UPDATE,
             req.since_seq,
-            Some(&req.session_id),
-        );
+            req.epoch.as_deref(),
+            Some(SessionViewer {
+                session_id: req.session_id.clone(),
+                sessions: Arc::clone(&self.ctx.sessions),
+                live_generation: record.live_generation,
+            }),
+        )?;
         to_result(SessionAttachResult {
             running: self.ctx.sessions.has_inflight_turn(&req.session_id),
             session_id: req.session_id,
-            subscription_id,
-            seq,
+            subscription_id: opened.subscription_id,
+            seq: opened.seq,
+            epoch: opened.epoch,
         })
     }
 
@@ -7256,17 +7276,18 @@ impl RpcDispatcher {
                 .apply_model_provider(
                     &session_id,
                     session_generation,
-                    model_provider,
-                    model_provider_name,
-                    model_name,
-                    model_route_resolver,
-                    tool_dispatcher,
-                    Arc::clone(&config_generation),
-                    // Temperature travels in the same state transition as the
-                    // provider box rather than a follow-up `set_temperature`,
-                    // so a session cannot briefly show the new provider with
-                    // the old profile temperature.
-                    Some(temperature),
+                    crate::rpc::session::ModelProviderUpdate {
+                        model_provider,
+                        model_provider_name,
+                        model_name,
+                        model_route_resolver,
+                        tool_dispatcher,
+                        config_generation: Arc::clone(&config_generation),
+                        // Temperature travels in the same state transition as
+                        // the provider box rather than a follow-up setter.
+                        temperature: Some(temperature),
+                        multimodal_config: config_generation.multimodal.clone(),
+                    },
                 )
                 .await;
             if applied {
@@ -8364,7 +8385,9 @@ impl RpcDispatcher {
         // that models.dev may not carry yet) rather than silently falling back.
         let config = self.ctx.config.read().clone();
         let (models, pricing, live) =
-            crate::quickstart::model_catalog_with_config(Some(&config), &req.model_provider).await;
+            crate::quickstart::model_catalog_with_config_result(Some(&config), &req.model_provider)
+                .await
+                .map_err(|error| rpc_err(INVALID_PARAMS, error.to_string()))?;
         to_result(CatalogModelsResult {
             model_provider: req.model_provider,
             models,
@@ -8377,33 +8400,23 @@ impl RpcDispatcher {
     // ── Logs handler ─────────────────────────────────────────────
 
     fn handle_logs_subscribe(&self, params: &Value) -> RpcResult {
-        let (subscription_id, seq) = self.open_subscription(
+        to_result(self.open_subscription(
             crate::rpc::subscription::Source::Logs,
             Method::LogsSubscribe,
             notification::LOGS_EVENT,
             params,
-        )?;
-        to_result(LogsSubscribeResult {
-            subscribed: true,
-            subscription_id,
-            seq,
-        })
+        )?)
     }
 
     /// Observer frames only (agent, tool, LLM, history-trim, error): the
     /// live twin of `events/history`, from the daemon's bus.
     fn handle_events_subscribe(&self, params: &Value) -> RpcResult {
-        let (subscription_id, seq) = self.open_subscription(
+        to_result(self.open_subscription(
             crate::rpc::subscription::Source::Events,
             Method::EventsSubscribe,
             notification::EVENTS_EVENT,
             params,
-        )?;
-        to_result(LogsSubscribeResult {
-            subscribed: true,
-            subscription_id,
-            seq,
-        })
+        )?)
     }
 
     fn handle_subscription_cancel(&self, params: &Value) -> RpcResult {
@@ -8435,7 +8448,7 @@ impl RpcDispatcher {
         method: Method,
         notification_method: &'static str,
         params: &Value,
-    ) -> Result<(String, u64), JsonRpcError> {
+    ) -> Result<LogsSubscribeResult, JsonRpcError> {
         let p: SubscribeParams = if params.is_null() {
             SubscribeParams::default()
         } else {
@@ -8447,32 +8460,59 @@ impl RpcDispatcher {
             .as_ref()
             .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Event streaming is not available"))?;
         self.ctx.subscriptions.attach_bus(event_tx);
-        Ok(self.start_subscription(source, method, notification_method, p.since_seq, None))
+        self.start_subscription(
+            source,
+            method,
+            notification_method,
+            p.since_seq,
+            p.epoch.as_deref(),
+            None,
+        )
     }
 
     /// Start one subscription's delivery task on this connection. Returns
-    /// the id and the newest sequence number. `viewer_of` names the session
-    /// when this is a viewer of a session ring, so the session's viewer set
-    /// tracks it for as long as it delivers.
+    /// its id, the newest sequence number, and the hub epoch. `viewer` names
+    /// the session when this is a viewer of a session ring: the session's
+    /// viewer set tracks it for as long as it delivers, and every disclosure
+    /// is held to the session's current owner and incarnation.
     fn start_subscription(
         &self,
         source: crate::rpc::subscription::Source,
         method: Method,
         notification_method: &'static str,
         since_seq: Option<u64>,
-        viewer_of: Option<&str>,
-    ) -> (String, u64) {
+        since_epoch: Option<&str>,
+        viewer: Option<SessionViewer>,
+    ) -> Result<LogsSubscribeResult, JsonRpcError> {
         let hub = Arc::clone(&self.ctx.subscriptions);
         let head = hub.head_seq(source);
-        let cursor = since_seq.map_or(head + 1, |since| since.saturating_add(1));
+        // Sequence numbers are scoped to the hub's epoch; a new hub (daemon
+        // restart or reload) starts again at 1. `since_seq` resumes only
+        // against the epoch it came from. Any other epoch, or none, cannot be
+        // lined up with this hub's numbers: replay what this hub still holds
+        // and say that continuity broke.
+        let (cursor, epoch_changed) = match since_seq {
+            None => (head + 1, false),
+            Some(since) if since_epoch == Some(hub.epoch()) => {
+                if since > head {
+                    return Err(rpc_err(
+                        INVALID_PARAMS,
+                        format!("since_seq {since} is ahead of this stream (newest is {head})"),
+                    ));
+                }
+                (since + 1, false)
+            }
+            Some(_) => (hub.oldest_seq(source), true),
+        };
+        let epoch = hub.epoch().to_string();
         let subscription_id = uuid::Uuid::new_v4().to_string();
         let cancel = self.connection_cancel.child_token();
         self.subscriptions
             .lock()
             .insert(subscription_id.clone(), cancel.clone());
-        if let Some(session_id) = viewer_of {
+        if let Some(viewer) = viewer.as_ref() {
             hub.add_viewer(
-                session_id,
+                &viewer.session_id,
                 &subscription_id,
                 self.connection_nonce,
                 cancel.clone(),
@@ -8483,6 +8523,7 @@ impl RpcDispatcher {
             source,
             subscription_id: subscription_id.clone(),
             cursor,
+            epoch_changed,
             rpc: self.rpc.clone(),
             cancel,
             notification_method,
@@ -8490,10 +8531,15 @@ impl RpcDispatcher {
             inbound: Arc::clone(&self.ctx.auth),
             binding: self.auth.clone(),
             registry: Arc::clone(&self.subscriptions),
-            viewer_of: viewer_of.map(str::to_string),
+            viewer,
         };
         zeroclaw_spawn::spawn!(deliver_subscription(delivery));
-        (subscription_id, head)
+        Ok(LogsSubscribeResult {
+            subscribed: true,
+            subscription_id,
+            seq: head,
+            epoch,
+        })
     }
 
     /// Recent observer frames (agent, tool, LLM, history-trim, error), oldest
@@ -9721,6 +9767,9 @@ struct SubscriptionDelivery {
     source: crate::rpc::subscription::Source,
     subscription_id: String,
     cursor: u64,
+    /// The client's `since_seq` came from another hub epoch; `cursor` is the
+    /// oldest frame still buffered here.
+    epoch_changed: bool,
     rpc: Arc<RpcOutbound>,
     cancel: CancellationToken,
     notification_method: &'static str,
@@ -9729,7 +9778,7 @@ struct SubscriptionDelivery {
     binding: Option<crate::rpc::auth::ConnectionAuth>,
     registry: Arc<parking_lot::Mutex<std::collections::HashMap<String, CancellationToken>>>,
     /// The session this subscription views, when it reads a session ring.
-    viewer_of: Option<String>,
+    viewer: Option<SessionViewer>,
 }
 
 /// Move one subscription's cursor through the hub until it is cancelled, the
@@ -9741,6 +9790,7 @@ async fn deliver_subscription(delivery: SubscriptionDelivery) {
         source,
         subscription_id,
         mut cursor,
+        epoch_changed,
         rpc,
         cancel,
         notification_method,
@@ -9748,104 +9798,171 @@ async fn deliver_subscription(delivery: SubscriptionDelivery) {
         inbound,
         binding,
         registry,
-        viewer_of,
+        viewer,
     } = delivery;
     let finish = || {
         registry.lock().remove(&subscription_id);
-        if let Some(session_id) = viewer_of.as_deref() {
-            hub.remove_viewer(session_id, &subscription_id);
+        if let Some(viewer) = viewer.as_ref() {
+            hub.remove_viewer(&viewer.session_id, &subscription_id);
         }
     };
-    let lagged = |from_seq: u64, resume_seq: u64| {
+    let lagged = |from_seq: u64, resume_seq: u64, epoch_changed: bool| {
         serde_json::to_string(&JsonRpcNotification::new(
             notification::SUBSCRIPTION_LAGGED,
             serde_json::json!(SubscriptionLagged {
                 subscription_id: subscription_id.clone(),
                 from_seq,
                 resume_seq,
+                epoch_changed,
             }),
         ))
         .ok()
     };
     let mut checked_generation = binding.as_ref().map(|auth| auth.generation);
+    let mut grants = binding.as_ref().map(|auth| auth.grants.clone());
 
-    // A `since_seq` past the head means this hub started after the client's
-    // last frame (a daemon restart): continuity is broken, so say so.
-    let next = hub.head_seq(source) + 1;
-    if cursor > next {
-        if let Some(json) = lagged(cursor, next)
-            && !rpc.send_raw(json).await
-        {
-            finish();
-            return;
-        }
-        cursor = next;
-    }
-
-    'deliver: loop {
-        let notifier = hub.notifier(source);
-        let notified = notifier.notified();
-        tokio::pin!(notified);
-        notified.as_mut().enable();
-        match hub.read(source, cursor, READ_BATCH) {
-            Read::Lagged {
-                from_seq,
-                resume_seq,
-            } => {
-                let Some(json) = lagged(from_seq, resume_seq) else {
-                    break 'deliver;
-                };
-                if !rpc.send_raw(json).await {
-                    break 'deliver;
-                }
-                cursor = resume_seq;
-                continue;
+    'deliver: {
+        // The client's numbers belong to another epoch: nothing it saw can be
+        // matched here. Everything before `cursor` in this epoch is gone; from
+        // `cursor` on, every buffered frame is replayed.
+        if epoch_changed {
+            if !still_authorized(
+                &inbound,
+                binding.as_ref(),
+                method,
+                &mut checked_generation,
+                &mut grants,
+            ) || !viewer_may_see(viewer.as_ref(), binding.as_ref(), grants.as_ref()).await
+            {
+                break 'deliver;
             }
-            Read::Frames(frames) if !frames.is_empty() => {
-                for (seq, frame) in frames {
-                    if cancel.is_cancelled() {
+            let Some(json) = lagged(1, cursor, true) else {
+                break 'deliver;
+            };
+            if !rpc.send_raw(json).await {
+                break 'deliver;
+            }
+        }
+
+        loop {
+            let notifier = hub.notifier(source);
+            let notified = notifier.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            match hub.read(source, cursor, READ_BATCH) {
+                Read::Lagged {
+                    from_seq,
+                    resume_seq,
+                } => {
+                    if !still_authorized(
+                        &inbound,
+                        binding.as_ref(),
+                        method,
+                        &mut checked_generation,
+                        &mut grants,
+                    ) || !viewer_may_see(viewer.as_ref(), binding.as_ref(), grants.as_ref())
+                        .await
+                    {
                         break 'deliver;
                     }
-                    if let Some(auth) = binding.as_ref() {
-                        let generation = inbound.generation();
-                        let authority = if checked_generation == Some(generation) {
-                            credential_is_live(&inbound, auth)
-                        } else {
-                            current_authority(&inbound, auth, method).map(|_| ())
-                        };
-                        if let Err(denied) = authority {
-                            audit_denial(Some(auth), method, &denied);
-                            break 'deliver;
-                        }
-                        checked_generation = Some(generation);
-                    }
-                    let mut params = (*frame).clone();
-                    if let Some(object) = params.as_object_mut() {
-                        object.insert("subscription_id".into(), serde_json::json!(subscription_id));
-                        object.insert("seq".into(), serde_json::json!(seq));
-                    }
-                    let notification = JsonRpcNotification::new(notification_method, params);
-                    let Ok(json) = serde_json::to_string(&notification) else {
+                    let Some(json) = lagged(from_seq, resume_seq, false) else {
                         break 'deliver;
                     };
                     if !rpc.send_raw(json).await {
                         break 'deliver;
                     }
-                    cursor = seq + 1;
+                    cursor = resume_seq;
+                    continue;
                 }
-                tokio::task::yield_now().await;
-                continue;
+                Read::Frames(frames) if !frames.is_empty() => {
+                    for (seq, frame) in frames {
+                        // Every disclosure is held to the authority in force
+                        // when it happens, not when the stream was opened: a
+                        // revoked grant, and for a session viewer a lost
+                        // ownership or a replaced session, ends the stream
+                        // before the next frame, buffered ones included.
+                        if cancel.is_cancelled()
+                            || !still_authorized(
+                                &inbound,
+                                binding.as_ref(),
+                                method,
+                                &mut checked_generation,
+                                &mut grants,
+                            )
+                            || !viewer_may_see(viewer.as_ref(), binding.as_ref(), grants.as_ref())
+                                .await
+                        {
+                            break 'deliver;
+                        }
+                        let mut params = (*frame).clone();
+                        if let Some(object) = params.as_object_mut() {
+                            object.insert(
+                                "subscription_id".into(),
+                                serde_json::json!(subscription_id),
+                            );
+                            object.insert("seq".into(), serde_json::json!(seq));
+                        }
+                        let notification = JsonRpcNotification::new(notification_method, params);
+                        let Ok(json) = serde_json::to_string(&notification) else {
+                            break 'deliver;
+                        };
+                        if !rpc.send_raw(json).await {
+                            break 'deliver;
+                        }
+                        cursor = seq + 1;
+                    }
+                    tokio::task::yield_now().await;
+                    continue;
+                }
+                Read::Frames(_) => {}
             }
-            Read::Frames(_) => {}
-        }
-        tokio::select! {
-            biased;
-            () = cancel.cancelled() => break,
-            () = rpc.closed() => break,
-            () = &mut notified => {}
+            tokio::select! {
+                biased;
+                () = cancel.cancelled() => break 'deliver,
+                () = rpc.closed() => break 'deliver,
+                () = &mut notified => {}
+            }
         }
     }
     finish();
+}
+
+/// A viewer of one session's ring. Attach authorized it against the session
+/// as it was then; delivery holds every frame to the session as it is now.
+struct SessionViewer {
+    session_id: String,
+    sessions: Arc<crate::rpc::session::SessionStore>,
+    /// The live incarnation attach authorized, when the session was live.
+    live_generation: Option<u64>,
+}
+
+/// Whether a session viewer may still see the session's frames: the live
+/// incarnation it attached to has not been replaced, and a scoped principal
+/// (authenticated, not admin under the grants resolved most recently) still
+/// owns the session. The same scope rule as `RpcDispatcher::scoped_principal_id`.
+/// Not a viewer, or an unbound dispatcher, passes.
+async fn viewer_may_see(
+    viewer: Option<&SessionViewer>,
+    binding: Option<&crate::rpc::auth::ConnectionAuth>,
+    grants: Option<&zeroclaw_api::grants::ResolvedGrants>,
+) -> bool {
+    let (Some(viewer), Some(auth)) = (viewer, binding) else {
+        return true;
+    };
+    if let Some(expected) = viewer.live_generation
+        && let Some(current) = viewer.sessions.get_generation(&viewer.session_id).await
+        && current != expected
+    {
+        return false;
+    }
+    let admin = grants.map_or(auth.grants.admin, |grants| grants.admin);
+    if admin || !auth.principal.is_authenticated() {
+        return true;
+    }
+    matches!(
+        viewer.sessions.session_owner_principal(&viewer.session_id).await,
+        Some(Some(owner)) if owner == auth.principal.id.as_str()
+    )
 }
 
 /// A process-unique id for each accepted connection. See
@@ -9881,6 +9998,37 @@ impl TurnSink {
             }
         }
     }
+}
+
+/// Hold one delivery (a frame or a `lagged` notice) to the connection's
+/// authority. The credential must still be live, and whenever the accepted
+/// policy generation has moved, the principal is resolved again against
+/// `method`. A refusal is audited. An unbound dispatcher (the direct
+/// unit-test handlers) has nothing to recheck.
+fn still_authorized(
+    inbound: &crate::rpc::auth::RpcInboundAuth,
+    binding: Option<&crate::rpc::auth::ConnectionAuth>,
+    method: Method,
+    checked_generation: &mut Option<u64>,
+    grants: &mut Option<zeroclaw_api::grants::ResolvedGrants>,
+) -> bool {
+    let Some(auth) = binding else {
+        return true;
+    };
+    let generation = inbound.generation();
+    let authority = if *checked_generation == Some(generation) {
+        credential_is_live(inbound, auth)
+    } else {
+        current_authority(inbound, auth, method).map(|resolved| {
+            *grants = Some(resolved);
+        })
+    };
+    if let Err(denied) = authority {
+        audit_denial(Some(auth), method, &denied);
+        return false;
+    }
+    *checked_generation = Some(generation);
+    true
 }
 
 fn parse_params<T: DeserializeOwned>(params: &Value) -> Result<T, JsonRpcError> {
@@ -10114,6 +10262,7 @@ fn session_update_params(session_id: &str, event: &TurnEvent) -> Option<Value> {
         },
         TurnEvent::HistoryTrimmed {
             dropped_messages,
+            dropped_turns,
             kept_turns,
             reason,
             token_budget,
@@ -10125,6 +10274,7 @@ fn session_update_params(session_id: &str, event: &TurnEvent) -> Option<Value> {
         } => SessionUpdateEvent::HistoryTrimmed {
             session_id: session_id.to_string(),
             dropped_messages: *dropped_messages,
+            dropped_turns: *dropped_turns,
             kept_turns: *kept_turns,
             reason: reason.clone(),
             token_budget: *token_budget,
@@ -17240,10 +17390,10 @@ mod tests {
             }
         }
         assert_eq!(kinds, ["agent_start", "llm_request", "tool_call"]);
-        // `logs/subscribe` carries every frame on the process-wide bus, and
-        // tests running in parallel record onto it too, so only this turn's
-        // frames can show a duplicate.
-        let quiet_until = tokio::time::Instant::now() + std::time::Duration::from_millis(100);
+        // The observer hook is process-wide, so tests running in parallel can
+        // put their own frames on this bus. Only a second copy of this test's
+        // turn would be a duplicate.
+        let quiet_until = tokio::time::Instant::now() + std::time::Duration::from_millis(150);
         while let Ok(Some(frame)) = tokio::time::timeout_at(quiet_until, writer_rx.recv()).await {
             let frame: Value = serde_json::from_str(&frame).expect("notification is JSON");
             assert_ne!(
@@ -17253,9 +17403,9 @@ mod tests {
             );
         }
 
-        // The hook is process-wide, so turns other tests run in parallel land
-        // in this history too; judge only this turn's frames.
         let history = d.handle_events_history().expect("history is available");
+        // Parallel tests can record into the same process-wide hook; only this
+        // test's turn is asserted on.
         let types: Vec<_> = history["events"]
             .as_array()
             .expect("events array")
@@ -17394,9 +17544,10 @@ mod tests {
         }
 
         let opened = d
-            .handle_events_subscribe(&json!({"since_seq": 6}))
+            .handle_events_subscribe(&json!({"since_seq": 6, "epoch": hub.epoch()}))
             .expect("subscribe");
         assert_eq!(opened["seq"], json!(10));
+        assert_eq!(opened["epoch"], json!(hub.epoch()));
         let id = opened["subscription_id"].as_str().expect("id").to_string();
 
         let replay = notifications(&mut rx, 4).await;
@@ -17423,7 +17574,7 @@ mod tests {
         }
 
         let opened = d
-            .handle_logs_subscribe(&json!({"since_seq": 0}))
+            .handle_logs_subscribe(&json!({"since_seq": 0, "epoch": hub.epoch()}))
             .expect("subscribe");
         let id = opened["subscription_id"].as_str().expect("id").to_string();
 
@@ -17434,7 +17585,12 @@ mod tests {
         );
         assert_eq!(
             frames[0]["params"],
-            json!({"subscription_id": id, "from_seq": 1, "resume_seq": 7})
+            json!({
+                "subscription_id": id,
+                "from_seq": 1,
+                "resume_seq": 7,
+                "epoch_changed": false,
+            })
         );
         assert_eq!(seqs(&frames[1..]), [7, 8, 9, 10]);
 
@@ -17442,22 +17598,90 @@ mod tests {
         assert_eq!(seqs(&notifications(&mut rx, 1).await), [11]);
     }
 
-    /// A `since_seq` past the head (a client from before a restart) cannot be
-    /// satisfied; it is reported as a gap rather than silently skipped.
+    /// Within one epoch, a `since_seq` ahead of the newest frame cannot come
+    /// from this stream: it is refused, not turned into a notice.
     #[tokio::test]
-    async fn a_since_seq_past_the_head_is_reported() {
+    async fn a_future_since_seq_in_the_same_epoch_is_refused() {
         use crate::rpc::subscription::Source;
-        let (d, mut rx, hub) = subscription_dispatcher(64);
+        let (d, _rx, hub) = subscription_dispatcher(64);
         hub.publish(Source::Logs, json!({"n": 1}));
-        d.handle_logs_subscribe(&json!({"since_seq": 40}))
-            .expect("subscribe");
-        let frames = notifications(&mut rx, 1).await;
-        assert_eq!(
-            frames[0]["method"],
-            json!(notification::SUBSCRIPTION_LAGGED)
+        let refused = d.handle_logs_subscribe(&json!({"since_seq": 40, "epoch": hub.epoch()}));
+        assert!(
+            matches!(&refused, Err(error) if error.code == INVALID_PARAMS),
+            "{refused:?}"
         );
-        assert_eq!(frames[0]["params"]["from_seq"], json!(41));
-        assert_eq!(frames[0]["params"]["resume_seq"], json!(2));
+    }
+
+    /// Sequence numbers restart in a new hub (daemon restart or reload). A
+    /// `since_seq` from another epoch is never lined up by number, whether the
+    /// new hub holds fewer frames than it or more: the client is told its
+    /// continuity broke (`epoch_changed`, a forward range) and gets every
+    /// frame the new hub still buffers.
+    #[tokio::test]
+    async fn a_since_seq_from_another_epoch_replays_the_new_hub() {
+        use crate::rpc::subscription::Source;
+        for (published, since_seq) in [(3_u64, 40_u64), (10, 6)] {
+            let (d, mut rx, hub) = subscription_dispatcher(64);
+            for n in 1..=published {
+                hub.publish(Source::Logs, json!({ "n": n }));
+            }
+            let opened = d
+                .handle_logs_subscribe(&json!({
+                    "since_seq": since_seq,
+                    "epoch": "an-epoch-from-before-the-restart",
+                }))
+                .expect("subscribe");
+            assert_ne!(opened["epoch"], json!("an-epoch-from-before-the-restart"));
+
+            let count = usize::try_from(published).expect("small") + 1;
+            let frames = notifications(&mut rx, count).await;
+            assert_eq!(
+                frames[0]["method"],
+                json!(notification::SUBSCRIPTION_LAGGED)
+            );
+            assert_eq!(frames[0]["params"]["from_seq"], json!(1));
+            assert_eq!(frames[0]["params"]["resume_seq"], json!(1));
+            assert_eq!(frames[0]["params"]["epoch_changed"], json!(true));
+            assert_eq!(
+                seqs(&frames[1..]),
+                (1..=published).collect::<Vec<_>>(),
+                "published {published}, since_seq {since_seq}"
+            );
+            assert_quiet(&mut rx).await;
+        }
+    }
+
+    /// A principal granted only `Logs:Read` can open a subscription and end
+    /// it through the real authorization gate.
+    #[tokio::test]
+    async fn a_logs_reader_can_cancel_its_own_subscription() {
+        use zeroclaw_api::grants::{Resource, Verb};
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+        let mut config = roster_config(4242);
+        let reader = config
+            .permission_profiles
+            .get_mut("reader")
+            .expect("the fixture profile exists");
+        reader.grants.clear();
+        reader.grants.insert(Resource::Logs, vec![Verb::Read]);
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let (event_tx, _rx0) = tokio::sync::broadcast::channel(16);
+        let ctx = RpcContext::minimal_with_event_tx(config, sessions, event_tx);
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+
+        let opened = rpc(&mut alice, &mut rx, 1, "logs/subscribe", json!({})).await;
+        let id = opened["result"]["subscription_id"].clone();
+        assert!(id.is_string(), "{opened}");
+        let cancelled = rpc(
+            &mut alice,
+            &mut rx,
+            2,
+            "subscription/cancel",
+            json!({"subscription_id": id}),
+        )
+        .await;
+        assert_eq!(cancelled["result"]["cancelled"], json!(true), "{cancelled}");
     }
 
     #[tokio::test]
@@ -19919,6 +20143,7 @@ mod tests {
     fn history_trimmed_notification() {
         let event = TurnEvent::HistoryTrimmed {
             dropped_messages: 12,
+            dropped_turns: 4,
             kept_turns: 1,
             reason: "context token budget exceeded".into(),
             token_budget: Some(500_000),
@@ -19934,6 +20159,7 @@ mod tests {
         assert_eq!(v["params"]["type"], "history_trimmed");
         assert_eq!(v["params"]["session_id"], "s1");
         assert_eq!(v["params"]["dropped_messages"], 12);
+        assert_eq!(v["params"]["dropped_turns"], 4);
         assert_eq!(v["params"]["kept_turns"], 1);
         assert_eq!(v["params"]["reason"], "context token budget exceeded");
         assert_eq!(v["params"]["token_budget"], 500_000);
@@ -19950,6 +20176,7 @@ mod tests {
         // keep resolving the provenance label.
         let event = TurnEvent::HistoryTrimmed {
             dropped_messages: 4,
+            dropped_turns: 1,
             kept_turns: 2,
             reason: "context token budget exceeded".into(),
             token_budget: Some(10_000),
@@ -22197,6 +22424,7 @@ mod tests {
         let (dispatcher, mut rx, _sessions) = make_dispatcher_with_capture(config);
         let event = TurnEvent::HistoryTrimmed {
             dropped_messages: 4,
+            dropped_turns: 2,
             kept_turns: 1,
             reason: "message cap".into(),
             token_budget: None,
@@ -22719,16 +22947,26 @@ mod tests {
             ConversationMessage::Chat(ChatMessage::assistant("new answer")),
         ];
 
+        // The limit counts complete turns: keeping one turn retains the
+        // newest exchange and drops the older tool-bearing turn whole.
         let active = crate::agent::history_trim::trim_conversation_to_recent_turns(
             durable.clone(),
-            2,
-            crate::agent::history_trim::history_trim_target(2, 1.0),
+            1,
             false,
         );
         assert!(active.trimmed);
         assert!(!active.history.iter().any(|message| matches!(
             message,
             ConversationMessage::Chat(chat) if chat.content == "old question"
+        )));
+        assert!(!active.history.iter().any(|message| matches!(
+            message,
+            ConversationMessage::ToolResults(results)
+                if results.iter().any(|result| result.tool_call_id == "old-call")
+        )));
+        assert!(active.history.iter().any(|message| matches!(
+            message,
+            ConversationMessage::Chat(chat) if chat.content == "new question"
         )));
 
         let transcript = conversation_message_entries(&durable);
@@ -25074,7 +25312,7 @@ mod tests {
             .runtime_profiles
             .get_mut("reloadable")
             .expect("runtime profile exists")
-            .max_history_messages = Some(2);
+            .max_history_messages = Some(1);
 
         let agent = dispatcher
             .ctx
@@ -25104,194 +25342,6 @@ mod tests {
                 if chat.content == "new assistant"
         )));
     }
-
-    #[tokio::test]
-    async fn existing_session_uses_reloaded_history_trim_low_water() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let mut config = make_model_refresh_test_config(&tmp);
-        config
-            .agents
-            .get_mut("test-agent")
-            .expect("test agent exists")
-            .runtime_profile = "reloadable".into();
-        config.runtime_profiles.insert(
-            "reloadable".into(),
-            zeroclaw_config::schema::RuntimeProfileConfig {
-                max_history_messages: Some(4),
-                ..Default::default()
-            },
-        );
-
-        let dispatcher = make_config_set_test_dispatcher(config);
-        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
-        dispatcher
-            .ctx
-            .config
-            .write()
-            .runtime_profiles
-            .get_mut("reloadable")
-            .expect("runtime profile exists")
-            .history_trim_low_water = Some(1.0);
-
-        let agent = dispatcher
-            .ctx
-            .sessions
-            .get_agent(&session_id)
-            .await
-            .expect("session agent exists");
-        let mut agent = agent.lock().await;
-        let event = agent.seed_history_with_event(&[
-            ChatMessage::user("old user"),
-            ChatMessage::assistant("old answer"),
-            ChatMessage::user("middle user"),
-            ChatMessage::assistant("middle answer"),
-            ChatMessage::user("new user"),
-            ChatMessage::assistant("new answer"),
-        ]);
-
-        let Some(TurnEvent::HistoryTrimmed {
-            dropped_messages,
-            kept_turns,
-            ..
-        }) = event
-        else {
-            panic!("an existing session must observe the reloaded low-water fraction");
-        };
-        assert_eq!(dropped_messages, 2, "legacy 1.0 refills to the cap of 4");
-        assert_eq!(kept_turns, 2, "legacy 1.0 retains the newest two turns");
-        let breadcrumb = crate::i18n::get_required_cli_string("history-trim-breadcrumb");
-        let history = agent.history();
-        assert_eq!(
-            history.len(),
-            6,
-            "synthesized system prompt plus breadcrumb plus the retained body"
-        );
-        assert!(!history.iter().any(|message| matches!(
-            message,
-            zeroclaw_providers::ConversationMessage::Chat(chat)
-                if chat.content == "old user" || chat.content == "old answer"
-        )));
-        for retained in ["middle user", "middle answer", "new user", "new answer"] {
-            assert!(
-                history.iter().any(|message| matches!(
-                    message,
-                    zeroclaw_providers::ConversationMessage::Chat(chat)
-                        if chat.content == retained
-                )),
-                "fraction 1.0 loaded after construction must retain {retained}"
-            );
-        }
-        assert_eq!(
-            history
-                .iter()
-                .filter(|message| matches!(
-                    message,
-                    zeroclaw_providers::ConversationMessage::Chat(chat)
-                        if chat.role == "user" && chat.content == breadcrumb
-                ))
-                .count(),
-            1,
-            "exactly one synthetic breadcrumb accompanies the retained turns"
-        );
-    }
-
-    #[tokio::test]
-    async fn config_set_persists_history_trim_low_water_and_trims_existing_session() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let mut config = make_model_refresh_test_config(&tmp);
-        config
-            .agents
-            .get_mut("test-agent")
-            .expect("test agent exists")
-            .runtime_profile = "reloadable".into();
-        config.runtime_profiles.insert(
-            "reloadable".into(),
-            zeroclaw_config::schema::RuntimeProfileConfig {
-                max_history_messages: Some(4),
-                history_trim_low_water: None,
-                ..Default::default()
-            },
-        );
-
-        let dispatcher = make_config_set_test_dispatcher(config);
-        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
-
-        let set = dispatcher
-            .handle_config_set(&json!({
-                "prop": "runtime_profiles.reloadable.history_trim_low_water",
-                "value": 1.0
-            }))
-            .await;
-        assert!(
-            set.is_ok(),
-            "config/set must accept the low-water fraction: {set:?}"
-        );
-
-        let config_path = tmp.path().join("config.toml");
-        let disk = std::fs::read_to_string(&config_path).unwrap();
-        let reloaded: zeroclaw_config::schema::Config = toml::from_str(&disk)
-            .unwrap_or_else(|e| panic!("config must reload after the fraction write: {e}\n{disk}"));
-        assert_eq!(
-            reloaded
-                .runtime_profiles
-                .get("reloadable")
-                .and_then(|profile| profile.history_trim_low_water),
-            Some(1.0),
-            "the RPC write must persist the exact fraction to disk"
-        );
-
-        let agent = dispatcher
-            .ctx
-            .sessions
-            .get_agent(&session_id)
-            .await
-            .expect("session agent exists");
-        let mut agent = agent.lock().await;
-        let event = agent.seed_history_with_event(&[
-            ChatMessage::user("old user"),
-            ChatMessage::assistant("old answer"),
-            ChatMessage::user("middle user"),
-            ChatMessage::assistant("middle answer"),
-            ChatMessage::user("new user"),
-            ChatMessage::assistant("new answer"),
-        ]);
-
-        let Some(TurnEvent::HistoryTrimmed {
-            dropped_messages,
-            kept_turns,
-            ..
-        }) = event
-        else {
-            panic!("an existing session must observe the persisted low-water fraction");
-        };
-        assert_eq!(
-            dropped_messages, 2,
-            "fraction 1.0 written via config/set refills to the cap of 4"
-        );
-        assert_eq!(kept_turns, 2, "fraction 1.0 retains the newest two turns");
-        let history = agent.history();
-        assert_eq!(
-            history.len(),
-            6,
-            "synthesized system prompt plus breadcrumb plus the retained body"
-        );
-        assert!(!history.iter().any(|message| matches!(
-            message,
-            zeroclaw_providers::ConversationMessage::Chat(chat)
-                if chat.content == "old user" || chat.content == "old answer"
-        )));
-        for retained in ["middle user", "middle answer", "new user", "new answer"] {
-            assert!(
-                history.iter().any(|message| matches!(
-                    message,
-                    zeroclaw_providers::ConversationMessage::Chat(chat)
-                        if chat.content == retained
-                )),
-                "fraction 1.0 persisted via config/set must retain {retained}"
-            );
-        }
-    }
-
     #[tokio::test]
     async fn config_set_provider_model_refreshes_matching_live_session() {
         let tmp = tempfile::TempDir::new().unwrap();

@@ -361,6 +361,12 @@ rpc_type! {
         /// reported as `subscription/lagged`. Omit for live frames only.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub since_seq: Option<u64>,
+        /// The `epoch` `since_seq` came from. `since_seq` resumes only
+        /// against the same epoch; any other (a daemon restart or reload)
+        /// replays what the ring holds after a `subscription/lagged` with
+        /// `epoch_changed: true`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub epoch: Option<String>,
     }
 }
 
@@ -372,6 +378,8 @@ rpc_type! {
         pub subscription_id: String,
         /// Newest sequence number on the session's ring at attach time.
         pub seq: u64,
+        /// The hub's epoch: pass it back with `since_seq` to resume.
+        pub epoch: String,
         /// Whether a turn is running on the session now.
         pub running: bool,
     }
@@ -1479,6 +1487,13 @@ rpc_type! {
         /// for live frames only.
         #[serde(default)]
         pub since_seq: Option<u64>,
+        /// The `epoch` the client's `since_seq` came from (returned by the
+        /// subscribe result). Sequence numbers restart in every hub, so
+        /// `since_seq` resumes only when this matches the current epoch;
+        /// otherwise, or when omitted, every frame still buffered is replayed
+        /// after a `subscription/lagged` with `epoch_changed: true`.
+        #[serde(default)]
+        pub epoch: Option<String>,
     }
 }
 
@@ -1489,6 +1504,8 @@ rpc_type! {
         pub subscribed: bool,
         pub subscription_id: String,
         pub seq: u64,
+        /// The hub's epoch: pass it back with `since_seq` to resume.
+        pub epoch: String,
     }
 }
 
@@ -1513,6 +1530,12 @@ rpc_type! {
         pub subscription_id: String,
         pub from_seq: u64,
         pub resume_seq: u64,
+        /// The client's `since_seq` came from another epoch (the daemon
+        /// restarted or reloaded). Nothing it saw can be matched here: this
+        /// epoch's frames from `resume_seq` on are replayed, and those before
+        /// it are gone.
+        #[serde(default)]
+        pub epoch_changed: bool,
     }
 }
 
@@ -1707,11 +1730,12 @@ pub enum SessionUpdateEvent {
     /// Emitted whenever older whole turns were dropped from structured history
     /// to fit a token budget or message cap. Surfaces a user-visible "context
     /// was cut here" marker so trimming is never silent. `dropped_messages` is
-    /// the count of conversation messages removed; `kept_turns` is how many
-    /// whole turns remained after the cut.
+    /// the count of conversation messages removed; `dropped_turns` and
+    /// `kept_turns` describe the user-facing whole-turn accounting.
     HistoryTrimmed {
         session_id: String,
         dropped_messages: usize,
+        dropped_turns: usize,
         kept_turns: usize,
         reason: String,
         /// Configured context token budget in effect at trim time. `None` for

@@ -7,18 +7,21 @@
 //! exceeded, the oldest frame across all rings is evicted.
 //!
 //! Nothing is dropped silently. A cursor that points into a gap, whether the
-//! frames were evicted, never reached the hub, or predate a restart, reads
-//! [`Read::Lagged`] with the first missing sequence and the first one still
-//! available, and the subscriber resumes from there.
+//! frames were evicted or never reached the hub, reads [`Read::Lagged`] with
+//! the first missing sequence and the first one still available, and the
+//! subscriber resumes from there.
 //!
-//! Sequence numbers start at 1 per source and are never reused within a hub,
-//! so a client can resume with `since_seq` (the last sequence it saw).
+//! Sequence numbers start at 1 per source and are never reused within a hub.
+//! Each hub has a random [`SubscriptionHub::epoch`]; a new hub (a daemon
+//! restart or reload) starts numbering again, so a client resumes with the
+//! epoch and `since_seq` it last saw, and a different epoch is reported as a
+//! break in continuity rather than matched by number.
 //!
 //! Besides the fixed daemon streams, each session can have its own ring
 //! ([`SubscriptionHub::session_source`]). A session-lifetime turn publishes
 //! its `session/update` frames there, and every attached viewer reads them
 //! through a cursor like any other subscriber, so a turn never waits on a
-//! viewer and a viewer that reconnects resumes with `since_seq`.
+//! viewer and a viewer that reconnects resumes with its epoch and `since_seq`.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -138,6 +141,7 @@ struct Sessions {
 
 /// The process's subscription sources. Cheap to share behind an `Arc`.
 pub struct SubscriptionHub {
+    epoch: String,
     state: Mutex<HubState>,
     notify: Mutex<HashMap<Source, Arc<Notify>>>,
     sessions: Mutex<Sessions>,
@@ -165,6 +169,7 @@ impl SubscriptionHub {
     #[must_use]
     pub fn with_limits(ring: RingLimits, byte_budget: usize) -> Self {
         Self {
+            epoch: uuid::Uuid::new_v4().to_string(),
             state: Mutex::new(HubState {
                 rings: Source::ALL
                     .into_iter()
@@ -258,6 +263,27 @@ impl SubscriptionHub {
             .or_insert_with(|| Ring::new(session_ring))
             .next_seq += count;
         self.notifier(source).notify_waiters();
+    }
+
+    /// This hub's identity. Sequence numbers are only comparable within one
+    /// epoch.
+    #[must_use]
+    pub fn epoch(&self) -> &str {
+        &self.epoch
+    }
+
+    /// The sequence number of the oldest frame still buffered, or the next
+    /// sequence number when the ring is empty.
+    #[must_use]
+    pub fn oldest_seq(&self, source: Source) -> u64 {
+        let state = self.state.lock();
+        // A session ring exists from its first frame; before that the next
+        // sequence number is 1.
+        state.rings.get(&source).map_or(1, |ring| {
+            ring.entries
+                .front()
+                .map_or(ring.next_seq, |entry| entry.seq)
+        })
     }
 
     /// The sequence number of the newest frame (0 before the first).
@@ -549,6 +575,19 @@ mod tests {
         assert_eq!(hub.publish(Source::Logs, json!({"n": 2})), 2);
         assert_eq!(hub.publish(Source::Events, json!({"n": 1})), 1);
         assert_eq!(hub.head_seq(Source::Logs), 2);
+    }
+
+    #[test]
+    fn epochs_differ_per_hub_and_oldest_tracks_eviction() {
+        let first = small_hub(2);
+        let second = small_hub(2);
+        assert_ne!(first.epoch(), second.epoch());
+        assert_eq!(first.oldest_seq(Source::Logs), 1);
+        for n in 1..=5 {
+            first.publish(Source::Logs, json!({ "n": n }));
+        }
+        assert_eq!(first.oldest_seq(Source::Logs), 4);
+        assert_eq!(first.oldest_seq(Source::Events), 1);
     }
 
     #[test]
