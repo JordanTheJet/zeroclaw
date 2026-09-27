@@ -6221,6 +6221,11 @@ impl RpcDispatcher {
         let session_id = match req.session_id {
             Some(sid) => {
                 if self.resolve_session_record(&sid).await?.is_some() {
+                    // A scoped caller naming another principal's session gets
+                    // the uniform ownership denial first, so run-once cannot
+                    // be used to probe which session ids exist.
+                    self.authorize_session_owner(&sid, Method::SessionRunOnce)
+                        .await?;
                     return Err(rpc_err(
                         INVALID_PARAMS,
                         "session/run-once requires a session_id that does not exist yet",
@@ -31301,6 +31306,44 @@ mod tests {
                 ConversationMessage::Chat(chat) if chat.content.contains("operator-approved")
             )),
             "nothing may reach the live agent"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_once_does_not_reveal_another_principals_session_id() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = session_cwd_config(&tmp, 4242, None);
+        let workspace = config.agent_workspace_dir("test-agent");
+        let (ctx, chat_backend, _acp_store) = persistence_enforcement_ctx(config);
+        let (provider, _handles) = scripted_turn_provider();
+        install_state_test_session_owned_at(
+            &ctx.sessions,
+            &chat_backend,
+            "s-bobs",
+            provider,
+            None,
+            Some("user:bob"),
+            &workspace,
+        )
+        .await;
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+
+        let response = rpc(
+            &mut alice,
+            &mut rx,
+            1,
+            "session/run-once",
+            json!({"agent_alias": "test-agent", "prompt": "hi", "session_id": "s-bobs"}),
+        )
+        .await;
+        assert_eq!(
+            response["error"]["code"],
+            json!(FORBIDDEN),
+            "another principal's id reads as not owned, not as already existing: {response}"
+        );
+        assert!(
+            ctx.sessions.get_agent("s-bobs").await.is_some(),
+            "run-once must not touch a session it did not create"
         );
     }
 }
