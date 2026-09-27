@@ -57,6 +57,19 @@ impl RpcApprovalChannel {
         }
     }
 
+    /// Whether the session's current turn is session-owned. Choice
+    /// elicitation is a request to one client, and there is no session-owned
+    /// responder for it yet: the client that created this channel may have
+    /// detached, and an attached viewer cannot answer a request sent
+    /// elsewhere. Until elicitation has a session-owned path it is declined
+    /// (no answer) for such a turn rather than sent to a client that may be
+    /// gone.
+    fn turn_is_session_owned(&self) -> bool {
+        self.subscriptions
+            .as_ref()
+            .is_some_and(|hub| hub.routed_source(&self.session_id).is_some())
+    }
+
     /// Route approval prompts through the session's ring while its turn is
     /// session-owned.
     #[must_use]
@@ -165,7 +178,7 @@ impl Channel for RpcApprovalChannel {
             // a bug, not an interactive prompt we can render.
             anyhow::bail!("RpcApprovalChannel.request_choice requires at least one choice")
         }
-        if !self.client_caps.form {
+        if !self.client_caps.form || self.turn_is_session_owned() {
             return Ok(None);
         }
         self.request_choice_via_elicitation(question, choices, timeout)
@@ -183,7 +196,7 @@ impl Channel for RpcApprovalChannel {
         if choices.is_empty() {
             anyhow::bail!("RpcApprovalChannel.request_multi_choice requires at least one choice")
         }
-        if !self.client_caps.form {
+        if !self.client_caps.form || self.turn_is_session_owned() {
             return Ok(None);
         }
         self.request_multi_choice_via_elicitation(question, choices, min_items, max_items, timeout)
@@ -813,6 +826,36 @@ mod tests {
         assert!(
             !pending.contains(&request_id),
             "the pending entry is dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn choice_elicitation_is_declined_for_a_session_owned_turn() {
+        let (rpc, mut write_rx) = make_rpc();
+        let hub = Arc::new(crate::rpc::subscription::SubscriptionHub::new());
+        let ch = make_channel_form_caps(rpc, make_pending()).with_subscriptions(Arc::clone(&hub));
+        let _route = hub.route_session("sess-1");
+        hub.add_viewer(
+            "sess-1",
+            "viewer",
+            1,
+            tokio_util::sync::CancellationToken::new(),
+        );
+
+        let choices = vec!["a".to_string(), "b".to_string()];
+        let single = ch
+            .request_choice("pick", &choices, Duration::from_secs(60))
+            .await
+            .unwrap();
+        let multi = ch
+            .request_multi_choice("pick", &choices, 1, 2, Duration::from_secs(60))
+            .await
+            .unwrap();
+        assert_eq!(single, None);
+        assert_eq!(multi, None);
+        assert!(
+            write_rx.try_recv().is_err(),
+            "no elicitation request goes to the creating connection"
         );
     }
 }
