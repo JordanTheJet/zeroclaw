@@ -4058,6 +4058,10 @@ impl Tool for ToolArcRef {
         self.inner.invocation_triggers()
     }
 
+    fn rebind_forwarded_env(&self, env: Option<std::collections::HashMap<String, String>>) {
+        self.inner.rebind_forwarded_env(env);
+    }
+
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         self.inner.execute(args).await
     }
