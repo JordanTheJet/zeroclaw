@@ -333,6 +333,10 @@ impl Normalizer {
         ));
         replacements.push((provider.addr.to_string(), "<provider>".into()));
         replacements.push((env!("CARGO_PKG_VERSION").to_string(), "<version>".into()));
+        Self::with_replacements(replacements)
+    }
+
+    fn with_replacements(replacements: Vec<(String, String)>) -> Self {
         Self {
             replacements,
             uuids: HashMap::new(),
@@ -376,7 +380,12 @@ impl Normalizer {
         let mut out = String::with_capacity(s.len());
         let mut i = 0;
         while i < bytes.len() {
-            if i + 36 <= bytes.len() && is_uuid(&s[i..i + 36]) {
+            // Match on bytes: slicing the `str` 36 bytes ahead could land
+            // inside a multibyte character. A match is all ASCII, so both of
+            // its ends are character boundaries.
+            if let Some(candidate) = bytes.get(i..i + 36)
+                && is_uuid(candidate)
+            {
                 let found = s[i..i + 36].to_ascii_lowercase();
                 let next = self.uuids.len() + 1;
                 let n = *self.uuids.entry(found).or_insert(next);
@@ -392,11 +401,11 @@ impl Normalizer {
     }
 }
 
-fn is_uuid(candidate: &str) -> bool {
+fn is_uuid(candidate: &[u8]) -> bool {
     candidate.len() == 36
-        && candidate.char_indices().all(|(i, c)| match i {
-            8 | 13 | 18 | 23 => c == '-',
-            _ => c.is_ascii_hexdigit(),
+        && candidate.iter().enumerate().all(|(i, b)| match i {
+            8 | 13 | 18 | 23 => *b == b'-',
+            _ => b.is_ascii_hexdigit(),
         })
 }
 
@@ -662,8 +671,14 @@ async fn read_response(
 }
 
 fn parse_http_response(raw: &[u8]) -> HttpResponse {
-    let text = String::from_utf8_lossy(raw);
-    let (head, rest) = text.split_once("\r\n\r\n").unwrap_or((&text, ""));
+    // Split and de-chunk on raw bytes, and decode only the reassembled body:
+    // chunk sizes count bytes, and a multibyte character may straddle two
+    // chunks, so decoding before de-chunking would misalign or corrupt it.
+    let (head, rest) = match raw.windows(4).position(|w| w == b"\r\n\r\n") {
+        Some(end) => (&raw[..end], &raw[end + 4..]),
+        None => (raw, &raw[raw.len()..]),
+    };
+    let head = String::from_utf8_lossy(head);
     let mut lines = head.lines();
     let status = lines
         .next()
@@ -687,28 +702,32 @@ fn parse_http_response(raw: &[u8]) -> HttpResponse {
     let body = if chunked {
         dechunk(rest)
     } else {
-        rest.to_string()
+        rest.to_vec()
     };
     HttpResponse {
         status,
         content_type,
-        body,
+        body: String::from_utf8_lossy(&body).into_owned(),
     }
 }
 
-/// Decodes the complete chunks of a chunked body, ignoring a partial tail.
-fn dechunk(mut rest: &str) -> String {
-    let mut out = String::new();
-    while let Some((size_line, after)) = rest.split_once("\r\n") {
+/// Reassembles the complete chunks of a chunked body, ignoring a partial tail.
+fn dechunk(mut rest: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    while let Some(line_end) = rest.windows(2).position(|w| w == b"\r\n") {
+        let size_line = std::str::from_utf8(&rest[..line_end]).unwrap_or("");
         let Ok(size) = usize::from_str_radix(size_line.split(';').next().unwrap_or("").trim(), 16)
         else {
             break;
         };
+        let after = &rest[line_end + 2..];
         if size == 0 || after.len() < size {
             break;
         }
-        out.push_str(&after[..size]);
-        rest = after[size..].strip_prefix("\r\n").unwrap_or(&after[size..]);
+        out.extend_from_slice(&after[..size]);
+        rest = after[size..]
+            .strip_prefix(b"\r\n")
+            .unwrap_or(&after[size..]);
     }
     out
 }
@@ -1057,4 +1076,103 @@ fn headers_json(headers: &[(&str, &str)]) -> Value {
             .map(|(k, v)| ((*k).to_string(), Value::String((*v).to_string())))
             .collect::<serde_json::Map<_, _>>(),
     )
+}
+
+// ── Harness self-tests (not ignored: no gateway, no network) ────────────
+
+const SAMPLE_UUID: &str = "123e4567-e89b-12d3-a456-426614174000";
+
+#[test]
+fn normalizer_survives_multibyte_text_at_the_uuid_width() {
+    let mut normalizer = Normalizer::with_replacements(Vec::new());
+    // Every prefix length puts a multibyte character on each side of the
+    // 36-byte window at some point, including 35 ASCII bytes then `é`.
+    for prefix in 0..40 {
+        for tail in ["é", "日本", "🦀", "aé", "é\u{301}"] {
+            let text = format!("{}{tail}{}", "a".repeat(prefix), "b".repeat(prefix % 3));
+            assert_eq!(normalizer.string(&text), text, "unchanged: {text:?}");
+        }
+    }
+}
+
+#[test]
+fn normalizer_numbers_uuids_by_first_appearance_beside_multibyte_text() {
+    let mut normalizer = Normalizer::with_replacements(Vec::new());
+    let other = "00000000-0000-0000-0000-000000000000";
+    let upper = SAMPLE_UUID.to_ascii_uppercase();
+    let text = format!("é{SAMPLE_UUID}日 {other} 🦀{upper}");
+    assert_eq!(normalizer.string(&text), "é<uuid:1>日 <uuid:2> 🦀<uuid:1>");
+    // Numbering persists across strings in one transcript.
+    assert_eq!(normalizer.string(other), "<uuid:2>");
+    // A 36-byte run that is not a UUID is left alone.
+    let near_miss = "123e4567-e89b-12d3-a456_426614174000";
+    assert_eq!(normalizer.string(near_miss), near_miss);
+}
+
+#[test]
+fn normalizer_masks_timing_and_clock_fields_only() {
+    let mut normalizer = Normalizer::with_replacements(vec![("/tmp/x".into(), "<root>".into())]);
+    let input = json!({
+        "duration_ms": 12,
+        "timestamp": 1_700_000_000,
+        "input_tokens": 10,
+        "at": "2026-09-26T12:00:00Z",
+        "path": "/tmp/x/workspace",
+    });
+    assert_eq!(
+        normalizer.value(None, &input),
+        json!({
+            "duration_ms": "<duration>",
+            "timestamp": "<timestamp>",
+            "input_tokens": 10,
+            "at": "<timestamp>",
+            "path": "<root>/workspace",
+        })
+    );
+}
+
+#[test]
+fn coalescing_joins_only_adjacent_received_ws_chunks() {
+    let chunk = |content: &str| json!({"dir": "recv", "channel": "ws", "payload": {"type": "chunk", "content": content}});
+    let done = json!({"dir": "recv", "channel": "ws", "payload": {"type": "done"}});
+    let frames = vec![
+        chunk("Hel"),
+        chunk("lo, "),
+        chunk("é"),
+        done.clone(),
+        chunk("again"),
+    ];
+    assert_eq!(
+        coalesce_chunks(frames),
+        vec![chunk("Hello, é"), done, chunk("again")]
+    );
+}
+
+#[test]
+fn chunked_body_reassembles_multibyte_text_split_across_chunks() {
+    let text = "héllo 日本";
+    let bytes = text.as_bytes();
+    // Split inside `é` (2 bytes) and inside `日` (3 bytes).
+    let (a, rest) = bytes.split_at(2);
+    let (b, c) = rest.split_at(6);
+    let mut raw =
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\n\r\n"
+            .to_vec();
+    for part in [a, b, c] {
+        raw.extend_from_slice(format!("{:x}\r\n", part.len()).as_bytes());
+        raw.extend_from_slice(part);
+        raw.extend_from_slice(b"\r\n");
+    }
+    let complete = raw.len();
+    raw.extend_from_slice(b"0\r\n\r\n");
+
+    let parsed = parse_http_response(&raw);
+    assert_eq!(parsed.status, 200);
+    assert_eq!(parsed.content_type.as_deref(), Some("text/plain"));
+    assert_eq!(parsed.body, text);
+
+    // A partial final chunk is ignored rather than decoded half-way.
+    let mut partial = raw[..complete].to_vec();
+    partial.extend_from_slice(b"5\r\nab");
+    assert_eq!(parse_http_response(&partial).body, text);
 }
