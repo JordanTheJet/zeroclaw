@@ -862,14 +862,11 @@ async fn channels_bind_refuses_alike_on_both_surfaces() {
         )
         .await;
         assert_ne!(status, 200, "{channel_type}.{alias}: {http}");
+        let guard = std::sync::Arc::clone(&state.config_write_lock)
+            .lock_owned()
+            .await;
         let err = control
-            .bind(
-                &state.config,
-                &state.config_write_lock,
-                channel_type,
-                alias,
-                "@alice",
-            )
+            .bind(&state.config, &guard, channel_type, alias, "@alice")
             .await
             .unwrap_err();
         assert!(

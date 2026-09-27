@@ -382,22 +382,21 @@ impl BindFailure {
 /// Authorize an operator-named `identity` on one channel alias, the
 /// equivalent of `zeroclaw channel bind-<type> <identity> --alias <alias>`.
 ///
-/// Writes only `peer_groups.<group>.external_peers`, under the config write
-/// lock, onto the current on-disk document, then swaps `config`. The body
+/// Writes only `peer_groups.<group>.external_peers` onto the current on-disk
+/// document, then swaps `config`. The caller must hold the config write lock
+/// and pass its guard: it is held from the caller's authorization recheck
+/// through the swap, so authority withdrawn while the bind waited for the
+/// lock is seen before anything is written. The body
 /// reports `saved: false, already_bound: true` when the identity already
 /// holds the grant. Channels running on another config copy pick the peer up
 /// on the next reload.
 pub async fn bind(
     config: &Arc<RwLock<Config>>,
-    config_write_lock: &Arc<tokio::sync::Mutex<()>>,
+    _config_write_guard: &tokio::sync::OwnedMutexGuard<()>,
     channel_type: &str,
     alias: &str,
     identity: &str,
 ) -> Result<Value, BindFailure> {
-    // Serialize the whole read-mutate-swap section: acquired before the
-    // read-for-modify below and held through the swap, so a concurrent
-    // config writer can't land between the read and the save/swap.
-    let _cfg_guard = Arc::clone(config_write_lock).lock_owned().await;
     let channel_type = channel_type.trim();
     let alias = alias.trim();
 
@@ -525,13 +524,13 @@ impl zeroclaw_runtime::rpc::channels::ChannelControl for ChannelsControl {
     async fn bind(
         &self,
         config: &Arc<RwLock<Config>>,
-        config_write_lock: &Arc<tokio::sync::Mutex<()>>,
+        config_write_guard: &tokio::sync::OwnedMutexGuard<()>,
         channel_type: &str,
         alias: &str,
         identity: &str,
     ) -> Result<Value, zeroclaw_api::jsonrpc::JsonRpcError> {
         use zeroclaw_api::jsonrpc::error_codes;
-        bind(config, config_write_lock, channel_type, alias, identity)
+        bind(config, config_write_guard, channel_type, alias, identity)
             .await
             .map_err(|failure| zeroclaw_api::jsonrpc::JsonRpcError {
                 code: match failure.kind {

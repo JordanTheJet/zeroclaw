@@ -27,11 +27,12 @@ pub trait ChannelControl: Send + Sync {
     fn relink(&self, config: &Config, channel: &str) -> Result<Value, JsonRpcError>;
 
     /// Authorize `identity` on one channel alias's peer allowlist, saving
-    /// and swapping `config` under `config_write_lock`.
+    /// and swapping `config`. The caller holds the config write lock and has
+    /// rechecked its authority under it; `config_write_guard` is that guard.
     async fn bind(
         &self,
         config: &Arc<RwLock<Config>>,
-        config_write_lock: &Arc<tokio::sync::Mutex<()>>,
+        config_write_guard: &tokio::sync::OwnedMutexGuard<()>,
         channel_type: &str,
         alias: &str,
         identity: &str,

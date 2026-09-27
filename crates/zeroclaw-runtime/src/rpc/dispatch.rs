@@ -1999,14 +1999,25 @@ impl RpcDispatcher {
             }
             Method::ChannelsBind => {
                 let req: zeroclaw_api::jsonrpc::ChannelsBindRequest = parse_params(params)?;
-                self.authorize_channel_owner(method, |info| {
+                let is_channel = |info: &zeroclaw_config::schema::ChannelAliasInfo| {
                     info.channel_type == req.channel_type.trim() && info.alias == req.alias.trim()
-                })?;
+                };
+                // Refuse early on the stamped grants, before waiting.
+                self.authorize_channel_owner(method, is_channel)?;
                 self.selector_config_write(method, "peer_groups")?;
+                // The bind waits for the config write lock, and a policy change
+                // committed while it waited must be seen: re-resolve authority
+                // under the lock, against the policy and config in force now,
+                // and hold the lock through the write.
+                let guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
+                self.recheck_config_write_authority(method, Some("peer_groups"), &guard)?;
+                if let Some(grants) = self.recheck_authority_after_admission(method)? {
+                    self.check_channel_owner(method, &grants, is_channel)?;
+                }
                 control
                     .bind(
                         &self.ctx.config,
-                        &self.ctx.config_write_lock,
+                        &guard,
                         &req.channel_type,
                         &req.alias,
                         &req.identity,
@@ -2149,6 +2160,22 @@ impl RpcDispatcher {
         method: Method,
         matches: impl Fn(&zeroclaw_config::schema::ChannelAliasInfo) -> bool,
     ) -> Result<(), JsonRpcError> {
+        let Some(grants) = self.stamped_grants() else {
+            return Err(rpc_err(AUTH_REQUIRED, "First call must be 'initialize'"));
+        };
+        let grants = grants.clone();
+        self.check_channel_owner(method, &grants, matches)
+    }
+
+    /// [`Self::authorize_channel_owner`] against an explicit grant set and
+    /// the config in force now, for a handler that re-resolved its principal
+    /// after waiting.
+    fn check_channel_owner(
+        &self,
+        method: Method,
+        grants: &zeroclaw_api::grants::ResolvedGrants,
+        matches: impl Fn(&zeroclaw_config::schema::ChannelAliasInfo) -> bool,
+    ) -> Result<(), JsonRpcError> {
         let owner = self
             .ctx
             .config
@@ -2157,10 +2184,28 @@ impl RpcDispatcher {
             .into_iter()
             .find(|info| matches(info))
             .and_then(|info| info.owning_agent);
-        match owner {
-            Some(agent) => self.authorize_agent_selector(method, &agent),
-            None => self.authorize_every_agent(method, "an unowned channel"),
+        let entitled = match owner.as_deref() {
+            Some(agent) => grants.may_use_agent(agent),
+            None => grants.may_use_agent(zeroclaw_api::grants::WILDCARD),
+        };
+        if entitled {
+            return Ok(());
         }
+        let denied = rpc_err(
+            FORBIDDEN,
+            format!(
+                "{} is not permitted for this channel's owning agent",
+                method.wire_name()
+            ),
+        );
+        self.audit_auth_denial(
+            method,
+            &crate::rpc::auth::AuthDenied {
+                code: denied.code,
+                message: denied.message.clone(),
+            },
+        );
+        Err(denied)
     }
 
     /// Refuse `method` unless the bound principal is an administrator. An

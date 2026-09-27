@@ -67,21 +67,21 @@ pub fn list_directory(config: &Config, raw: &str) -> Result<BrowseResult, Browse
 }
 
 fn list_under_root(root: &std::path::Path, raw: &str) -> Result<BrowseResult, BrowseError> {
-    let resolved: PathBuf = resolve_under(root, raw)?;
-
-    let metadata = match std::fs::metadata(&resolved) {
-        Ok(m) => m,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            return Err(BrowseError::NotFound(raw.to_string()));
-        }
-        Err(err) => return Err(err.into()),
-    };
+    let (_, relative) = resolve_relative(root, raw)?;
+    let dir = open_root(root, raw)?;
+    let target = here(&relative);
+    let metadata = dir.metadata(target).map_err(confined(raw, root))?;
     if !metadata.is_dir() {
         return Err(BrowseError::NotADirectory(raw.to_string()));
     }
+    let listed = if relative.is_empty() {
+        dir
+    } else {
+        dir.open_dir(target).map_err(confined(raw, root))?
+    };
 
     let mut entries: Vec<BrowseEntry> = Vec::new();
-    for child in std::fs::read_dir(&resolved)?.flatten() {
+    for child in listed.entries().map_err(confined(raw, root))?.flatten() {
         let Ok(file_type) = child.file_type() else {
             continue;
         };
@@ -118,14 +118,23 @@ const PROTECTED_SHARED_TOP_LEVEL: &[&str] = &["skills", "skill-bundles", "knowle
 /// Rejects path traversal and refuses to create over an existing file.
 pub fn make_directory(config: &Config, raw: &str) -> Result<(), BrowseError> {
     let shared = config.shared_workspace_dir();
-    let resolved: PathBuf = resolve_under(&shared, raw)?;
-    if let Ok(meta) = std::fs::metadata(&resolved) {
-        if meta.is_dir() {
-            return Ok(());
-        }
-        return Err(BrowseError::NotADirectory(raw.to_string()));
+    make_directory_under(&shared, raw)
+}
+
+/// Create `raw` beneath `root`, creating the configured root itself first
+/// when it is missing. Idempotent for an existing directory.
+fn make_directory_under(root: &std::path::Path, raw: &str) -> Result<(), BrowseError> {
+    let (_, relative) = resolve_relative(root, raw)?;
+    std::fs::create_dir_all(root)?;
+    let dir = open_root(root, raw)?;
+    let target = here(&relative);
+    match dir.metadata(target) {
+        Ok(meta) if meta.is_dir() => return Ok(()),
+        Ok(_) => return Err(BrowseError::NotADirectory(raw.to_string())),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(confined(raw, root)(err)),
     }
-    std::fs::create_dir_all(&resolved)?;
+    dir.create_dir_all(target).map_err(confined(raw, root))?;
     Ok(())
 }
 
@@ -134,24 +143,22 @@ pub fn make_directory(config: &Config, raw: &str) -> Result<(), BrowseError> {
 /// knowledge/) or the shared root itself. Rejects path traversal.
 pub fn remove_directory(config: &Config, raw: &str) -> Result<(), BrowseError> {
     let shared = config.shared_workspace_dir();
-    let (resolved, relative) = resolve_relative(&shared, raw)?;
+    let (_, relative) = resolve_relative(&shared, raw)?;
     if relative.is_empty() {
         return Err(BrowseError::Protected("shared".to_string()));
     }
     if PROTECTED_SHARED_TOP_LEVEL.contains(&relative.as_str()) {
         return Err(BrowseError::Protected(format!("shared/{relative}")));
     }
-    let metadata = match std::fs::metadata(&resolved) {
-        Ok(m) => m,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            return Err(BrowseError::NotFound(raw.to_string()));
-        }
-        Err(err) => return Err(err.into()),
-    };
+    let dir = open_root(&shared, raw)?;
+    let metadata = dir
+        .symlink_metadata(&relative)
+        .map_err(confined(raw, &shared))?;
     if !metadata.is_dir() {
         return Err(BrowseError::NotADirectory(raw.to_string()));
     }
-    std::fs::remove_dir_all(&resolved)?;
+    dir.remove_dir_all(&relative)
+        .map_err(confined(raw, &shared))?;
     Ok(())
 }
 
@@ -173,6 +180,38 @@ const AGENT_WORKSPACE_PROTECTED_FILES: &[&str] = &[
 /// session write by `zeroclaw_infra::session_sqlite`. Deleting it wipes
 /// session history.
 const AGENT_WORKSPACE_PROTECTED_DIRS: &[&str] = &["sessions"];
+
+/// Open `root` as a directory handle. Every path handed to it is resolved
+/// beneath it: `..`, an absolute path, or a symlink, intermediate or final,
+/// that would lead outside is refused by the handle, so a link planted in a
+/// workspace cannot reach another agent's files or anything else on the host.
+/// The lexical checks in [`resolve_relative`] decide which entries are
+/// protected; this decides what the filesystem calls can reach.
+fn open_root(root: &std::path::Path, raw: &str) -> Result<cap_std::fs::Dir, BrowseError> {
+    cap_std::fs::Dir::open_ambient_dir(root, cap_std::ambient_authority())
+        .map_err(confined(raw, root))
+}
+
+/// The path to hand a root handle for `relative`: the root itself when empty.
+fn here(relative: &str) -> &str {
+    if relative.is_empty() { "." } else { relative }
+}
+
+/// Map an error from a confined filesystem call. A path that led outside
+/// the root surfaces as `PermissionDenied`, and is reported as an escape.
+fn confined<'a>(
+    raw: &'a str,
+    root: &'a std::path::Path,
+) -> impl Fn(std::io::Error) -> BrowseError + 'a {
+    move |err| match err.kind() {
+        std::io::ErrorKind::NotFound => BrowseError::NotFound(raw.to_string()),
+        std::io::ErrorKind::PermissionDenied => BrowseError::Escape(RootEscapeError {
+            input: raw.to_string(),
+            root: root.display().to_string(),
+        }),
+        _ => BrowseError::Io(err),
+    }
+}
 
 /// Resolve `raw` under `root` and return the resolved path together with its
 /// normalized path relative to `root`: `/`-separated, and empty for the root
@@ -247,21 +286,14 @@ pub fn make_agent_workspace_directory(
     raw: &str,
 ) -> Result<(), BrowseError> {
     let root = agent_root(config, agent_alias)?;
-    let (resolved, relative) = resolve_relative(&root, raw)?;
+    let (_, relative) = resolve_relative(&root, raw)?;
     if relative.is_empty() {
         return Err(BrowseError::NotFound(raw.to_string()));
     }
     if protected_file(&relative) {
         return Err(BrowseError::ProtectedFile(relative));
     }
-    if let Ok(meta) = std::fs::metadata(&resolved) {
-        if meta.is_dir() {
-            return Ok(());
-        }
-        return Err(BrowseError::NotADirectory(raw.to_string()));
-    }
-    std::fs::create_dir_all(&resolved)?;
-    Ok(())
+    make_directory_under(&root, raw)
 }
 
 /// Result of reading a file from the agent workspace.
@@ -334,15 +366,12 @@ pub fn read_agent_workspace_file(
     agent_alias: &str,
     raw: &str,
 ) -> Result<FileReadResult, BrowseError> {
+    use std::io::Read;
     let root = agent_root(config, agent_alias)?;
-    let resolved: PathBuf = resolve_under(&root, raw)?;
-    let metadata = match std::fs::metadata(&resolved) {
-        Ok(m) => m,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            return Err(BrowseError::NotFound(raw.to_string()));
-        }
-        Err(err) => return Err(err.into()),
-    };
+    let (_, relative) = resolve_relative(&root, raw)?;
+    let dir = open_root(&root, raw)?;
+    let target = here(&relative);
+    let metadata = dir.metadata(target).map_err(confined(raw, &root))?;
     if !metadata.is_file() {
         return Err(BrowseError::NotADirectory(raw.to_string()));
     }
@@ -352,11 +381,22 @@ pub fn read_agent_workspace_file(
             AGENT_WORKSPACE_READ_CAP,
         ));
     }
-    let bytes = std::fs::read(&resolved)?;
+    // Read through the opened handle, bounded, so a file swapped or grown
+    // after the size check cannot be read past the cap.
+    let file = dir.open(target).map_err(confined(raw, &root))?;
+    let mut bytes = Vec::new();
+    file.take(AGENT_WORKSPACE_READ_CAP + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > AGENT_WORKSPACE_READ_CAP {
+        return Err(BrowseError::TooLarge(
+            raw.to_string(),
+            AGENT_WORKSPACE_READ_CAP,
+        ));
+    }
     let is_text = std::str::from_utf8(&bytes).is_ok();
     Ok(FileReadResult {
         path: raw.trim_matches('/').to_string(),
-        size: metadata.len(),
+        size: bytes.len() as u64,
         bytes,
         is_text,
     })
@@ -371,7 +411,7 @@ pub fn delete_agent_workspace_path(
     raw: &str,
 ) -> Result<(), BrowseError> {
     let root = agent_root(config, agent_alias)?;
-    let (resolved, relative) = resolve_relative(&root, raw)?;
+    let (_, relative) = resolve_relative(&root, raw)?;
     if relative.is_empty() {
         return Err(BrowseError::Protected(format!(
             "agents/{agent_alias}/workspace"
@@ -385,17 +425,17 @@ pub fn delete_agent_workspace_path(
             "agents/{agent_alias}/workspace/{relative}"
         )));
     }
-    let metadata = match std::fs::metadata(&resolved) {
-        Ok(m) => m,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            return Err(BrowseError::NotFound(raw.to_string()));
-        }
-        Err(err) => return Err(err.into()),
-    };
+    let dir = open_root(&root, raw)?;
+    // The final component is examined without following it, so a link is
+    // removed as a link and never deletes what it points at.
+    let metadata = dir
+        .symlink_metadata(&relative)
+        .map_err(confined(raw, &root))?;
     if metadata.is_dir() {
-        std::fs::remove_dir_all(&resolved)?;
+        dir.remove_dir_all(&relative)
+            .map_err(confined(raw, &root))?;
     } else {
-        std::fs::remove_file(&resolved)?;
+        dir.remove_file(&relative).map_err(confined(raw, &root))?;
     }
     Ok(())
 }
@@ -410,9 +450,9 @@ pub fn move_agent_workspace_path(
     to: &str,
 ) -> Result<(), BrowseError> {
     let root = agent_root(config, agent_alias)?;
-    let (src, from_trimmed) = resolve_relative(&root, from)?;
-    let (dst, to_trimmed) = resolve_relative(&root, to)?;
-    let (from_trimmed, to_trimmed) = (from_trimmed.as_str(), to_trimmed.as_str());
+    let (_, from_relative) = resolve_relative(&root, from)?;
+    let (_, to_relative) = resolve_relative(&root, to)?;
+    let (from_trimmed, to_trimmed) = (from_relative.as_str(), to_relative.as_str());
     if from_trimmed.is_empty() || to_trimmed.is_empty() {
         return Err(BrowseError::NotFound(from.to_string()));
     }
@@ -436,18 +476,26 @@ pub fn move_agent_workspace_path(
             }
         )));
     }
-    if !src.exists() {
-        return Err(BrowseError::NotFound(from.to_string()));
+    let dir = open_root(&root, from)?;
+    match dir.symlink_metadata(from_trimmed) {
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Err(BrowseError::NotFound(from.to_string()));
+        }
+        Err(err) => return Err(confined(from, &root)(err)),
     }
-    if dst.exists() {
+    if dir.symlink_metadata(to_trimmed).is_ok() {
         return Err(BrowseError::NotADirectory(format!(
             "target '{to_trimmed}' already exists"
         )));
     }
-    if let Some(parent) = dst.parent() {
-        std::fs::create_dir_all(parent)?;
+    if let Some(parent) = std::path::Path::new(to_trimmed).parent()
+        && !parent.as_os_str().is_empty()
+    {
+        dir.create_dir_all(parent).map_err(confined(to, &root))?;
     }
-    std::fs::rename(&src, &dst)?;
+    dir.rename(from_trimmed, &dir, to_trimmed)
+        .map_err(confined(from, &root))?;
     Ok(())
 }
 
@@ -605,6 +653,71 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("shared/scratch/inner")).unwrap();
         remove_directory(&cfg, "scratch/inner/..").unwrap();
         assert!(!dir.path().join("shared/scratch").exists());
+    }
+
+    /// A link inside one agent's workspace that points into another's must
+    /// not carry any operation across: the root handle refuses to resolve a
+    /// path through it. A link that stays inside the root still works, and
+    /// deleting a link removes the link, not its target.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_out_of_the_workspace_is_not_followed() {
+        let (dir, cfg) = fixture();
+        let alpha = dir.path().join("agents/alpha/workspace");
+        let beta = dir.path().join("agents/beta/workspace");
+        std::fs::create_dir_all(alpha.join("notes")).unwrap();
+        std::fs::create_dir_all(&beta).unwrap();
+        std::fs::write(beta.join("private.txt"), b"beta only").unwrap();
+        std::fs::write(alpha.join("notes/own.txt"), b"alpha").unwrap();
+        std::os::unix::fs::symlink(&beta, alpha.join("export")).unwrap();
+        // A relative link that stays inside the root, and an absolute one
+        // that happens to point inside it too.
+        std::os::unix::fs::symlink("notes", alpha.join("inner")).unwrap();
+        std::os::unix::fs::symlink(alpha.join("notes"), alpha.join("absolute")).unwrap();
+
+        let escaped = |r: &Result<_, BrowseError>| matches!(r, Err(BrowseError::Escape(_)));
+        assert!(escaped(
+            &read_agent_workspace_file(&cfg, "alpha", "export/private.txt").map(|_| ())
+        ));
+        assert!(escaped(
+            &list_agent_workspace(&cfg, "alpha", "export").map(|_| ())
+        ));
+        assert!(escaped(&delete_agent_workspace_path(
+            &cfg,
+            "alpha",
+            "export/private.txt"
+        )));
+        assert!(escaped(&move_agent_workspace_path(
+            &cfg,
+            "alpha",
+            "export/private.txt",
+            "stolen.txt"
+        )));
+        assert!(escaped(&make_agent_workspace_directory(
+            &cfg,
+            "alpha",
+            "export/planted"
+        )));
+        assert!(
+            beta.join("private.txt").exists(),
+            "beta's file is untouched"
+        );
+        assert!(!beta.join("planted").exists());
+        assert!(!alpha.join("stolen.txt").exists());
+
+        // A relative link that stays inside the root resolves normally. An
+        // absolute target cannot be resolved beneath the root handle, so it
+        // is refused even when it points inside: fail closed.
+        let own = read_agent_workspace_file(&cfg, "alpha", "inner/own.txt").unwrap();
+        assert_eq!(own.bytes, b"alpha");
+        assert!(escaped(
+            &read_agent_workspace_file(&cfg, "alpha", "absolute/own.txt").map(|_| ())
+        ));
+
+        // Deleting the link removes the link only.
+        delete_agent_workspace_path(&cfg, "alpha", "export").unwrap();
+        assert!(!alpha.join("export").exists());
+        assert!(beta.join("private.txt").exists());
     }
 
     #[test]

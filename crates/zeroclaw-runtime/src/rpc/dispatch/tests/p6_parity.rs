@@ -873,7 +873,7 @@ impl crate::rpc::channels::ChannelControl for RecordingChannels {
     async fn bind(
         &self,
         _config: &Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>,
-        _config_write_lock: &Arc<tokio::sync::Mutex<()>>,
+        _config_write_guard: &tokio::sync::OwnedMutexGuard<()>,
         channel_type: &str,
         alias: &str,
         identity: &str,
@@ -1349,5 +1349,104 @@ async fn canvas_needs_access_to_every_agent() {
             .as_str()
             .is_some_and(|m| m.contains("every agent")),
         "refused by the shared-store check, not the grant gate: {listed}"
+    );
+}
+
+// ── Adversarial review ────────────────────────────────────────────────────
+
+/// A link in agent alpha's workspace into agent beta's does not let a
+/// principal scoped to alpha read or delete beta's files.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_scoped_principal_cannot_follow_a_link_into_another_agents_workspace() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let ctx = enforcement_ctx(files_config(&tmp));
+    let alpha = tmp.path().join("agents/alpha/workspace");
+    let beta = tmp.path().join("agents/beta/workspace");
+    std::os::unix::fs::symlink(&beta, alpha.join("export")).unwrap();
+    let (mut peer, mut rx) = roster_peer(&ctx, SCOPED).await;
+    for (id, method) in [(1, "fs/read"), (2, "fs/delete")] {
+        let response = rpc(
+            &mut peer,
+            &mut rx,
+            id,
+            method,
+            json!({"agent": "alpha", "path": "export/secret.md"}),
+        )
+        .await;
+        assert_eq!(
+            response["error"]["code"],
+            json!(zeroclaw_api::jsonrpc::error_codes::FS_INVALID_PATH),
+            "{method}: {response}"
+        );
+    }
+    assert!(beta.join("secret.md").exists(), "beta's file survives");
+}
+
+/// A bind queued behind another config writer re-resolves its authority
+/// once it holds the lock: a grant withdrawn while it waited stops it before
+/// anything is written.
+#[tokio::test]
+async fn a_bind_queued_behind_a_config_writer_is_refused_once_its_grant_is_withdrawn() {
+    use std::collections::HashMap;
+    use zeroclaw_api::grants::{Resource, Verb};
+    use zeroclaw_config::schema::{PermissionProfileConfig, UserConfig};
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let mut config = make_acp_test_config(&tmp);
+    config.permission_profiles.insert(
+        "binder".into(),
+        PermissionProfileConfig {
+            allowed_agents: vec![zeroclaw_api::grants::WILDCARD.into()],
+            config_write_paths: vec!["peer_groups.*".into()],
+            grants: HashMap::from([(Resource::Channels, vec![Verb::Read, Verb::Update])]),
+            ..PermissionProfileConfig::default()
+        },
+    );
+    config.users.insert(
+        "scoped".into(),
+        UserConfig {
+            uid: Some(SCOPED),
+            permission_profiles: vec!["binder".into()],
+            ..UserConfig::default()
+        },
+    );
+    let (ctx, channels) = with_channels(config);
+    let (mut peer, mut rx) = roster_peer(&ctx, SCOPED).await;
+
+    // Another writer holds the config write lock.
+    let held = Arc::clone(&ctx.config_write_lock).lock_owned().await;
+    let bind = rpc(
+        &mut peer,
+        &mut rx,
+        1,
+        "channels/bind",
+        json!({"channel_type": "telegram", "alias": "main", "identity": "123456789"}),
+    );
+    let withdraw = async {
+        // Let the bind pass its entry checks and park on the lock.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let mut narrowed = ctx.config.read().clone();
+        narrowed
+            .permission_profiles
+            .get_mut("binder")
+            .expect("the fixture profile exists")
+            .config_write_paths
+            .clear();
+        *ctx.config.write() = narrowed.clone();
+        let revision = ctx.auth.accepted_revision().saturating_add(1);
+        ctx.auth
+            .publish_accepted(&narrowed, revision)
+            .expect("the narrowed policy publishes");
+        drop(held);
+    };
+    let (response, ()) = tokio::join!(bind, withdraw);
+    assert_forbidden(
+        &response,
+        "a bind whose grant was withdrawn while it waited",
+    );
+    assert!(
+        channels.calls.lock().is_empty(),
+        "nothing reached the bind after authority was withdrawn"
     );
 }
