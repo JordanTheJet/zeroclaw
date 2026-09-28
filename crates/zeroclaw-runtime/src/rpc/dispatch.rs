@@ -10487,13 +10487,16 @@ async fn deliver_subscription(delivery: SubscriptionDelivery) {
 /// Enqueue one subscription line only if the connection may still see it at
 /// the moment it is enqueued.
 ///
-/// Writer room is reserved first, and that wait ends early on cancellation.
-/// Only then is the disclosure held to the authority in force: the credential
-/// and, after a policy change, the re-resolved grants; for a session viewer,
-/// also the session's current owner and incarnation. Checking before a wait
-/// for room would let a line queued behind a full writer go out after the
-/// viewer lost access, so the check sits between the reservation and the
-/// commit. Returns `false` when the stream must end.
+/// The order is the point. Every wait comes first: writer room is reserved
+/// (cancellably), then, for a session viewer, the session's current
+/// incarnation and owner are read from the session store. Only then is the
+/// disclosure decided, synchronously and with no await before the commit: the
+/// credential and, after a policy change, freshly re-resolved grants, then
+/// ownership from those fresh grants and the facts just read. A decision made
+/// before any of those waits would be judged on authority that could change
+/// while it waited (a viewer demoted while the writer was full, or while the
+/// session store was being read) and still commit. Returns `false` when the
+/// stream must end.
 #[allow(clippy::too_many_arguments)]
 async fn disclose(
     json: String,
@@ -10516,19 +10519,41 @@ async fn disclose(
         },
     };
     hub.wait_test_delivery_pause(true).await;
-    if !still_authorized(
-        inbound,
-        binding,
-        method,
-        checked_generation,
-        grants,
-        viewer.is_none(),
-    ) || !viewer_may_see(viewer, binding, grants.as_ref()).await
-    {
-        return false;
+    let facts = match viewer {
+        Some(viewer) => Some(ViewerFacts::read(viewer).await),
+        None => None,
+    };
+    hub.wait_test_delivery_facts_pause().await;
+
+    // From here to the commit nothing awaits. A publication racing the
+    // resolution on another thread is caught by re-resolving until the
+    // generation read after the decision is the one it was made under.
+    for _ in 0..3 {
+        if !still_authorized(
+            inbound,
+            binding,
+            method,
+            checked_generation,
+            grants,
+            viewer.is_none(),
+        ) {
+            return false;
+        }
+        if binding.is_some() && *checked_generation != Some(inbound.generation()) {
+            continue;
+        }
+        let permitted = match (viewer, facts.as_ref()) {
+            (Some(viewer), Some(facts)) => viewer_permits(viewer, facts, binding, grants.as_ref()),
+            _ => true,
+        };
+        if !permitted {
+            return false;
+        }
+        permit.send(json);
+        return true;
     }
-    permit.send(json);
-    true
+    // The policy kept moving under the decision: fail closed.
+    false
 }
 
 /// A viewer of one session's ring. Attach authorized it against the session
@@ -10540,21 +10565,42 @@ struct SessionViewer {
     live_generation: Option<u64>,
 }
 
-/// Whether a session viewer may still see the session's frames: the live
-/// incarnation it attached to has not been replaced, and a scoped principal
-/// (authenticated, not admin under the grants resolved most recently) still
-/// owns the session. The same scope rule as `RpcDispatcher::scoped_principal_id`.
-/// Not a viewer, or an unbound dispatcher, passes.
-async fn viewer_may_see(
-    viewer: Option<&SessionViewer>,
+/// What the session store says about a viewed session right now: its live
+/// incarnation and its live owner (`None` when it is not live). Read before
+/// the disclosure is decided, never after.
+struct ViewerFacts {
+    live_generation: Option<u64>,
+    owner: Option<Option<String>>,
+}
+
+impl ViewerFacts {
+    async fn read(viewer: &SessionViewer) -> Self {
+        Self {
+            live_generation: viewer.sessions.get_generation(&viewer.session_id).await,
+            owner: viewer
+                .sessions
+                .session_owner_principal(&viewer.session_id)
+                .await,
+        }
+    }
+}
+
+/// Whether a session viewer may see the session's next frame, decided
+/// synchronously from facts already read: the live incarnation it attached to
+/// has not been replaced, and a scoped principal (authenticated, and not admin
+/// under the grants resolved for this decision) owns the session. The same
+/// scope rule as `RpcDispatcher::scoped_principal_id`. An unbound dispatcher
+/// passes.
+fn viewer_permits(
+    viewer: &SessionViewer,
+    facts: &ViewerFacts,
     binding: Option<&crate::rpc::auth::ConnectionAuth>,
     grants: Option<&zeroclaw_api::grants::ResolvedGrants>,
 ) -> bool {
-    let (Some(viewer), Some(auth)) = (viewer, binding) else {
+    let Some(auth) = binding else {
         return true;
     };
-    if let Some(expected) = viewer.live_generation
-        && let Some(current) = viewer.sessions.get_generation(&viewer.session_id).await
+    if let (Some(expected), Some(current)) = (viewer.live_generation, facts.live_generation)
         && current != expected
     {
         return false;
@@ -10564,7 +10610,7 @@ async fn viewer_may_see(
         return true;
     }
     matches!(
-        viewer.sessions.session_owner_principal(&viewer.session_id).await,
+        facts.owner.as_ref(),
         Some(Some(owner)) if owner == auth.principal.id.as_str()
     )
 }
@@ -10649,7 +10695,7 @@ fn still_authorized(
         current_authority(inbound, auth, method).and_then(|resolved| {
             // The daemon-wide streams are limited to administrators and the
             // shared operator. A session viewer is held to the session's
-            // ownership instead (`viewer_may_see`), so a scoped owner keeps
+            // ownership instead (`viewer_permits`), so a scoped owner keeps
             // its own session.
             if global && !sees_every_principal(auth, &resolved) {
                 return Err(crate::rpc::auth::AuthDenied::forbidden(
@@ -34475,6 +34521,57 @@ mod tests {
         assert!(
             !delivered,
             "a viewer of a replaced, re-owned session gets no frame"
+        );
+        await_viewer_detached(&ctx, sid).await;
+    }
+
+    /// The counterexample from the second re-review: the writer slot is won
+    /// and the viewer's session facts are being read when the viewer is
+    /// demoted. Grants resolved before that read would still say admin; the
+    /// decision must use grants resolved after it.
+    #[tokio::test]
+    async fn session_deliver_demoted_during_the_session_metadata_read_is_not_delivered() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sid = "s-deliver-metadata-wait";
+        let (ctx, _backend, _key, _) = recheck_fixture(&tmp, sid, "user:bob", true).await;
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+        let attached = rpc(
+            &mut alice,
+            &mut rx,
+            1,
+            "session/attach",
+            json!({"session_id": sid}),
+        )
+        .await;
+        assert!(attached.get("error").is_none(), "{attached}");
+
+        let (entered, release) = ctx.subscriptions.set_test_delivery_facts_pause();
+        let source = ctx.subscriptions.session_source(sid);
+        ctx.subscriptions.publish(
+            source,
+            json!({"type": "agent_message_chunk", "session_id": sid, "text": "metadata-frame"}),
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+            .await
+            .expect("delivery reaches the point after the session metadata read");
+
+        republish_alice(&ctx, |profile| profile.admin = false);
+        release.notify_one();
+
+        let leaked = tokio::time::timeout(std::time::Duration::from_millis(500), async {
+            loop {
+                match rx.recv().await {
+                    Some(frame) if frame.contains("metadata-frame") => return true,
+                    Some(_) => {}
+                    None => return false,
+                }
+            }
+        })
+        .await
+        .unwrap_or(false);
+        assert!(
+            !leaked,
+            "a viewer demoted while its session metadata was read gets none of Bob's frames"
         );
         await_viewer_detached(&ctx, sid).await;
     }

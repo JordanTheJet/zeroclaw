@@ -154,6 +154,8 @@ pub struct SubscriptionHub {
     /// before the disclosure is rechecked. Fires once.
     #[cfg(test)]
     test_delivery_pause: Mutex<Option<DeliveryPause>>,
+    #[cfg(test)]
+    test_delivery_facts_pause: Mutex<Option<(Arc<Notify>, Arc<Notify>)>>,
 }
 
 /// Handles for the test-only delivery park point. `slot_held_at_pause` is
@@ -206,6 +208,8 @@ impl SubscriptionHub {
             bus_attached: AtomicBool::new(false),
             #[cfg(test)]
             test_delivery_pause: Mutex::new(None),
+            #[cfg(test)]
+            test_delivery_facts_pause: Mutex::new(None),
         }
     }
 
@@ -387,6 +391,29 @@ impl SubscriptionHub {
     #[cfg(not(test))]
     #[inline(always)]
     pub(crate) async fn wait_test_delivery_pause(&self, _slot_held: bool) {}
+
+    /// A second test-only park point in delivery: after the session facts
+    /// are read and before the disclosure is decided. Fires once.
+    #[cfg(test)]
+    pub(crate) fn set_test_delivery_facts_pause(&self) -> (Arc<Notify>, Arc<Notify>) {
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        *self.test_delivery_facts_pause.lock() = Some((Arc::clone(&entered), Arc::clone(&release)));
+        (entered, release)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn wait_test_delivery_facts_pause(&self) {
+        let Some((entered, release)) = self.test_delivery_facts_pause.lock().take() else {
+            return;
+        };
+        entered.notify_one();
+        release.notified().await;
+    }
+
+    #[cfg(not(test))]
+    #[inline(always)]
+    pub(crate) async fn wait_test_delivery_facts_pause(&self) {}
 
     /// The ring for `session_id`, created on first use.
     pub fn session_source(&self, session_id: &str) -> Source {
