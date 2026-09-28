@@ -743,38 +743,42 @@ fn pairing_methods_are_classified_and_named() {
     }
 }
 
-#[tokio::test]
-async fn an_administrator_manages_pairing_over_rpc() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let ctx = enforcement_ctx(pairing_config(&tmp, true));
-    let (mut operator, mut rx) = local_operator(&ctx).await;
+#[test]
+fn an_administrator_manages_pairing_over_rpc() {
+    // Persisting the pairing tokens runs the config save, whose debug-build
+    // frames exceed the default test stack; see `run_on_a_large_stack`.
+    run_on_a_large_stack(|| async move {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ctx = enforcement_ctx(pairing_config(&tmp, true));
+        let (mut operator, mut rx) = local_operator(&ctx).await;
 
-    let code = rpc(&mut operator, &mut rx, 1, "pairing/new-code", json!({})).await;
-    assert_eq!(code["result"]["success"], json!(true), "{code}");
-    assert!(code["result"]["pairing_code"].is_string(), "{code}");
+        let code = rpc(&mut operator, &mut rx, 1, "pairing/new-code", json!({})).await;
+        assert_eq!(code["result"]["success"], json!(true), "{code}");
+        assert!(code["result"]["pairing_code"].is_string(), "{code}");
 
-    let listed = rpc(&mut operator, &mut rx, 2, "pairing/list", json!({})).await;
-    assert_eq!(listed["result"]["count"], json!(0), "{listed}");
+        let listed = rpc(&mut operator, &mut rx, 2, "pairing/list", json!({})).await;
+        assert_eq!(listed["result"]["count"], json!(0), "{listed}");
 
-    let missing = rpc(
-        &mut operator,
-        &mut rx,
-        3,
-        "pairing/revoke",
-        json!({"device_id": "no-such-device"}),
-    )
-    .await;
-    assert_eq!(missing["error"]["code"], json!(INVALID_PARAMS), "{missing}");
-    assert_eq!(missing["error"]["message"], json!("Device not found"));
+        let missing = rpc(
+            &mut operator,
+            &mut rx,
+            3,
+            "pairing/revoke",
+            json!({"device_id": "no-such-device"}),
+        )
+        .await;
+        assert_eq!(missing["error"]["code"], json!(INVALID_PARAMS), "{missing}");
+        assert_eq!(missing["error"]["message"], json!("Device not found"));
 
-    let rotated = rpc(&mut operator, &mut rx, 4, "pairing/revoke-all", json!({})).await;
-    assert_eq!(rotated["result"]["success"], json!(true), "{rotated}");
-    assert!(
-        rotated["result"]["message"]
-            .as_str()
-            .is_some_and(|m| m.starts_with("Revoked all")),
-        "{rotated}"
-    );
+        let rotated = rpc(&mut operator, &mut rx, 4, "pairing/revoke-all", json!({})).await;
+        assert_eq!(rotated["result"]["success"], json!(true), "{rotated}");
+        assert!(
+            rotated["result"]["message"]
+                .as_str()
+                .is_some_and(|m| m.starts_with("Revoked all")),
+            "{rotated}"
+        );
+    });
 }
 
 #[tokio::test]
