@@ -922,6 +922,42 @@ pub struct RpcDispatcher {
 /// explicit no-follow option refuses a final component that is a link at all.
 /// An allowlisted `SOUL.md` planted as a symlink therefore cannot redirect the
 /// read outside the entitled agent's workspace.
+/// Refuse an agent job whose `allowed_tools` names a tool the agent's current
+/// policy does not admit. Uses the matcher the runtime builds the job's tool
+/// registry with, so submission and run agree on every name, including MCP
+/// `server__tool` names. Omitting the list requests everything the policy
+/// admits; an empty list admits no tools. The run re-applies the agent's policy
+/// as it is at that time, so a later narrowing still binds the job.
+fn check_tools_admitted_by_agent_policy(
+    config: &Config,
+    agent: &str,
+    tools: &[String],
+) -> Result<(), JsonRpcError> {
+    let security = zeroclaw_config::policy::SecurityPolicy::for_agent(config, agent)
+        .map_err(|e| rpc_err(INVALID_PARAMS, format!("Cron add failed: {e}")))?;
+    let policy = zeroclaw_tools::tool_search::ToolAccessPolicy::from_security(
+        security.allowed_tools.as_deref(),
+        security.excluded_tools.as_deref(),
+        None,
+    );
+    let refused: Vec<&str> = tools
+        .iter()
+        .filter(|tool| !policy.as_ref().is_none_or(|p| p.is_tool_allowed(tool)))
+        .map(String::as_str)
+        .collect();
+    if refused.is_empty() {
+        Ok(())
+    } else {
+        Err(rpc_err(
+            INVALID_PARAMS,
+            format!(
+                "allowed_tools names tools agent {agent:?}'s policy does not admit: {}",
+                refused.join(", ")
+            ),
+        ))
+    }
+}
+
 /// The surface a quickstart RPC call reports: `tui` when the caller does not
 /// say, which is what every RPC client was labelled before. `test` is refused
 /// so a client cannot tag production telemetry as test traffic.
@@ -1814,6 +1850,38 @@ impl RpcDispatcher {
         let target = policy.resolve_policy_target(std::path::Path::new(path))?;
         let root = policy.approved_read_root(&target);
         Some(super::attachments::AttachmentSource { root, target })
+    }
+
+    /// Admit headless agent work: creating an agent cron job, changing one, or
+    /// running one now. That work executes later under the agent's own
+    /// authority, with no connection left to re-resolve the submitter, so the
+    /// submitter's ceiling has to be one that cannot change underneath the job.
+    /// Only the shared operator qualifies: the install's own principal, whose
+    /// authority no grant publication narrows. A scoped principal, or a named
+    /// administrator whose admin grant can later be removed, is refused until
+    /// the runtime can carry and re-check a submitter's delegated authority at
+    /// run time.
+    fn admit_headless_agent_work(&self, method: Method) -> Result<(), JsonRpcError> {
+        let Some(auth) = self.auth.as_ref() else {
+            return Err(rpc_err(AUTH_REQUIRED, "First call must be 'initialize'"));
+        };
+        if auth.grants.admin && !auth.principal.is_authenticated() {
+            return Ok(());
+        }
+        let denied = rpc_err(
+            FORBIDDEN,
+            "Agent cron jobs run later without this connection, so only the local operator \
+             may create, change or run one; a named or scoped principal's authority cannot \
+             yet be carried to the run and re-checked there",
+        );
+        self.audit_auth_denial(
+            method,
+            &crate::rpc::auth::AuthDenied {
+                code: denied.code,
+                message: denied.message.clone(),
+            },
+        );
+        Err(denied)
     }
 
     /// Whether this connection holds operator-level (admin) grants. An
@@ -7447,6 +7515,10 @@ impl RpcDispatcher {
         let is_agent = matches!(req.job_type.as_deref(), Some("agent"))
             || (req.job_type.is_none() && req.prompt.is_some());
         let job = if is_agent {
+            self.admit_headless_agent_work(Method::CronAdd)?;
+            if let Some(tools) = req.allowed_tools.as_deref() {
+                check_tools_admitted_by_agent_policy(&config, &req.agent, tools)?;
+            }
             if req.shell_output_format.is_some() {
                 return Err(rpc_err(
                     INVALID_PARAMS,
@@ -7511,6 +7583,9 @@ impl RpcDispatcher {
         // any row, including the ownerless legacy ones.
         let owner = self.authorize_cron_job(Method::CronPatch, &config, &req.id)?;
         let is_agent = matches!(owner.job_type, crate::cron::JobType::Agent);
+        if is_agent {
+            self.admit_headless_agent_work(Method::CronPatch)?;
+        }
         if req.shell_output_format.is_some() {
             if is_agent {
                 return Err(rpc_err(
@@ -7606,6 +7681,9 @@ impl RpcDispatcher {
         let req: CronIdParams = parse_params(params)?;
         let config = self.ctx.config.read().clone();
         let job = self.authorize_cron_job(Method::CronTrigger, &config, &req.id)?;
+        if matches!(job.job_type, crate::cron::JobType::Agent) {
+            self.admit_headless_agent_work(Method::CronTrigger)?;
+        }
         let event_tx = self.ctx.event_tx.clone();
         let result = crate::cron::scheduler::run_manual_job(
             &config,
@@ -12917,8 +12995,8 @@ mod tests {
         .await;
         assert_eq!(
             response["error"]["code"],
-            json!(INVALID_PARAMS),
-            "a refused command must not patch the job: {response}"
+            json!(FORBIDDEN),
+            "a scoped principal must not change an agent job: {response}"
         );
 
         let reread = crate::cron::get_job(&config, &job.id).expect("the job still exists");
@@ -37064,5 +37142,181 @@ mod tests {
         let surface: Surface =
             serde_json::from_value(json!("web")).expect("surface wire name deserialises");
         assert_eq!(surface, Surface::Web);
+    }
+
+    /// The review's original attack, with no policy change in between: a
+    /// principal scoped to alpha with `cron:create` asks for an agent job that
+    /// names a tool it holds no grant to, or omits the list to inherit alpha's
+    /// whole tool set. Both must be refused at submission, and nothing stored.
+    #[tokio::test]
+    async fn cron_add_refuses_headless_agent_jobs_from_a_scoped_principal() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = p4_config(&tmp);
+        let ctx = enforcement_ctx(config.clone());
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+
+        for (id, params) in [
+            (
+                1u64,
+                json!({
+                    "agent": "alpha",
+                    "schedule": "* * * * *",
+                    "job_type": "agent",
+                    "prompt": "Use file_write to write marker.txt with the text cron-proof",
+                    "allowed_tools": ["file_write"],
+                }),
+            ),
+            (
+                2,
+                json!({
+                    "agent": "alpha",
+                    "schedule": "* * * * *",
+                    "job_type": "agent",
+                    "prompt": "Use file_write to write marker.txt with the text cron-proof",
+                }),
+            ),
+        ] {
+            let response = rpc(&mut alice, &mut rx, id, "cron/add", params).await;
+            assert_eq!(response["error"]["code"], json!(FORBIDDEN), "{response}");
+        }
+        assert!(
+            crate::cron::list_jobs(&config)
+                .expect("store readable")
+                .is_empty(),
+            "a refused agent job must not be stored"
+        );
+
+        // Control: the same principal still adds a policy-validated shell job.
+        let shell = rpc(
+            &mut alice,
+            &mut rx,
+            3,
+            "cron/add",
+            json!({"agent": "alpha", "schedule": "*/5 * * * *", "command": "echo hi"}),
+        )
+        .await;
+        assert_eq!(shell["result"]["command"], json!("echo hi"), "{shell}");
+    }
+
+    /// A named administrator is refused too: its admin grant can be removed
+    /// after the job is stored, and the job would keep running under the
+    /// agent's authority with nothing left to re-check.
+    #[tokio::test]
+    async fn cron_add_refuses_headless_agent_jobs_from_a_named_administrator() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = p4_config(&tmp);
+        config
+            .permission_profiles
+            .get_mut("cron-alpha")
+            .expect("the roster profile exists")
+            .admin = true;
+        let ctx = enforcement_ctx(config.clone());
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+
+        let response = rpc(
+            &mut alice,
+            &mut rx,
+            1,
+            "cron/add",
+            json!({"agent": "alpha", "schedule": "* * * * *", "prompt": "p"}),
+        )
+        .await;
+        assert_eq!(response["error"]["code"], json!(FORBIDDEN), "{response}");
+        assert!(
+            crate::cron::list_jobs(&config)
+                .expect("store readable")
+                .is_empty(),
+            "a refused agent job must not be stored"
+        );
+    }
+
+    /// Changing or running an existing agent job is the same headless work: a
+    /// scoped principal can neither rewrite its prompt nor run it now.
+    #[tokio::test]
+    async fn cron_patch_and_trigger_refuse_a_scoped_principal_on_an_agent_job() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = p4_config(&tmp);
+        let job = seed_cron_job(&config, "alpha", "alpha-job");
+        let ctx = enforcement_ctx(config.clone());
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+
+        let patched = rpc(
+            &mut alice,
+            &mut rx,
+            1,
+            "cron/patch",
+            json!({"id": job.id, "agent": "alpha", "prompt": "Use file_write now"}),
+        )
+        .await;
+        assert_eq!(patched["error"]["code"], json!(FORBIDDEN), "{patched}");
+        let triggered = rpc(
+            &mut alice,
+            &mut rx,
+            2,
+            "cron/trigger",
+            json!({"id": job.id}),
+        )
+        .await;
+        assert_eq!(triggered["error"]["code"], json!(FORBIDDEN), "{triggered}");
+
+        let stored = crate::cron::get_job(&config, &job.id).expect("the job still exists");
+        assert_eq!(
+            stored.prompt, job.prompt,
+            "a refused patch must not change the prompt"
+        );
+        assert!(
+            stored.last_status.is_none(),
+            "a refused trigger must not run the job"
+        );
+    }
+
+    /// The operator may submit agent jobs, but only with tools the agent's
+    /// current policy admits, checked with the matcher the run uses.
+    #[tokio::test]
+    async fn cron_add_checks_requested_tools_against_the_agent_policy() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = p4_config(&tmp);
+        config
+            .risk_profiles
+            .get_mut("cron-profile")
+            .expect("the roster profile exists")
+            .excluded_tools = vec!["file_write".into()];
+        let ctx = enforcement_ctx(config.clone());
+        let (mut operator, mut rx) = local_operator(&ctx).await;
+
+        let refused = rpc(
+            &mut operator,
+            &mut rx,
+            1,
+            "cron/add",
+            json!({"agent": "alpha", "schedule": "* * * * *", "prompt": "p", "allowed_tools": ["file_write"]}),
+        )
+        .await;
+        assert_eq!(refused["error"]["code"], json!(INVALID_PARAMS), "{refused}");
+        assert!(
+            refused["error"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("file_write")),
+            "{refused}"
+        );
+        assert!(
+            crate::cron::list_jobs(&config)
+                .expect("store readable")
+                .is_empty()
+        );
+
+        let accepted = rpc(
+            &mut operator,
+            &mut rx,
+            2,
+            "cron/add",
+            json!({"agent": "alpha", "schedule": "* * * * *", "prompt": "p", "allowed_tools": ["file_read"]}),
+        )
+        .await;
+        let id = accepted["result"]["id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{accepted}"));
+        let job = crate::cron::get_job(&config, id).expect("the operator's job exists");
+        assert_eq!(job.allowed_tools, Some(vec!["file_read".to_string()]));
     }
 }
