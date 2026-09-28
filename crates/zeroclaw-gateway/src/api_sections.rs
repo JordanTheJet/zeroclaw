@@ -1139,10 +1139,11 @@ pub async fn handle_section_select(
     if created {
         writes = writes.with(fields_prefix.clone(), zeroclaw_api::grants::Verb::Create);
     }
-    let authorization = match crate::principal_gate::authorize_config_write(&principal, writes) {
-        Ok(authorization) => authorization,
-        Err(denied) => return denied.into_response(),
-    };
+    let authorization =
+        match crate::principal_gate::authorize_config_write(&principal, writes, &_cfg_guard) {
+            Ok(authorization) => authorization,
+            Err(denied) => return denied.into_response(),
+        };
     if let Err(e) = persist_and_swap(&state, &authorization, working, &_cfg_guard).await {
         return e;
     }
