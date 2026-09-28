@@ -150,6 +150,21 @@ pub struct SubscriptionHub {
     session_ring: RingLimits,
     byte_budget: usize,
     bus_attached: AtomicBool,
+    /// Test-only park point in delivery, after a writer slot is reserved and
+    /// before the disclosure is rechecked. Fires once.
+    #[cfg(test)]
+    test_delivery_pause: Mutex<Option<DeliveryPause>>,
+}
+
+/// Handles for the test-only delivery park point. `slot_held_at_pause` is
+/// recorded by the delivery path when it parks, so a test can assert the park
+/// came after the writer slot was won.
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct DeliveryPause {
+    pub(crate) entered: Arc<Notify>,
+    pub(crate) release: Arc<Notify>,
+    pub(crate) slot_held_at_pause: Arc<AtomicBool>,
 }
 
 impl Default for SubscriptionHub {
@@ -189,6 +204,8 @@ impl SubscriptionHub {
             session_ring: ring,
             byte_budget,
             bus_attached: AtomicBool::new(false),
+            #[cfg(test)]
+            test_delivery_pause: Mutex::new(None),
         }
     }
 
@@ -343,6 +360,33 @@ impl SubscriptionHub {
                 .or_insert_with(|| Arc::new(Notify::new())),
         )
     }
+
+    #[cfg(test)]
+    pub(crate) fn set_test_delivery_pause(&self) -> DeliveryPause {
+        let pause = DeliveryPause {
+            entered: Arc::new(Notify::new()),
+            release: Arc::new(Notify::new()),
+            slot_held_at_pause: Arc::new(AtomicBool::new(false)),
+        };
+        *self.test_delivery_pause.lock() = Some(pause.clone());
+        pause
+    }
+
+    /// Park delivery once, if a test armed it. `slot_held` is whether the
+    /// caller holds its writer slot at this point.
+    #[cfg(test)]
+    pub(crate) async fn wait_test_delivery_pause(&self, slot_held: bool) {
+        let Some(pause) = self.test_delivery_pause.lock().take() else {
+            return;
+        };
+        pause.slot_held_at_pause.store(slot_held, Ordering::SeqCst);
+        pause.entered.notify_one();
+        pause.release.notified().await;
+    }
+
+    #[cfg(not(test))]
+    #[inline(always)]
+    pub(crate) async fn wait_test_delivery_pause(&self, _slot_held: bool) {}
 
     /// The ring for `session_id`, created on first use.
     pub fn session_source(&self, session_id: &str) -> Source {

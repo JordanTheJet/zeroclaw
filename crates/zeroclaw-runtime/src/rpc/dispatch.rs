@@ -6424,6 +6424,7 @@ impl RpcDispatcher {
             .acquire(sid)
             .await
             .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?;
+        self.ctx.sessions.wait_test_append_admission_pause().await;
         let admitted = self
             .revalidate_admitted_session(sid, authorized.as_ref())
             .await?;
@@ -10245,6 +10246,7 @@ async fn deliver_subscription(delivery: SubscriptionDelivery) {
             };
             if !disclose(
                 json,
+                &hub,
                 &rpc,
                 &cancel,
                 &inbound,
@@ -10275,6 +10277,7 @@ async fn deliver_subscription(delivery: SubscriptionDelivery) {
                     };
                     if !disclose(
                         json,
+                        &hub,
                         &rpc,
                         &cancel,
                         &inbound,
@@ -10310,6 +10313,7 @@ async fn deliver_subscription(delivery: SubscriptionDelivery) {
                         };
                         if !disclose(
                             json,
+                            &hub,
                             &rpc,
                             &cancel,
                             &inbound,
@@ -10354,6 +10358,7 @@ async fn deliver_subscription(delivery: SubscriptionDelivery) {
 #[allow(clippy::too_many_arguments)]
 async fn disclose(
     json: String,
+    hub: &crate::rpc::subscription::SubscriptionHub,
     rpc: &RpcOutbound,
     cancel: &CancellationToken,
     inbound: &crate::rpc::auth::RpcInboundAuth,
@@ -10371,6 +10376,7 @@ async fn disclose(
             None => return false,
         },
     };
+    hub.wait_test_delivery_pause(true).await;
     if !still_authorized(
         inbound,
         binding,
@@ -33203,5 +33209,371 @@ mod tests {
         })
         .await
         .expect("the demoted viewer is detached");
+    }
+
+    // ── Admit, wait, recheck, effect (revocation-recheck design §3) ───
+    //
+    // Two operations on this site. `session_append`: admitted at the gate,
+    // waits on the session's queue, rechecks, then writes the transcript.
+    // `session_deliver`: a viewer admitted at attach, each frame waits for a
+    // writer slot, rechecks, then is written. Each test parks the operation
+    // AFTER its wait was won (the guard asserts it), changes the world, and
+    // releases; the probe is the side effect itself, never only the reply.
+
+    const APPEND_TEXT: &str = "text appended while parked";
+
+    /// Republish the accepted policy with alice's profile edited by `edit`.
+    fn republish_alice(
+        ctx: &Arc<RpcContext>,
+        edit: impl FnOnce(&mut PermissionProfileConfigForTests),
+    ) {
+        let mut next = ctx.config.read().clone();
+        edit(
+            next.permission_profiles
+                .get_mut("session-scoped")
+                .expect("the fixture profile exists"),
+        );
+        ctx.auth
+            .refresh_from_config(&next)
+            .expect("the republished policy compiles");
+    }
+
+    type PermissionProfileConfigForTests = zeroclaw_config::schema::PermissionProfileConfig;
+
+    fn set_session_verbs(
+        profile: &mut PermissionProfileConfigForTests,
+        verbs: Vec<zeroclaw_api::grants::Verb>,
+    ) {
+        profile
+            .grants
+            .insert(zeroclaw_api::grants::Resource::Sessions, verbs);
+    }
+
+    fn widen_with_an_unrelated_grant(profile: &mut PermissionProfileConfigForTests) {
+        profile.grants.insert(
+            zeroclaw_api::grants::Resource::Memory,
+            vec![zeroclaw_api::grants::Verb::Read],
+        );
+    }
+
+    /// Alice (roster uid 4242) with every session verb, optionally admin, and
+    /// one live session owned by `owner`.
+    async fn recheck_fixture(
+        tmp: &tempfile::TempDir,
+        sid: &str,
+        owner: &str,
+        admin: bool,
+    ) -> (
+        Arc<RpcContext>,
+        Arc<zeroclaw_infra::session_sqlite::SqliteSessionBackend>,
+        String,
+        std::path::PathBuf,
+    ) {
+        use zeroclaw_api::grants::Verb;
+        let mut config = session_cwd_config(tmp, 4242, None);
+        {
+            let profile = config
+                .permission_profiles
+                .get_mut("session-scoped")
+                .expect("the fixture profile exists");
+            profile.admin = admin;
+            set_session_verbs(
+                profile,
+                vec![Verb::Create, Verb::Read, Verb::Execute, Verb::Update],
+            );
+        }
+        let workspace = config.agent_workspace_dir("test-agent");
+        let (ctx, chat_backend, _acp_store) = persistence_enforcement_ctx(config);
+        let (provider, _handles) = scripted_turn_provider();
+        let key = install_state_test_session_owned_at(
+            &ctx.sessions,
+            &chat_backend,
+            sid,
+            provider,
+            None,
+            Some(owner),
+            &workspace,
+        )
+        .await;
+        (ctx, chat_backend, key, workspace)
+    }
+
+    /// Run alice's `session/append` to `sid`, parked right after it wins the
+    /// session queue; apply `change` while parked; release; return the reply.
+    async fn append_parked_after_admission<F, Fut>(
+        ctx: &Arc<RpcContext>,
+        sid: &str,
+        change: F,
+    ) -> RpcResult
+    where
+        F: FnOnce(Arc<RpcContext>) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        let (alice, _rx) = roster_peer(ctx, 4242).await;
+        let (entered, release) = ctx.sessions.set_test_append_admission_pause();
+        let params = json!({"session_id": sid, "content": APPEND_TEXT});
+        let task =
+            zeroclaw_spawn::spawn!(async move { alice.handle_session_append(&params).await });
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+            .await
+            .expect("the append must reach its park point");
+        // Guard: the park is after admission was won. The append holds the
+        // session's queue permit, so nobody else can take it now.
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                ctx.sessions.session_queue.acquire(sid),
+            )
+            .await
+            .is_err(),
+            "the append must be parked holding the queue permit, not before it"
+        );
+        change(Arc::clone(ctx)).await;
+        release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("the append finishes once released")
+            .expect("the append task does not panic")
+    }
+
+    fn durable_has_append(
+        backend: &Arc<zeroclaw_infra::session_sqlite::SqliteSessionBackend>,
+        key: &str,
+    ) -> bool {
+        zeroclaw_infra::session_backend::SessionBackend::load(backend.as_ref(), key)
+            .iter()
+            .any(|message| message.content == APPEND_TEXT)
+    }
+
+    async fn live_has_append(ctx: &Arc<RpcContext>, sid: &str) -> bool {
+        let Some(agent) = ctx.sessions.get_agent(sid).await else {
+            return false;
+        };
+        agent.lock().await.history().iter().any(|message| {
+            matches!(message, ConversationMessage::Chat(chat) if chat.content == APPEND_TEXT)
+        })
+    }
+
+    #[tokio::test]
+    async fn session_append_revoked_after_admission_has_no_effect() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sid = "s-append-revoke";
+        let (ctx, backend, key, _) = recheck_fixture(&tmp, sid, "user:alice", false).await;
+
+        let result = append_parked_after_admission(&ctx, sid, |ctx| async move {
+            republish_alice(&ctx, |profile| {
+                set_session_verbs(profile, vec![zeroclaw_api::grants::Verb::Read]);
+            });
+        })
+        .await;
+
+        assert_eq!(result.expect_err("revoked").code, FORBIDDEN);
+        assert!(!durable_has_append(&backend, &key), "no durable write");
+        assert!(!live_has_append(&ctx, sid).await, "no live write");
+    }
+
+    #[tokio::test]
+    async fn session_append_narrowed_after_admission_has_no_effect() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sid = "s-append-narrow";
+        // Alice appends to Bob's session as an administrator, keeps
+        // sessions:update, and is narrowed to a scoped principal while parked.
+        let (ctx, backend, key, _) = recheck_fixture(&tmp, sid, "user:bob", true).await;
+
+        let result = append_parked_after_admission(&ctx, sid, |ctx| async move {
+            republish_alice(&ctx, |profile| profile.admin = false);
+        })
+        .await;
+
+        assert_eq!(result.expect_err("narrowed to scoped").code, FORBIDDEN);
+        assert!(!durable_has_append(&backend, &key), "no durable write");
+        assert!(!live_has_append(&ctx, sid).await, "no live write");
+    }
+
+    #[tokio::test]
+    async fn session_append_widened_after_admission_is_honoured() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sid = "s-append-widen";
+        let (ctx, backend, key, _) = recheck_fixture(&tmp, sid, "user:alice", false).await;
+
+        let result = append_parked_after_admission(&ctx, sid, |ctx| async move {
+            republish_alice(&ctx, widen_with_an_unrelated_grant);
+        })
+        .await;
+
+        result.expect("a widened principal still appends: the recheck re-resolves");
+        assert!(
+            durable_has_append(&backend, &key),
+            "the durable write happened"
+        );
+        assert!(live_has_append(&ctx, sid).await, "the live write happened");
+    }
+
+    #[tokio::test]
+    async fn session_append_resource_reowned_after_admission_is_refused() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sid = "s-append-reown";
+        let (ctx, backend, key, _) = recheck_fixture(&tmp, sid, "user:alice", false).await;
+
+        let reown_backend = Arc::clone(&backend);
+        let reown_key = key.clone();
+        let result = append_parked_after_admission(&ctx, sid, move |ctx| async move {
+            // The live incarnation goes away and the durable row now belongs
+            // to Bob. Neither step takes the queue the append is holding.
+            ctx.sessions.kill_session(sid).await;
+            reown_backend
+                .set_session_principal(&reown_key, "user:bob")
+                .expect("the durable owner is rewritten");
+        })
+        .await;
+
+        assert_eq!(result.expect_err("re-owned").code, FORBIDDEN);
+        assert!(!durable_has_append(&backend, &key), "no durable write");
+    }
+
+    /// Alice attaches to `sid`, delivery of one published frame is parked
+    /// right after it wins a writer slot, `change` runs, and delivery is
+    /// released. Returns whether the frame reached Alice's writer.
+    async fn deliver_parked_after_admission<F, Fut>(
+        ctx: &Arc<RpcContext>,
+        sid: &str,
+        change: F,
+    ) -> bool
+    where
+        F: FnOnce(Arc<RpcContext>) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        let (mut alice, mut rx) = roster_peer(ctx, 4242).await;
+        let attached = rpc(
+            &mut alice,
+            &mut rx,
+            1,
+            "session/attach",
+            json!({"session_id": sid}),
+        )
+        .await;
+        assert!(attached.get("error").is_none(), "{attached}");
+        let pause = ctx.subscriptions.set_test_delivery_pause();
+        let source = ctx.subscriptions.session_source(sid);
+        ctx.subscriptions.publish(
+            source,
+            json!({"type": "agent_message_chunk", "session_id": sid, "text": "parked-frame"}),
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), pause.entered.notified())
+            .await
+            .expect("delivery must reach its park point");
+        // Guard: the park is after the writer slot was won, so the only thing
+        // left between this frame and the wire is the recheck.
+        assert!(
+            pause
+                .slot_held_at_pause
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "delivery must be parked holding its writer slot"
+        );
+        change(Arc::clone(ctx)).await;
+        pause.release.notify_one();
+        let delivered = tokio::time::timeout(std::time::Duration::from_millis(500), async {
+            loop {
+                match rx.recv().await {
+                    Some(frame) if frame.contains("parked-frame") => return true,
+                    Some(_) => {}
+                    None => return false,
+                }
+            }
+        })
+        .await
+        .unwrap_or(false);
+        drop(alice);
+        delivered
+    }
+
+    async fn await_viewer_detached(ctx: &Arc<RpcContext>, sid: &str) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while ctx.subscriptions.viewer_count(sid) != 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("a refused viewer is detached");
+    }
+
+    #[tokio::test]
+    async fn session_deliver_revoked_after_admission_has_no_effect() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sid = "s-deliver-revoke";
+        let (ctx, _backend, _key, _) = recheck_fixture(&tmp, sid, "user:alice", false).await;
+
+        let delivered = deliver_parked_after_admission(&ctx, sid, |ctx| async move {
+            republish_alice(&ctx, |profile| set_session_verbs(profile, Vec::new()));
+        })
+        .await;
+
+        assert!(!delivered, "a viewer that lost sessions:read gets no frame");
+        await_viewer_detached(&ctx, sid).await;
+    }
+
+    #[tokio::test]
+    async fn session_deliver_narrowed_after_admission_has_no_effect() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sid = "s-deliver-narrow";
+        let (ctx, _backend, _key, _) = recheck_fixture(&tmp, sid, "user:bob", true).await;
+
+        let delivered = deliver_parked_after_admission(&ctx, sid, |ctx| async move {
+            republish_alice(&ctx, |profile| profile.admin = false);
+        })
+        .await;
+
+        assert!(
+            !delivered,
+            "a viewer narrowed out of admin gets none of Bob's frames"
+        );
+        await_viewer_detached(&ctx, sid).await;
+    }
+
+    #[tokio::test]
+    async fn session_deliver_widened_after_admission_is_honoured() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sid = "s-deliver-widen";
+        let (ctx, _backend, _key, _) = recheck_fixture(&tmp, sid, "user:alice", false).await;
+
+        let delivered = deliver_parked_after_admission(&ctx, sid, |ctx| async move {
+            republish_alice(&ctx, widen_with_an_unrelated_grant);
+        })
+        .await;
+
+        assert!(
+            delivered,
+            "a widened viewer still gets the frame: the recheck re-resolves"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_deliver_resource_reowned_after_admission_is_refused() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sid = "s-deliver-reown";
+        let (ctx, backend, _key, workspace) = recheck_fixture(&tmp, sid, "user:alice", false).await;
+
+        let delivered = deliver_parked_after_admission(&ctx, sid, move |ctx| async move {
+            // Replace the live incarnation with one Bob owns.
+            ctx.sessions.kill_session(sid).await;
+            let (provider, _handles) = scripted_turn_provider();
+            install_state_test_session_owned_at(
+                &ctx.sessions,
+                &backend,
+                sid,
+                provider,
+                None,
+                Some("user:bob"),
+                &workspace,
+            )
+            .await;
+        })
+        .await;
+
+        assert!(
+            !delivered,
+            "a viewer of a replaced, re-owned session gets no frame"
+        );
+        await_viewer_detached(&ctx, sid).await;
     }
 }

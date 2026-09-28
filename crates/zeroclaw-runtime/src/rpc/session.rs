@@ -273,6 +273,11 @@ pub struct SessionStore {
     /// prompt owns admission but before any fallible setup or provider work.
     #[cfg(test)]
     test_prompt_registration_pause: std::sync::Mutex<Option<PromptRegistrationPause>>,
+    /// Test-only pause immediately after `session/append` wins its session's
+    /// queue permit, before it rechecks authority: the "admission won" park
+    /// point for the revocation tests. Fires once.
+    #[cfg(test)]
+    test_append_admission_pause: std::sync::Mutex<Option<PromptRegistrationPause>>,
     /// Test-only pause between a rehydration's publication and its history
     /// restore, letting a regression drive another RPC deterministically
     /// inside the window where the successor is live but unseeded.
@@ -335,6 +340,8 @@ impl SessionStore {
             test_gated_op_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
             test_prompt_registration_pause: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            test_append_admission_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
             test_rehydrate_seed_pause: std::sync::Mutex::new(None),
         }
@@ -1356,6 +1363,29 @@ impl SessionStore {
         let entered = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(tokio::sync::Notify::new());
         *self.test_prompt_registration_pause.lock().unwrap() =
+            Some((Arc::clone(&entered), Arc::clone(&release)));
+        (entered, release)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn wait_test_append_admission_pause(&self) {
+        let Some((entered, release)) = self.test_append_admission_pause.lock().unwrap().take()
+        else {
+            return;
+        };
+        entered.notify_one();
+        release.notified().await;
+    }
+
+    #[cfg(not(test))]
+    #[inline(always)]
+    pub(crate) async fn wait_test_append_admission_pause(&self) {}
+
+    #[cfg(test)]
+    pub(crate) fn set_test_append_admission_pause(&self) -> PromptRegistrationPause {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        *self.test_append_admission_pause.lock().unwrap() =
             Some((Arc::clone(&entered), Arc::clone(&release)));
         (entered, release)
     }
