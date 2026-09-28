@@ -2577,7 +2577,10 @@ fn format_paircode_recovery_curl(
     format!(
         "curl -s -X POST -H \"{GATEWAY_ADMIN_TOKEN_HEADER}: $(cat '{}')\" \
          http://{recovery_host}:{port}{path_prefix}/admin/paircode/new",
-        admin_token_path.display()
+        admin_token_path
+            .display()
+            .to_string()
+            .replace('\'', "'\\''")
     )
 }
 
@@ -5378,6 +5381,31 @@ mod tests {
             ),
             "curl -s -X POST -H \"x-zeroclaw-admin-token: $(cat '/zc/data/gateway-admin.token')\" http://[::1]:42617/admin/paircode/new"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn paircode_recovery_curl_quotes_admin_token_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let token_path = tmp.path().join("owner's $(touch escaped).token");
+        std::fs::write(&token_path, "synthetic-admin-token").unwrap();
+        let command = format_paircode_recovery_curl("127.0.0.1", 42617, "", &token_path);
+        // Intercept curl: exercise actual shell parsing and cat without a
+        // network call, and verify path contents cannot become shell syntax.
+        let output = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!("curl() {{ printf '%s\\n' \"$@\"; }}; {command}"))
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{:?}", output.stderr);
+        let args = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            args.lines()
+                .any(|arg| arg == "x-zeroclaw-admin-token: synthetic-admin-token"),
+            "{args}"
+        );
+        assert!(!tmp.path().join("escaped").exists());
     }
 
     #[test]
