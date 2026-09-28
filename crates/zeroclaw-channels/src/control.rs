@@ -379,24 +379,43 @@ impl BindFailure {
     }
 }
 
+/// What a bind will do, computed under the config write lock before
+/// anything is written, so the caller can authorize the exact write.
+pub enum BindPlan {
+    /// The identity already holds the grant; nothing needs writing. The value
+    /// is the response body.
+    AlreadyBound(Value),
+    /// Add the identity to `group`'s `external_peers`: `working` is the
+    /// config to persist.
+    Write {
+        working: Box<Config>,
+        group: String,
+        channel: String,
+    },
+}
+
+impl BindPlan {
+    /// The one config path a `Write` persists.
+    #[must_use]
+    pub fn write_path(group: &str) -> String {
+        format!("peer_groups.{group}.external_peers")
+    }
+}
+
 /// Authorize an operator-named `identity` on one channel alias, the
-/// equivalent of `zeroclaw channel bind-<type> <identity> --alias <alias>`.
+/// equivalent of `zeroclaw channel bind-<type> <identity> --alias <alias>`:
+/// the first half, which decides what to write.
 ///
-/// Writes only `peer_groups.<group>.external_peers` onto the current on-disk
-/// document, then swaps `config`. The caller must hold the config write lock
-/// and pass its guard: it is held from the caller's authorization recheck
-/// through the swap, so authority withdrawn while the bind waited for the
-/// lock is seen before anything is written. The body
-/// reports `saved: false, already_bound: true` when the identity already
-/// holds the grant. Channels running on another config copy pick the peer up
-/// on the next reload.
-pub async fn bind(
+/// The caller must hold the config write lock and pass its guard, from its
+/// own authorization check through [`commit_bind`], so a policy change
+/// cannot land between deciding and writing.
+pub async fn prepare_bind(
     config: &Arc<RwLock<Config>>,
     _config_write_guard: &tokio::sync::OwnedMutexGuard<()>,
     channel_type: &str,
     alias: &str,
     identity: &str,
-) -> Result<Value, BindFailure> {
+) -> Result<BindPlan, BindFailure> {
     let channel_type = channel_type.trim();
     let alias = alias.trim();
 
@@ -461,14 +480,32 @@ pub async fn bind(
             identity,
         )
         .or_else(|| crate::orchestrator::channel_peer_group_key(&working, channel_type, alias));
-        return Ok(serde_json::json!({
+        return Ok(BindPlan::AlreadyBound(serde_json::json!({
             "saved": false,
             "already_bound": true,
             "group": source,
             "channel": channel,
-        }));
+        })));
     };
 
+    Ok(BindPlan::Write {
+        working: Box::new(working),
+        group,
+        channel,
+    })
+}
+
+/// The second half of a bind: persist a `BindPlan::Write`, run `after_save`
+/// on the persisted config, then swap it in. `after_save` is where a caller
+/// publishes the policy compiled from what it just persisted.
+pub async fn commit_bind(
+    config: &Arc<RwLock<Config>>,
+    _config_write_guard: &tokio::sync::OwnedMutexGuard<()>,
+    mut working: Config,
+    group: String,
+    channel: String,
+    after_save: impl FnOnce(&Config),
+) -> Result<Value, BindFailure> {
     // Incremental: only `peer_groups` is applied onto the current on-disk
     // document, so the rest of this snapshot cannot drop another writer's
     // keys. A direct peer-group mutation is not dirty-tracked, so the
@@ -480,6 +517,7 @@ pub async fn bind(
             format!("save failed: {e}"),
         ));
     }
+    after_save(&working);
     *config.write() = working;
 
     Ok(serde_json::json!({

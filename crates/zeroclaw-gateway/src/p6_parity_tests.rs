@@ -851,7 +851,7 @@ async fn channels_bind_refuses_alike_on_both_surfaces() {
         let (status, http) = body_json(
             crate::api_config::handle_api_channel_bind(
                 State(state.clone()),
-                HeaderMap::new(),
+                None,
                 Json(crate::api_config::ChannelBindBody {
                     channel_type: channel_type.into(),
                     alias: alias.into(),
