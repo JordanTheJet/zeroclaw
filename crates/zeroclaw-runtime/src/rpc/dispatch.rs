@@ -3682,7 +3682,9 @@ impl RpcDispatcher {
             Method::ToolsCliDiscover
             | Method::IntegrationsList
             | Method::PluginsList
-            | Method::A2aIdentity => self.handle_catalog_method(method, &req.params).await,
+            | Method::A2aIdentity => {
+                Box::pin(self.handle_catalog_method(method, &req.params)).await
+            }
             Method::ToolsList => Box::pin(self.handle_tools_list(&req.params)).await,
             Method::PairingList
             | Method::PairingRevoke

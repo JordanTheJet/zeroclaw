@@ -770,9 +770,24 @@ async fn pairing_new_code_matches_the_admin_paircode_route() {
         let http_state = pairing_state(&http_dir);
         let rpc_state = pairing_state(&rpc_dir);
 
+        // The route admits only a caller holding this run's admin token, minted
+        // the way a gateway start mints it; the RPC method's local-transport and
+        // admin checks are its counterpart.
+        let admin_token = http_state
+            .pairing
+            .rotate_admin_token(&http_dir.path().join("data"))
+            .expect("the admin token is written");
+        let mut admin_headers = HeaderMap::new();
+        admin_headers.insert(
+            zeroclaw_runtime::security::pairing::GATEWAY_ADMIN_TOKEN_HEADER,
+            admin_token
+                .parse()
+                .expect("the admin token is a header value"),
+        );
         let response = crate::handle_admin_paircode_new(
             State(http_state),
             loopback,
+            admin_headers,
             Query(crate::AdminPaircodeQuery {
                 rotate: rotate.map(str::to_string),
             }),
