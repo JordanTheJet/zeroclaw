@@ -3,13 +3,76 @@
 //! Derives the daemon's relay-registration identity, proves control of it with an
 //! Ed25519 signature, POSTs the proof to the control plane's `/v1/claim` endpoint,
 //! and on success writes the `[relay]` config so the daemon registers against the
-//! now-allowlisted relay on its next start. The byte-exact claim proof is built by
-//! `zeroclaw_runtime::relay_claim`, next to the registration key it must agree with.
+//! now-allowlisted relay on its next start. The CLI owns proof construction and
+//! loads the canonical registration key through `zeroclaw_runtime::relay::ensure_signing_key`.
 
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as B64;
+use ring::signature::{Ed25519KeyPair, KeyPair};
+use sha2::{Digest, Sha256};
 use zeroclaw_config::schema::Config;
+
+/// Domain-separation tag for the self-serve claim signature (18 bytes). Disjoint
+/// from the relay registration handshake, which signs a bare 32-byte nonce, so a
+/// claim signature can never be replayed as a registration proof. Must equal the
+/// control plane's `CLAIM_DOMAIN_TAG`.
+const CLAIM_DOMAIN_TAG: &str = "zerorelay-claim-v1";
+
+/// The exact bytes the daemon signs to claim a node:
+/// `CLAIM_DOMAIN_TAG || "\n" || claim_token || "\n" || fingerprint`, UTF-8.
+///
+/// The claim token and the 64-hex fingerprint contain no `\n`, so the two
+/// separators frame the message unambiguously without length prefixes. This is
+/// byte-identical to the control plane's `canonical_claim_message`.
+fn claim_signing_message(claim_token: &str, fingerprint: &str) -> Vec<u8> {
+    let mut msg =
+        Vec::with_capacity(CLAIM_DOMAIN_TAG.len() + claim_token.len() + fingerprint.len() + 2);
+    msg.extend_from_slice(CLAIM_DOMAIN_TAG.as_bytes());
+    msg.push(b'\n');
+    msg.extend_from_slice(claim_token.as_bytes());
+    msg.push(b'\n');
+    msg.extend_from_slice(fingerprint.as_bytes());
+    msg
+}
+
+/// Lowercase-hex `SHA-256` fingerprint of a raw Ed25519 public key. Identical to
+/// `apps/zerorelay`'s `hex::encode(Sha256::digest(&pubkey))`.
+fn fingerprint_of_pubkey(pubkey: &[u8]) -> String {
+    hex::encode(Sha256::digest(pubkey))
+}
+
+/// The proof a daemon presents to the control plane's `POST /v1/claim`. The public key and
+/// signature use padded base64 STANDARD; the fingerprint is lowercase SHA-256 hex.
+#[derive(Debug, Clone)]
+struct ClaimProof {
+    /// base64 STANDARD of the raw 32-byte Ed25519 public key.
+    public_key_b64: String,
+    /// Lowercase hex of `SHA-256(pubkey)`, 64 chars.
+    fingerprint: String,
+    /// base64 STANDARD of the raw 64-byte Ed25519 signature.
+    signature_b64: String,
+}
+
+/// Derive and sign the claim proof from the daemon's PKCS#8 registration key (as
+/// returned by [`zeroclaw_runtime::relay::ensure_signing_key`]). Loads the key with the same
+/// `ring` API the registration path uses, so the presented fingerprint equals the
+/// one the daemon registers under.
+fn build_claim_proof(signing_key_pkcs8: &[u8], claim_token: &str) -> Result<ClaimProof> {
+    let keypair = Ed25519KeyPair::from_pkcs8(signing_key_pkcs8)
+        .map_err(|e| anyhow::Error::msg(format!("loading relay signing key: {e}")))?;
+    let pubkey = keypair.public_key().as_ref();
+    let fingerprint = fingerprint_of_pubkey(pubkey);
+    let message = claim_signing_message(claim_token, &fingerprint);
+    let signature = keypair.sign(&message);
+    Ok(ClaimProof {
+        public_key_b64: B64.encode(pubkey),
+        fingerprint,
+        signature_b64: B64.encode(signature.as_ref()),
+    })
+}
 
 /// Cap on the control plane's response body. A `/v1/claim` result is a tiny JSON
 /// object; anything larger is refused rather than buffered, so a hostile or
@@ -34,10 +97,7 @@ struct Claimed {
 /// Build the `POST /v1/claim` request body: exactly the four fields the control
 /// plane accepts (it rejects unknown fields), each carrying the proof's wire
 /// encoding.
-fn claim_request_body(
-    proof: &zeroclaw_runtime::relay_claim::ClaimProof,
-    claim_token: &str,
-) -> serde_json::Value {
+fn claim_request_body(proof: &ClaimProof, claim_token: &str) -> serde_json::Value {
     serde_json::json!({
         "fingerprint": proof.fingerprint,
         "public_key": proof.public_key_b64,
@@ -345,7 +405,7 @@ pub async fn handle_claim(config: &mut Config, claim_token: &str, control: &str)
     let data_dir = config.data_dir.clone();
     let signing_key_pkcs8 = zeroclaw_runtime::relay::ensure_signing_key(&data_dir)
         .context("loading the daemon relay registration key")?;
-    let proof = zeroclaw_runtime::relay_claim::build_claim_proof(&signing_key_pkcs8, token)?;
+    let proof = build_claim_proof(&signing_key_pkcs8, token)?;
     let body = claim_request_body(&proof, token);
 
     let url = format!("{control}/v1/claim");
@@ -446,13 +506,90 @@ pub async fn handle_claim(config: &mut Config, claim_token: &str, control: &str)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ring::rand::SystemRandom;
+    use ring::signature::{ED25519, UnparsedPublicKey};
 
-    fn sample_proof() -> zeroclaw_runtime::relay_claim::ClaimProof {
+    /// The claim message framing is a fixed contract. This golden vector is the
+    /// locus any tag or separator change breaks, independent of the key.
+    #[test]
+    fn claim_message_is_byte_exact() {
+        assert_eq!(CLAIM_DOMAIN_TAG, "zerorelay-claim-v1");
+        let msg = claim_signing_message("tok-123", "abc0def");
+        assert_eq!(msg, b"zerorelay-claim-v1\ntok-123\nabc0def");
+    }
+
+    /// End-to-end byte-exactness against exactly what the control plane checks:
+    /// fingerprint == hex(sha256(pubkey)); the signed message is the canonical
+    /// framing; and the signature verifies under the pubkey with a strict Ed25519
+    /// verifier over that message. `ring`'s verifier enforces the same canonical
+    /// encoding the control plane's `verify_strict` requires.
+    #[test]
+    fn claim_proof_round_trips_and_verifies_strictly() {
+        let rng = SystemRandom::new();
+        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+        let token = "clm_A1b2.C3d4-E5f6_G7h8";
+
+        let proof = build_claim_proof(pkcs8.as_ref(), token).unwrap();
+
+        // The advertised public key is the raw 32-byte key, base64 STANDARD.
+        let pubkey = B64.decode(proof.public_key_b64.as_bytes()).unwrap();
+        assert_eq!(pubkey.len(), 32);
+
+        // (a) fingerprint == hex(sha256(pubkey)), 64 lowercase hex chars.
+        assert_eq!(proof.fingerprint, hex::encode(Sha256::digest(&pubkey)));
+        assert_eq!(proof.fingerprint.len(), 64);
+        assert!(
+            proof
+                .fingerprint
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        );
+
+        // (b) the signed message equals the exact tag||\n||token||\n||fpr bytes.
+        let expected = {
+            let mut m = Vec::new();
+            m.extend_from_slice(b"zerorelay-claim-v1");
+            m.push(0x0A);
+            m.extend_from_slice(token.as_bytes());
+            m.push(0x0A);
+            m.extend_from_slice(proof.fingerprint.as_bytes());
+            m
+        };
+        assert_eq!(claim_signing_message(token, &proof.fingerprint), expected);
+
+        // (c) the signature verifies under the pubkey over that message, using a
+        // strict verifier — the guard that the daemon and control plane agree.
+        let sig = B64.decode(proof.signature_b64.as_bytes()).unwrap();
+        assert_eq!(sig.len(), 64);
+        UnparsedPublicKey::new(&ED25519, &pubkey)
+            .verify(&expected, &sig)
+            .expect("claim signature must verify over the canonical message");
+    }
+
+    /// A wrong token yields a signature that does not verify over the real
+    /// message, so the proof is bound to the token, not merely carrying it.
+    #[test]
+    fn signature_is_bound_to_the_token() {
+        let rng = SystemRandom::new();
+        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+        let proof = build_claim_proof(pkcs8.as_ref(), "token-A").unwrap();
+
+        let pubkey = B64.decode(proof.public_key_b64.as_bytes()).unwrap();
+        let sig = B64.decode(proof.signature_b64.as_bytes()).unwrap();
+        let other = claim_signing_message("token-B", &proof.fingerprint);
+        assert!(
+            UnparsedPublicKey::new(&ED25519, &pubkey)
+                .verify(&other, &sig)
+                .is_err()
+        );
+    }
+
+    fn sample_proof() -> ClaimProof {
         // Mint a real registration key the same way the daemon does, so the proof
-        // is derived from an authentic PKCS#8 key without depending on `ring` here.
+        // is derived from the canonical registration key source.
         let tmp = tempfile::TempDir::new().unwrap();
         let pkcs8 = zeroclaw_runtime::relay::ensure_signing_key(tmp.path()).unwrap();
-        zeroclaw_runtime::relay_claim::build_claim_proof(&pkcs8, "tok-xyz").unwrap()
+        build_claim_proof(&pkcs8, "tok-xyz").unwrap()
     }
 
     #[test]
@@ -890,7 +1027,7 @@ mod tests {
         // Fingerprint on the wire equals sha256(pubkey) — the identity the daemon
         // registers under, proving the request is self-consistent.
         let pubkey = base64_decode(obj["public_key"].as_str().unwrap());
-        let expected_fpr = zeroclaw_runtime::relay_claim::fingerprint_of_pubkey(&pubkey);
+        let expected_fpr = fingerprint_of_pubkey(&pubkey);
         assert_eq!(obj["fingerprint"], serde_json::json!(expected_fpr));
 
         // Config was written from the server's response.
@@ -1107,9 +1244,7 @@ mod tests {
         // this reads back the very key the claim signed with. The fingerprint is
         // sha256(pubkey) and independent of the token, so any token serves here.
         let daemon_key = zeroclaw_runtime::relay::ensure_signing_key(&config.data_dir).unwrap();
-        let daemon_fpr = zeroclaw_runtime::relay_claim::build_claim_proof(&daemon_key, "any")
-            .unwrap()
-            .fingerprint;
+        let daemon_fpr = build_claim_proof(&daemon_key, "any").unwrap().fingerprint;
         assert_eq!(
             proven_fpr, daemon_fpr,
             "the claim must prove the exact key the daemon registers with (config.data_dir)"
@@ -1120,17 +1255,14 @@ mod tests {
         // a different fingerprint, so this assertion is not vacuous.
         let other = tempfile::TempDir::new().unwrap();
         let other_key = zeroclaw_runtime::relay::ensure_signing_key(other.path()).unwrap();
-        let other_fpr = zeroclaw_runtime::relay_claim::build_claim_proof(&other_key, "any")
-            .unwrap()
-            .fingerprint;
+        let other_fpr = build_claim_proof(&other_key, "any").unwrap().fingerprint;
         assert_ne!(
             proven_fpr, other_fpr,
             "a different data dir must yield a different fingerprint"
         );
     }
 
-    // Minimal base64 STANDARD decode for the test assertion above; base64 is a
-    // dev-dependency of this crate.
+    // Decode the wire-format public key for the identity assertion above.
     fn base64_decode(s: &str) -> Vec<u8> {
         use base64::Engine as _;
         base64::engine::general_purpose::STANDARD.decode(s).unwrap()

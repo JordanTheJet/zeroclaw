@@ -1435,17 +1435,14 @@ mod registration_challenge_tests {
     /// claim token. It must be refused before anything is signed.
     #[test]
     fn a_claim_shaped_challenge_is_refused() {
-        // A real claim message, built by the very function the proof uses.
-        let hostile = crate::relay_claim::claim_signing_message(
-            "attacker-controlled-token",
-            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-        );
+        // Fixed claim wire fixture; runtime does not depend on the CLI's proof builder.
+        let hostile = b"zerorelay-claim-v1\nattacker-controlled-token\n0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
         assert_ne!(
             hostile.len(),
             zeroclaw_relay_proto::REGISTRATION_NONCE_LEN,
             "the attack payload must not coincidentally be nonce-sized"
         );
-        let err = decode_registration_challenge(&B64.encode(&hostile))
+        let err = decode_registration_challenge(&B64.encode(hostile))
             .expect_err("a claim-shaped challenge must never be signed");
         let msg = format!("{err:#}");
         assert!(

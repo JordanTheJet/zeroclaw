@@ -1,6 +1,6 @@
 //! Binary-spawn coverage for `zeroclaw relay claim`.
 //!
-//! The eight in-crate tests exercise `handle_claim` and its helpers directly.
+//! The in-crate tests exercise `handle_claim` and its helpers directly.
 //! None of them go through the shipped binary: clap dispatch, the global config
 //! load, the default-vs-`--config-dir` data dir, the persisted config write, and
 //! the process exit status are only exercised end-to-end here. This test spawns
