@@ -142,7 +142,9 @@ class ResolveCratesReleaseTest(unittest.TestCase):
     def test_recovery_tooling_must_be_on_master(self):
         self.released_then_fixed_on_master()
         self.git("checkout", "-q", "-b", "unreviewed")
-        unreviewed = self.commit("1.2.3")
+        # Different content keeps this sibling distinct even when both commits
+        # have the same author, message and second-resolution timestamp.
+        unreviewed = self.commit("1.2.4")
         self.git("checkout", "-q", "--detach", "v1.2.3")
         self.assert_fails(self.resolve(tooling=unreviewed), "is not on master")
 
