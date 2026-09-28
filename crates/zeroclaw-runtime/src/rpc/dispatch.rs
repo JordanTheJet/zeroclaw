@@ -1159,33 +1159,7 @@ fn credential_is_live(
     inbound: &crate::rpc::auth::RpcInboundAuth,
     auth: &crate::rpc::auth::ConnectionAuth,
 ) -> Result<(), crate::rpc::auth::AuthDenied> {
-    use crate::rpc::auth::AuthDenied;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    if let Some(expires_at) = auth.principal.expires_at
-        && expires_at <= now
-    {
-        return Err(AuthDenied::auth_required(
-            crate::i18n::get_required_cli_string("rpc-auth-credential-expired"),
-        ));
-    }
-    if let Some(revalidate_by) = auth.principal.revalidate_by
-        && revalidate_by <= now
-    {
-        return Err(AuthDenied::auth_required(
-            crate::i18n::get_required_cli_string("rpc-auth-revalidation-due"),
-        ));
-    }
-    if let Some(hash) = auth.native_token_hash.as_deref()
-        && !inbound.pairing().token_hash_is_paired(hash)
-    {
-        return Err(AuthDenied::auth_required(
-            crate::i18n::get_required_cli_string("rpc-auth-pairing-revoked"),
-        ));
-    }
-    Ok(())
+    inbound.credential_is_live(auth)
 }
 
 /// The authority `auth` holds for `method` under the accepted policy in force
@@ -1197,26 +1171,16 @@ fn current_authority(
     method: Method,
 ) -> Result<zeroclaw_api::grants::ResolvedGrants, crate::rpc::auth::AuthDenied> {
     use crate::rpc::auth::AuthDenied;
-    credential_is_live(inbound, auth)?;
-    let resolved = inbound
-        .resolve_current(auth)
-        .map_err(AuthDenied::from_deny_reason)?;
-    if resolved.generation != inbound.generation() {
-        // The accepted state moved between the resolution and this read.
-        // Fail closed rather than act under a policy nobody observed.
-        return Err(AuthDenied::auth_required(
-            crate::i18n::get_required_cli_string("rpc-auth-revalidation-due"),
-        ));
-    }
+    let grants = inbound.current_grants(auth)?;
     if let MethodAuthz::Requires(resource, verb) = method.authz()
-        && !resolved.grants.permits(resource, verb)
+        && !grants.permits(resource, verb)
     {
         return Err(AuthDenied::forbidden(format!(
             "Principal is not granted {resource}:{verb} (required by {})",
             method.wire_name()
         )));
     }
-    Ok(resolved.grants)
+    Ok(grants)
 }
 
 impl RpcDispatcher {

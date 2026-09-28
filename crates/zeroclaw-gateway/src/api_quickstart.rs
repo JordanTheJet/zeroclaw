@@ -106,6 +106,7 @@ pub async fn handle_apply(
             zeroclaw_api::grants::Verb::Create,
             zeroclaw_api::grants::Verb::Update,
         ],
+        &_cfg_guard,
     ) {
         Ok(authorization) => authorization,
         Err(denied) => return denied.into_response(),
