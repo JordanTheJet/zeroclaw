@@ -75,6 +75,9 @@ export class HttpError extends Error {
  * the behaviour that depends on the code.
  */
 export type ConfigApiCode = components["schemas"]["ConfigApiCode"];
+export type PluginCatalogEntry = components["schemas"]["PluginCatalogEntry"];
+export type PluginCatalogIssue = components["schemas"]["PluginCatalogIssue"];
+export type PluginsResponse = components["schemas"]["PluginsResponse"];
 export const ConfigApiCodes = {
   configChangedExternally: "config_changed_externally",
 } as const satisfies Record<string, ConfigApiCode>;
@@ -2037,6 +2040,11 @@ export function getIntegrations(): Promise<Integration[]> {
   });
 }
 
+/** Read-only plugin packages from installed and cached-registry sources. */
+export function getPlugins(): Promise<PluginsResponse> {
+  return apiFetch<PluginsResponse>("/api/plugins");
+}
+
 // ---------------------------------------------------------------------------
 // Doctor / Diagnostics
 // ---------------------------------------------------------------------------
@@ -2243,7 +2251,7 @@ export interface LogEvent {
   service?: { name: string; version: string };
   trace_id?: string | null;
   span_id?: string | null;
-  zeroclaw: Record<string, string> & { duration_ms?: number };
+  zeroclaw: Record<string, string | number | undefined> & { duration_ms?: number };
   message?: string;
   attributes?: Record<string, unknown>;
   schema_version?: number;
@@ -2277,6 +2285,7 @@ export interface LogsResponse {
    *  daemons predating multi-segment reads. */
   next_segment_cursor?: string | null;
   at_end: boolean;
+  persistence_enabled: boolean;
   /** True when a retained segment could not be read and was left out of this
    *  page. `at_end` then only means "no older events among the segments that
    *  could be read", so the UI must not present the buffer as the complete

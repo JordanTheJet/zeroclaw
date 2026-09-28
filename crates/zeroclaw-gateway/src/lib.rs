@@ -12,9 +12,9 @@ pub mod api;
 pub mod api_browse;
 pub mod api_config;
 pub mod api_logs;
+pub mod api_oidc;
 pub mod api_pairing;
 pub mod api_personality;
-#[cfg(feature = "plugins-wasm")]
 pub mod api_plugins;
 pub mod api_quickstart;
 pub mod api_sections;
@@ -39,6 +39,7 @@ pub mod nodes;
 pub mod openapi;
 #[cfg(feature = "plugins-wasm")]
 mod plugin_webhook;
+pub mod principal_gate;
 pub mod security_headers;
 pub mod session_queue;
 pub mod sse;
@@ -264,7 +265,7 @@ fn hash_webhook_secret(value: &str) -> String {
 const RATE_LIMITER_SWEEP_INTERVAL_SECS: u64 = 300; // 5 minutes
 
 #[derive(Debug)]
-struct SlidingWindowRateLimiter {
+pub(crate) struct SlidingWindowRateLimiter {
     limit_per_window: u32,
     window: Duration,
     max_keys: usize,
@@ -272,7 +273,7 @@ struct SlidingWindowRateLimiter {
 }
 
 impl SlidingWindowRateLimiter {
-    fn new(limit_per_window: u32, window: Duration, max_keys: usize) -> Self {
+    pub(crate) fn new(limit_per_window: u32, window: Duration, max_keys: usize) -> Self {
         Self {
             limit_per_window,
             window,
@@ -289,8 +290,16 @@ impl SlidingWindowRateLimiter {
     }
 
     fn allow(&self, key: &str) -> bool {
+        self.allow_or_retry_after(key).is_ok()
+    }
+
+    /// Consume one request from `key`'s budget. On refusal, the error is the
+    /// whole seconds until the oldest request still inside the window ages
+    /// out (rounded up, never below 1), which is what a caller puts in
+    /// `Retry-After`.
+    pub(crate) fn allow_or_retry_after(&self, key: &str) -> Result<(), u64> {
         if self.limit_per_window == 0 {
-            return true;
+            return Ok(());
         }
 
         let now = Instant::now();
@@ -325,11 +334,18 @@ impl SlidingWindowRateLimiter {
         entry.retain(|instant| *instant > cutoff);
 
         if entry.len() >= self.limit_per_window as usize {
-            return false;
+            // Timestamps are pushed in order, so the first one still inside
+            // the window is the one whose expiry frees the next slot.
+            let remaining = entry
+                .first()
+                .map(|oldest| self.window.saturating_sub(now.duration_since(*oldest)))
+                .unwrap_or(self.window);
+            let secs = remaining.as_secs() + u64::from(remaining.subsec_nanos() > 0);
+            return Err(secs.max(1));
         }
 
         entry.push(now);
-        true
+        Ok(())
     }
 }
 
@@ -621,7 +637,7 @@ fn forwarded_client_ip(headers: &HeaderMap) -> Option<IpAddr> {
         .and_then(parse_client_ip)
 }
 
-fn client_key_from_request(
+pub(crate) fn client_key_from_request(
     peer_addr: Option<SocketAddr>,
     headers: &HeaderMap,
     trust_forwarded_headers: bool,
@@ -781,12 +797,17 @@ pub struct AppState {
     pub sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     /// Shared SOP audit logger from the daemon (for WS agent sessions).
     pub sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
+    pub sop_driver_handles: Option<zeroclaw_runtime::sop::SopDriverHandles>,
 }
 
 /// Daemon-owned services whose lifecycle matches one supervised gateway run.
 pub struct GatewaySupervision {
     readiness: Option<zeroclaw_runtime::daemon::GatewayReadinessReporter>,
     plugin_webhooks: Arc<zeroclaw_api::webhook::PluginWebhookRegistry>,
+    /// The daemon generation's driver supervisor set. Approval surfaces
+    /// register resumed headless drivers here so a reload drains them with the
+    /// generation that owns them. `None` standalone, where no generation exists.
+    sop_driver_handles: Option<zeroclaw_runtime::sop::SopDriverHandles>,
 }
 
 impl GatewaySupervision {
@@ -795,15 +816,117 @@ impl GatewaySupervision {
     pub fn new(
         readiness: Option<zeroclaw_runtime::daemon::GatewayReadinessReporter>,
         plugin_webhooks: Arc<zeroclaw_api::webhook::PluginWebhookRegistry>,
+        sop_driver_handles: Option<zeroclaw_runtime::sop::SopDriverHandles>,
     ) -> Self {
         Self {
             readiness,
             plugin_webhooks,
+            sop_driver_handles,
         }
     }
 }
 
+/// The config/onboarding route group. Authentication is enforced
+/// structurally by the `route_layer` at the tail (see [`principal_gate`]),
+/// never per handler: every route whose handler lives in `api_config`,
+/// `api_quickstart`, or `api_sections` MUST be registered on THIS router,
+/// whatever its URL prefix.
+fn config_admin_router(inbound_auth: &Arc<principal_gate::GatewayInboundAuth>) -> Router<AppState> {
+    Router::new()
+        .route(
+            "/api/config",
+            get(api_config::handle_config_get)
+                .patch(api_config::handle_patch)
+                .options(api_config::handle_options_config),
+        )
+        .route(
+            "/api/config/prop",
+            get(api_config::handle_prop_get)
+                .put(api_config::handle_prop_put)
+                .delete(api_config::handle_prop_delete)
+                .options(api_config::handle_options_prop),
+        )
+        .route("/api/config/list", get(api_config::handle_list))
+        .route("/api/config/drift", get(api_config::handle_drift))
+        .route(
+            "/api/config/reload-status",
+            get(api_config::handle_reload_status),
+        )
+        .route("/api/config/templates", get(api_config::handle_templates))
+        .route("/api/config/map-keys", get(api_config::handle_get_map_keys))
+        .route(
+            "/api/config/resolve-alias-source",
+            get(api_config::handle_resolve_alias_source),
+        )
+        .route(
+            "/api/config/map-key",
+            post(api_config::handle_map_key).delete(api_config::handle_delete_map_key),
+        )
+        .route(
+            "/api/config/rename-map-key",
+            post(api_config::handle_rename_map_key),
+        )
+        .route(
+            "/api/config/model-providers/{type}/{alias}/refresh-context-window",
+            post(api_config::handle_refresh_context_window),
+        )
+        .route(
+            "/api/config/delete-plan",
+            get(api_config::handle_delete_plan),
+        )
+        .route("/api/config/catalog", get(api_sections::handle_catalog))
+        .route(
+            "/api/config/catalog/models",
+            get(api_sections::handle_catalog_models),
+        )
+        .route(
+            "/api/config/status",
+            get(api_sections::handle_section_status),
+        )
+        .route(
+            "/api/config/agent-options",
+            get(api_sections::handle_agent_options),
+        )
+        .route("/api/config/sections", get(api_sections::handle_sections))
+        .route(
+            "/api/config/sections/{section}",
+            get(api_sections::handle_section_picker),
+        )
+        .route(
+            "/api/config/sections/{section}/items/{key}",
+            post(api_sections::handle_section_select),
+        )
+        .route("/api/quickstart/state", get(api_quickstart::handle_state))
+        .route(
+            "/api/quickstart/fields",
+            post(api_quickstart::handle_fields),
+        )
+        .route(
+            "/api/quickstart/validate",
+            post(api_quickstart::handle_validate),
+        )
+        .route("/api/quickstart/apply", post(api_quickstart::handle_apply))
+        .route(
+            "/api/quickstart/dismiss",
+            post(api_quickstart::handle_dismiss),
+        )
+        .route("/api/config/init", post(api_config::handle_init))
+        .route("/api/config/migrate", post(api_config::handle_migrate))
+        .route(
+            "/api/channels/bind",
+            post(api_config::handle_api_channel_bind),
+        )
+        .route_layer(axum::middleware::from_fn_with_state(
+            Arc::clone(inbound_auth),
+            principal_gate::config_route_auth,
+        ))
+}
+
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
+#[allow(clippy::too_many_lines)]
+// One parameter per daemon-owned dependency; a bundling struct would only
+// move the list. Matches the existing allowance on the runtime spawn paths.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_gateway(
     host: &str,
     port: u16,
@@ -820,6 +943,13 @@ pub async fn run_gateway(
     // Shared SOP engine from the daemon. `None` when standalone — sessions build their own.
     sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
+    // The daemon's canonical live pairing authority, shared with the RPC
+    // native auth provider. `None` (standalone gateway) constructs a
+    // local guard from config as before.
+    shared_pairing: Option<PairingGuard>,
+    // The daemon generation's driver supervisor set: approval surfaces
+    // register resumed headless drivers here so reload drains them.
+    sop_driver_handles: Option<zeroclaw_runtime::sop::SopDriverHandles>,
     readiness: Option<zeroclaw_runtime::daemon::GatewayReadinessReporter>,
 ) -> Result<()> {
     Box::pin(run_gateway_with_plugin_webhooks(
@@ -832,9 +962,11 @@ pub async fn run_gateway(
         canvas_store,
         sop_engine,
         sop_audit,
+        shared_pairing,
         GatewaySupervision::new(
             readiness,
             Arc::new(zeroclaw_api::webhook::PluginWebhookRegistry::new()),
+            sop_driver_handles,
         ),
     ))
     .await
@@ -844,6 +976,7 @@ pub async fn run_gateway(
 /// webhook registry. Standalone callers use [`run_gateway`], because no channel
 /// supervisor exists there to publish live routes.
 #[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)] // supervised-run wiring; params mirror run_gateway plus the plugin webhook registry
 pub async fn run_gateway_with_plugin_webhooks(
     host: &str,
     port: u16,
@@ -854,11 +987,16 @@ pub async fn run_gateway_with_plugin_webhooks(
     canvas_store: Option<CanvasStore>,
     sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
+    // The daemon's canonical live pairing authority, shared with the RPC
+    // inbound-auth layer so pairing and revocation reach both surfaces.
+    // Standalone runs pass `None` and build their own guard from config.
+    shared_pairing: Option<PairingGuard>,
     supervision: GatewaySupervision,
 ) -> Result<()> {
     let GatewaySupervision {
         readiness,
         plugin_webhooks,
+        sop_driver_handles,
     } = supervision;
     // ── Security: warn on public bind without tunnel or explicit opt-in ──
     if is_public_bind(host)
@@ -1503,14 +1641,19 @@ pub async fn run_gateway_with_plugin_webhooks(
     };
 
     // ── Pairing guard ──────────────────────────────────────
-    // The pairing-code policy is resolved from config here and nowhere
-    // else: startup pairing, `gateway get-paircode --new`, the dashboard
-    // pairing flow, and rotate-device all issue through this guard.
-    let pairing = Arc::new(PairingGuard::new(
-        config.gateway.require_pairing,
-        &config.gateway.paired_tokens,
-        config.gateway.pairing_code,
-    ));
+    // Supervised runs share the daemon's live authority so pairing and
+    // revocation reach RPC authentication too; standalone constructs its
+    // own from config exactly as before. Either way the pairing-code policy
+    // is resolved from config in exactly one guard: startup pairing,
+    // `gateway get-paircode --new`, the dashboard pairing flow, and
+    // rotate-device all issue through it.
+    let pairing = Arc::new(shared_pairing.unwrap_or_else(|| {
+        PairingGuard::new(
+            config.gateway.require_pairing,
+            &config.gateway.paired_tokens,
+            config.gateway.pairing_code,
+        )
+    }));
     let rate_limit_max_keys = normalize_max_keys(
         config.gateway.rate_limit_max_keys,
         RATE_LIMIT_MAX_KEYS_DEFAULT,
@@ -1802,6 +1945,14 @@ pub async fn run_gateway_with_plugin_webhooks(
         None
     };
 
+    // The gateway's inbound-auth authority: same registry/resolver stack
+    // as the RPC layer, same canonical pairing guard. Its accepted policy
+    // moves only when a config mutation persists (see `persist_and_swap`).
+    let inbound_auth = Arc::new(principal_gate::GatewayInboundAuth::from_config(
+        &config,
+        Arc::clone(&pairing),
+    )?);
+
     let state = AppState {
         config: config_state,
         config_write_lock: zeroclaw_config::write_lock::shared_config_write_lock(),
@@ -1852,6 +2003,7 @@ pub async fn run_gateway_with_plugin_webhooks(
         tui_registry,
         sop_engine,
         sop_audit,
+        sop_driver_handles,
         #[cfg(feature = "webauthn")]
         webauthn: if config.security.webauthn.enabled {
             let secret_store = Arc::new(zeroclaw_runtime::security::SecretStore::new(
@@ -1880,10 +2032,13 @@ pub async fn run_gateway_with_plugin_webhooks(
 
     // Build router with middleware
     let inner = Router::new()
+        .merge(config_admin_router(&inbound_auth))
+        .merge(api_oidc::routes())
         // ── Admin routes (for CLI management) ──
         .route("/admin/shutdown", post(handle_admin_shutdown))
         .route("/admin/reload", post(handle_admin_reload))
         .route("/admin/sop/pending", get(api_sop::handle_sop_pending))
+        .route("/admin/sop/logs", get(api_sop::handle_sop_logs))
         .route("/admin/sop/approve", post(api_sop::handle_sop_approve))
         .route("/admin/sop/deny", post(api_sop::handle_sop_deny))
         .route("/admin/paircode", get(handle_admin_paircode))
@@ -1908,20 +2063,6 @@ pub async fn run_gateway_with_plugin_webhooks(
         )
         .route("/api/logs", get(api_logs::handle_api_logs))
         .route(
-            "/api/config",
-            get(api_config::handle_config_get)
-                .patch(api_config::handle_patch)
-                .options(api_config::handle_options_config),
-        )
-        .route(
-            "/api/config/prop",
-            get(api_config::handle_prop_get)
-                .put(api_config::handle_prop_put)
-                .delete(api_config::handle_prop_delete)
-                .options(api_config::handle_options_prop),
-        )
-        .route("/api/config/list", get(api_config::handle_list))
-        .route(
             "/api/sops",
             get(api_sop_author::handle_sops_list).post(api_sop_author::handle_sop_create),
         )
@@ -1936,6 +2077,10 @@ pub async fn run_gateway_with_plugin_webhooks(
         .route(
             "/api/sops/{name}/run",
             post(api_sop_author::handle_sop_run),
+        )
+        .route(
+            "/api/sops/{name}/rename",
+            post(api_sop_author::handle_sop_rename),
         )
         .route("/api/sops/runs", get(api_sop_author::handle_sop_runs))
         .route(
@@ -1953,6 +2098,10 @@ pub async fn run_gateway_with_plugin_webhooks(
         .route(
             "/api/sops/trigger-sources",
             get(api_sop_author::handle_sop_trigger_sources),
+        )
+        .route(
+            "/api/sops/decision-models",
+            get(api_sop_author::handle_sop_decision_models),
         )
         .route(
             "/api/sops/graph-legend",
@@ -1974,67 +2123,7 @@ pub async fn run_gateway_with_plugin_webhooks(
             "/api/sops/{name}/runs/{run_id}/cancel",
             post(api_sop_author::handle_sop_cancel),
         )
-        .route("/api/config/drift", get(api_config::handle_drift))
-        .route(
-            "/api/config/reload-status",
-            get(api_config::handle_reload_status),
-        )
-        .route("/api/config/templates", get(api_config::handle_templates))
-        .route("/api/config/map-keys", get(api_config::handle_get_map_keys))
-        .route(
-            "/api/config/resolve-alias-source",
-            get(api_config::handle_resolve_alias_source),
-        )
-        .route(
-            "/api/config/map-key",
-            post(api_config::handle_map_key).delete(api_config::handle_delete_map_key),
-        )
-        .route("/api/config/rename-map-key", post(api_config::handle_rename_map_key))
-        .route(
-            "/api/config/model-providers/{type}/{alias}/refresh-context-window",
-            post(api_config::handle_refresh_context_window),
-        )
-        .route("/api/config/delete-plan", get(api_config::handle_delete_plan))
-        .route("/api/config/catalog", get(api_sections::handle_catalog))
-        .route(
-            "/api/config/catalog/models",
-            get(api_sections::handle_catalog_models),
-        )
-        .route("/api/config/status", get(api_sections::handle_section_status))
-        .route(
-            "/api/config/agent-options",
-            get(api_sections::handle_agent_options),
-        )
-        .route("/api/config/sections", get(api_sections::handle_sections))
-        .route(
-            "/api/config/sections/{section}",
-            get(api_sections::handle_section_picker),
-        )
-        .route(
-            "/api/config/sections/{section}/items/{key}",
-            post(api_sections::handle_section_select),
-        )
         .route("/api/personality", get(api_personality::handle_index))
-        .route(
-            "/api/quickstart/state",
-            get(api_quickstart::handle_state),
-        )
-        .route(
-            "/api/quickstart/fields",
-            post(api_quickstart::handle_fields),
-        )
-        .route(
-            "/api/quickstart/validate",
-            post(api_quickstart::handle_validate),
-        )
-        .route(
-            "/api/quickstart/apply",
-            post(api_quickstart::handle_apply),
-        )
-        .route(
-            "/api/quickstart/dismiss",
-            post(api_quickstart::handle_dismiss),
-        )
         .route(
             "/api/personality/templates",
             get(api_personality::handle_templates),
@@ -2085,8 +2174,6 @@ pub async fn run_gateway_with_plugin_webhooks(
                 .put(api_skills::handle_write_skill)
                 .delete(api_skills::handle_delete_skill),
         )
-        .route("/api/config/init", post(api_config::handle_init))
-        .route("/api/config/migrate", post(api_config::handle_migrate))
         .route("/api/openapi.json", get(openapi::handle_openapi_json))
         .route("/api/docs", get(openapi::handle_docs))
         .route("/api/tools", get(api::handle_api_tools))
@@ -2119,10 +2206,6 @@ pub async fn run_gateway_with_plugin_webhooks(
         .route("/api/cost", get(api::handle_api_cost))
         .route("/api/cli-tools", get(api::handle_api_cli_tools))
         .route("/api/channels", get(api::handle_api_channels))
-        .route(
-            "/api/channels/bind",
-            post(api_config::handle_api_channel_bind),
-        )
         .route(
             "/api/channels/{channel}/relink",
             post(api::handle_api_channel_relink),
@@ -2202,12 +2285,9 @@ pub async fn run_gateway_with_plugin_webhooks(
             delete(api_webauthn::handle_delete_credential),
         );
 
-    // ── Plugin management API (requires plugins-wasm feature) ──
-    #[cfg(feature = "plugins-wasm")]
-    let inner = inner.route(
-        "/api/plugins",
-        get(api_plugins::plugin_routes::list_plugins),
-    );
+    // The read-only package catalog remains discoverable in every gateway
+    // build; WASM-specific sources degrade explicitly when support is absent.
+    let inner = inner.route("/api/plugins", get(api_plugins::list_plugins));
 
     let inner = inner
         // ── SSE event stream ──
@@ -2905,8 +2985,9 @@ pub(crate) async fn run_gateway_chat_with_tools(
             turn_usage.clone(),
             zeroclaw_runtime::agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
                 cost_tracking_context,
-                zeroclaw_runtime::agent::process_message(
+                zeroclaw_runtime::agent::process_message_with_live_config(
                     config,
+                    Arc::clone(&state.config),
                     &agent_alias,
                     message,
                     session_id,
@@ -5369,6 +5450,7 @@ mod tests {
             tui_registry: None,
             sop_engine: None,
             sop_audit: None,
+            sop_driver_handles: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         }
@@ -5414,6 +5496,7 @@ path = "{trigger_path}"
         let install_root = state.config.read().install_root_dir();
         let (engine, audit) = zeroclaw_runtime::sop::build_sop_engine(
             sop_config,
+            &std::collections::HashMap::new(),
             &data_dir,
             &install_root,
             Arc::clone(&state.mem),
@@ -5470,6 +5553,7 @@ path = "{trigger_path}"
         let install_root = state.config.read().install_root_dir();
         let (engine, audit) = zeroclaw_runtime::sop::build_sop_engine(
             sop_config,
+            &std::collections::HashMap::new(),
             &data_dir,
             &install_root,
             Arc::clone(&state.mem),
@@ -5565,6 +5649,48 @@ path = "{trigger_path}"
             )
             .expect("test device registry insert");
         token
+    }
+
+    #[tokio::test]
+    async fn plugin_catalog_rejects_missing_and_invalid_bearer_tokens() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = admin_paircode_state(&tmp, true, false);
+
+        let response = api_plugins::list_plugins(State(state.clone()), HeaderMap::new()).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer invalid-token"),
+        );
+        let response = api_plugins::list_plugins(State(state), headers).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn plugin_catalog_accepts_a_paired_bearer_in_every_gateway_build() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = admin_paircode_state(&tmp, true, true);
+        let token = pair_device(&state, "plugin-catalog-browser").await;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+
+        let response = api_plugins::list_plugins(State(state), headers).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["wasm_plugins_available"],
+            cfg!(feature = "plugins-wasm")
+        );
+        assert!(json["plugins"].is_array());
+        assert!(json["issues"].is_array());
     }
 
     async fn admin_paircode_response_json(
@@ -6030,6 +6156,8 @@ path = "{trigger_path}"
                 None,
                 None,
                 None,
+                None,
+                None,
             )
             .await
         });
@@ -6098,6 +6226,8 @@ path = "{trigger_path}"
                 None,
                 None,
                 None,
+                None,
+                None,
             )
             .await
         });
@@ -6145,6 +6275,8 @@ path = "{trigger_path}"
                 "127.0.0.1",
                 0,
                 config,
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -6216,6 +6348,8 @@ path = "{trigger_path}"
                 None,
                 None,
                 None,
+                None,
+                None,
                 Some(readiness),
             )
             .await
@@ -6279,6 +6413,8 @@ path = "{trigger_path}"
             "127.0.0.1",
             0,
             config,
+            None,
+            None,
             None,
             None,
             None,
@@ -6357,6 +6493,7 @@ path = "{trigger_path}"
             tui_registry: None,
             sop_engine: None,
             sop_audit: None,
+            sop_driver_handles: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -6443,6 +6580,7 @@ path = "{trigger_path}"
             tui_registry: None,
             sop_engine: None,
             sop_audit: None,
+            sop_driver_handles: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -7115,6 +7253,7 @@ path = "{trigger_path}"
             sop_audit: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
+            sop_driver_handles: None,
         }
     }
 
@@ -8697,6 +8836,7 @@ data: [DONE]\n\n";
             tui_registry: None,
             sop_engine: None,
             sop_audit: None,
+            sop_driver_handles: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -9616,6 +9756,7 @@ data: [DONE]\n\n";
             tui_registry: None,
             sop_engine: None,
             sop_audit: None,
+            sop_driver_handles: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -9737,6 +9878,7 @@ data: [DONE]\n\n";
             tui_registry: None,
             sop_engine: None,
             sop_audit: None,
+            sop_driver_handles: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -9837,6 +9979,7 @@ data: [DONE]\n\n";
             tui_registry: None,
             sop_engine: None,
             sop_audit: None,
+            sop_driver_handles: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -10044,6 +10187,7 @@ data: [DONE]\n\n";
             tui_registry: None,
             sop_engine: None,
             sop_audit: None,
+            sop_driver_handles: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -10131,6 +10275,7 @@ data: [DONE]\n\n";
             tui_registry: None,
             sop_engine: None,
             sop_audit: None,
+            sop_driver_handles: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -10223,6 +10368,7 @@ data: [DONE]\n\n";
             tui_registry: None,
             sop_engine: None,
             sop_audit: None,
+            sop_driver_handles: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -10320,6 +10466,7 @@ data: [DONE]\n\n";
             tui_registry: None,
             sop_engine: None,
             sop_audit: None,
+            sop_driver_handles: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -10412,6 +10559,7 @@ data: [DONE]\n\n";
             tui_registry: None,
             sop_engine: None,
             sop_audit: None,
+            sop_driver_handles: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -10511,6 +10659,7 @@ data: [DONE]\n\n";
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
+            sop_driver_handles: None,
             sop_audit: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
@@ -10661,6 +10810,7 @@ data: [DONE]\n\n";
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_handles: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -11545,6 +11695,7 @@ data: [DONE]\n\n";
             tui_registry: None,
             sop_engine: None,
             sop_audit: None,
+            sop_driver_handles: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         }
@@ -11630,6 +11781,7 @@ data: [DONE]\n\n";
             tui_registry: None,
             sop_engine: None,
             sop_audit: None,
+            sop_driver_handles: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -12242,6 +12394,7 @@ data: [DONE]\n\n";
             tui_registry: None,
             sop_engine: None,
             sop_audit: None,
+            sop_driver_handles: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         }
