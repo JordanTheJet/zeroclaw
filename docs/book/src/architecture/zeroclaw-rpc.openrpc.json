@@ -636,6 +636,40 @@
         ],
         "type": "object"
       },
+      "ConfigSetManyParams": {
+        "description": "An ordered batch of `config/set` entries committed as one unit: every\nentry is staged on a single working copy in order (a later entry for\nthe same prop wins), and the result is saved and installed once, or\nnot at all. Must contain at least one entry and at most the\ndispatcher's batch cap (256); either bound violated is `INVALID_PARAMS`.",
+        "properties": {
+          "sets": {
+            "items": {
+              "$ref": "#/components/schemas/ConfigSetParams"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "sets"
+        ],
+        "type": "object"
+      },
+      "ConfigSetManyResult": {
+        "properties": {
+          "props": {
+            "description": "The props written, in request order.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "set": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "props",
+          "set"
+        ],
+        "type": "object"
+      },
       "ConfigSetParams": {
         "description": "Value is polymorphic: a JSON string passes through as-is (backward\ncompat); any other JSON type is coerced via `coerce_for_set_prop`.",
         "properties": {
@@ -1638,6 +1672,13 @@
           },
           "key": {
             "type": "string"
+          },
+          "plane": {
+            "description": "Memory plane; see `MemoryListParams::plane`.",
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
@@ -1663,8 +1704,21 @@
       "MemoryGetParams": {
         "description": "`memory/get` params — fetch one entry's full content by key.",
         "properties": {
+          "agent": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "key": {
             "type": "string"
+          },
+          "plane": {
+            "description": "Memory plane; see `MemoryListParams::plane`.",
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
@@ -1689,6 +1743,13 @@
             ]
           },
           "category": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "plane": {
+            "description": "Memory plane: `\"private\"` (the caller's own; the default for every\nauthenticated principal) or `\"shared\"` (honoured only for callers\nwith the admin bypass, audited).",
             "type": [
               "string",
               "null"
@@ -1735,6 +1796,13 @@
             "format": "uint",
             "minimum": 0,
             "type": "integer"
+          },
+          "plane": {
+            "description": "Memory plane; see `MemoryListParams::plane`.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "query": {
             "type": "string"
@@ -1801,6 +1869,13 @@
           },
           "key": {
             "type": "string"
+          },
+          "plane": {
+            "description": "Memory plane; see `MemoryListParams::plane`.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "session_id": {
             "type": [
@@ -4558,6 +4633,32 @@
         "name": "result",
         "schema": {
           "$ref": "#/components/schemas/ConfigSetResult"
+        },
+        "x-zeroclaw-shape": "typed"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "config",
+        "verb": "update"
+      }
+    },
+    {
+      "name": "config/set-many",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "params",
+          "required": true,
+          "schema": {
+            "$ref": "#/components/schemas/ConfigSetManyParams"
+          },
+          "x-zeroclaw-shape": "typed"
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/ConfigSetManyResult"
         },
         "x-zeroclaw-shape": "typed"
       },
