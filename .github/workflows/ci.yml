@@ -1330,9 +1330,9 @@ jobs:
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
         run: bash scripts/ci/crates_preflight_trigger.sh "$EVENT_NAME" "$BASE_SHA" >> "$GITHUB_OUTPUT"
 
-  # Blocking by design: a flaky failure here is re-run, not bypassed. The
-  # release run's own preflight still gates the GitHub Release, so an admin
-  # override of this check cannot publish a broken crate.
+  # Blocking by design: retry an infrastructure failure and keep the bump
+  # unmerged until required CI is green. The release run independently
+  # repeats the preflight before publishing the GitHub Release.
   crates-preflight:
     name: crates.io Package Preflight
     needs: [crates-preflight-changes]
