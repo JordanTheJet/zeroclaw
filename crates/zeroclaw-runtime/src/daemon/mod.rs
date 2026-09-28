@@ -100,13 +100,15 @@ impl GatewayReadinessReporter {
     }
 }
 
-/// Start the live-pricing refresher for the process that owns the runtime.
+/// Start the live-pricing refresher for a standalone command that owns the
+/// runtime without a daemon (`zeroclaw gateway`, `zeroclaw channel start`).
 ///
-/// The daemon calls this once per generation, and the standalone
-/// `zeroclaw gateway` command calls it when there is no daemon. Each call
-/// re-binds the refresher to the given config, so a reload is honored without
-/// a restart, and the refresher itself starts at most once per process. It is
-/// a no-op unless a provider sets `live_pricing = true`.
+/// The daemon does not use this: it starts the refresher on its generation's
+/// shared live configuration. A standalone command has no such handle, so
+/// this binds a copy of `config`; the standalone gateway then re-binds the
+/// refresher to the live handle its config API writes. The refresher starts at
+/// most once per process and is a no-op unless a provider sets
+/// `live_pricing = true`.
 pub fn spawn_pricing_refresher(config: &Config) {
     zeroclaw_providers::pricing::spawn_refresher(std::sync::Arc::new(parking_lot::RwLock::new(
         config.clone(),
@@ -578,10 +580,6 @@ pub async fn run(
 
     crate::agent::pricing_catalog::load_global_pricing_catalog(&config.data_dir);
 
-    // The daemon owns the live-pricing refresher, so it runs whether or not the
-    // gateway is enabled.
-    spawn_pricing_refresher(&config);
-
     let mut handles: Vec<JoinHandle<()>> = vec![spawn_state_writer(config.clone())];
     let mut channels_handle: Option<JoinHandle<()>> = None;
 
@@ -623,6 +621,12 @@ pub async fn run(
     // through either surface therefore binds the other before the writer
     // returns, not at the next daemon reload.
     let live_config = std::sync::Arc::new(parking_lot::RwLock::new(config.clone()));
+    // The daemon owns the live-pricing refresher, so it runs whether or not the
+    // gateway is enabled. It follows this generation's live configuration, the
+    // one the RPC context and the supervised gateway both write in place, so
+    // an operator's change reaches the next refresh from either surface
+    // without a reload. A reload starts a new generation and re-binds it.
+    zeroclaw_providers::pricing::spawn_refresher(std::sync::Arc::clone(&live_config));
     let inbound_auth = std::sync::Arc::new(
         crate::rpc::auth::RpcInboundAuth::from_config(&config, pairing_guard.clone()).map_err(
             |e| anyhow::Error::msg(format!("building the inbound authentication layer: {e:#}")),
@@ -6631,24 +6635,26 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert!(
-            !zeroclaw_providers::pricing::refresher_running(),
-            "nothing else in this process opts into live pricing"
-        );
-
         // No gateway is registered: the daemon runs with the gateway disabled.
         let registry = DaemonRegistry::new();
         let daemon = run(config, "127.0.0.1".to_string(), 0, registry, false, false);
         tokio::pin!(daemon);
 
         let deadline = Instant::now() + Duration::from_secs(5);
+        // The refresher starts once per process, so another test may already
+        // have started it. What this run must do is bind it to this daemon's
+        // opted-in live configuration: the other daemon tests hold the same
+        // lock and leave the binding opted out, so it only turns true here.
         loop {
-            if zeroclaw_providers::pricing::refresher_running() {
+            if zeroclaw_providers::pricing::refresher_running()
+                && zeroclaw_providers::pricing::live_pricing_enabled()
+            {
                 break;
             }
             assert!(
                 Instant::now() < deadline,
-                "the daemon must start the pricing refresher without a gateway"
+                "the daemon must start the pricing refresher on its live configuration \
+                 without a gateway"
             );
             tokio::select! {
                 result = &mut daemon => panic!("daemon exited before the check: {result:?}"),
@@ -6810,5 +6816,76 @@ mod tests {
                 "hooks enabled = {hooks_enabled}: the gateway starter's readiness reporter"
             );
         }
+    }
+
+    /// In daemon mode the refresher follows the generation's shared live
+    /// configuration: the handle the RPC context writes and hands to the
+    /// supervised gateway. A write through that handle, as either surface's
+    /// config API makes, must reach the refresher without a reload.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn a_live_config_write_reaches_the_daemon_pricing_refresher_without_a_reload() {
+        use std::sync::Arc;
+        use tokio::time::{Duration, Instant, sleep};
+
+        let _broadcast_guard = hold_log_broadcast();
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        config.providers.models.ollama.insert(
+            "priced".to_string(),
+            zeroclaw_config::schema::OllamaModelProviderConfig {
+                base: zeroclaw_config::schema::ModelProviderConfig {
+                    uri: Some("http://127.0.0.1:9".to_string()),
+                    model: Some("priced-model".to_string()),
+                    live_pricing: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+
+        // The gateway starter captures the live configuration the daemon hands it.
+        let handed = Arc::new(std::sync::Mutex::new(None));
+        let mut registry = DaemonRegistry::new();
+        {
+            let handed = handed.clone();
+            registry.register_gateway(Box::new(
+                move |_host, _port, _config, _event_tx, _reload, _tui, authority, _ready| {
+                    *handed.lock().unwrap() = authority.map(|authority| authority.config);
+                    Box::pin(std::future::pending::<Result<()>>())
+                },
+            ));
+        }
+
+        let daemon = run(config, "127.0.0.1".to_string(), 0, registry, false, false);
+        tokio::pin!(daemon);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let live = loop {
+            if let Some(live) = handed.lock().unwrap().clone() {
+                break live;
+            }
+            assert!(Instant::now() < deadline, "the gateway starter must run");
+            tokio::select! {
+                result = &mut daemon => panic!("daemon exited early: {result:?}"),
+                () = sleep(Duration::from_millis(10)) => {}
+            }
+        };
+        assert!(
+            zeroclaw_providers::pricing::live_pricing_enabled(),
+            "the refresher follows the generation's live configuration, which opts in"
+        );
+
+        live.write()
+            .providers
+            .models
+            .ollama
+            .get_mut("priced")
+            .expect("the opted-in provider exists")
+            .base
+            .live_pricing = false;
+        assert!(
+            !zeroclaw_providers::pricing::live_pricing_enabled(),
+            "a write to the shared live configuration must reach the refresher without a reload"
+        );
     }
 }
