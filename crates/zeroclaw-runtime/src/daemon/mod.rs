@@ -2991,8 +2991,13 @@ mod tests {
     /// as the observer broadcast hook, which would take observer events meant
     /// for a hook-capturing test. Those tests serialize on these two locks; a
     /// lifecycle test that calls `run` without them makes theirs miss events.
+    ///
+    /// Async because the observer lock is a `tokio` mutex. The name differs
+    /// from the old synchronous `hold_log_broadcast` on purpose: a call written
+    /// against that helper would otherwise compile to an un-awaited future
+    /// that takes no lock at all.
     #[must_use]
-    async fn hold_log_broadcast() -> (impl Drop, impl Drop) {
+    async fn hold_broadcast_hooks() -> (impl Drop, impl Drop) {
         let observer_hook = crate::observability::HOOK_TEST_LOCK.lock().await;
         (zeroclaw_log::__private_test_hook_lock(), observer_hook)
     }
@@ -4158,7 +4163,7 @@ mod tests {
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn registry_gateway_starter_can_trigger_daemon_reload() {
-        let _broadcast_guard = hold_log_broadcast().await;
+        let _broadcast_guard = hold_broadcast_hooks().await;
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp);
         let expected_data_dir = config.data_dir.clone();
@@ -4241,7 +4246,7 @@ mod tests {
     async fn initial_socket_addr_in_use_fails_daemon_startup() {
         use std::io;
 
-        let _broadcast_guard = hold_log_broadcast().await;
+        let _broadcast_guard = hold_broadcast_hooks().await;
         for startup_feedback_enabled in [false, true] {
             let tmp = TempDir::new().unwrap();
             let config = test_config(&tmp);
@@ -4325,7 +4330,7 @@ mod tests {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        let _broadcast_guard = hold_log_broadcast().await;
+        let _broadcast_guard = hold_broadcast_hooks().await;
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp);
         let attempts = Arc::new(AtomicUsize::new(0));
@@ -4375,7 +4380,7 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use tokio::time::{Duration, timeout};
 
-        let _broadcast_guard = hold_log_broadcast().await;
+        let _broadcast_guard = hold_broadcast_hooks().await;
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(&tmp);
         config.reliability.channel_initial_backoff_secs = 1;
@@ -4432,7 +4437,7 @@ mod tests {
         use std::sync::atomic::{AtomicBool, Ordering};
         use tokio::time::{Duration, Instant, timeout};
 
-        let _broadcast_guard = hold_log_broadcast().await;
+        let _broadcast_guard = hold_broadcast_hooks().await;
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp);
 
@@ -4516,7 +4521,7 @@ mod tests {
     async fn scheduler_cooperative_shutdown_observed_through_daemon_reload() {
         use tokio::time::{Duration, timeout};
 
-        let _broadcast_guard = hold_log_broadcast().await;
+        let _broadcast_guard = hold_broadcast_hooks().await;
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(&tmp);
         config.scheduler.enabled = true;
@@ -6704,7 +6709,7 @@ mod tests {
     async fn pricing_refresher_runs_with_the_gateway_disabled() {
         use tokio::time::{Duration, Instant, sleep};
 
-        let _broadcast_guard = hold_log_broadcast();
+        let _broadcast_guard = hold_broadcast_hooks().await;
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(&tmp);
         config.providers.models.ollama.insert(
@@ -6866,7 +6871,7 @@ mod tests {
         use std::sync::atomic::{AtomicU8, Ordering};
         use tokio::time::{Duration, Instant, sleep};
 
-        let _broadcast_guard = hold_log_broadcast();
+        let _broadcast_guard = hold_broadcast_hooks().await;
         for (hooks_enabled, expect_reporter) in [(true, true), (false, false)] {
             let tmp = TempDir::new().unwrap();
             let mut config = test_config(&tmp);
@@ -6914,7 +6919,7 @@ mod tests {
         use std::sync::Arc;
         use tokio::time::{Duration, Instant, sleep};
 
-        let _broadcast_guard = hold_log_broadcast();
+        let _broadcast_guard = hold_broadcast_hooks().await;
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(&tmp);
         config.providers.models.ollama.insert(
