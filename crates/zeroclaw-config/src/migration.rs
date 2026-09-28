@@ -6,7 +6,95 @@ use crate::schema::v1::V1Config;
 use crate::schema::v2::V2Config;
 
 /// The schema version this binary writes and expects on disk.
-pub const CURRENT_SCHEMA_VERSION: u32 = 3;
+///
+/// V4 retires keys listed in [`RETIRED_KEYS`] (first: `[security.nevis]`).
+pub const CURRENT_SCHEMA_VERSION: u32 = 4;
+
+/// Something a migration changed or assumed about the operator's config.
+///
+/// Migrations report these instead of discarding or rewriting anything
+/// silently. They carry key paths and reasons only, never values: a retired
+/// table may hold a plaintext secret.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum MigrationNotice {
+    /// The file has no `schema_version`, so it was read as V1 and migrated
+    /// from there. The V1 migration folds channel sections into a `default`
+    /// alias, so a newer config missing only this key loses its aliases.
+    AssumedV1,
+    /// A retired key was removed.
+    Removed { path: String, reason: &'static str },
+    /// A retired key was moved to its replacement.
+    Renamed {
+        from: String,
+        to: String,
+        reason: &'static str,
+    },
+    /// A retired key was removed without being moved, because its
+    /// replacement was already set (the replacement wins).
+    RenameConflict {
+        from: String,
+        to: String,
+        reason: &'static str,
+    },
+}
+
+impl MigrationNotice {
+    /// One-line English description, for logs and as the fallback for
+    /// localized CLI output.
+    pub fn message(&self) -> String {
+        match self {
+            Self::AssumedV1 => "config has no `schema_version`, so it was read as schema V1 and \
+                 migrated from there. The V1 migration merges channel sections into a \
+                 `default` alias; if this file was written for a newer ZeroClaw, add \
+                 `schema_version` at the top with the version it was written for, \
+                 restore any lost channel aliases, and run `zeroclaw config migrate`."
+                .to_string(),
+            Self::Removed { path, reason } => {
+                format!("removed retired config key `{path}`: {reason}")
+            }
+            Self::Renamed { from, to, reason } => {
+                format!("moved retired config key `{from}` to `{to}`: {reason}")
+            }
+            Self::RenameConflict { from, to, reason } => format!(
+                "removed retired config key `{from}` without moving it, because `{to}` \
+                 is already set: {reason}"
+            ),
+        }
+    }
+}
+
+/// How a retired key is carried into the schema version that retires it.
+#[derive(Debug, Clone, Copy)]
+pub enum Retirement {
+    /// Delete the key (and everything under it).
+    Remove,
+    /// Move the key's value to `to`, unless `to` is already set.
+    Rename { to: &'static [&'static str] },
+}
+
+/// One retired config key.
+#[derive(Debug, Clone, Copy)]
+pub struct RetiredKey {
+    /// The schema version whose migration step retires the key.
+    pub retired_in: u32,
+    /// Path from the config root, one segment per table key.
+    pub path: &'static [&'static str],
+    pub retirement: Retirement,
+    /// Why it was retired and what to use instead. Shown to the operator.
+    pub reason: &'static str,
+}
+
+/// Every retired key, applied by the migration chain when it reaches
+/// `retired_in`. Retiring another key is one entry here, plus a version bump
+/// (a new `MIGRATION_STEPS` entry) if no pending version already covers it.
+pub const RETIRED_KEYS: &[RetiredKey] = &[RetiredKey {
+    retired_in: 4,
+    path: &["security", "nevis"],
+    retirement: Retirement::Remove,
+    reason: "the Nevis IAM integration was removed; configure `[oidc.<alias>]` with \
+             `[users]` and `[permission_profiles]` instead",
+}];
 
 pub(crate) struct ConfigLoadAttribution;
 
@@ -59,8 +147,16 @@ pub fn detect_version(value: &toml::Value) -> Result<u32> {
     }
 }
 
-pub fn migrate_file(input: &str) -> Result<Option<String>> {
-    let value: toml::Value = toml::from_str(input).context("failed to parse config TOML")?;
+/// A parsed config carried to the current schema version, with what changed.
+struct Migrated {
+    value: toml::Value,
+    notices: Vec<MigrationNotice>,
+}
+
+/// Carry a parsed config to [`CURRENT_SCHEMA_VERSION`]. `Ok(None)` when it is
+/// already current. Every notice is also logged at WARN; callers that talk to
+/// an operator must surface them too, since WARN is hidden without `-v`.
+fn migrate_toml(value: toml::Value) -> Result<Option<Migrated>> {
     let from = detect_version(&value)?;
     if from == CURRENT_SCHEMA_VERSION {
         return Ok(None);
@@ -80,8 +176,37 @@ pub fn migrate_file(input: &str) -> Result<Option<String>> {
             "config schema_version {from} is newer than this binary supports ({CURRENT_SCHEMA_VERSION})"
         );
     }
-    let migrated_value = run_chain(value, from)?;
-    let migrated_table = match migrated_value {
+    let mut notices = Vec::new();
+    if value
+        .as_table()
+        .is_some_and(|root| !root.contains_key("schema_version"))
+    {
+        notices.push(MigrationNotice::AssumedV1);
+    }
+    let value = run_chain(value, from, &mut notices)?;
+    for notice in &notices {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({ "notice": notice })),
+            &notice.message()
+        );
+    }
+    Ok(Some(Migrated { value, notices }))
+}
+
+pub fn migrate_file(input: &str) -> Result<Option<String>> {
+    Ok(migrate_file_with_notices(input)?.map(|(migrated, _)| migrated))
+}
+
+/// [`migrate_file`], also returning what the migration changed or assumed.
+pub fn migrate_file_with_notices(input: &str) -> Result<Option<(String, Vec<MigrationNotice>)>> {
+    let value: toml::Value = toml::from_str(input).context("failed to parse config TOML")?;
+    let Some(Migrated { value, notices }) = migrate_toml(value)? else {
+        return Ok(None);
+    };
+    let migrated_table = match value {
         toml::Value::Table(t) => t,
         _ => {
             anyhow::bail!("migrated config is not a TOML table");
@@ -93,11 +218,11 @@ pub fn migrate_file(input: &str) -> Result<Option<String>> {
     // already succeeded on it), fall back to a fresh serialization.
     if let Ok(mut doc) = input.parse::<toml_edit::DocumentMut>() {
         sync_table(doc.as_table_mut(), &migrated_table);
-        Ok(Some(doc.to_string()))
+        Ok(Some((doc.to_string(), notices)))
     } else {
         let serialized = toml::to_string_pretty(&toml::Value::Table(migrated_table))
             .context("failed to serialize migrated config")?;
-        Ok(Some(serialized))
+        Ok(Some((serialized, notices)))
     }
 }
 
@@ -134,7 +259,7 @@ pub fn generate(target_version: u32, opts: &GenerateOptions<'_>) -> Result<Strin
     } else {
         let v1_value: toml::Value =
             toml::from_str(V1_FIXTURE).context("embedded V1 fixture is malformed")?;
-        run_chain_until(v1_value, 1, target_version)?
+        run_chain_until(v1_value, 1, target_version, &mut Vec::new())?
     };
 
     let mut value = value;
@@ -220,7 +345,7 @@ fn encrypt_in_place(value: &mut toml::Value, store: &crate::secrets::SecretStore
 /// that needs the precise failure. Daemon load uses the resilient path.
 pub fn migrate_to_current(input: &str) -> Result<Config> {
     let _attribution = ::zeroclaw_log::attribution_span!(&ConfigLoadAttribution).entered();
-    let final_value = migrate_value(input)?;
+    let (final_value, _notices) = migrate_value(input)?;
     final_value
         .try_into()
         .context("migrated config failed to deserialize as current schema")
@@ -257,11 +382,13 @@ pub struct ResilientLoad {
     /// [`SECURITY_CRITICAL_KEYS`] sections dropped to `Default` (logged ERROR).
     /// Non-empty means the running posture may be weaker than intended.
     pub dropped_security: Vec<String>,
+    /// What migrating to the current schema changed or assumed.
+    pub notices: Vec<MigrationNotice>,
 }
 
 pub fn migrate_to_current_salvaged(input: &str) -> ResilientLoad {
-    let value = match migrate_value(input) {
-        Ok(value) => value,
+    let (value, notices) = match migrate_value(input) {
+        Ok(migrated) => migrated,
         Err(err) => {
             ::zeroclaw_log::record!(
                 ERROR,
@@ -278,35 +405,23 @@ pub fn migrate_to_current_salvaged(input: &str) -> ResilientLoad {
                 // security-critical section is gone, so mark it so the serving
                 // gate refuses to start without an explicit override.
                 dropped_security: vec![WHOLE_CONFIG_SENTINEL.to_string()],
+                notices: Vec::new(),
             };
         }
     };
-    deserialize_resilient(value)
+    ResilientLoad {
+        notices,
+        ..deserialize_resilient(value)
+    }
 }
 
 /// Parse + migrate to the current schema version as a `toml::Value`, without
 /// the final typed deserialize. Shared by the strict and resilient entries.
-fn migrate_value(input: &str) -> Result<toml::Value> {
+fn migrate_value(input: &str) -> Result<(toml::Value, Vec<MigrationNotice>)> {
     let value: toml::Value = toml::from_str(input).context("failed to parse config TOML")?;
-    let from = detect_version(&value)?;
-    if from == CURRENT_SCHEMA_VERSION {
-        Ok(value)
-    } else if from > CURRENT_SCHEMA_VERSION {
-        ::zeroclaw_log::record!(
-            ERROR,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                .with_attrs(::serde_json::json!({
-                    "from_version": from,
-                    "supported_version": CURRENT_SCHEMA_VERSION,
-                })),
-            "config schema_version is newer than this binary supports"
-        );
-        anyhow::bail!(
-            "config schema_version {from} is newer than this binary supports ({CURRENT_SCHEMA_VERSION})"
-        )
-    } else {
-        run_chain(value, from)
+    match migrate_toml(value.clone())? {
+        Some(Migrated { value, notices }) => Ok((value, notices)),
+        None => Ok((value, Vec::new())),
     }
 }
 
@@ -319,6 +434,7 @@ fn deserialize_resilient(value: toml::Value) -> ResilientLoad {
             config,
             dropped: Vec::new(),
             dropped_security: Vec::new(),
+            notices: Vec::new(),
         };
     }
 
@@ -393,6 +509,7 @@ fn deserialize_resilient(value: toml::Value) -> ResilientLoad {
         config,
         dropped: dropped_plain,
         dropped_security,
+        notices: Vec::new(),
     }
 }
 
@@ -607,8 +724,8 @@ pub fn migrate_file_in_place(path: &Path) -> Result<Option<MigrateReport>> {
     let _attribution = ::zeroclaw_log::attribution_span!(&ConfigLoadAttribution).entered();
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read config at {}", path.display().to_string()))?;
-    let migrated = match migrate_file(&raw)? {
-        Some(s) => s,
+    let (migrated, notices) = match migrate_file_with_notices(&raw)? {
+        Some(migrated) => migrated,
         None => return Ok(None),
     };
     let parent = path.parent().with_context(|| {
@@ -698,6 +815,7 @@ pub fn migrate_file_in_place(path: &Path) -> Result<Option<MigrateReport>> {
     Ok(Some(MigrateReport {
         backup_path,
         to_version: CURRENT_SCHEMA_VERSION,
+        notices,
     }))
 }
 
@@ -733,6 +851,8 @@ fn sync_directory(path: &Path) -> Result<()> {
 pub struct MigrateReport {
     pub backup_path: std::path::PathBuf,
     pub to_version: u32,
+    /// What the migration changed or assumed, for the operator.
+    pub notices: Vec<MigrationNotice>,
 }
 
 pub fn ensure_disk_at_current_version(path: &Path) -> Result<()> {
@@ -815,6 +935,9 @@ const MIGRATION_STEPS: &[MigrationStep] = &[
             .context("failed to deserialize as V2 schema")?;
         v2.migrate().context("failed to migrate V2 → V3")
     },
+    // V3 → V4: no shape change; the chain applies the V4 entries in
+    // `RETIRED_KEYS` after this step.
+    |value| stamp_schema_version(value, 4),
 ];
 
 const _: () = assert!(
@@ -825,11 +948,20 @@ const _: () = assert!(
 
 /// Run the typed migration chain from `from` up to `CURRENT_SCHEMA_VERSION`.
 /// `from` must be `< CURRENT_SCHEMA_VERSION` (caller checks).
-fn run_chain(value: toml::Value, from: u32) -> Result<toml::Value> {
-    run_chain_until(value, from, CURRENT_SCHEMA_VERSION)
+fn run_chain(
+    value: toml::Value,
+    from: u32,
+    notices: &mut Vec<MigrationNotice>,
+) -> Result<toml::Value> {
+    run_chain_until(value, from, CURRENT_SCHEMA_VERSION, notices)
 }
 
-fn run_chain_until(value: toml::Value, from: u32, target: u32) -> Result<toml::Value> {
+fn run_chain_until(
+    value: toml::Value,
+    from: u32,
+    target: u32,
+    notices: &mut Vec<MigrationNotice>,
+) -> Result<toml::Value> {
     if target < from {
         anyhow::bail!("cannot migrate backwards from V{from} to V{target}");
     }
@@ -840,11 +972,114 @@ fn run_chain_until(value: toml::Value, from: u32, target: u32) -> Result<toml::V
     }
 
     let mut cur = value;
-    for step in &MIGRATION_STEPS[from as usize..target as usize] {
+    for (index, step) in MIGRATION_STEPS
+        .iter()
+        .enumerate()
+        .take(target as usize)
+        .skip(from as usize)
+    {
         cur = step(cur)?;
+        // Step `index` produces schema version `index + 1`.
+        apply_retired_keys(&mut cur, index as u32 + 1, RETIRED_KEYS, notices);
         strip_retired_node_transport(&mut cur);
     }
     Ok(cur)
+}
+
+fn stamp_schema_version(mut value: toml::Value, version: u32) -> Result<toml::Value> {
+    value
+        .as_table_mut()
+        .context("config root must be a TOML table")?
+        .insert(
+            "schema_version".to_string(),
+            toml::Value::Integer(i64::from(version)),
+        );
+    Ok(value)
+}
+
+/// Apply every entry of `table` retired in `version`, recording a notice for
+/// each key that was actually present. Keys that are absent change nothing.
+fn apply_retired_keys(
+    value: &mut toml::Value,
+    version: u32,
+    table: &[RetiredKey],
+    notices: &mut Vec<MigrationNotice>,
+) {
+    let Some(root) = value.as_table_mut() else {
+        return;
+    };
+    for key in table.iter().filter(|key| key.retired_in == version) {
+        let Some(taken) = take_path(root, key.path) else {
+            continue;
+        };
+        let from = key.path.join(".");
+        let notice = match key.retirement {
+            Retirement::Remove => MigrationNotice::Removed {
+                path: from,
+                reason: key.reason,
+            },
+            Retirement::Rename { to } => {
+                let to_path = to.join(".");
+                if put_path_if_vacant(root, to, taken) {
+                    MigrationNotice::Renamed {
+                        from,
+                        to: to_path,
+                        reason: key.reason,
+                    }
+                } else {
+                    MigrationNotice::RenameConflict {
+                        from,
+                        to: to_path,
+                        reason: key.reason,
+                    }
+                }
+            }
+        };
+        notices.push(notice);
+    }
+}
+
+/// Remove and return the value at `path`, if every segment exists.
+fn take_path(root: &mut toml::Table, path: &[&str]) -> Option<toml::Value> {
+    let (last, parents) = path.split_last()?;
+    let mut table = root;
+    for segment in parents {
+        table = table.get_mut(*segment)?.as_table_mut()?;
+    }
+    table.remove(*last)
+}
+
+/// Insert `value` at `path`, creating missing parent tables. Returns `false`,
+/// leaving the config unchanged, when `path` is already set or a parent
+/// segment is not a table.
+fn put_path_if_vacant(root: &mut toml::Table, path: &[&str], value: toml::Value) -> bool {
+    let Some((last, parents)) = path.split_last() else {
+        return false;
+    };
+    // Check the whole path first, so a refusal creates no parent tables.
+    let mut probe = Some(&*root);
+    for segment in parents {
+        probe = match probe.and_then(|table| table.get(*segment)) {
+            None => None,
+            Some(toml::Value::Table(next)) => Some(next),
+            Some(_) => return false,
+        };
+    }
+    if probe.is_some_and(|table| table.contains_key(*last)) {
+        return false;
+    }
+    let mut table = root;
+    for segment in parents {
+        let entry = table
+            .entry((*segment).to_string())
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+        let Some(next) = entry.as_table_mut() else {
+            return false;
+        };
+        table = next;
+    }
+    table.insert((*last).to_string(), value);
+    true
 }
 
 fn strip_retired_node_transport(value: &mut toml::Value) {
@@ -944,7 +1179,7 @@ mod tests {
     fn broken_channel_alias_is_dropped_not_fatal() {
         // Email alias missing required `imap_host` must not abort the load.
         let raw = r#"
-schema_version = 3
+schema_version = 4
 
 [channels.email.fakeemail]
 enabled = true
@@ -970,7 +1205,7 @@ from_address = "a@example.com"
         // an explicit `bot_token = ""`. Runtime safety is enforced
         // separately by `validate_bot_token` when `enabled = true`.
         let raw = r#"
-schema_version = 3
+schema_version = 4
 
 [channels.telegram.default]
 enabled = true
@@ -996,7 +1231,7 @@ enabled = true
         // exact path recorded so `doctor` can name it (see zeroclaw-runtime's
         // check_degraded_sections).
         let raw = r#"
-schema_version = 3
+schema_version = 4
 
 [channels.telegram.bad]
 enabled = true
@@ -1022,7 +1257,7 @@ bot_token = 42
         // alias with no `bot_token` must survive salvage now that
         // `DiscordConfig.bot_token` also has `#[serde(default)]`.
         let raw = r#"
-schema_version = 3
+schema_version = 4
 
 [channels.discord.default]
 enabled = true
@@ -1047,7 +1282,7 @@ enabled = true
         // [channels.telegram.default] (bot_token present) must survive
         // intact and must not appear in `dropped`.
         let raw = r#"
-schema_version = 3
+schema_version = 4
 
 [channels.telegram.default]
 enabled = true
@@ -1071,7 +1306,7 @@ bot_token = "t"
         // one malformed provider alias must not take the whole [providers]
         // section (and every other provider) down with it.
         let raw = r#"
-schema_version = 3
+schema_version = 4
 
 [providers.models.ollama.ai]
 model = "qwen3:30b"
@@ -2891,10 +3126,10 @@ vision_model_provider = "custom:https://vision.example.invalid"
         // loader, and prune_bad_provider_aliases carries expect() calls that
         // rely on the scalar pre-passes; pin that invariant here.
         for raw in [
-            "schema_version = 3\nproviders = 3\n",
-            "schema_version = 3\n[[providers.models.ollama]]\nmodel = \"x\"\n",
-            "schema_version = 3\n[providers.models.ollama]\nai = [1, 2]\n",
-            "schema_version = 3\n[providers.models]\nollama = [1]\n",
+            "schema_version = 4\nproviders = 3\n",
+            "schema_version = 4\n[[providers.models.ollama]]\nmodel = \"x\"\n",
+            "schema_version = 4\n[providers.models.ollama]\nai = [1, 2]\n",
+            "schema_version = 4\n[providers.models]\nollama = [1]\n",
         ] {
             let _ = migrate_to_current_salvaged(raw);
         }
@@ -2905,7 +3140,7 @@ vision_model_provider = "custom:https://vision.example.invalid"
         // A scalar where a family/kind table is required must drop only
         // that node, not the whole [providers] section.
         let raw = r#"
-schema_version = 3
+schema_version = 4
 
 [providers.models]
 ollama = "oops"
@@ -2929,7 +3164,7 @@ model = "m"
     #[test]
     fn valid_alias_survives_broken_sibling() {
         let raw = r#"
-schema_version = 3
+schema_version = 4
 
 [channels.email.broken]
 enabled = true
@@ -2962,7 +3197,7 @@ from_address = "a@example.com"
         // A type mismatch outside the channel maps must NOT abort the daemon:
         // the section is dropped to its default so the operator can repair it.
         let raw = r#"
-schema_version = 3
+schema_version = 4
 
 [heartbeat]
 enabled = "not-a-bool"
@@ -3022,7 +3257,7 @@ enabled = "not-a-bool"
     fn unsalvageable_root_marks_whole_config_degraded() {
         // A root that is not a table cannot be salvaged section-by-section; the
         // final deserialize fallback defaults the whole config and must mark it.
-        let raw = "schema_version = 3\nthis_is_a_bare_top_level = \"value\"\n[\n";
+        let raw = "schema_version = 4\nthis_is_a_bare_top_level = \"value\"\n[\n";
         let load = migrate_to_current_salvaged(raw);
         assert!(
             !load.dropped_security.is_empty(),
@@ -3035,7 +3270,7 @@ enabled = "not-a-bool"
     fn strict_path_still_errors_for_tooling() {
         // `migrate_to_current` stays strict — repair tooling needs the error.
         let raw = r#"
-schema_version = 3
+schema_version = 4
 
 [channels.email.fakeemail]
 enabled = true
@@ -3057,7 +3292,7 @@ from_address = "a@example.com"
         // re-opens the shared-operator fallback. It must surface as a
         // security-critical drop so exposure gating can react.
         let raw = r#"
-schema_version = 3
+schema_version = 4
 
 [users.alice]
 uid = "not-an-integer"
@@ -3074,7 +3309,7 @@ permission_profiles = ["operator"]
     #[test]
     fn broken_security_section_is_reported_as_degraded() {
         let raw = r#"
-schema_version = 3
+schema_version = 4
 
 [security]
 audit = "should-be-a-table-not-a-string"
@@ -3093,7 +3328,7 @@ audit = "should-be-a-table-not-a-string"
     #[test]
     fn broken_non_security_section_is_plain_drop_not_security() {
         let raw = r#"
-schema_version = 3
+schema_version = 4
 
 [heartbeat]
 enabled = "not-a-bool"
@@ -3112,7 +3347,7 @@ enabled = "not-a-bool"
     #[test]
     fn broken_channel_type_block_is_dropped_not_fatal() {
         let raw = r#"
-schema_version = 3
+schema_version = 4
 
 [channels]
 email = "oops-this-should-be-a-table"
@@ -3136,7 +3371,7 @@ bot_token = "t"
     #[test]
     fn multiple_independent_bad_sections_all_dropped() {
         let raw = r#"
-schema_version = 3
+schema_version = 4
 
 [heartbeat]
 enabled = "not-a-bool"
@@ -3160,7 +3395,7 @@ enabled = "also-not-a-bool"
     #[test]
     fn multiple_bad_sections_one_security_critical() {
         let raw = r#"
-schema_version = 3
+schema_version = 4
 
 [security]
 audit = "should-be-a-table-not-a-string"
@@ -3252,6 +3487,214 @@ enabled = "not-a-bool"
             !backup.exists(),
             "no `.backup` should be created on the no-op path; got {}",
             backup.display()
+        );
+    }
+    const V3_WITH_NEVIS: &str = r#"
+schema_version = 3
+
+[security]
+trust_daemon_uid = false
+
+[security.nevis]
+enabled = true
+instance_url = "https://nevis.example.com"
+client_secret = "plaintext-nevis-secret"
+"#;
+
+    #[test]
+    fn v3_to_v4_removes_security_nevis_and_reports_it() {
+        let (migrated, notices) = migrate_file_with_notices(V3_WITH_NEVIS)
+            .unwrap()
+            .expect("a V3 config migrates to V4");
+
+        let value: toml::Value = toml::from_str(&migrated).unwrap();
+        assert_eq!(detect_version(&value).unwrap(), 4);
+        let security = value["security"].as_table().expect("[security] kept");
+        assert!(!security.contains_key("nevis"), "{migrated}");
+        assert_eq!(
+            security.get("trust_daemon_uid"),
+            Some(&toml::Value::Boolean(false)),
+            "sibling keys are untouched"
+        );
+        assert!(
+            !migrated.contains("plaintext-nevis-secret"),
+            "the retired table's secret must not survive on disk"
+        );
+        assert_eq!(
+            notices,
+            vec![MigrationNotice::Removed {
+                path: "security.nevis".to_string(),
+                reason: RETIRED_KEYS[0].reason,
+            }]
+        );
+    }
+
+    #[test]
+    fn migration_notices_never_carry_retired_values() {
+        let (_, notices) = migrate_file_with_notices(V3_WITH_NEVIS).unwrap().unwrap();
+        for notice in &notices {
+            let rendered = format!(
+                "{} {}",
+                notice.message(),
+                serde_json::to_string(notice).unwrap()
+            );
+            assert!(!rendered.contains("plaintext-nevis-secret"), "{rendered}");
+            assert!(!rendered.contains("nevis.example.com"), "{rendered}");
+        }
+    }
+
+    #[test]
+    fn v3_without_retired_keys_migrates_silently() {
+        let (migrated, notices) = migrate_file_with_notices("schema_version = 3\n")
+            .unwrap()
+            .expect("a V3 config is stamped V4");
+        assert_eq!(
+            detect_version(&toml::from_str(&migrated).unwrap()).unwrap(),
+            CURRENT_SCHEMA_VERSION
+        );
+        assert!(notices.is_empty(), "{notices:?}");
+    }
+
+    #[test]
+    fn current_config_is_left_alone() {
+        assert_eq!(
+            migrate_file_with_notices(&format!("schema_version = {CURRENT_SCHEMA_VERSION}\n"))
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn missing_schema_version_reports_the_v1_assumption() {
+        let (_, notices) = migrate_file_with_notices("foo = 1\n")
+            .unwrap()
+            .expect("an unversioned config is migrated from V1");
+        assert_eq!(notices.first(), Some(&MigrationNotice::AssumedV1));
+
+        let (_, notices) = migrate_file_with_notices("schema_version = 1\nfoo = 1\n")
+            .unwrap()
+            .unwrap();
+        assert!(
+            !notices.contains(&MigrationNotice::AssumedV1),
+            "an explicit V1 is not an assumption"
+        );
+    }
+
+    #[test]
+    fn resilient_load_carries_migration_notices() {
+        let load = migrate_to_current_salvaged(V3_WITH_NEVIS);
+        assert_eq!(load.config.security.nevis, None);
+        assert!(!load.config.security.trust_daemon_uid);
+        assert!(
+            load.notices.iter().any(
+                |n| matches!(n, MigrationNotice::Removed { path, .. } if path == "security.nevis")
+            ),
+            "{:?}",
+            load.notices
+        );
+
+        let unversioned = migrate_to_current_salvaged("");
+        assert_eq!(
+            unversioned.notices.first(),
+            Some(&MigrationNotice::AssumedV1)
+        );
+    }
+
+    #[test]
+    fn every_retired_key_names_a_migrated_version() {
+        for key in RETIRED_KEYS {
+            assert!(
+                (2..=CURRENT_SCHEMA_VERSION).contains(&key.retired_in),
+                "{:?} must be retired by a step the chain runs",
+                key.path
+            );
+            assert!(!key.path.is_empty() && !key.reason.is_empty(), "{key:?}");
+        }
+    }
+
+    const TEST_RENAMES: &[RetiredKey] = &[
+        RetiredKey {
+            retired_in: 9,
+            path: &["old", "knob"],
+            retirement: Retirement::Rename {
+                to: &["new", "section", "knob"],
+            },
+            reason: "renamed for the test",
+        },
+        RetiredKey {
+            retired_in: 8,
+            path: &["other"],
+            retirement: Retirement::Remove,
+            reason: "a different version",
+        },
+    ];
+
+    fn apply(raw: &str, version: u32) -> (toml::Value, Vec<MigrationNotice>) {
+        let mut value: toml::Value = toml::from_str(raw).unwrap();
+        let mut notices = Vec::new();
+        apply_retired_keys(&mut value, version, TEST_RENAMES, &mut notices);
+        (value, notices)
+    }
+
+    #[test]
+    fn a_retired_rename_moves_the_value_and_creates_parents() {
+        let (value, notices) = apply("other = 1\n[old]\nknob = 7\nkeep = true\n", 9);
+        assert_eq!(value["new"]["section"]["knob"].as_integer(), Some(7));
+        assert!(value["old"].get("knob").is_none());
+        assert_eq!(value["old"]["keep"].as_bool(), Some(true));
+        assert_eq!(
+            value["other"].as_integer(),
+            Some(1),
+            "only version 9 entries apply"
+        );
+        assert_eq!(
+            notices,
+            vec![MigrationNotice::Renamed {
+                from: "old.knob".to_string(),
+                to: "new.section.knob".to_string(),
+                reason: "renamed for the test",
+            }]
+        );
+    }
+
+    #[test]
+    fn a_retired_rename_never_overwrites_the_replacement() {
+        let (value, notices) = apply("[old]\nknob = 7\n[new.section]\nknob = 1\n", 9);
+        assert_eq!(value["new"]["section"]["knob"].as_integer(), Some(1));
+        assert!(value["old"].get("knob").is_none());
+        assert!(matches!(
+            notices.as_slice(),
+            [MigrationNotice::RenameConflict { from, to, .. }] if from == "old.knob" && to == "new.section.knob"
+        ));
+    }
+
+    #[test]
+    fn a_blocked_rename_creates_no_parent_tables() {
+        let (value, notices) = apply("new = \"scalar\"\n[old]\nknob = 7\n", 9);
+        assert_eq!(value["new"].as_str(), Some("scalar"));
+        assert!(matches!(
+            notices.as_slice(),
+            [MigrationNotice::RenameConflict { .. }]
+        ));
+
+        let mut root: toml::Table = toml::from_str("[new]\nx = 1\n").unwrap();
+        assert!(!put_path_if_vacant(
+            &mut root,
+            &["new", "x", "deeper"],
+            toml::Value::Integer(2)
+        ));
+        assert_eq!(toml::Value::Table(root)["new"]["x"].as_integer(), Some(1));
+    }
+
+    #[test]
+    fn an_absent_retired_key_changes_nothing() {
+        let (value, notices) = apply("[old]\nkeep = true\n", 9);
+        assert!(notices.is_empty());
+        assert!(value.get("new").is_none());
+        let (_, notices) = apply("[old]\nknob = { nested = 1 }\n", 8);
+        assert!(
+            notices.is_empty(),
+            "version 9 entries do not apply at version 8"
         );
     }
 }

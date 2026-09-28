@@ -2610,7 +2610,7 @@ fn encryption_covers_compound_map_secret_field() {
     let store = SecretStore::new(tmp.path(), true);
 
     let raw_toml = r#"
-schema_version = 3
+schema_version = 4
 
 [[mcp.servers]]
 name = "primary"
@@ -2676,7 +2676,7 @@ fn encryption_preserves_onepassword_secret_references() {
     let store = SecretStore::new(tmp.path(), true);
 
     let raw_toml = r#"
-schema_version = 3
+schema_version = 4
 
 [providers.models.openai.default]
 model = "gpt-5"
@@ -2779,7 +2779,7 @@ fn lookup_dotted<'a>(value: &'a toml::Value, path: &str) -> Option<&'a toml::Val
 fn get_prop_resolves_model_field_for_typed_provider_alias() {
     use zeroclaw_config::schema::Config;
     let raw = r#"
-schema_version = 3
+schema_version = 4
 
 [providers.models.anthropic.glados]
 model = "claude-opus-4-7"
@@ -2809,7 +2809,7 @@ fn prop_fields_includes_providers_models_alias_model_path() {
     // the frontend's resolveModelToProviderType walk silently drops the alias.
     use zeroclaw_config::schema::Config;
     let raw = r#"
-schema_version = 3
+schema_version = 4
 
 [providers.models.anthropic.glados]
 model = "claude-opus-4-7"
@@ -2832,7 +2832,7 @@ model = "claude-opus-4-7"
 fn typed_family_root_is_not_a_map_keyed_section() {
     use zeroclaw_config::schema::Config;
     let raw = r#"
-schema_version = 3
+schema_version = 4
 [providers.models.anthropic.glados]
 model = "claude-opus-4-7"
 "#;
@@ -2936,7 +2936,7 @@ fn v3_explicit_empty_allowed_tools_stays_unrestricted() {
     // No schema migration touches `allowed_tools`: V3 files with an explicit
     // `allowed_tools = []` keep the legacy unrestricted meaning.
     let raw = r#"
-schema_version = 3
+schema_version = 4
 
 [risk_profiles.default]
 allowed_tools = []
@@ -2968,7 +2968,7 @@ fn v3_deny_all_tools_flag_loads_without_migration() {
     // `deny_all_tools` is a plain additive V3 field: no migration step, it
     // deserializes directly and maps to deny-all at the policy boundary.
     let raw = r#"
-schema_version = 3
+schema_version = 4
 
 [risk_profiles.default]
 deny_all_tools = true

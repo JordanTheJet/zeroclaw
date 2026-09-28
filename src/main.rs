@@ -125,6 +125,50 @@ use zeroclaw_config::api_error::{ConfigApiCode, ConfigApiError};
 /// i18n catalogue under `agent-runtime` (default + CI/release); without that
 /// feature the runtime crate is absent, so the English `fallback` is used.
 #[allow(unused_variables)]
+/// Localized, operator-facing text for one config migration notice about the
+/// config file at `path`. Printed on stderr: the matching WARN record is
+/// hidden without `-v`, and these report config the operator wrote being
+/// dropped, moved, or read under an assumed schema version.
+fn migration_notice_text(notice: &crate::config::migration::MigrationNotice, path: &str) -> String {
+    use crate::config::migration::MigrationNotice;
+    match notice {
+        MigrationNotice::AssumedV1 => ta(
+            "cli-config-migration-assumed-v1",
+            &[("path", path)],
+            format!(
+                "warning: {path} has no `schema_version`, so it was read as schema V1 and migrated from there. The V1 migration merges channel sections into a `default` alias. If this file was written for a newer ZeroClaw, add `schema_version` at the top with the version it was written for (restore the `.backup` copy first if `zeroclaw config migrate` already rewrote it)."
+            ),
+        ),
+        MigrationNotice::Removed { path: key, reason } => ta(
+            "cli-config-retired-key-removed",
+            &[("key", key), ("path", path), ("reason", reason)],
+            format!("warning: dropped retired config key `{key}` from {path}: {reason}"),
+        ),
+        MigrationNotice::Renamed { from, to, reason } => ta(
+            "cli-config-retired-key-renamed",
+            &[
+                ("from", from),
+                ("to", to),
+                ("path", path),
+                ("reason", reason),
+            ],
+            format!("warning: moved retired config key `{from}` to `{to}` in {path}: {reason}"),
+        ),
+        MigrationNotice::RenameConflict { from, to, reason } => ta(
+            "cli-config-retired-key-rename-conflict",
+            &[
+                ("from", from),
+                ("to", to),
+                ("path", path),
+                ("reason", reason),
+            ],
+            format!(
+                "warning: dropped retired config key `{from}` from {path} without moving it, because `{to}` is already set: {reason}"
+            ),
+        ),
+    }
+}
+
 fn t(key: &str, fallback: &str) -> String {
     #[cfg(feature = "agent-runtime")]
     {
@@ -6387,6 +6431,29 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
             )
         );
     }
+    // `config migrate` reports the same notices itself, as changes it wrote.
+    let reports_own_migration = matches!(
+        &cli.command,
+        Commands::Config {
+            config_command: ConfigCommands::Migrate { .. }
+        }
+    );
+    if !reports_own_migration && !config.migration_notices.is_empty() {
+        let path = config.config_path.display().to_string();
+        for notice in &config.migration_notices {
+            eprintln!("{}", migration_notice_text(notice, &path));
+        }
+        eprintln!(
+            "{}",
+            ta(
+                "cli-config-migration-pending",
+                &[("path", &path)],
+                format!(
+                    "warning: these changes apply to this run only. Run `zeroclaw config migrate` to write them to {path}."
+                ),
+            )
+        );
+    }
     #[cfg(feature = "agent-runtime")]
     observability::runtime_trace::init_from_config(&config.observability, &config.data_dir);
     // Must follow the trace sink init above, or the record has no destination.
@@ -9345,6 +9412,7 @@ Add pricing to the active provider profile or supply a catalog entry."
                                 "migrated": true,
                                 "backup_path": report.backup_path.display().to_string(),
                                 "schema_version": to,
+                                "notices": report.notices,
                             });
                             println!("{}", serde_json::to_string_pretty(&envelope)?);
                         } else {
@@ -9360,6 +9428,10 @@ Add pricing to the active provider profile or supply a catalog entry."
                                 "Migrated {} to schema version {to}.",
                                 config.config_path.display()
                             );
+                            let path = config.config_path.display().to_string();
+                            for notice in &report.notices {
+                                eprintln!("{}", migration_notice_text(notice, &path));
+                            }
                         }
                     }
                     None => {

@@ -162,6 +162,12 @@ pub struct Config {
     /// CLI surfaces upgrade guidance without retaining the retired secret.
     #[serde(skip)]
     pub retired_node_transport_config: bool,
+    /// What migrating this config to the current schema changed or assumed
+    /// (retired keys removed or moved, a missing `schema_version` read as V1).
+    /// Never serialized; the CLI surfaces each on stderr, since the matching
+    /// WARN records are hidden without `-v`.
+    #[serde(skip)]
+    pub migration_notices: Vec<crate::migration::MigrationNotice>,
     /// Config file schema version.
     #[serde(default = "default_schema_version")]
     pub schema_version: u32,
@@ -20958,6 +20964,7 @@ impl Default for Config {
             degraded_sections: Vec::new(),
             retired_wati_config_sections: Vec::new(),
             retired_node_transport_config: false,
+            migration_notices: Vec::new(),
             schema_version: crate::migration::CURRENT_SCHEMA_VERSION,
             providers: crate::providers::Providers::default(),
             model_routes: Vec::new(),
@@ -22485,6 +22492,7 @@ impl Config {
             config.degraded_sections = salvage.dropped;
             config.retired_wati_config_sections = retired_wati_config_sections;
             config.retired_node_transport_config = retired_node_transport_config;
+            config.migration_notices = salvage.notices;
             if let Some(from_version) = stale_version {
                 ::zeroclaw_log::record!(
                     WARN,
@@ -32222,6 +32230,7 @@ auto_save = true
             degraded_sections: Vec::new(),
             retired_wati_config_sections: Vec::new(),
             retired_node_transport_config: false,
+            migration_notices: Vec::new(),
             schema_version: crate::migration::CURRENT_SCHEMA_VERSION,
             providers: {
                 let mut p = crate::providers::Providers::default();
@@ -33536,6 +33545,7 @@ default_temperature = 0.7
             degraded_sections: Vec::new(),
             retired_wati_config_sections: Vec::new(),
             retired_node_transport_config: false,
+            migration_notices: Vec::new(),
             schema_version: crate::migration::CURRENT_SCHEMA_VERSION,
             providers,
             model_routes: Vec::new(),
@@ -35753,7 +35763,7 @@ requires_openai_auth = true
     async fn provider_models_round_trips_through_load_apply_serialize() {
         let _env_guard = env_override_lock().await;
         let toml_in = r#"
-schema_version = 3
+schema_version = 4
 
 [providers.models.openrouter.default]
 uri = "https://example.invalid/v1"
@@ -36115,7 +36125,7 @@ model = "primary-model"
     #[test]
     async fn deserialize_rejects_unknown_model_provider_wire_api() {
         let toml = r#"
-schema_version = 3
+schema_version = 4
 
 [providers.models.openrouter.default]
 uri = "https://api.tonsof.blue/v1"
@@ -36335,7 +36345,7 @@ wire_api = "ws"
         fs::write(
             config_dir.path().join("config.toml"),
             r#"
-schema_version = 3
+schema_version = 4
 
 [proxy]
 enabled = true
@@ -36626,7 +36636,7 @@ default_model = "persisted-profile"
         let cases = [
             (
                 "current",
-                r#"schema_version = 3
+                r#"schema_version = 4
 
 [channels.wati.production]
 enabled = true
@@ -36695,7 +36705,7 @@ api_token = "legacy-placeholder-token"
         fs::create_dir_all(&install).await.unwrap();
         fs::write(
             install.join("config.toml"),
-            r#"schema_version = 3
+            r#"schema_version = 4
 
 [node_transport]
 enabled = true
@@ -36745,7 +36755,7 @@ shared_secret = "retired-node-transport-sentinel"
         // section to drop to its default on the resilient daemon path.
         fs::write(
             &config_path,
-            r#"schema_version = 3
+            r#"schema_version = 4
 audit = "should-be-a-table-not-a-string"
 
 [security]
@@ -36800,7 +36810,7 @@ audit = "should-be-a-table-not-a-string"
         fs::create_dir_all(&workspace_dir).await.unwrap();
         fs::write(
             &config_path,
-            r#"schema_version = 3
+            r#"schema_version = 4
 
 [channels.telegram.default]
 enabled = true
@@ -36855,7 +36865,7 @@ bot_token = 42
         fs::create_dir_all(&workspace_dir).await.unwrap();
         fs::write(
             &config_path,
-            r#"schema_version = 3
+            r#"schema_version = 4
 
 [channels.telegram.default]
 enabled = false
@@ -36903,7 +36913,7 @@ enabled = false
         // `ResilientLoad::dropped`; load_or_init copies it onto
         // `degraded_sections` so the CLI surfaces it on stderr instead of
         // the operator discovering `enabled = false` by accident.
-        let raw = r#"schema_version = 3
+        let raw = r#"schema_version = 4
 
 [plugins]
 enabled = true
@@ -36981,7 +36991,7 @@ name = "weather-tool"
         fs::create_dir_all(&workspace_dir).await.unwrap();
         fs::write(
             &config_path,
-            r#"schema_version = 3
+            r#"schema_version = 4
 
 [providers.models.ollama.default]
 
@@ -41147,7 +41157,7 @@ bot_token = "enc:v1:UNRELATED-CIPHERTEXT-THAT-MUST-SURVIVE"
     /// The TOML template baked into Docker images (Dockerfile + Dockerfile.debian).
     /// Kept here so changes to the Dockerfiles can be validated by `cargo test`.
     const DOCKER_CONFIG_TEMPLATE: &str = r#"
-schema_version = 3
+schema_version = 4
 workspace_dir = "/zeroclaw-data/workspace"
 config_path = "/zeroclaw-data/.zeroclaw/config.toml"
 api_key = ""
@@ -42522,7 +42532,7 @@ exit 65
         std::fs::write(
             &config_path,
             r#"
-schema_version = 3
+schema_version = 4
 
 [providers.models.openai.default]
 model = "gpt-5"
@@ -42591,7 +42601,7 @@ exit 65
         std::fs::write(
             &config_path,
             r#"
-schema_version = 3
+schema_version = 4
 
 [providers.models.openai.default]
 model = "gpt-5"
@@ -42651,7 +42661,7 @@ printf '%s\n' 'sk-proj-from-onepassword'
         std::fs::write(
             &config_path,
             r#"
-schema_version = 3
+schema_version = 4
 
 [providers.models.openai.default]
 model = "gpt-5"
@@ -43378,7 +43388,7 @@ api_key = "op://zeroclaw/provider/openai-api-key"
     async fn retired_wati_config_sections_cover_current_and_legacy_shapes() {
         assert_eq!(
             Config::retired_wati_config_sections(
-                "schema_version = 3\n[channels.wati.production]\nenabled = true\n",
+                "schema_version = 4\n[channels.wati.production]\nenabled = true\n",
             ),
             vec!["channels.wati".to_string()]
         );
@@ -43390,7 +43400,7 @@ api_key = "op://zeroclaw/provider/openai-api-key"
         );
         assert!(
             Config::retired_wati_config_sections(
-                "schema_version = 3\n[channels.whatsapp.production]\nenabled = true\n",
+                "schema_version = 4\n[channels.whatsapp.production]\nenabled = true\n",
             )
             .is_empty()
         );
@@ -43400,10 +43410,10 @@ api_key = "op://zeroclaw/provider/openai-api-key"
     #[test]
     async fn retired_node_transport_detector_keeps_only_presence() {
         assert!(Config::has_retired_node_transport_config(
-            "schema_version = 3\n[node_transport]\nshared_secret = \"sentinel-secret\"\n",
+            "schema_version = 4\n[node_transport]\nshared_secret = \"sentinel-secret\"\n",
         ));
         assert!(!Config::has_retired_node_transport_config(
-            "schema_version = 3\n[nodes]\nenabled = true\n",
+            "schema_version = 4\n[nodes]\nenabled = true\n",
         ));
         assert!(!Config::has_retired_node_transport_config("not toml {{{"));
     }
@@ -43431,7 +43441,7 @@ api_key = "op://zeroclaw/provider/openai-api-key"
         // family parses cleanly and its aliases vanish on reload. The
         // detector must flag it; known families must pass.
         let raw = r#"
-schema_version = 3
+schema_version = 4
 
 [providers.models.antropic.main]
 model = "claude-sonnet-4-6"
@@ -43450,7 +43460,7 @@ model = "gpt-4o"
         );
         assert_eq!(
             Config::unknown_provider_families(
-                "schema_version = 3\n[providers.tts.bogustts.x]\nenabled = true\n",
+                "schema_version = 4\n[providers.tts.bogustts.x]\nenabled = true\n",
             ),
             vec!["tts.bogustts".to_string()]
         );
@@ -43482,7 +43492,7 @@ model = "gpt-4o"
         // in-progress quickstart entry. The raw-TOML detector must preserve
         // that diagnostic signal before deserialization erases the shape.
         let raw = r#"
-schema_version = 3
+schema_version = 4
 
 [providers.models.zai.default.default]
 model = "glm-5.1"
@@ -43516,7 +43526,7 @@ risk_profile = "default"
         );
 
         let valid = r#"
-schema_version = 3
+schema_version = 4
 
 [providers.models.zai.default]
 model = "glm-5.1"
@@ -43529,7 +43539,7 @@ endpoint = "global"
         );
 
         let valid_table_fields = r#"
-schema_version = 3
+schema_version = 4
 
 [providers.models.openai.default]
 model = "gpt-4o"
@@ -43556,7 +43566,7 @@ api_key = 2.0
         );
 
         let valid_pricing = r#"
-schema_version = 3
+schema_version = 4
 
 [providers.models.openai.default]
 model = "gpt-4o"
@@ -43568,7 +43578,7 @@ pricing = { "gpt-4o.input" = 5.0, "gpt-4o.output" = 15.0 }
         );
 
         let family_specific = r#"
-schema_version = 3
+schema_version = 4
 
 [providers.models.azure.default.default]
 api_version = "2024-10-21"
@@ -43586,7 +43596,7 @@ num_ctx = 16384
         );
 
         let dotted_alias = r#"
-schema_version = 3
+schema_version = 4
 
 [providers.models.openai."prod.v2".default]
 model = "gpt-4o"
@@ -43599,7 +43609,7 @@ model = "gpt-4o"
 
         assert!(
             Config::extra_nested_model_provider_tables(
-                "schema_version = 3\n[providers.models.zia.default.default]\nmodel = \"x\"\n",
+                "schema_version = 4\n[providers.models.zia.default.default]\nmodel = \"x\"\n",
             )
             .is_empty(),
             "unknown families are handled by unknown_provider_families"
@@ -43790,7 +43800,7 @@ model = "gpt-4o"
         // [channels.matrix] is present (possibly with all default fields),
         // then a PATCH from the dashboard hits set_prop.
         let toml_src = r#"
-schema_version = 3
+schema_version = 4
 
 [channels.matrix.default]
 enabled = false

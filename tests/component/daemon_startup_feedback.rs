@@ -80,7 +80,7 @@ fn daemon_surfaces_retired_wati_config_without_leaking_tokens() {
     let cases = [
         (
             "current",
-            r#"schema_version = 3
+            r#"schema_version = 4
 
 [gateway]
 require_pairing = false
