@@ -19348,31 +19348,6 @@ pub struct SecurityConfig {
     #[nested]
     pub estop: EstopConfig,
 
-    /// DEPRECATED and ignored: the Nevis IAM integration was removed in
-    /// favor of the shared authentication stack (`[oidc.<alias>]`
-    /// verification, the `[users]` roster, and `[permission_profiles]`
-    /// grants). A legacy `[security.nevis]` table still parses so existing
-    /// configs keep loading, but enabling it does nothing and config
-    /// validation logs a warning naming the replacement.
-    ///
-    /// Its content is discarded on load: only a content-free presence marker
-    /// is retained (so validation can warn once), and the field is never
-    /// serialized. A legacy table may carry a plaintext `client_secret`, so
-    /// keeping it would let `GET /api/config` disclose that credential to a
-    /// `config:read` principal (the raw value sits outside the derived
-    /// `mask_secrets`). Discarding it here keeps the dead secret out of the
-    /// loaded configuration, and so out of the API response and the next
-    /// on-disk save. The deserializer still materializes the input before
-    /// dropping it and the file loader holds the raw text, so this is a
-    /// retention boundary, not zeroization. `save_dirty` removes the table
-    /// from the file itself (see `retire_nevis_table_in_doc`).
-    #[serde(
-        default,
-        skip_serializing,
-        deserialize_with = "deserialize_inert_nevis"
-    )]
-    pub nevis: Option<serde_json::Value>,
-
     /// WebAuthn / FIDO2 hardware key authentication configuration.
     #[serde(default)]
     #[nested]
@@ -19387,26 +19362,10 @@ impl Default for SecurityConfig {
             leak_detection: LeakDetectionConfig::default(),
             otp: OtpConfig::default(),
             estop: EstopConfig::default(),
-            nevis: None,
             webauthn: WebAuthnConfig::default(),
             nat64_prefixes: Vec::new(),
         }
     }
-}
-
-/// Accept a legacy `[security.nevis]` table so old configs keep loading, but
-/// discard every value it carries. Only a content-free presence marker
-/// (`Some(Value::Null)`) is returned, so validation can warn once while the
-/// removed integration's fields — including any plaintext `client_secret` —
-/// are never retained in the loaded configuration, and so never reach
-/// `GET /api/config` or the next on-disk save. (The value is materialized
-/// transiently to be discarded; this is not zeroization.)
-fn deserialize_inert_nevis<'de, D>(deserializer: D) -> Result<Option<serde_json::Value>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let present = Option::<serde_json::Value>::deserialize(deserializer)?.is_some();
-    Ok(present.then_some(serde_json::Value::Null))
 }
 
 /// Outbound credential leak detection configuration.
@@ -24807,20 +24766,6 @@ impl Config {
                     );
                 }
             }
-        }
-
-        // Nevis IAM was removed; the table is tolerated but inert.
-        if self.security.nevis.is_some() {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                "[security.nevis] is deprecated and ignored: the Nevis integration was \
-                 removed. Configure [oidc.<alias>] with [users] / [permission_profiles] \
-                 instead; the table is removed from config.toml on the next save \
-                 (full or incremental). Backups of config.toml taken before that save \
-                 still carry the original table and any client_secret in it."
-            );
         }
 
         // Delegate tool global defaults
@@ -40524,51 +40469,6 @@ url = "http://localhost:8080/mcp"
         }
     }
 
-    #[test]
-    async fn legacy_nevis_table_parses_and_is_ignored() {
-        // Compat shim: a config carrying the removed [security.nevis] table
-        // must keep loading, but its content is discarded on load. Only a
-        // content-free presence marker is retained (so validation can warn),
-        // and the table is never serialized. A legacy table may carry a
-        // plaintext client_secret; retaining it would let `GET /api/config`
-        // disclose that credential to a `config:read` principal, since the raw
-        // value sits outside the derived mask_secrets.
-        let raw = r#"
-[security.nevis]
-enabled = true
-instance_url = "https://nevis.example.com"
-realm = "corp"
-client_secret = "enc:v1:abc"
-role_mapping = [{ nevis_role = "admin", zeroclaw_permissions = ["all"] }]
-"#;
-        let config: Config = toml::from_str(raw).expect("legacy nevis table still parses");
-        assert_eq!(
-            config.security.nevis,
-            Some(serde_json::Value::Null),
-            "the shim keeps only a content-free presence marker"
-        );
-
-        // The loaded config must never re-emit the dead table or its secret,
-        // whether through the next save or `GET /api/config` (which serializes
-        // the config). Discarding the content on load means the raw value is
-        // never in memory to leak. This is the disclosure the shim must avoid.
-        let serialized = toml::to_string(&config).unwrap();
-        assert!(
-            !serialized.contains("nevis"),
-            "a loaded legacy table must not be serialized back"
-        );
-        assert!(
-            !serialized.contains("client_secret") && !serialized.contains("enc:v1:abc"),
-            "the legacy client_secret must not survive into serialized config"
-        );
-
-        let serialized_default = toml::to_string(&Config::default()).unwrap();
-        assert!(
-            !serialized_default.contains("nevis"),
-            "default configs must not emit the removed table"
-        );
-    }
-
     /// Seed an on-disk config that still carries the retired
     /// `[security.nevis]` table next to unrelated content an incremental save
     /// must preserve: a comment, another `[security]` key, and ciphertext in
@@ -40614,7 +40514,6 @@ bot_token = "enc:v1:UNRELATED-CIPHERTEXT-THAT-MUST-SURVIVE"
         // on every start despite promising removal on the next save.
         let tmp = tempfile::TempDir::new().unwrap();
         let mut config = seed_config_with_legacy_nevis_table(tmp.path());
-        assert_eq!(config.security.nevis, Some(serde_json::Value::Null));
 
         // An unrelated dirty path drives the save.
         config.observability.backend = ObservabilityBackend::Otel;
@@ -40650,7 +40549,6 @@ bot_token = "enc:v1:UNRELATED-CIPHERTEXT-THAT-MUST-SURVIVE"
         // A second load no longer sees the table (so validation stops
         // warning), and a second incremental save is a clean no-op for it.
         let mut reloaded: Config = toml::from_str(&written).unwrap();
-        assert_eq!(reloaded.security.nevis, None);
         reloaded.config_path = tmp.path().join("config.toml");
         reloaded.observability.backend = ObservabilityBackend::None;
         reloaded.mark_dirty("observability.backend");

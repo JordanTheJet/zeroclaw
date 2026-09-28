@@ -86,8 +86,10 @@ pub struct RetiredKey {
 }
 
 /// Every retired key, applied by the migration chain when it reaches
-/// `retired_in`. Retiring another key is one entry here, plus a version bump
-/// (a new `MIGRATION_STEPS` entry) if no pending version already covers it.
+/// `retired_in`, and again on every load of a current config so a key that
+/// reappears is dropped with a notice rather than silently ignored. Retiring
+/// another key is one entry here plus removing its schema field, and a version
+/// bump (a new `MIGRATION_STEPS` entry) if no pending version already covers it.
 pub const RETIRED_KEYS: &[RetiredKey] = &[RetiredKey {
     retired_in: 4,
     path: &["security", "nevis"],
@@ -154,12 +156,25 @@ struct Migrated {
 }
 
 /// Carry a parsed config to [`CURRENT_SCHEMA_VERSION`]. `Ok(None)` when it is
-/// already current. Every notice is also logged at WARN; callers that talk to
-/// an operator must surface them too, since WARN is hidden without `-v`.
+/// already current and holds no retired key. Every notice is also logged at
+/// WARN; callers that talk to an operator must surface them too, since WARN is
+/// hidden without `-v`.
 fn migrate_toml(value: toml::Value) -> Result<Option<Migrated>> {
     let from = detect_version(&value)?;
     if from == CURRENT_SCHEMA_VERSION {
-        return Ok(None);
+        // A retired key can reappear in a current file (hand-edited, or
+        // copied from an old example). The schema no longer has a field for
+        // it, so serde would silently ignore it; drop it and say so instead.
+        let mut value = value;
+        let mut notices = Vec::new();
+        for version in 2..=CURRENT_SCHEMA_VERSION {
+            apply_retired_keys(&mut value, version, RETIRED_KEYS, &mut notices);
+        }
+        if notices.is_empty() {
+            return Ok(None);
+        }
+        log_notices(&notices);
+        return Ok(Some(Migrated { value, notices }));
     }
     if from > CURRENT_SCHEMA_VERSION {
         ::zeroclaw_log::record!(
@@ -184,7 +199,12 @@ fn migrate_toml(value: toml::Value) -> Result<Option<Migrated>> {
         notices.push(MigrationNotice::AssumedV1);
     }
     let value = run_chain(value, from, &mut notices)?;
-    for notice in &notices {
+    log_notices(&notices);
+    Ok(Some(Migrated { value, notices }))
+}
+
+fn log_notices(notices: &[MigrationNotice]) {
+    for notice in notices {
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -193,7 +213,6 @@ fn migrate_toml(value: toml::Value) -> Result<Option<Migrated>> {
             &notice.message()
         );
     }
-    Ok(Some(Migrated { value, notices }))
 }
 
 pub fn migrate_file(input: &str) -> Result<Option<String>> {
@@ -3556,6 +3575,33 @@ client_secret = "plaintext-nevis-secret"
     }
 
     #[test]
+    fn a_retired_key_in_a_current_config_is_dropped_with_a_notice() {
+        let raw = format!(
+            "schema_version = {CURRENT_SCHEMA_VERSION}\n\n[security]\ntrust_daemon_uid = false\n\n\
+             [security.nevis]\nclient_secret = \"plaintext-nevis-secret\"\n"
+        );
+        let (migrated, notices) = migrate_file_with_notices(&raw)
+            .unwrap()
+            .expect("a current config holding a retired key is rewritten");
+        assert!(!migrated.contains("nevis"), "{migrated}");
+        assert!(!migrated.contains("plaintext-nevis-secret"));
+        assert!(migrated.contains("trust_daemon_uid = false"));
+        assert!(matches!(
+            notices.as_slice(),
+            [MigrationNotice::Removed { path, .. }] if path == "security.nevis"
+        ));
+
+        let load = migrate_to_current_salvaged(&raw);
+        assert!(!load.config.security.trust_daemon_uid);
+        assert!(
+            load.dropped_security.is_empty(),
+            "a retired key must not degrade the security section: {:?}",
+            load.dropped_security
+        );
+        assert_eq!(load.notices, notices);
+    }
+
+    #[test]
     fn current_config_is_left_alone() {
         assert_eq!(
             migrate_file_with_notices(&format!("schema_version = {CURRENT_SCHEMA_VERSION}\n"))
@@ -3583,8 +3629,12 @@ client_secret = "plaintext-nevis-secret"
     #[test]
     fn resilient_load_carries_migration_notices() {
         let load = migrate_to_current_salvaged(V3_WITH_NEVIS);
-        assert_eq!(load.config.security.nevis, None);
         assert!(!load.config.security.trust_daemon_uid);
+        assert!(
+            load.dropped_security.is_empty(),
+            "{:?}",
+            load.dropped_security
+        );
         assert!(
             load.notices.iter().any(
                 |n| matches!(n, MigrationNotice::Removed { path, .. } if path == "security.nevis")
