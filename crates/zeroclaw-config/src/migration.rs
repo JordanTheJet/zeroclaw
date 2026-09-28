@@ -106,8 +106,8 @@ pub const RETIRED_KEYS: &[RetiredKey] = &[
         reason: "the Nevis IAM integration was removed; configure `[oidc.<alias>]` with \
                  `[users]` and `[permission_profiles]` instead",
     },
-    // Agent-inline runtime tunables: superseded by runtime profiles (#6877)
-    // and never read from `[agents.<alias>]`. First identified in #8754.
+    // Agent-inline runtime tunables: superseded by runtime profiles and never
+    // read from `[agents.<alias>]`, so serde ignored them silently.
     RetiredKey {
         retired_in: 4,
         path: &["agents", ANY_KEY, "compact_context"],

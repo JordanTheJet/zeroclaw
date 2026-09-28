@@ -2996,8 +2996,8 @@ deny_all_tools = true
 
 // ─────────────────────────────────────────────────────────────
 // V4 fixture: the committed at-rest V4 config loads and is idempotent.
-// Fixture and tests adapted from #8754 by @singlerider; the fixture is
-// regenerated from this chain with `zeroclaw config generate 4`.
+// The fixture is regenerated from this chain with
+// `zeroclaw config generate 4`.
 // ─────────────────────────────────────────────────────────────
 
 const V4_FIXTURE: &str = include_str!("../fixtures/v4.toml");
