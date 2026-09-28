@@ -532,6 +532,7 @@ pub async fn run(
     crate::agent::pricing_catalog::load_global_pricing_catalog(&config.data_dir);
 
     let mut handles: Vec<JoinHandle<()>> = vec![spawn_state_writer(config.clone())];
+    let mut channels_handle: Option<JoinHandle<()>> = None;
 
     // Reload channel: gateway's /admin/reload writes here; our wait loop
     // (below) selects on it alongside OS signals. Cross-platform.
@@ -554,9 +555,20 @@ pub async fn run(
     let tui_registry =
         std::sync::Arc::new(crate::rpc::tui_identity::TuiRegistry::new(&config.data_dir));
 
+    // Canonical live pairing authority for this daemon generation. The
+    // gateway serves /pair, rotation, and revocation from THIS instance
+    // and the RPC native auth provider verifies against it, so a pairing
+    // change reaches both surfaces immediately (no boot-time snapshot).
+    let pairing_guard = std::sync::Arc::new(zeroclaw_config::pairing::PairingGuard::new(
+        config.gateway.require_pairing,
+        &config.gateway.paired_tokens,
+        config.gateway.pairing_code,
+    ));
+
     if let Some(gateway_start) = registry.take_gateway_start() {
         gateway_required = true;
         let gateway_cfg = config.clone();
+        let gateway_pairing = pairing_guard.clone();
         let gateway_host = host.clone();
         let gateway_event_tx = event_tx.clone();
         let gateway_reload_controls = GatewayReloadControls {
@@ -578,6 +590,7 @@ pub async fn run(
                 let reload_controls = gateway_reload_controls.clone();
                 let tui_reg = gateway_tui_registry.clone();
                 let start = gateway_start.clone();
+                let pairing = gateway_pairing.as_ref().clone();
                 let (readiness_attempt, readiness_reporter) =
                     StartupReadinessAttempt::gateway(gateway_readiness_tx.clone());
                 async move {
@@ -589,6 +602,7 @@ pub async fn run(
                         Some(tx),
                         Some(reload_controls),
                         Some(tui_reg),
+                        Some(pairing),
                         readiness_reporter,
                     )
                     .await
@@ -625,7 +639,7 @@ pub async fn run(
             let channels_cfg = config.clone();
             let channels_start = std::sync::Arc::new(channels_start);
             let cancel_for_supervisor = channels_cancel.clone();
-            handles.push(spawn_component_supervisor(
+            channels_handle = Some(spawn_component_supervisor(
                 "channels",
                 initial_backoff,
                 max_backoff,
@@ -663,7 +677,7 @@ pub async fn run(
         || registry.has_enroll_start();
 
     // Extract shared SOP engine from registry for RpcContext.
-    let (sop_engine, sop_audit) = registry.take_sop_engine();
+    let (sop_engine, sop_audit, sop_driver_handles) = registry.take_sop_engine();
 
     let rpc_ctx = if need_rpc_ctx {
         use crate::rpc::context::RpcContext;
@@ -783,16 +797,28 @@ pub async fn run(
             };
 
         let hooks: Option<std::sync::Arc<crate::hooks::HookRunner>> = if config.hooks.enabled {
-            Some(std::sync::Arc::new(crate::hooks::HookRunner::from_config(
-                &config.hooks,
-            )))
+            Some(std::sync::Arc::new(
+                crate::hooks::HookRunner::from_root_config(&config),
+            ))
         } else {
             None
         };
 
+        let rpc_auth = std::sync::Arc::new(
+            crate::rpc::auth::RpcInboundAuth::from_config(&config, pairing_guard.clone()).map_err(
+                |e| {
+                    anyhow::Error::msg(format!(
+                        "building the RPC inbound authentication layer: {e:#}"
+                    ))
+                },
+            )?,
+        );
+
         Some(std::sync::Arc::new(RpcContext {
+            #[cfg(test)]
+            config_commit_pause: None,
             config: std::sync::Arc::new(parking_lot::RwLock::new(config.clone())),
-            config_write_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            config_write_lock: zeroclaw_config::write_lock::shared_config_write_lock(),
             sessions,
             session_backend,
             memory: rpc_memory,
@@ -813,8 +839,10 @@ pub async fn run(
             acp_session_store,
             sop_engine,
             sop_audit,
+            sop_driver_handles,
             hooks,
             cert_audit,
+            auth: rpc_auth,
         }))
     } else {
         None
@@ -1077,6 +1105,13 @@ pub async fn run(
     let drain = await_rpc_connection_drain(&rpc_connection_count).await;
     let exit_result = settle_exit_against_drain(exit_result, drain);
 
+    // Channel teardown owns listener cleanup plus all accepted message work.
+    // Keep that supervisor out of the generic 500 ms component pool: its
+    // internal absolute deadline is five seconds, and a reload may start a
+    // replacement generation only after this owner has actually retired.
+    let channels_retired = retire_channels_supervisor(channels_handle).await;
+    let exit_result = settle_exit_against_channel_retirement(exit_result, channels_retired);
+
     // Grace window for cooperative shutdown of each component supervisor. The
     // RPC listeners are already past their own drain by this point, so this
     // only covers the supervisor loop returning after its component did.
@@ -1169,7 +1204,10 @@ async fn await_socket_startup(
         Ok(SocketStartupState::Fatal { kind, message }) => {
             Err(std::io::Error::new(kind, message).into())
         }
-        Ok(SocketStartupState::Pending) => unreachable!("wait_for excludes pending state"),
+        Ok(SocketStartupState::Pending) => Err(std::io::Error::other(
+            "socket startup remained pending after readiness wait",
+        )
+        .into()),
         Err(_) => Ok(()),
     }
 }
@@ -1343,6 +1381,59 @@ fn settle_exit_against_drain(exit: Result<DaemonExit>, drain: RpcDrain) -> Resul
     Ok(DaemonExit::Shutdown)
 }
 
+const CHANNEL_SUPERVISOR_SHUTDOWN_GRACE: Duration = Duration::from_secs(6);
+
+async fn retire_channels_supervisor(handle: Option<JoinHandle<()>>) -> bool {
+    let Some(mut handle) = handle else {
+        return true;
+    };
+    tokio::select! {
+        biased;
+        result = &mut handle => {
+            if let Err(error) = result {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({ "error": error.to_string() })),
+                    "Channel supervisor ended without establishing clean retirement"
+                );
+                false
+            } else {
+                true
+            }
+        }
+        () = tokio::time::sleep(CHANNEL_SUPERVISOR_SHUTDOWN_GRACE) => {
+            handle.abort();
+            let _ = handle.await;
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                "Channel supervisor did not retire inside its shutdown allowance"
+            );
+            false
+        }
+    }
+}
+
+fn settle_exit_against_channel_retirement(
+    exit: Result<DaemonExit>,
+    channels_retired: bool,
+) -> Result<DaemonExit> {
+    if channels_retired || !matches!(exit, Ok(DaemonExit::Reload)) {
+        return exit;
+    }
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+        "Reload refused: channel work from the retiring generation is still unwinding; shutting \
+         down instead so a replacement generation cannot overlap it"
+    );
+    Ok(DaemonExit::Shutdown)
+}
+
 fn spawn_component_supervisor<F, Fut>(
     name: &'static str,
     initial_backoff_secs: u64,
@@ -1404,17 +1495,18 @@ where
                     }
                 }
                 Err(e) => {
-                    crate::health::mark_component_error(name, format!("{e:#}"));
+                    let error_chain = format!("{e:#}");
+                    crate::health::mark_component_error(name, &error_chain);
                     ::zeroclaw_log::record!(
                         ERROR,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
                             .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                             .with_attrs(::serde_json::json!({
-                                "error": format!("{e:#}"),
+                                "error": &error_chain,
                                 "name": name,
                                 "ran_for_secs": ran_for.as_secs(),
                             })),
-                        &format!("Daemon component '{name}' failed: {e:#}")
+                        &format!("Daemon component '{name}' failed: {error_chain}")
                     );
                     // A long-lived run that eventually errors is not a
                     // fast-fail loop; let it reset so a component that ran fine
@@ -2605,7 +2697,7 @@ fn auto_detect_heartbeat_channel(config: &Config) -> Option<(String, String)> {
     // channel block).
     if !config.channels.telegram.is_empty() {
         for alias in config.channels.telegram.keys() {
-            let peers = config.channel_external_peers("telegram", alias);
+            let peers = config.channel_addressable_peers("telegram", alias);
             if let Some(target) = peers.into_iter().next() {
                 return Some(("telegram".to_string(), target));
             }
@@ -2715,6 +2807,54 @@ mod tests {
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn daemon_channels_shutdown_allows_cleanup_past_generic_grace() {
+        let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let finished_by_task = std::sync::Arc::clone(&finished);
+        let handle = zeroclaw_spawn::spawn!(async move {
+            tokio::time::sleep(Duration::from_millis(750)).await;
+            finished_by_task.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        assert!(
+            retire_channels_supervisor(Some(handle)).await,
+            "channel cleanup longer than the generic 500 ms grace must still retire cleanly"
+        );
+        assert!(
+            finished.load(std::sync::atomic::Ordering::SeqCst),
+            "the channel cleanup future must complete rather than be detached"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn daemon_channels_shutdown_refuses_reload_when_retirement_times_out() {
+        struct RetirementProbe(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for RetirementProbe {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let probe = RetirementProbe(std::sync::Arc::clone(&dropped));
+        let handle = zeroclaw_spawn::spawn!(async move {
+            let _probe = probe;
+            std::future::pending::<()>().await;
+        });
+
+        let retired = retire_channels_supervisor(Some(handle)).await;
+        assert!(!retired, "a timed-out channel generation is not retired");
+        assert!(
+            dropped.load(std::sync::atomic::Ordering::SeqCst),
+            "the timed-out supervisor must be aborted and joined"
+        );
+        assert_eq!(
+            settle_exit_against_channel_retirement(Ok(DaemonExit::Reload), retired).unwrap(),
+            DaemonExit::Shutdown,
+            "reload must be refused when channel retirement is unproven"
+        );
+    }
+
     fn test_config(tmp: &TempDir) -> Config {
         let config = Config {
             data_dir: tmp.path().join("data"),
@@ -2736,6 +2876,17 @@ mod tests {
         config.agents.insert(agent_alias.to_string(), agent);
     }
 
+    /// Hold the process-global log broadcast still for a daemon lifecycle test.
+    ///
+    /// `run` calls `set_broadcast_hook`, replacing the sender every
+    /// log-assertion test subscribed to, and those tests only serialize
+    /// against each other. A lifecycle test that calls `run` without this lock
+    /// closes their receiver mid-read, which surfaces as a missing log event.
+    #[must_use]
+    fn hold_log_broadcast() -> impl Drop {
+        zeroclaw_log::__private_test_hook_lock()
+    }
+
     async fn recv_log_event(
         rx: &mut tokio::sync::broadcast::Receiver<serde_json::Value>,
         message: &str,
@@ -2754,7 +2905,12 @@ mod tests {
                     return value;
                 }
                 Ok(Ok(_)) | Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
-                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => break,
+                // A closed channel means the global broadcast hook was replaced
+                // or cleared, not that the record was slow; keep that distinct
+                // from a deadline miss so the failure names the real cause.
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
+                    panic!("log broadcast closed before event arrived: {message}");
+                }
                 Err(_elapsed) => {}
             }
         }
@@ -3156,6 +3312,37 @@ mod tests {
         );
     }
 
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn supervisor_preserves_component_error_chain() {
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut rx = zeroclaw_log::subscribe_or_install();
+        while rx.try_recv().is_ok() {}
+
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let handle =
+            spawn_component_supervisor("daemon-test-error-chain", 60, 60, cancel, || async {
+                Err(anyhow::Error::msg("provider entry has no model")
+                    .context("agents.ox.model_provider"))
+            });
+
+        let expected_chain = "agents.ox.model_provider: provider entry has no model";
+        let expected_message =
+            format!("Daemon component 'daemon-test-error-chain' failed: {expected_chain}");
+        let value = recv_log_event(&mut rx, &expected_message).await;
+        handle.abort();
+        let _ = handle.await;
+
+        assert_eq!(value["attributes"]["error"], expected_chain);
+        let snapshot = crate::health::snapshot_json();
+        assert_eq!(
+            snapshot["components"]["daemon-test-error-chain"]["last_error"],
+            expected_chain
+        );
+    }
+
     #[tokio::test]
     async fn supervisor_marks_unexpected_exit_as_error() {
         let cancel = tokio_util::sync::CancellationToken::new();
@@ -3336,8 +3523,11 @@ mod tests {
                 api_base_url: zeroclaw_config::schema::TELEGRAM_OFFICIAL_API_BASE_URL.to_string(),
                 stream_mode: zeroclaw_config::schema::StreamMode::default(),
                 draft_update_interval_ms: 1000,
+                multi_message_delay_ms: 800,
                 interrupt_on_new_message: false,
                 mention_only: false,
+                per_user_session: true,
+                passive_group_context: false,
                 ack_reactions: None,
                 proxy_url: None,
                 approval_timeout_secs: 120,
@@ -3388,6 +3578,8 @@ mod tests {
                 excluded_tools: vec![],
                 reply_min_interval_secs: 0,
                 reply_queue_depth_max: 0,
+                approval_timeout_secs: 300,
+                purpose_as_instructions: false,
             },
         );
         assert!(has_supervised_channels(&config));
@@ -3637,8 +3829,11 @@ mod tests {
                 api_base_url: zeroclaw_config::schema::TELEGRAM_OFFICIAL_API_BASE_URL.to_string(),
                 stream_mode: zeroclaw_config::schema::StreamMode::default(),
                 draft_update_interval_ms: 1000,
+                multi_message_delay_ms: 800,
                 interrupt_on_new_message: false,
                 mention_only: false,
+                per_user_session: true,
+                passive_group_context: false,
                 ack_reactions: None,
                 proxy_url: None,
                 approval_timeout_secs: 120,
@@ -3666,8 +3861,11 @@ mod tests {
                 api_base_url: zeroclaw_config::schema::TELEGRAM_OFFICIAL_API_BASE_URL.to_string(),
                 stream_mode: zeroclaw_config::schema::StreamMode::default(),
                 draft_update_interval_ms: 1000,
+                multi_message_delay_ms: 800,
                 interrupt_on_new_message: false,
                 mention_only: false,
+                per_user_session: true,
+                passive_group_context: false,
                 ack_reactions: None,
                 proxy_url: None,
                 approval_timeout_secs: 120,
@@ -3701,6 +3899,52 @@ mod tests {
         let config = Config::default();
         let target = auto_detect_heartbeat_channel(&config);
         assert!(target.is_none());
+    }
+
+    #[test]
+    fn auto_detect_skips_peers_that_are_not_addresses() {
+        use zeroclaw_config::multi_agent::{PeerGroupConfig, PeerUsername};
+
+        // The resolved peer list answers "who is authorized", so it carries a
+        // wildcard and the deny markers for `ignore`. Neither is somewhere a
+        // heartbeat can be sent, and an ignored peer least of all.
+        let mut config = Config::default();
+        config.channels.telegram.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::TelegramConfig {
+                enabled: true,
+                bot_token: "bot-token".into(),
+                api_base_url: zeroclaw_config::schema::TELEGRAM_OFFICIAL_API_BASE_URL.to_string(),
+                stream_mode: zeroclaw_config::schema::StreamMode::default(),
+                draft_update_interval_ms: 1000,
+                interrupt_on_new_message: false,
+                mention_only: false,
+                ack_reactions: None,
+                proxy_url: None,
+                approval_timeout_secs: 120,
+                excluded_tools: vec![],
+                reply_min_interval_secs: 0,
+                reply_queue_depth_max: 0,
+                multi_message_delay_ms: 800,
+                debounce_ms: None,
+                per_user_session: true,
+                passive_group_context: false,
+            },
+        );
+        config.peer_groups.insert(
+            "telegram_default".to_string(),
+            PeerGroupConfig {
+                channel: "telegram".into(),
+                external_peers: vec![PeerUsername::new("*"), PeerUsername::new("user123")],
+                ignore: vec![PeerUsername::new("user123")],
+                ..PeerGroupConfig::default()
+            },
+        );
+
+        assert!(
+            auto_detect_heartbeat_channel(&config).is_none(),
+            "a wildcard and an ignored peer leave no heartbeat target"
+        );
     }
 
     #[cfg(unix)]
@@ -3747,8 +3991,10 @@ mod tests {
         assert_eq!(result, DaemonExit::Reload);
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn registry_gateway_starter_can_trigger_daemon_reload() {
+        let _broadcast_guard = hold_log_broadcast();
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp);
         let expected_data_dir = config.data_dir.clone();
@@ -3756,7 +4002,14 @@ mod tests {
 
         let mut registry = DaemonRegistry::new();
         registry.register_gateway(Box::new(
-            move |host, port, config, event_tx, reload_controls, tui_registry, _ready_tx| {
+            move |host,
+                  port,
+                  config,
+                  event_tx,
+                  reload_controls,
+                  tui_registry,
+                  _pairing,
+                  _ready_tx| {
                 let seen_tx = seen_tx.clone();
                 Box::pin(async move {
                     let has_event_tx = event_tx.is_some();
@@ -3819,10 +4072,12 @@ mod tests {
         assert!(has_tui_registry);
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn initial_socket_addr_in_use_fails_daemon_startup() {
         use std::io;
 
+        let _broadcast_guard = hold_log_broadcast();
         for startup_feedback_enabled in [false, true] {
             let tmp = TempDir::new().unwrap();
             let config = test_config(&tmp);
@@ -3899,12 +4154,14 @@ mod tests {
         );
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn initial_socket_invalid_input_fails_daemon_startup() {
         use std::io;
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
+        let _broadcast_guard = hold_log_broadcast();
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp);
         let attempts = Arc::new(AtomicUsize::new(0));
@@ -3946,6 +4203,7 @@ mod tests {
         );
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn socket_addr_in_use_after_readiness_stays_supervised() {
         use std::io;
@@ -3953,6 +4211,7 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use tokio::time::{Duration, timeout};
 
+        let _broadcast_guard = hold_log_broadcast();
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(&tmp);
         config.reliability.channel_initial_backoff_secs = 1;
@@ -4002,12 +4261,14 @@ mod tests {
         );
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn reload_waits_for_rpc_connection_drain_without_holding_other_components() {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
         use tokio::time::{Duration, Instant, timeout};
 
+        let _broadcast_guard = hold_log_broadcast();
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp);
 
@@ -4040,7 +4301,14 @@ mod tests {
         // The gateway asks for the reload once the connection exists, then
         // parks: an unrelated pending component must not extend shutdown.
         registry.register_gateway(Box::new(
-            move |_host, _port, _config, _event_tx, reload_controls, _tui_reg, _ready_tx| {
+            move |_host,
+                  _port,
+                  _config,
+                  _event_tx,
+                  reload_controls,
+                  _tui_reg,
+                  _pairing,
+                  _ready_tx| {
                 let accepted = accepted.clone();
                 Box::pin(async move {
                     let reload_tx = reload_controls
@@ -4079,10 +4347,12 @@ mod tests {
         );
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn scheduler_cooperative_shutdown_observed_through_daemon_reload() {
         use tokio::time::{Duration, timeout};
 
+        let _broadcast_guard = hold_log_broadcast();
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(&tmp);
         config.scheduler.enabled = true;
@@ -4091,7 +4361,14 @@ mod tests {
 
         let mut registry = DaemonRegistry::new();
         registry.register_gateway(Box::new(
-            move |_host, _port, _config, _event_tx, reload_controls, _tui_reg, _ready_tx| {
+            move |_host,
+                  _port,
+                  _config,
+                  _event_tx,
+                  reload_controls,
+                  _tui_reg,
+                  _pairing,
+                  _ready_tx| {
                 Box::pin(async move {
                     let reload_tx = reload_controls
                         .map(|controls| controls.reload_tx)

@@ -48,6 +48,8 @@ zc-app-reload-confirm-row = { $confirm_chord } = reload   { $cancel_chord } = ca
 zc-error-daemon-version-mismatch = Version mismatch: zerocode is { $client_version } but the daemon is { $server_version }. Rebuild and restart the daemon from the same checkout as zerocode.
 zc-error-daemon-initialize-timeout = zerocode connected to the daemon, but initialization did not finish within { $seconds }s. Restart the daemon and try again.
 zc-error-spawned-daemon-startup = zerocode started an ephemeral daemon, but it failed to become ready: { $details }
+zc-daemon-wait-notice = zerocode: waiting for daemon at { $path } (up to { $seconds }s)…
+zc-error-daemon-not-ready-timeout = daemon did not become ready within { $seconds }s (socket: { $path }); if the socket path is long, set ZEROCLAW_SOCKET to a shorter path or use a shorter --config-dir
 
 zc-zerocode-tab-theme = Theme
 zc-zerocode-tab-agent-theme = Agent Themes
@@ -190,11 +192,14 @@ zc-logs-no-event-selected = No event selected
 zc-logs-loading = Loading…
 zc-logs-search-action-apply = apply
 zc-logs-search-action-cancel = cancel
+zc-logs-run-filter-label = run
+zc-logs-run-filter-clear = R:clear
 
 zc-logs-help-mouse-label = Mouse
 zc-logs-help-mouse-desc = Click rows, drag to select text, scroll wheel, double-click detail
 zc-logs-copy = Copy
 zc-logs-copied = [Copied]
+zc-logs-status-partial = [partial]
 
 zc-doctor-title = Doctor
 zc-doctor-loading = Loading diagnostics...
@@ -438,10 +443,38 @@ zc-chat-pane-acp = ACP
 
 zc-chat-no-agents = No enabled agents yet. Open Quickstart to create one, or use Config to add and enable an agent.
 zc-chat-error-fetch-agents = Failed to fetch agents: { $error }
+zc-chat-history-trimmed-turns = Earlier conversation history was trimmed: { $reason } ({ $dropped } older { $dropped-kind ->
+    [one] turn
+   *[other] turns
+} dropped; { $kept } { $kept-kind ->
+    [one] turn
+   *[other] turns
+} kept).
 zc-chat-history-trimmed = Earlier conversation history was trimmed: { $reason } ({ $dropped } messages dropped; { $kept } turns kept).
+zc-chat-history-trimmed-tokens = Earlier conversation history was trimmed from approximately { $before } to { $after } tokens: { $reason }; { $dropped } messages dropped and { $kept } turns kept.
+zc-chat-history-trimmed-tokens-turns = Earlier conversation history was trimmed from approximately { $before } to { $after } tokens: { $reason }; { $dropped } older { $dropped-kind ->
+    [one] turn
+   *[other] turns
+} dropped and { $kept } { $kept-kind ->
+    [one] turn
+   *[other] turns
+} kept.
+zc-chat-history-trimmed-floor = The conversation history could not be trimmed below the configured token budget: { $reason }; the most recent turn still needs approximately { $after } tokens (configured budget: { $budget }).
+zc-chat-history-trimmed-token-budget-clause = (configured token budget: { $budget })
+zc-chat-history-trimmed-token-source-provider = provider-reported
+zc-chat-history-trimmed-token-source-estimate = estimated
+zc-chat-history-trimmed-token-source-calibrated = provider + estimate
+zc-chat-history-trimmed-token-sources = ({ $before } before; { $after } after)
 zc-chat-error-create-session = Failed to create session: { $error }
 zc-chat-error-resume-history = The session reattached, but its durable transcript could not be loaded: { $error }
 zc-chat-session-switch-error = Failed to switch session: { $error }
+zc-chat-status-working = working
+zc-chat-status-thinking = thinking
+zc-chat-status-responding = responding
+zc-chat-status-calling-tool = calling tool { $tool }
+zc-chat-status-awaiting-approval = awaiting approval
+zc-chat-status-awaiting-input = awaiting input
+zc-chat-status-cancelling = cancelling
 zc-chat-session-close-error = Failed to close session: { $error }
 zc-chat-elicitation-dropped = A prompt from the agent was dropped before it could be shown (the client fell behind). The agent's question may be waiting; try again.
 zc-chat-session-restarted = New session started.
@@ -452,8 +485,10 @@ zc-chat-resyncing = Some live updates were missed. Reloading this session before
 zc-chat-resynced = Live updates were missed, so the durable transcript was reloaded. Any in-progress approval or question was cancelled.
 zc-chat-resync-failed = Live updates were missed and the session could not be reloaded: { $error }
 zc-chat-session-restart-error = Failed to start a new session: { $error }
-zc-chat-code-cwd-unavailable = Cannot determine the directory zerocode was launched from: { $error }. A local Code session must start in that project, so it was not created.
-zc-chat-code-cwd-not-utf8 = The directory zerocode was launched from is not valid UTF-8 ({ $path }), so a local Code session cannot start there. Relaunch zerocode from a UTF-8 path.
+zc-chat-code-cwd-not-utf8 = The selected directory is not valid UTF-8 ({ $path }), so the Code session was not created. Pick a directory whose path is valid UTF-8.
+zc-chat-code-cwd-not-absolute = The selected directory is not an absolute path ({ $path }), so the new Code session was not created. Pick a directory from the root of the filesystem the session runs on.
+zc-chat-change-directory-error = Failed to start a session in the selected directory: { $error }
+zc-chat-change-directory-chat-only = Chat sessions follow the selected agent's workspace, so there is no directory to choose here. Use the Code pane to start a session in a different directory.
 
 zc-chat-thinking-visible = Thinking output: visible
 zc-chat-thinking-hidden = Thinking output: hidden
@@ -469,6 +504,7 @@ zc-model-switch-provider-ok = model_provider switched to { $provider } (model: {
 zc-model-switch-failed = Model switch failed: { $error }
 zc-model-catalog-no-provider = Could not resolve this agent's model_provider from config.
 zc-model-catalog-empty = No models available for the active model_provider.
+zc-model-catalog-failed = Could not load models for the active model_provider: { $error }
 zc-model-catalog-loading = Loading models…
 zc-model-provider-catalog-failed = Could not load model_providers: { $error }
 
@@ -497,8 +533,10 @@ zc-chat-help-yank-selection = Yank selection
 zc-chat-help-return-to-input = Return to input
 zc-chat-help-browse-mode = Browse mode
 zc-chat-help-scroll-conversation = Scroll conversation
+zc-chat-help-open-link = Click a link to open it; drag from elsewhere to select text
 zc-chat-help-toggle-thoughts = Toggle thoughts
 zc-chat-help-new-session = New session
+zc-chat-help-change-directory = Choose a directory and start a new Code session
 zc-chat-help-acp-memory = History saved & resumable; persistent memory isolated
 zc-chat-session-list-resume-title = Saved sessions (Enter=resume, Esc=new)
 zc-chat-session-list-resume-note = Session history saved & resumable · Persistent memory isolated
@@ -521,9 +559,17 @@ zc-chat-copied-clipboard = Copied to clipboard
 zc-chat-copy-message = [Copy]
 zc-chat-copy-message-copied = [Copied]
 zc-chat-context-menu-copy = Copy
+zc-chat-context-menu-copy-selection = Copy selection
+zc-chat-context-menu-open-link = Open link
+zc-chat-context-menu-copy-link = Copy link
+zc-chat-open-link-failed = Could not open link: { $error }
 zc-chat-context-menu-send-now = Send now
 zc-chat-context-menu-edit = Edit
 zc-chat-context-menu-delete = Delete
+zc-chat-tool-show-all = [Show all · { $count } more lines]
+zc-chat-tool-show-less = [Show less]
+zc-chat-tool-display-limited = [Display limited; copy for full content]
+zc-chat-tool-encoded-size = { $count } encoded characters
 
 zc-config-breadcrumb-root = Config
 zc-config-section-detail-hint = { $open } or { $into } to open this section
@@ -621,3 +667,85 @@ zc-config-footer-action-new-line = new line
 zc-config-field-edit-hint = { $keys } → press to edit
 
 zc-doctor-log-path = log: { $path }
+
+zc-oidc-enroll-visit = To sign in, visit { $uri } and enter code { $code }
+zc-oidc-enroll-waiting = Waiting for identity-provider approval (the code expires in { $seconds } seconds)...
+zc-oidc-enroll-missing-url = auth_provider { $provider } is set with no auth_token. Set [connection.wss] enroll_url to the gateway's HTTP origin to sign in interactively, or export ZEROCLAW_AUTH_TOKEN (see: zeroclaw oidc login).
+zc-oidc-enroll-done = Signed in. The token is held for this session only; export ZEROCLAW_AUTH_TOKEN to skip enrollment next time.
+
+## Config registry metadata. Stable identifiers are used for lookup while the
+## RPC-provided English display strings remain compatibility fallbacks.
+zc-config-group-foundation = Foundation
+zc-config-group-agent = Agent
+zc-config-group-multi-agent = Multi-agent
+zc-config-group-tools = Tools
+zc-config-group-integrations = Integrations
+zc-config-group-network = Network
+zc-config-group-storage = Storage
+zc-config-group-operations = Operations
+zc-config-group-other = Other
+
+zc-config-section-providers-models-label = Model providers
+zc-config-section-model-routes-label = Model routes
+zc-config-section-embedding-routes-label = Embedding routes
+zc-config-section-risk-profiles-label = Risk profiles
+zc-config-section-runtime-profiles-label = Runtime profiles
+zc-config-section-storage-label = Storage
+zc-config-section-memory-label = Memory
+zc-config-section-skills-label = Skills
+zc-config-section-skill-bundles-label = Skill bundles
+zc-config-section-mcp-label = MCP
+zc-config-section-mcp-servers-label = MCP servers
+zc-config-section-mcp-bundles-label = MCP bundles
+zc-config-section-knowledge-bundles-label = Knowledge bundles
+zc-config-section-providers-tts-label = TTS providers
+zc-config-section-providers-transcription-label = Transcription providers
+zc-config-section-channels-label = Channels
+zc-config-section-hardware-label = Hardware
+zc-config-section-agents-label = Agents
+zc-config-section-peer-groups-label = Peer groups
+zc-config-section-cron-label = Cron
+zc-config-section-tunnel-label = Tunnel
+zc-config-section-onboard-state-label = Quickstart state
+zc-config-section-heartbeat-label = Heartbeat
+zc-config-section-hooks-label = Hooks
+zc-config-section-pacing-label = Pacing
+zc-config-section-pipeline-label = Pipeline
+zc-config-section-query-classification-label = Query classification
+zc-config-section-reliability-label = Reliability
+zc-config-section-runtime-label = Runtime
+zc-config-section-scheduler-label = Scheduler
+zc-config-section-sop-label = SOP
+zc-config-section-verifiable-intent-label = Verifiable intent
+zc-config-section-delegate-label = Delegate
+zc-config-section-browser-label = Browser
+zc-config-section-browser-delegate-label = Browser delegate
+zc-config-section-http-request-label = HTTP request
+zc-config-section-image-gen-label = Image generation
+zc-config-section-knowledge-label = Knowledge
+zc-config-section-link-enricher-label = Link enricher
+zc-config-section-media-pipeline-label = Media pipeline
+zc-config-section-multimodal-label = Multimodal
+
+zc-config-section-providers-models-help = Pick a model provider to configure (Anthropic, OpenAI, OpenRouter, Ollama, custom OpenAI-compatible gateways, etc.). Multiple aliases per provider are supported.
+zc-config-section-model-routes-help = Named model routing hints (for example, reasoning, fast, or code). Each route maps a hint to a provider and model.
+zc-config-section-embedding-routes-help = Named embedding routing hints. Each route maps a hint to an embedding-capable provider and model.
+zc-config-section-risk-profiles-help = Named risk profiles that bind allowlists, denylists, and approval thresholds.
+zc-config-section-runtime-profiles-help = Named runtime tuning profiles for token limits, retry policy, and timeouts.
+zc-config-section-storage-help = Configure storage backends such as SQLite, Postgres, Qdrant, Markdown, or Lucid.
+zc-config-section-memory-help = Persistent memory backend. SQLite is the default; choose `none` to disable long-term recall.
+zc-config-section-skills-help = Configure where skill files live and how the skills loader handles community repositories.
+zc-config-section-skill-bundles-help = Named bundles of skill files that agents can load at startup.
+zc-config-section-mcp-help = Model Context Protocol settings, including whether servers load eagerly or on demand.
+zc-config-section-mcp-servers-help = Individual Model Context Protocol servers and their transport, command or URL, headers, and timeout.
+zc-config-section-mcp-bundles-help = Named bundles of MCP servers granted to agents.
+zc-config-section-knowledge-bundles-help = Named bundles of knowledge sources such as RAG indexes and document folders.
+zc-config-section-providers-tts-help = Text-to-speech providers for agent voices and languages.
+zc-config-section-providers-transcription-help = Speech-to-text providers for audio transcription pipelines.
+zc-config-section-channels-help = Configure the chat platforms that ZeroClaw listens on.
+zc-config-section-hardware-help = Optional hardware peripherals such as Arduino, STM32, and GPIO.
+zc-config-section-agents-help = Configure agents that bind providers, profiles, bundles, and channels.
+zc-config-section-peer-groups-help = Named groups that bind a channel, member agents, and external peers.
+zc-config-section-cron-help = Scheduled tasks that bind a schedule to a prompt, channel, and target.
+zc-config-section-tunnel-help = Optionally expose the gateway through Cloudflare or ngrok, or keep it local only.
+zc-config-section-onboard-state-help = Quickstart lifecycle state and its legacy per-section completion ledger.

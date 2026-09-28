@@ -1,4 +1,4 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::ops::Range;
 use std::sync::{
     Arc,
@@ -86,10 +86,37 @@ enum ChatPhase {
         /// Interactive directory picker.
         explorer: FileExplorerState,
     },
+    /// Code-only picker opened by `/change-directory`; the current session is
+    /// stashed in `background` until the new session succeeds or the picker
+    /// closes. A running session is never re-rooted in place.
+    PickChangeDirectory {
+        /// The agent the new session starts for — the active session's agent.
+        agent_alias: String,
+        /// Interactive directory picker (local or daemon-side).
+        explorer: FileExplorerState,
+    },
     /// Active chat session.
     Active(Box<ChatState>),
     /// Unrecoverable error.
     Error(String),
+}
+
+/// Outcome of a session-start attempt.
+///
+/// `start_session_with_cancel` renders its own failure into the pane, but a
+/// caller that *frames* the start differently (`/change-directory` reports a
+/// directory selection failure, not a bare session failure) needs the
+/// underlying error text without re-deriving it from pane state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SessionStartOutcome {
+    /// A session was created (or resumed) and is now the active phase.
+    Started,
+    /// The attempt was abandoned before creation completed, either by a
+    /// cancellation signal or because another retry owns the creation.
+    Cancelled,
+    /// Creation, or the post-creation history replay, failed. Carries the raw
+    /// error text already surfaced by the pane.
+    Failed(String),
 }
 
 /// Distinguishes which kind of chat pane this is.
@@ -99,67 +126,184 @@ pub(crate) enum PaneKind {
     Acp,
 }
 
-/// Why pinning a local Code session to the launch directory failed.
+/// Why converting an explicitly selected session root into a JSON-RPC `cwd`
+/// failed.
 ///
-/// A local Code session promises that file and shell tools operate on the
-/// project zerocode was launched from. If that directory cannot be captured we
-/// must not silently fall through to an omitted cwd: `session/new` would then
-/// resolve the selected agent's workspace and the session would look healthy
-/// while acting on a different project tree.
+/// An explicit selection is a promise that the session's file and shell tools
+/// operate on *that* directory. If the selection cannot be represented
+/// faithfully we must not fall through to an omitted cwd: `session/new` would
+/// then resolve the selected agent's workspace and the session would look
+/// healthy while acting on a different project tree.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum LocalCodeCwdError {
-    /// `std::env::current_dir()` failed (e.g. the directory was deleted or is
-    /// unreadable). Carries the OS error text.
-    Unavailable(String),
-    /// The launch directory is not valid UTF-8, so it cannot be represented in
-    /// the JSON-RPC `cwd` string. Carries the lossy rendering for diagnosis.
+    /// The selected directory is not valid UTF-8, so it cannot be represented
+    /// in the JSON-RPC `cwd` string. Carries the lossy rendering for display.
     NotUtf8(String),
+    /// An explicitly selected root is not absolute. A relative `cwd` would be
+    /// resolved against the daemon's process directory, not the directory the
+    /// user picked. Carries the rejected path.
+    NotAbsolute(String),
 }
 
 impl LocalCodeCwdError {
-    /// Localized, user-facing text for this capture failure.
+    /// Localized, user-facing text for this conversion failure.
     fn localized(&self) -> String {
         match self {
-            LocalCodeCwdError::Unavailable(error) => {
-                crate::i18n::t_args("zc-chat-code-cwd-unavailable", &[("error", error.as_str())])
-            }
             LocalCodeCwdError::NotUtf8(path) => {
                 crate::i18n::t_args("zc-chat-code-cwd-not-utf8", &[("path", path.as_str())])
+            }
+            LocalCodeCwdError::NotAbsolute(path) => {
+                crate::i18n::t_args("zc-chat-code-cwd-not-absolute", &[("path", path.as_str())])
             }
         }
     }
 }
 
-/// Process cwd for a fresh local Code session. Chat and remote transports
-/// return `Ok(None)` to deliberately omit cwd so the daemon uses the agent
-/// workspace or an explicit picker.
+/// Convert an explicitly selected session root into the JSON-RPC `cwd` string.
 ///
-/// Returns `Err` when a local Code session *should* pin the launch directory
-/// but cannot. Callers must surface that error rather than starting a session
-/// against a different project.
-fn local_code_session_cwd(
-    pane_kind: PaneKind,
+/// A non-UTF-8 selection is rejected rather than lossily converted: a lossy
+/// string names a *different* directory, so the session would silently root
+/// somewhere the user never picked. The error carries only the lossy rendering
+/// for display.
+///
+/// A non-absolute selection is rejected for the same reason: the daemon would
+/// resolve it against *its* process directory rather than the picked one.
+/// "Absolute" is judged for `transport`'s daemon, not for this client — see
+/// [`is_absolute_session_root`].
+fn explicit_cwd(
+    path: &std::path::Path,
     transport: crate::client::Transport,
-) -> Result<Option<String>, LocalCodeCwdError> {
-    if pane_kind == PaneKind::Acp && transport == crate::client::Transport::Local {
-        resolve_local_code_cwd(std::env::current_dir()).map(Some)
-    } else {
-        // Deliberate omission: Chat uses the agent workspace, remote Code uses
-        // the directory picker. Neither is a failure.
-        Ok(None)
+) -> Result<String, LocalCodeCwdError> {
+    let cwd = path
+        .to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| LocalCodeCwdError::NotUtf8(path.display().to_string()))?;
+    if !is_absolute_session_root(&cwd, transport) {
+        return Err(LocalCodeCwdError::NotAbsolute(cwd));
+    }
+    Ok(cwd)
+}
+
+/// Whether `root` is an absolute path *on the machine that will run the
+/// session*, which `transport` identifies.
+///
+/// `Path::is_absolute` answers for the platform zerocode was compiled for, and
+/// that is authoritative only for a local session. A WSS picker browses the
+/// *daemon's* filesystem, so the client's platform says nothing about the
+/// selection: a Windows client can legitimately confirm a POSIX root
+/// (`/srv/project`) on a Unix daemon, and a Unix client can confirm a drive
+/// (`C:\project`) or UNC (`\\host\share`) root on a Windows one. Remote
+/// validation therefore accepts every wire form and leaves the final ruling to
+/// the daemon, which is the only party that can make it.
+///
+/// Local validation stays native: a Windows form is not a root on a Unix
+/// machine, it is a relative directory name that would resolve against the
+/// daemon's process directory.
+fn is_absolute_session_root(root: &str, transport: crate::client::Transport) -> bool {
+    match transport {
+        crate::client::Transport::Local => std::path::Path::new(root).is_absolute(),
+        crate::client::Transport::Wss => is_remote_absolute_session_root(root),
     }
 }
 
-/// Pure capture step, split out so tests can inject both failure modes without
-/// mutating global process state.
-fn resolve_local_code_cwd(
-    current_dir: std::io::Result<std::path::PathBuf>,
-) -> Result<String, LocalCodeCwdError> {
-    let path = current_dir.map_err(|e| LocalCodeCwdError::Unavailable(e.to_string()))?;
-    match path.to_str() {
-        Some(s) => Ok(s.to_string()),
-        None => Err(LocalCodeCwdError::NotUtf8(path.display().to_string())),
+/// Whether `root` is absolute in any wire form a remote daemon can report.
+///
+/// Deliberately `cfg`-neutral: the answer depends on the daemon's platform,
+/// which this build knows nothing about.
+fn is_remote_absolute_session_root(root: &str) -> bool {
+    // POSIX root (which also covers `//server/share`), and UNC / device roots.
+    if root.starts_with('/') || root.starts_with(r"\\") {
+        return true;
     }
+    // Drive-letter root: `C:\...` or `C:/...`. A bare `C:` is drive-relative,
+    // not absolute, so the separator is required.
+    matches!(
+        root.as_bytes(),
+        [drive, b':', separator, ..]
+            if drive.is_ascii_alphabetic() && (*separator == b'\\' || *separator == b'/')
+    )
+}
+
+/// Root a remote picker opens at when the session has no directory to lead
+/// with.
+///
+/// The daemon exposes no "where should a picker start" RPC, so this is the
+/// existing daemon-side picker convention rather than a discovered root: the
+/// remote explorer lists `/` and the user navigates from there. It is a
+/// protocol root, not a local path, and is kept identical for the startup and
+/// restart pickers so a remote session never browses this machine.
+const WSS_PICKER_ROOT: &str = "/";
+
+/// Filesystem root of the machine zerocode itself runs on.
+///
+/// Used only as the last-resort start directory for a *local* picker, where a
+/// POSIX `/` would name nothing on Windows.
+fn local_picker_root() -> std::path::PathBuf {
+    std::path::PathBuf::from(if cfg!(windows) { r"C:\" } else { "/" })
+}
+
+/// Directory the `/change-directory` picker opens at.
+///
+/// The session's own root leads. The fallback is transport-aware: a WSS picker
+/// lists the *daemon's* filesystem, where this process's directory names
+/// nothing, so it starts at [`WSS_PICKER_ROOT`]. A local picker falls back to
+/// this machine's root. Either way the start directory satisfies the same
+/// absoluteness rule confirmation applies, so the picker never opens on a
+/// directory the user could not select.
+fn change_directory_start_dir(
+    session_cwd: Option<&str>,
+    transport: crate::client::Transport,
+    current_dir: impl FnOnce() -> Option<std::path::PathBuf>,
+) -> std::path::PathBuf {
+    if let Some(cwd) = session_cwd.filter(|cwd| !cwd.trim().is_empty()) {
+        return std::path::PathBuf::from(cwd);
+    }
+    if transport == crate::client::Transport::Wss {
+        return std::path::PathBuf::from(WSS_PICKER_ROOT);
+    }
+    current_dir()
+        .filter(|dir| {
+            dir.to_str()
+                .is_some_and(|dir| is_absolute_session_root(dir, crate::client::Transport::Local))
+        })
+        .unwrap_or_else(local_picker_root)
+}
+
+/// Combine a directory-change report with the notice the session restore
+/// already left on the focused session.
+///
+/// `superseded` is the generic session-start error the restore surfaced: the
+/// directory-change report carries the same underlying failure in the terms
+/// the user asked for, so repeating it is noise. Anything else *that same
+/// restore* appended — a dropped-resume count, for instance — is information
+/// the report does not carry and is preserved after it.
+///
+/// Existing text is only ever carried over when a `superseded` notice is given
+/// *and* matches as a prefix of it: that pairing is the sole proof the text
+/// belongs to the restore this report supersedes. Without it the existing
+/// notice is unrelated or expired — an older, already-stale message that this
+/// report replaces outright — so it is dropped rather than resurrected.
+fn merge_change_directory_notice(
+    notice: String,
+    existing: Option<&str>,
+    superseded: Option<&str>,
+) -> String {
+    let Some(existing) = existing.map(str::trim).filter(|text| !text.is_empty()) else {
+        return notice;
+    };
+    // No superseded notice: nothing ties `existing` to this restore.
+    let Some(superseded) = superseded.map(str::trim).filter(|text| !text.is_empty()) else {
+        return notice;
+    };
+    // A mismatched prefix means `existing` came from somewhere else entirely.
+    let Some(remainder) = existing.strip_prefix(superseded) else {
+        return notice;
+    };
+    let remainder = remainder.trim();
+    if remainder.is_empty() || notice.contains(remainder) {
+        return notice;
+    }
+    format!("{notice} {remainder}")
 }
 
 impl PaneKind {
@@ -343,10 +487,10 @@ struct GitStatusUpdate {
 /// picker swaps to the populated list (or surfaces an error) on the draw loop.
 struct ModelFetchResult {
     session_id: String,
-    family: String,
     model_provider_ref: String,
     models: Vec<String>,
     current: Option<String>,
+    error: Option<String>,
 }
 
 /// Completion of a background lost-session re-attachment. The message queue
@@ -509,6 +653,18 @@ struct PromptCompletion {
     turn_generation: u64,
     error: Option<String>,
     transport_closed: bool,
+}
+
+/// Map a wire `token_source` value ("provider"/"estimate"/"calibrated") to the
+/// Fluent key whose localized label describes that provenance. Unknown values
+/// (older or future daemons) fall back to a label-less render.
+fn token_source_fluent_key(source: &str) -> String {
+    match source {
+        "provider" => "zc-chat-history-trimmed-token-source-provider".to_string(),
+        "estimate" => "zc-chat-history-trimmed-token-source-estimate".to_string(),
+        "calibrated" => "zc-chat-history-trimmed-token-source-calibrated".to_string(),
+        other => format!("zc-chat-history-trimmed-token-source-{other}"),
+    }
 }
 
 fn should_retry_on_entry(phase: &ChatPhase) -> bool {
@@ -682,6 +838,20 @@ impl Chat {
 
     /// One summary per tracked session, in stable creation order, for the
     /// agent sidebar. Cheap: derives from live state, owns nothing.
+    /// Terminal status candidates for every live session this pane tracks,
+    /// focused or not, paired with the owning agent alias. Background sessions
+    /// keep draining transport events each tick, so their state is current.
+    pub(crate) fn terminal_statuses(&self) -> Vec<(TurnStatus, String)> {
+        let mut out = Vec::with_capacity(self.background.len() + 1);
+        if let ChatPhase::Active(state) = &self.phase {
+            out.push((state.terminal_status(), state.agent_alias.clone()));
+        }
+        for state in &self.background {
+            out.push((state.terminal_status(), state.agent_alias.clone()));
+        }
+        out
+    }
+
     pub(crate) fn session_summaries(&self) -> Vec<SidebarSessionSummary> {
         let active = match &self.phase {
             ChatPhase::Active(state) => Some(state.as_ref()),
@@ -1368,6 +1538,33 @@ impl Chat {
             .await;
     }
 
+    /// Give up the focused-resume slot before a session start that must *not*
+    /// reattach to it.
+    ///
+    /// `start_session` prefers `resume_focused`'s stable id over any
+    /// `cwd_override` and deliberately sends no cwd on a resume, so a retained
+    /// failed-reconnect identity would swallow an explicitly chosen root and
+    /// silently reopen that session at its own. Demoting to a background resume
+    /// keeps the identity (and its queued messages) for a later retry instead
+    /// of discarding it.
+    ///
+    /// Callers demote at whichever point the focused slot stops being the right
+    /// target, which is the moment a valid explicit cwd is about to be sent:
+    ///
+    /// - `add_agent_session` demotes up front: adding a session is by
+    ///   definition a request for a *different* session than the retained one,
+    ///   and no path can be rejected on the way there.
+    /// - The `PickCwd` and `/change-directory` confirm paths demote only after
+    ///   `explicit_cwd` accepts the selection, so a cancelled picker or a
+    ///   rejected path leaves resume ownership untouched and the pending
+    ///   reconnect can still reattach.
+    fn demote_focused_resume_to_background(&mut self) {
+        if let Some(mut retained) = self.resume_focused.take() {
+            retained.was_focused = false;
+            self.resume_backgrounds.push(retained);
+        }
+    }
+
     async fn pick_or_start_session_inner(
         &mut self,
         agent_alias: &str,
@@ -1388,7 +1585,7 @@ impl Chat {
         if self.pane_kind == PaneKind::Acp && self.rpc.transport() == crate::client::Transport::Wss
         {
             // Remote ACP: start from the daemon root, not a local path.
-            let start_dir = std::path::PathBuf::from("/");
+            let start_dir = std::path::PathBuf::from(WSS_PICKER_ROOT);
             self.phase = ChatPhase::PickCwd {
                 agent_alias: agent_alias.to_string(),
                 explorer: FileExplorerState::new_dir_picker_remote(
@@ -1399,6 +1596,163 @@ impl Chat {
         } else {
             self.start_session_with_cancel(agent_alias, None, cancellation, phase)
                 .await;
+        }
+    }
+
+    /// Open the Code directory picker for `/change-directory`.
+    ///
+    /// Code-only: a Chat session follows its agent's workspace, so there is no
+    /// root for the user to re-select. The active session is stashed (never
+    /// closed or re-rooted) so cancelling, a rejected path, or a failed start
+    /// can return to it untouched.
+    fn begin_change_directory(&mut self) {
+        if self.pane_kind != PaneKind::Acp {
+            // Chat follows the selected agent's workspace. Say so instead of
+            // dropping the command: a silent no-op reads as a broken command.
+            if let ChatPhase::Active(ref mut state) = self.phase {
+                state.set_info_notice(crate::i18n::t("zc-chat-change-directory-chat-only"));
+            }
+            return;
+        }
+        let ChatPhase::Active(state) = &self.phase else {
+            return;
+        };
+        let agent_alias = state.agent_alias.clone();
+        // Start browsing where this session is rooted; the fallback is
+        // transport-aware so a remote picker never opens on a local path.
+        let start_dir =
+            change_directory_start_dir(state.cwd.as_deref(), self.rpc.transport(), || {
+                std::env::current_dir().ok()
+            });
+
+        // A confirmed directory starts an *additional* session, so the pane cap
+        // applies here exactly as it does to the sidebar "+". Refusing before
+        // the stash keeps the live session focused instead of parking it
+        // behind a picker that cannot add the ninth tracked session it would
+        // need to honor the selection.
+        if self.tracked_session_count() >= MAX_TRACKED_SESSIONS_PER_PANE {
+            if let ChatPhase::Active(ref mut state) = self.phase {
+                state.set_info_notice(crate::i18n::t_args(
+                    "zc-chat-session-cap",
+                    &[("max", &MAX_TRACKED_SESSIONS_PER_PANE.to_string())],
+                ));
+            }
+            return;
+        }
+        // A retained failed-reconnect identity is *not* given up here: the user
+        // has only asked to browse. Demotion happens at confirmation, once a
+        // valid explicit root exists to replace it, so cancelling the picker or
+        // choosing an unusable path leaves the pending reconnect able to
+        // reattach.
+
+        self.stash_active();
+        let explorer = if self.rpc.transport() == crate::client::Transport::Wss {
+            // Remote Code browses the daemon's filesystem, not this machine's.
+            FileExplorerState::new_dir_picker_remote(start_dir, Arc::clone(&self.rpc))
+        } else {
+            FileExplorerState::new_dir_picker(start_dir)
+        };
+        self.phase = ChatPhase::PickChangeDirectory {
+            agent_alias,
+            explorer,
+        };
+    }
+
+    /// Apply a confirmed `/change-directory` selection: start a new session
+    /// rooted at `path`, keeping the stashed session as the fallback.
+    ///
+    /// Both transports go through the ordinary session-start path with an
+    /// explicit cwd, so the daemon remains the authority on the resulting root.
+    async fn apply_change_directory_selection(
+        &mut self,
+        agent_alias: &str,
+        path: &std::path::Path,
+    ) {
+        let (notice, superseded) = match explicit_cwd(path, self.rpc.transport()) {
+            Ok(cwd) => {
+                // Only now that a valid explicit root will be sent: release the
+                // focused-resume slot so `session/new` carries this directory
+                // instead of a retained session's id (and old cwd).
+                self.demote_focused_resume_to_background();
+                match self.start_session(agent_alias, Some(&cwd)).await {
+                    SessionStartOutcome::Started => return,
+                    // Defensive only: this call passes no cancellation token or
+                    // entry-retry phase, the two things `start_session_with_cancel`
+                    // reports `Cancelled` for, so this path is unreachable today.
+                    // It is kept so a future cancellable start cannot strand the
+                    // pane in a picker whose session is already parked in
+                    // `background` — the restore below puts it back.
+                    SessionStartOutcome::Cancelled => (None, None),
+                    SessionStartOutcome::Failed(error) => (
+                        Some(crate::i18n::t_args(
+                            "zc-chat-change-directory-error",
+                            &[("error", error.as_str())],
+                        )),
+                        Some(crate::i18n::t_args(
+                            "zc-chat-error-create-session",
+                            &[("error", error.as_str())],
+                        )),
+                    ),
+                }
+            }
+            // A selection that cannot be sent faithfully never reaches
+            // `session/new`: a lossy or relative cwd would root the session in
+            // a directory the user never picked. Each rejection is reported in
+            // its own terms, naming the path, so an encoding problem is
+            // distinguishable from a non-absolute one.
+            Err(error) => (Some(error.localized()), None),
+        };
+        self.restore_change_directory_session(notice, superseded)
+            .await;
+    }
+
+    /// Return to the session stashed by [`Chat::begin_change_directory`] and,
+    /// when there is something to report, say why the new root was not
+    /// adopted. `superseded` names a notice the restore may already have set
+    /// that `notice` replaces outright.
+    async fn restore_change_directory_session(
+        &mut self,
+        notice: Option<String>,
+        superseded: Option<String>,
+    ) {
+        // A failed start with a live background session is already restored by
+        // `after_session_start`; only a path rejected before the request (or a
+        // start that left the error screen up) still needs the restore here.
+        if !matches!(self.phase, ChatPhase::Active(_)) {
+            self.restore_last_focused().await;
+        }
+        match &mut self.phase {
+            // Replace the generic session-start notice: the user asked for a
+            // directory change, so the failure is reported in those terms.
+            ChatPhase::Active(state) => {
+                let Some(notice) = notice else {
+                    return;
+                };
+                let merged = merge_change_directory_notice(
+                    notice,
+                    state.info_message.as_ref().map(|msg| msg.text.as_str()),
+                    superseded.as_deref(),
+                );
+                // A directory change that did not happen is a failure, not a
+                // completed action: the neutral note styling reads as "done".
+                state.info_message = Some(crate::widgets::InfoMessage::error(merged));
+                state.mark_dirty_full();
+            }
+            _ => match notice {
+                Some(notice) => self.phase = ChatPhase::Error(notice),
+                // Nothing to report and nothing to return to: the stashed
+                // session was closed while the picker was open. Fall back to
+                // the agent picker rather than leaving a picker on screen
+                // whose session no longer exists.
+                None => {
+                    self.phase = ChatPhase::PickAgent {
+                        agents: Vec::new(),
+                        list_state: ListState::default(),
+                        loading: true,
+                    };
+                    let _ = self.init().await;
+                }
+            },
         }
     }
 
@@ -1431,10 +1785,7 @@ impl Chat {
             return;
         }
         // A fresh launch must not consume a failed reconnect's stable ID or queue.
-        if let Some(mut retained) = self.resume_focused.take() {
-            retained.was_focused = false;
-            self.resume_backgrounds.push(retained);
-        }
+        self.demote_focused_resume_to_background();
         self.stash_active();
         self.pick_or_start_session(agent_alias).await;
     }
@@ -1595,9 +1946,13 @@ impl Chat {
         }
     }
 
-    async fn start_session(&mut self, agent_alias: &str, cwd_override: Option<&str>) {
+    async fn start_session(
+        &mut self,
+        agent_alias: &str,
+        cwd_override: Option<&str>,
+    ) -> SessionStartOutcome {
         self.start_session_with_cancel(agent_alias, cwd_override, None, None)
-            .await;
+            .await
     }
 
     async fn start_session_with_cancel(
@@ -1606,9 +1961,9 @@ impl Chat {
         cwd_override: Option<&str>,
         cancellation: Option<&Arc<AtomicBool>>,
         phase: Option<&Arc<AtomicU8>>,
-    ) {
+    ) -> SessionStartOutcome {
         if is_cancelled(cancellation) {
-            return;
+            return SessionStartOutcome::Cancelled;
         }
         // TodoWrite display is a ZeroCode UI concern owned by
         // `zerocode-config.toml` — the daemon holds no TodoWrite display schema
@@ -1631,47 +1986,31 @@ impl Chat {
         } else {
             EntryRetrySessionOwnership::RetryCreated
         };
-        // A resume must not re-point the session at the TUI's launch directory:
-        // pass no cwd so the daemon keeps the retained session's own cwd.
+        // A resume must not re-point the session at a new root: pass no cwd so
+        // the daemon keeps the retained session's own saved cwd, whatever this
+        // process's directory or the agent's workspace is now.
         //
-        // Fresh Chat sessions omit cwd so the daemon uses the selected agent's
-        // workspace. Fresh local Code sessions pin the process cwd so file and
-        // shell tools operate on the project zerocode was launched from. An
-        // explicit caller-supplied cwd (the remote ACP picker) still wins.
-        //
-        // If a local Code session cannot capture its launch directory we fail
-        // the creation instead of omitting cwd: a silent fallback would start a
-        // healthy-looking session rooted at the agent workspace, letting file
-        // and shell tools act on a different project.
-        let explicit_cwd = cwd_override
-            .filter(|s| !s.trim().is_empty())
-            .map(str::to_string);
+        // A fresh session sends a root only when one was explicitly selected
+        // (the startup picker or `/change-directory`). Otherwise cwd is
+        // omitted so the daemon resolves the selected agent's configured
+        // workspace — the default session root for Chat and Code alike.
         let cwd_str: Option<String> = if resume_id.is_some() {
             None
-        } else if let Some(cwd) = explicit_cwd {
-            Some(cwd)
         } else {
-            match local_code_session_cwd(self.pane_kind, self.rpc.transport()) {
-                Ok(cwd) => cwd,
-                Err(e) => {
-                    self.phase = ChatPhase::Error(crate::i18n::t_args(
-                        "zc-chat-error-create-session",
-                        &[("error", &e.localized())],
-                    ));
-                    return;
-                }
-            }
+            cwd_override
+                .filter(|cwd| !cwd.trim().is_empty())
+                .map(str::to_owned)
         };
         if is_cancelled(cancellation) {
-            return;
+            return SessionStartOutcome::Cancelled;
         }
         if let Some(phase) = phase
             && !claim_entry_retry_session_creation(phase)
         {
-            return;
+            return SessionStartOutcome::Cancelled;
         }
         if is_cancelled(cancellation) {
-            return;
+            return SessionStartOutcome::Cancelled;
         }
         let result = if self.pane_kind == PaneKind::Acp {
             self.rpc
@@ -1682,7 +2021,7 @@ impl Chat {
                 .session_new_with_id(agent_alias, cwd_str.as_deref(), resume_id)
                 .await
         };
-        match result {
+        let outcome = match result {
             Ok(session) => {
                 let resumed_sid = resume.as_ref().map(|_| session.session_id.clone());
                 let recovery_session_id = session.session_id.clone();
@@ -1699,7 +2038,7 @@ impl Chat {
                         Some(session_ownership),
                     )
                     .await;
-                    return;
+                    return SessionStartOutcome::Cancelled;
                 }
                 // `todo_settings` is resolved fresh at this boundary from
                 // `zerocode-config.toml` (the canonical owner); the removed
@@ -1719,7 +2058,7 @@ impl Chat {
                         Some(session_ownership),
                     )
                     .await;
-                    return;
+                    return SessionStartOutcome::Cancelled;
                 }
                 Self::refresh_model_identity(&self.rpc, &mut state).await;
                 if is_cancelled(cancellation) {
@@ -1729,7 +2068,7 @@ impl Chat {
                         Some(session_ownership),
                     )
                     .await;
-                    return;
+                    return SessionStartOutcome::Cancelled;
                 }
                 // On a resume, replay the daemon-retained transcript so the
                 // reattached pane shows the prior conversation rather than an
@@ -1738,12 +2077,13 @@ impl Chat {
                     let msgs = match self.rpc.session_messages(&sid).await {
                         Ok(msgs) => msgs,
                         Err(error) => {
+                            let error = error.to_string();
                             self.phase = ChatPhase::Error(crate::i18n::t_args(
                                 "zc-chat-error-resume-history",
-                                &[("error", &error.to_string())],
+                                &[("error", &error)],
                             ));
                             self.after_session_start().await;
-                            return;
+                            return SessionStartOutcome::Failed(error);
                         }
                     };
                     state.message_count = msgs.total;
@@ -1769,21 +2109,25 @@ impl Chat {
                         Some(session_ownership),
                     )
                     .await;
-                    return;
+                    return SessionStartOutcome::Cancelled;
                 }
                 self.phase = ChatPhase::Active(Box::new(state));
                 if needs_terminal_recovery {
                     self.begin_session_resync(recovery_session_id);
                 }
+                SessionStartOutcome::Started
             }
             Err(e) => {
+                let error = e.to_string();
                 self.phase = ChatPhase::Error(crate::i18n::t_args(
                     "zc-chat-error-create-session",
-                    &[("error", &e.to_string())],
+                    &[("error", &error)],
                 ));
+                SessionStartOutcome::Failed(error)
             }
-        }
+        };
         self.after_session_start().await;
+        outcome
     }
 
     /// Post-`start_session` bookkeeping for the multi-session pane:
@@ -2019,34 +2363,21 @@ impl Chat {
                 return None;
             }
             // Remote ACP picker must start from a path the daemon understands.
-            let start_dir = std::path::PathBuf::from("/");
+            let start_dir = std::path::PathBuf::from(WSS_PICKER_ROOT);
             return Some(ChatPhase::PickCwd {
                 agent_alias: alias,
                 explorer: FileExplorerState::new_dir_picker_remote(start_dir, Arc::clone(rpc)),
             });
         }
 
-        // Chat restarts omit cwd so the daemon keeps the agent workspace.
-        // Local Code restarts pin the process cwd. Remote ACP re-prompts via
-        // the picker above.
-        //
-        // A capture failure aborts the restart and keeps the existing session
-        // rather than minting one rooted at the agent workspace, which would
-        // silently move file and shell tools to a different project.
-        let cwd_str = match local_code_session_cwd(pane_kind, rpc.transport()) {
-            Ok(cwd) => cwd,
-            Err(e) => {
-                state.set_info_notice(crate::i18n::t_args(
-                    "zc-chat-session-restart-error",
-                    &[("error", &e.localized())],
-                ));
-                return None;
-            }
-        };
+        // A restart mints a *fresh* session, so it follows the fresh-session
+        // default: omit cwd and let the daemon root the replacement at the
+        // selected agent's workspace. Remote ACP re-prompts via the picker
+        // above, which supplies an explicit root through `start_session`.
         let new_session = if pane_kind == PaneKind::Acp {
-            rpc.session_new_acp(&alias, cwd_str.as_deref(), None).await
+            rpc.session_new_acp(&alias, None, None).await
         } else {
-            rpc.session_new(&alias, cwd_str.as_deref()).await
+            rpc.session_new(&alias, None).await
         };
         match new_session {
             Ok(s) => {
@@ -2476,6 +2807,23 @@ impl Chat {
                     }
                 }
             }
+            ChatContextMenuRequest::OpenUrl(url) => {
+                let result = crate::url_open::open(&url).await;
+                if let ChatPhase::Active(ref mut state) = self.phase
+                    && let Err(error) = result
+                {
+                    state.set_info_notice(crate::i18n::t_args(
+                        "zc-chat-open-link-failed",
+                        &[("error", &error.to_string())],
+                    ));
+                }
+            }
+            ChatContextMenuRequest::CopyUrl(url) => {
+                crate::mouse::copy_osc52(&url);
+                if let ChatPhase::Active(ref mut state) = self.phase {
+                    state.set_info_notice(crate::i18n::t("zc-chat-copied-clipboard"));
+                }
+            }
             ChatContextMenuRequest::Queue { id, action } => match action {
                 ChatContextMenuAction::SendNow => {
                     let promoted = match self.phase {
@@ -2520,6 +2868,7 @@ impl Chat {
                         state.delete_queued_by_id(id);
                     }
                 }
+                ChatContextMenuAction::OpenLink | ChatContextMenuAction::CopyLink => {}
             },
         }
     }
@@ -2861,7 +3210,8 @@ impl Chat {
                     Some(crate::i18n::t("zc-chat-session-list-resume-note")),
                 );
             }
-            ChatPhase::PickCwd { explorer, .. } => {
+            ChatPhase::PickCwd { explorer, .. }
+            | ChatPhase::PickChangeDirectory { explorer, .. } => {
                 explorer.render(frame, area);
             }
             ChatPhase::Active(state) => {
@@ -2972,8 +3322,27 @@ impl Chat {
                 match action {
                     ExplorerAction::ConfirmDir(path) => {
                         let alias = agent_alias.clone();
-                        let cwd_str = path.to_str().map(str::to_string);
-                        self.start_session(&alias, cwd_str.as_deref()).await;
+                        match explicit_cwd(&path, self.rpc.transport()) {
+                            Ok(cwd) => {
+                                // Only now that a valid explicit root will be
+                                // sent: release the focused-resume slot so
+                                // `session/new` carries this directory instead
+                                // of a retained session's id (and old cwd).
+                                self.demote_focused_resume_to_background();
+                                self.start_session(&alias, Some(&cwd)).await;
+                            }
+                            // Never fall back to an omitted cwd: the daemon
+                            // would root the session at the agent workspace
+                            // while the user believes they picked this
+                            // directory. A rejection sends nothing, so resume
+                            // ownership stays as it was.
+                            Err(error) => {
+                                self.phase = ChatPhase::Error(crate::i18n::t_args(
+                                    "zc-chat-error-create-session",
+                                    &[("error", &error.localized())],
+                                ));
+                            }
+                        }
                     }
                     ExplorerAction::Cancel => {
                         // With live background sessions, a cancelled CWD pick
@@ -2986,6 +3355,34 @@ impl Chat {
                                 loading: true,
                             };
                             // Re-fetch agents asynchronously.
+                            let _ = self.init().await;
+                        }
+                    }
+                    ExplorerAction::Confirm(_) | ExplorerAction::None => {}
+                }
+                return false;
+            }
+            ChatPhase::PickChangeDirectory {
+                agent_alias,
+                explorer,
+            } => {
+                let action = explorer.handle_key(key);
+                match action {
+                    ExplorerAction::ConfirmDir(path) => {
+                        let alias = agent_alias.clone();
+                        self.apply_change_directory_selection(&alias, &path).await;
+                    }
+                    ExplorerAction::Cancel => {
+                        // The session this picker was opened from is stashed,
+                        // so cancelling returns to it without sending
+                        // `session/new`. The fallback mirrors the CWD picker
+                        // for the (unexpected) case of no stashed session.
+                        if !self.restore_last_focused().await {
+                            self.phase = ChatPhase::PickAgent {
+                                agents: Vec::new(),
+                                list_state: ListState::default(),
+                                loading: true,
+                            };
                             let _ = self.init().await;
                         }
                     }
@@ -3385,6 +3782,10 @@ impl Chat {
                         self.phase = next_phase;
                     }
                     self.note_session_replaced(&old_sid);
+                    return false;
+                }
+                InputBarAction::ChangeDirectory => {
+                    self.begin_change_directory();
                     return false;
                 }
                 InputBarAction::ResumeQueue => {
@@ -3851,13 +4252,17 @@ impl Chat {
         })
     }
 
-    /// Fetch the model catalog for a model_provider family. Returns an empty vec
-    /// on failure; the caller surfaces the error on the info bar.
-    async fn fetch_models(rpc: &RpcClient, family: &str) -> Vec<String> {
-        match rpc.catalog_models(family).await {
-            Ok(res) => res.models,
-            Err(_) => Vec::new(),
-        }
+    /// Fetch the model catalog for a configured model_provider reference while
+    /// preserving an actionable RPC diagnostic separately from a successful
+    /// empty catalog.
+    async fn fetch_models(
+        rpc: &RpcClient,
+        model_provider_ref: &str,
+    ) -> Result<Vec<String>, String> {
+        rpc.catalog_models(model_provider_ref)
+            .await
+            .map(|res| res.models)
+            .map_err(|error| error.to_string())
     }
 
     /// Open the single-stage model picker for the active agent's model_provider,
@@ -3878,14 +4283,10 @@ impl Chat {
             state.mark_dirty_full();
             return;
         };
-        let family = model_provider_ref
-            .split('.')
-            .next()
-            .unwrap_or(&model_provider_ref)
-            .to_string();
-
         // Warm cache: open immediately, no fetch, no loading state.
-        if state.input_bar.model_catalog_provider() == Some(family.as_str())
+        // The full configured reference is the cache identity: two aliases in
+        // one family may have different endpoints, headers, and catalogs.
+        if state.input_bar.model_catalog_provider() == Some(model_provider_ref.as_str())
             && !state.input_bar.model_catalog().is_empty()
         {
             let models = state.input_bar.model_catalog().to_vec();
@@ -3914,21 +4315,29 @@ impl Chat {
         let rpc = rpc.clone();
         let tx = model_fetch_tx.clone();
         let session_id = state.session_id.clone();
-        let model_provider_ref_c = model_provider_ref.clone();
         let session_model = state.model.clone();
+        let model_provider_ref_c = model_provider_ref.clone();
         tokio::spawn(async move {
-            let models = Self::fetch_models(&rpc, &family).await;
-            let current = match session_model {
-                Some(m) => Some(m),
-                None => Self::configured_model(&rpc, &model_provider_ref_c).await,
+            let catalog = Self::fetch_models(&rpc, &model_provider_ref_c).await;
+            let (models, error) = match catalog {
+                Ok(models) => (models, None),
+                Err(error) => (Vec::new(), Some(error)),
+            };
+            let current = if error.is_none() {
+                match session_model {
+                    Some(m) => Some(m),
+                    None => Self::configured_model(&rpc, &model_provider_ref_c).await,
+                }
+            } else {
+                None
             };
             let _ = tx
                 .send(ModelFetchResult {
                     session_id,
-                    family,
                     model_provider_ref: model_provider_ref_c,
                     models,
                     current,
+                    error,
                 })
                 .await;
         });
@@ -3948,6 +4357,15 @@ impl Chat {
         if !matches!(state.model_picker, ModelPickerOverlay::Loading) {
             return;
         }
+        if let Some(error) = res.error {
+            state.model_picker = ModelPickerOverlay::None;
+            state.info_message = Some(crate::widgets::InfoMessage::error(crate::i18n::t_args(
+                "zc-model-catalog-failed",
+                &[("error", &error)],
+            )));
+            state.mark_dirty_full();
+            return;
+        }
         if res.models.is_empty() {
             state.model_picker = ModelPickerOverlay::None;
             state.info_message = Some(crate::widgets::InfoMessage::error(crate::i18n::t(
@@ -3958,12 +4376,11 @@ impl Chat {
         }
         state
             .input_bar
-            .set_model_catalog(res.family, res.models.clone());
+            .set_model_catalog(res.model_provider_ref.clone(), res.models.clone());
         state.model_picker = ModelPickerOverlay::Model(crate::widgets::PickerState::new(
             res.models,
             res.current.as_deref(),
         ));
-        let _ = res.model_provider_ref;
         state.info_message = None;
         state.mark_dirty_full();
     }
@@ -4055,7 +4472,9 @@ impl Chat {
         self.finish_transcript_drag_if_released(&mouse);
 
         // Dir-picker explorer handles its own mouse events.
-        if let ChatPhase::PickCwd { explorer, .. } = &mut self.phase {
+        if let ChatPhase::PickCwd { explorer, .. }
+        | ChatPhase::PickChangeDirectory { explorer, .. } = &mut self.phase
+        {
             explorer.handle_mouse(mouse);
             return;
         }
@@ -4274,6 +4693,7 @@ impl Chat {
             let cleanup_report = state.input_bar.take_cleanup_report();
             state.surface_cleanup_report(cleanup_report);
             if input_bar_consumed {
+                state.cancel_url_activation();
                 state.clear_mouse_highlight();
                 return;
             }
@@ -4386,6 +4806,30 @@ impl Chat {
                 return;
             }
 
+            if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+                && mouse.modifiers.is_empty()
+                && (state.toggle_tool_footer_at(col, row) || state.toggle_tool_header_at(col, row))
+            {
+                return;
+            }
+
+            if state.in_browse_mode() {
+                match state.handle_url_pointer(&mouse.kind, mouse.modifiers, col, row) {
+                    UrlPointerAction::Open(url) => {
+                        match crate::url_open::open(&url).await {
+                            Ok(()) => {}
+                            Err(error) => state.set_info_notice(crate::i18n::t_args(
+                                "zc-chat-open-link-failed",
+                                &[("error", &error.to_string())],
+                            )),
+                        }
+                        return;
+                    }
+                    UrlPointerAction::Consumed => return,
+                    UrlPointerAction::Ignore => {}
+                }
+            }
+
             if !state.in_browse_mode() {
                 match mouse.kind {
                     MouseEventKind::ScrollUp => state.scroll_up(3),
@@ -4413,18 +4857,49 @@ impl Chat {
                                     CopyHitKind::Message => {}
                                 }
                             }
-                        } else if (mouse.modifiers.contains(KM::SHIFT)
-                            || mouse.modifiers.contains(KM::ALT))
-                            && state.transcript_selection.is_some()
-                        {
-                            state.update_transcript_drag(col, row);
                         } else {
-                            state.clear_mouse_highlight();
-                            state.begin_transcript_drag(col, row);
+                            match state.handle_url_pointer(&mouse.kind, mouse.modifiers, col, row) {
+                                UrlPointerAction::Consumed => {}
+                                UrlPointerAction::Open(_) => unreachable!("down cannot open URL"),
+                                UrlPointerAction::Ignore
+                                    if (mouse.modifiers.contains(KM::SHIFT)
+                                        || mouse.modifiers.contains(KM::ALT))
+                                        && state.transcript_selection.is_some() =>
+                                {
+                                    state.cancel_url_activation();
+                                    state.update_transcript_drag(col, row);
+                                }
+                                UrlPointerAction::Ignore => {
+                                    state.cancel_url_activation();
+                                    state.clear_mouse_highlight();
+                                    state.begin_transcript_drag(col, row);
+                                }
+                            }
                         }
                     }
                     MouseEventKind::Drag(MouseButton::Left) => {
-                        state.update_transcript_drag(col, row);
+                        match state.handle_url_pointer(&mouse.kind, mouse.modifiers, col, row) {
+                            UrlPointerAction::Consumed => {}
+                            UrlPointerAction::Open(_) => unreachable!("drag cannot open URL"),
+                            UrlPointerAction::Ignore => {
+                                state.update_transcript_drag(col, row);
+                            }
+                        }
+                    }
+                    MouseEventKind::Up(MouseButton::Left) => {
+                        match state.handle_url_pointer(&mouse.kind, mouse.modifiers, col, row) {
+                            UrlPointerAction::Open(url) => {
+                                match crate::url_open::open(&url).await {
+                                    Ok(()) => {}
+                                    Err(error) => state.set_info_notice(crate::i18n::t_args(
+                                        "zc-chat-open-link-failed",
+                                        &[("error", &error.to_string())],
+                                    )),
+                                }
+                            }
+                            UrlPointerAction::Consumed => {}
+                            UrlPointerAction::Ignore => state.finish_transcript_drag(),
+                        }
                     }
                     _ => {}
                 }
@@ -4542,10 +5017,15 @@ impl Chat {
         }
     }
 
-    pub(crate) fn ctx_tokens(&self) -> (Option<u64>, Option<u64>) {
+    /// Returns `(input_tokens, trim_budget, model_window)` for the context bar.
+    pub(crate) fn ctx_tokens(&self) -> (Option<u64>, Option<u64>, Option<u64>) {
         match &self.phase {
-            ChatPhase::Active(s) => (s.context_input_tokens, s.context_max_tokens),
-            _ => (None, None),
+            ChatPhase::Active(s) => (
+                s.context_input_tokens,
+                s.context_max_tokens,
+                s.context_model_window,
+            ),
+            _ => (None, None, None),
         }
     }
 
@@ -4555,7 +5035,8 @@ impl Chat {
     pub(crate) fn selected_agent(&self) -> Option<&str> {
         match &self.phase {
             ChatPhase::Active(s) => Some(s.agent_alias.as_str()),
-            ChatPhase::PickCwd { agent_alias, .. } => Some(agent_alias.as_str()),
+            ChatPhase::PickCwd { agent_alias, .. }
+            | ChatPhase::PickChangeDirectory { agent_alias, .. } => Some(agent_alias.as_str()),
             _ => None,
         }
     }
@@ -4620,8 +5101,8 @@ impl Chat {
 
     pub(crate) fn wants_text_input(&self) -> bool {
         match &self.phase {
-            // CWD picker always captures text input.
-            ChatPhase::PickCwd { .. } => true,
+            // Directory pickers always capture text input.
+            ChatPhase::PickCwd { .. } | ChatPhase::PickChangeDirectory { .. } => true,
             ChatPhase::PickSession { .. } => false,
             ChatPhase::Active(s) => {
                 // The model picker is modal: claim text-input so global keys
@@ -4702,7 +5183,8 @@ impl crate::widgets::HelpContext for Chat {
                     HelpNode::entries(entries)
                 }
             }
-            ChatPhase::PickCwd { explorer, .. } => explorer.help_context(),
+            ChatPhase::PickCwd { explorer, .. }
+            | ChatPhase::PickChangeDirectory { explorer, .. } => explorer.help_context(),
             ChatPhase::PickSession { .. } => {
                 use crate::keymap::{ChatTabAction as C, ModalAction as M, action_key_labels};
                 let nav = action_key_labels(M::Up)
@@ -4876,6 +5358,7 @@ impl crate::widgets::HelpContext for Chat {
                         "Shift+↑/↓",
                         crate::i18n::t("zc-chat-help-scroll-conversation"),
                     ),
+                    E::key("Mouse", crate::i18n::t("zc-chat-help-open-link")),
                     E::key("t", crate::i18n::t("zc-chat-help-toggle-thoughts")),
                     E::spacer(),
                     E::key(
@@ -4893,6 +5376,12 @@ impl crate::widgets::HelpContext for Chat {
                     ),
                 ];
                 pane_entries.extend(queue_sidebar_help_entries());
+                // Code owns a session root the user can re-select; Chat
+                // sessions follow their agent's workspace, so the hint is
+                // scoped to this pane.
+                if self.pane_kind == PaneKind::Acp {
+                    pane_entries.push(E::desc(crate::i18n::t("zc-chat-help-change-directory")));
+                }
                 let pane = HelpNode::entries(pane_entries);
                 pane.with_child(state.input_bar.help_context())
             }
@@ -5453,6 +5942,104 @@ fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
     &s[..end]
 }
 
+fn terminal_safe_tool_text_limited(
+    text: &str,
+    max_bytes: usize,
+    max_lines: usize,
+) -> (String, bool) {
+    let mut safe = String::with_capacity(text.len().min(max_bytes));
+    let mut lines = 1usize;
+    for ch in text.chars() {
+        let piece = match ch {
+            '\n' if lines >= max_lines => return (safe, true),
+            '\n' => {
+                lines += 1;
+                "\n".to_string()
+            }
+            ch if ch.is_control() => ch.escape_default().to_string(),
+            ch => ch.to_string(),
+        };
+        if safe.len().saturating_add(piece.len()) > max_bytes {
+            return (safe, true);
+        }
+        safe.push_str(&piece);
+    }
+    (safe, false)
+}
+
+const FILE_TOOL_PREVIEW_LINES: usize = 6;
+const TOOL_EXPANDED_MAX_BYTES: usize = 8 * 1024;
+const TOOL_EXPANDED_MAX_LINES: usize = 100;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ToolDisclosure {
+    Collapsed,
+    Preview,
+    Full,
+}
+
+impl ToolDisclosure {
+    fn is_open(self) -> bool {
+        !matches!(self, Self::Collapsed)
+    }
+}
+
+fn valid_specialized_file_input(name: &str, input: &serde_json::Value) -> bool {
+    if input.get("path").and_then(|value| value.as_str()).is_none() {
+        return false;
+    }
+    match name {
+        "file_edit" => {
+            input
+                .get("old_string")
+                .and_then(|value| value.as_str())
+                .is_some()
+                && input
+                    .get("new_string")
+                    .and_then(|value| value.as_str())
+                    .is_some()
+        }
+        "file_write" => {
+            let has_content = input
+                .get("content")
+                .and_then(|value| value.as_str())
+                .is_some();
+            let valid_encoding = match input.get("encoding") {
+                None => true,
+                Some(serde_json::Value::String(encoding)) => {
+                    encoding == "utf8" || encoding == "base64"
+                }
+                Some(_) => false,
+            };
+            has_content && valid_encoding
+        }
+        _ => false,
+    }
+}
+
+fn default_tool_disclosure(name: &str, input_json: &str) -> ToolDisclosure {
+    let specialized = matches!(name, "file_edit" | "file_write")
+        && serde_json::from_str::<serde_json::Value>(input_json)
+            .is_ok_and(|input| valid_specialized_file_input(name, &input));
+    if specialized {
+        ToolDisclosure::Preview
+    } else {
+        ToolDisclosure::Collapsed
+    }
+}
+
+fn semantic_tool_metadata(input: &serde_json::Value, bulk_fields: &[&str]) -> String {
+    let Some(object) = input.as_object() else {
+        return input.to_string();
+    };
+    let metadata = object
+        .iter()
+        .filter(|(key, _)| !bulk_fields.contains(&key.as_str()))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect::<serde_json::Map<_, _>>();
+    serde_json::Value::Object(metadata).to_string()
+}
+
 fn bounded_tool_output(raw_output: String) -> String {
     const MAX_OUTPUT: usize = 16 * 1024;
     const TRUNCATION_MARKER: &str = "…[truncated]";
@@ -5474,76 +6061,185 @@ fn render_tool_entry(
     input_json: &str,
     result: Option<&str>,
     is_selected: bool,
-) {
+    disclosure: ToolDisclosure,
+) -> Option<usize> {
     let sel_mod = if is_selected {
         Modifier::REVERSED
     } else {
         Modifier::empty()
     };
+    let marker = if disclosure.is_open() { "▼" } else { "▶" };
     lines.push(Line::from(vec![Span::styled(
-        format!("[tool: {name}] "),
+        format!("{marker} [tool: {name}] "),
         theme::tool_label_style().add_modifier(sel_mod),
     )]));
 
-    let parsed: Option<serde_json::Value> = match name {
-        "file_edit" | "file_write" => serde_json::from_str(input_json).ok(),
-        _ => None,
+    let preview = |text: &str, max_bytes: usize| {
+        let (compact, limited) = terminal_safe_tool_text_limited(text, max_bytes, 1);
+        if limited {
+            format!("{compact}…")
+        } else {
+            compact
+        }
     };
-
-    let body_start = lines.len();
-    match name {
-        "file_edit" => {
-            let input = parsed.as_ref();
-            let old = input
-                .and_then(|v| v.get("old_string"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let new = input
-                .and_then(|v| v.get("new_string"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let path = input.and_then(|v| v.get("path")).and_then(|v| v.as_str());
-            let ext = input.and_then(|v| file_ext(v));
-            let start_line = path
-                .and_then(|p| std::fs::read_to_string(p).ok())
-                .and_then(|content| {
-                    content
-                        .find(old)
-                        .map(|idx| content[..idx].bytes().filter(|b| *b == b'\n').count() + 1)
-                })
-                .unwrap_or(1);
-            lines.extend(diff::diff_lines(old, new, ext, start_line));
-        }
-        "file_write" => {
-            let input = parsed.as_ref();
-            let content = input
-                .and_then(|v| v.get("content"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let ext = input.and_then(|v| file_ext(v));
-            lines.extend(diff::write_lines(content, ext));
-        }
-        _ => {
-            let truncated = if input_json.len() > 120 {
-                format!("{}…", truncate_utf8(input_json, 120))
+    let push_text = |lines: &mut Vec<Line<'static>>, label: &str, text: &str| {
+        for (line_idx, text_line) in text.split('\n').enumerate() {
+            let prefix = if line_idx == 0 {
+                format!("  {label}: ")
             } else {
-                input_json.to_string()
+                "    ".to_string()
             };
             lines.push(Line::from(Span::styled(
-                format!("  {truncated}"),
+                format!("{prefix}{text_line}"),
                 theme::dim_style().add_modifier(sel_mod),
             )));
         }
+    };
+
+    let body_start = lines.len();
+    let mut footer = None;
+    let mut display_limited = false;
+    let render_generic_input = |lines: &mut Vec<Line<'static>>| {
+        let (input, limited) = if matches!(disclosure, ToolDisclosure::Full) {
+            terminal_safe_tool_text_limited(
+                input_json,
+                TOOL_EXPANDED_MAX_BYTES,
+                TOOL_EXPANDED_MAX_LINES,
+            )
+        } else {
+            (preview(input_json, 120), false)
+        };
+        push_text(lines, "input", &input);
+        limited
+    };
+    match name {
+        "file_edit" => {
+            if disclosure.is_open() {
+                let parsed = serde_json::from_str::<serde_json::Value>(input_json).ok();
+                let valid = parsed
+                    .as_ref()
+                    .filter(|input| valid_specialized_file_input(name, input))
+                    .and_then(|input| {
+                        Some((
+                            input.get("old_string")?.as_str()?,
+                            input.get("new_string")?.as_str()?,
+                        ))
+                    });
+                if let (Some(input), Some((old, new))) = (parsed.as_ref(), valid) {
+                    let (metadata, metadata_limited) = terminal_safe_tool_text_limited(
+                        &semantic_tool_metadata(input, &["old_string", "new_string"]),
+                        TOOL_EXPANDED_MAX_BYTES,
+                        TOOL_EXPANDED_MAX_LINES,
+                    );
+                    display_limited |= metadata_limited;
+                    push_text(lines, "input", &metadata);
+                    let (old, old_limited) = terminal_safe_tool_text_limited(
+                        old,
+                        TOOL_EXPANDED_MAX_BYTES,
+                        TOOL_EXPANDED_MAX_LINES,
+                    );
+                    let (new, new_limited) = terminal_safe_tool_text_limited(
+                        new,
+                        TOOL_EXPANDED_MAX_BYTES,
+                        TOOL_EXPANDED_MAX_LINES,
+                    );
+                    display_limited |= old_limited || new_limited;
+                    let rendered = diff::diff_lines_limited(
+                        &old,
+                        &new,
+                        file_ext(input),
+                        None,
+                        matches!(disclosure, ToolDisclosure::Preview)
+                            .then_some(FILE_TOOL_PREVIEW_LINES),
+                    );
+                    footer = (rendered.total > FILE_TOOL_PREVIEW_LINES).then_some(rendered.omitted);
+                    lines.extend(rendered.lines);
+                } else {
+                    display_limited |= render_generic_input(lines);
+                }
+            }
+        }
+        "file_write" => {
+            if disclosure.is_open() {
+                let parsed = serde_json::from_str::<serde_json::Value>(input_json).ok();
+                let content = parsed
+                    .as_ref()
+                    .filter(|input| valid_specialized_file_input(name, input))
+                    .and_then(|input| input.get("content"))
+                    .and_then(|value| value.as_str());
+                if let (Some(input), Some(content)) = (parsed.as_ref(), content) {
+                    let (metadata, metadata_limited) = terminal_safe_tool_text_limited(
+                        &semantic_tool_metadata(input, &["content"]),
+                        TOOL_EXPANDED_MAX_BYTES,
+                        TOOL_EXPANDED_MAX_LINES,
+                    );
+                    display_limited |= metadata_limited;
+                    push_text(lines, "input", &metadata);
+                    let encoding = input
+                        .get("encoding")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("utf8");
+                    if encoding == "base64" {
+                        push_text(
+                            lines,
+                            "content",
+                            &crate::i18n::t_args(
+                                "zc-chat-tool-encoded-size",
+                                &[("count", &content.len().to_string())],
+                            ),
+                        );
+                    } else {
+                        let (content, limited) = terminal_safe_tool_text_limited(
+                            content,
+                            TOOL_EXPANDED_MAX_BYTES,
+                            TOOL_EXPANDED_MAX_LINES,
+                        );
+                        display_limited |= limited;
+                        let rendered = diff::write_lines_limited(
+                            &content,
+                            file_ext(input),
+                            matches!(disclosure, ToolDisclosure::Preview)
+                                .then_some(FILE_TOOL_PREVIEW_LINES),
+                        );
+                        footer =
+                            (rendered.total > FILE_TOOL_PREVIEW_LINES).then_some(rendered.omitted);
+                        lines.extend(rendered.lines);
+                    }
+                } else {
+                    display_limited |= render_generic_input(lines);
+                }
+            }
+        }
+        _ => display_limited |= render_generic_input(lines),
+    }
+
+    let mut footer_line = None;
+    if let Some(omitted) = footer {
+        let text = if matches!(disclosure, ToolDisclosure::Full) {
+            crate::i18n::t("zc-chat-tool-show-less")
+        } else {
+            crate::i18n::t_args("zc-chat-tool-show-all", &[("count", &omitted.to_string())])
+        };
+        footer_line = Some(lines.len());
+        lines.push(Line::from(Span::styled(
+            format!("  {text}"),
+            theme::tool_label_style().add_modifier(sel_mod),
+        )));
     }
 
     if let Some(res) = result {
-        let truncated = if res.len() > 200 {
-            format!("{}…", truncate_utf8(res, 200))
+        let (result, limited) = if matches!(disclosure, ToolDisclosure::Full) {
+            terminal_safe_tool_text_limited(res, TOOL_EXPANDED_MAX_BYTES, TOOL_EXPANDED_MAX_LINES)
         } else {
-            res.to_string()
+            (preview(res, 200), false)
         };
+        push_text(lines, "result", &result);
+        display_limited |= limited;
+    }
+
+    if display_limited {
         lines.push(Line::from(Span::styled(
-            format!("  → {truncated}"),
+            format!("  {}", crate::i18n::t("zc-chat-tool-display-limited")),
             theme::dim_style().add_modifier(sel_mod),
         )));
     }
@@ -5558,6 +6254,7 @@ fn render_tool_entry(
                 .collect();
         }
     }
+    footer_line
 }
 
 /// Render a single committed entry into `lines`.
@@ -5567,9 +6264,10 @@ fn render_entry_into(
     entry: &ChatEntry,
     is_selected: bool,
     show_thoughts: bool,
+    tool_disclosure: ToolDisclosure,
     width: u16,
     lines: &mut Vec<Line<'static>>,
-) {
+) -> Option<usize> {
     let sel_mod = if is_selected {
         Modifier::REVERSED
     } else {
@@ -5595,7 +6293,9 @@ fn render_entry_into(
                     spans.push(label_span.clone());
                 }
                 spans.push(Span::styled((*line_text).to_string(), body_style));
-                lines.push(Line::from(spans));
+                let mut line = Line::from(spans);
+                style_recognized_urls(std::slice::from_mut(&mut line));
+                lines.push(line);
             }
             if !attachments.is_empty() {
                 let label = attachments
@@ -5610,24 +6310,10 @@ fn render_entry_into(
             }
         }
         ChatEntry::AgentMessage(text) => {
-            lines.push(Line::from(vec![Span::styled(
-                format!("{} ", crate::i18n::t("zc-chat-label-agent")),
-                theme::agent_label_style().add_modifier(sel_mod),
-            )]));
-            let md_lines = markdown_to_lines(text.as_ref(), width);
-            for mut line in md_lines {
-                if is_selected {
-                    line = Line::from(
-                        line.spans
-                            .into_iter()
-                            .map(|s| {
-                                s.patch_style(Style::default().add_modifier(Modifier::REVERSED))
-                            })
-                            .collect::<Vec<_>>(),
-                    );
-                }
-                lines.push(line);
-            }
+            render_agent_message_into(text, is_selected, width, lines);
+        }
+        ChatEntry::AgentMessageContinuation(text) => {
+            render_agent_message_into(text, is_selected, width, lines);
         }
         ChatEntry::AgentThought(text) => {
             if show_thoughts {
@@ -5651,14 +6337,45 @@ fn render_entry_into(
             result,
             ..
         } => {
-            render_tool_entry(
+            return render_tool_entry(
                 lines,
                 name.as_ref(),
                 input_json.as_ref(),
                 result.as_deref().map(|s| s as &str),
                 is_selected,
+                tool_disclosure,
             );
         }
+    }
+    None
+}
+
+fn render_agent_message_into(
+    text: &str,
+    is_selected: bool,
+    width: u16,
+    lines: &mut Vec<Line<'static>>,
+) {
+    let sel_mod = if is_selected {
+        Modifier::REVERSED
+    } else {
+        Modifier::empty()
+    };
+    lines.push(Line::from(vec![Span::styled(
+        format!("{} ", crate::i18n::t("zc-chat-label-agent")),
+        theme::agent_label_style().add_modifier(sel_mod),
+    )]));
+    let md_lines = markdown_to_lines(text, width);
+    for mut line in md_lines {
+        if is_selected {
+            line = Line::from(
+                line.spans
+                    .into_iter()
+                    .map(|s| s.patch_style(Style::default().add_modifier(Modifier::REVERSED)))
+                    .collect::<Vec<_>>(),
+            );
+        }
+        lines.push(line);
     }
 }
 
@@ -5689,14 +6406,22 @@ fn message_copied_label() -> String {
 }
 
 #[cfg(test)]
-fn context_menu_copy_label() -> String {
-    crate::i18n::t("zc-chat-context-menu-copy")
+fn context_menu_copy_selection_label() -> String {
+    crate::i18n::t("zc-chat-context-menu-copy-selection")
 }
 
-fn context_menu_action_label(action: ChatContextMenuAction) -> String {
+fn context_menu_action_label(
+    action: ChatContextMenuAction,
+    copy_kind: Option<CopyHitKind>,
+) -> String {
     let key = match action {
         ChatContextMenuAction::SendNow => "zc-chat-context-menu-send-now",
+        ChatContextMenuAction::Copy if copy_kind == Some(CopyHitKind::Transcript) => {
+            "zc-chat-context-menu-copy-selection"
+        }
         ChatContextMenuAction::Copy => "zc-chat-context-menu-copy",
+        ChatContextMenuAction::OpenLink => "zc-chat-context-menu-open-link",
+        ChatContextMenuAction::CopyLink => "zc-chat-context-menu-copy-link",
         ChatContextMenuAction::Edit => "zc-chat-context-menu-edit",
         ChatContextMenuAction::Delete => "zc-chat-context-menu-delete",
     };
@@ -5731,19 +6456,23 @@ fn context_menu_rect(
     row: u16,
     bounds: Rect,
     actions: &[ChatContextMenuAction],
+    copy_kind: Option<CopyHitKind>,
 ) -> Option<Rect> {
     use unicode_width::UnicodeWidthStr;
 
-    if bounds.width < 3 || bounds.height < 3 || actions.is_empty() {
+    let required_height = actions.len() as u16 + 2;
+    if bounds.width < 3 || bounds.height < required_height || actions.is_empty() {
         return None;
     }
     let label_width = actions
         .iter()
-        .map(|action| UnicodeWidthStr::width(context_menu_action_label(*action).as_str()) as u16)
+        .map(|action| {
+            UnicodeWidthStr::width(context_menu_action_label(*action, copy_kind).as_str()) as u16
+        })
         .max()
         .unwrap_or(0);
     let width = (label_width + 4).min(bounds.width).max(3);
-    let height = (actions.len() as u16 + 2).min(bounds.height);
+    let height = required_height;
     let max_x = bounds.x.saturating_add(bounds.width.saturating_sub(width));
     let max_y = bounds
         .y
@@ -5778,6 +6507,163 @@ fn fenced_text(_lang: Option<&str>, body: &str) -> String {
     body.to_string()
 }
 
+fn url_line_regions_for_lines(lines: &[Line<'static>], width: u16) -> Vec<UrlLineRegion> {
+    use ratatui::style::Color;
+
+    if width == 0 {
+        return Vec::new();
+    }
+    let mut regions = Vec::new();
+    let mut screen_row = 0u16;
+    for line in lines {
+        let rows = wrapped_rows(line, width);
+        let text = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        let urls = recognized_url_ranges(&text);
+        if !urls.is_empty() {
+            // Private color tags carry occurrence identity through Paragraph's
+            // actual wrapping and alignment; these colors are never displayed.
+            let mut spans = Vec::new();
+            let mut offset = 0;
+            for (idx, (start, end, _)) in urls.iter().enumerate() {
+                spans.push(Span::raw(text[offset..*start].to_owned()));
+                let tag = u32::try_from(idx).ok().filter(|tag| *tag <= 0x00ff_ffff);
+                let style = tag.map_or_else(Style::default, |tag| {
+                    Style::default().fg(Color::Rgb((tag >> 16) as u8, (tag >> 8) as u8, tag as u8))
+                });
+                spans.push(Span::styled(text[*start..*end].to_owned(), style));
+                offset = *end;
+            }
+            spans.push(Span::raw(text[offset..].to_owned()));
+            let mut tagged = Line::from(spans);
+            tagged.alignment = line.alignment;
+
+            regions.push(UrlLineRegion {
+                row: screen_row,
+                rows,
+                tagged,
+                urls,
+            });
+        }
+        screen_row = screen_row.saturating_add(rows);
+    }
+    regions
+}
+
+fn offset_url_line_regions(regions: &mut [UrlLineRegion], row_offset: u16) {
+    for region in regions {
+        region.row = region.row.saturating_add(row_offset);
+    }
+}
+
+fn project_url_hit_regions(
+    regions: &[UrlLineRegion],
+    scroll: u16,
+    body: Rect,
+) -> Vec<UrlHitRegion> {
+    use ratatui::{buffer::Buffer, style::Color, widgets::Widget};
+    use unicode_width::UnicodeWidthStr;
+
+    if body.width == 0 || body.height == 0 {
+        return Vec::new();
+    }
+    let viewport_end = u32::from(scroll) + u32::from(body.height);
+    let first_visible = regions.partition_point(|region| {
+        u32::from(region.row) + u32::from(region.rows) <= u32::from(scroll)
+    });
+    let mut hits: Vec<UrlHitRegion> = Vec::new();
+    for region in regions[first_visible..]
+        .iter()
+        .take_while(|region| u32::from(region.row) < viewport_end)
+    {
+        let start = u32::from(region.row).max(u32::from(scroll));
+        let end = (u32::from(region.row) + u32::from(region.rows)).min(viewport_end);
+        let Some(height) = end.checked_sub(start).filter(|height| *height > 0) else {
+            continue;
+        };
+        // Only a visible line is reflowed, once, into viewport-sized storage.
+        // Never render a tall line in repeated strips from its beginning.
+        let area = Rect::new(0, 0, body.width, height as u16);
+        let mut buffer = Buffer::empty(area);
+        Paragraph::new(borrow_line(&region.tagged))
+            .wrap(Wrap { trim: false })
+            .scroll(((start - u32::from(region.row)) as u16, 0))
+            .render(area, &mut buffer);
+        for y in 0..area.height {
+            let screen_y = body
+                .y
+                .saturating_add((start - u32::from(scroll)) as u16)
+                .saturating_add(y);
+            let mut col = 0;
+            while col < body.width {
+                let cell = &buffer[(col, y)];
+                let cells = (UnicodeWidthStr::width(cell.symbol()) as u16)
+                    .max(1)
+                    .min(body.width - col);
+                if let Color::Rgb(r, g, b) = cell.fg {
+                    let idx = (usize::from(r) << 16) | (usize::from(g) << 8) | usize::from(b);
+                    if let Some((start, _, url)) = region.urls.get(idx) {
+                        let occurrence = UrlOccurrenceId {
+                            row: region.row,
+                            byte_start: *start,
+                        };
+                        let screen_x = body.x.saturating_add(col);
+                        if let Some(previous) = hits.last_mut()
+                            && previous.rect.y == screen_y
+                            && previous.rect.right() == screen_x
+                            && previous.occurrence == occurrence
+                        {
+                            previous.rect.width += cells;
+                        } else {
+                            hits.push(UrlHitRegion {
+                                rect: Rect::new(screen_x, screen_y, cells, 1),
+                                url: url.clone(),
+                                occurrence,
+                            });
+                        }
+                    }
+                }
+                col += cells;
+            }
+        }
+    }
+    hits
+}
+
+fn append_wrapped_hit_rects(
+    regions: &mut Vec<(usize, Rect)>,
+    entry_idx: usize,
+    line: &Line<'static>,
+    screen_start: u16,
+    scroll: u16,
+    body: Rect,
+) {
+    let text = line
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect::<String>();
+    for (row_offset, visual_line) in crate::input_bar::wrap_visual_lines(&text, body.width)
+        .iter()
+        .enumerate()
+    {
+        let screen_row = screen_start.saturating_add(row_offset as u16);
+        if screen_row < scroll || screen_row >= scroll.saturating_add(body.height) {
+            continue;
+        }
+        let width = crate::display_width::display_width(&text[visual_line.start..visual_line.end])
+            .min(usize::from(body.width));
+        if width > 0 {
+            regions.push((
+                entry_idx,
+                Rect::new(body.x, body.y + (screen_row - scroll), width as u16, 1),
+            ));
+        }
+    }
+}
 /// Build a `[Copy]` region if its global wrapped row is on-screen.
 fn copy_region(
     global_row: u16,
@@ -5856,6 +6742,34 @@ fn centered_copy_feedback_rect(label: &str, anchor: Rect) -> Option<Rect> {
     Some(Rect::new(x, anchor.y, cells, 1))
 }
 
+fn pinned_preview_source(message: &str, width: u16) -> &str {
+    if width == 0 {
+        return "";
+    }
+
+    let mut has_content = false;
+    let mut cells = 0;
+    for (offset, grapheme, grapheme_width) in crate::display_width::grapheme_widths(message) {
+        // Match Span's control filtering and WordWrapper's oversized-symbol handling.
+        if grapheme.contains(char::is_control) || grapheme_width > usize::from(width) {
+            continue;
+        }
+        if !has_content {
+            if ratatui::text::StyledGrapheme::new(grapheme, Style::default()).is_whitespace() {
+                continue;
+            }
+            has_content = true;
+        }
+        // One positive-width lookahead lets the existing wrapper settle the first
+        // row's word boundary without laying out the invisible message tail.
+        if cells >= usize::from(width) && grapheme_width > 0 {
+            return &message[..offset + grapheme.len()];
+        }
+        cells += grapheme_width;
+    }
+    message
+}
+
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ConversationRenderWork {
@@ -5920,7 +6834,10 @@ fn render_conversation(
     if first_row_h == 1 {
         let first_row = Rect::new(inner.x, inner.y, inner.width, 1);
         let msg = state.first_message.as_deref().unwrap_or_default();
-        let line = Line::from(Span::styled(msg.to_string(), theme::dim_style()));
+        let line = Line::from(Span::styled(
+            pinned_preview_source(msg, first_row.width),
+            theme::dim_style(),
+        ));
         f.render_widget(Paragraph::new(line).wrap(Wrap { trim: true }), first_row);
     }
 
@@ -5944,6 +6861,13 @@ fn render_conversation(
     };
     let transient_row_breaks = if transient {
         row_breaks_for_lines(&overlay_lines, inner_width)
+    } else {
+        Vec::new()
+    };
+    let transient_url_regions = if transient {
+        let mut regions = url_line_regions_for_lines(&overlay_lines, inner_width);
+        offset_url_line_regions(&mut regions, state.cached_total_rows);
+        regions
     } else {
         Vec::new()
     };
@@ -5995,6 +6919,14 @@ fn render_conversation(
         .scroll((render_scroll, 0));
     f.render_widget(p, body_area);
     capture_transcript_snapshot(f, state, body_area, row_breaks);
+    state.url_hit_regions = project_url_hit_regions(&state.cached_url_regions, scroll, body_area);
+    if transient {
+        state.url_hit_regions.extend(project_url_hit_regions(
+            &transient_url_regions,
+            scroll,
+            body_area,
+        ));
+    }
     render_transcript_selection(f, state);
 
     state.last_total_rows = total_rows;
@@ -6008,9 +6940,11 @@ fn render_conversation(
     let body_w = inner_width;
     let body_h = inner_height;
     state.entry_rects.clear();
-    for &(entry_idx, screen_lo, screen_hi, content_width) in
-        &state.cached_screen_ranges[visible_cached_window.entries.clone()]
-    {
+    state.tool_header_rects.clear();
+    state.tool_footer_rects.clear();
+    for range_idx in visible_cached_window.entries.clone() {
+        let (entry_idx, screen_lo, screen_hi, content_width) =
+            state.cached_screen_ranges[range_idx];
         let visible_lo = screen_lo.max(scroll);
         let visible_hi = screen_hi.min(scroll.saturating_add(body_h));
         debug_assert!(visible_hi > visible_lo);
@@ -6024,6 +6958,33 @@ fn render_conversation(
             visible_hi - visible_lo,
         );
         state.entry_rects.push((entry_idx, rect));
+
+        if matches!(state.entries.get(entry_idx), Some(ChatEntry::Tool { .. })) {
+            let (_, line_lo, line_hi) = state.cached_line_ranges[range_idx];
+            let header_line = &state.cached_lines[line_lo];
+            append_wrapped_hit_rects(
+                &mut state.tool_header_rects,
+                entry_idx,
+                header_line,
+                screen_lo,
+                scroll,
+                body_area,
+            );
+
+            if let Some(&footer_line) = state.cached_tool_footer_lines.get(&entry_idx)
+                && (line_lo..line_hi).contains(&footer_line)
+            {
+                let footer_screen_lo = state.cached_line_screen_ranges[footer_line].0;
+                append_wrapped_hit_rects(
+                    &mut state.tool_footer_rects,
+                    entry_idx,
+                    &state.cached_lines[footer_line],
+                    footer_screen_lo,
+                    scroll,
+                    body_area,
+                );
+            }
+        }
     }
 
     let body_rect = Rect::new(body_x, body_y, body_w, body_h);
@@ -6185,7 +7146,10 @@ fn render_context_menu(f: &mut Frame, state: &ChatState) {
             } else {
                 theme::body_style()
             };
-            Line::from(Span::styled(context_menu_action_label(*action), style))
+            Line::from(Span::styled(
+                context_menu_action_label(*action, menu.target.copy_kind()),
+                style,
+            ))
         })
         .collect::<Vec<_>>();
     f.render_widget(
@@ -6889,7 +7853,127 @@ fn markdown_to_lines(text: &str, width: u16) -> Vec<Line<'static>> {
         )));
     }
 
+    style_recognized_urls(&mut lines);
     lines
+}
+
+/// Find complete HTTP(S) tokens in the final rendered text. This deliberately
+/// runs after Markdown rendering so bare URLs and rendered destinations share
+/// one hit-test source and no second Markdown semantic tree is retained.
+fn recognized_url_ranges(text: &str) -> Vec<(usize, usize, String)> {
+    let mut ranges = Vec::new();
+    let mut starts = text
+        .match_indices("http://")
+        .chain(text.match_indices("https://"))
+        .collect::<Vec<_>>();
+    starts.sort_by_key(|(start, _)| *start);
+    for (start, _) in starts {
+        let has_left_boundary = start == 0
+            || text[..start].chars().next_back().is_some_and(|ch| {
+                ch.is_whitespace() || matches!(ch, '(' | '[' | '{' | '<' | '\'' | '"')
+            });
+        if !has_left_boundary {
+            continue;
+        }
+        if ranges.last().is_some_and(|(_, end, _)| start < *end) {
+            continue;
+        }
+        let end = text[start..]
+            .char_indices()
+            .find_map(|(offset, ch)| ch.is_whitespace().then_some(start + offset))
+            .unwrap_or(text.len());
+        let mut candidate_end = end;
+        while let Some((offset, ch)) = text[start..candidate_end].char_indices().last() {
+            let trim = match ch {
+                '.' | ',' | ';' | ':' | '\'' | '"' | '>' => true,
+                '!' | '?' => {
+                    let before = text[start..start + offset].trim_end_matches(['!', '?']);
+                    match before.chars().next_back() {
+                        Some('>' | '\'' | '"') => true,
+                        Some(')') => before.matches('(').count() < before.matches(')').count(),
+                        Some(']') => before.matches('[').count() < before.matches(']').count(),
+                        Some('}') => before.matches('{').count() < before.matches('}').count(),
+                        _ => false,
+                    }
+                }
+                ')' => {
+                    text[start..candidate_end].matches('(').count()
+                        < text[start..candidate_end].matches(')').count()
+                }
+                ']' => {
+                    text[start..candidate_end].matches('[').count()
+                        < text[start..candidate_end].matches(']').count()
+                }
+                '}' => {
+                    text[start..candidate_end].matches('{').count()
+                        < text[start..candidate_end].matches('}').count()
+                }
+                _ => false,
+            };
+            if !trim {
+                break;
+            }
+            candidate_end = start + offset;
+        }
+        let candidate = &text[start..candidate_end];
+        if !candidate.is_empty()
+            && !candidate.contains('\u{2026}')
+            && crate::url_open::validate_url(candidate).is_ok()
+        {
+            ranges.push((start, candidate_end, candidate.to_string()));
+        }
+    }
+    ranges
+}
+
+fn style_recognized_urls(lines: &mut [Line<'static>]) {
+    for line in lines {
+        let text = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        let ranges = recognized_url_ranges(&text);
+        if ranges.is_empty() {
+            continue;
+        }
+
+        let mut styled = Vec::new();
+        let mut line_offset = 0usize;
+        for span in std::mem::take(&mut line.spans) {
+            let content = span.content.as_ref();
+            let span_start = line_offset;
+            let span_end = span_start + content.len();
+            let mut cursor = 0;
+            for (start, end, _) in &ranges {
+                let overlap_start = (*start).max(span_start);
+                let overlap_end = (*end).min(span_end);
+                if overlap_end <= overlap_start {
+                    continue;
+                }
+                let local_start = overlap_start - span_start;
+                let local_end = overlap_end - span_start;
+                if local_start > cursor {
+                    styled.push(Span::styled(
+                        content[cursor..local_start].to_string(),
+                        span.style,
+                    ));
+                }
+                styled.push(Span::styled(
+                    content[local_start..local_end].to_string(),
+                    span.style
+                        .fg(theme::active().accent)
+                        .add_modifier(Modifier::UNDERLINED),
+                ));
+                cursor = local_end;
+            }
+            if cursor < content.len() {
+                styled.push(Span::styled(content[cursor..].to_string(), span.style));
+            }
+            line_offset = span_end;
+        }
+        line.spans = styled;
+    }
 }
 
 fn render_table(
@@ -7101,6 +8185,10 @@ impl PendingElicitation {
 #[derive(Debug, Clone)]
 pub enum ChatEntry {
     AgentMessage(Arc<str>),
+    /// A response committed after the prompt RPC returned but before its
+    /// terminal notification arrived. Late chunks extend this buffer in place;
+    /// the next ordering boundary freezes it back into `AgentMessage`.
+    AgentMessageContinuation(String),
     AgentThought(Arc<str>),
     /// Local system/info message (e.g. "Attached: photo.png").
     SystemMessage(Arc<str>),
@@ -7177,6 +8265,8 @@ enum LinesDirty {
     /// `rebuild_lines` can extend `cached_lines` instead of rebuilding from scratch,
     /// avoiding re-parsing markdown for unchanged `AgentMessage` entries.
     Appended,
+    /// The final cached entry changed without shifting the render window.
+    TailChanged(usize),
     /// Full rebuild required (entry mutation, selection/thoughts change, reset).
     Full,
 }
@@ -7221,6 +8311,40 @@ struct CopyHitRegion {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct UrlLineRegion {
+    row: u16,
+    rows: u16,
+    tagged: Line<'static>,
+    urls: Vec<(usize, usize, String)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UrlHitRegion {
+    rect: Rect,
+    url: String,
+    occurrence: UrlOccurrenceId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct UrlOccurrenceId {
+    row: u16,
+    byte_start: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingUrlActivation {
+    url: String,
+    occurrence: UrlOccurrenceId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum UrlPointerAction {
+    Ignore,
+    Consumed,
+    Open(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct CachedCodeBlock {
     header_row: u16,
     block_end: u16,
@@ -7235,11 +8359,22 @@ struct CachedCodeBlock {
 enum ChatContextMenuAction {
     SendNow,
     Copy,
+    OpenLink,
+    CopyLink,
     Edit,
     Delete,
 }
 
 const TRANSCRIPT_CONTEXT_ACTIONS: &[ChatContextMenuAction] = &[ChatContextMenuAction::Copy];
+const URL_CONTEXT_ACTIONS: &[ChatContextMenuAction] = &[
+    ChatContextMenuAction::OpenLink,
+    ChatContextMenuAction::CopyLink,
+];
+const URL_WITH_COPY_CONTEXT_ACTIONS: &[ChatContextMenuAction] = &[
+    ChatContextMenuAction::OpenLink,
+    ChatContextMenuAction::CopyLink,
+    ChatContextMenuAction::Copy,
+];
 const QUEUE_CONTEXT_ACTIONS: &[ChatContextMenuAction] = &[
     ChatContextMenuAction::SendNow,
     ChatContextMenuAction::Copy,
@@ -7250,6 +8385,11 @@ const QUEUE_CONTEXT_ACTIONS: &[ChatContextMenuAction] = &[
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ChatContextMenuTarget {
     Transcript(CopyHitRegion),
+    Url(UrlHitRegion),
+    UrlWithCopy {
+        url: UrlHitRegion,
+        copy: CopyHitRegion,
+    },
     Queue(u64),
 }
 
@@ -7257,8 +8397,21 @@ impl ChatContextMenuTarget {
     fn actions(&self) -> &'static [ChatContextMenuAction] {
         match self {
             Self::Transcript(_) => TRANSCRIPT_CONTEXT_ACTIONS,
+            Self::Url(_) => URL_CONTEXT_ACTIONS,
+            Self::UrlWithCopy { .. } => URL_WITH_COPY_CONTEXT_ACTIONS,
             Self::Queue(_) => QUEUE_CONTEXT_ACTIONS,
         }
+    }
+
+    fn copy_kind(&self) -> Option<CopyHitKind> {
+        match self {
+            Self::Transcript(copy) | Self::UrlWithCopy { copy, .. } => Some(copy.kind),
+            Self::Url(_) | Self::Queue(_) => None,
+        }
+    }
+
+    fn is_url(&self) -> bool {
+        matches!(self, Self::Url(_) | Self::UrlWithCopy { .. })
     }
 }
 
@@ -7302,6 +8455,8 @@ impl ChatContextMenu {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ChatContextMenuRequest {
     CopyTranscript(CopyHitRegion),
+    OpenUrl(String),
+    CopyUrl(String),
     Queue {
         id: u64,
         action: ChatContextMenuAction,
@@ -7386,6 +8541,11 @@ pub struct ChatState {
     /// Used by `commit_turn` to decide whether `full_text` is a fallback
     /// (no streaming happened) or a duplicate (streaming already committed).
     turn_had_streaming_text: bool,
+    /// Agent-message entry committed by prompt-response fallback while its
+    /// terminal notification may still be in flight. Continuation chunks for
+    /// the same local generation extend this entry instead of creating a
+    /// second `Agent:` block.
+    prompt_settled_stream_entry: Option<(u64, usize)>,
     /// Set when any `ToolCall` event arrived during the current turn.
     /// Used by `commit_turn` to distinguish "empty completion with tool
     /// calls" (normal — tool output is the visible record) from "empty
@@ -7417,8 +8577,22 @@ pub struct ChatState {
     transcript_selection: Option<TranscriptSelection>,
     /// Per-entry hit rects from the last draw.
     entry_rects: Vec<(usize, ratatui::layout::Rect)>,
+    /// Visible tool-header hit rects from the last draw.
+    tool_header_rects: Vec<(usize, ratatui::layout::Rect)>,
+    /// Visible file-tool footer hit rects from the last draw.
+    tool_footer_rects: Vec<(usize, ratatui::layout::Rect)>,
+    /// Per-tool disclosure overrides; file tools otherwise default to preview.
+    tool_disclosures: BTreeMap<Arc<str>, ToolDisclosure>,
     /// Clickable `[Copy]` labels from the last draw.
     copy_hit_regions: Vec<CopyHitRegion>,
+    /// URL hit segments projected from the complete wrapped transcript into
+    /// the visible body viewport.
+    url_hit_regions: Vec<UrlHitRegion>,
+    /// Tagged URL-bearing logical lines with transcript-relative row extents.
+    /// Rebuilt with `cached_lines` so idle frames do not repeat recognition.
+    cached_url_regions: Vec<UrlLineRegion>,
+    /// A normal-mode left press that may become a link activation on release.
+    pending_url_activation: Option<PendingUrlActivation>,
     /// Full code-block targets used by right-click context-menu resolution.
     context_copy_regions: Vec<CopyHitRegion>,
     /// Active transcript or queue context menu.
@@ -7443,6 +8617,8 @@ pub struct ChatState {
     /// Per-entry unwrapped-line ranges in `cached_lines` — `(entry_idx,
     /// start, end_exclusive)`. Used by mouse hit-testing.
     cached_line_ranges: Vec<(usize, usize, usize)>,
+    /// Per-entry disclosure footer line indices in `cached_lines`.
+    cached_tool_footer_lines: BTreeMap<usize, usize>,
     /// Per-line wrapped screen-row spans derived from `cached_lines` at
     /// `cached_render_width`. This is the line-level index for viewport
     /// slicing; it is rebuilt atomically with the rendered-line cache.
@@ -7476,8 +8652,11 @@ pub struct ChatState {
     /// provider (input + cached + output) is added on arrival. Cleared on
     /// session reset only.
     pub context_input_tokens: Option<u64>,
-    /// Configured context limit for this session's model.
+    /// Preemptive-trim budget for this session (the bar fills toward this).
     pub context_max_tokens: Option<u64>,
+    /// Model's full context window; when present, the bar denominator so the
+    /// trim budget shows as a marker rather than the 100% point.
+    pub context_model_window: Option<u64>,
     /// Outbound message queue; the front dispatches when the session is free.
     message_queue: VecDeque<QueuedMessage>,
     /// Monotonic id source for queued messages.
@@ -7549,6 +8728,7 @@ impl ChatState {
             turn_generation: 0,
             optimistic_user_message: None,
             turn_had_streaming_text: false,
+            prompt_settled_stream_entry: None,
             turn_had_tool_calls: false,
             turn_status: TurnStatus::Idle,
             turn_started_at: Instant::now(),
@@ -7560,7 +8740,13 @@ impl ChatState {
             transcript_snapshot: None,
             transcript_selection: None,
             entry_rects: Vec::new(),
+            tool_header_rects: Vec::new(),
+            tool_footer_rects: Vec::new(),
+            tool_disclosures: BTreeMap::new(),
             copy_hit_regions: Vec::new(),
+            url_hit_regions: Vec::new(),
+            cached_url_regions: Vec::new(),
+            pending_url_activation: None,
             context_copy_regions: Vec::new(),
             context_menu: None,
             copy_feedback: None,
@@ -7575,6 +8761,7 @@ impl ChatState {
             cached_lines: Vec::new(),
             cached_row_breaks: Vec::new(),
             cached_line_ranges: Vec::new(),
+            cached_tool_footer_lines: BTreeMap::new(),
             cached_line_screen_ranges: Vec::new(),
             cached_screen_ranges: Vec::new(),
             cached_code_blocks: Vec::new(),
@@ -7585,6 +8772,7 @@ impl ChatState {
             cached_total_rows: 0,
             context_input_tokens: None,
             context_max_tokens: None,
+            context_model_window: None,
             message_queue: VecDeque::new(),
             next_queue_id: 0,
             queue_paused: false,
@@ -7603,10 +8791,32 @@ impl ChatState {
     }
 
     fn mark_dirty_append(&mut self) {
-        if self.dirty == LinesDirty::Clean {
-            self.dirty = LinesDirty::Appended;
+        self.invalidate_url_interactions();
+        match self.dirty {
+            LinesDirty::Clean => self.dirty = LinesDirty::Appended,
+            LinesDirty::TailChanged(_) => self.dirty = LinesDirty::Full,
+            LinesDirty::Appended | LinesDirty::Full => {}
         }
         // Full is sticky — don't downgrade.
+    }
+
+    fn mark_dirty_tail(&mut self, entry_index: usize) {
+        match self.dirty {
+            LinesDirty::Clean => self.dirty = LinesDirty::TailChanged(entry_index),
+            LinesDirty::TailChanged(index) if index == entry_index => {}
+            LinesDirty::Appended => {
+                // An intervening append does not make previously cached text fresh.
+                if (self.cached_render_start
+                    ..self
+                        .cached_render_start
+                        .saturating_add(self.cached_entry_count))
+                    .contains(&entry_index)
+                {
+                    self.dirty = LinesDirty::Full;
+                }
+            }
+            LinesDirty::TailChanged(_) | LinesDirty::Full => self.dirty = LinesDirty::Full,
+        }
     }
 
     /// Whether text input currently belongs to the composer rather than a
@@ -7647,11 +8857,13 @@ impl ChatState {
     }
 
     fn mark_dirty_full(&mut self) {
+        self.invalidate_url_interactions();
         self.dirty = LinesDirty::Full;
     }
 
     fn clear_transcript_selection(&mut self) {
         self.transcript_selection = None;
+        self.pending_url_activation = None;
         self.copy_hit_regions.clear();
         self.context_copy_regions.clear();
         self.context_menu = None;
@@ -7731,6 +8943,76 @@ impl ChatState {
         self.clear_transcript_selection();
     }
 
+    fn url_hit_at(&self, column: u16, row: u16) -> Option<UrlHitRegion> {
+        self.url_hit_regions
+            .iter()
+            .find(|region| mouse::in_rect(column, row, region.rect))
+            .cloned()
+    }
+
+    fn begin_url_activation(&mut self, hit: UrlHitRegion) {
+        // Browser-like link ownership: a drag that starts on a URL must not
+        // extend a character selection that happened to predate the click.
+        self.transcript_selection = None;
+        self.pending_url_activation = Some(PendingUrlActivation {
+            url: hit.url,
+            occurrence: hit.occurrence,
+        });
+    }
+
+    fn cancel_url_activation(&mut self) {
+        self.pending_url_activation = None;
+    }
+
+    fn invalidate_url_interactions(&mut self) {
+        self.pending_url_activation = None;
+        if self
+            .context_menu
+            .as_ref()
+            .is_some_and(|menu| menu.target.is_url())
+        {
+            self.context_menu = None;
+        }
+    }
+
+    fn take_url_activation(&mut self, column: u16, row: u16) -> Option<String> {
+        let pending = self.pending_url_activation.take()?;
+        let hit = self.url_hit_at(column, row)?;
+        (hit.occurrence == pending.occurrence && hit.url == pending.url).then_some(hit.url)
+    }
+
+    fn handle_url_pointer(
+        &mut self,
+        kind: &MouseEventKind,
+        modifiers: crossterm::event::KeyModifiers,
+        column: u16,
+        row: u16,
+    ) -> UrlPointerAction {
+        match kind {
+            MouseEventKind::Down(MouseButton::Left) if modifiers.is_empty() => {
+                let Some(hit) = self.url_hit_at(column, row) else {
+                    return UrlPointerAction::Ignore;
+                };
+                self.begin_url_activation(hit);
+                UrlPointerAction::Consumed
+            }
+            MouseEventKind::Drag(MouseButton::Left) if self.pending_url_activation.is_some() => {
+                self.cancel_url_activation();
+                UrlPointerAction::Consumed
+            }
+            MouseEventKind::Up(MouseButton::Left) if self.pending_url_activation.is_some() => {
+                if modifiers.is_empty() {
+                    self.take_url_activation(column, row)
+                        .map_or(UrlPointerAction::Consumed, UrlPointerAction::Open)
+                } else {
+                    self.cancel_url_activation();
+                    UrlPointerAction::Consumed
+                }
+            }
+            _ => UrlPointerAction::Ignore,
+        }
+    }
+
     fn clear_browse_selection(&mut self) {
         let lines_changed = self.mouse_down_entry.is_some()
             || self.browse_cursor.is_some()
@@ -7800,6 +9082,7 @@ impl ChatState {
     }
 
     fn open_transcript_context_menu(&mut self, column: u16, row: u16) -> bool {
+        self.cancel_url_activation();
         let Some(bounds) = self
             .transcript_snapshot
             .as_ref()
@@ -7834,7 +9117,7 @@ impl ChatState {
 
         // Code blocks are nested inside message rows, so resolve their more
         // specific target before falling back to the containing message.
-        let target = selected_target.or_else(|| {
+        let copy_target = selected_target.or_else(|| {
             self.context_copy_regions
                 .iter()
                 .find(|region| mouse::in_rect(column, row, region.rect))
@@ -7854,11 +9137,20 @@ impl ChatState {
                         })
                 })
         });
-        let Some(target) = target else {
-            return false;
+        let target = if let Some(url) = self.url_hit_at(column, row) {
+            match copy_target {
+                Some(copy) => ChatContextMenuTarget::UrlWithCopy { url, copy },
+                None => ChatContextMenuTarget::Url(url),
+            }
+        } else {
+            let Some(copy) = copy_target else {
+                return false;
+            };
+            ChatContextMenuTarget::Transcript(copy)
         };
-        let target = ChatContextMenuTarget::Transcript(target);
-        let Some(rect) = context_menu_rect(column, row, bounds, target.actions()) else {
+        let Some(rect) =
+            context_menu_rect(column, row, bounds, target.actions(), target.copy_kind())
+        else {
             return false;
         };
         self.context_menu = Some(ChatContextMenu {
@@ -7880,7 +9172,9 @@ impl ChatState {
         };
         self.select_queued_by_id(id);
         let target = ChatContextMenuTarget::Queue(id);
-        let Some(rect) = context_menu_rect(column, row, bounds, target.actions()) else {
+        let Some(rect) =
+            context_menu_rect(column, row, bounds, target.actions(), target.copy_kind())
+        else {
             return false;
         };
         self.context_menu = Some(ChatContextMenu {
@@ -7895,7 +9189,7 @@ impl ChatState {
     fn context_menu_select_step(&mut self, delta: isize) {
         if let Some(menu) = self.context_menu.as_mut() {
             menu.select_step(delta);
-            self.mark_dirty_full();
+            self.dirty = LinesDirty::Full;
         }
     }
 
@@ -7917,11 +9211,106 @@ impl ChatState {
             (ChatContextMenuTarget::Transcript(target), ChatContextMenuAction::Copy) => {
                 Some(ChatContextMenuRequest::CopyTranscript(target))
             }
+            (ChatContextMenuTarget::Url(url), ChatContextMenuAction::OpenLink)
+            | (ChatContextMenuTarget::UrlWithCopy { url, .. }, ChatContextMenuAction::OpenLink) => {
+                Some(ChatContextMenuRequest::OpenUrl(url.url))
+            }
+            (ChatContextMenuTarget::Url(url), ChatContextMenuAction::CopyLink)
+            | (ChatContextMenuTarget::UrlWithCopy { url, .. }, ChatContextMenuAction::CopyLink) => {
+                Some(ChatContextMenuRequest::CopyUrl(url.url))
+            }
+            (ChatContextMenuTarget::UrlWithCopy { copy, .. }, ChatContextMenuAction::Copy) => {
+                Some(ChatContextMenuRequest::CopyTranscript(copy))
+            }
             (ChatContextMenuTarget::Queue(id), action) => {
                 Some(ChatContextMenuRequest::Queue { id, action })
             }
-            (ChatContextMenuTarget::Transcript(_), _) => None,
+            (ChatContextMenuTarget::Transcript(_), _)
+            | (ChatContextMenuTarget::Url(_), _)
+            | (ChatContextMenuTarget::UrlWithCopy { .. }, _) => None,
         }
+    }
+
+    fn toggle_tool_header_at(&mut self, column: u16, row: u16) -> bool {
+        let Some(entry_idx) = self
+            .tool_header_rects
+            .iter()
+            .find(|(_, rect)| mouse::in_rect(column, row, *rect))
+            .map(|(idx, _)| *idx)
+        else {
+            return false;
+        };
+        let Some(ChatEntry::Tool {
+            tool_call_id,
+            name,
+            input_json,
+            ..
+        }) = self.entries.get(entry_idx)
+        else {
+            return false;
+        };
+        let tool_call_id = Arc::clone(tool_call_id);
+        let current = self
+            .tool_disclosures
+            .get(&tool_call_id)
+            .copied()
+            .unwrap_or_else(|| default_tool_disclosure(name, input_json));
+        let next = match current {
+            ToolDisclosure::Collapsed => match default_tool_disclosure(name, input_json) {
+                ToolDisclosure::Preview => ToolDisclosure::Preview,
+                ToolDisclosure::Collapsed | ToolDisclosure::Full => ToolDisclosure::Full,
+            },
+            ToolDisclosure::Preview | ToolDisclosure::Full => ToolDisclosure::Collapsed,
+        };
+        self.tool_disclosures.insert(tool_call_id, next);
+        self.clear_transcript_selection();
+        self.mark_dirty_full();
+        true
+    }
+
+    fn disclosure_for_entry(&self, entry: &ChatEntry) -> ToolDisclosure {
+        let ChatEntry::Tool {
+            tool_call_id,
+            name,
+            input_json,
+            ..
+        } = entry
+        else {
+            return ToolDisclosure::Collapsed;
+        };
+        self.tool_disclosures
+            .get(tool_call_id)
+            .copied()
+            .unwrap_or_else(|| default_tool_disclosure(name, input_json))
+    }
+
+    fn toggle_tool_footer_at(&mut self, column: u16, row: u16) -> bool {
+        let Some(entry_idx) = self
+            .tool_footer_rects
+            .iter()
+            .find(|(_, rect)| mouse::in_rect(column, row, *rect))
+            .map(|(idx, _)| *idx)
+        else {
+            return false;
+        };
+        let Some(ChatEntry::Tool { tool_call_id, .. }) = self.entries.get(entry_idx) else {
+            return false;
+        };
+        let tool_call_id = Arc::clone(tool_call_id);
+        let current = self
+            .tool_disclosures
+            .get(&tool_call_id)
+            .copied()
+            .unwrap_or(ToolDisclosure::Preview);
+        let next = if matches!(current, ToolDisclosure::Full) {
+            ToolDisclosure::Preview
+        } else {
+            ToolDisclosure::Full
+        };
+        self.tool_disclosures.insert(tool_call_id, next);
+        self.clear_transcript_selection();
+        self.mark_dirty_full();
+        true
     }
 
     /// Yank a single entry's body text for explicit copy actions.
@@ -8083,6 +9472,7 @@ impl ChatState {
 
     fn rebuild_lines(&mut self, width: u16) {
         if self.cached_render_width != width {
+            self.pending_url_activation = None;
             self.dirty = LinesDirty::Full;
             self.cached_render_width = width;
         }
@@ -8105,6 +9495,58 @@ impl ChatState {
         start = start.min(natural_start);
         let end = start.saturating_add(MAX_RENDERED_ENTRIES).min(total);
 
+        // A prompt-response fallback may commit the current stream just before
+        // its final chunks arrive. Re-render only that final entry: earlier
+        // markdown and row metadata remain valid.
+        if let LinesDirty::TailChanged(entry_index) = self.dirty
+            && start == self.cached_render_start
+            && entry_index + 1 == end
+            && let Some(range_pos) = self
+                .cached_line_ranges
+                .iter()
+                .position(|&(index, _, _)| index == entry_index)
+            && range_pos + 1 == self.cached_line_ranges.len()
+        {
+            let line_start = self.cached_line_ranges[range_pos].1;
+            self.cached_lines.truncate(line_start);
+            self.cached_line_ranges.truncate(range_pos);
+
+            let mut changed_lines = Vec::new();
+            let footer_line = render_entry_into(
+                &self.entries[entry_index],
+                self.is_entry_highlighted(entry_index),
+                self.show_thoughts,
+                self.disclosure_for_entry(&self.entries[entry_index]),
+                width,
+                &mut changed_lines,
+            );
+            self.cached_tool_footer_lines.remove(&entry_index);
+            if let Some(footer_line) = footer_line {
+                self.cached_tool_footer_lines
+                    .insert(entry_index, line_start + footer_line);
+            }
+            let line_end = line_start + changed_lines.len();
+            self.cached_lines.extend(changed_lines);
+            self.cached_line_ranges
+                .push((entry_index, line_start, line_end));
+            self.cached_row_breaks = row_breaks_for_lines(&self.cached_lines, width);
+            let row_start = self.cached_line_screen_ranges[line_start].0;
+            if row_start == u16::MAX {
+                // Saturated row offsets cannot distinguish the unchanged prefix.
+                self.cached_url_regions = url_line_regions_for_lines(&self.cached_lines, width);
+            } else {
+                self.cached_url_regions
+                    .retain(|region| region.row < row_start);
+                let mut tail_regions =
+                    url_line_regions_for_lines(&self.cached_lines[line_start..], width);
+                offset_url_line_regions(&mut tail_regions, row_start);
+                self.cached_url_regions.extend(tail_regions);
+            }
+            self.dirty = LinesDirty::Clean;
+            self.rebuild_screen_ranges(width);
+            return;
+        }
+
         // Incremental append path.
         if self.dirty == LinesDirty::Appended && start == self.cached_render_start {
             let render_from = start + self.cached_entry_count;
@@ -8114,10 +9556,12 @@ impl ChatState {
             for (rel_idx, entry) in self.entries[render_from..end].iter().enumerate() {
                 let abs_idx = render_from + rel_idx;
                 let before = new_lines.len();
-                render_entry_into(
+                let disclosure = self.disclosure_for_entry(entry);
+                let footer_line = render_entry_into(
                     entry,
                     self.is_entry_highlighted(abs_idx),
                     show_thoughts,
+                    disclosure,
                     width,
                     &mut new_lines,
                 );
@@ -8126,9 +9570,16 @@ impl ChatState {
                     let base = self.cached_lines.len();
                     new_ranges.push((abs_idx, base + before, base + after));
                 }
+                if let Some(footer_line) = footer_line {
+                    self.cached_tool_footer_lines
+                        .insert(abs_idx, self.cached_lines.len() + footer_line);
+                }
             }
             self.cached_row_breaks
                 .extend(row_breaks_for_lines(&new_lines, width));
+            let mut appended_url_regions = url_line_regions_for_lines(&new_lines, width);
+            offset_url_line_regions(&mut appended_url_regions, self.cached_total_rows);
+            self.cached_url_regions.extend(appended_url_regions);
             self.cached_lines.extend(new_lines);
             self.cached_line_ranges.extend(new_ranges);
             self.cached_entry_count = end - start;
@@ -8140,14 +9591,17 @@ impl ChatState {
         // Full rebuild path.
         let mut lines = Vec::new();
         let mut ranges = Vec::new();
+        let mut footer_lines = BTreeMap::new();
         let show_thoughts = self.show_thoughts;
         for (rel_idx, entry) in self.entries[start..end].iter().enumerate() {
             let abs_idx = start + rel_idx;
             let before = lines.len();
-            render_entry_into(
+            let disclosure = self.disclosure_for_entry(entry);
+            let footer_line = render_entry_into(
                 entry,
                 self.is_entry_highlighted(abs_idx),
                 show_thoughts,
+                disclosure,
                 width,
                 &mut lines,
             );
@@ -8155,10 +9609,15 @@ impl ChatState {
             if after > before {
                 ranges.push((abs_idx, before, after));
             }
+            if let Some(footer_line) = footer_line {
+                footer_lines.insert(abs_idx, footer_line);
+            }
         }
         self.cached_row_breaks = row_breaks_for_lines(&lines, width);
+        self.cached_url_regions = url_line_regions_for_lines(&lines, width);
         self.cached_lines = lines;
         self.cached_line_ranges = ranges;
+        self.cached_tool_footer_lines = footer_lines;
         self.cached_entry_count = end - start;
         self.cached_render_start = start;
         self.dirty = LinesDirty::Clean;
@@ -8669,6 +10128,36 @@ impl ChatState {
         }
     }
 
+    fn append_to_prompt_settled_stream(&mut self, text: &str) -> bool {
+        let Some((generation, entry_index)) = self.prompt_settled_stream_entry else {
+            return false;
+        };
+        if generation != self.turn_generation {
+            self.prompt_settled_stream_entry = None;
+            return false;
+        }
+        let Some(ChatEntry::AgentMessageContinuation(existing)) = self.entries.get_mut(entry_index)
+        else {
+            self.prompt_settled_stream_entry = None;
+            return false;
+        };
+        existing.push_str(text);
+        self.mark_dirty_tail(entry_index);
+        true
+    }
+
+    fn freeze_prompt_settled_stream(&mut self) {
+        let Some((_, entry_index)) = self.prompt_settled_stream_entry.take() else {
+            return;
+        };
+        let Some(entry) = self.entries.get_mut(entry_index) else {
+            return;
+        };
+        if let ChatEntry::AgentMessageContinuation(text) = entry {
+            *entry = ChatEntry::AgentMessage(Arc::<str>::from(std::mem::take(text)));
+        }
+    }
+
     pub fn apply_update(&mut self, update: SessionUpdate) {
         // Ignore notifications that belong to a different session.
         let update_sid = match &update {
@@ -8688,6 +10177,10 @@ impl ChatState {
 
         match update {
             SessionUpdate::AgentMessageChunk { text, .. } => {
+                self.invalidate_url_interactions();
+                if !self.turn_in_flight && self.append_to_prompt_settled_stream(&text) {
+                    return;
+                }
                 // Flush any accumulated thought before the response text begins
                 // so it appears inline at the right position, not piled at the end.
                 if self.streaming_text.is_empty() {
@@ -8703,6 +10196,8 @@ impl ChatState {
                 }
             }
             SessionUpdate::AgentThoughtChunk { text, .. } => {
+                self.invalidate_url_interactions();
+                self.freeze_prompt_settled_stream();
                 self.streaming_thought.push_str(&text);
                 if self.turn_in_flight {
                     self.turn_status = TurnStatus::Thinking;
@@ -8714,6 +10209,7 @@ impl ChatState {
                 raw_input,
                 ..
             } => {
+                self.freeze_prompt_settled_stream();
                 // Flush any accumulated text and thought before the tool call
                 // so that pre-tool agent text and thinking both appear in
                 // conversation order before the Tool entry.
@@ -8780,27 +10276,116 @@ impl ChatState {
             SessionUpdate::ContextUsage {
                 input_tokens,
                 max_context_tokens,
+                model_context_window,
                 ..
             } => {
-                if input_tokens.is_some() {
-                    self.context_input_tokens = input_tokens;
-                }
-                if max_context_tokens.is_some() {
-                    self.context_max_tokens = max_context_tokens;
-                }
+                self.context_input_tokens = input_tokens;
+                // Budget and capacity are one authoritative per-call snapshot.
+                // In particular, `None` capacity is meaningful: compatibility
+                // fallback routes omit it and must clear a prior configured
+                // route's denominator instead of retaining stale state.
+                self.context_max_tokens = max_context_tokens;
+                self.context_model_window = model_context_window;
             }
             SessionUpdate::HistoryTrimmed {
                 dropped_messages,
+                dropped_turns,
                 kept_turns,
                 reason,
+                token_budget,
+                tokens_before,
+                tokens_after,
+                tokens_before_source,
+                tokens_after_source,
+                unsatisfiable_floor,
                 ..
             } => {
-                let dropped = dropped_messages.to_string();
+                self.freeze_prompt_settled_stream();
+                let dropped = dropped_turns.unwrap_or(dropped_messages).to_string();
                 let kept = kept_turns.to_string();
-                let notice = crate::i18n::t_args(
-                    "zc-chat-history-trimmed",
-                    &[("reason", &reason), ("dropped", &dropped), ("kept", &kept)],
-                );
+                let dropped_kind = if dropped_turns == Some(1) {
+                    "one"
+                } else {
+                    "other"
+                };
+                let kept_kind = if kept_turns == 1 { "one" } else { "other" };
+                // The unsatisfiable newest-turn/schema floor is flagged
+                // explicitly by the runtime: the retained request cannot fit
+                // the configured budget even though history MAY have been
+                // trimmed on the way to that floor, so the notice must not
+                // claim a successful trim.
+                let at_floor = unsatisfiable_floor == Some(true);
+                let notice = if at_floor {
+                    crate::i18n::t_args(
+                        "zc-chat-history-trimmed-floor",
+                        &[
+                            ("reason", &reason),
+                            ("after", &tokens_after.unwrap_or_default().to_string()),
+                            ("budget", &token_budget.unwrap_or_default().to_string()),
+                        ],
+                    )
+                } else {
+                    match (tokens_before, tokens_after) {
+                        (Some(before), Some(after)) => {
+                            let mut notice = crate::i18n::t_args(
+                                if dropped_turns.is_some() {
+                                    "zc-chat-history-trimmed-tokens-turns"
+                                } else {
+                                    "zc-chat-history-trimmed-tokens"
+                                },
+                                &[
+                                    ("reason", &reason),
+                                    ("before", &before.to_string()),
+                                    ("after", &after.to_string()),
+                                    ("dropped", &dropped),
+                                    ("kept", &kept),
+                                    ("dropped-kind", dropped_kind),
+                                    ("kept-kind", kept_kind),
+                                ],
+                            );
+                            // The configured budget is context, never the trim
+                            // target: recovery trims toward a provider-overflow
+                            // target, so the notice must not present the
+                            // configured limit as governing the trim.
+                            if let Some(budget) = token_budget {
+                                notice.push_str(&crate::i18n::t_args(
+                                    "zc-chat-history-trimmed-token-budget-clause",
+                                    &[("budget", &budget.to_string())],
+                                ));
+                            }
+                            let before_label = tokens_before_source.as_deref().and_then(|source| {
+                                crate::i18n::try_t(&token_source_fluent_key(source))
+                            });
+                            let after_label = tokens_after_source.as_deref().and_then(|source| {
+                                crate::i18n::try_t(&token_source_fluent_key(source))
+                            });
+                            if let (Some(before_label), Some(after_label)) =
+                                (before_label, after_label)
+                            {
+                                notice.push(' ');
+                                notice.push_str(&crate::i18n::t_args(
+                                    "zc-chat-history-trimmed-token-sources",
+                                    &[("before", &before_label), ("after", &after_label)],
+                                ));
+                            }
+                            notice
+                        }
+                        _ => crate::i18n::t_args(
+                            if dropped_turns.is_some() {
+                                "zc-chat-history-trimmed-turns"
+                            } else {
+                                "zc-chat-history-trimmed"
+                            },
+                            &[
+                                ("reason", &reason),
+                                ("dropped", &dropped),
+                                ("kept", &kept),
+                                ("dropped-kind", dropped_kind),
+                                ("kept-kind", kept_kind),
+                            ],
+                        ),
+                    }
+                };
                 self.entries
                     .push(ChatEntry::SystemMessage(Arc::<str>::from(notice)));
                 self.mark_dirty_append();
@@ -8853,6 +10438,7 @@ impl ChatState {
     }
 
     pub fn commit_turn(&mut self, full_text: String, clean: bool) {
+        self.freeze_prompt_settled_stream();
         if self.flush_streaming_text() {
             self.turn_had_streaming_text = true;
         }
@@ -8880,17 +10466,28 @@ impl ChatState {
         }
         self.turn_had_streaming_text = false;
         self.turn_had_tool_calls = false;
-        self.mark_dirty_append();
         self.settle_turn_lifecycle(clean);
     }
 
     fn settle_turn_from_prompt_response(&mut self) {
-        if self.flush_streaming_text() {
+        self.freeze_prompt_settled_stream();
+        let text = std::mem::take(&mut self.streaming_text);
+        if !text.is_empty() {
             self.turn_had_streaming_text = true;
+            let entry_index = self.entries.len();
+            self.entries.push(ChatEntry::AgentMessageContinuation(text));
+            self.prompt_settled_stream_entry = Some((self.turn_generation, entry_index));
+            self.mark_dirty_append();
         }
         self.flush_streaming_thought();
-        self.turn_had_streaming_text = false;
-        self.turn_had_tool_calls = false;
+        if self
+            .prompt_settled_stream_entry
+            .is_some_and(|(_, entry_index)| entry_index + 1 != self.entries.len())
+        {
+            self.freeze_prompt_settled_stream();
+        }
+        // Preserve per-turn provenance for a delayed terminal notification;
+        // the next turn resets both flags when its user message is committed.
         self.mark_dirty_append();
         self.settle_turn_lifecycle(false);
     }
@@ -8926,6 +10523,23 @@ impl ChatState {
     /// running (the turn is still winding down); a pending elicitation
     /// counts only when it targets this session (defense against a stale
     /// modal surviving a session switch).
+    /// Terminal-facing turn status. An operator wait outranks whatever the
+    /// turn was doing, so the terminal reads as blocked while a prompt is up
+    /// and returns to the turn's own state once it is answered.
+    pub(crate) fn terminal_status(&self) -> TurnStatus {
+        if self
+            .pending_elicitation
+            .as_ref()
+            .is_some_and(|e| e.session_id == self.session_id)
+        {
+            TurnStatus::WaitingForInput
+        } else if self.pending_approval.is_some() {
+            TurnStatus::WaitingForApproval
+        } else {
+            self.turn_status.clone()
+        }
+    }
+
     pub(crate) fn sidebar_status(&self) -> SidebarStatus {
         if self.last_error.is_some() {
             SidebarStatus::Errored
@@ -8944,6 +10558,7 @@ impl ChatState {
     }
 
     pub fn push_user_message(&mut self, text: Option<String>, attachments: Vec<String>) {
+        self.freeze_prompt_settled_stream();
         // A new prompt supersedes the previous failure: the red dot clears
         // until the daemon reports otherwise.
         self.last_error = None;
@@ -9478,6 +11093,7 @@ impl ChatState {
     }
 
     fn prepare_for_notification_resync(&mut self) {
+        self.freeze_prompt_settled_stream();
         self.pending_approval = None;
         self.pending_elicitation = None;
         self.streaming_text.clear();
@@ -9626,7 +11242,14 @@ impl ChatState {
         self.cached_screen_ranges.clear();
         self.cached_code_blocks.clear();
         self.entry_rects.clear();
+        self.tool_header_rects.clear();
+        self.tool_footer_rects.clear();
+        self.tool_disclosures.clear();
+        self.cached_tool_footer_lines.clear();
         self.copy_hit_regions.clear();
+        self.url_hit_regions.clear();
+        self.cached_url_regions.clear();
+        self.pending_url_activation = None;
         self.context_copy_regions.clear();
         self.context_menu = None;
         self.copy_feedback = None;
@@ -9640,6 +11263,7 @@ impl ChatState {
         self.turn_in_flight = false;
         self.message_count = 0;
         self.turn_generation = self.turn_generation.wrapping_add(1);
+        self.prompt_settled_stream_entry = None;
         self.turn_status = TurnStatus::Idle;
         self.cancel_started_at = None;
         self.browse_cursor = None;
@@ -9658,6 +11282,7 @@ impl ChatState {
         // ContextUsage event.
         self.context_input_tokens = None;
         self.context_max_tokens = None;
+        self.context_model_window = None;
         // The TodoWrite plan is per-session; drop it (and its show/hide state)
         // so a switched-to session doesn't inherit the previous plan's tasks.
         // Rebuilding from freshly resolved settings also applies any Config-pane
@@ -9701,6 +11326,7 @@ fn clipboard_text(entry: &ChatEntry) -> String {
             }
         }
         ChatEntry::AgentMessage(t) => t.to_string(),
+        ChatEntry::AgentMessageContinuation(t) => t.clone(),
         ChatEntry::AgentThought(t) => format!("(thinking) {t}"),
         ChatEntry::SystemMessage(t) => t.to_string(),
         ChatEntry::Tool {
@@ -9721,7 +11347,7 @@ fn labelled_clipboard_text(entry: &ChatEntry) -> String {
         ChatEntry::UserMessage { .. } => {
             crate::i18n::t_args("zc-chat-clipboard-you", &[("text", &clipboard_text(entry))])
         }
-        ChatEntry::AgentMessage(_) => crate::i18n::t_args(
+        ChatEntry::AgentMessage(_) | ChatEntry::AgentMessageContinuation(_) => crate::i18n::t_args(
             "zc-chat-clipboard-agent",
             &[("text", &clipboard_text(entry))],
         ),
@@ -9759,6 +11385,10 @@ pub async fn open_editor_for_content(content: &str) -> String {
         .await;
 
     crossterm::terminal::enable_raw_mode().ok();
+    // The editor owned the terminal and may have set its own title, so the
+    // cached view of it is no longer true. Without this the next sync dedupes
+    // against a value the terminal no longer shows and never corrects it.
+    crate::osc_status::invalidate();
     let _ = crossterm::execute!(
         std::io::stdout(),
         crossterm::terminal::EnterAlternateScreen,
@@ -9810,6 +11440,589 @@ mod tests {
             "myagent".to_string(),
             crate::todo_tracker::TodoTrackerSettings::default(),
         )
+    }
+
+    fn url_hit(rect: Rect, url: &str, row: u16, byte_start: usize) -> UrlHitRegion {
+        UrlHitRegion {
+            rect,
+            url: url.to_string(),
+            occurrence: UrlOccurrenceId { row, byte_start },
+        }
+    }
+
+    #[test]
+    fn recognized_urls_accept_bare_and_markdown_destinations_without_punctuation() {
+        let bare = recognized_url_ranges("See https://example.com/path, then stop.");
+        assert_eq!(bare, vec![(4, 28, "https://example.com/path".to_string())]);
+        let balanced = recognized_url_ranges("(https://example.com/a_(b)),");
+        assert_eq!(balanced.len(), 1);
+        assert_eq!(balanced[0].2, "https://example.com/a_(b)");
+        let markdown = markdown_to_lines("[docs](https://example.com/docs).", 80);
+        let rendered = markdown
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert_eq!(rendered, "docs (https://example.com/docs).");
+        assert_eq!(recognized_url_ranges(&rendered).len(), 1);
+
+        let mut split = vec![Line::from(vec![
+            Span::raw("https://"),
+            Span::styled("example.com", theme::dim_style()),
+        ])];
+        style_recognized_urls(&mut split);
+        assert!(
+            split[0]
+                .spans
+                .iter()
+                .all(|span| span.style.add_modifier(Modifier::UNDERLINED) == span.style)
+        );
+        assert!(
+            split[0]
+                .spans
+                .iter()
+                .all(|span| span.style.fg == Some(theme::active().accent))
+        );
+    }
+
+    #[test]
+    fn recognized_urls_preserve_valid_terminal_punctuation() {
+        let ranges = recognized_url_ranges(
+            "https://example.com/foo! https://example.com/? https://example.com/end, See <https://example.com/docs>?!",
+        );
+        let urls = ranges
+            .into_iter()
+            .map(|(_, _, url)| url)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            urls,
+            vec![
+                "https://example.com/foo!",
+                "https://example.com/?",
+                "https://example.com/end",
+                "https://example.com/docs",
+            ]
+        );
+    }
+
+    #[test]
+    fn recognized_urls_reject_other_schemes_and_malformed_hosts() {
+        for text in [
+            "javascript:alert(1)",
+            "ftp://example.com",
+            "prefixhttps://example.com",
+            "wordhttp://example.com",
+            "https://",
+            "https:///",
+        ] {
+            assert!(
+                recognized_url_ranges(text).is_empty(),
+                "recognized {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn user_message_urls_receive_the_same_link_style() {
+        let mut lines = Vec::new();
+        render_entry_into(
+            &ChatEntry::UserMessage {
+                text: Some(Arc::from("visit https://example.com")),
+                attachments: Vec::new(),
+            },
+            false,
+            false,
+            ToolDisclosure::Collapsed,
+            80,
+            &mut lines,
+        );
+        let url_span = lines[0]
+            .spans
+            .iter()
+            .find(|span| span.content.contains("https://example.com"))
+            .expect("styled URL span");
+        assert_eq!(url_span.style.fg, Some(theme::active().accent));
+        assert!(url_span.style.add_modifier(Modifier::UNDERLINED) == url_span.style);
+    }
+
+    #[test]
+    fn url_hit_map_wrapping_matches_rendered_cells_while_scrolling() {
+        use ratatui::{buffer::Buffer, widgets::Widget};
+
+        let reproducer = vec![
+            Line::from("https://a.co x https://b.co x https://c.co x https://d.co"),
+            Line::from("https://e.co"),
+        ];
+        let regions = url_line_regions_for_lines(&reproducer, 10);
+        let visible = project_url_hit_regions(&regions, 9, Rect::new(0, 0, 10, 2));
+        assert!(visible.iter().all(|hit| hit.rect.y < 2));
+
+        let lines = vec![
+            Line::from("https://one.example/aaaaa x https://two.example/bbbbbb"),
+            Line::from("https://three.example/end"),
+            Line::from("https://wide.example/\u{754c}e\u{301}").centered(),
+            Line::from("https://right.example/end").right_aligned(),
+        ];
+        for width in [10, 16, 24, 40] {
+            let regions = url_line_regions_for_lines(&lines, width);
+            assert!(
+                regions.windows(2).all(|pair| pair[0].row <= pair[1].row),
+                "URL rows must remain ordered at width {width}: {regions:?}"
+            );
+            let total = Paragraph::new(lines.clone())
+                .wrap(Wrap { trim: false })
+                .line_count(width) as u16;
+            let full_body = Rect::new(0, 0, width, total);
+            let mut full_buffer = Buffer::empty(full_body);
+            Paragraph::new(lines.clone())
+                .wrap(Wrap { trim: false })
+                .render(full_body, &mut full_buffer);
+            let all = project_url_hit_regions(&regions, 0, full_body);
+            for region in &regions {
+                for (start, _, url) in &region.urls {
+                    let occurrence = UrlOccurrenceId {
+                        row: region.row,
+                        byte_start: *start,
+                    };
+                    let mut visible = String::new();
+                    for hit in all.iter().filter(|hit| hit.occurrence == occurrence) {
+                        let mut x = hit.rect.x;
+                        while x < hit.rect.right() {
+                            use unicode_width::UnicodeWidthStr;
+                            let symbol = full_buffer[(x, hit.rect.y)].symbol();
+                            visible.push_str(symbol);
+                            x += (UnicodeWidthStr::width(symbol) as u16).max(1);
+                        }
+                    }
+                    assert_eq!(
+                        &visible, url,
+                        "all URL cells remain reachable at width {width}"
+                    );
+                }
+            }
+            for scroll in 0..total {
+                let body = Rect::new(2, 3, width, 2);
+                let mut buffer = Buffer::empty(body);
+                Paragraph::new(lines.clone())
+                    .wrap(Wrap { trim: false })
+                    .scroll((scroll, 0))
+                    .render(body, &mut buffer);
+                for hit in project_url_hit_regions(&regions, scroll, body) {
+                    use unicode_width::UnicodeWidthStr;
+                    let mut visible = String::new();
+                    let mut x = hit.rect.x;
+                    while x < hit.rect.right() {
+                        let symbol = buffer[(x, hit.rect.y)].symbol();
+                        visible.push_str(symbol);
+                        x += (UnicodeWidthStr::width(symbol) as u16).max(1);
+                    }
+                    assert!(
+                        !visible.is_empty() && hit.url.contains(&visible),
+                        "phantom URL cells at width {width}, scroll {scroll}: {visible:?}, {hit:?}"
+                    );
+                }
+            }
+
+            let mut appended = url_line_regions_for_lines(&lines[..1], width);
+            let mut tail = url_line_regions_for_lines(&lines[1..], width);
+            offset_url_line_regions(&mut tail, wrapped_rows(&lines[0], width));
+            appended.extend(tail);
+            assert_eq!(appended.len(), regions.len());
+            for (incremental, full) in appended.iter().zip(&regions) {
+                assert_eq!(incremental, full);
+            }
+        }
+    }
+
+    #[test]
+    fn url_hit_map_tall_line_retains_only_visible_cell_regions() {
+        let url = format!("https://example.com/{}", "a".repeat(6_000));
+        let lines = vec![Line::from(url.clone())];
+        let cached = url_line_regions_for_lines(&lines, 10);
+        assert_eq!(
+            cached.len(),
+            1,
+            "cache logical lines, not every wrapped cell"
+        );
+        assert!(cached[0].rows > 256);
+        let body = Rect::new(4, 5, 10, 3);
+        let hits = project_url_hit_regions(&cached, 400, body);
+        assert_eq!(hits.len(), 3);
+        assert!(hits.iter().all(|hit| hit.url == url));
+        assert_eq!(hits[0].rect, Rect::new(4, 5, 10, 1));
+        assert_eq!(hits[2].rect, Rect::new(4, 7, 10, 1));
+        assert!(project_url_hit_regions(&cached, cached[0].rows, body).is_empty());
+    }
+
+    #[test]
+    fn url_hit_map_projects_wrapped_wide_cells_and_viewport_rows() {
+        let lines = vec![Line::from("界 https://example.com/path")];
+        let logical = url_line_regions_for_lines(&lines, 10);
+        let all = project_url_hit_regions(&logical, 0, Rect::new(5, 3, 10, 4));
+        assert!(
+            all.len() >= 2,
+            "URL should be split by soft wrapping: {all:?}"
+        );
+        assert!(all.iter().all(|hit| hit.url == "https://example.com/path"));
+        assert!(
+            all.iter().all(|hit| hit.occurrence == all[0].occurrence),
+            "wrapped URL segments must retain one occurrence identity"
+        );
+        assert!(all.iter().all(|hit| hit.rect.x >= 5 && hit.rect.width > 0));
+        let clipped = project_url_hit_regions(&logical, 1, Rect::new(5, 3, 10, 1));
+        assert_eq!(clipped.len(), 1);
+        assert_eq!(clipped[0].rect.y, 3);
+
+        let mut offset = logical.clone();
+        offset_url_line_regions(&mut offset, 7);
+        assert_eq!(offset[0].row, logical[0].row + 7);
+        let shifted = project_url_hit_regions(&offset, 7, Rect::new(5, 3, 10, 4));
+        assert_eq!(shifted[0].occurrence.row, all[0].occurrence.row + 7);
+    }
+
+    #[test]
+    fn link_origin_drag_cannot_extend_a_preexisting_selection() {
+        let mut state = state();
+        state.transcript_snapshot = Some(transcript_snapshot(
+            Rect::new(0, 0, 30, 1),
+            &["old https://example.com text"],
+        ));
+        assert!(state.begin_transcript_drag(0, 0));
+        assert!(state.update_transcript_drag(2, 0));
+        state.finish_transcript_drag();
+        assert!(state.transcript_selection.is_some());
+
+        state.begin_url_activation(url_hit(Rect::new(4, 0, 19, 1), "https://example.com", 0, 4));
+        state.cancel_url_activation();
+        assert!(!state.update_transcript_drag(20, 0));
+        assert_eq!(state.transcript_selection, None);
+    }
+
+    #[test]
+    fn url_context_menu_remains_actionable_in_browse_mode() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let mut state = state();
+        state.entries.push(ChatEntry::AgentMessage(Arc::from(
+            "| Link |\n| --- |\n| https://example.com/this/is/a/very/long/path/that/must/be/truncated |\n\nhttps://example.complete",
+        )));
+        state.browse_cursor = Some(0);
+        state.mark_dirty_full();
+
+        let area = Rect::new(0, 0, 140, 40);
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| render(frame, &mut state, area, PaneKind::Chat))
+            .expect("draw browse-mode transcript");
+
+        let snapshot = state
+            .transcript_snapshot
+            .as_ref()
+            .expect("render captures transcript cells");
+        let (row, column) = snapshot
+            .cells
+            .chunks(usize::from(snapshot.area.width))
+            .enumerate()
+            .find_map(|(row, cells)| {
+                cells
+                    .iter()
+                    .map(|cell| cell.symbol.as_str())
+                    .collect::<String>()
+                    .find("https://example.complete")
+                    .map(|column| {
+                        (
+                            snapshot.area.y + row as u16,
+                            snapshot.area.x + column as u16,
+                        )
+                    })
+            })
+            .expect("complete URL remains visible after the table");
+
+        assert!(state.open_transcript_context_menu(column, row));
+        let menu = state.context_menu.as_ref().expect("URL menu");
+        assert_eq!(menu.target.actions(), URL_WITH_COPY_CONTEXT_ACTIONS);
+        assert_eq!(
+            menu.selected_action(),
+            Some(ChatContextMenuAction::OpenLink)
+        );
+        assert_eq!(menu.target.copy_kind(), Some(CopyHitKind::Message));
+        assert_eq!(
+            context_menu_action_label(ChatContextMenuAction::Copy, menu.target.copy_kind()),
+            crate::i18n::t("zc-chat-context-menu-copy")
+        );
+    }
+
+    #[tokio::test]
+    async fn browse_mode_plain_url_click_owns_the_link_gesture() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+
+        let (mut chat, _rx) = test_chat();
+        let mut state = state();
+        state
+            .entries
+            .push(ChatEntry::AgentMessage(Arc::<str>::from("first")));
+        state.entries.push(ChatEntry::AgentMessage(Arc::<str>::from(
+            "https://example.com",
+        )));
+        state.browse_cursor = Some(0);
+        state.entry_rects = vec![(0, Rect::new(2, 3, 20, 1)), (1, Rect::new(2, 4, 20, 1))];
+        state
+            .url_hit_regions
+            .push(url_hit(Rect::new(2, 4, 19, 1), "https://example.com", 1, 0));
+        chat.phase = ChatPhase::Active(Box::new(state));
+
+        chat.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 4,
+                row: 4,
+                modifiers: KeyModifiers::NONE,
+            },
+            Rect::new(0, 0, 80, 20),
+        )
+        .await;
+
+        let ChatPhase::Active(state) = &chat.phase else {
+            panic!("expected active chat");
+        };
+        assert_eq!(state.browse_cursor, Some(0));
+        assert_eq!(
+            state
+                .pending_url_activation
+                .as_ref()
+                .map(|pending| pending.url.as_str()),
+            Some("https://example.com")
+        );
+    }
+
+    #[test]
+    fn context_menu_names_only_transcript_selection_copy_explicitly() {
+        assert_eq!(
+            context_menu_action_label(ChatContextMenuAction::Copy, Some(CopyHitKind::Transcript)),
+            crate::i18n::t("zc-chat-context-menu-copy-selection")
+        );
+        assert_eq!(
+            context_menu_action_label(ChatContextMenuAction::Copy, Some(CopyHitKind::Code)),
+            crate::i18n::t("zc-chat-context-menu-copy")
+        );
+        assert_eq!(
+            context_menu_action_label(ChatContextMenuAction::Copy, None),
+            crate::i18n::t("zc-chat-context-menu-copy")
+        );
+    }
+
+    #[test]
+    fn url_pointer_lifecycle_requires_same_occurrence() {
+        let mut state = state();
+        let first = url_hit(Rect::new(4, 2, 8, 1), "https://example.com", 2, 4);
+        let second = url_hit(Rect::new(20, 2, 8, 1), "https://example.com", 2, 20);
+        state.url_hit_regions = vec![first, second];
+
+        assert_eq!(
+            state.handle_url_pointer(
+                &MouseEventKind::Down(MouseButton::Left),
+                crossterm::event::KeyModifiers::NONE,
+                6,
+                2,
+            ),
+            UrlPointerAction::Consumed
+        );
+        assert_eq!(
+            state.handle_url_pointer(
+                &MouseEventKind::Up(MouseButton::Left),
+                crossterm::event::KeyModifiers::NONE,
+                6,
+                2,
+            ),
+            UrlPointerAction::Open("https://example.com".to_string())
+        );
+
+        assert_eq!(
+            state.handle_url_pointer(
+                &MouseEventKind::Down(MouseButton::Left),
+                crossterm::event::KeyModifiers::NONE,
+                6,
+                2,
+            ),
+            UrlPointerAction::Consumed
+        );
+        assert_eq!(
+            state.handle_url_pointer(
+                &MouseEventKind::Up(MouseButton::Left),
+                crossterm::event::KeyModifiers::NONE,
+                22,
+                2,
+            ),
+            UrlPointerAction::Consumed,
+            "same URL text at a different occurrence must not open"
+        );
+
+        state.transcript_selection = Some(TranscriptSelection {
+            anchor: CellPoint { row: 0, column: 0 },
+            head: CellPoint { row: 0, column: 1 },
+            dragged: true,
+        });
+        assert_eq!(
+            state.handle_url_pointer(
+                &MouseEventKind::Down(MouseButton::Left),
+                crossterm::event::KeyModifiers::NONE,
+                6,
+                2,
+            ),
+            UrlPointerAction::Consumed
+        );
+        assert_eq!(state.transcript_selection, None);
+        assert_eq!(
+            state.handle_url_pointer(
+                &MouseEventKind::Drag(MouseButton::Left),
+                crossterm::event::KeyModifiers::NONE,
+                10,
+                2,
+            ),
+            UrlPointerAction::Consumed
+        );
+        assert!(state.pending_url_activation.is_none());
+    }
+
+    #[test]
+    fn transcript_reflow_cancels_pending_url_activation() {
+        let mut state = state();
+        state.cached_render_width = 80;
+        state.begin_url_activation(url_hit(Rect::new(4, 2, 8, 1), "https://example.com", 2, 4));
+
+        state.rebuild_lines(40);
+
+        assert!(state.pending_url_activation.is_none());
+    }
+
+    #[test]
+    fn streaming_updates_invalidate_pending_url_actions() {
+        let updates = [
+            SessionUpdate::AgentMessageChunk {
+                session_id: "sess-1".to_string(),
+                text: "/private".to_string(),
+            },
+            SessionUpdate::AgentThoughtChunk {
+                session_id: "sess-1".to_string(),
+                text: "/thinking".to_string(),
+            },
+        ];
+
+        for update in updates {
+            let mut state = state();
+            let hit = url_hit(Rect::new(0, 0, 19, 1), "https://example.com", 0, 0);
+            state.url_hit_regions = vec![hit.clone()];
+            assert_eq!(
+                state.handle_url_pointer(
+                    &MouseEventKind::Down(MouseButton::Left),
+                    crossterm::event::KeyModifiers::NONE,
+                    2,
+                    0,
+                ),
+                UrlPointerAction::Consumed
+            );
+            state.context_menu = Some(ChatContextMenu {
+                rect: Rect::new(0, 1, 20, 4),
+                target: ChatContextMenuTarget::Url(hit),
+                selected: 0,
+            });
+
+            state.apply_update(update);
+
+            assert!(state.pending_url_activation.is_none());
+            assert!(state.context_menu.is_none());
+            assert_eq!(
+                state.handle_url_pointer(
+                    &MouseEventKind::Up(MouseButton::Left),
+                    crossterm::event::KeyModifiers::NONE,
+                    2,
+                    0,
+                ),
+                UrlPointerAction::Ignore
+            );
+        }
+    }
+
+    #[test]
+    fn dirty_transitions_preserve_non_url_context_menus() {
+        let transcript = ChatContextMenuTarget::Transcript(CopyHitRegion {
+            rect: Rect::new(0, 0, 1, 1),
+            text: Arc::<str>::from("message"),
+            kind: CopyHitKind::Message,
+            group: 0,
+        });
+        let queue = ChatContextMenuTarget::Queue(7);
+
+        for (index, target) in [transcript, queue].into_iter().enumerate() {
+            let mut state = state();
+            state.context_menu = Some(ChatContextMenu {
+                rect: Rect::new(0, 1, 20, 4),
+                target: target.clone(),
+                selected: 0,
+            });
+
+            if index == 0 {
+                state.mark_dirty_append();
+            } else {
+                state.mark_dirty_full();
+            }
+
+            assert_eq!(
+                state.context_menu.as_ref().map(|menu| &menu.target),
+                Some(&target)
+            );
+        }
+    }
+
+    #[test]
+    fn url_context_menu_keyboard_selection_remains_actionable() {
+        let mut state = state();
+        state.context_menu = Some(ChatContextMenu {
+            rect: Rect::new(0, 1, 20, 4),
+            target: ChatContextMenuTarget::Url(url_hit(
+                Rect::new(0, 0, 19, 1),
+                "https://example.com",
+                0,
+                0,
+            )),
+            selected: 0,
+        });
+
+        state.context_menu_select_step(1);
+
+        assert_eq!(
+            state.take_context_menu_request(),
+            Some(ChatContextMenuRequest::CopyUrl(
+                "https://example.com".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn context_usage_clears_stale_capacity_when_next_route_omits_it() {
+        let mut state = state();
+        state.apply_update(SessionUpdate::ContextUsage {
+            session_id: "sess-1".to_string(),
+            input_tokens: Some(100_000),
+            max_context_tokens: Some(180_000),
+            model_context_window: Some(200_000),
+        });
+        assert_eq!(state.context_max_tokens, Some(180_000));
+        assert_eq!(state.context_model_window, Some(200_000));
+
+        state.apply_update(SessionUpdate::ContextUsage {
+            session_id: "sess-1".to_string(),
+            input_tokens: Some(12_000),
+            max_context_tokens: Some(32_000),
+            model_context_window: None,
+        });
+        assert_eq!(state.context_input_tokens, Some(12_000));
+        assert_eq!(state.context_max_tokens, Some(32_000));
+        assert_eq!(
+            state.context_model_window, None,
+            "a compatibility-fallback frame must clear the prior route's capacity"
+        );
     }
 
     fn resume_entry(session_id: &str, agent_alias: &str, was_focused: bool) -> ResumeEntry {
@@ -10003,6 +12216,19 @@ mod tests {
         assert!(matches!(
             command_action_from_initialize(response, "/new-session"),
             InputBarAction::RestartSession
+        ));
+    }
+
+    #[test]
+    fn change_directory_command_is_a_dedicated_input_action() {
+        // `/change-directory` must reach the pane as its own action; falling
+        // back to `Submit` would send the command to the agent as chat text.
+        assert!(matches!(
+            command_action_from_initialize(
+                serde_json::json!({"server_version": env!("CARGO_PKG_VERSION")}),
+                "/change-directory",
+            ),
+            InputBarAction::ChangeDirectory
         ));
     }
 
@@ -10270,12 +12496,19 @@ mod tests {
         use unicode_width::UnicodeWidthStr;
 
         let bounds = Rect::new(10, 5, 20, 8);
-        let menu_width = (UnicodeWidthStr::width(context_menu_copy_label().as_str()) as u16 + 4)
-            .min(bounds.width)
-            .max(3);
+        let menu_width =
+            (UnicodeWidthStr::width(context_menu_copy_selection_label().as_str()) as u16 + 4)
+                .min(bounds.width)
+                .max(3);
 
         assert_eq!(
-            context_menu_rect(29, 12, bounds, TRANSCRIPT_CONTEXT_ACTIONS),
+            context_menu_rect(
+                29,
+                12,
+                bounds,
+                TRANSCRIPT_CONTEXT_ACTIONS,
+                Some(CopyHitKind::Transcript),
+            ),
             Some(Rect::new(
                 bounds.x + bounds.width - menu_width,
                 bounds.y + bounds.height - 3,
@@ -10284,16 +12517,56 @@ mod tests {
             ))
         );
         assert_eq!(
-            context_menu_rect(0, 0, bounds, TRANSCRIPT_CONTEXT_ACTIONS)
-                .unwrap()
-                .x,
+            context_menu_rect(
+                0,
+                0,
+                bounds,
+                TRANSCRIPT_CONTEXT_ACTIONS,
+                Some(CopyHitKind::Transcript),
+            )
+            .unwrap()
+            .x,
             bounds.x
         );
         assert_eq!(
-            context_menu_rect(0, 0, bounds, TRANSCRIPT_CONTEXT_ACTIONS)
-                .unwrap()
-                .y,
+            context_menu_rect(
+                0,
+                0,
+                bounds,
+                TRANSCRIPT_CONTEXT_ACTIONS,
+                Some(CopyHitKind::Transcript),
+            )
+            .unwrap()
+            .y,
             bounds.y
+        );
+    }
+
+    #[test]
+    fn url_context_menu_requires_room_for_every_action() {
+        let too_short = Rect::new(0, 0, 30, 4);
+        assert_eq!(
+            context_menu_rect(
+                2,
+                1,
+                too_short,
+                URL_WITH_COPY_CONTEXT_ACTIONS,
+                Some(CopyHitKind::Transcript),
+            ),
+            None
+        );
+
+        let enough_room = Rect::new(0, 0, 30, 5);
+        assert_eq!(
+            context_menu_rect(
+                2,
+                1,
+                enough_room,
+                URL_WITH_COPY_CONTEXT_ACTIONS,
+                Some(CopyHitKind::Transcript),
+            )
+            .map(|rect| rect.height),
+            Some(5)
         );
     }
 
@@ -11184,18 +13457,6 @@ mod tests {
         );
     }
 
-    /// B1 risk #2, automated: a bounded-range off-by-one can still satisfy the
-    /// line-count assertions the other tests make, and would surface only as
-    /// mis-aimed clicks and wrong copy regions in a real terminal.
-    ///
-    /// This sweeps EVERY scroll offset over a wrapped history (prose plus code
-    /// fences) and pins the coordinate invariants that scrolling, bottom
-    /// anchoring, copy targets and `entry_rects` all read:
-    ///   1. the resolved entry range covers the whole viewport window, so no
-    ///      visible row is projected from outside the range;
-    ///   2. the line-level window covers the viewport and `local_scroll`
-    ///      indexes a real row of the slice;
-    ///   3. the materialized line count is exactly the resolved line window.
     #[test]
     fn visible_range_coordinate_invariants_hold_at_every_scroll_offset() {
         let mut s = state();
@@ -11294,6 +13555,64 @@ mod tests {
             .unwrap_or_else(|_| panic!("{reason}"))
             .expect("session reattach result channel should stay open");
         chat.apply_session_reattach_result(update);
+    }
+
+    #[tokio::test]
+    async fn model_picker_catalog_request_preserves_configured_hailo_alias() {
+        let (writer_tx, mut writer_rx) = mpsc::channel::<String>(16);
+        let outbound = Arc::new(RpcOutbound::new(writer_tx));
+        let rpc = Arc::new(RpcClient::with_rpc(Arc::clone(&outbound)));
+        let (fetch_tx, mut fetch_rx) = mpsc::channel(1);
+        let mut active = state();
+        active.set_model_identity(Some("hailo_ollama.edge"), Some("edge-model"));
+
+        Chat::open_model_picker(&rpc, &fetch_tx, &mut active).await;
+        let request =
+            next_rpc_request(&mut writer_rx, "model picker should request a catalog").await;
+        assert_eq!(
+            request["method"],
+            crate::client::method::CONFIG_CATALOG_MODELS
+        );
+        assert_eq!(request["params"]["model_provider"], "hailo_ollama.edge");
+        respond_ok(
+            &outbound,
+            &request,
+            serde_json::json!({"models": ["edge-model"], "live": true}),
+        );
+        let fetched = fetch_rx.recv().await.expect("catalog result should arrive");
+        assert_eq!(fetched.model_provider_ref, "hailo_ollama.edge");
+        assert_eq!(fetched.models, vec!["edge-model"]);
+        assert!(fetched.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn model_picker_catalog_error_remains_distinct_from_empty_catalog() {
+        let mut chat = chat_with_active_input(PaneKind::Chat);
+        {
+            let active = active_state(&mut chat);
+            active.model_picker = ModelPickerOverlay::Loading;
+        }
+
+        chat.apply_model_fetch(ModelFetchResult {
+            session_id: "sess-1".to_string(),
+            model_provider_ref: "hailo_ollama.edge".to_string(),
+            models: Vec::new(),
+            current: None,
+            error: Some("HTTP 401 Unauthorized".to_string()),
+        });
+
+        let active = active_state(&mut chat);
+        assert!(matches!(active.model_picker, ModelPickerOverlay::None));
+        let message = active
+            .info_message
+            .as_ref()
+            .expect("catalog failure should surface an info-bar error");
+        assert!(
+            message.text.contains("401"),
+            "actionable catalog diagnostic was lost: {}",
+            message.text
+        );
+        assert_ne!(message.text, crate::i18n::t("zc-model-catalog-empty"));
     }
 
     #[test]
@@ -11941,6 +14260,52 @@ mod tests {
     fn model_picker_overlay_default_is_closed() {
         let s = state();
         assert!(!s.model_picker.is_open());
+    }
+
+    #[tokio::test]
+    async fn model_picker_catalog_preserves_provider_alias_and_isolates_cache() {
+        let (tx, mut requests) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(rpc.clone()));
+        let mut chat = Chat::new(client.clone(), PaneKind::Chat);
+        chat.phase = ChatPhase::Active(Box::new(state()));
+        let (results_tx, mut results_rx) = mpsc::channel(1);
+
+        for provider in ["custom.first", "custom.second", "anthropic.work"] {
+            let model = format!("{provider}-model");
+            let active = active_state(&mut chat);
+            active.model_provider_ref = Some(provider.to_string());
+            active.model = Some(model.clone());
+            Chat::open_model_picker(&client, &results_tx, active).await;
+            assert!(matches!(active.model_picker, ModelPickerOverlay::Loading));
+
+            let request = next_rpc_request(&mut requests, "catalog request expected").await;
+            assert_eq!(request["method"], "config/catalog-models");
+            assert_eq!(request["params"]["model_provider"], provider);
+            respond_ok(
+                &rpc,
+                &request,
+                serde_json::json!({ "models": [model.clone()] }),
+            );
+            let result = tokio::time::timeout(Duration::from_secs(2), results_rx.recv())
+                .await
+                .expect("catalog response should complete")
+                .expect("catalog result channel should remain open");
+            chat.apply_model_fetch(result);
+
+            let active = active_state(&mut chat);
+            assert_eq!(active.input_bar.model_catalog_provider(), Some(provider));
+            assert_eq!(active.input_bar.model_catalog(), &[model]);
+            assert!(matches!(active.model_picker, ModelPickerOverlay::Model(_)));
+            active.model_picker = ModelPickerOverlay::None;
+            Chat::open_model_picker(&client, &results_tx, active).await;
+            assert!(matches!(active.model_picker, ModelPickerOverlay::Model(_)));
+            assert!(
+                requests.try_recv().is_err(),
+                "same alias should reuse its catalog"
+            );
+            active.model_picker = ModelPickerOverlay::None;
+        }
     }
 
     #[test]
@@ -14353,60 +16718,35 @@ mod tests {
         assert!(matches!(chat.phase, ChatPhase::Error(_)));
     }
 
-    #[test]
-    fn local_code_session_cwd_only_pins_local_acp() {
-        assert_eq!(
-            local_code_session_cwd(PaneKind::Chat, crate::client::Transport::Local),
-            Ok(None)
-        );
-        assert_eq!(
-            local_code_session_cwd(PaneKind::Chat, crate::client::Transport::Wss),
-            Ok(None)
-        );
-        assert_eq!(
-            local_code_session_cwd(PaneKind::Acp, crate::client::Transport::Wss),
-            Ok(None)
-        );
-        let expected = std::env::current_dir()
-            .expect("process cwd")
-            .to_str()
-            .expect("utf-8 cwd")
-            .to_string();
-        assert_eq!(
-            local_code_session_cwd(PaneKind::Acp, crate::client::Transport::Local),
-            Ok(Some(expected))
-        );
+    /// A path that is absolute for the platform these tests run on, so local
+    /// transport assertions stay meaningful on Windows as well as Unix.
+    fn native_absolute_root() -> &'static str {
+        if cfg!(windows) {
+            r"C:\tmp\project"
+        } else {
+            "/tmp/project"
+        }
     }
 
     #[test]
-    fn local_code_cwd_capture_failure_is_an_error_not_an_omission() {
-        // A failed capture must never look like the deliberate `None` used by
-        // Chat and remote Code: omitting cwd here would silently root the
-        // session at the agent workspace, i.e. a different project.
-        let err = resolve_local_code_cwd(Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "no such file or directory",
-        )))
-        .expect_err("cwd capture failure must be reported");
-        let LocalCodeCwdError::Unavailable(msg) = &err else {
-            panic!("expected Unavailable, got {err:?}");
-        };
-        assert!(msg.contains("no such file or directory"), "got {msg}");
-        // And it renders as real localized text, not a `{key}` placeholder.
-        let shown = err.localized();
-        assert!(!shown.starts_with('{'), "unlocalized error text: {shown}");
-        assert!(shown.contains("no such file or directory"), "got {shown}");
+    fn explicit_cwd_accepts_utf8_selection() {
+        let root = native_absolute_root();
+        assert_eq!(
+            explicit_cwd(std::path::Path::new(root), crate::client::Transport::Local),
+            Ok(root.to_string())
+        );
     }
 
     #[cfg(unix)]
     #[test]
-    fn local_code_cwd_rejects_non_utf8_launch_path() {
+    fn explicit_cwd_rejects_non_utf8_selection() {
         use std::os::unix::ffi::OsStrExt;
-        // 0xFF is never valid UTF-8, so this models a launch directory that
-        // cannot be sent as a JSON-RPC `cwd` string.
+        // 0xFF is never valid UTF-8: the selection cannot be sent as a
+        // JSON-RPC `cwd` string, and must be rejected rather than repaired
+        // into a lossy path that names a different directory.
         let raw = std::ffi::OsStr::from_bytes(b"/tmp/proj-\xFF");
-        let err = resolve_local_code_cwd(Ok(std::path::PathBuf::from(raw)))
-            .expect_err("non-UTF-8 cwd must be reported");
+        let err = explicit_cwd(std::path::Path::new(raw), crate::client::Transport::Local)
+            .expect_err("non-UTF-8 selections must be rejected");
         let LocalCodeCwdError::NotUtf8(shown_path) = &err else {
             panic!("expected NotUtf8, got {err:?}");
         };
@@ -14415,11 +16755,932 @@ mod tests {
         assert!(!shown.starts_with('{'), "unlocalized error text: {shown}");
     }
 
-    #[test]
-    fn local_code_cwd_accepts_utf8_launch_path() {
+    /// A local Code pane holding one active session rooted at `cwd`.
+    fn local_code_chat_with_session(rpc: &Arc<RpcOutbound>, session_id: &str, cwd: &str) -> Chat {
+        let client = Arc::new(RpcClient::with_rpc_transport(
+            Arc::clone(rpc),
+            crate::client::Transport::Local,
+        ));
+        let mut chat = Chat::new(client, PaneKind::Acp);
+        let mut state = ChatState::new(
+            session_id.to_string(),
+            "alpha".to_string(),
+            crate::todo_tracker::TodoTrackerSettings::default(),
+        );
+        state.cwd = Some(cwd.to_string());
+        chat.session_order.push(session_id.to_string());
+        chat.phase = ChatPhase::Active(Box::new(state));
+        chat
+    }
+
+    fn headless_term() -> crate::config_manager::Term {
+        ratatui::Terminal::with_options(
+            crate::terminal_backend::WideCellCleanupBackend::new(std::io::stdout()),
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Fixed(Rect::new(0, 0, 100, 30)),
+            },
+        )
+        .expect("test terminal")
+    }
+
+    fn active_info_message(chat: &Chat) -> crate::widgets::InfoMessage {
+        let ChatPhase::Active(state) = &chat.phase else {
+            panic!("expected an active session, got another phase");
+        };
+        state
+            .info_message
+            .clone()
+            .expect("the restored session should carry a notice")
+    }
+
+    fn active_info_notice(chat: &Chat) -> String {
+        active_info_message(chat).text
+    }
+
+    #[tokio::test]
+    async fn begin_change_directory_stashes_the_session_and_opens_a_picker() {
+        let (tx, _rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let mut chat = local_code_chat_with_session(&rpc, "sess-old", "/old/project");
+
+        chat.begin_change_directory();
+
+        let ChatPhase::PickChangeDirectory { agent_alias, .. } = &chat.phase else {
+            panic!("expected the change-directory picker");
+        };
+        assert_eq!(agent_alias, "alpha");
+        // The live session is parked, never closed: the picker can be
+        // cancelled without losing the running conversation.
+        assert_eq!(chat.background.len(), 1);
+        assert_eq!(chat.last_focused_sid.as_deref(), Some("sess-old"));
+    }
+
+    #[tokio::test]
+    async fn change_directory_cancel_restores_existing_session() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let mut chat = local_code_chat_with_session(&rpc, "sess-old", "/old/project");
+        chat.begin_change_directory();
+
+        let mut term = headless_term();
+        chat.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &mut term)
+            .await;
+
+        assert_eq!(chat.current_session_id(), Some("sess-old"));
+        assert_eq!(chat.current_cwd(), Some("/old/project"));
+        assert!(
+            rx.try_recv().is_err(),
+            "a cancelled picker must not create or close any session"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn change_directory_invalid_path_restores_existing_session() {
+        use std::os::unix::ffi::OsStrExt;
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let mut chat = local_code_chat_with_session(&rpc, "sess-old", "/old/project");
+        chat.begin_change_directory();
+
+        let raw = std::ffi::OsStr::from_bytes(b"/tmp/proj-\xFF");
+        chat.apply_change_directory_selection("alpha", std::path::Path::new(raw))
+            .await;
+
+        assert_eq!(chat.current_session_id(), Some("sess-old"));
+        assert_eq!(chat.current_cwd(), Some("/old/project"));
+        let message = active_info_message(&chat);
+        // The rejected path is named: "not valid UTF-8" with no path leaves
+        // the user guessing which selection failed.
+        let LocalCodeCwdError::NotUtf8(shown_path) =
+            explicit_cwd(std::path::Path::new(raw), crate::client::Transport::Local)
+                .expect_err("the fixture path is not UTF-8")
+        else {
+            panic!("expected NotUtf8 for a non-UTF-8 fixture path");
+        };
         assert_eq!(
-            resolve_local_code_cwd(Ok(std::path::PathBuf::from("/tmp/project"))),
-            Ok("/tmp/project".to_string())
+            message.text,
+            crate::i18n::t_args(
+                "zc-chat-code-cwd-not-utf8",
+                &[("path", shown_path.as_str())]
+            )
+        );
+        assert_eq!(
+            message.kind,
+            crate::widgets::InfoKind::Error,
+            "a refused directory change is a failure, not a neutral note"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "a rejected path must not reach session/new"
+        );
+    }
+
+    #[tokio::test]
+    async fn change_directory_failure_restores_existing_session() {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let mut chat = local_code_chat_with_session(&rpc, "sess-old", "/old/project");
+        chat.begin_change_directory();
+        let selected_root = native_absolute_root();
+
+        let task = tokio::spawn(async move {
+            chat.apply_change_directory_selection("alpha", std::path::Path::new(selected_root))
+                .await;
+            chat
+        });
+
+        let request =
+            next_rpc_request(&mut rx, "confirming a directory should start a session").await;
+        assert_eq!(request["method"], method::SESSION_NEW);
+        assert_eq!(request["params"]["cwd"], selected_root);
+        respond_err(&rpc, &request, -32000, "workspace unavailable");
+
+        let chat = task.await.unwrap();
+        assert_eq!(chat.current_session_id(), Some("sess-old"));
+        assert_eq!(chat.current_cwd(), Some("/old/project"));
+        let message = active_info_message(&chat);
+        let notice = message.text.clone();
+        assert_eq!(
+            message.kind,
+            crate::widgets::InfoKind::Error,
+            "a failed directory change is a failure, not a neutral note"
+        );
+        let template =
+            crate::i18n::t_args("zc-chat-change-directory-error", &[("error", "SENTINEL")]);
+        let (prefix, suffix) = template
+            .split_once("SENTINEL")
+            .expect("the change-directory error carries an { $error } placeholder");
+        assert!(
+            notice.starts_with(prefix) && notice.ends_with(suffix),
+            "failure must be reported as a change-directory error, got {notice}"
+        );
+        assert!(
+            notice.contains("workspace unavailable"),
+            "the notice must carry the underlying failure, got {notice}"
+        );
+    }
+
+    #[tokio::test]
+    async fn change_directory_success_keeps_the_old_session_at_its_root() {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let mut chat = local_code_chat_with_session(&rpc, "sess-old", "/old/project");
+        chat.begin_change_directory();
+        let selected_root = native_absolute_root();
+
+        let task = tokio::spawn(async move {
+            chat.apply_change_directory_selection("alpha", std::path::Path::new(selected_root))
+                .await;
+            chat
+        });
+
+        let request =
+            next_rpc_request(&mut rx, "confirming a directory should start a session").await;
+        assert_eq!(request["method"], method::SESSION_NEW);
+        assert_eq!(request["params"]["cwd"], selected_root);
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({"session_id": "sess-new", "workspace_dir": selected_root}),
+        );
+        let request = next_rpc_request(&mut rx, "a new session refreshes model identity").await;
+        assert_eq!(request["method"], method::CONFIG_LIST);
+        respond_ok(&rpc, &request, serde_json::json!([]));
+
+        let chat = task.await.unwrap();
+        assert_eq!(chat.current_session_id(), Some("sess-new"));
+        assert_eq!(chat.current_cwd(), Some(selected_root));
+        // The prior session keeps its own root; a new root never re-points a
+        // session that is already running.
+        assert_eq!(
+            chat.state_for_session("sess-old")
+                .and_then(|state| state.cwd.as_deref()),
+            Some("/old/project")
+        );
+    }
+
+    #[tokio::test]
+    async fn change_directory_at_the_session_cap_reports_the_cap_and_keeps_the_session() {
+        // A confirmed directory starts an *additional* session, so the picker
+        // must refuse at the cap exactly like the sidebar "+": opening it
+        // would stash the live session behind a picker that cannot add the
+        // ninth tracked session it would need to honor the selection.
+        let (tx, _rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let mut chat = local_code_chat_with_session(&rpc, "sess-old", "/old/project");
+        for idx in 2..=MAX_TRACKED_SESSIONS_PER_PANE {
+            let session_id = format!("sess-{idx}");
+            chat.session_order.push(session_id.clone());
+            chat.background.push(state_for(&session_id, "alpha"));
+        }
+        assert_eq!(chat.tracked_session_count(), MAX_TRACKED_SESSIONS_PER_PANE);
+
+        chat.begin_change_directory();
+
+        assert_eq!(chat.current_session_id(), Some("sess-old"));
+        assert_eq!(
+            active_info_notice(&chat),
+            crate::i18n::t_args(
+                "zc-chat-session-cap",
+                &[("max", &MAX_TRACKED_SESSIONS_PER_PANE.to_string())]
+            )
+        );
+        assert_eq!(
+            chat.background.len(),
+            MAX_TRACKED_SESSIONS_PER_PANE - 1,
+            "a refused picker must not stash the focused session"
+        );
+    }
+
+    #[tokio::test]
+    async fn change_directory_demotes_a_retained_resume_identity() {
+        // A failed reconnect leaves `resume_focused` set. Without demoting it
+        // the next `session/new` would carry that stable id (and its cwd),
+        // silently swallowing the directory the user just picked.
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let mut chat = local_code_chat_with_session(&rpc, "sess-old", "/old/project");
+        chat.session_order.push("sess-retained".to_string());
+        chat.resume_focused = Some(resume_entry("sess-retained", "alpha", true));
+        let selected_root = native_absolute_root();
+
+        chat.begin_change_directory();
+        assert!(
+            chat.resume_focused.is_some(),
+            "opening the picker must not give up the retained identity: the \
+             user has not confirmed a directory yet"
+        );
+        assert!(
+            chat.resume_backgrounds.is_empty(),
+            "nothing is demoted before a directory is confirmed"
+        );
+
+        let task = tokio::spawn(async move {
+            chat.apply_change_directory_selection("alpha", std::path::Path::new(selected_root))
+                .await;
+            chat
+        });
+
+        let request =
+            next_rpc_request(&mut rx, "confirming a directory should start a session").await;
+        assert_eq!(request["method"], method::SESSION_NEW);
+        assert_eq!(request["params"]["cwd"], selected_root);
+        assert!(
+            request["params"]["session_id"].is_null(),
+            "an explicit directory choice must not resume a retained session"
+        );
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({"session_id": "sess-new", "workspace_dir": selected_root}),
+        );
+        let request = next_rpc_request(&mut rx, "a new session refreshes model identity").await;
+        assert_eq!(request["method"], method::CONFIG_LIST);
+        respond_ok(&rpc, &request, serde_json::json!([]));
+
+        // The demoted identity is retried as a background resume, carrying its
+        // own stable id — proof it was preserved rather than consumed by the
+        // directory change.
+        let request = next_rpc_request(&mut rx, "the demoted entry is re-attached").await;
+        assert_eq!(request["method"], method::SESSION_NEW);
+        assert_eq!(request["params"]["session_id"], "sess-retained");
+        respond_err(&rpc, &request, -32000, "retained session gone");
+
+        let chat = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the directory change should finish")
+            .unwrap();
+        assert_eq!(chat.current_session_id(), Some("sess-new"));
+        assert_eq!(chat.current_cwd(), Some(selected_root));
+        assert!(
+            chat.resume_focused.is_none(),
+            "a confirmed directory releases the focused-resume slot"
+        );
+    }
+
+    #[tokio::test]
+    async fn change_directory_cancel_preserves_a_retained_resume_identity() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        // Cancelling the picker is not a request for a different session, so
+        // the pending reconnect must still own the focused slot and be able to
+        // reattach.
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let mut chat = local_code_chat_with_session(&rpc, "sess-old", "/old/project");
+        chat.session_order.push("sess-retained".to_string());
+        chat.resume_focused = Some(resume_entry("sess-retained", "alpha", true));
+
+        chat.begin_change_directory();
+        let mut term = headless_term();
+        chat.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &mut term)
+            .await;
+
+        assert_eq!(
+            chat.resume_focused
+                .as_ref()
+                .map(|entry| entry.session_id.as_str()),
+            Some("sess-retained"),
+            "a cancelled picker must leave resume ownership untouched"
+        );
+        assert!(chat.resume_backgrounds.is_empty());
+        assert!(
+            rx.try_recv().is_err(),
+            "a cancelled picker must not talk to the daemon"
+        );
+    }
+
+    #[tokio::test]
+    async fn change_directory_invalid_path_preserves_a_retained_resume_identity() {
+        // A rejected selection sends no cwd, so the retained identity is still
+        // the right target for the pending reconnect.
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let mut chat = local_code_chat_with_session(&rpc, "sess-old", "/old/project");
+        chat.session_order.push("sess-retained".to_string());
+        chat.resume_focused = Some(resume_entry("sess-retained", "alpha", true));
+
+        chat.begin_change_directory();
+        chat.apply_change_directory_selection("alpha", std::path::Path::new("relative/project"))
+            .await;
+
+        assert_eq!(
+            chat.resume_focused
+                .as_ref()
+                .map(|entry| entry.session_id.as_str()),
+            Some("sess-retained"),
+            "a rejected path must leave resume ownership untouched"
+        );
+        assert!(chat.resume_backgrounds.is_empty());
+        assert_eq!(chat.current_session_id(), Some("sess-old"));
+        assert!(
+            rx.try_recv().is_err(),
+            "a rejected path must not reach session/new"
+        );
+    }
+
+    #[tokio::test]
+    async fn change_directory_on_the_chat_pane_explains_why_it_is_unavailable() {
+        // Chat follows the selected agent's workspace, so there is no root to
+        // re-select — but a silent no-op looks like a broken command.
+        let mut chat = active_chat();
+
+        chat.begin_change_directory();
+
+        assert!(matches!(chat.phase, ChatPhase::Active(_)));
+        assert!(chat.background.is_empty());
+        let message = active_info_message(&chat);
+        assert_eq!(
+            message.text,
+            crate::i18n::t("zc-chat-change-directory-chat-only")
+        );
+        assert_eq!(
+            message.kind,
+            crate::widgets::InfoKind::Note,
+            "explaining where Chat is rooted is a note, not a failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn restoring_from_the_picker_without_a_notice_returns_the_stashed_session() {
+        // Exercises `restore_change_directory_session` directly — the helper
+        // the defensive `SessionStartOutcome::Cancelled` arm calls — rather
+        // than the `apply_change_directory_selection` path, which passes no
+        // cancellation token and so cannot produce `Cancelled` today. A
+        // notice-less restore must still leave the picker phase: otherwise the
+        // pane strands in `PickChangeDirectory` with the live session parked
+        // in `background`. Escape cancellation is covered separately by
+        // `change_directory_cancel_restores_existing_session`.
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let mut chat = local_code_chat_with_session(&rpc, "sess-old", "/old/project");
+        chat.begin_change_directory();
+        assert!(matches!(chat.phase, ChatPhase::PickChangeDirectory { .. }));
+
+        chat.restore_change_directory_session(None, None).await;
+
+        assert_eq!(chat.current_session_id(), Some("sess-old"));
+        assert_eq!(chat.current_cwd(), Some("/old/project"));
+        let ChatPhase::Active(state) = &chat.phase else {
+            panic!("expected the stashed session to be restored");
+        };
+        assert!(
+            state.info_message.is_none(),
+            "a restore with no notice has nothing to report"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "restoring a stashed session must not talk to the daemon"
+        );
+    }
+
+    #[tokio::test]
+    async fn change_directory_failure_keeps_extra_notice_information() {
+        // `after_session_start` may add information the directory-change
+        // report does not carry (a dropped-resume count). Replacing the whole
+        // notice would throw that away.
+        let (tx, _rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let mut chat = local_code_chat_with_session(&rpc, "sess-old", "/old/project");
+        chat.begin_change_directory();
+        chat.restore_last_focused().await;
+        let start_error = crate::i18n::t_args("zc-chat-error-create-session", &[("error", "boom")]);
+        let dropped = crate::i18n::t_args("zc-chat-resume-dropped", &[("count", "1")]);
+        if let ChatPhase::Active(ref mut state) = chat.phase {
+            state.set_info_notice(format!("{start_error} {dropped}"));
+        }
+
+        let notice = crate::i18n::t_args("zc-chat-change-directory-error", &[("error", "boom")]);
+        chat.restore_change_directory_session(Some(notice.clone()), Some(start_error.clone()))
+            .await;
+
+        let shown = active_info_notice(&chat);
+        assert!(
+            shown.starts_with(&notice),
+            "the directory-change report leads, got {shown}"
+        );
+        assert!(
+            shown.contains(&dropped),
+            "extra session-start information must survive, got {shown}"
+        );
+        assert!(
+            !shown.contains(&start_error),
+            "the superseded generic start error must not be repeated, got {shown}"
+        );
+    }
+
+    #[test]
+    fn merge_notice_keeps_only_the_extra_information_after_a_matching_superseded_prefix() {
+        // The restore left "<generic start error> <dropped resume count>".
+        // The report re-states the failure in directory-change terms, so only
+        // the dropped-resume tail is new information worth carrying over.
+        let start_error = crate::i18n::t_args("zc-chat-error-create-session", &[("error", "boom")]);
+        let dropped = crate::i18n::t_args("zc-chat-resume-dropped", &[("count", "1")]);
+        let notice = crate::i18n::t_args("zc-chat-change-directory-error", &[("error", "boom")]);
+
+        let merged = merge_change_directory_notice(
+            notice.clone(),
+            Some(&format!("{start_error} {dropped}")),
+            Some(&start_error),
+        );
+
+        assert_eq!(merged, format!("{notice} {dropped}"));
+        assert!(
+            !merged.contains(&start_error),
+            "the superseded generic start error must not be repeated, got {merged}"
+        );
+    }
+
+    #[test]
+    fn merge_notice_drops_existing_text_when_there_is_no_superseded_notice() {
+        // Without a superseded notice nothing ties the existing text to this
+        // restore: it is an unrelated or expired message, not information the
+        // report is missing, so resurrecting it would mislead.
+        let stale = crate::i18n::t("zc-chat-change-directory-chat-only");
+        let notice = crate::i18n::t_args("zc-chat-change-directory-error", &[("error", "boom")]);
+
+        let merged = merge_change_directory_notice(notice.clone(), Some(&stale), None);
+
+        assert_eq!(merged, notice);
+        assert!(
+            !merged.contains(&stale),
+            "an unattributed prior notice must not be resurrected, got {merged}"
+        );
+    }
+
+    #[test]
+    fn merge_notice_drops_existing_text_when_the_superseded_prefix_does_not_match() {
+        // The existing notice does not start with the notice this report
+        // supersedes, so it was left by something else entirely — keeping any
+        // of it would staple an unrelated message onto the report.
+        let start_error = crate::i18n::t_args("zc-chat-error-create-session", &[("error", "boom")]);
+        let unrelated = crate::i18n::t_args(
+            "zc-chat-code-cwd-not-utf8",
+            &[("path", "/tmp/proj-\u{FFFD}")],
+        );
+        let notice = crate::i18n::t_args("zc-chat-change-directory-error", &[("error", "boom")]);
+
+        let merged =
+            merge_change_directory_notice(notice.clone(), Some(&unrelated), Some(&start_error));
+
+        assert_eq!(merged, notice);
+        assert!(
+            !merged.contains(&unrelated),
+            "a mismatched prior notice must not survive, got {merged}"
+        );
+    }
+
+    #[test]
+    fn explicit_cwd_rejects_a_relative_selection() {
+        // A relative root would be resolved against the *daemon's* process
+        // directory, not the directory the user picked — on either transport.
+        for transport in [
+            crate::client::Transport::Local,
+            crate::client::Transport::Wss,
+        ] {
+            let err = explicit_cwd(std::path::Path::new("relative/project"), transport)
+                .expect_err("relative roots must be rejected");
+            let LocalCodeCwdError::NotAbsolute(shown_path) = &err else {
+                panic!("expected NotAbsolute, got {err:?}");
+            };
+            assert_eq!(shown_path, "relative/project");
+            let shown = err.localized();
+            assert!(!shown.starts_with('{'), "unlocalized error text: {shown}");
+        }
+    }
+
+    #[test]
+    fn explicit_cwd_accepts_windows_roots_from_a_remote_daemon() {
+        // A Unix client may browse a Windows daemon: drive-letter and UNC
+        // roots are absolute there and must not be rejected by Unix rules.
+        assert_eq!(
+            explicit_cwd(
+                std::path::Path::new(r"C:\Users\dev\project"),
+                crate::client::Transport::Wss
+            ),
+            Ok(r"C:\Users\dev\project".to_string())
+        );
+        assert_eq!(
+            explicit_cwd(
+                std::path::Path::new(r"\\server\share\project"),
+                crate::client::Transport::Wss
+            ),
+            Ok(r"\\server\share\project".to_string())
+        );
+    }
+
+    #[test]
+    fn explicit_cwd_accepts_posix_roots_from_a_remote_daemon() {
+        // The mirror case: a Windows client browsing a Unix daemon confirms a
+        // slash-rooted wire path. `Path::is_absolute` says "no" there, but the
+        // daemon that will run the session says "yes", and it is the authority.
+        assert_eq!(
+            explicit_cwd(
+                std::path::Path::new("/srv/project"),
+                crate::client::Transport::Wss
+            ),
+            Ok("/srv/project".to_string())
+        );
+        assert_eq!(
+            explicit_cwd(std::path::Path::new("/"), crate::client::Transport::Wss),
+            Ok("/".to_string())
+        );
+    }
+
+    #[test]
+    fn remote_absolute_roots_do_not_depend_on_the_client_platform() {
+        // The daemon's platform decides, and this build cannot know it, so the
+        // remote rule consults no `cfg` and no `Path::is_absolute`. This test
+        // therefore asserts the same answers on every client platform.
+        for root in [
+            "/",
+            "/srv/project",
+            r"C:\project",
+            "C:/project",
+            r"\\host\share",
+            "//host/share",
+        ] {
+            assert!(
+                is_remote_absolute_session_root(root),
+                "{root} is a root on some daemon platform"
+            );
+        }
+        for root in ["", "relative/project", "C:", "C:project", r"\project"] {
+            assert!(
+                !is_remote_absolute_session_root(root),
+                "{root} is absolute on no platform"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_cwd_rejects_foreign_roots_for_a_local_unix_daemon() {
+        // Local transport runs the session on *this* machine, so a Windows
+        // form is not a root here — it is a relative directory name that would
+        // resolve against the daemon's process directory.
+        for root in [r"C:\Users\dev\project", r"\\server\share\project"] {
+            let err = explicit_cwd(std::path::Path::new(root), crate::client::Transport::Local)
+                .expect_err("a foreign root must not be accepted locally");
+            assert!(
+                matches!(&err, LocalCodeCwdError::NotAbsolute(shown) if shown == root),
+                "expected NotAbsolute({root}), got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn change_directory_start_dir_never_leaks_a_local_path_to_a_remote_daemon() {
+        // The picker browses the daemon's filesystem over WSS; a local
+        // process directory is meaningless (and leaky) there.
+        assert_eq!(
+            change_directory_start_dir(
+                Some("/remote/project"),
+                crate::client::Transport::Wss,
+                || Some(std::path::PathBuf::from("/local/launch")),
+            ),
+            std::path::PathBuf::from("/remote/project")
+        );
+        assert_eq!(
+            change_directory_start_dir(None, crate::client::Transport::Wss, || Some(
+                std::path::PathBuf::from("/local/launch")
+            )),
+            std::path::PathBuf::from("/"),
+            "a rootless remote session starts at the daemon root"
+        );
+        assert_eq!(
+            change_directory_start_dir(Some("  "), crate::client::Transport::Wss, || None),
+            std::path::PathBuf::from("/")
+        );
+    }
+
+    #[test]
+    fn change_directory_start_dir_stays_absolute_locally() {
+        let launch = std::path::PathBuf::from(native_absolute_root());
+        assert_eq!(
+            change_directory_start_dir(None, crate::client::Transport::Local, || Some(
+                launch.clone()
+            )),
+            launch
+        );
+        // Never `.`: a relative root is rejected at confirmation, so the
+        // picker would open on a directory the user could not select. The
+        // fallback is the local platform's root, not a hardcoded POSIX `/`
+        // that names nothing on Windows.
+        let fallback = change_directory_start_dir(None, crate::client::Transport::Local, || None);
+        assert!(
+            fallback.is_absolute(),
+            "the local fallback must be absolute, got {}",
+            fallback.display()
+        );
+        assert_eq!(
+            fallback,
+            std::path::PathBuf::from(if cfg!(windows) { r"C:\" } else { "/" })
+        );
+        // A launch directory that is not a root on *this* platform is
+        // filtered by the same transport-aware rule confirmation uses.
+        assert_eq!(
+            change_directory_start_dir(None, crate::client::Transport::Local, || Some(
+                std::path::PathBuf::from("relative/launch")
+            )),
+            fallback
+        );
+    }
+
+    #[test]
+    fn change_directory_start_dir_preserves_nonblank_saved_root_whitespace() {
+        let saved_root = if cfg!(windows) {
+            r"C:\\project "
+        } else {
+            "/tmp/project "
+        };
+        assert_eq!(
+            change_directory_start_dir(
+                Some(saved_root),
+                crate::client::Transport::Local,
+                || panic!("a saved root should win without probing the process cwd"),
+            ),
+            std::path::PathBuf::from(saved_root)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn change_directory_start_dir_rejects_a_foreign_root_locally() {
+        // A Windows form is not a local root on Unix; opening the picker
+        // there would strand it on a directory confirmation rejects.
+        assert_eq!(
+            change_directory_start_dir(None, crate::client::Transport::Local, || Some(
+                std::path::PathBuf::from(r"C:\Users\dev")
+            )),
+            std::path::PathBuf::from("/")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn change_directory_over_wss_browses_the_daemon_root() {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc_transport(
+            Arc::clone(&rpc),
+            crate::client::Transport::Wss,
+        ));
+        let mut chat = Chat::new(client, PaneKind::Acp);
+        let state = ChatState::new(
+            "sess-remote".to_string(),
+            "alpha".to_string(),
+            crate::todo_tracker::TodoTrackerSettings::default(),
+        );
+        chat.session_order.push("sess-remote".to_string());
+        chat.phase = ChatPhase::Active(Box::new(state));
+
+        let task = tokio::task::spawn_blocking(move || {
+            chat.begin_change_directory();
+            chat
+        });
+
+        let request = next_rpc_request(&mut rx, "a remote picker lists the daemon root").await;
+        assert_eq!(request["method"], method::FS_LIST_DIR);
+        assert_eq!(
+            request["params"]["path"], "/",
+            "a rootless remote session must not browse the local process directory"
+        );
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({"cwd": "/", "entries": []}),
+        );
+
+        let chat = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the remote picker should open")
+            .unwrap();
+        assert!(matches!(chat.phase, ChatPhase::PickChangeDirectory { .. }));
+    }
+
+    #[tokio::test]
+    async fn startup_cwd_picker_rejects_a_relative_directory() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        // The startup picker must not fall back to an omitted cwd on a path
+        // it cannot send: the session would silently root at the agent
+        // workspace instead of the picked directory.
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc_transport(
+            Arc::clone(&rpc),
+            crate::client::Transport::Wss,
+        ));
+        let mut chat = Chat::new(client, PaneKind::Acp);
+        chat.phase = ChatPhase::PickCwd {
+            agent_alias: "alpha".to_string(),
+            explorer: FileExplorerState::new_dir_picker(std::path::PathBuf::from("relative/dir")),
+        };
+        // A retained failed-reconnect identity is only demoted when a valid
+        // root will actually be sent; a rejection must leave ownership alone.
+        chat.session_order.push("sess-retained".to_string());
+        chat.resume_focused = Some(resume_entry("sess-retained", "alpha", true));
+
+        let mut term = headless_term();
+        chat.handle_key(
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
+            &mut term,
+        )
+        .await;
+
+        let ChatPhase::Error(message) = &chat.phase else {
+            panic!("expected the create-session error, got another phase");
+        };
+        assert!(
+            message
+                .contains(&LocalCodeCwdError::NotAbsolute("relative/dir".to_string()).localized()),
+            "the rejection must be reported, got {message}"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "a rejected path must not reach session/new"
+        );
+        assert_eq!(
+            chat.resume_focused
+                .as_ref()
+                .map(|entry| entry.session_id.as_str()),
+            Some("sess-retained"),
+            "a path that never reaches session/new must not move resume ownership"
+        );
+        assert!(
+            chat.resume_backgrounds.is_empty(),
+            "a rejected path must not demote the retained identity"
+        );
+    }
+
+    /// Helper for the startup CWD picker tests: a WSS Code pane parked in
+    /// `PickCwd`. The explorer lists locally on purpose — `ConfirmDir` returns
+    /// its `cwd` either way, and a local listing keeps `fs/list_dir` chatter
+    /// out of the RPC channel the assertions read.
+    fn wss_code_chat_in_cwd_picker(rpc: &Arc<RpcOutbound>, start_dir: &str) -> Chat {
+        let client = Arc::new(RpcClient::with_rpc_transport(
+            Arc::clone(rpc),
+            crate::client::Transport::Wss,
+        ));
+        let mut chat = Chat::new(client, PaneKind::Acp);
+        chat.phase = ChatPhase::PickCwd {
+            agent_alias: "alpha".to_string(),
+            explorer: FileExplorerState::new_dir_picker(std::path::PathBuf::from(start_dir)),
+        };
+        chat
+    }
+
+    #[tokio::test]
+    async fn startup_cwd_picker_sends_the_selected_directory() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        // Happy path for the WSS Code picker: a confirmed absolute directory is
+        // the explicit root for a *fresh* session, so `session/new` carries it
+        // and no session id.
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let mut chat = wss_code_chat_in_cwd_picker(&rpc, "/selected/project");
+
+        let task = tokio::spawn(async move {
+            let mut term = headless_term();
+            chat.handle_key(
+                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
+                &mut term,
+            )
+            .await;
+            chat
+        });
+
+        let request = next_rpc_request(&mut rx, "confirming a directory starts a session").await;
+        assert_eq!(request["method"], method::SESSION_NEW);
+        assert_eq!(request["params"]["agent_alias"], "alpha");
+        assert_eq!(request["params"]["cwd"], "/selected/project");
+        assert!(
+            request["params"]["session_id"].is_null(),
+            "a picked directory starts a fresh session"
+        );
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({"session_id": "sess-new", "workspace_dir": "/selected/project"}),
+        );
+        let request = next_rpc_request(&mut rx, "a new session refreshes model identity").await;
+        assert_eq!(request["method"], method::CONFIG_LIST);
+        respond_ok(&rpc, &request, serde_json::json!([]));
+
+        let chat = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the picked directory should start a session")
+            .unwrap();
+        assert_eq!(chat.current_session_id(), Some("sess-new"));
+        assert_eq!(chat.current_cwd(), Some("/selected/project"));
+    }
+
+    #[tokio::test]
+    async fn startup_cwd_picker_demotes_a_retained_resume_identity() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        // A failed reconnect leaves `resume_focused` set, and the WSS Code
+        // restart path re-opens this picker without clearing it. `start_session`
+        // prefers a resume id over `cwd_override`, so without demoting the
+        // retained entry the confirmed directory would be dropped and the old
+        // session silently resumed at *its* root — the same leak
+        // `begin_change_directory`/`add_agent_session` already guard against.
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let mut chat = wss_code_chat_in_cwd_picker(&rpc, "/selected/project");
+        chat.session_order.push("sess-retained".to_string());
+        chat.resume_focused = Some(resume_entry("sess-retained", "alpha", true));
+
+        let task = tokio::spawn(async move {
+            let mut term = headless_term();
+            chat.handle_key(
+                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
+                &mut term,
+            )
+            .await;
+            chat
+        });
+
+        let request = next_rpc_request(&mut rx, "confirming a directory starts a session").await;
+        assert_eq!(request["method"], method::SESSION_NEW);
+        assert_eq!(
+            request["params"]["cwd"], "/selected/project",
+            "the explicit root must survive the retained resume identity"
+        );
+        assert!(
+            request["params"]["session_id"].is_null(),
+            "an explicit directory choice must not resume a retained session"
+        );
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({"session_id": "sess-new", "workspace_dir": "/selected/project"}),
+        );
+        let request = next_rpc_request(&mut rx, "a new session refreshes model identity").await;
+        assert_eq!(request["method"], method::CONFIG_LIST);
+        respond_ok(&rpc, &request, serde_json::json!([]));
+
+        // The demoted identity is retried separately, carrying its own stable
+        // id — proof it was preserved rather than consumed by the pick.
+        let request = next_rpc_request(&mut rx, "the demoted entry is re-attached").await;
+        assert_eq!(request["method"], method::SESSION_NEW);
+        assert_eq!(request["params"]["session_id"], "sess-retained");
+        respond_err(&rpc, &request, -32000, "retained session gone");
+
+        let chat = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the picked directory should start a session")
+            .unwrap();
+        assert_eq!(chat.current_session_id(), Some("sess-new"));
+        assert_eq!(chat.current_cwd(), Some("/selected/project"));
+        assert!(
+            chat.resume_focused.is_none(),
+            "the retained identity must no longer own the focused resume slot"
+        );
+        assert!(
+            chat.resume_backgrounds
+                .iter()
+                .any(|entry| entry.session_id == "sess-retained" && !entry.was_focused),
+            "a failed background retry keeps the retained identity queued"
         );
     }
 
@@ -14463,16 +17724,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fresh_local_acp_session_sends_process_cwd() {
+    async fn fresh_local_acp_session_omits_cwd_so_agent_workspace_wins() {
         let (tx, mut rx) = mpsc::channel::<String>(16);
         let rpc = Arc::new(RpcOutbound::new(tx));
         let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
         let mut chat = Chat::new(client, PaneKind::Acp);
-        let expected_cwd = std::env::current_dir()
-            .expect("process cwd")
-            .to_str()
-            .expect("utf-8 cwd")
-            .to_string();
 
         let init = tokio::spawn(async move {
             let _ = chat.init().await;
@@ -14512,11 +17768,121 @@ mod tests {
         assert_eq!(params["agent_alias"], "alpha");
         assert!(params["session_id"].is_null());
         assert_eq!(params["chat_mode"], "acp");
-        // Code sessions pin the directory zerocode was launched from so file
-        // and shell tools operate on that project, not the agent workspace.
-        assert_eq!(params["cwd"], expected_cwd);
+        // Regression guard: a fresh Code session must not send the TUI's
+        // launch directory. Omitting cwd lets the daemon root the session at
+        // the selected agent's configured workspace.
+        assert!(params["cwd"].is_null());
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({
+                "session_id": "sess-fresh",
+                "workspace_dir": "/agents/alpha/workspace"
+            }),
+        );
 
-        start.abort();
+        let request = next_rpc_request(&mut rx, "new session refreshes identity").await;
+        assert_eq!(request["method"], method::CONFIG_LIST);
+        respond_ok(&rpc, &request, serde_json::json!([]));
+
+        let chat = tokio::time::timeout(Duration::from_secs(2), start)
+            .await
+            .expect("start should finish")
+            .unwrap();
+        // The daemon-selected workspace is the session root of record.
+        assert_eq!(chat.current_cwd(), Some("/agents/alpha/workspace"));
+    }
+
+    #[tokio::test]
+    async fn fresh_local_acp_session_sends_explicit_cwd() {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc_transport(
+            Arc::clone(&rpc),
+            crate::client::Transport::Local,
+        ));
+        let mut chat = Chat::new(client, PaneKind::Acp);
+        let task = tokio::spawn(async move {
+            chat.start_session("alpha", Some("/selected/project")).await;
+            chat
+        });
+
+        let request = next_rpc_request(&mut rx, "explicit local Code session should start").await;
+        assert_eq!(request["method"], method::SESSION_NEW);
+        assert!(request["params"]["session_id"].is_null());
+        // An explicit selection is sent verbatim: the daemon must root the
+        // session exactly where the picker confirmed.
+        assert_eq!(request["params"]["cwd"], "/selected/project");
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({
+                "session_id": "sess-selected",
+                "workspace_dir": "/selected/project"
+            }),
+        );
+
+        let request = next_rpc_request(&mut rx, "new session refreshes identity").await;
+        assert_eq!(request["method"], method::CONFIG_LIST);
+        respond_ok(&rpc, &request, serde_json::json!([]));
+
+        let chat = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("start should finish")
+            .unwrap();
+        assert_eq!(chat.current_cwd(), Some("/selected/project"));
+    }
+
+    #[tokio::test]
+    async fn resumed_local_acp_session_keeps_saved_cwd() {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc_transport(
+            Arc::clone(&rpc),
+            crate::client::Transport::Local,
+        ));
+        let mut chat = Chat::new(client, PaneKind::Acp);
+        chat.set_resume_sessions(vec![resume_entry("sess-saved", "alpha", true)]);
+        let task = tokio::spawn(async move {
+            chat.start_session("alpha", None).await;
+            chat
+        });
+
+        let request = next_rpc_request(&mut rx, "resume should reattach the saved session").await;
+        assert_eq!(request["method"], method::SESSION_NEW);
+        assert_eq!(request["params"]["session_id"], "sess-saved");
+        // A resume must send no replacement cwd: the daemon keeps the root the
+        // retained session was created with, whatever this process's directory
+        // or the agent's workspace is now.
+        assert!(request["params"]["cwd"].is_null());
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({
+                "session_id": "sess-saved",
+                "workspace_dir": "/saved/project"
+            }),
+        );
+
+        let request = next_rpc_request(&mut rx, "resume refreshes identity").await;
+        assert_eq!(request["method"], method::CONFIG_LIST);
+        respond_ok(&rpc, &request, serde_json::json!([]));
+
+        let request = next_rpc_request(&mut rx, "resume replays the retained transcript").await;
+        assert_eq!(request["method"], method::SESSION_MESSAGES);
+        assert_eq!(request["params"]["session_id"], "sess-saved");
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({ "messages": [], "total": 0 }),
+        );
+
+        let chat = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("resume should finish")
+            .unwrap();
+        assert_eq!(chat.current_session_id(), Some("sess-saved"));
+        assert_eq!(chat.current_cwd(), Some("/saved/project"));
     }
 
     #[tokio::test]
@@ -14565,15 +17931,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restart_local_acp_session_sends_process_cwd() {
+    async fn restart_local_acp_session_omits_cwd_so_agent_workspace_wins() {
         let (tx, mut rx) = mpsc::channel::<String>(16);
         let rpc = Arc::new(RpcOutbound::new(tx));
         let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
-        let expected_cwd = std::env::current_dir()
-            .expect("process cwd")
-            .to_str()
-            .expect("utf-8 cwd")
-            .to_string();
         let mut state = ChatState::new(
             "sess-old".to_string(),
             "alpha".to_string(),
@@ -14581,7 +17942,8 @@ mod tests {
         );
 
         let restart = tokio::spawn(async move {
-            Chat::restart_session_for_state(&client, PaneKind::Acp, &mut state).await
+            let phase = Chat::restart_session_for_state(&client, PaneKind::Acp, &mut state).await;
+            (state, phase)
         });
 
         let request = next_rpc_request(&mut rx, "restart should start a fresh ACP session").await;
@@ -14590,11 +17952,16 @@ mod tests {
         assert_eq!(params["agent_alias"], "alpha");
         assert!(params["session_id"].is_null());
         assert_eq!(params["chat_mode"], "acp");
-        assert_eq!(params["cwd"], expected_cwd);
+        // Regression guard: a restart mints a *fresh* session, so it must not
+        // send the TUI's launch directory either.
+        assert!(params["cwd"].is_null());
         respond_ok(
             &rpc,
             &request,
-            serde_json::json!({ "session_id": "sess-fresh", "workspace_dir": expected_cwd }),
+            serde_json::json!({
+                "session_id": "sess-fresh",
+                "workspace_dir": "/agents/alpha/workspace"
+            }),
         );
 
         let request = next_rpc_request(&mut rx, "restart should close the old session").await;
@@ -14606,11 +17973,13 @@ mod tests {
         assert_eq!(request["method"], method::CONFIG_LIST);
         respond_ok(&rpc, &request, serde_json::json!([]));
 
-        let phase = tokio::time::timeout(Duration::from_secs(2), restart)
+        let (state, phase) = tokio::time::timeout(Duration::from_secs(2), restart)
             .await
             .expect("restart should finish")
             .unwrap();
         assert!(phase.is_none());
+        // The replacement session adopts the daemon-selected workspace.
+        assert_eq!(state.cwd.as_deref(), Some("/agents/alpha/workspace"));
     }
 
     #[tokio::test]
@@ -15320,12 +18689,20 @@ mod tests {
         );
     }
 
+    // This test intentionally holds the process-global keymap test guard while
+    // async dispatch runs so override-mutating tests cannot race it.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
-    async fn rtg_9739_composer_enter_and_primary_enter_dispatch_without_approval() {
+    async fn rtg_9739_composer_enter_and_modifier_enter_dispatch_without_approval() {
         use crossterm::event::{KeyCode, KeyModifiers};
 
+        let _guard = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        crate::keymap::overrides::reset();
+
         for kind in [PaneKind::Chat, PaneKind::Acp] {
-            for (key, prompt) in [
+            let mut cases = vec![
                 (KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), "submit"),
                 (
                     KeyEvent::new(
@@ -15335,7 +18712,15 @@ mod tests {
                     ),
                     "inject",
                 ),
-            ] {
+            ];
+            if cfg!(target_os = "macos") {
+                cases.push((
+                    KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL),
+                    "control inject",
+                ));
+            }
+
+            for (key, prompt) in cases {
                 let (tx, mut rx) = mpsc::channel::<String>(16);
                 let outbound = Arc::new(RpcOutbound::new(tx));
                 let client = Arc::new(RpcClient::with_rpc(Arc::clone(&outbound)));
@@ -16918,16 +20303,313 @@ mod tests {
         s.apply_update(SessionUpdate::HistoryTrimmed {
             session_id: "sess-1".to_string(),
             dropped_messages: 12,
+            dropped_turns: Some(4),
             kept_turns: 3,
             reason: "history message limit exceeded".to_string(),
+            token_budget: None,
+            tokens_before: None,
+            tokens_after: None,
+            tokens_before_source: None,
+            tokens_after_source: None,
+            unsatisfiable_floor: None,
         });
 
         assert!(matches!(
             s.entries().last(),
             Some(ChatEntry::SystemMessage(text))
                 if text.contains("history message limit exceeded")
-                    && text.contains("12")
+                    && text.contains("4 older turns dropped")
                     && text.contains("3")
+        ));
+    }
+
+    #[test]
+    fn legacy_history_trimmed_update_reports_message_count() {
+        let mut s = state();
+        s.apply_update(SessionUpdate::HistoryTrimmed {
+            session_id: "sess-1".to_string(),
+            dropped_messages: 12,
+            dropped_turns: None,
+            kept_turns: 3,
+            reason: "history message limit exceeded".to_string(),
+            token_budget: None,
+            tokens_before: None,
+            tokens_after: None,
+            tokens_before_source: None,
+            tokens_after_source: None,
+            unsatisfiable_floor: None,
+        });
+
+        assert!(matches!(
+            s.entries().last(),
+            Some(ChatEntry::SystemMessage(text))
+                if text.contains("12 messages dropped") && text.contains("3 turns kept")
+        ));
+    }
+
+    #[test]
+    fn history_trimmed_update_uses_singular_turn_copy() {
+        let mut s = state();
+        s.apply_update(SessionUpdate::HistoryTrimmed {
+            session_id: "sess-1".to_string(),
+            dropped_messages: 2,
+            dropped_turns: Some(1),
+            kept_turns: 1,
+            reason: "history turn limit exceeded".to_string(),
+            token_budget: None,
+            tokens_before: None,
+            tokens_after: None,
+            tokens_before_source: None,
+            tokens_after_source: None,
+            unsatisfiable_floor: None,
+        });
+
+        assert!(matches!(
+            s.entries().last(),
+            Some(ChatEntry::SystemMessage(text))
+                if text.contains("1 older turn dropped; 1 turn kept")
+        ));
+    }
+
+    #[test]
+    fn history_trimmed_token_accounting_renders_in_notice() {
+        let mut s = state();
+        s.apply_update(SessionUpdate::HistoryTrimmed {
+            session_id: "sess-1".to_string(),
+            dropped_messages: 12,
+            dropped_turns: None,
+            kept_turns: 33,
+            reason: "context token budget exceeded".to_string(),
+            token_budget: Some(500_000),
+            tokens_before: Some(612_000),
+            tokens_after: Some(117_000),
+            tokens_before_source: Some("provider".to_string()),
+            tokens_after_source: Some("calibrated".to_string()),
+            unsatisfiable_floor: None,
+        });
+
+        assert!(matches!(
+            s.entries().last(),
+            Some(ChatEntry::SystemMessage(text))
+                if text.contains("612000")
+                    && text.contains("117000")
+                    && text.contains("configured token budget: 500000")
+                    && text.contains("context token budget exceeded")
+                    && text.contains("12")
+                    && text.contains("33")
+                    && text.contains("provider")
+                    && text.contains("estimate")
+                    && text.contains("before")
+                    && text.contains("after")
+                    && !text.contains("against a")
+        ));
+    }
+
+    #[test]
+    fn history_trimmed_turn_counts_preserve_token_sources_and_floor_precedence() {
+        for (dropped_turns, floor) in [(1, false), (0, false), (1, true)] {
+            let mut s = state();
+            s.apply_update(SessionUpdate::HistoryTrimmed {
+                session_id: "sess-1".to_string(),
+                dropped_messages: 12,
+                dropped_turns: Some(dropped_turns),
+                kept_turns: 2,
+                reason: "context token budget exceeded".to_string(),
+                token_budget: Some(10_000),
+                tokens_before: Some(20_000),
+                tokens_after: Some(if floor { 12_000 } else { 6_000 }),
+                tokens_before_source: Some("provider".to_string()),
+                tokens_after_source: Some("calibrated".to_string()),
+                unsatisfiable_floor: floor.then_some(true),
+            });
+            let Some(ChatEntry::SystemMessage(text)) = s.entries().last() else {
+                panic!("expected trim notice");
+            };
+            if floor {
+                assert!(text.contains("could not be trimmed below the configured token budget"));
+                assert!(!text.contains("history was trimmed"));
+            } else {
+                let expected = if dropped_turns == 1 {
+                    "1 older turn dropped"
+                } else {
+                    "0 older turns dropped"
+                };
+                assert!(text.contains(expected), "{text}");
+                assert!(text.contains("2 turns kept"), "{text}");
+                assert!(text.contains("20000") && text.contains("6000"));
+                assert!(text.contains("provider") && text.contains("estimate"));
+                assert!(!text.contains("12 older"));
+            }
+        }
+    }
+
+    #[test]
+    fn history_trimmed_recovery_below_configured_budget_does_not_claim_budget_governed() {
+        let mut s = state();
+        s.apply_update(SessionUpdate::HistoryTrimmed {
+            session_id: "sess-1".to_string(),
+            dropped_messages: 4,
+            dropped_turns: None,
+            kept_turns: 2,
+            reason: "context window overflow recovery".to_string(),
+            token_budget: Some(500_000),
+            tokens_before: Some(612_000),
+            tokens_after: Some(117_000),
+            tokens_before_source: Some("provider".to_string()),
+            tokens_after_source: Some("calibrated".to_string()),
+            unsatisfiable_floor: None,
+        });
+
+        assert!(matches!(
+            s.entries().last(),
+            Some(ChatEntry::SystemMessage(text))
+                if text.contains("612000")
+                    && text.contains("117000")
+                    && text.contains("context window overflow recovery")
+                    && text.contains("configured token budget: 500000")
+                    && !text.contains("against a")
+        ));
+    }
+
+    #[test]
+    fn history_trimmed_recovery_with_enforcement_disabled_renders_valid_counts() {
+        let mut s = state();
+        s.apply_update(SessionUpdate::HistoryTrimmed {
+            session_id: "sess-1".to_string(),
+            dropped_messages: 4,
+            dropped_turns: None,
+            kept_turns: 2,
+            reason: "context window overflow recovery".to_string(),
+            token_budget: None,
+            tokens_before: Some(612_000),
+            tokens_after: Some(117_000),
+            tokens_before_source: Some("provider".to_string()),
+            tokens_after_source: Some("calibrated".to_string()),
+            unsatisfiable_floor: None,
+        });
+
+        assert!(matches!(
+            s.entries().last(),
+            Some(ChatEntry::SystemMessage(text))
+                if text.contains("612000")
+                    && text.contains("117000")
+                    && text.contains("context window overflow recovery")
+                    && !text.contains("budget")
+        ));
+    }
+
+    #[test]
+    fn history_trimmed_untrimmable_floor_does_not_claim_history_changed() {
+        // The unsatisfiable newest-turn/schema floor carries the explicit
+        // `unsatisfiable_floor` flag while the projected `tokens_after`
+        // still exceeds the configured budget. The notice must not claim
+        // history was trimmed.
+        let mut s = state();
+        s.apply_update(SessionUpdate::HistoryTrimmed {
+            session_id: "sess-1".to_string(),
+            dropped_messages: 0,
+            dropped_turns: None,
+            kept_turns: 1,
+            reason: "context token budget exceeded".to_string(),
+            token_budget: Some(100_000),
+            tokens_before: Some(117_000),
+            tokens_after: Some(117_000),
+            tokens_before_source: Some("calibrated".to_string()),
+            tokens_after_source: Some("calibrated".to_string()),
+            unsatisfiable_floor: Some(true),
+        });
+
+        assert!(matches!(
+            s.entries().last(),
+            Some(ChatEntry::SystemMessage(text))
+                if text.contains("could not be trimmed below the configured token budget")
+                    && text.contains("117000")
+                    && text.contains("configured budget: 100000")
+                    && !text.contains("was trimmed:")
+                    && !text.contains("messages dropped")
+        ));
+    }
+
+    #[test]
+    fn history_trimmed_floor_with_real_drops_reports_both_facts() {
+        // A breadcrumb-induced floor after real turns were removed carries
+        // BOTH the honest drop count and the unsatisfiable flag; the notice
+        // must use the floor wording, not claim an ordinary successful trim.
+        let mut s = state();
+        s.apply_update(SessionUpdate::HistoryTrimmed {
+            session_id: "sess-1".to_string(),
+            dropped_messages: 2,
+            dropped_turns: None,
+            kept_turns: 1,
+            reason: "context token budget exceeded".to_string(),
+            token_budget: Some(100_000),
+            tokens_before: Some(200_000),
+            tokens_after: Some(117_000),
+            tokens_before_source: Some("provider".to_string()),
+            tokens_after_source: Some("calibrated".to_string()),
+            unsatisfiable_floor: Some(true),
+        });
+
+        assert!(matches!(
+            s.entries().last(),
+            Some(ChatEntry::SystemMessage(text))
+                if text.contains("could not be trimmed below the configured token budget")
+                    && text.contains("configured budget: 100000")
+                    && !text.contains("Earlier conversation history was trimmed")
+        ));
+    }
+
+    #[test]
+    fn history_trimmed_without_flag_keeps_trimmed_wording_when_over_budget() {
+        // Older daemons never emit the flag; their events must keep rendering
+        // through the ordinary wording paths even when counts exceed the
+        // budget, so the flag alone drives the floor discriminator.
+        let mut s = state();
+        s.apply_update(SessionUpdate::HistoryTrimmed {
+            session_id: "sess-1".to_string(),
+            dropped_messages: 1,
+            dropped_turns: None,
+            kept_turns: 1,
+            reason: "context token budget exceeded".to_string(),
+            token_budget: Some(100_000),
+            tokens_before: Some(200_000),
+            tokens_after: Some(117_000),
+            tokens_before_source: Some("provider".to_string()),
+            tokens_after_source: Some("calibrated".to_string()),
+            unsatisfiable_floor: None,
+        });
+
+        assert!(matches!(
+            s.entries().last(),
+            Some(ChatEntry::SystemMessage(text))
+                if text.contains("Earlier conversation history was trimmed")
+                    && !text.contains("could not be trimmed")
+        ));
+    }
+
+    #[test]
+    fn history_trimmed_estimated_sources_render_estimate_label() {
+        let mut s = state();
+        s.apply_update(SessionUpdate::HistoryTrimmed {
+            session_id: "sess-1".to_string(),
+            dropped_messages: 2,
+            dropped_turns: None,
+            kept_turns: 1,
+            reason: "context token budget exceeded".to_string(),
+            token_budget: Some(10_000),
+            tokens_before: Some(12_000),
+            tokens_after: Some(6_000),
+            tokens_before_source: Some("estimate".to_string()),
+            tokens_after_source: Some("estimate".to_string()),
+            unsatisfiable_floor: None,
+        });
+
+        assert!(matches!(
+            s.entries().last(),
+            Some(ChatEntry::SystemMessage(text))
+                if text.contains("estimated")
+                    && text.contains("estimated before")
+                    && text.contains("estimated after")
         ));
     }
 
@@ -16954,6 +20636,397 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn tool_result_retention_truncates_utf8_safely_and_keeps_marker() {
+        let mut s = state();
+        s.apply_update(SessionUpdate::ToolCall {
+            session_id: "sess-1".to_string(),
+            tool_call_id: "tc-long".to_string(),
+            name: "shell".to_string(),
+            raw_input: serde_json::json!({"command": "long-output"}),
+        });
+        let raw_output = format!("{}éé", "a".repeat(16 * 1024 - 1));
+        s.apply_update(SessionUpdate::ToolResult {
+            session_id: "sess-1".to_string(),
+            tool_call_id: "tc-long".to_string(),
+            raw_output,
+        });
+
+        let ChatEntry::Tool {
+            result: Some(result),
+            ..
+        } = &s.entries()[0]
+        else {
+            panic!("expected retained tool result");
+        };
+        assert!(result.ends_with("…[truncated]"));
+        assert!(result.is_char_boundary(result.len()));
+    }
+
+    fn rendered_text(lines: &[Line<'static>]) -> String {
+        lines
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn tool_entry_disclosure_shows_full_retained_content_only_when_expanded() {
+        let input = format!(r#"{{"command":"{}"}}"#, "x".repeat(180));
+        let result = format!(
+            "first line\n{}\n\u{1b}]52;c;payload\u{7}\n…[truncated]",
+            "y".repeat(240)
+        );
+
+        let mut collapsed = Vec::new();
+        render_tool_entry(
+            &mut collapsed,
+            "shell",
+            &input,
+            Some(&result),
+            false,
+            ToolDisclosure::Collapsed,
+        );
+        let collapsed_text = rendered_text(&collapsed);
+        assert!(collapsed_text.starts_with("▶ [tool: shell]"));
+        assert!(collapsed_text.contains("input:"));
+        assert!(collapsed_text.contains("result:"));
+        assert!(!collapsed_text.contains(&input));
+        assert!(!collapsed_text.contains("→"));
+
+        let mut expanded = Vec::new();
+        render_tool_entry(
+            &mut expanded,
+            "shell",
+            &input,
+            Some(&result),
+            false,
+            ToolDisclosure::Full,
+        );
+        let expanded_text = rendered_text(&expanded);
+        assert!(expanded_text.starts_with("▼ [tool: shell]"));
+        assert!(expanded_text.contains(&input));
+        assert!(expanded_text.contains(&"y".repeat(240)));
+        assert!(!expanded_text.contains('\u{1b}'));
+        assert!(!expanded_text.contains('\u{7}'));
+        assert!(expanded_text.contains("\\u{1b}]52;c;payload\\u{7}"));
+        assert!(expanded_text.contains("…[truncated]"));
+    }
+
+    #[test]
+    fn expanded_tool_display_is_bounded_while_copy_retains_full_content() {
+        let input_tail = "input-tail-must-remain-copyable";
+        let result_tail = "result-tail-must-remain-copyable";
+        let input = format!("{}\n{input_tail}", "input line\n".repeat(500));
+        let result = format!("{}\n{result_tail}", "result line\n".repeat(500));
+        let mut lines = Vec::new();
+
+        render_tool_entry(
+            &mut lines,
+            "shell",
+            &input,
+            Some(&result),
+            false,
+            ToolDisclosure::Full,
+        );
+
+        let text = rendered_text(&lines);
+        assert!(lines.len() <= 2 * TOOL_EXPANDED_MAX_LINES + 2);
+        assert!(text.contains("Display limited; copy for full content"));
+        assert!(!text.contains(input_tail));
+        assert!(!text.contains(result_tail));
+
+        let entry = ChatEntry::Tool {
+            tool_call_id: Arc::from("tc-oversized"),
+            name: Arc::from("shell"),
+            input_json: Arc::from(input),
+            result: Some(Arc::from(result)),
+        };
+        let copied = clipboard_text(&entry);
+        assert!(copied.contains(input_tail));
+        assert!(copied.contains(result_tail));
+    }
+
+    #[test]
+    fn file_tool_preview_is_six_lines_and_full_view_avoids_raw_content_duplication() {
+        let edit_input = serde_json::json!({
+            "path": "/tmp/example.rs",
+            "old_string": "fn old() {}",
+            "new_string": "fn new() {}",
+        })
+        .to_string();
+        let mut collapsed_edit_lines = Vec::new();
+        render_tool_entry(
+            &mut collapsed_edit_lines,
+            "file_edit",
+            &edit_input,
+            Some("done"),
+            false,
+            ToolDisclosure::Collapsed,
+        );
+        let collapsed_edit_text = rendered_text(&collapsed_edit_lines);
+        assert!(collapsed_edit_text.starts_with("▶ [tool: file_edit]"));
+        assert!(!collapsed_edit_text.contains("fn old() {}"));
+        assert!(!collapsed_edit_text.contains("fn new() {}"));
+        assert!(!collapsed_edit_text.contains(&edit_input));
+        assert!(collapsed_edit_text.contains("result: done"));
+
+        let content = (0..10)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let write_input = serde_json::json!({
+            "path": "/tmp/example.txt",
+            "content": content,
+        })
+        .to_string();
+        let result = format!("first\n{}", "result".repeat(60));
+        let mut preview_lines = Vec::new();
+        let footer_line = render_tool_entry(
+            &mut preview_lines,
+            "file_write",
+            &write_input,
+            Some(&result),
+            false,
+            ToolDisclosure::Preview,
+        );
+        let preview_text = rendered_text(&preview_lines);
+        let footer_line = footer_line.expect("long preview has a disclosure footer");
+        assert!(preview_text.starts_with("▼ [tool: file_write]"));
+        assert!(preview_text.contains(r#"input: {"path":"/tmp/example.txt"}"#));
+        assert!(preview_text.contains("line 0"));
+        assert!(preview_text.contains("line 5"));
+        assert!(!preview_text.contains("line 6"));
+        assert!(preview_text.contains("4 more lines"));
+        assert!(!preview_text.contains(&write_input));
+        assert!(!preview_text.contains(&result));
+        assert!(
+            preview_lines[footer_line]
+                .to_string()
+                .contains("4 more lines")
+        );
+        assert!(preview_text.find("line 5").unwrap() < preview_text.find("4 more lines").unwrap());
+        assert!(
+            preview_text.find("4 more lines").unwrap()
+                < preview_text.find("result: first").unwrap()
+        );
+
+        let mut full_lines = Vec::new();
+        render_tool_entry(
+            &mut full_lines,
+            "file_write",
+            &write_input,
+            Some(&result),
+            false,
+            ToolDisclosure::Full,
+        );
+        let full_text = rendered_text(&full_lines);
+        assert!(full_text.contains("line 9"));
+        assert!(full_text.contains("first"));
+        assert!(full_text.contains(&"result".repeat(60)));
+        assert!(full_text.contains("[Show less]"));
+        assert!(!full_text.contains(&write_input));
+        assert!(full_text.find("line 9").unwrap() < full_text.find("[Show less]").unwrap());
+        assert!(full_text.find("[Show less]").unwrap() < full_text.find("result: first").unwrap());
+    }
+
+    #[test]
+    fn file_write_base64_and_malformed_inputs_have_safe_fallbacks() {
+        let base64_input = serde_json::json!({
+            "path": "/tmp/example.bin",
+            "content": "A".repeat(4_000),
+            "encoding": "base64",
+        })
+        .to_string();
+        let mut base64_lines = Vec::new();
+        let footer_line = render_tool_entry(
+            &mut base64_lines,
+            "file_write",
+            &base64_input,
+            None,
+            false,
+            ToolDisclosure::Preview,
+        );
+        let base64_text = rendered_text(&base64_lines);
+        assert!(footer_line.is_none());
+        assert!(base64_text.contains(r#""encoding":"base64""#));
+        assert!(base64_text.contains("content: 4000 encoded characters"));
+        assert!(!base64_text.contains(&"A".repeat(200)));
+
+        let malformed = r#"{"path":"/tmp/example.txt""#;
+        let mut malformed_lines = Vec::new();
+        render_tool_entry(
+            &mut malformed_lines,
+            "file_write",
+            malformed,
+            None,
+            false,
+            ToolDisclosure::Preview,
+        );
+        assert!(rendered_text(&malformed_lines).contains(malformed));
+
+        for invalid in [
+            serde_json::json!({"content": "text"}),
+            serde_json::json!({"path": "/tmp/a.txt", "content": "text", "encoding": 3}),
+            serde_json::json!({"path": "/tmp/a.txt", "content": "text", "encoding": "hex"}),
+        ] {
+            let invalid = invalid.to_string();
+            assert_eq!(
+                default_tool_disclosure("file_write", &invalid),
+                ToolDisclosure::Collapsed
+            );
+        }
+        assert_eq!(
+            default_tool_disclosure("file_edit", r#"{"old_string":"a","new_string":"b"}"#),
+            ToolDisclosure::Collapsed
+        );
+    }
+
+    #[test]
+    fn wrapped_tool_hit_regions_exclude_blank_cells_and_respect_scroll() {
+        let label = crate::i18n::t_args("zc-chat-tool-show-all", &[("count", "123")]);
+        let line = Line::from(format!("  {label}"));
+        let body = Rect::new(5, 7, 10, 2);
+        let mut regions = Vec::new();
+        append_wrapped_hit_rects(&mut regions, 4, &line, 4, 5, body);
+
+        assert_eq!(regions.len(), 2, "first wrapped row is scrolled out");
+        assert!(
+            regions
+                .iter()
+                .all(|(entry, rect)| *entry == 4 && rect.height == 1)
+        );
+        assert_eq!(regions[0].1.y, body.y);
+        assert!(regions[0].1.width <= body.width);
+        assert!(regions[1].1.width < body.width);
+        assert!(!mouse::in_rect(
+            body.x + body.width - 1,
+            regions[1].1.y,
+            regions[1].1
+        ));
+    }
+
+    #[test]
+    fn tool_clipboard_keeps_raw_input_and_result() {
+        let entry = ChatEntry::Tool {
+            tool_call_id: Arc::<str>::from("tc-copy"),
+            name: Arc::<str>::from("file_write"),
+            input_json: Arc::<str>::from(r#"{"path":"a.txt","content":"raw"}"#),
+            result: Some(Arc::<str>::from("written")),
+        };
+        let copied = clipboard_text(&entry);
+        assert!(copied.contains(r#""content":"raw""#));
+        assert!(copied.contains("written"));
+    }
+
+    #[tokio::test]
+    async fn file_tool_header_and_footer_clicks_keep_cards_independent() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let (mut chat, _rx) = test_chat();
+        let mut state = state();
+        let content = (0..10)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for (id, path) in [
+            ("tc-offscreen", "older.txt"),
+            ("tc-1", "first.txt"),
+            ("tc-2", "second.txt"),
+        ] {
+            state.entries.push(ChatEntry::Tool {
+                tool_call_id: Arc::<str>::from(id),
+                name: Arc::<str>::from("file_write"),
+                input_json: Arc::<str>::from(
+                    serde_json::json!({"path": path, "content": content.clone()}).to_string(),
+                ),
+                result: Some(Arc::<str>::from("written")),
+            });
+        }
+        state.mark_dirty_full();
+
+        let area = Rect::new(0, 0, 80, 24);
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| render(frame, &mut state, area, PaneKind::Chat))
+            .expect("draw chat");
+        state.pinned_to_bottom = false;
+        state.scroll_offset = state.cached_screen_ranges[1].1;
+        terminal
+            .draw(|frame| render(frame, &mut state, area, PaneKind::Chat))
+            .expect("draw scrolled chat");
+        assert_eq!(
+            state
+                .visible_cached_entry_range(state.scroll_offset, state.last_inner_height)
+                .start,
+            1,
+            "the click must use an absolute cached-entry index after scrolling"
+        );
+        assert!(state.entry_rects.iter().all(|(idx, _)| *idx != 0));
+        assert!(state.tool_header_rects.iter().all(|(idx, _)| *idx != 0));
+        assert!(state.tool_footer_rects.iter().all(|(idx, _)| *idx != 0));
+        assert_eq!(state.tool_footer_rects[0].0, 1);
+        let first_footer = state.tool_footer_rects[0].1;
+        chat.phase = ChatPhase::Active(Box::new(state));
+
+        chat.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: first_footer.x + 1,
+                row: first_footer.y,
+                modifiers: KeyModifiers::NONE,
+            },
+            area,
+        )
+        .await;
+        let ChatPhase::Active(state) = &mut chat.phase else {
+            panic!("expected active chat");
+        };
+        assert_eq!(
+            state.tool_disclosures.get("tc-1"),
+            Some(&ToolDisclosure::Full)
+        );
+        assert!(!state.tool_disclosures.contains_key("tc-2"));
+        assert!(!state.tool_disclosures.contains_key("tc-offscreen"));
+        assert_eq!(state.dirty, LinesDirty::Full);
+
+        terminal
+            .draw(|frame| render(frame, state, area, PaneKind::Chat))
+            .expect("redraw expanded chat");
+        let first_header = state.tool_header_rects[0].1;
+        chat.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: first_header.x + 1,
+                row: first_header.y,
+                modifiers: KeyModifiers::NONE,
+            },
+            area,
+        )
+        .await;
+        let ChatPhase::Active(state) = &mut chat.phase else {
+            panic!("expected active chat");
+        };
+        assert_eq!(
+            state.tool_disclosures.get("tc-1"),
+            Some(&ToolDisclosure::Collapsed)
+        );
+        assert!(!state.tool_disclosures.contains_key("tc-2"));
+        assert!(!state.tool_disclosures.contains_key("tc-offscreen"));
+
+        state.reset_for_session(
+            "sess-2".to_string(),
+            None,
+            crate::todo_tracker::TodoTrackerSettings::default(),
+        );
+        assert!(state.tool_disclosures.is_empty());
+        assert!(state.tool_header_rects.is_empty());
+        assert!(state.tool_footer_rects.is_empty());
     }
 
     #[test]
@@ -18369,6 +22442,28 @@ mod tests {
     }
 
     #[test]
+    fn md_table_truncated_url_is_not_actionable() {
+        let lines = markdown_to_lines(
+            "| col |\n|-----|\n| https://example.com/a/very/long/path |\n\nhttps://example.org/ok\n",
+            24,
+        );
+        let truncated = lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .find(|span| span.content.contains("https://") && span.content.contains('\u{2026}'))
+            .expect("truncated table URL");
+        assert_ne!(truncated.style.fg, Some(theme::active().accent));
+        assert_ne!(
+            truncated.style.add_modifier(Modifier::UNDERLINED),
+            truncated.style
+        );
+
+        let regions = url_line_regions_for_lines(&lines, 24);
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].urls[0].2, "https://example.org/ok");
+    }
+
+    #[test]
     fn md_table_pads_emoji_presentation_to_two_cells() {
         // 🏔️ is U+1F3D4 + U+FE0F. Natural column width must be 2 (not 1), so a
         // wider sibling cell still leaves a full cell of space after the glyph.
@@ -19613,6 +23708,69 @@ mod tests {
         assert_eq!(s.title(), "personal_code  — my work  40be773");
     }
 
+    fn pinned_preview_buffer(message: &str, width: u16) -> ratatui::buffer::Buffer {
+        use ratatui::widgets::Widget;
+
+        let area = Rect::new(0, 0, width, 1);
+        let mut buffer = ratatui::buffer::Buffer::empty(area);
+        Paragraph::new(Line::from(Span::styled(message, theme::dim_style())))
+            .wrap(Wrap { trim: true })
+            .render(area, &mut buffer);
+        buffer
+    }
+
+    #[test]
+    fn pinned_preview_preserves_wrapped_first_row() {
+        let messages = [
+            "",
+            "   ",
+            "one two three four five",
+            "  original ask with leading space",
+            "a verylongunbrokenwordandmore",
+            "word       another word",
+            "line one\nline two\tand more",
+            "\u{754c}\u{754c} a \u{754c}bc",
+            "e\u{301} \u{26a0}\u{fe0f} \u{1f469}\u{200d}\u{1f4bb} next word",
+            "\u{200b} a\u{a0}b \u{200b}c",
+        ];
+        for message in messages {
+            for width in 0..=24 {
+                assert_eq!(
+                    pinned_preview_buffer(pinned_preview_source(message, width), width),
+                    pinned_preview_buffer(message, width),
+                    "message {message:?}, width {width}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pinned_preview_long_message_only_borrows_visible_prefix() {
+        for message in ["word ".repeat(100_000), "x".repeat(500_000)] {
+            let preview = pinned_preview_source(&message, 80);
+            assert_eq!(preview.len(), 81);
+            assert_eq!(preview.as_ptr(), message.as_ptr());
+            assert_eq!(
+                pinned_preview_buffer(preview, 80),
+                pinned_preview_buffer(&message, 80),
+            );
+        }
+    }
+
+    #[test]
+    fn pinned_preview_keeps_grapheme_clusters_and_recomputes_for_width() {
+        let message = "\u{1f469}\u{200d}\u{1f4bb}".repeat(1000);
+        for width in [2, 3, 8, 20] {
+            let preview = pinned_preview_source(&message, width);
+            assert_eq!(preview.chars().count() % 3, 0);
+            assert!(preview.len() <= (usize::from(width) / 2 + 2) * 11);
+            assert_eq!(
+                pinned_preview_buffer(preview, width),
+                pinned_preview_buffer(&message, width),
+            );
+        }
+    }
+
     #[test]
     fn first_message_captures_first_user_message_only() {
         let mut s = state();
@@ -20066,6 +24224,246 @@ mod tests {
                 .all(|entry| !matches!(entry, ChatEntry::AgentMessage(_))),
             "the lifecycle fence must not invent the dropped final transcript content"
         );
+    }
+
+    #[tokio::test]
+    async fn prompt_completion_before_turn_complete_does_not_duplicate_streamed_text() {
+        let (mut chat, mut writer_rx) = test_chat();
+        let mut active = state();
+        active
+            .enqueue_message("hello".to_string(), Vec::new())
+            .unwrap();
+        chat.phase = ChatPhase::Active(Box::new(active));
+        chat.pump_all_queues();
+        let request = next_rpc_request(&mut writer_rx, "prompt request should be sent").await;
+
+        let (notif_tx, notif_rx) = broadcast::channel(4);
+        chat.notif_rx = notif_rx;
+        notif_tx
+            .send(RpcNotification {
+                method: "session/update".to_string(),
+                params: serde_json::json!({
+                    "type": "agent_message_chunk",
+                    "session_id": "sess-1",
+                    "text": "streamed reply"
+                }),
+            })
+            .unwrap();
+        chat.drain_notifications();
+        respond_ok(&chat.rpc_out, &request, serde_json::json!({}));
+        tokio::task::yield_now().await;
+        chat.drain_prompt_completions();
+
+        notif_tx
+            .send(RpcNotification {
+                method: "session/update".to_string(),
+                params: serde_json::json!({
+                    "type": "turn_complete",
+                    "session_id": "sess-1",
+                    "outcome": "completed",
+                    "content": "streamed reply"
+                }),
+            })
+            .unwrap();
+        chat.drain_notifications();
+
+        let replies = active_state(&mut chat)
+            .entries()
+            .iter()
+            .filter(|entry| {
+                matches!(entry, ChatEntry::AgentMessage(text) if text.as_ref() == "streamed reply")
+            })
+            .count();
+        assert_eq!(
+            replies, 1,
+            "a delayed terminal frame must not duplicate text committed by response settlement"
+        );
+    }
+
+    #[tokio::test]
+    async fn prompt_completion_late_url_chunk_refreshes_hit_regions() {
+        let (mut chat, mut writer_rx) = test_chat();
+        let mut active = state();
+        active.entries.push(ChatEntry::AgentMessage(Arc::from(
+            "https://example.org/earlier",
+        )));
+        active
+            .enqueue_message("hello".to_string(), Vec::new())
+            .unwrap();
+        chat.phase = ChatPhase::Active(Box::new(active));
+        chat.pump_all_queues();
+        let request = next_rpc_request(&mut writer_rx, "prompt request should be sent").await;
+        active_state(&mut chat).apply_update(SessionUpdate::AgentMessageChunk {
+            session_id: "sess-1".to_string(),
+            text: "https://example.com".to_string(),
+        });
+        respond_ok(&chat.rpc_out, &request, serde_json::json!({}));
+        tokio::task::yield_now().await;
+        chat.drain_prompt_completions();
+
+        let state = active_state(&mut chat);
+        let width = 24;
+        let body = Rect::new(0, 0, width, 20);
+        state.rebuild_lines(width);
+        state.url_hit_regions = project_url_hit_regions(&state.cached_url_regions, 0, body);
+        let hit = state
+            .url_hit_regions
+            .iter()
+            .find(|hit| hit.url == "https://example.com")
+            .unwrap()
+            .clone();
+        state.begin_url_activation(hit.clone());
+        state.context_menu = Some(ChatContextMenu {
+            rect: Rect::new(0, 1, 20, 4),
+            target: ChatContextMenuTarget::Url(hit.clone()),
+            selected: 0,
+        });
+
+        state.apply_update(SessionUpdate::AgentMessageChunk {
+            session_id: "sess-1".to_string(),
+            text: "/long-path?query=yes".to_string(),
+        });
+        assert!(matches!(state.dirty, LinesDirty::TailChanged(_)));
+        assert!(state.pending_url_activation.is_none());
+        assert!(state.context_menu.is_none());
+        assert!(state.take_url_activation(hit.rect.x, hit.rect.y).is_none());
+        state.rebuild_lines(width);
+        let tail_regions = state.cached_url_regions.clone();
+        let hits = project_url_hit_regions(&tail_regions, 0, body);
+        assert!(!hits.is_empty());
+        assert!(
+            hits.iter()
+                .any(|hit| hit.url == "https://example.com/long-path?query=yes")
+        );
+        assert!(
+            hits.iter()
+                .any(|hit| hit.url == "https://example.org/earlier")
+        );
+        assert!(!hits.iter().any(|hit| hit.url == "https://example.com"));
+
+        state.mark_dirty_full();
+        state.rebuild_lines(width);
+        assert_eq!(tail_regions, state.cached_url_regions);
+    }
+
+    #[tokio::test]
+    async fn prompt_completion_keeps_late_stream_chunk_in_one_agent_entry() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        for interposed_error in [false, true] {
+            let (mut chat, mut writer_rx) = test_chat();
+            let mut active = state();
+            active
+                .enqueue_message("hello".to_string(), Vec::new())
+                .unwrap();
+            chat.phase = ChatPhase::Active(Box::new(active));
+            chat.pump_all_queues();
+            let request = next_rpc_request(&mut writer_rx, "prompt request should be sent").await;
+
+            let (notif_tx, notif_rx) = broadcast::channel(4);
+            chat.notif_rx = notif_rx;
+            notif_tx
+                .send(RpcNotification {
+                    method: "session/update".to_string(),
+                    params: serde_json::json!({
+                        "type": "agent_message_chunk",
+                        "session_id": "sess-1",
+                        "text": "```rust\nlet daemon = 1;"
+                    }),
+                })
+                .unwrap();
+            chat.drain_notifications();
+            respond_ok(&chat.rpc_out, &request, serde_json::json!({}));
+            tokio::task::yield_now().await;
+            chat.drain_prompt_completions();
+            let state = active_state(&mut chat);
+            state.rebuild_lines(80);
+            assert_eq!(state.dirty, LinesDirty::Clean);
+            assert!(state.prompt_settled_stream_entry.is_some());
+            let continuation_index = state.prompt_settled_stream_entry.unwrap().1;
+
+            if interposed_error {
+                state.input_bar.insert_text("   ");
+                let mut term: crate::config_manager::Term = ratatui::Terminal::with_options(
+                    crate::terminal_backend::WideCellCleanupBackend::new(std::io::stdout()),
+                    ratatui::TerminalOptions {
+                        viewport: ratatui::Viewport::Fixed(Rect::new(0, 0, 80, 24)),
+                    },
+                )
+                .unwrap();
+                chat.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut term)
+                    .await;
+                let state = active_state(&mut chat);
+                assert_eq!(state.dirty, LinesDirty::Appended);
+                assert!(matches!(
+                    state.entries().last(),
+                    Some(ChatEntry::SystemMessage(_))
+                ));
+                assert!(state.prompt_settled_stream_entry.is_some());
+                assert!(
+                    writer_rx.try_recv().is_err(),
+                    "whitespace must not dispatch a prompt"
+                );
+            }
+
+            notif_tx
+                .send(RpcNotification {
+                    method: "session/update".to_string(),
+                    params: serde_json::json!({
+                        "type": "agent_message_chunk",
+                        "session_id": "sess-1",
+                        "text": "\nlet late = 2;\n```"
+                    }),
+                })
+                .unwrap();
+            chat.drain_notifications();
+            let state = active_state(&mut chat);
+            assert_eq!(
+                state.dirty,
+                if interposed_error {
+                    LinesDirty::Full
+                } else {
+                    LinesDirty::TailChanged(continuation_index)
+                }
+            );
+            assert!(matches!(
+                state.entries().get(continuation_index),
+                Some(ChatEntry::AgentMessageContinuation(text))
+                    if text == "```rust\nlet daemon = 1;\nlet late = 2;\n```"
+            ));
+            state.rebuild_lines(80);
+            assert_eq!(state.dirty, LinesDirty::Clean);
+            assert!(rendered_text(&state.cached_lines).contains("let late = 2;"));
+            assert_eq!(
+                state.cached_line_screen_ranges.len(),
+                state.cached_lines.len()
+            );
+            assert_eq!(state.cached_code_blocks.len(), 1);
+            assert!(state.cached_code_blocks[0].text.contains("let late = 2;"));
+            notif_tx
+                .send(RpcNotification {
+                    method: "session/update".to_string(),
+                    params: serde_json::json!({
+                        "type": "turn_complete",
+                        "session_id": "sess-1",
+                        "outcome": "completed",
+                        "content": "```rust\nlet daemon = 1;\nlet late = 2;\n```"
+                    }),
+                })
+                .unwrap();
+            chat.drain_notifications();
+            assert_eq!(active_state(&mut chat).dirty, LinesDirty::Clean);
+
+            let replies = active_state(&mut chat)
+                .entries()
+                .iter()
+                .filter_map(|entry| match entry {
+                    ChatEntry::AgentMessage(text) => Some(text.as_ref()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(replies, ["```rust\nlet daemon = 1;\nlet late = 2;\n```"]);
+        }
     }
 
     #[tokio::test]

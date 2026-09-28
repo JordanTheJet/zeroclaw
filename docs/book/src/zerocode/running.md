@@ -18,12 +18,31 @@ zerocode finds the daemon's local endpoint automatically: `<data_dir>/data/daemo
 on Unix, `\\.\pipe\zeroclaw-<hash>` on Windows. If the daemon isn't running,
 zerocode spawns an ephemeral one.
 
-Local **Code** sessions start in the directory you launched zerocode from, so
-file and shell tools operate on that project. If that directory cannot be
-determined, the session reports an error instead of starting somewhere else.
-Local **Chat** sessions still use the selected agent's configured workspace.
-Remote (WSS) Code sessions keep the directory picker. Existing sessions keep
-their own working directory when you resume them.
+## Session working directories
+
+Fresh **Chat** sessions, and fresh **Code** sessions on a local connection, use
+the selected agent's configured workspace, so file and shell tools operate there
+unless you choose a directory yourself. The daemon resolves that root and
+reports it back; zerocode does not substitute the directory you launched it
+from.
+
+Remote (WSS) **Code** always asks first. A fresh or restarted remote Code
+session opens the daemon-side directory picker before the session is created, so
+its root is always a directory you selected on the daemon's filesystem. That
+picker browses the daemon's machine, not your local one, and it has no default
+to fall back to.
+
+In the **Code** pane, `/change-directory` opens a directory picker and starts a
+new session in the selected directory. It works on both connections: locally the
+picker browses this machine, and over WSS it browses the daemon's filesystem.
+The existing session is not moved: it remains available at its own saved root,
+and you can switch back to it at any time. Cancelling the picker, or a selection
+the daemon rejects, returns you to that session unchanged and reports why.
+
+Resumed Code sessions keep the working directory they were created with, even
+if your launch directory or the agent's configured workspace changes afterwards.
+**Chat** differs here: a reattached Chat session can resolve against the selected
+agent's current workspace.
 
 ## Switching sessions
 
@@ -33,6 +52,12 @@ In the **Chat** and **Code** panes you can load or switch existing sessions with
 - Use the list-navigation keys to move the selection (defaults: Up/Down).
 - **Enter** switches to the highlighted session.
 - **New session** starts fresh (default chord: Ctrl+N; rebindable).
+
+Switching to an existing **Code** session resumes it at its own saved root,
+while **New session** starts fresh: at the selected agent's workspace over a
+local connection, or in the directory you pick in the daemon-side picker over
+WSS. Neither action changes the root of a session that is already running; use
+`/change-directory` when you want a Code session somewhere else.
 
 The in-app help overlay shows your live key bindings for these actions.
 
@@ -52,3 +77,37 @@ zerocode receives the input.
 | `--connect <url>` | Connect to a remote daemon via WSS (e.g. `wss://host:9781`) |
 | `--tls-skip-verify` | Skip TLS certificate verification. Required for self-signed certs |
 | `--config-dir <path>` | Override the config directory |
+
+## Terminal status
+
+zerocode automatically publishes the most urgent Chat or Code turn state to
+the terminal using two escape-sequence conventions:
+
+- OSC 2 sets a short, human-readable tab title such as `⏳ my-agent — working`
+  or `⚠ my-agent — awaiting approval`.
+- OSC 9;4 reports cleared, indeterminate, or warning progress without requiring
+  another program to parse the title text.
+
+Both sequences derive idle, working, blocked, and finished semantics from the
+content-free lifecycle contract in `zeroclaw-api`; Zerocode keeps localized
+detail such as thinking, responding, or the current tool only for display.
+Every live session in the sidebar is a candidate, focused or not: blocked
+outranks working, working outranks idle, and a named session wins ties.
+
+This is terminal metadata, not a connection to a particular workspace manager.
+Compatible terminals and multiplexers may display, retain, or consume it;
+software that does not support these sequences ignores them. The payload
+includes only the selected agent alias and a bounded status or tool name. It
+never includes the prompt, tool arguments, tool output, or response text.
+
+If the daemon connection is lost, zerocode immediately clears progress and
+publishes the neutral `✓ zerocode` title instead of retaining a cached working
+or blocked state. Session state remains available for reconnection, and live
+session status is projected again only after the daemon reconnects.
+
+On normal exit and supported termination signals, zerocode clears progress and
+restores the terminal title when the terminal supports a title stack. It writes
+a neutral `zerocode` fallback for terminals without one. Like all terminal
+programs, it cannot clean up after an uncatchable `SIGKILL` or an abrupt machine
+shutdown. A later terminal or shell title update, or closing the tab, clears
+that stale display.

@@ -9,18 +9,14 @@ repository.workspace = true
 publish = true
 
 [features]
-# The SOP pane is unconditionally reachable from mode-bar navigation as a
-# read-only status surface; mutating run, authoring, delete, and checkpoint
-# actions stay disabled there. This flag gates no exposure today and is
-# reserved as the seam for future authoring and run-control work.
 default = []
-sop-authoring = []
 
 [[bin]]
 name = "zerocode"
 path = "src/main.rs"
 
 [dependencies]
+zeroclaw-api.workspace = true
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
 tempfile = "3"
@@ -70,11 +66,15 @@ fluent = "0.16"
 unic-langid = "0.9"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 url = "2.5"
+# Lean HTTP client for gateway OIDC enrollment only; rustls + webpki roots
+# are already in the tree via tokio-tungstenite.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "json"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [dev-dependencies]
+wiremock = "0.6"
 # `test-util` enables tokio's paused-clock test runtime so deadline regressions
 # (e.g. the enrollment read timeout) assert instantly instead of sleeping out
 # the real timeout. Test-only: it does not reach the shipped binary.

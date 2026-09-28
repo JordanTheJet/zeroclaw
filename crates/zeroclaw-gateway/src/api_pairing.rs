@@ -3,7 +3,7 @@
 use super::AppState;
 use axum::{
     extract::{ConnectInfo, State},
-    http::{HeaderMap, StatusCode, header},
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Json},
 };
 use chrono::{DateTime, Utc};
@@ -328,22 +328,7 @@ impl PairingStore {
     }
 }
 
-fn extract_bearer(headers: &HeaderMap) -> Option<&str> {
-    headers
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|auth| auth.strip_prefix("Bearer "))
-}
-
-fn require_auth(state: &AppState, headers: &HeaderMap) -> Result<(), (StatusCode, &'static str)> {
-    if state.pairing.require_pairing() {
-        let token = extract_bearer(headers).unwrap_or("");
-        if !state.pairing.is_authenticated(token) {
-            return Err((StatusCode::UNAUTHORIZED, "Unauthorized"));
-        }
-    }
-    Ok(())
-}
+use crate::api::{extract_bearer_token, require_auth};
 
 /// POST /api/pairing/initiate — initiate a new pairing session
 pub async fn initiate_pairing(
@@ -354,7 +339,10 @@ pub async fn initiate_pairing(
         return e.into_response();
     }
 
-    match state.pairing.generate_new_pairing_code() {
+    match state
+        .pairing
+        .generate_new_pairing_code(crate::live_pairing_code_policy(&state))
+    {
         Some(code) => Json(serde_json::json!({
             "pairing_code": code,
             "message": "New pairing code generated"
@@ -613,7 +601,7 @@ pub async fn update_my_capabilities(
         return e.into_response();
     }
 
-    let token = match extract_bearer(&headers) {
+    let token = match extract_bearer_token(&headers) {
         Some(t) => t,
         None => return (StatusCode::UNAUTHORIZED, "Missing bearer token").into_response(),
     };
@@ -707,7 +695,7 @@ pub async fn rotate_token(
     // flow holds the slot, the revoke still stands — return 200 with
     // `pairing_code: null` and a message that tells the operator what
     // happened so they do not assume rotation failed.
-    match state.pairing.generate_pairing_code_if_vacant() {
+    match state.pairing.generate_pairing_code_if_vacant(crate::live_pairing_code_policy(&state)) {
         Ok(code) => Json(serde_json::json!({
             "device_id": device_id,
             "pairing_code": code,
@@ -750,7 +738,11 @@ mod tests {
     /// issued code is actually consumable.
     fn unwriteable_registry_state() -> AppState {
         let mut state = test_state(Config::default());
-        state.pairing = Arc::new(PairingGuard::new(true, &[]));
+        state.pairing = Arc::new(PairingGuard::new(
+            true,
+            &[],
+            zeroclaw_config::pairing::PairingCodePolicy::default(),
+        ));
         state.device_registry = Some(Arc::new(DeviceRegistry::with_db_path(PathBuf::from(
             "/this/path/does/not/exist/devices.db",
         ))));
@@ -771,7 +763,7 @@ mod tests {
         // Issue a pairing code so the next `try_pair` succeeds.
         let code = state
             .pairing
-            .generate_new_pairing_code()
+            .generate_new_pairing_code(crate::live_pairing_code_policy(&state))
             .expect("pairing code must be issuable when require_pairing=true");
 
         let (status, body) = response_json(
@@ -808,7 +800,11 @@ mod tests {
     #[tokio::test]
     async fn submit_pairing_enhanced_rolls_back_in_process_token_when_persist_fails() {
         let mut state = test_state(Config::default());
-        state.pairing = Arc::new(PairingGuard::new(true, &[]));
+        state.pairing = Arc::new(PairingGuard::new(
+            true,
+            &[],
+            zeroclaw_config::pairing::PairingCodePolicy::default(),
+        ));
         let tmp = tempfile::TempDir::new().unwrap();
         let blocker = tmp.path().join("blocker");
         std::fs::write(&blocker, b"").expect("seed blocker file");
@@ -819,7 +815,7 @@ mod tests {
 
         let code = state
             .pairing
-            .generate_new_pairing_code()
+            .generate_new_pairing_code(crate::live_pairing_code_policy(&state))
             .expect("pairing code must be issuable when require_pairing=true");
 
         let (status, body) = response_json(
@@ -854,7 +850,11 @@ mod tests {
     #[tokio::test]
     async fn submit_pairing_enhanced_keys_lockout_on_peer_not_forwarded_header() {
         let mut state = test_state(Config::default());
-        state.pairing = Arc::new(PairingGuard::new(true, &[]));
+        state.pairing = Arc::new(PairingGuard::new(
+            true,
+            &[],
+            zeroclaw_config::pairing::PairingCodePolicy::default(),
+        ));
         // Default config does not trust forwarded headers.
         assert!(!state.trust_forwarded_headers);
 
@@ -907,7 +907,11 @@ mod tests {
     #[tokio::test]
     async fn submit_pairing_enhanced_honors_trusted_forwarded_client_identity() {
         let mut state = test_state(Config::default());
-        state.pairing = Arc::new(PairingGuard::new(true, &[]));
+        state.pairing = Arc::new(PairingGuard::new(
+            true,
+            &[],
+            zeroclaw_config::pairing::PairingCodePolicy::default(),
+        ));
         state.trust_forwarded_headers = true;
         state.rate_limiter = Arc::new(GatewayRateLimiter::new(1, 100, 100));
         let peer: SocketAddr = "10.0.0.2:55555".parse().unwrap();
@@ -956,7 +960,11 @@ mod tests {
     #[tokio::test]
     async fn submit_pairing_enhanced_enforces_pair_request_limiter_threshold() {
         let mut state = test_state(Config::default());
-        state.pairing = Arc::new(PairingGuard::new(true, &[]));
+        state.pairing = Arc::new(PairingGuard::new(
+            true,
+            &[],
+            zeroclaw_config::pairing::PairingCodePolicy::default(),
+        ));
         state.rate_limiter = Arc::new(GatewayRateLimiter::new(2, 100, 100));
         let peer: SocketAddr = "203.0.113.20:55555".parse().unwrap();
 
@@ -996,7 +1004,11 @@ mod tests {
     #[tokio::test]
     async fn submit_pairing_enhanced_enforces_shared_auth_limiter_threshold() {
         let mut state = test_state(Config::default());
-        state.pairing = Arc::new(PairingGuard::new(true, &[]));
+        state.pairing = Arc::new(PairingGuard::new(
+            true,
+            &[],
+            zeroclaw_config::pairing::PairingCodePolicy::default(),
+        ));
         state.rate_limiter = Arc::new(GatewayRateLimiter::new(100, 100, 100));
         state.auth_limiter = Arc::new(AuthRateLimiter::new());
         let peer: SocketAddr = "203.0.113.30:55555".parse().unwrap();
@@ -1037,7 +1049,11 @@ mod tests {
         // it never produces the 429 — the lockout can only come from the shared
         // limiter the handler fed.
         let mut state = test_state(Config::default());
-        state.pairing = Arc::new(PairingGuard::new(true, &[]));
+        state.pairing = Arc::new(PairingGuard::new(
+            true,
+            &[],
+            zeroclaw_config::pairing::PairingCodePolicy::default(),
+        ));
         state.rate_limiter = Arc::new(GatewayRateLimiter::new(100, 100, 100));
         state.auth_limiter = Arc::new(AuthRateLimiter::new());
         let peer: SocketAddr = "203.0.113.40:55555".parse().unwrap();
@@ -1141,7 +1157,11 @@ mod tests {
         // `X-Forwarded-For` on every request must not dodge the peer-keyed
         // lockout. After five wrong attempts the sixth is locked out (429).
         let mut state = test_state(Config::default());
-        state.pairing = Arc::new(PairingGuard::new(true, &[]));
+        state.pairing = Arc::new(PairingGuard::new(
+            true,
+            &[],
+            zeroclaw_config::pairing::PairingCodePolicy::default(),
+        ));
         state.rate_limiter = Arc::new(GatewayRateLimiter::new(100, 100, 100));
         state.auth_limiter = Arc::new(AuthRateLimiter::new());
         state.trust_forwarded_headers = false;
@@ -1167,7 +1187,11 @@ mod tests {
         // client A's five failures lock only A. Client B keeps a fresh bucket,
         // and A's sixth request is the one that is locked out.
         let mut state = test_state(Config::default());
-        state.pairing = Arc::new(PairingGuard::new(true, &[]));
+        state.pairing = Arc::new(PairingGuard::new(
+            true,
+            &[],
+            zeroclaw_config::pairing::PairingCodePolicy::default(),
+        ));
         state.rate_limiter = Arc::new(GatewayRateLimiter::new(100, 100, 100));
         state.auth_limiter = Arc::new(AuthRateLimiter::new());
         state.trust_forwarded_headers = true;
