@@ -192,7 +192,6 @@ export default function Plugins() {
       ) : (
         <div className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-3">
           {visible.map((entry) => {
-            const capabilities = catalogCapabilities(entry);
             const description = catalogDescription(entry);
             return (
               <article
@@ -237,13 +236,28 @@ export default function Plugins() {
                   )}
                 </dl>
 
-                {capabilities.length > 0 && (
+                {entry.installed && entry.installed.capabilities.length > 0 && (
                   <div className="space-y-1.5">
                     <h3 className="text-[11px] font-medium uppercase tracking-wider text-pc-text-faint">
-                      {t("plugins.capabilities")}
+                      {t("plugins.installed_capabilities")} · {entry.installed.version}
                     </h3>
                     <div className="flex flex-wrap gap-1.5">
-                      {capabilities.map((capability) => (
+                      {catalogCapabilities(entry.installed.capabilities).map((capability) => (
+                        <Badge key={capability} tone="neutral">
+                          {displayToken(capability)}
+                        </Badge>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {entry.available && entry.available.capabilities.length > 0 && (
+                  <div className="space-y-1.5">
+                    <h3 className="text-[11px] font-medium uppercase tracking-wider text-pc-text-faint">
+                      {t("plugins.registry_capabilities")} · {entry.available.version}
+                    </h3>
+                    <div className="flex flex-wrap gap-1.5">
+                      {catalogCapabilities(entry.available.capabilities).map((capability) => (
                         <Badge key={capability} tone="neutral">
                           {displayToken(capability)}
                         </Badge>

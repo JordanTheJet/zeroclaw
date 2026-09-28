@@ -4,6 +4,9 @@
 //! host-admitted installed manifests, and the cached registry index. The
 //! gateway does not retain a second catalog or plugin lifecycle state.
 
+#[cfg(feature = "plugins-wasm")]
+static CATALOG_DISCOVERY: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+
 use axum::{
     extract::State,
     http::{HeaderMap, StatusCode, header},
@@ -104,33 +107,70 @@ pub async fn list_plugins(State(state): State<AppState>, headers: HeaderMap) -> 
         }
     }
 
-    let config = state.config.read();
-    let plugins_enabled = config.plugins.enabled;
-    let plugins_dir = config.plugins.plugins_dir.clone();
-
     #[cfg(not(feature = "plugins-wasm"))]
     {
-        drop(config);
+        let config = state.config.read();
+        let plugins_enabled = config.plugins.enabled;
+        let plugins_dir = config.plugins.plugins_dir.clone();
         Json(build_response(plugins_enabled, plugins_dir)).into_response()
     }
 
     #[cfg(feature = "plugins-wasm")]
     {
-        let plugin_path = config.plugins.resolved_plugins_dir();
-        let signature_mode = config.plugins.security.signature_mode.clone();
-        let trusted_publisher_keys = config.plugins.security.trusted_publisher_keys.clone();
-        let data_dir = config.data_dir.clone();
-        drop(config);
-
-        Json(build_response(
+        let (
             plugins_enabled,
             plugins_dir,
             plugin_path,
             signature_mode,
             trusted_publisher_keys,
             data_dir,
-        ))
-        .into_response()
+        ) = {
+            let config = state.config.read();
+            (
+                config.plugins.enabled,
+                config.plugins.plugins_dir.clone(),
+                config.plugins.resolved_plugins_dir(),
+                config.plugins.security.signature_mode.clone(),
+                config.plugins.security.trusted_publisher_keys.clone(),
+                config.data_dir.clone(),
+            )
+        };
+
+        // Host admission reads and verifies each component synchronously. Keep
+        // it off the async executor and admit at most one catalog scan at a
+        // time, including after a requesting client disconnects.
+        let permit = match CATALOG_DISCOVERY.try_acquire() {
+            Ok(permit) => permit,
+            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        };
+        match tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            build_response(
+                plugins_enabled,
+                plugins_dir,
+                plugin_path,
+                signature_mode,
+                trusted_publisher_keys,
+                data_dir,
+            )
+        })
+        .await
+        {
+            Ok(response) => Json(response).into_response(),
+            Err(error) => {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "error": error.to_string(),
+                            "error_key": "plugin_catalog_discovery_task_failed",
+                        })),
+                    "plugin catalog discovery task failed"
+                );
+                StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            }
+        }
     }
 }
 

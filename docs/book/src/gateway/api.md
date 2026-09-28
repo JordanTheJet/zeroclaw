@@ -89,6 +89,11 @@ catalog while detailed diagnostics remain in gateway logs. Registry download
 URLs and the cached registry URL are never returned; an available record only
 exposes inert `name@version` install identity.
 
+Catalog discovery runs on a blocking worker because host admission reads and
+verifies installed WASM payloads. Only one scan runs at a time; a concurrent
+request receives `503 Service Unavailable` and may retry. The endpoint does not
+cache admitted package state between requests.
+
 ## Per-property CRUD
 
 | Method | Path | Purpose |

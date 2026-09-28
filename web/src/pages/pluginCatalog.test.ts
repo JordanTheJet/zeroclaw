@@ -23,12 +23,15 @@ const packageWithBothSources = {
   },
 };
 
-test("catalog capabilities are a sorted per-call union", () => {
-  assert.deepEqual(catalogCapabilities(packageWithBothSources), [
-    "channel",
-    "skill",
-    "tool",
-  ]);
+test("catalog capabilities stay with the version that declares them", () => {
+  assert.deepEqual(
+    catalogCapabilities(packageWithBothSources.installed.capabilities),
+    ["channel", "tool"],
+  );
+  assert.deepEqual(
+    catalogCapabilities(packageWithBothSources.available.capabilities),
+    ["channel", "skill"],
+  );
 });
 
 test("installed metadata takes display precedence without losing registry data", () => {

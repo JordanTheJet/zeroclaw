@@ -488,7 +488,8 @@ const translations: Record<Locale, Record<string, string>> = {
     'plugins.no_description': "No description provided.",
     'plugins.installed_version': "Installed version",
     'plugins.registry_version': "Registry version",
-    'plugins.capabilities': "Capabilities",
+    'plugins.installed_capabilities': "Installed capabilities",
+    'plugins.registry_capabilities': "Registry capabilities",
     'plugins.permissions': "Requested permissions",
     'plugins.install_source': "Package identity",
     // ── i18n sweep: keys added by the conversion workflow ──
