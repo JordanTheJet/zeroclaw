@@ -1,3 +1,4 @@
+use crate::agent::execution_tree_budget::ExecutionTreeBudget;
 use crate::approval::ApprovalManager;
 
 /// Format token count with thousands separators.
@@ -963,6 +964,15 @@ async fn agent_turn_with_sop_reassembly(
     sop_reassembly: Option<SopStepReassembly<'_>>,
 ) -> Result<String> {
     let turn_id = turn_id.map_or_else(|| uuid::Uuid::new_v4().to_string(), str::to_string);
+    let shared_budget = ExecutionTreeBudget::current()
+        .map(|budget| budget.child())
+        .or_else(|| {
+            config.zip(agent_alias).and_then(|(config, alias)| {
+                ExecutionTreeBudget::from_limit(
+                    config.effective_max_execution_tree_iterations(alias),
+                )
+            })
+        });
     #[cfg(test)]
     if let Some(hook) = AGENT_TURN_SOP_REASSEMBLY_TEST_HOOK
         .lock()
@@ -970,7 +980,13 @@ async fn agent_turn_with_sop_reassembly(
         .as_ref()
         .cloned()
     {
-        hook(sop_reassembly.is_some());
+        hook(
+            sop_reassembly.is_some(),
+            sop_reassembly
+                .as_ref()
+                .and_then(|reassembly| reassembly.live_config.as_ref())
+                .is_some(),
+        );
     }
     // Bracket the turn with AgentStart/AgentEnd so entry points that dispatch
     // through `agent_turn` (gateway webhook chat via `process_message`, peer
@@ -1045,7 +1061,7 @@ async fn agent_turn_with_sop_reassembly(
         channel_reply_target,
         cancellation_token: None,
         on_delta: None,
-        shared_budget: None, // no shared budget for agent_turn callers
+        shared_budget,
         channel,
         collected_receipts: None,
         event_tx: None,
@@ -1247,7 +1263,7 @@ static RESOLVED_AGENT_FOR_TURN_TEST_HOOK: LazyLock<Mutex<Option<ResolvedAgentFor
     LazyLock::new(|| Mutex::new(None));
 
 #[cfg(test)]
-type AgentTurnSopReassemblyTestHook = Arc<dyn Fn(bool) + Send + Sync>;
+type AgentTurnSopReassemblyTestHook = Arc<dyn Fn(bool, bool) + Send + Sync>;
 
 #[cfg(test)]
 static AGENT_TURN_SOP_REASSEMBLY_TEST_HOOK: LazyLock<
@@ -1790,7 +1806,7 @@ pub async fn run(
         }
         retain_registered_tool_descriptions(&mut tool_descs, &tools_registry);
         let bootstrap_max_chars = if eff_compact_context {
-            Some(6000)
+            Some(crate::agent::system_prompt::COMPACT_BOOTSTRAP_MAX_CHARS)
         } else {
             None
         };
@@ -2021,6 +2037,11 @@ pub async fn run(
                 ChatMessage::system(&system_prompt),
                 ChatMessage::user(&enriched),
             ];
+            let execution_tree_budget = ExecutionTreeBudget::current()
+                .map(|budget| budget.child())
+                .or_else(|| {
+                    ExecutionTreeBudget::from_limit(agent.resolved.max_execution_tree_iterations)
+                });
             // One-shot transcript: no prior trim ran, so no crumb exists.
             let mut history_has_trim_breadcrumb = false;
 
@@ -2116,7 +2137,7 @@ pub async fn run(
                                 channel_reply_target: None,
                                 cancellation_token: None,
                                 on_delta: None,
-                                shared_budget: None,
+                                shared_budget: execution_tree_budget.clone(),
                                 channel: None,
                                 collected_receipts: None,
                                 event_tx: None,
@@ -2143,6 +2164,7 @@ pub async fn run(
                                 served_route_sink: None,
                                 sop_reassembly: Some(crate::agent::turn::SopStepReassembly {
                                     config: &config,
+                                    live_config: None,
                                 }),
                             }),
                         ),
@@ -2576,6 +2598,13 @@ pub async fn run(
                 };
 
                 history.push(ChatMessage::user(&enriched));
+                let execution_tree_budget = ExecutionTreeBudget::current()
+                    .map(|budget| budget.child())
+                    .or_else(|| {
+                        ExecutionTreeBudget::from_limit(
+                            agent.resolved.max_execution_tree_iterations,
+                        )
+                    });
 
                 // Set up streaming channel so tool progress and response
                 // content are printed progressively instead of buffered.
@@ -2712,7 +2741,7 @@ pub async fn run(
                                     channel_reply_target: None,
                                     cancellation_token: Some(cancel_token.clone()),
                                     on_delta: Some(delta_tx.clone()),
-                                    shared_budget: None,
+                                    shared_budget: execution_tree_budget.clone(),
                                     channel: None,
                                     collected_receipts: None,
                                     event_tx: None,
@@ -2739,6 +2768,7 @@ pub async fn run(
                                     served_route_sink: None,
                                     sop_reassembly: Some(crate::agent::turn::SopStepReassembly {
                                         config: &config,
+                                        live_config: None,
                                     }),
                                 }),
                             ),
@@ -3039,7 +3069,15 @@ pub async fn process_message(
     session_id: Option<&str>,
     origin: TurnOrigin,
 ) -> Result<String> {
-    process_message_shared(Arc::new(config), agent_alias, message, session_id, origin).await
+    process_message_inner(
+        Arc::new(config),
+        None,
+        agent_alias,
+        message,
+        session_id,
+        origin,
+    )
+    .await
 }
 
 /// Shared-snapshot implementation for callers that already own the canonical
@@ -3048,6 +3086,58 @@ pub async fn process_message(
 /// futures.
 pub(crate) async fn process_message_shared(
     config: Arc<Config>,
+    agent_alias: &str,
+    message: &str,
+    session_id: Option<&str>,
+    origin: TurnOrigin,
+) -> Result<String> {
+    process_message_inner(config, None, agent_alias, message, session_id, origin).await
+}
+
+/// Shared-snapshot variant that also preserves the daemon's live tool-policy source.
+pub(crate) async fn process_message_shared_with_live_config(
+    config: Arc<Config>,
+    live_config: Arc<parking_lot::RwLock<Config>>,
+    agent_alias: &str,
+    message: &str,
+    session_id: Option<&str>,
+    origin: TurnOrigin,
+) -> Result<String> {
+    process_message_inner(
+        config,
+        Some(live_config),
+        agent_alias,
+        message,
+        session_id,
+        origin,
+    )
+    .await
+}
+
+/// Process a single message while preserving the daemon/gateway's live config
+/// source for tools that resolve security policy at execution time.
+pub async fn process_message_with_live_config(
+    config: Config,
+    live_config: Arc<parking_lot::RwLock<Config>>,
+    agent_alias: &str,
+    message: &str,
+    session_id: Option<&str>,
+    origin: TurnOrigin,
+) -> Result<String> {
+    process_message_inner(
+        Arc::new(config),
+        Some(live_config),
+        agent_alias,
+        message,
+        session_id,
+        origin,
+    )
+    .await
+}
+
+async fn process_message_inner(
+    config: Arc<Config>,
+    live_config: Option<Arc<parking_lot::RwLock<Config>>>,
     agent_alias: &str,
     message: &str,
     session_id: Option<&str>,
@@ -3189,7 +3279,7 @@ pub(crate) async fn process_message_shared(
             None,
             sop_engine,
             sop_audit,
-            None,
+            live_config.clone(),
         )?;
         let skills = crate::skills::load_skills_for_agent_from_config(&config, agent_alias);
         let assembled = scoped::ScopedToolRegistry::assemble(scoped::ScopedAssembly {
@@ -3397,7 +3487,7 @@ pub(crate) async fn process_message_shared(
         tool_descs.retain(|(name, _)| effective_tool_names.contains(name));
 
         let bootstrap_max_chars = if eff_compact_context {
-            Some(6000)
+            Some(crate::agent::system_prompt::COMPACT_BOOTSTRAP_MAX_CHARS)
         } else {
             None
         };
@@ -3618,7 +3708,10 @@ pub(crate) async fn process_message_shared(
                     }),
                     Some(agent_alias),
                     Some(&turn_id),
-                    Some(SopStepReassembly { config: &config }),
+                    Some(SopStepReassembly {
+                        config: &config,
+                        live_config,
+                    }),
                 ),
             )
             .await
@@ -18244,22 +18337,32 @@ Let me check the result."#;
             .risk_profiles
             .insert("default".to_string(), RiskProfileConfig::default());
 
-        let seen = Arc::new(std::sync::Mutex::new(Vec::<bool>::new()));
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<(bool, bool)>::new()));
         let seen_for_hook = Arc::clone(&seen);
         {
             let mut hook = super::AGENT_TURN_SOP_REASSEMBLY_TEST_HOOK
                 .lock()
                 .expect("agent-turn reassembly test hook lock should not be poisoned");
-            *hook = Some(Arc::new(move |has_reassembly| {
+            *hook = Some(Arc::new(move |has_reassembly, has_live_config| {
                 seen_for_hook
                     .lock()
                     .expect("seen lock should not be poisoned")
-                    .push(has_reassembly);
+                    .push((has_reassembly, has_live_config));
             }));
         }
 
-        let result = super::process_message(
+        let snapshot_result = super::process_message(
+            config.clone(),
+            "process-message-reassembly-agent",
+            "hello",
+            Some("session"),
+            TurnOrigin::SubTurn,
+        )
+        .await;
+        let live_config = Arc::new(parking_lot::RwLock::new(config.clone()));
+        let live_result = super::process_message_with_live_config(
             config,
+            live_config,
             "process-message-reassembly-agent",
             "hello",
             Some("session"),
@@ -18276,10 +18379,193 @@ Let me check the result."#;
 
         let seen = seen.lock().expect("seen lock should not be poisoned");
         assert!(
-            seen.iter().any(|has_reassembly| *has_reassembly),
+            seen.iter()
+                .any(|(has_reassembly, has_live_config)| *has_reassembly && !*has_live_config),
             "process_message must pass a config-backed SopStepReassembly handle into agent_turn; \
-             observed {seen:?}; process_message result: {result:?}"
+             observed {seen:?}; process_message result: {snapshot_result:?}"
         );
+        assert!(
+            seen.iter()
+                .any(|(has_reassembly, has_live_config)| *has_reassembly && *has_live_config),
+            "process_message_with_live_config must pass a live-config-backed SopStepReassembly \
+             handle into agent_turn; observed {seen:?}; process_message result: {live_result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_message_with_live_config_file_download_observes_revoked_private_host() {
+        use axum::{Json, Router, extract::State, routing::post};
+        use tempfile::TempDir;
+        use tokio::net::TcpListener;
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path, query_param},
+        };
+        use zeroclaw_config::schema::{AliasedAgentConfig, FileDownloadConfig, RiskProfileConfig};
+
+        #[derive(Clone)]
+        struct ProviderState {
+            calls: Arc<AtomicUsize>,
+            requests: Arc<Mutex<Vec<serde_json::Value>>>,
+        }
+
+        async fn respond_with_file_download_then_done(
+            State(state): State<ProviderState>,
+            Json(body): Json<serde_json::Value>,
+        ) -> Json<serde_json::Value> {
+            state
+                .requests
+                .lock()
+                .expect("provider request capture lock should be valid")
+                .push(body);
+            let call = state.calls.fetch_add(1, Ordering::SeqCst);
+            Json(if call == 0 {
+                serde_json::json!({
+                    "choices": [{
+                        "message": {
+                            "content": null,
+                            "tool_calls": [{
+                                "id": "call-file-download",
+                                "type": "function",
+                                "function": {
+                                    "name": "file_download",
+                                    "arguments": "{\"document_id\":\"doc-1\",\"dest_path\":\"out.bin\"}"
+                                }
+                            }]
+                        },
+                        "finish_reason": "tool_calls"
+                    }]
+                })
+            } else {
+                serde_json::json!({
+                    "choices": [{"message": {"content": "done"}}]
+                })
+            })
+        }
+
+        let tmp = TempDir::new().expect("temp dir");
+        let download_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/download"))
+            .and(query_param("document_id", "doc-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"should-not-download"))
+            .expect(0)
+            .mount(&download_server)
+            .await;
+
+        let provider_state = ProviderState {
+            calls: Arc::new(AtomicUsize::new(0)),
+            requests: Arc::new(Mutex::new(Vec::new())),
+        };
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test provider listener should bind");
+        let provider_addr = listener.local_addr().expect("test provider address");
+        let app = Router::new()
+            .route(
+                "/chat/completions",
+                post(respond_with_file_download_then_done),
+            )
+            .with_state(provider_state.clone());
+        let provider_server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test provider serves");
+        });
+
+        let mut config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            file_download: FileDownloadConfig {
+                url: Some(format!("{}/download", download_server.uri())),
+                allowed_private_hosts: vec!["127.0.0.1".into()],
+                ..FileDownloadConfig::default()
+            },
+            ..zeroclaw_config::schema::Config::default()
+        };
+        let provider = config
+            .providers
+            .models
+            .ensure("custom", "default")
+            .expect("custom provider slot");
+        provider.api_key = Some("test-key".to_string());
+        provider.model = Some("test-model".to_string());
+        provider.uri = Some(format!("http://{provider_addr}"));
+        provider.native_tools = Some(true);
+        config.memory.backend = "none".to_string();
+        config.memory.auto_save = false;
+        config.risk_profiles.insert(
+            "full".to_string(),
+            RiskProfileConfig {
+                level: crate::security::AutonomyLevel::Full,
+                allowed_tools: vec!["file_download".to_string()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.agents.insert(
+            "live-file-download-agent".to_string(),
+            AliasedAgentConfig {
+                model_provider: "custom.default".into(),
+                risk_profile: "full".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        std::fs::create_dir_all(config.agent_workspace_dir("live-file-download-agent"))
+            .expect("agent workspace directory");
+
+        let live_config = Arc::new(RwLock::new(config.clone()));
+        live_config
+            .write()
+            .file_download
+            .allowed_private_hosts
+            .clear();
+
+        let result = super::process_message_with_live_config(
+            config.clone(),
+            live_config,
+            "live-file-download-agent",
+            "download the private document",
+            Some("session"),
+            TurnOrigin::Channel,
+        )
+        .await
+        .expect("process_message_with_live_config should complete");
+
+        provider_server.abort();
+        assert_eq!(result, "done");
+        assert_eq!(
+            provider_state.calls.load(Ordering::SeqCst),
+            2,
+            "the second model call should receive the denied tool result"
+        );
+        {
+            let requests = provider_state
+                .requests
+                .lock()
+                .expect("provider requests lock should be valid");
+            assert!(
+                requests.iter().any(|body| body
+                    .to_string()
+                    .contains("file_download.allowed_private_hosts")),
+                "model provider should receive the live-policy denial result, got {requests:?}"
+            );
+        }
+        assert!(
+            !config
+                .agent_workspace_dir("live-file-download-agent")
+                .join("out.bin")
+                .exists(),
+            "revoked private-host policy must fail before writing the download"
+        );
+        assert!(
+            download_server
+                .received_requests()
+                .await
+                .unwrap()
+                .is_empty(),
+            "revoked private-host policy must fail before contacting the private endpoint"
+        );
+        download_server.verify().await;
     }
 
     #[tokio::test]
@@ -19421,7 +19707,7 @@ Let me check the result."#;
         }
         assert_eq!(
             hook_calls.load(Ordering::SeqCst),
-            if summary { 1 } else { 2 },
+            2,
             "one hook per preparation"
         );
         let captured = requests.lock().unwrap();
@@ -19485,12 +19771,13 @@ Let me check the result."#;
             }
             if summary {
                 assert_eq!(next.schema_tokens, 0, "the summary is tools-free");
+                let mut tail = next.messages.iter().rev();
+                assert_eq!(tail.next().unwrap().content, "hook suffix");
                 assert!(
-                    next.messages
-                        .last()
+                    tail.next()
                         .unwrap()
                         .content
-                        .starts_with("You have reached")
+                        .starts_with("Agent exceeded maximum tool iterations")
                 );
                 assert!(
                     next.messages
@@ -19515,9 +19802,9 @@ Let me check the result."#;
                     .any(|m| m.content.contains(&"r".repeat(4000)))
             );
             assert!(
-                !history
-                    .iter()
-                    .any(|m| m.content.starts_with("You have reached")),
+                !history.iter().any(|m| m
+                    .content
+                    .starts_with("Agent exceeded maximum tool iterations")),
                 "failed summary must not append a synthetic user turn"
             );
         }

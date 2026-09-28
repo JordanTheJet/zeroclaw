@@ -50,6 +50,7 @@ const SUPPORTED_PROXY_SERVICE_KEYS: &[&str] = &[
     "tool.a2a",
     "tool.browser",
     "tool.composio",
+    "tool.file_download",
     "tool.http_request",
     "tool.pushover",
     "tool.web_search",
@@ -3754,6 +3755,7 @@ impl Default for DelegateToolConfig {
 pub struct ResolvedRuntime {
     pub compact_context: bool,
     pub max_tool_iterations: usize,
+    pub max_execution_tree_iterations: Option<usize>,
     /// History retention limit. Structured Agent and legacy loop sessions
     /// interpret this as complete turns; channel caches retain message rows.
     pub max_history_messages: usize,
@@ -3924,6 +3926,7 @@ impl Default for ResolvedRuntime {
         Self {
             compact_context: true,
             max_tool_iterations: 10,
+            max_execution_tree_iterations: None,
             max_history_messages: 50,
             max_context_tokens: None,
             model_context_window: 32_000,
@@ -4536,6 +4539,12 @@ impl Config {
     }
 
     #[must_use]
+    pub fn effective_max_execution_tree_iterations(&self, agent_alias: &str) -> Option<usize> {
+        self.runtime_profile_for_agent(agent_alias)
+            .and_then(|p| p.max_execution_tree_iterations)
+    }
+
+    #[must_use]
     pub fn effective_max_history_messages(&self, agent_alias: &str) -> usize {
         self.runtime_profile_for_agent(agent_alias)
             .and_then(|p| p.max_history_messages)
@@ -4806,6 +4815,8 @@ impl Config {
         let model_context_window = self.resolved_model_context_window(agent_alias);
         let mut resolved = ResolvedRuntime {
             max_tool_iterations: self.effective_max_tool_iterations(agent_alias),
+            max_execution_tree_iterations: self
+                .effective_max_execution_tree_iterations(agent_alias),
             max_history_messages: self.effective_max_history_messages(agent_alias),
             // Absolute operator budget. In opt-in ratio mode it also caps the
             // model-derived threshold (see `effective_context_budget`).
@@ -10213,6 +10224,13 @@ pub struct FileDownloadConfig {
     #[serde(default = "default_file_download_timeout_secs")]
     pub timeout_secs: u64,
 
+    /// Private, loopback, or link-local endpoint hosts that file_download may
+    /// contact. Cloud metadata and credential-delivery addresses remain blocked
+    /// even when their host appears here. Use only for operator-controlled
+    /// internal document services.
+    #[serde(default)]
+    pub allowed_private_hosts: Vec<String>,
+
     /// Static HTTP headers attached to every download request — typically an
     /// `Authorization: Bearer …` token for the upstream endpoint. Same shape as
     /// `[mcp.servers.*.headers]`.
@@ -10237,6 +10255,7 @@ impl Default for FileDownloadConfig {
             max_file_size_bytes: default_file_download_max_size_bytes(),
             timeout_secs: default_file_download_timeout_secs(),
             headers: HashMap::new(),
+            allowed_private_hosts: Vec::new(),
         }
     }
 }
@@ -10781,13 +10800,13 @@ pub enum ProxyScope {
 }
 
 /// Proxy configuration for outbound HTTP/HTTPS/SOCKS5 traffic (`[proxy]` section).
-/// The standard `web_fetch` request and every `http_request` request are direct
-/// so their locally validated DNS answers can be pinned: they bypass environment
-/// proxies and reject a runtime proxy scope that applies to `tool.web_fetch` or
-/// `tool.http_request`, including an enabled `environment` scope. Unmanaged process
-/// proxy variables are warned when ignored. The optional Firecrawl API fallback uses
-/// normal environment proxy discovery. To proxy other traffic, use `services` scope
-/// without those selectors or `tool.*`.
+/// The standard `web_fetch` request, every `http_request` request, and configured
+/// `file_download` requests are direct so their locally validated DNS answers can
+/// be pinned: they bypass environment proxies and reject a runtime proxy scope
+/// that applies to their `tool.*` selectors, including an enabled `environment`
+/// scope. Unmanaged process proxy variables are warned when ignored. The optional
+/// Firecrawl API fallback uses normal environment proxy discovery. To proxy other
+/// traffic, use `services` scope without those selectors or `tool.*`.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "proxy"]
@@ -14452,6 +14471,8 @@ pub struct RuntimeProfileConfig {
     pub agentic: bool,
     /// Maximum tool-call iterations in agentic mode. `0` inherits the global default.
     pub max_tool_iterations: usize,
+    /// Maximum aggregate loop iterations for one execution tree. Omitted disables it.
+    pub max_execution_tree_iterations: Option<usize>,
     // ── Budget caps (enforced with subagent parent-subset discipline) ──
     /// Maximum actions allowed per hour. `0` is a hard zero budget — the
     /// per-sender rate tracker treats a max of 0 as always exhausted
@@ -14535,6 +14556,7 @@ impl Default for RuntimeProfileConfig {
         Self {
             agentic: false,
             max_tool_iterations: 0,
+            max_execution_tree_iterations: None,
             max_actions_per_hour: 20,
             max_cost_per_day_cents: 500,
             shell_timeout_secs: 60,
@@ -22686,30 +22708,49 @@ impl Config {
             return;
         }
 
-        let (http_request_blocked, web_fetch_blocked) = match self.proxy.scope {
-            ProxyScope::Environment | ProxyScope::Zeroclaw => (true, true),
-            ProxyScope::Services => (
-                self.proxy.should_apply_to_service("tool.http_request"),
-                self.proxy.should_apply_to_service("tool.web_fetch"),
-            ),
-        };
-        if !http_request_blocked && !web_fetch_blocked {
+        let file_download_enabled = self
+            .file_download
+            .url
+            .as_deref()
+            .is_some_and(|url| !url.trim().is_empty());
+        let mut affected = Vec::new();
+        match self.proxy.scope {
+            ProxyScope::Environment | ProxyScope::Zeroclaw => {
+                affected.push("http_request");
+                affected.push("web_fetch");
+                if file_download_enabled {
+                    affected.push("file_download");
+                }
+            }
+            ProxyScope::Services => {
+                if self.proxy.should_apply_to_service("tool.http_request") {
+                    affected.push("http_request");
+                }
+                if self.proxy.should_apply_to_service("tool.web_fetch") {
+                    affected.push("web_fetch");
+                }
+                if file_download_enabled && self.proxy.should_apply_to_service("tool.file_download")
+                {
+                    affected.push("file_download");
+                }
+            }
+        }
+        if affected.is_empty() {
             return;
         }
-
-        let affected = match (http_request_blocked, web_fetch_blocked) {
-            (true, true) => "http_request and web_fetch",
-            (true, false) => "http_request",
-            (false, true) => "web_fetch",
-            (false, false) => return,
+        let affected = match affected.as_slice() {
+            [one] => (*one).to_string(),
+            [first, second] => format!("{first} and {second}"),
+            [first, second, third] => format!("{first}, {second}, and {third}"),
+            _ => affected.join(", "),
         };
         warnings.push(crate::validation_warnings::ValidationWarning::new(
             "proxy_conflicts_with_dns_pinned_tools",
             format!(
                 "The configured proxy scope applies to DNS-pinned tool calls ({affected}), so \
                  those calls will fail instead of using an unpinned proxy connection. Use \
-                 proxy.scope = \"services\" and omit tool.http_request and tool.* from \
-                 proxy.services; tool.* also selects web_fetch."
+                 proxy.scope = \"services\" and omit tool.http_request, tool.web_fetch, \
+                 tool.file_download, and tool.* from proxy.services."
             ),
             if self.proxy.scope == ProxyScope::Services {
                 "proxy.services"
@@ -23383,6 +23424,16 @@ impl Config {
     pub fn validate(&self) -> Result<()> {
         validate_memory_rerank_config(&self.memory)?;
         self.cost.rates.validate()?;
+
+        for (profile_alias, profile) in &self.runtime_profiles {
+            if profile.max_execution_tree_iterations == Some(0) {
+                validation_bail!(
+                    InvalidNumericRange,
+                    format!("runtime_profiles.{profile_alias}.max_execution_tree_iterations"),
+                    "runtime_profiles.{profile_alias}.max_execution_tree_iterations must be greater than 0"
+                );
+            }
+        }
 
         let websocket_ping_interval_secs = self.gateway.websocket_ping_interval_secs;
         if websocket_ping_interval_secs > GATEWAY_WEBSOCKET_PING_INTERVAL_MAX_SECS {
@@ -32763,6 +32814,7 @@ reasoning_effort = "turbo"
         let cfg = AliasedAgentConfig::default();
         assert!(cfg.resolved.compact_context);
         assert_eq!(cfg.resolved.max_tool_iterations, 10);
+        assert_eq!(cfg.resolved.max_execution_tree_iterations, None);
         assert_eq!(cfg.resolved.max_history_messages, 50);
         assert!(!cfg.resolved.parallel_tools);
         assert_eq!(cfg.resolved.tool_dispatcher, "auto");
@@ -32866,6 +32918,62 @@ runtime_profile = "fast"
 "#;
         let parsed = parse_test_config(raw);
         assert_eq!(parsed.effective_max_tool_iterations("default"), 10);
+    }
+
+    #[test]
+    async fn runtime_profile_execution_tree_budget_is_disabled_when_omitted() {
+        let raw = r#"
+[runtime_profiles.default]
+
+[agents.default]
+runtime_profile = "default"
+"#;
+        let parsed = parse_test_config(raw);
+        assert_eq!(
+            parsed.effective_max_execution_tree_iterations("default"),
+            None
+        );
+        let agent = parsed.resolved_agent_config("default").unwrap();
+        assert_eq!(agent.resolved.max_execution_tree_iterations, None);
+    }
+
+    #[test]
+    async fn runtime_profile_execution_tree_budget_resolves_positive_value() {
+        let raw = r#"
+[runtime_profiles.default]
+max_execution_tree_iterations = 7
+
+[agents.default]
+runtime_profile = "default"
+"#;
+        let parsed = parse_test_config(raw);
+        assert_eq!(
+            parsed.effective_max_execution_tree_iterations("default"),
+            Some(7)
+        );
+        let agent = parsed.resolved_agent_config("default").unwrap();
+        assert_eq!(agent.resolved.max_execution_tree_iterations, Some(7));
+    }
+
+    #[test]
+    async fn validate_rejects_zero_runtime_profile_execution_tree_budget() {
+        let mut config = Config::default();
+        config.runtime_profiles.insert(
+            "default".to_string(),
+            RuntimeProfileConfig {
+                max_execution_tree_iterations: Some(0),
+                ..RuntimeProfileConfig::default()
+            },
+        );
+
+        let error = config
+            .validate()
+            .expect_err("zero execution-tree budget must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("runtime_profiles.default.max_execution_tree_iterations")
+        );
     }
 
     #[test]
@@ -37045,6 +37153,24 @@ api_token = "tok"
         assert_eq!(http_warning.path, "proxy.services");
         assert!(http_warning.message.contains("tool calls (http_request)"));
         assert!(!http_warning.message.contains("tool calls (web_fetch)"));
+
+        let file_download_warning = Config {
+            file_download: FileDownloadConfig {
+                url: Some("https://files.example.test/download".into()),
+                ..FileDownloadConfig::default()
+            },
+            ..services_config(vec!["tool.file_download"])
+        }
+        .collect_warnings()
+        .into_iter()
+        .find(|warning| warning.code == "proxy_conflicts_with_dns_pinned_tools")
+        .expect("the explicit file_download selector must warn when file_download is enabled");
+        assert_eq!(file_download_warning.path, "proxy.services");
+        assert!(
+            file_download_warning
+                .message
+                .contains("tool calls (file_download)")
+        );
 
         let wildcard_warning = services_config(vec!["tool.*"])
             .collect_warnings()
