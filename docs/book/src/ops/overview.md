@@ -153,6 +153,8 @@ The service does not auto-update. Subscribe to the release feed (GitHub releases
 
 If the new version requires config migrations, the startup log emits a warning and the binary usually auto-migrates. Check `zeroclaw config list` to spot-check values after upgrade, and `zeroclaw config migrate` to apply any pending schema migrations manually.
 
+Before you start a new version against an existing config, run `zeroclaw config check` (or `zeroclaw config check <path>`). It reads the file without loading or changing it, and lists what loading would do: keys that will be dropped, keys that will be renamed, keys that are accepted but never read, and a missing `schema_version`. It exits non-zero when anything needs attention; add `--json` for scripts.
+
 ## See also
 
 - [Setup → Service management](../setup/service.md): install/remove/logs per platform

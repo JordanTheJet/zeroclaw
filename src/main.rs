@@ -4527,6 +4527,16 @@ enum ConfigCommands {
         #[arg(long)]
         json: bool,
     },
+    /// Check a config.toml before loading it: report keys that will be dropped,
+    /// renamed, or accepted but never read, and a missing schema_version. Read-only;
+    /// runs before the config is loaded, so it works on a config that won't load.
+    Check {
+        /// Path to the config.toml to check. Defaults to the one the daemon would load.
+        path: Option<PathBuf>,
+        /// Emit the report as JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
     /// Migrate the on-disk config to the current schema version (preserves comments)
     Migrate {
         /// Emit a structured JSON envelope ({migrated, backup_path?, schema_version, valid?, error?}) instead of plain text.
@@ -6323,6 +6333,15 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
     } = &cli.command
     {
         return service::run_openrc_log_writer(matches!(stream, ServiceLogStream::Stderr));
+    }
+
+    // `config check` must run before load: loading can migrate or rewrite the
+    // file, and a config that fails to load is exactly the one worth checking.
+    if let Commands::Config {
+        config_command: ConfigCommands::Check { path, json },
+    } = &cli.command
+    {
+        return run_config_check(path.as_deref(), *json).await;
     }
 
     // All other commands need config loaded first
@@ -9335,6 +9354,7 @@ Add pricing to the active provider profile or supply a catalog entry."
                 }
                 Ok(())
             }
+            ConfigCommands::Check { path, json } => run_config_check(path.as_deref(), json).await,
             ConfigCommands::Migrate { json } => {
                 match crate::config::migration::migrate_file_in_place(&config.config_path)? {
                     Some(report) => {
@@ -10089,6 +10109,104 @@ Add pricing to the active provider profile or supply a catalog entry."
 }
 
 #[cfg(feature = "agent-runtime")]
+/// `zeroclaw config check`: report what loading a config.toml would do to it,
+/// without loading it. Exits non-zero when anything needs attention.
+async fn run_config_check(path: Option<&std::path::Path>, json: bool) -> Result<()> {
+    #[cfg(feature = "schema-export")]
+    {
+        use zeroclaw_config::preflight::Severity;
+
+        let path = match path {
+            Some(p) => p.to_path_buf(),
+            None => {
+                let (config_dir, _) = zeroclaw_config::schema::resolve_runtime_dirs().await?;
+                config_dir.join("config.toml")
+            }
+        };
+        let input = std::fs::read_to_string(&path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        let report = zeroclaw_config::preflight::check(&input);
+        let shown = path.display().to_string();
+
+        if json {
+            let envelope = serde_json::json!({ "path": shown, "report": report });
+            println!("{}", serde_json::to_string_pretty(&envelope)?);
+        } else {
+            let current = report.current_version.to_string();
+            let version = match (report.schema_version_present, report.detected_version) {
+                (true, Some(v)) => ta(
+                    "cli-config-check-version-present",
+                    &[("version", &v.to_string())],
+                    format!("schema_version {v}"),
+                ),
+                _ => t("cli-config-check-version-missing", "NO schema_version"),
+            };
+            println!(
+                "{}",
+                ta(
+                    "cli-config-check-header",
+                    &[
+                        ("path", &shown),
+                        ("version", &version),
+                        ("current", &current)
+                    ],
+                    format!("{shown} ({version}; current {current})"),
+                )
+            );
+            for f in &report.findings {
+                let level = match f.severity {
+                    Severity::Error => t("cli-config-check-level-error", "ERROR"),
+                    Severity::Warning => t("cli-config-check-level-warning", "WARN"),
+                    Severity::Info => t("cli-config-check-level-info", "info"),
+                };
+                let to = f.to.clone().unwrap_or_default();
+                let detail = f.detail.clone().unwrap_or_default();
+                let message = ta(
+                    &format!("cli-config-check-{}", f.reason),
+                    &[
+                        ("path", &f.path),
+                        ("to", &to),
+                        ("current", &current),
+                        ("detail", &detail),
+                    ],
+                    format!("{}: {} {to} {detail}", f.reason, f.path),
+                );
+                println!("\n{level}  {message}");
+            }
+            let problems = report
+                .findings
+                .iter()
+                .filter(|f| f.severity <= Severity::Warning)
+                .count();
+            if problems == 0 {
+                println!("\n{}", t("cli-config-check-none", "No problems found."));
+            } else {
+                println!(
+                    "\n{}",
+                    ta(
+                        "cli-config-check-count",
+                        &[("count", &problems.to_string())],
+                        format!("{problems} problem(s) found."),
+                    )
+                );
+            }
+        }
+        if report.has_problems() {
+            bail!(ta(
+                "cli-config-check-failed",
+                &[("path", &shown)],
+                format!("config check found problems in {shown}"),
+            ));
+        }
+        Ok(())
+    }
+    #[cfg(not(feature = "schema-export"))]
+    {
+        let _ = (path, json);
+        bail!("`config check` requires the schema-export feature") // i18n-exempt: feature-gated build error
+    }
+}
+
 fn handle_estop_command(
     config: &Config,
     estop_command: Option<EstopSubcommands>,
@@ -19744,5 +19862,28 @@ hosts = ["api.example.com", "api2.example.com"]
             b_after.contains("gitea.b.example.net"),
             "premise: profile B's operator-only grant is on disk: {b_after}"
         );
+    }
+}
+
+#[cfg(all(test, feature = "schema-export"))]
+mod config_check_tests {
+    #[test]
+    fn every_config_check_reason_has_an_english_message() {
+        // Each preflight reason renders as the Fluent message
+        // `cli-config-check-<reason>`; a missing one would print a raw key.
+        let ftl = include_str!("../crates/zeroclaw-runtime/locales/en/cli.ftl");
+        let preflight = zeroclaw_config::preflight::RETIRED_KEYS
+            .iter()
+            .map(|r| r.reason)
+            .chain(
+                zeroclaw_config::preflight::INERT_KEYS
+                    .iter()
+                    .map(|r| r.reason),
+            )
+            .chain(zeroclaw_config::preflight::BUILTIN_REASONS.iter().copied());
+        for reason in preflight {
+            let key = format!("\ncli-config-check-{reason} =");
+            assert!(ftl.contains(&key), "missing Fluent message{key}");
+        }
     }
 }

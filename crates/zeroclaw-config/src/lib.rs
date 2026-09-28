@@ -22,6 +22,8 @@ pub mod pairing;
 pub mod paths;
 pub mod platform;
 pub mod policy;
+#[cfg(feature = "schema-export")]
+pub mod preflight;
 pub mod presets;
 pub mod provider_aliases;
 pub mod providers;

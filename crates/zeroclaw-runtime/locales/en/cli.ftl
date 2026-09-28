@@ -53,6 +53,7 @@ cli-config-get-about = Get a config property value
 cli-config-set-about = Set a config property (secret fields auto-prompt for masked input)
 cli-config-init-about = Initialize unconfigured sections with defaults (enabled=false)
 cli-config-migrate-about = Migrate config.toml to the current schema version on disk (preserves comments)
+cli-config-check-about = Check a config.toml before loading it: keys that will be dropped, renamed, or accepted but never read, and a missing schema_version
 
 cli-service-install-about = Install daemon service unit for auto-start and restart
 cli-service-start-about = Start daemon service
@@ -883,6 +884,29 @@ cli-desktop-blurb1 = The companion app is a lightweight menu bar app that
 cli-desktop-blurb2 = connects to the same gateway as the CLI.
 cli-config-all-configured = All sections already configured.
 cli-config-schema-current = Config already at current schema version.
+cli-config-check-header = Checked {$path} ({$version}; this binary is at schema_version {$current})
+cli-config-check-version-present = schema_version {$version}
+cli-config-check-version-missing = NO schema_version
+cli-config-check-level-error = ERROR
+cli-config-check-level-warning = WARN
+cli-config-check-level-info = info
+cli-config-check-none = No problems found.
+cli-config-check-count = {$count} problem(s) found. Nothing was changed.
+cli-config-check-failed = config check found problems in {$path}
+cli-config-check-parse-error = Not valid TOML, so nothing can load it: {$detail}
+cli-config-check-invalid-schema-version = schema_version is not usable: {$detail}
+cli-config-check-missing-schema-version = NO schema_version. This file will be treated as a V1 config and rewritten by the V1 migration, which collapses hand-written channel aliases into "default" and can move or drop the keys listed below. If this file was written for a current ZeroClaw, add `schema_version = {$current}` as its first line before starting the daemon. If it really is a V1 config, back it up and run `zeroclaw config migrate`.
+cli-config-check-newer-schema-version = This file's schema_version is newer than this binary supports ({$current}), so it will refuse to load. Upgrade ZeroClaw.
+cli-config-check-migration-failed = Migrating this file to the current schema fails, so it will not load: {$detail}
+cli-config-check-migration-moved = {$path} is moved to {$to} by the schema migration.
+cli-config-check-migration-removed = {$path} is removed by the schema migration.
+cli-config-check-load-error = This config will not load: {$detail}
+cli-config-check-legacy-spelling = {$path} is a legacy spelling of {$to}. It is accepted, and written back as {$to} on the next save.
+cli-config-check-unknown-key = {$path} is not a key ZeroClaw knows here. The loader ignores it and it is lost on the next save. Check the spelling and which section it is in.
+cli-config-check-retired-security-nevis = {$path} is retired: the Nevis integration was removed. Its content is discarded at load and the table is dropped on the next save. Configure [oidc.<alias>] with [users] / [permission_profiles] instead.
+cli-config-check-retired-node-transport = {$path} is retired: the legacy HMAC node transport was removed. It is ignored; delete the section.
+cli-config-check-retired-wati = {$path} is retired: WATI support was removed. Move to [channels.whatsapp.<alias>] using the Cloud API or WhatsApp Web, then revoke the unused WATI API token.
+cli-config-check-inert-channel-excluded-tools = {$path} is accepted but never read. Tool exclusion comes from risk_profiles.<profile>.excluded_tools, and a risk profile with level = "full" bypasses exclusions entirely.
 cli-config-applied-ops = Applied {$count} operation(s):
 cli-plugins-none = No plugins installed.
 cli-plugins-installed = Installed plugins:

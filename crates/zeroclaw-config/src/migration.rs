@@ -825,7 +825,7 @@ const _: () = assert!(
 
 /// Run the typed migration chain from `from` up to `CURRENT_SCHEMA_VERSION`.
 /// `from` must be `< CURRENT_SCHEMA_VERSION` (caller checks).
-fn run_chain(value: toml::Value, from: u32) -> Result<toml::Value> {
+pub(crate) fn run_chain(value: toml::Value, from: u32) -> Result<toml::Value> {
     run_chain_until(value, from, CURRENT_SCHEMA_VERSION)
 }
 
