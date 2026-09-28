@@ -67,7 +67,9 @@ pub fn detect_version(value: &toml::Value) -> Result<u32> {
 const V1_KEYS_STILL_CURRENT: &[&str] = &["model_routes", "embedding_routes", "cron"];
 
 /// Whether a config with no `schema_version` key was read as the current
-/// version because its shape leaves no doubt (see [`is_plainly_current_shape`]).
+/// version because its shape leaves no doubt: an alias-keyed
+/// `providers.models.<family>` or `channels.<type>` section, no section in
+/// the older flat shape, and no V1-only top-level key.
 ///
 /// Loaders use this to warn the operator: the key is missing and should be
 /// added, even though the file loads correctly.
