@@ -1418,3 +1418,8 @@ rpc-auth-revalidation-due = Credential revalidation due: re-initialize to revali
 rpc-auth-pairing-revoked = Pairing token revoked: re-pair and re-initialize
 
 cron-agent-job-failed = The scheduled task could not be completed. Please try again or ask an administrator to check the logs.
+
+# Atomic RPC configuration batches
+rpc-config-set-many-empty = config/set-many requires at least one entry in `sets`
+rpc-config-set-many-limit = config/set-many accepts at most { $limit } entries in `sets`; got { $count }
+rpc-config-set-many-entry-rejected = config/set-many entry { $index } (`{ $prop }`) rejected; nothing was saved: { $reason }
