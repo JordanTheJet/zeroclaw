@@ -1216,56 +1216,64 @@ fn paired_ctx(tmp: &tempfile::TempDir) -> Arc<RpcContext> {
     ctx
 }
 
-#[tokio::test]
-async fn pairing_revoke_invalidates_a_registered_devices_token() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let ctx = paired_ctx(&tmp);
-    let now = chrono::Utc::now();
-    crate::devices::DeviceRegistry::shared(&ctx.config.read().data_dir)
-        .register(
-            zeroclaw_config::pairing::PairingGuard::token_hash(PAIRED_TOKEN),
-            crate::devices::DeviceInfo {
-                id: "device-1".into(),
-                name: Some("phone".into()),
-                device_type: None,
-                paired_at: now,
-                last_seen: now,
-                ip_address: None,
-                capabilities: None,
-            },
-        )
-        .unwrap();
-    let (mut operator, mut rx) = local_operator(&ctx).await;
+#[test]
+fn pairing_revoke_invalidates_a_registered_devices_token() {
+    // Persisting the pairing tokens runs the config save, whose debug-build
+    // frames exceed the default test stack; see `run_on_a_large_stack`.
+    run_on_a_large_stack(|| async move {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ctx = paired_ctx(&tmp);
+        let now = chrono::Utc::now();
+        crate::devices::DeviceRegistry::shared(&ctx.config.read().data_dir)
+            .register(
+                zeroclaw_config::pairing::PairingGuard::token_hash(PAIRED_TOKEN),
+                crate::devices::DeviceInfo {
+                    id: "device-1".into(),
+                    name: Some("phone".into()),
+                    device_type: None,
+                    paired_at: now,
+                    last_seen: now,
+                    ip_address: None,
+                    capabilities: None,
+                },
+            )
+            .unwrap();
+        let (mut operator, mut rx) = local_operator(&ctx).await;
 
-    let listed = rpc(&mut operator, &mut rx, 1, "pairing/list", json!({})).await;
-    assert_eq!(listed["result"]["count"], json!(1), "{listed}");
-    let revoked = rpc(
-        &mut operator,
-        &mut rx,
-        2,
-        "pairing/revoke",
-        json!({"device_id": "device-1"}),
-    )
-    .await;
-    assert_eq!(
-        revoked["result"]["device_id"],
-        json!("device-1"),
-        "{revoked}"
-    );
-    assert!(
-        !ctx.auth.pairing().is_authenticated(PAIRED_TOKEN),
-        "the revoked device's bearer no longer authenticates"
-    );
+        let listed = rpc(&mut operator, &mut rx, 1, "pairing/list", json!({})).await;
+        assert_eq!(listed["result"]["count"], json!(1), "{listed}");
+        let revoked = rpc(
+            &mut operator,
+            &mut rx,
+            2,
+            "pairing/revoke",
+            json!({"device_id": "device-1"}),
+        )
+        .await;
+        assert_eq!(
+            revoked["result"]["device_id"],
+            json!("device-1"),
+            "{revoked}"
+        );
+        assert!(
+            !ctx.auth.pairing().is_authenticated(PAIRED_TOKEN),
+            "the revoked device's bearer no longer authenticates"
+        );
+    });
 }
 
-#[tokio::test]
-async fn pairing_revoke_all_invalidates_every_paired_token() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let ctx = paired_ctx(&tmp);
-    let (mut operator, mut rx) = local_operator(&ctx).await;
-    let rotated = rpc(&mut operator, &mut rx, 1, "pairing/revoke-all", json!({})).await;
-    assert_eq!(rotated["result"]["success"], json!(true), "{rotated}");
-    assert!(!ctx.auth.pairing().is_authenticated(PAIRED_TOKEN));
+#[test]
+fn pairing_revoke_all_invalidates_every_paired_token() {
+    // Persisting the pairing tokens runs the config save, whose debug-build
+    // frames exceed the default test stack; see `run_on_a_large_stack`.
+    run_on_a_large_stack(|| async move {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ctx = paired_ctx(&tmp);
+        let (mut operator, mut rx) = local_operator(&ctx).await;
+        let rotated = rpc(&mut operator, &mut rx, 1, "pairing/revoke-all", json!({})).await;
+        assert_eq!(rotated["result"]["success"], json!(true), "{rotated}");
+        assert!(!ctx.auth.pairing().is_authenticated(PAIRED_TOKEN));
+    });
 }
 
 #[tokio::test]
