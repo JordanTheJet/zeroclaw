@@ -85,6 +85,32 @@ the operating system:
 | `session/update` | daemon -> client | Streaming notification during a turn (text chunks, tool calls, approvals) |
 | `elicitation/create` | daemon -> client | Request interactive input for ask-user and poll flows |
 
+### Atomic configuration writes
+
+`config/set-many` accepts an ordered `sets` array containing 1–256 objects,
+each with `prop` and `value`. It uses the same property syntax and value rules
+as `config/set`. For example, after creating a permission profile named
+`operator`, an administrator can create a complete user in one request:
+
+```json
+{"jsonrpc":"2.0","method":"config/set-many","params":{"sets":[{"prop":"users.example.uid","value":1001},{"prop":"users.example.permission_profiles","value":["operator"]}]},"id":2}
+```
+
+Success returns `{"props":["users.example.uid","users.example.permission_profiles"],"set":true}`.
+All fields are staged on one candidate and validated before one persistent
+commit. Later entries for the same property win. A staging or commit failure
+leaves the persisted and live config unchanged; an invalid entry error names
+its zero-based index.
+
+The caller needs `Config:Update` and authorization for every requested path.
+The daemon resolves current authority while holding the config write lock,
+before staging any entry. If one path is forbidden, the entire batch is
+refused with `FORBIDDEN`, including the entry index, even if earlier paths
+were allowed. Revocation while waiting for that lock also refuses the batch.
+Provider/model views are prepared from the complete candidate and installed
+after the successful commit. Deletes and map-key operations are not part of
+this method.
+
 ### Bidirectional requests
 
 Either side may send a request on the established socket. The receiver must
