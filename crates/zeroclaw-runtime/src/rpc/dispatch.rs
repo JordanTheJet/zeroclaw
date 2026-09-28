@@ -3010,7 +3010,9 @@ impl RpcDispatcher {
             Method::SopsGraphDraft => self.handle_sops_graph_draft(&req.params),
             Method::SopsTriggerSources => self.handle_sops_trigger_sources(),
             Method::SopsCancel => self.handle_sops_cancel(&req.params),
-            Method::SopsDispatchEvent => self.handle_sops_dispatch_event(&req.params).await,
+            Method::SopsDispatchEvent => {
+                Box::pin(self.handle_sops_dispatch_event(&req.params)).await
+            }
             Method::SopsDecisionModels => self.handle_sops_decision_models(),
             Method::SopsGraphLegend => to_result(crate::sop::GraphLegend::canonical()),
             Method::ToolsParamOptions => self.handle_tools_param_options(&req.params),
