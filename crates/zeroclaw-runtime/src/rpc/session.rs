@@ -20,6 +20,20 @@ pub(crate) enum WaitForProviderUpdateError {
     Timeout,
 }
 
+/// One transient, generation-bound provider publication. Every field is
+/// derived from the same config snapshot and committed under the session
+/// generation fence; this is a transfer object, not another source of truth.
+pub(crate) struct ModelProviderUpdate {
+    pub model_provider: Box<dyn ModelProvider>,
+    pub model_provider_name: String,
+    pub model_name: String,
+    pub model_route_resolver: Arc<zeroclaw_providers::router::ModelRouteResolver>,
+    pub tool_dispatcher: Box<dyn ToolDispatcher>,
+    pub config_generation: Arc<zeroclaw_config::schema::Config>,
+    pub temperature: Option<Option<f64>>,
+    pub multimodal_config: zeroclaw_config::schema::MultimodalConfig,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CancelCause {
@@ -70,6 +84,9 @@ pub struct UploadEntry {
 
 pub struct RpcSession {
     pub agent: Arc<Mutex<Agent>>,
+    /// The same immutable map the Agent's shell tool executes with. Sharing
+    /// it lets admission inspect the incarnation without locking an active turn.
+    forwarded_environment: Option<crate::tools::ForwardedEnvironment>,
     /// Orders provider refreshes and configuration within this session.
     model_provider_update: Arc<Mutex<()>>,
     pub created_at: Instant,
@@ -156,6 +173,7 @@ impl RpcSession {
         chat_mode: crate::rpc::types::ChatMode,
     ) -> Self {
         Self {
+            forwarded_environment: agent.forwarded_environment(),
             agent: Arc::new(Mutex::new(agent)),
             model_provider_update: Arc::new(Mutex::new(())),
             created_at: Instant::now(),
@@ -446,7 +464,8 @@ impl SessionStore {
     /// be adopted. A scoped mismatch is reported as absent, never as a
     /// distinguishable denial.
     ///
-    /// `authorize` then judges that record's agent alias and workspace before
+    /// `authorize` then judges the record's agent alias, workspace and
+    /// forwarded environment before
     /// anything changes, under the same lock that guards the claim, so a
     /// caller it refuses neither takes ownership nor observes a session that
     /// was swapped in after the check. Its refusal comes back as `Ok(Some(Err))`.
@@ -459,7 +478,7 @@ impl SessionStore {
         chat_mode: &crate::rpc::types::ChatMode,
         owner_tui_id: Option<String>,
         expected_owner: Option<&str>,
-        authorize: impl FnOnce(&str, &str) -> Result<(), E>,
+        authorize: impl FnOnce(&str, &str, bool) -> Result<(), E>,
     ) -> Result<Option<Result<ResumedRpcSession, E>>, &'static str> {
         let mut sessions = self.sessions.lock().await;
         let Some(session) = sessions.get_mut(id) else {
@@ -476,7 +495,14 @@ impl SessionStore {
         if &session.chat_mode != chat_mode {
             return Err("session uses a different chat mode");
         }
-        if let Err(refused) = authorize(&session.agent_alias, &session.workspace_dir) {
+        if let Err(refused) = authorize(
+            &session.agent_alias,
+            &session.workspace_dir,
+            session
+                .forwarded_environment
+                .as_ref()
+                .is_some_and(|env| !env.is_empty()),
+        ) {
             return Ok(Some(Err(refused)));
         }
 
@@ -499,6 +525,15 @@ impl SessionStore {
 
     pub async fn get_agent(&self, id: &str) -> Option<Arc<Mutex<Agent>>> {
         self.sessions.lock().await.get(id).map(|s| s.agent.clone())
+    }
+
+    pub(crate) async fn has_forwarded_environment(&self, id: &str) -> Option<bool> {
+        self.sessions.lock().await.get(id).map(|session| {
+            session
+                .forwarded_environment
+                .as_ref()
+                .is_some_and(|env| !env.is_empty())
+        })
     }
 
     pub(crate) async fn lock_model_provider_update(
@@ -911,17 +946,15 @@ impl SessionStore {
     /// When `temperature` is `None`, the agent's temperature is left unchanged
     /// — used by `session/configure` where temperature is already committed
     /// via `set_overrides_gated`.
-    pub async fn apply_model_provider(
+    ///
+    /// `multimodal_config` must be the same `[multimodal]` policy snapshot the
+    /// caller built the provider box from, so the agent-side preparation pass
+    /// and the provider boundary stay on one policy after a live refresh.
+    pub(crate) async fn apply_model_provider(
         &self,
         id: &str,
         generation: u64,
-        model_provider: Box<dyn ModelProvider>,
-        model_provider_name: String,
-        model_name: String,
-        model_route_resolver: Arc<zeroclaw_providers::router::ModelRouteResolver>,
-        tool_dispatcher: Box<dyn ToolDispatcher>,
-        config_generation: Arc<zeroclaw_config::schema::Config>,
-        temperature: Option<Option<f64>>,
+        update: ModelProviderUpdate,
     ) -> bool {
         let done = self.wait_test_gate().await;
         let agent = {
@@ -939,13 +972,14 @@ impl SessionStore {
             }
         };
         let mut guard = agent.lock().await;
-        guard.set_model_provider(model_provider);
-        guard.set_model_provider_name(model_provider_name);
-        guard.set_model_name(model_name);
-        guard.set_model_route_resolver(model_route_resolver);
-        guard.set_tool_dispatcher(tool_dispatcher);
-        guard.set_config_generation(config_generation);
-        if let Some(t) = temperature {
+        guard.set_model_provider(update.model_provider);
+        guard.set_model_provider_name(update.model_provider_name);
+        guard.set_model_name(update.model_name);
+        guard.set_model_route_resolver(update.model_route_resolver);
+        guard.set_tool_dispatcher(update.tool_dispatcher);
+        guard.set_multimodal_config(update.multimodal_config);
+        guard.set_config_generation(update.config_generation);
+        if let Some(t) = update.temperature {
             guard.set_temperature(t);
         }
         self.signal_test_gate_done(done);
@@ -2181,6 +2215,28 @@ mod tests {
         assert_eq!(overrides.temperature, Some(0.7));
     }
 
+    fn test_model_provider_update(
+        provider_name: &str,
+        model_name: &str,
+        temperature: Option<Option<f64>>,
+        multimodal_config: zeroclaw_config::schema::MultimodalConfig,
+    ) -> ModelProviderUpdate {
+        ModelProviderUpdate {
+            model_provider: Box::new(StubProvider),
+            model_provider_name: provider_name.into(),
+            model_name: model_name.into(),
+            model_route_resolver: Arc::new(zeroclaw_providers::router::ModelRouteResolver::new(
+                Vec::new(),
+                provider_name.into(),
+                model_name.into(),
+            )),
+            tool_dispatcher: Box::new(NativeToolDispatcher),
+            config_generation: Arc::new(zeroclaw_config::schema::Config::default()),
+            temperature,
+            multimodal_config,
+        }
+    }
+
     #[tokio::test]
     async fn apply_model_provider_rejects_stale_generation() {
         let store = make_store(4);
@@ -2206,17 +2262,12 @@ mod tests {
             .apply_model_provider(
                 "s",
                 captured_gen,
-                Box::new(StubProvider),
-                "stale-provider".into(),
-                "stale-model".into(),
-                Arc::new(zeroclaw_providers::router::ModelRouteResolver::new(
-                    Vec::new(),
-                    "stale-provider".into(),
-                    "stale-model".into(),
-                )),
-                Box::new(NativeToolDispatcher),
-                Arc::new(zeroclaw_config::schema::Config::default()),
-                Some(Some(0.99)),
+                test_model_provider_update(
+                    "stale-provider",
+                    "stale-model",
+                    Some(Some(0.99)),
+                    zeroclaw_config::schema::MultimodalConfig::default(),
+                ),
             )
             .await;
         assert!(
@@ -2346,17 +2397,12 @@ mod tests {
             .apply_model_provider(
                 "s",
                 captured_gen,
-                Box::new(StubProvider),
-                "new-provider".into(),
-                "new-model".into(),
-                Arc::new(zeroclaw_providers::router::ModelRouteResolver::new(
-                    Vec::new(),
-                    "new-provider".into(),
-                    "new-model".into(),
-                )),
-                Box::new(NativeToolDispatcher),
-                Arc::new(zeroclaw_config::schema::Config::default()),
-                Some(Some(0.42)),
+                test_model_provider_update(
+                    "new-provider",
+                    "new-model",
+                    Some(Some(0.42)),
+                    zeroclaw_config::schema::MultimodalConfig::default(),
+                ),
             )
             .await;
         assert!(applied, "current generation must be accepted");
@@ -2370,6 +2416,52 @@ mod tests {
             guard.temperature_for_test(),
             Some(0.42),
             "temperature must be set on the captured agent under the generation check"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_model_provider_applies_multimodal_policy_to_captured_agent() {
+        let store = make_store(4);
+        store
+            .insert(
+                "s".into(),
+                RpcSession::new(make_agent(), "a", ".", crate::rpc::types::ChatMode::Chat),
+            )
+            .await
+            .unwrap();
+        let captured_gen = store.get_generation("s").await.unwrap();
+
+        // A live refresh swaps the provider alongside a tightened
+        // `[multimodal]` policy; the agent-side preparation pass must see the
+        // same snapshot the provider boundary was built from, or a refresh
+        // that lowers the caps leaves the agent counting against the old,
+        // looser limits.
+        let refreshed = zeroclaw_config::schema::MultimodalConfig {
+            max_images: 1,
+            max_image_size_mb: 1,
+            ..Default::default()
+        };
+
+        let applied = store
+            .apply_model_provider(
+                "s",
+                captured_gen,
+                test_model_provider_update("new-provider", "new-model", None, refreshed),
+            )
+            .await;
+        assert!(applied, "current generation must be accepted");
+
+        let agent = store.get_agent("s").await.unwrap();
+        let guard = agent.lock().await;
+        assert_eq!(
+            guard.multimodal_config_for_test().max_images,
+            1,
+            "max_images must be refreshed on the captured agent"
+        );
+        assert_eq!(
+            guard.multimodal_config_for_test().max_image_size_mb,
+            1,
+            "max_image_size_mb must be refreshed on the captured agent"
         );
     }
 }

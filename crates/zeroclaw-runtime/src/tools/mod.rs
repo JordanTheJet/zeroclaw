@@ -63,7 +63,7 @@ pub use zeroclaw_tools::discord_search::DiscordSearchTool;
 pub use zeroclaw_tools::email_read::EmailReadTool;
 pub use zeroclaw_tools::email_search::EmailSearchTool;
 pub use zeroclaw_tools::escalate::EscalateToHumanTool;
-pub use zeroclaw_tools::file_download::FileDownloadTool;
+pub use zeroclaw_tools::file_download::{FileDownloadSsrfPolicy, FileDownloadTool};
 pub use zeroclaw_tools::file_edit::FileEditTool;
 pub use zeroclaw_tools::file_upload::FileUploadTool;
 pub use zeroclaw_tools::file_upload_bundle::FileUploadBundleTool;
@@ -223,6 +223,10 @@ impl Tool for ArcToolRef {
         self.0.invocation_triggers()
     }
 
+    fn rebind_forwarded_env(&self, env: Option<std::collections::HashMap<String, String>>) {
+        self.0.rebind_forwarded_env(env);
+    }
+
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         self.0.execute(args).await
     }
@@ -307,6 +311,10 @@ impl Tool for ArcDelegatingTool {
 
     fn invocation_triggers(&self) -> Vec<String> {
         self.inner.invocation_triggers()
+    }
+
+    fn rebind_forwarded_env(&self, env: Option<std::collections::HashMap<String, String>>) {
+        self.inner.rebind_forwarded_env(env);
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
@@ -550,6 +558,8 @@ pub const BUILTIN_TOOL_INTEGRATIONS: &[(&str, &str)] = &[
         "Spawn an ephemeral SubAgent that inherits this agent's identity",
     ),
 ];
+
+pub use shell_env::ForwardedEnvironment;
 
 /// Bundled return values from tool registry construction.
 /// Named struct to avoid an ever-growing positional tuple that's painful
@@ -1045,7 +1055,7 @@ pub fn all_tools_with_runtime(
         root_config,
         canvas_store,
         is_subagent_caller,
-        tui_env,
+        tui_env.map(Arc::new),
         sop_engine,
         sop_audit,
         live_config,
@@ -1077,7 +1087,7 @@ pub fn all_tools_with_runtime_and_acp_sessions(
     root_config: &zeroclaw_config::schema::Config,
     canvas_store: Option<CanvasStore>,
     is_subagent_caller: bool,
-    tui_env: Option<HashMap<String, String>>,
+    tui_env: Option<ForwardedEnvironment>,
     sop_engine: Option<Arc<Mutex<SopEngine>>>,
     sop_audit: Option<Arc<SopAuditLogger>>,
     // Live config handle for `send_via` peer-group authority. `Some` from the
@@ -1165,7 +1175,7 @@ fn all_tools_with_runtime_on_thread(
     root_config: &zeroclaw_config::schema::Config,
     canvas_store: Option<CanvasStore>,
     is_subagent_caller: bool,
-    tui_env: Option<HashMap<String, String>>,
+    tui_env: Option<ForwardedEnvironment>,
     sop_engine: Option<Arc<Mutex<SopEngine>>>,
     sop_audit: Option<Arc<SopAuditLogger>>,
     // Live config handle for `send_via` peer-group authority. `Some` from the
@@ -1202,7 +1212,7 @@ fn all_tools_with_runtime_on_thread(
                 } else {
                     root_config.shell_tool.timeout_secs
                 })
-                .with_tui_env(tui_env)
+                .with_shared_tui_env(tui_env)
                 .with_persistent_writes(persistent_writes),
             security.clone(),
         )),
@@ -1283,9 +1293,10 @@ fn all_tools_with_runtime_on_thread(
             )
             .with_subagent_caller(is_subagent_caller),
         ),
-        Arc::new(SendMessageToPeerTool::new(
+        Arc::new(SendMessageToPeerTool::new_with_live_config(
             Arc::clone(&root_config_shared),
             agent_alias,
+            live_config.clone(),
         )),
         Arc::new(ModelRoutingConfigTool::new(
             config.clone(),
@@ -1761,19 +1772,23 @@ fn all_tools_with_runtime_on_thread(
 
     // Backup tool (enabled by default)
     if root_config.backup.enabled {
-        tool_arcs.push(Arc::new(BackupTool::new(
-            workspace_dir.to_path_buf(),
+        tool_arcs.push(Arc::new(BackupTool::new_with_data_root_and_security(
+            config.data_dir.clone(),
             root_config.backup.include_dirs.clone(),
             root_config.backup.max_keep,
+            security.clone(),
         )));
     }
 
     // Data management tool (disabled by default)
     if root_config.data_retention.enabled {
-        tool_arcs.push(Arc::new(DataManagementTool::new(
-            workspace_dir.to_path_buf(),
-            root_config.data_retention.retention_days,
-        )));
+        tool_arcs.push(Arc::new(
+            DataManagementTool::new_with_data_root_and_security(
+                config.data_dir.clone(),
+                root_config.data_retention.retention_days,
+                security.clone(),
+            ),
+        ));
     }
 
     // Cloud operations advisory tools (read-only analysis)
@@ -1983,11 +1998,30 @@ fn all_tools_with_runtime_on_thread(
         .as_deref()
         .is_some_and(|u| !u.trim().is_empty())
     {
-        tool_arcs.push(Arc::new(FileDownloadTool::new_with_persistence(
-            security.clone(),
-            root_config.file_download.clone(),
-            persistent_writes,
-        )));
+        let policy_resolver: Arc<dyn Fn() -> FileDownloadSsrfPolicy + Send + Sync> =
+            if let Some(live) = live_config.clone() {
+                Arc::new(move || {
+                    let config = live.read();
+                    FileDownloadSsrfPolicy {
+                        allowed_private_hosts: config.file_download.allowed_private_hosts.clone(),
+                        nat64_prefixes: config.security.nat64_prefixes.clone(),
+                    }
+                })
+            } else {
+                let snapshot = FileDownloadSsrfPolicy {
+                    allowed_private_hosts: root_config.file_download.allowed_private_hosts.clone(),
+                    nat64_prefixes: root_config.security.nat64_prefixes.clone(),
+                };
+                Arc::new(move || snapshot.clone())
+            };
+        tool_arcs.push(Arc::new(
+            FileDownloadTool::new_with_persistence_and_resolver(
+                security.clone(),
+                root_config.file_download.clone(),
+                persistent_writes,
+                move || policy_resolver(),
+            ),
+        ));
     }
 
     // Poll tool — always registered; owns its own late-bound channel map.
@@ -2498,8 +2532,8 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
     use zeroclaw_config::schema::{
-        ApprovalGroupConfig, ApprovalPolicyConfig, BrowserConfig, Config, MemoryConfig,
-        SopApprovalConfig,
+        ApprovalGroupConfig, ApprovalPolicyConfig, BrowserConfig, Config, FileDownloadConfig,
+        MemoryConfig, SopApprovalConfig,
     };
 
     #[test]
@@ -4335,6 +4369,192 @@ permissions = ["http_client"]
     }
 
     #[tokio::test]
+    async fn backup_and_data_management_use_shared_data_dir_not_agent_workspace() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("shared-data");
+        let workspace_dir = tmp.path().join("agent-workspace");
+        std::fs::create_dir_all(data_dir.join("config")).unwrap();
+        std::fs::create_dir_all(workspace_dir.join("config")).unwrap();
+        std::fs::write(data_dir.join("config/shared.txt"), "shared").unwrap();
+        std::fs::write(workspace_dir.join("config/agent.txt"), "agent").unwrap();
+        let shared_old = data_dir.join("shared-old.txt");
+        let agent_old = workspace_dir.join("agent-old.txt");
+        std::fs::write(&shared_old, "old").unwrap();
+        std::fs::write(&agent_old, "old-agent").unwrap();
+        let old_time = std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 86_400);
+        std::fs::File::options()
+            .write(true)
+            .open(&shared_old)
+            .unwrap()
+            .set_modified(old_time)
+            .unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&agent_old)
+            .unwrap()
+            .set_modified(old_time)
+            .unwrap();
+
+        let security = Arc::new(SecurityPolicy {
+            workspace_dir: workspace_dir.clone(),
+            ..SecurityPolicy::default()
+        });
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+        let browser = BrowserConfig::default();
+        let http = zeroclaw_config::schema::HttpRequestConfig::default();
+        let web = zeroclaw_config::schema::WebFetchConfig::default();
+        let risk = zeroclaw_config::schema::RiskProfileConfig::default();
+        let mut root_config = test_config(&tmp);
+        root_config.data_dir = data_dir.clone();
+        root_config.backup.enabled = true;
+        root_config.backup.include_dirs = vec!["config".into()];
+        root_config.data_retention.enabled = true;
+        root_config.data_retention.retention_days = 1;
+        let config = Config {
+            data_dir: data_dir.clone(),
+            ..Config::default()
+        };
+
+        let tools = all_tools_with_runtime(
+            Arc::new(config),
+            &security,
+            &risk,
+            "test-agent",
+            Arc::new(NativeRuntime::new()),
+            mem,
+            None,
+            None,
+            &browser,
+            &http,
+            &web,
+            workspace_dir.as_path(),
+            &HashMap::new(),
+            None,
+            &root_config,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("tool registry builds")
+        .tools;
+        assert!(!security.allowed_roots.contains(&data_dir));
+
+        let backup = tools
+            .iter()
+            .find(|tool| tool.name() == "backup")
+            .expect("enabled backup tool must register");
+        let created = backup
+            .execute(serde_json::json!({"command": "create"}))
+            .await
+            .unwrap();
+        assert!(created.success, "backup failed: {:?}", created.error);
+        let created: serde_json::Value = serde_json::from_str(&created.output).unwrap();
+        let backup_name = created["backup"].as_str().unwrap();
+        assert!(
+            data_dir
+                .join("backups")
+                .join(backup_name)
+                .join("manifest.json")
+                .exists()
+        );
+        assert!(
+            data_dir
+                .join("backups")
+                .join(backup_name)
+                .join("config/shared.txt")
+                .exists()
+        );
+        assert!(
+            !data_dir
+                .join("backups")
+                .join(backup_name)
+                .join("config/agent.txt")
+                .exists()
+        );
+        assert!(!workspace_dir.join("backups").exists());
+
+        let listed = backup
+            .execute(serde_json::json!({"command": "list"}))
+            .await
+            .unwrap();
+        assert!(listed.success, "list failed: {:?}", listed.error);
+        let listed: serde_json::Value = serde_json::from_str(&listed.output).unwrap();
+        assert!(
+            listed
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["name"] == backup_name)
+        );
+
+        let verified = backup
+            .execute(serde_json::json!({
+                "command": "verify",
+                "backup_name": backup_name
+            }))
+            .await
+            .unwrap();
+        assert!(verified.success, "verify failed: {:?}", verified.error);
+
+        std::fs::write(data_dir.join("config/shared.txt"), "changed").unwrap();
+        let restored = backup
+            .execute(serde_json::json!({
+                "command": "restore",
+                "backup_name": backup_name,
+                "confirm": true
+            }))
+            .await
+            .unwrap();
+        assert!(restored.success, "restore failed: {:?}", restored.error);
+        assert_eq!(
+            std::fs::read_to_string(data_dir.join("config/shared.txt")).unwrap(),
+            "shared"
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace_dir.join("config/agent.txt")).unwrap(),
+            "agent"
+        );
+
+        let data_management = tools
+            .iter()
+            .find(|tool| tool.name() == "data_management")
+            .expect("enabled data-management tool must register");
+        let status = data_management
+            .execute(serde_json::json!({"command": "retention_status"}))
+            .await
+            .unwrap();
+        assert!(status.success, "status failed: {:?}", status.error);
+        let status: serde_json::Value = serde_json::from_str(&status.output).unwrap();
+        assert_eq!(status["affected_files"], 1);
+
+        let preview = data_management
+            .execute(serde_json::json!({"command": "purge", "dry_run": true}))
+            .await
+            .unwrap();
+        assert!(preview.success, "preview failed: {:?}", preview.error);
+        let preview: serde_json::Value = serde_json::from_str(&preview.output).unwrap();
+        assert_eq!(preview["files"], 1);
+        assert_eq!(preview["bytes_freed"], 3);
+
+        let stats = data_management
+            .execute(serde_json::json!({"command": "stats"}))
+            .await
+            .unwrap();
+        assert!(stats.success, "stats failed: {:?}", stats.error);
+        let stats: serde_json::Value = serde_json::from_str(&stats.output).unwrap();
+        assert!(stats["subdirectories"].get("backups").is_some());
+        assert!(!workspace_dir.join("backups").exists());
+    }
+
+    #[tokio::test]
     async fn sop_audit_memory_uses_agent_alias_not_default() {
         let tmp = TempDir::new().unwrap();
         let sops_dir = tmp.path().join("sops");
@@ -5475,6 +5695,92 @@ permissions = ["http_client"]
             "llm_task should construct the Codex provider for \
              openai.codex (requires_openai_auth=true), producing an \
              openai-codex credential error; got: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn file_download_factory_seam_reflects_live_config_revocation() {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method, matchers::path};
+
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy {
+            workspace_dir: tmp.path().to_path_buf(),
+            max_actions_per_hour: 100,
+            ..SecurityPolicy::default()
+        });
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/download"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"ok".to_vec()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut root_config = test_config(&tmp);
+        root_config.file_download = FileDownloadConfig {
+            url: Some(format!("{}/download", server.uri())),
+            allowed_private_hosts: vec!["127.0.0.1".into()],
+            ..FileDownloadConfig::default()
+        };
+        let live_config = Arc::new(parking_lot::RwLock::new(root_config.clone()));
+
+        let tools = all_tools_with_runtime(
+            Arc::new(root_config.clone()),
+            &security,
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            "test-agent",
+            Arc::new(NativeRuntime::new()),
+            mem,
+            None,
+            None,
+            &BrowserConfig::default(),
+            &zeroclaw_config::schema::HttpRequestConfig::default(),
+            &zeroclaw_config::schema::WebFetchConfig::default(),
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &root_config,
+            None,
+            false,
+            None,
+            None,
+            None,
+            Some(live_config.clone()),
+        )
+        .expect("tool registry should build")
+        .tools;
+        let file_download = tools
+            .iter()
+            .find(|tool| tool.name() == "file_download")
+            .expect("file_download must be registered when file_download.url is set");
+        let args = serde_json::json!({ "document_id": "doc-1", "dest_path": "out.bin" });
+
+        let first = file_download.execute(args.clone()).await.unwrap();
+        assert!(first.success, "allowlisted local endpoint should pass");
+
+        live_config
+            .write()
+            .file_download
+            .allowed_private_hosts
+            .clear();
+
+        let second = file_download.execute(args).await.unwrap();
+        assert!(
+            !second.success,
+            "same tool instance must observe live allowlist revocation"
+        );
+        assert!(
+            second
+                .error
+                .unwrap_or_default()
+                .contains("file_download.allowed_private_hosts")
         );
     }
 }

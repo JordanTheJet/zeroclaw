@@ -209,7 +209,12 @@ fn format_cli_string_with_args(
 fn format_ftl_messages(ftl_source: &str, locale: &str) -> HashMap<String, String> {
     let resource =
         FluentResource::try_new(ftl_source.to_string()).unwrap_or_else(|(resource, _)| resource);
-    let language_identifier = locale.parse().unwrap_or_else(|_| "en".parse().unwrap());
+    let language_identifier = match locale.parse() {
+        Ok(identifier) => identifier,
+        Err(_) => "en"
+            .parse()
+            .expect("static English Fluent locale must parse"),
+    };
     let mut bundle = FluentBundle::new(vec![language_identifier]);
     bundle.set_use_isolating(false);
     let _ = bundle.add_resource(resource);
@@ -242,7 +247,12 @@ fn format_ftl_message(
 ) -> Option<String> {
     let resource =
         FluentResource::try_new(ftl_source.to_string()).unwrap_or_else(|(resource, _)| resource);
-    let language_identifier = locale.parse().unwrap_or_else(|_| "en".parse().unwrap());
+    let language_identifier = match locale.parse() {
+        Ok(identifier) => identifier,
+        Err(_) => "en"
+            .parse()
+            .expect("static English Fluent locale must parse"),
+    };
     let mut bundle = FluentBundle::new(vec![language_identifier]);
     bundle.set_use_isolating(false);
     let _ = bundle.add_resource(resource);
@@ -1258,6 +1268,86 @@ mod tests {
             ),
             ("cli-daemon-started-pairing", &[][..], &[][..]),
             ("cli-daemon-started-stop", &[][..], &["Ctrl+C"][..]),
+        ];
+
+        for (source, locale) in [
+            (include_str!("../locales/en/cli.ftl"), "en"),
+            (include_str!("../locales/es/cli.ftl"), "es"),
+            (include_str!("../locales/fr/cli.ftl"), "fr"),
+            (include_str!("../locales/ja/cli.ftl"), "ja"),
+            (include_str!("../locales/zh-CN/cli.ftl"), "zh-CN"),
+        ] {
+            for &(key, args, expected_parts) in &cases {
+                let value = format_ftl_message(source, locale, key, args)
+                    .unwrap_or_else(|| panic!("{key} should format in {locale}"));
+                for &expected in expected_parts {
+                    assert!(
+                        value.contains(expected),
+                        "{key} in {locale} should preserve {expected:?}; got: {value:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bootstrap_truncation_cli_strings_format_in_all_locales() {
+        let alias = "alpha";
+        let file = "AGENTS.md";
+        let cases = [
+            (
+                "cli-doctor-bootstrap-file-truncated-compact",
+                &[
+                    ("alias", alias),
+                    ("file", file),
+                    ("retained", "6000"),
+                    ("total", "13985"),
+                    ("discarded", "7985"),
+                    ("limit", "6000"),
+                    ("profile", "nightly"),
+                ][..],
+                &[
+                    alias,
+                    file,
+                    "6000",
+                    "13985",
+                    "7985",
+                    "compact_context = false",
+                    "nightly",
+                ][..],
+            ),
+            (
+                "cli-doctor-bootstrap-file-truncated-compact-no-profile",
+                &[
+                    ("alias", alias),
+                    ("file", file),
+                    ("retained", "6000"),
+                    ("total", "13985"),
+                    ("discarded", "7985"),
+                    ("limit", "6000"),
+                ][..],
+                &[
+                    alias,
+                    file,
+                    "6000",
+                    "13985",
+                    "7985",
+                    "compact_context = false",
+                    "runtime_profile = \"<name>\"",
+                ][..],
+            ),
+            (
+                "cli-doctor-bootstrap-file-truncated",
+                &[
+                    ("alias", alias),
+                    ("file", file),
+                    ("retained", "20000"),
+                    ("total", "20500"),
+                    ("discarded", "500"),
+                    ("limit", "20000"),
+                ][..],
+                &[alias, file, "20000", "20500", "500", "20000"][..],
+            ),
         ];
 
         for (source, locale) in [
