@@ -20,6 +20,27 @@ pub struct GatewayReloadControls {
     pub reload_tx: watch::Sender<bool>,
 }
 
+/// The daemon generation's one inbound-authentication state, handed to the
+/// supervised gateway so HTTP and RPC authenticate against the same accepted
+/// policy over the same live configuration.
+///
+/// Both surfaces persist under the process-wide config write lock and then
+/// publish the policy compiled from the configuration they just wrote into
+/// `inbound_auth`, as the next accepted revision. Because they share the one
+/// authority and the one live configuration, a revocation persisted through
+/// either surface binds the other before the writer returns, and neither can
+/// republish policy compiled from a stale copy of the configuration.
+#[derive(Clone)]
+pub struct DaemonInboundAuthority {
+    /// Canonical live pairing authority for native bearer tokens.
+    pub pairing: zeroclaw_config::pairing::PairingGuard,
+    /// The accepted provider, profile and roster policy, shared with the RPC
+    /// context.
+    pub inbound_auth: Arc<crate::rpc::auth::RpcInboundAuth>,
+    /// The live configuration the RPC context reads and writes.
+    pub config: Arc<parking_lot::RwLock<Config>>,
+}
+
 pub type GatewayStarter = Box<
     dyn Fn(
             String,
@@ -28,6 +49,11 @@ pub type GatewayStarter = Box<
             Option<broadcast::Sender<Value>>,
             Option<GatewayReloadControls>,
             Option<Arc<TuiRegistry>>,
+            // The daemon's one inbound-auth state: pairing guard, accepted
+            // policy and live configuration, shared with the RPC context so
+            // pairing, revocation and policy changes act on both surfaces at
+            // once. `None` only for standalone gateways.
+            Option<DaemonInboundAuthority>,
             Option<GatewayReadinessReporter>,
         ) -> StarterFuture
         + Send
@@ -70,7 +96,17 @@ pub struct DaemonRegistry {
     /// RpcContext so RPC/TUI agent sessions share the same engine.
     sop_engine: Option<Arc<std::sync::Mutex<crate::sop::SopEngine>>>,
     sop_audit: Option<Arc<crate::sop::SopAuditLogger>>,
+    sop_driver_handles: Option<crate::sop::SopDriverHandles>,
 }
+
+/// The SOP wiring one daemon generation hands from `main` into the RPC
+/// context: the shared engine, the audit logger, and the generation's
+/// driver supervisor set.
+type SopWiring = (
+    Option<Arc<std::sync::Mutex<crate::sop::SopEngine>>>,
+    Option<Arc<crate::sop::SopAuditLogger>>,
+    Option<crate::sop::SopDriverHandles>,
+);
 
 impl DaemonRegistry {
     /// Create an empty registry. Missing starters are treated as unwired
@@ -181,19 +217,20 @@ impl DaemonRegistry {
         &mut self,
         sop_engine: Option<Arc<std::sync::Mutex<crate::sop::SopEngine>>>,
         sop_audit: Option<Arc<crate::sop::SopAuditLogger>>,
+        sop_driver_handles: Option<crate::sop::SopDriverHandles>,
     ) -> &mut Self {
         self.sop_engine = sop_engine;
         self.sop_audit = sop_audit;
+        self.sop_driver_handles = sop_driver_handles;
         self
     }
 
-    pub(crate) fn take_sop_engine(
-        &mut self,
-    ) -> (
-        Option<Arc<std::sync::Mutex<crate::sop::SopEngine>>>,
-        Option<Arc<crate::sop::SopAuditLogger>>,
-    ) {
-        (self.sop_engine.take(), self.sop_audit.take())
+    pub(crate) fn take_sop_engine(&mut self) -> SopWiring {
+        (
+            self.sop_engine.take(),
+            self.sop_audit.take(),
+            self.sop_driver_handles.take(),
+        )
     }
 }
 
@@ -202,7 +239,7 @@ mod tests {
     use super::*;
 
     fn gateway_starter() -> GatewayStarter {
-        Box::new(|_, _, _, _, _, _, _| Box::pin(async { Ok(()) }))
+        Box::new(|_, _, _, _, _, _, _, _| Box::pin(async { Ok(()) }))
     }
 
     fn channels_starter() -> ChannelsStarter {

@@ -507,9 +507,12 @@ Dispatch **Deploy mdBook docs to Pages** from branch **master**, set **mode** to
 `promote-stable`, and set **tag** to the exact final tag, for example `v0.8.5`.
 The default `build` mode retains the normal build behavior.
 
-Promotion updates only `stable-version.txt`, `index.html`, and `versions.json` at
-the site root. It installs no Rust or mdBook tools and preserves every locale,
-the API reference, shared chrome, and retention state. The workflow's existing
+Promotion updates `stable-version.txt`, `index.html`, `versions.json`, and the
+root `llms.txt` / `llms-full.txt` pair at the site root. That pair mirrors the
+promoted release's English copy, and is withdrawn when the release doesn't carry
+both files, so the fixed LLM URLs always describe the release `/` redirects to.
+It installs no Rust or mdBook tools and preserves every locale, the API
+reference, shared chrome, and retention state. The workflow's existing
 `gh-pages` concurrency group serializes both modes; promotion also uses an exact
 push lease so it cannot replace a site changed by another writer.
 
@@ -597,7 +600,9 @@ deleted. Fix the failing crate at the same release commit, then re-run
 `Pub crates.io` for the same tag with `dry_run: false`; the publisher queries
 every `<crate>@<version>` first and skips versions that already landed. Read the
 Publish step for the last successful crate. If preflight failed, no upload was
-attempted and the problem is still reversible.
+attempted and the problem is still reversible. If the publish job reports that
+`web/dist` does not match the bundle preflight verified, nothing was uploaded;
+dispatch `Pub crates.io` again so a fresh preflight rebuilds and re-verifies it.
 
 **The `scoop` job failed with `remote: Permission ... denied to <account>` (403):**
 A permissions problem, not a manifest problem: the bucket token is dead or

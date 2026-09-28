@@ -44,12 +44,13 @@ pub use knobs::{LoopKnobs, MaxIterationBehavior};
 pub(crate) use max_iter::finish_after_max_iterations;
 pub(crate) use outcome::StreamCancelledAfterOutput;
 pub use outcome::{
-    ModelSwitchCallback, ModelSwitchRequested, ServedRoute, ServedRouteSink, ToolLoopCancelled,
-    is_model_switch_requested, is_tool_loop_cancelled,
+    ContextWindowExceeded, append_safeguard_fallback_notice, context_window_exceeded_from_error,
+    is_semantic_empty_terminal_completion, semantic_empty_terminal_completion_message,
+    terminal_completion_error_message,
 };
 pub use outcome::{
-    append_safeguard_fallback_notice, is_semantic_empty_terminal_completion,
-    semantic_empty_terminal_completion_message, terminal_completion_error_message,
+    ModelSwitchCallback, ModelSwitchRequested, ServedRoute, ServedRouteSink, ToolLoopCancelled,
+    is_model_switch_requested, is_tool_loop_cancelled,
 };
 pub(crate) use outcome::{current_model_switch_state, scope_model_switch_state};
 #[cfg(test)]
@@ -72,6 +73,7 @@ pub(crate) use stream_consume::consume_provider_streaming_response;
 pub(crate) use tool_specs::{IterationToolSpecs, build_iteration_tool_specs};
 pub(crate) use vision_route::{prepare_messages_for_iteration, resolve_vision_provider};
 
+use crate::agent::execution_tree_budget::{ExecutionTreeBudget, ExecutionTreeReservation};
 use crate::agent::system_prompt::{NATIVE_TOOLS_TASK_FRAMING, NO_TOOLS_TASK_FRAMING};
 use crate::agent::tool_execution::{
     ToolDispatchContext, execute_tools_parallel, execute_tools_sequential,
@@ -222,16 +224,6 @@ fn replace_tool_protocol_section(
     }
 }
 
-fn try_reserve_shared_iteration(budget: &std::sync::atomic::AtomicUsize) -> bool {
-    budget
-        .fetch_update(
-            std::sync::atomic::Ordering::AcqRel,
-            std::sync::atomic::Ordering::Acquire,
-            |remaining| remaining.checked_sub(1),
-        )
-        .is_ok()
-}
-
 pub struct ToolLoop<'a> {
     /// The resolved per-agent execution context: model binding, gated tool
     /// registry, approval, observability, and resolved runtime knobs. Stable
@@ -263,7 +255,7 @@ pub struct ToolLoop<'a> {
     pub channel_reply_target: Option<&'a str>,
     pub cancellation_token: Option<CancellationToken>,
     pub on_delta: Option<tokio::sync::mpsc::Sender<DraftEvent>>,
-    pub shared_budget: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    pub shared_budget: Option<ExecutionTreeBudget>,
     pub channel: Option<&'a dyn Channel>,
     pub collected_receipts: Option<&'a std::sync::Mutex<Vec<String>>>,
     pub event_tx: Option<tokio::sync::mpsc::Sender<TurnEvent>>,
@@ -339,7 +331,7 @@ async fn projected_provider_facing_tokens(
         .round() as usize
 }
 
-struct ReportedRequestUsage {
+pub(crate) struct ReportedRequestUsage {
     provider_name: String,
     model: String,
     reported_tokens: usize,
@@ -384,6 +376,49 @@ enum PreDispatchOutcome {
     Fit,
     Trimmed,
     Floor,
+}
+
+fn dispatch_trim_budget(limits: zeroclaw_config::schema::ResolvedContextLimits) -> usize {
+    if limits.context_token_budget == 0 {
+        limits.model_context_window
+    } else {
+        limits.context_token_budget.min(limits.model_context_window)
+    }
+}
+
+fn context_window_exceeded_error(
+    (provider_name, model): (&str, &str),
+    limits: zeroclaw_config::schema::ResolvedContextLimits,
+    tokens: u64,
+    token_source: zeroclaw_api::agent::TokenCountSource,
+) -> anyhow::Error {
+    let span = ::zeroclaw_log::info_span!(
+        target: "zeroclaw_log_internal_scope",
+        "zeroclaw_scope",
+        model = %model,
+        model_provider = %provider_name,
+    );
+    let _guard = span.entered();
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+            .with_category(::zeroclaw_log::EventCategory::Agent)
+            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+            .with_attrs(::serde_json::json!({
+                "error_key": "context_window_exceeded",
+                "estimated_tokens": tokens,
+                "token_count_source": token_source,
+                "model_context_window": limits.model_context_window,
+                "model_context_window_source": format!("{:?}", limits.model_context_window_source),
+                "context_token_budget": limits.context_token_budget,
+            })),
+        "Provider-facing request exceeds the active model context window"
+    );
+    ContextWindowExceeded {
+        estimated_tokens: usize::try_from(tokens).unwrap_or(usize::MAX),
+        model_context_window: limits.model_context_window,
+    }
+    .into()
 }
 
 struct PreDispatchTrimResult {
@@ -492,6 +527,8 @@ async fn enforce_reported_budget(
     context_token_budget: usize,
     event_tx: Option<&tokio::sync::mpsc::Sender<TurnEvent>>,
     observer: &dyn crate::observability::Observer,
+    agent_alias: Option<&str>,
+    turn_id: &str,
     // The multimodal boundary the NEXT request will re-normalize retained
     // history through. A short `[IMAGE:...]` marker in raw history can become a
     // large base64 provider payload, so selection and the recount must describe
@@ -531,6 +568,8 @@ async fn enforce_reported_budget(
     let taken_had_crumb = *crumb_present;
     let taken = std::mem::take(history);
     let taken_len = taken.len();
+    let taken_turns = crate::agent::history_trim::count_turns(&taken)
+        .saturating_sub(usize::from(taken_had_crumb));
     let ratio = reported_input_tokens as f64 / pre_trim_estimated.max(1) as f64;
     // Project the provider-facing population of the FULL pre-trim history, so
     // `tokens_before` always describes the population actually trimmed — even
@@ -599,13 +638,6 @@ async fn enforce_reported_budget(
     // `tokens_before` for every trim, replacing the prior provider count the
     // raw selection would otherwise report.
     let mut tokens_after: usize;
-    // Whether the projection loop reached the newest-turn/schema floor while the
-    // projected next request was still over the budget. `drop_oldest_whole_turn`
-    // returns zero only when no droppable whole turn remains, so reaching it with
-    // nothing trimmed means the request cannot be brought under the budget without
-    // dropping the newest turn — an outcome that must be surfaced, not silently
-    // kept as if the trim succeeded.
-    let mut hit_floor = false;
     // The decision seam targets the actual next request without executing any
     // hook: the durable projection is compared against the budget minus the
     // measured hook reserve, so a request-growing `before_llm_call` hook cannot
@@ -628,7 +660,6 @@ async fn enforce_reported_budget(
         let dropped =
             crate::agent::history_trim::drop_oldest_whole_turn(&mut trimmed, taken_had_crumb);
         if dropped == 0 {
-            hit_floor = true;
             break;
         }
         trimmed_any = true;
@@ -656,63 +687,8 @@ async fn enforce_reported_budget(
             }
             let dropped = crate::agent::history_trim::drop_oldest_whole_turn(&mut trimmed, true);
             if dropped == 0 {
-                hit_floor = true;
                 break;
             }
-        }
-        // If the breadcrumb pushes the retained newest turn over the decision
-        // budget and no more whole turn can be dropped, carry the floor flag so
-        // the explicit floor is surfaced instead of a successful ordinary
-        // trim that still exceeds the budget. The floor event reports the REAL
-        // structural removals that happened on the way to the floor (this loop
-        // may already have dropped turns before the breadcrumb-induced floor)
-        // and marks the outcome unsatisfiable so clients never read it as an
-        // ordinary successful trim.
-        if hit_floor && tokens_after > decision_budget {
-            let structural_drops = taken_len.saturating_sub(
-                trimmed
-                    .len()
-                    .saturating_add(usize::from(taken_had_crumb))
-                    .saturating_sub(1),
-            );
-            let floor_turns = crate::agent::history_trim::count_turns(&trimmed).saturating_sub(1);
-            *history = trimmed;
-            if let Some(tx) = event_tx {
-                let _ = tx
-                    .send(TurnEvent::HistoryTrimmed {
-                        dropped_messages: structural_drops,
-                        kept_turns: floor_turns,
-                        reason: crate::i18n::get_required_cli_string("history-trim-reason-budget"),
-                        token_budget: Some(context_token_budget as u64),
-                        tokens_before: Some(projected_pre_trim as u64),
-                        tokens_after: Some(tokens_after as u64),
-                        tokens_before_source: Some(
-                            zeroclaw_api::agent::TokenCountSource::Calibrated,
-                        ),
-                        tokens_after_source: Some(
-                            zeroclaw_api::agent::TokenCountSource::Calibrated,
-                        ),
-                        unsatisfiable_floor: Some(true),
-                    })
-                    .await;
-            }
-            observer.record_event(
-                &zeroclaw_api::observability_traits::ObserverEvent::HistoryTrimmed {
-                    dropped_messages: structural_drops,
-                    kept_turns: floor_turns,
-                    reason: crate::i18n::get_required_cli_string("history-trim-reason-budget"),
-                    channel: None,
-                    agent_alias: None,
-                    turn_id: None,
-                    token_budget: Some(context_token_budget as u64),
-                    tokens_before: Some(projected_pre_trim as u64),
-                    tokens_after: Some(tokens_after as u64),
-                    tokens_before_source: Some(zeroclaw_api::agent::TokenCountSource::Calibrated),
-                    tokens_after_source: Some(zeroclaw_api::agent::TokenCountSource::Calibrated),
-                    unsatisfiable_floor: Some(true),
-                },
-            );
-            return;
         }
         // Recompute the structural counts against the final retained set so the
         // emitted event reflects the re-trim, not just the first raw pass. The
@@ -731,8 +707,8 @@ async fn enforce_reported_budget(
         // is persisted and re-dispatched next — a calibrated estimate of the
         // prepared retained population (breadcrumb included, schemas included),
         // WITHOUT the transient hook growth that each dispatched request adds
-        // back on top. The decision seam above reserved that growth against the
-        // budget, so the post-hook next request fits.
+        // back on top. A protected newest turn may remain above the soft target;
+        // only the next actual dispatch can decide whether model capacity fits.
         result.tokens_after = projected_provider_facing_tokens(
             &trimmed,
             multimodal_config,
@@ -755,6 +731,7 @@ async fn enforce_reported_budget(
             let _ = tx
                 .send(TurnEvent::HistoryTrimmed {
                     dropped_messages: result.dropped_messages,
+                    dropped_turns: taken_turns.saturating_sub(result.kept_turns),
                     kept_turns: result.kept_turns,
                     reason: crate::i18n::get_required_cli_string("history-trim-reason-budget"),
                     token_budget: Some(context_token_budget as u64),
@@ -776,57 +753,14 @@ async fn enforce_reported_budget(
                 kept_turns: result.kept_turns,
                 reason: crate::i18n::get_required_cli_string("history-trim-reason-budget"),
                 channel: None,
-                agent_alias: None,
-                turn_id: None,
+                agent_alias: agent_alias.map(str::to_string),
+                turn_id: Some(turn_id.to_string()),
                 token_budget: Some(context_token_budget as u64),
                 tokens_before: Some(tokens_before as u64),
                 tokens_after: Some(result.tokens_after as u64),
                 tokens_before_source: Some(tokens_before_source),
                 tokens_after_source: Some(zeroclaw_api::agent::TokenCountSource::Calibrated),
                 unsatisfiable_floor: None,
-            },
-        );
-    } else if hit_floor {
-        // The projected next request is over the budget but history already sits
-        // at the newest-turn/schema floor: `drop_oldest_whole_turn` returned zero,
-        // so no whole turn could be removed. Nothing was dropped, so no breadcrumb
-        // is injected and no trim claim is made; instead the floor is surfaced
-        // explicitly with the honest accounting so clients and operators see that
-        // the request cannot be brought under the configured budget. `kept_turns`
-        // excludes a leading crumb left by an earlier trim so the count stays
-        // breadcrumb-aware.
-        let floor_turns = crate::agent::history_trim::count_turns(&trimmed)
-            .saturating_sub(usize::from(taken_had_crumb));
-        *history = trimmed;
-        if let Some(tx) = event_tx {
-            let _ = tx
-                .send(TurnEvent::HistoryTrimmed {
-                    dropped_messages: 0,
-                    kept_turns: floor_turns,
-                    reason: crate::i18n::get_required_cli_string("history-trim-reason-budget"),
-                    token_budget: Some(context_token_budget as u64),
-                    tokens_before: Some(projected_pre_trim as u64),
-                    tokens_after: Some(tokens_after as u64),
-                    tokens_before_source: Some(zeroclaw_api::agent::TokenCountSource::Calibrated),
-                    tokens_after_source: Some(zeroclaw_api::agent::TokenCountSource::Calibrated),
-                    unsatisfiable_floor: Some(true),
-                })
-                .await;
-        }
-        observer.record_event(
-            &zeroclaw_api::observability_traits::ObserverEvent::HistoryTrimmed {
-                dropped_messages: 0,
-                kept_turns: floor_turns,
-                reason: crate::i18n::get_required_cli_string("history-trim-reason-budget"),
-                channel: None,
-                agent_alias: None,
-                turn_id: None,
-                token_budget: Some(context_token_budget as u64),
-                tokens_before: Some(projected_pre_trim as u64),
-                tokens_after: Some(tokens_after as u64),
-                tokens_before_source: Some(zeroclaw_api::agent::TokenCountSource::Calibrated),
-                tokens_after_source: Some(zeroclaw_api::agent::TokenCountSource::Calibrated),
-                unsatisfiable_floor: Some(true),
             },
         );
     } else {
@@ -1197,6 +1131,32 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
     let mut pending_reported_usage: Option<ReportedRequestUsage> = None;
 
     for iteration in 0..max_iterations {
+        // Re-resolved every iteration, against the tools callable *right now*.
+        //
+        // A step's scope is resolved by name, so it can only narrow tools that
+        // exist when it runs: `tool_search` activates deferred MCP tools in the
+        // middle of a turn, and a scoped step must narrow those on the next
+        // iteration rather than the next turn — otherwise a step that may call
+        // `tool_search` can reach a tool its scope excludes. Reading the scope
+        // from the task (rather than a parameter) also covers the loops this
+        // one drives on behalf of another agent: a delegated target assembles
+        // its own registry, and inherits the boundary all the same.
+        //
+        // `None` for every ordinary turn, which keeps its own slice and pays
+        // nothing.
+        let step_scoped_excluded: Option<Vec<String>> =
+            crate::sop::active_scope::active_headless_step_scope().map(|scope| {
+                let mut merged = excluded_tools.to_vec();
+                crate::agent::loop_::merge_sop_step_exclusions(
+                    &mut merged,
+                    tools_registry,
+                    activated_tools,
+                    Some(&scope),
+                );
+                merged
+            });
+        let excluded_tools: &[String] = step_scoped_excluded.as_deref().unwrap_or(excluded_tools);
+
         for steering_message in drain_steering_messages(&mut steering) {
             match ingress_policy(&steering_message, &ingress, &ingress_policy_cfg) {
                 // DEFAULT — append the injection to history exactly as today.
@@ -1227,19 +1187,52 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             return Err(ToolLoopCancelled.into());
         }
 
-        // Shared iteration budget: parent + subagents share a global counter
-        if let Some(ref budget) = shared_budget
-            && !try_reserve_shared_iteration(budget)
-        {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                    .with_category(::zeroclaw_log::EventCategory::Agent)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({"iteration": iteration})),
-                "Shared iteration budget exhausted at iteration"
-            );
-            break;
+        if let Some(budget) = shared_budget.as_ref() {
+            match budget.reserve() {
+                Ok(ExecutionTreeReservation::Iteration) => {}
+                Ok(ExecutionTreeReservation::FinalCompletion) => {
+                    let mut final_knobs = knobs.clone();
+                    final_knobs.max_iteration_behavior = MaxIterationBehavior::GracefulSummary;
+                    let summary_result = finish_after_max_iterations(
+                        model_provider,
+                        turn_state.history,
+                        provider_name,
+                        model,
+                        dispatch_model,
+                        temperature,
+                        pacing,
+                        cancellation_token.as_ref(),
+                        max_iter::CompletionLimit::ExecutionTree,
+                        accumulated_display_text,
+                        turn_id,
+                        &final_knobs,
+                        event_tx.as_ref(),
+                        on_delta.as_ref(),
+                        turn_state.canonical.as_deref_mut(),
+                        config,
+                        multimodal_config,
+                        hooks,
+                        image_cache.as_deref_mut(),
+                        |provider, selected_model| {
+                            resolve_context_limits_for_call(
+                                context_limits_resolver.as_ref(),
+                                config,
+                                agent_alias,
+                                provider,
+                                selected_model,
+                                context_limits,
+                            )
+                        },
+                        &mut turn_state.crumb_present,
+                        pending_reported_usage,
+                        observer,
+                    )
+                    .await;
+                    *history_has_trim_breadcrumb = turn_state.crumb_present;
+                    return summary_result;
+                }
+                Err(error) => return Err(error.into()),
+            }
         }
 
         preflight_history_maintenance(turn_state.history);
@@ -1316,13 +1309,14 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             activated_tools,
         )?;
 
-        let prepared_messages = prepare_messages_for_iteration(
-            turn_state.history,
-            multimodal_config,
-            degrade_strip_images,
-            image_cache.as_deref_mut(),
-        )
-        .await?;
+        let (prepared_messages, prepared_source_rows) =
+            vision_route::prepare_messages_with_source_rows(
+                turn_state.history,
+                multimodal_config,
+                degrade_strip_images,
+                image_cache.as_deref_mut(),
+            )
+            .await?;
         let mut provider_request_messages = prepared_messages.messages;
         let pre_hook_messages = provider_request_messages.clone();
         let mut hook_selected_model = None;
@@ -1411,6 +1405,9 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             context_limits,
         );
         let context_token_budget = active_context_limits.context_token_budget;
+        let model_context_window = active_context_limits.model_context_window;
+        // Zero disables proactive trimming, but model capacity still applies.
+        let trim_budget = dispatch_trim_budget(active_context_limits);
         let ctx = base_ctx.for_route(
             active_model_provider_name,
             provider_request_model,
@@ -1500,7 +1497,8 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
 
         // Budget and dispatch share these post-hook messages, schemas and
         // prompt framing. Rebuild after each whole-turn drop without invoking
-        // the hook again, and reject an unsatisfiable request before dispatch.
+        // the hook again. The soft target never makes the newest turn droppable;
+        // only the model's capacity can reject its final retained population.
         let history_len_before = turn_state.history.len();
         let crumb_before = turn_state.crumb_present;
         let tokens_before_dispatch = dispatch_tokens(reported_population_estimated);
@@ -1508,19 +1506,24 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         // mutations to retained messages rather than discarding them.
         let post_hook_snapshot = provider_request_messages.clone();
         let post_hook_had_crumb = crumb_before;
+        let original_body_start = turn_state
+            .history
+            .iter()
+            .take_while(|m| m.is_system())
+            .count()
+            + usize::from(crumb_before);
         // The gate attempts a whole-turn trim of the durable history but does
         // not itself decide Trimmed vs. Floor for the client-visible event:
         // a dropped turn can carry a disproportionate share of the measured
         // population (e.g. a large multimodal attachment), so only the
         // rebuilt post-hook request re-measured below is authoritative. A
-        // genuine floor (no further whole turn can be dropped and the
-        // rebuilt request is still over budget) fails the turn below instead
-        // of dispatching the request it just declared unsatisfiable.
+        // floor is fatal only when the rebuilt request exceeds model capacity.
+        // A newest turn above the proactive target can still be dispatched.
         let mut trim_result = surface_oversized_dispatch_if_needed(
             turn_state.history,
             &mut turn_state.crumb_present,
             tokens_before_dispatch,
-            context_token_budget,
+            trim_budget,
         );
         *history_has_trim_breadcrumb = turn_state.crumb_present;
         let history_was_trimmed = turn_state.history.len() != history_len_before
@@ -1551,40 +1554,19 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             let mut total_dropped_messages = trim_result.dropped_messages;
             let mut dropped_turns = usize::from(trim_result.dropped_messages > 0);
             let mut tokens_after_dispatch = tokens_before_dispatch;
-            let mut genuine_floor = false;
             let max_iterations = crate::agent::history_trim::count_turns(turn_state.history) + 1;
             for _ in 0..max_iterations {
-                // Preserve the hook's mutations to retained messages by
-                // trimming the already-mutated post-hook snapshot directly,
-                // rather than repreparing the trimmed durable history and
-                // losing rewrites of existing messages.
-                let mut trimmed_post_hook = post_hook_snapshot.clone();
-                // Separate any hook-appended suffix (messages beyond the
-                // original prepared length) so turn-dropping targets the
-                // durable prefix without dropping the hook's transient growth.
-                let suffix_len = hook_suffix.len();
-                let mut suffix = Vec::new();
-                if suffix_len > 0 && trimmed_post_hook.len() >= suffix_len {
-                    suffix = trimmed_post_hook.split_off(trimmed_post_hook.len() - suffix_len);
-                }
-                // Drop oldest whole turns from the post-hook prefix until its
-                // turn count matches the (possibly further-trimmed) durable
-                // history's count.
-                let durable_target_turns =
-                    crate::agent::history_trim::count_turns(turn_state.history)
-                        .saturating_sub(usize::from(turn_state.crumb_present));
-                while crate::agent::history_trim::count_turns(&trimmed_post_hook)
-                    .saturating_sub(usize::from(post_hook_had_crumb))
-                    > durable_target_turns
-                {
-                    let dropped = crate::agent::history_trim::drop_oldest_whole_turn(
-                        &mut trimmed_post_hook,
-                        post_hook_had_crumb,
-                    );
-                    if dropped == 0 {
-                        break;
-                    }
-                }
+                // Wire roles cannot identify turns: prompt-mode results are
+                // plain user messages. Remove precisely the durable source
+                // span, preserving prepared media and the hook suffix.
+                let removed_rows =
+                    original_body_start..original_body_start + total_dropped_messages;
+                let mut trimmed_post_hook: Vec<_> = post_hook_snapshot
+                    .iter()
+                    .zip(&prepared_source_rows)
+                    .filter(|(_, source_row)| !removed_rows.contains(source_row))
+                    .map(|(message, _)| message.clone())
+                    .collect();
                 // If the durable trim inserted a fresh breadcrumb, mirror it
                 // in the post-hook request so the dispatched population
                 // matches the persisted history.
@@ -1596,7 +1578,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 }
                 // Re-append the hook's transient suffix and re-apply prompt
                 // framing so the system anchor stays consistent.
-                trimmed_post_hook.extend(suffix);
+                trimmed_post_hook.extend(hook_suffix.iter().cloned());
                 refresh_prompt_anchor(&mut trimmed_post_hook, use_native_tools);
                 refresh_scoped_tool_protocol_prompt(
                     turn_state.history,
@@ -1608,14 +1590,12 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     crate::agent::history::estimate_history_tokens(&provider_request_messages)
                         + tool_schema_tokens;
                 tokens_after_dispatch = dispatch_tokens(reported_population_estimated);
-                if tokens_after_dispatch <= context_token_budget as u64 {
-                    genuine_floor = false;
+                if tokens_after_dispatch <= trim_budget as u64 {
                     break;
                 }
                 if trim_result.outcome == PreDispatchOutcome::Floor {
                     // The prior call already found no droppable whole turn;
                     // re-running it would repeat the same no-op decision.
-                    genuine_floor = true;
                     break;
                 }
                 // Still over budget on the authoritative rebuilt count: try
@@ -1627,7 +1607,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     turn_state.history,
                     &mut turn_state.crumb_present,
                     tokens_after_dispatch,
-                    context_token_budget,
+                    trim_budget,
                 );
                 *history_has_trim_breadcrumb = turn_state.crumb_present;
                 total_dropped_messages += trim_result.dropped_messages;
@@ -1635,16 +1615,21 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 let dropped_more = turn_state.history.len() != before_len
                     || turn_state.crumb_present != before_crumb;
                 if !dropped_more {
-                    genuine_floor = true;
                     break;
                 }
             }
+            let exceeds_model_window = tokens_after_dispatch > model_context_window as u64;
+            let event_budget = if exceeds_model_window {
+                model_context_window
+            } else {
+                trim_budget
+            };
             trim_result.dropped_messages = total_dropped_messages;
             record_dispatch_trim(
                 (active_model_provider_name, provider_request_model),
                 &trim_result,
                 dropped_turns,
-                context_token_budget,
+                trim_budget,
                 tokens_before_dispatch,
                 tokens_after_dispatch,
                 dispatch_token_source,
@@ -1653,14 +1638,15 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 let _ = tx
                     .send(TurnEvent::HistoryTrimmed {
                         dropped_messages: trim_result.dropped_messages,
+                        dropped_turns,
                         kept_turns: trim_result.kept_turns,
                         reason: crate::i18n::get_required_cli_string("history-trim-reason-budget"),
-                        token_budget: Some(context_token_budget as u64),
+                        token_budget: Some(event_budget as u64),
                         tokens_before: Some(tokens_before_dispatch),
                         tokens_after: Some(tokens_after_dispatch),
                         tokens_before_source: Some(dispatch_token_source),
                         tokens_after_source: Some(dispatch_token_source),
-                        unsatisfiable_floor: genuine_floor.then_some(true),
+                        unsatisfiable_floor: exceeds_model_window.then_some(true),
                     })
                     .await;
             }
@@ -1670,26 +1656,19 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     kept_turns: trim_result.kept_turns,
                     reason: crate::i18n::get_required_cli_string("history-trim-reason-budget"),
                     channel: None,
-                    agent_alias: None,
-                    turn_id: None,
-                    token_budget: Some(context_token_budget as u64),
+                    agent_alias: agent_alias.map(str::to_string),
+                    turn_id: Some(turn_id.to_string()),
+                    token_budget: Some(event_budget as u64),
                     tokens_before: Some(tokens_before_dispatch),
                     tokens_after: Some(tokens_after_dispatch),
                     tokens_before_source: Some(dispatch_token_source),
                     tokens_after_source: Some(dispatch_token_source),
-                    unsatisfiable_floor: genuine_floor.then_some(true),
+                    unsatisfiable_floor: exceeds_model_window.then_some(true),
                 },
             );
-            if genuine_floor {
-                // The rebuilt request is still over budget after dropping
-                // every available whole turn: dispatching it would send the
-                // request this event just declared unsatisfiable. Fail the
-                // turn instead of sending it.
-                return Err(anyhow::Error::msg(crate::i18n::get_required_cli_string(
-                    "turn-context-budget-floor-error",
-                )));
-            }
-        } else if trim_result.outcome == PreDispatchOutcome::Floor {
+        } else if trim_result.outcome == PreDispatchOutcome::Floor
+            && tokens_before_dispatch > model_context_window as u64
+        {
             // No droppable whole turn remained at all — the durable history
             // and rebuilt request are identical, so the gate's measured
             // population is already the authoritative count.
@@ -1697,9 +1676,10 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 let _ = tx
                     .send(TurnEvent::HistoryTrimmed {
                         dropped_messages: 0,
+                        dropped_turns: 0,
                         kept_turns: trim_result.kept_turns,
                         reason: crate::i18n::get_required_cli_string("history-trim-reason-budget"),
-                        token_budget: Some(context_token_budget as u64),
+                        token_budget: Some(model_context_window as u64),
                         tokens_before: Some(tokens_before_dispatch),
                         tokens_after: Some(tokens_before_dispatch),
                         tokens_before_source: Some(dispatch_token_source),
@@ -1714,9 +1694,9 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     kept_turns: trim_result.kept_turns,
                     reason: crate::i18n::get_required_cli_string("history-trim-reason-budget"),
                     channel: None,
-                    agent_alias: None,
-                    turn_id: None,
-                    token_budget: Some(context_token_budget as u64),
+                    agent_alias: agent_alias.map(str::to_string),
+                    turn_id: Some(turn_id.to_string()),
+                    token_budget: Some(model_context_window as u64),
                     tokens_before: Some(tokens_before_dispatch),
                     tokens_after: Some(tokens_before_dispatch),
                     tokens_before_source: Some(dispatch_token_source),
@@ -1724,12 +1704,15 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     unsatisfiable_floor: Some(true),
                 },
             );
-            // No whole turn was ever droppable, so this is already the
-            // authoritative population: fail the turn instead of dispatching
-            // the request this event just declared unsatisfiable.
-            return Err(anyhow::Error::msg(crate::i18n::get_required_cli_string(
-                "turn-context-budget-floor-error",
-            )));
+        }
+        let retained_tokens = dispatch_tokens(reported_population_estimated);
+        if retained_tokens > model_context_window as u64 {
+            return Err(context_window_exceeded_error(
+                (active_model_provider_name, provider_request_model),
+                active_context_limits,
+                retained_tokens,
+                dispatch_token_source,
+            ));
         }
 
         // Fail closed on the local budget BEFORE announcing the request.
@@ -1753,16 +1736,6 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             .into());
         }
 
-        let llm_started_at = announce_llm_request(
-            &ctx,
-            &provider_request_messages,
-            active_model_provider,
-            active_model_provider_name,
-            provider_request_model,
-            iteration,
-        )
-        .await;
-
         // Unified path via ModelProvider::chat so provider-specific native tool logic
         // (OpenAI/Anthropic/OpenRouter/compatible adapters) is honored.
         let request_tools = if use_native_tools {
@@ -1770,6 +1743,16 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         } else {
             None
         };
+        let llm_started_at = announce_llm_request(
+            &ctx,
+            &provider_request_messages,
+            request_tools,
+            active_model_provider,
+            active_model_provider_name,
+            provider_request_model,
+            iteration,
+        )
+        .await;
         let request_tool_count = request_tools.map_or(0, <[crate::tools::ToolSpec]>::len);
         let base_provider_supports_native_tools = model_provider
             .capabilities_for_model(dispatch_model)
@@ -1958,6 +1941,8 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     on_delta.as_ref(),
                     observer,
                     ctx.context_limits,
+                    agent_alias,
+                    turn_id,
                     &mut turn_state.crumb_present,
                 )
                 .await;
@@ -2173,6 +2158,8 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     ctx.context_limits.context_token_budget,
                     event_tx.as_ref(),
                     observer,
+                    agent_alias,
+                    turn_id,
                     multimodal_config,
                     degrade_strip_images,
                     image_cache.as_deref_mut(),
@@ -2260,7 +2247,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         .await?;
 
         let live_sop_queue = crate::sop::executor::new_live_action_queue();
-        let execution_result =
+        let execution =
             crate::sop::executor::scope_live_action_queue(live_sop_queue.clone(), async {
                 if allow_parallel_execution && executable_calls.len() > 1 {
                     let meta = ctx.meta();
@@ -2299,8 +2286,11 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     )
                     .await
                 }
-            })
-            .await;
+            });
+        let execution_result = match shared_budget.clone() {
+            Some(budget) => ExecutionTreeBudget::scope(budget, Box::pin(execution)).await,
+            None => execution.await,
+        };
         let executed_slots = match execution_result {
             Ok(slots) => slots,
             Err(e) if is_tool_loop_cancelled(&e) => {
@@ -2489,7 +2479,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 channel_reply_target,
                 cancellation_token.clone(),
                 on_delta.clone(),
-                shared_budget.clone(),
+                shared_budget.as_ref().map(ExecutionTreeBudget::child),
                 channel,
                 collected_receipts,
                 event_tx.clone(),
@@ -2497,7 +2487,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 image_cache.as_deref_mut(),
                 agent_alias,
                 parent_agent_alias,
-                sop_reassembly,
+                sop_reassembly.clone(),
                 &mut sop_exec_cache,
             ))
             .await?;
@@ -2512,14 +2502,10 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         });
     }
 
-    let summary_limits = resolve_context_limits_for_call(
-        context_limits_resolver.as_ref(),
-        config,
-        agent_alias,
-        provider_name,
-        model,
-        context_limits,
-    );
+    if let Some(budget) = shared_budget.as_ref() {
+        budget.reserve()?;
+    }
+
     let summary_result = finish_after_max_iterations(
         model_provider,
         turn_state.history,
@@ -2527,18 +2513,31 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         model,
         dispatch_model,
         temperature,
-        multimodal_config,
         pacing,
         cancellation_token.as_ref(),
-        max_iterations,
+        max_iter::CompletionLimit::LocalIterations(max_iterations),
         accumulated_display_text,
         turn_id,
         knobs,
         event_tx.as_ref(),
+        on_delta.as_ref(),
         turn_state.canonical.as_deref_mut(),
-        summary_limits.context_token_budget,
+        config,
+        multimodal_config,
+        hooks,
+        image_cache,
+        |provider, selected_model| {
+            resolve_context_limits_for_call(
+                context_limits_resolver.as_ref(),
+                config,
+                agent_alias,
+                provider,
+                selected_model,
+                context_limits,
+            )
+        },
         &mut turn_state.crumb_present,
-        DispatchTokenCounter::for_route(pending_reported_usage, provider_name, model),
+        pending_reported_usage,
         observer,
     )
     .await;
@@ -2546,7 +2545,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
     summary_result
 }
 
-fn collect_callable_tool_names(
+pub(crate) fn collect_callable_tool_names(
     tools_registry: &[Box<dyn crate::tools::Tool>],
     activated_tools: Option<&Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
 ) -> Vec<String> {
@@ -2594,7 +2593,7 @@ fn sop_step_excluded_tools(
     excluded_tools: &[String],
 ) -> Vec<String> {
     let mut scoped = excluded_tools.to_vec();
-    for tool in ["sop_execute", "sop_advance", "sop_approve"] {
+    for tool in crate::sop::active_scope::SOP_CONTROL_TOOLS {
         push_excluded_tool(&mut scoped, tool);
     }
 
@@ -2651,9 +2650,10 @@ fn sop_step_excluded_tools(
 /// at every depth — no separate baseline field is needed: a depth >= 2 step
 /// naming the outer agent compares against the re-assembled child's alias and
 /// re-assembles correctly instead of inheriting the child's scope.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct SopStepReassembly<'a> {
     pub config: &'a zeroclaw_config::schema::Config,
+    pub live_config: Option<Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
 }
 
 /// The re-assembly gate: a step needs its own agent context re-assembled when
@@ -2724,6 +2724,7 @@ pub(crate) struct OwnedAgentExecution {
 /// drain and re-assembles only on an alias change.
 pub(crate) async fn assemble_owned_execution(
     config: &zeroclaw_config::schema::Config,
+    live_config: Option<Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
     alias: &str,
     sop_engine: Arc<std::sync::Mutex<crate::sop::SopEngine>>,
     sop_audit: Option<Arc<crate::sop::SopAuditLogger>>,
@@ -2790,7 +2791,7 @@ pub(crate) async fn assemble_owned_execution(
         None,
         Some(sop_engine),
         sop_audit,
-        None,
+        live_config,
     )?;
     let skills = crate::skills::load_skills_for_agent_from_config(config, alias);
     // Capture before `runtime` is moved into `ScopedAssembly` below.
@@ -2894,7 +2895,7 @@ fn build_owned_step_system_prompt(
         .map(|t| (t.name(), t.description()))
         .collect();
     let bootstrap_max_chars = if owned.agent.resolved.compact_context {
-        Some(6000)
+        Some(crate::agent::system_prompt::COMPACT_BOOTSTRAP_MAX_CHARS)
     } else {
         None
     };
@@ -2969,7 +2970,7 @@ async fn drive_live_sop_actions(
     channel_reply_target: Option<&str>,
     cancellation_token: Option<CancellationToken>,
     on_delta: Option<tokio::sync::mpsc::Sender<StreamDelta>>,
-    shared_budget: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    shared_budget: Option<ExecutionTreeBudget>,
     channel: Option<&dyn Channel>,
     collected_receipts: Option<&std::sync::Mutex<Vec<String>>>,
     event_tx: Option<tokio::sync::mpsc::Sender<TurnEvent>>,
@@ -3026,10 +3027,11 @@ async fn drive_live_sop_actions(
                     if needs_reassembly {
                         let alias =
                             step_alias.expect("needs_reassembly implies a step agent alias");
-                        if let Some(reassembly) = sop_reassembly {
+                        if let Some(reassembly) = sop_reassembly.as_ref() {
                             if !exec_cache.contains_key(alias) {
                                 match assemble_owned_execution(
                                     reassembly.config,
+                                    reassembly.live_config.clone(),
                                     alias,
                                     Arc::clone(&queued.engine),
                                     queued.audit.clone(),
@@ -3147,6 +3149,7 @@ async fn drive_live_sop_actions(
                                 o.agent.resolved.context_limits(),
                                 o.agent.resolved.tool_call_dedup_exempt.as_slice(),
                                 &sop_reassembly
+                                    .as_ref()
                                     .expect("owned implies a reassembly handle")
                                     .config
                                     .pacing,
@@ -3209,6 +3212,7 @@ async fn drive_live_sop_actions(
                             match build_owned_step_system_prompt(
                                 o,
                                 sop_reassembly
+                                    .as_ref()
                                     .expect("owned implies a reassembly handle")
                                     .config,
                                 step_alias.expect("needs_reassembly implies a step agent alias"),
@@ -3240,9 +3244,17 @@ async fn drive_live_sop_actions(
                                 Some(_) => &mut child_history,
                                 None => &mut *history,
                             };
-                            let step_result = crate::sop::executor::scope_step_call_sink(
-                                step_call_sink.clone(),
-                                Box::pin(run_tool_call_loop(ToolLoop {
+                            // Owned here, not a `&mut None` temporary: the step
+                            // future is built inside the run-attribution scope and
+                            // awaited after it, so a temporary would be dropped
+                            // while the future still borrows it.
+                            let mut nested_memory_preamble: Option<String> = None;
+                            let step_result = ::zeroclaw_log::scope!(
+                                sop_run_id: run_id.as_str(),
+                                =>
+                                crate::sop::executor::scope_step_call_sink(
+                                    step_call_sink.clone(),
+                                    Box::pin(run_tool_call_loop(ToolLoop {
                                     exec: ResolvedAgentExecution::resolve(
                                         ResolvedModelAccess {
                                             model_provider: eff_model_provider,
@@ -3296,7 +3308,7 @@ async fn drive_live_sop_actions(
                                     ),
                                     history: nested_history,
                                     history_has_trim_breadcrumb: &mut nested_crumb_present,
-                                    injected_memory_preamble: &mut None,
+                                    injected_memory_preamble: &mut nested_memory_preamble,
                                     channel_name,
                                     channel_reply_target,
                                     cancellation_token: cancellation_token.clone(),
@@ -3340,8 +3352,9 @@ async fn drive_live_sop_actions(
                                     },
                                     turn_id: &nested_turn_id,
                                     served_route_sink: None,
-                                    sop_reassembly,
-                                })),
+                                    sop_reassembly: sop_reassembly.clone(),
+                                    })),
+                                )
                             )
                             .await;
                             // Replay child loop's new messages to the parent's
@@ -3639,6 +3652,65 @@ mod reported_budget_tests {
     use super::*;
     use crate::observability::NoopObserver;
 
+    // Keep existing budget tests focused on trim behavior; the identity test
+    // below calls the production function with an explicit turn identity.
+    #[allow(clippy::too_many_arguments)]
+    async fn enforce_reported_budget(
+        history: &mut Vec<ChatMessage>,
+        reported_input_tokens: usize,
+        reported_population_estimated: usize,
+        tool_schema_tokens: usize,
+        context_token_budget: usize,
+        event_tx: Option<&tokio::sync::mpsc::Sender<TurnEvent>>,
+        observer: &dyn crate::observability::Observer,
+        multimodal_config: &zeroclaw_config::schema::MultimodalConfig,
+        degrade_strip_images: bool,
+        image_cache: Option<&mut zeroclaw_providers::multimodal::LocalImageCache>,
+        next_use_native_tools: bool,
+        hook_reserve_tokens: usize,
+        crumb_present: &mut bool,
+    ) {
+        super::enforce_reported_budget(
+            history,
+            reported_input_tokens,
+            reported_population_estimated,
+            tool_schema_tokens,
+            context_token_budget,
+            event_tx,
+            observer,
+            None,
+            "test",
+            multimodal_config,
+            degrade_strip_images,
+            image_cache,
+            next_use_native_tools,
+            hook_reserve_tokens,
+            crumb_present,
+        )
+        .await;
+    }
+
+    #[derive(Default)]
+    struct TrimObserver(std::sync::Mutex<Vec<zeroclaw_api::observability_traits::ObserverEvent>>);
+
+    impl crate::observability::Observer for TrimObserver {
+        fn record_event(&self, event: &zeroclaw_api::observability_traits::ObserverEvent) {
+            self.0.lock().expect("trim events lock").push(event.clone());
+        }
+
+        fn record_metric(&self, _metric: &zeroclaw_api::observability_traits::ObserverMetric) {}
+
+        fn name(&self) -> &str {
+            "trim-test"
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn flush(&self) {}
+    }
+
     fn big_history() -> Vec<ChatMessage> {
         let big = "x".repeat(2000);
         vec![
@@ -3650,6 +3722,41 @@ mod reported_budget_tests {
             ChatMessage::user("turn3 short".to_string()),
             ChatMessage::assistant("final answer".to_string()),
         ]
+    }
+
+    #[tokio::test]
+    async fn reported_budget_observer_identifies_the_effective_turn() {
+        let mut history = big_history();
+        let estimated = crate::agent::history::estimate_history_tokens(&history);
+        let observer = TrimObserver::default();
+        super::enforce_reported_budget(
+            &mut history,
+            estimated * 4,
+            estimated,
+            0,
+            estimated * 2,
+            None,
+            &observer,
+            Some("effective-agent"),
+            "turn-2",
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+            false,
+            None,
+            false,
+            0,
+            &mut false,
+        )
+        .await;
+        let events = observer.0.lock().expect("trim events lock");
+        assert!(events.iter().any(|event| matches!(
+            event,
+            zeroclaw_api::observability_traits::ObserverEvent::HistoryTrimmed {
+                agent_alias,
+                turn_id,
+                ..
+            } if agent_alias.as_deref() == Some("effective-agent")
+                && turn_id.as_deref() == Some("turn-2")
+        )));
     }
 
     #[tokio::test]
@@ -3885,6 +3992,8 @@ mod reported_budget_tests {
 
     #[tokio::test]
     async fn enforce_retrims_against_the_prepared_population_for_retained_images() {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+
         // `estimate_history_tokens` now charges the same fixed per-image cost
         // whether a `[IMAGE:...]` marker holds a path or the base64 payload
         // preparation resolves it to, so the raw and prepared populations for
@@ -3896,14 +4005,14 @@ mod reported_budget_tests {
         // request (prepared retained messages), not drift from it.
         let temp = tempfile::tempdir().unwrap();
         let image_path = temp.path().join("shot.png");
-        // PNG signature plus padding: MIME detection only needs the
-        // extension, but the padding keeps the base64 expansion larger than
-        // the marker's own path text regardless of how long the platform's
-        // temp-dir path is (a bare 8-byte signature can lose that race on
-        // Windows CI runners, whose temp paths run longer than Linux's).
-        let mut fake_png = vec![0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
-        fake_png.extend(vec![0u8; 4096]);
-        std::fs::write(&image_path, &fake_png).unwrap();
+        // Use a fully decodable image: the multimodal boundary intentionally
+        // rejects files that merely carry a valid signature.
+        const PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+        std::fs::write(
+            &image_path,
+            STANDARD.decode(PNG_B64).expect("valid PNG fixture"),
+        )
+        .unwrap();
         let marker = format!("[IMAGE:{}]", image_path.display());
         let big = "x".repeat(2000);
         let mut history = vec![
@@ -4203,15 +4312,9 @@ mod reported_budget_tests {
     }
 
     #[tokio::test]
-    async fn enforce_surfaces_the_untrimmable_newest_turn_floor() {
-        // History already sits at the newest-turn/schema floor: only the protected
-        // newest whole turn remains (plus system). The projected next request is
-        // over the budget because of a materially large deferred schema
-        // population, and `drop_oldest_whole_turn` returns zero (no droppable
-        // whole turn exists), so the trim cannot satisfy the budget. The floor
-        // must be surfaced explicitly with the honest accounting — the projected
-        // request still exceeds the budget with nothing dropped — rather than
-        // silently persisting an over-budget request as if the trim succeeded.
+    async fn enforce_soft_floor_keeps_the_latest_turn_without_a_false_failure() {
+        // Reported-budget maintenance is proactive only: a protected newest
+        // turn above its target is neither a deletion nor a capacity failure.
         let big = "x".repeat(2000);
         let mut history = vec![
             ChatMessage::system("system"),
@@ -4262,53 +4365,7 @@ mod reported_budget_tests {
         )
         .await;
 
-        // The floor is an explicit outcome, not a silent no-op: an event must be
-        // emitted even though no whole turn could be dropped.
-        let event = rx
-            .recv()
-            .await
-            .expect("the untrimmable floor must emit a HistoryTrimmed event");
-        let (dropped_messages, kept_turns, tokens_before, tokens_after, token_budget) = match event
-        {
-            TurnEvent::HistoryTrimmed {
-                dropped_messages,
-                kept_turns,
-                tokens_before,
-                tokens_after,
-                token_budget,
-                ..
-            } => (
-                dropped_messages,
-                kept_turns,
-                tokens_before,
-                tokens_after,
-                token_budget,
-            ),
-            other => panic!("expected HistoryTrimmed, got {other:?}"),
-        };
-        assert_eq!(
-            dropped_messages, 0,
-            "at the newest-turn floor nothing can be dropped"
-        );
-        assert_eq!(kept_turns, 1, "only the protected newest turn remains");
-        let tokens_after =
-            tokens_after.expect("the floor event must carry the projected post-trim token count");
-        let tokens_before =
-            tokens_before.expect("the floor event must carry the projected pre-trim token count");
-        assert!(
-            tokens_after > budget as u64,
-            "the projected request must still exceed the budget at the floor \
-             (tokens_after {tokens_after}, budget {budget})"
-        );
-        assert_eq!(
-            tokens_before, tokens_after,
-            "with nothing dropped the projected pre-trim and post-trim counts coincide"
-        );
-        assert_eq!(
-            token_budget,
-            Some(budget as u64),
-            "the configured budget must still be reported so the floor is anchored"
-        );
+        assert!(rx.try_recv().is_err(), "no trim or hard rejection occurred");
         let after: Vec<String> = history.iter().map(|m| m.content.clone()).collect();
         assert_eq!(
             after, taken,
@@ -4317,15 +4374,9 @@ mod reported_budget_tests {
     }
 
     #[tokio::test]
-    async fn enforce_breadcrumb_induced_floor_after_real_drop_reports_both_facts() {
-        // Two real turns: the projection drops the oldest turn to fit, but the
-        // inserted model-visible breadcrumb pushes the retained newest turn
-        // back over the budget and no further whole turn can be dropped. The
-        // floor outcome must report BOTH facts honestly: the messages that
-        // were actually removed on the way to the floor, and the
-        // unsatisfiable flag clients use as the authoritative discriminator —
-        // not a zero-drop "nothing was trimmed" claim about a history that
-        // lost a real turn.
+    async fn enforce_soft_floor_after_real_drop_reports_honest_trim_counts() {
+        // Preserve real deletion counts when the breadcrumb leaves the newest
+        // turn above the soft target, without mislabeling it as a hard failure.
         let big = "x".repeat(2000);
         let mut history = vec![
             ChatMessage::system("system"),
@@ -4416,9 +4467,8 @@ mod reported_budget_tests {
             "kept_turns must be breadcrumb-aware: only the newest real turn remains"
         );
         assert_eq!(
-            unsatisfiable_floor,
-            Some(true),
-            "the client-visible unsatisfiable flag must mark the floor even after real drops"
+            unsatisfiable_floor, None,
+            "a soft target cannot declare the model capacity unsatisfiable"
         );
         let tokens_after =
             tokens_after.expect("the floor event must carry the projected post-trim count");
@@ -5291,17 +5341,21 @@ vision_model_provider = "custom.vision"
 
 #[cfg(test)]
 mod shared_iteration_budget_tests {
-    use super::try_reserve_shared_iteration;
+    use super::{ExecutionTreeBudget, ExecutionTreeReservation};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier};
 
     #[test]
     fn exhausted_budget_never_wraps() {
-        let budget = AtomicUsize::new(1);
+        let budget = ExecutionTreeBudget::root(2);
 
-        assert!(try_reserve_shared_iteration(&budget));
-        assert!(!try_reserve_shared_iteration(&budget));
-        assert_eq!(budget.load(Ordering::Acquire), 0);
+        assert_eq!(budget.reserve(), Ok(ExecutionTreeReservation::Iteration));
+        assert_eq!(
+            budget.reserve(),
+            Ok(ExecutionTreeReservation::FinalCompletion)
+        );
+        assert!(budget.reserve().is_err());
+        assert_eq!(budget.remaining(), 0);
     }
 
     #[test]
@@ -5309,18 +5363,18 @@ mod shared_iteration_budget_tests {
         const AVAILABLE: usize = 8;
         const WORKERS: usize = 64;
 
-        let budget = Arc::new(AtomicUsize::new(AVAILABLE));
+        let budget = Arc::new(ExecutionTreeBudget::root(AVAILABLE + 1));
         let granted = Arc::new(AtomicUsize::new(0));
         let start = Arc::new(Barrier::new(WORKERS + 1));
 
         std::thread::scope(|scope| {
             for _ in 0..WORKERS {
-                let budget = Arc::clone(&budget);
+                let budget = budget.child();
                 let granted = Arc::clone(&granted);
                 let start = Arc::clone(&start);
                 scope.spawn(move || {
                     start.wait();
-                    if try_reserve_shared_iteration(&budget) {
+                    if budget.reserve() == Ok(ExecutionTreeReservation::Iteration) {
                         granted.fetch_add(1, Ordering::Relaxed);
                     }
                 });
@@ -5329,7 +5383,7 @@ mod shared_iteration_budget_tests {
         });
 
         assert_eq!(granted.load(Ordering::Relaxed), AVAILABLE);
-        assert_eq!(budget.load(Ordering::Acquire), 0);
+        assert_eq!(budget.remaining(), 1);
     }
 }
 
@@ -5471,12 +5525,14 @@ mod sop_step_reassembly_tests {
             SopConfig::default(),
         )));
 
-        let reader = assemble_owned_execution(&config, "reader", Arc::clone(&engine), None, None)
-            .await
-            .expect("reader assembles");
-        let writer = assemble_owned_execution(&config, "writer", Arc::clone(&engine), None, None)
-            .await
-            .expect("writer assembles");
+        let reader =
+            assemble_owned_execution(&config, None, "reader", Arc::clone(&engine), None, None)
+                .await
+                .expect("reader assembles");
+        let writer =
+            assemble_owned_execution(&config, None, "writer", Arc::clone(&engine), None, None)
+                .await
+                .expect("writer assembles");
         let reader_names = tool_names(&reader.tools_registry);
         let writer_names = tool_names(&writer.tools_registry);
 
@@ -5496,6 +5552,110 @@ mod sop_step_reassembly_tests {
         // With no parent approval manager the child is non-interactive
         // (auto-deny), matching the headless driver.
         assert!(reader.approval.is_non_interactive());
+    }
+
+    #[tokio::test]
+    async fn reassembled_step_file_download_observes_live_revocation() {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method, matchers::path};
+        use zeroclaw_config::multi_agent::{AgentMemoryConfig, MemoryBackendKind};
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, Config, FileDownloadConfig, ModelProviderConfig,
+            OllamaModelProviderConfig, RiskProfileConfig, SopConfig,
+        };
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/download"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"ok".to_vec()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            file_download: FileDownloadConfig {
+                url: Some(format!("{}/download", server.uri())),
+                allowed_private_hosts: vec!["127.0.0.1".into()],
+                ..FileDownloadConfig::default()
+            },
+            ..Config::default()
+        };
+        config.risk_profiles.insert(
+            "stepper".to_string(),
+            RiskProfileConfig {
+                allowed_tools: vec!["file_download".to_string()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.providers.models.ollama.insert(
+            "p".to_string(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("test-model".to_string()),
+                    ..ModelProviderConfig::default()
+                },
+                ..OllamaModelProviderConfig::default()
+            },
+        );
+        config.agents.insert(
+            "stepper".to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                model_provider: "ollama.p".into(),
+                risk_profile: "stepper".into(),
+                memory: AgentMemoryConfig {
+                    backend: MemoryBackendKind::Markdown,
+                },
+                ..AliasedAgentConfig::default()
+            },
+        );
+        let live_config = Arc::new(parking_lot::RwLock::new(config.clone()));
+        let engine = Arc::new(std::sync::Mutex::new(crate::sop::SopEngine::new(
+            SopConfig::default(),
+        )));
+
+        let owned = assemble_owned_execution(
+            &config,
+            Some(Arc::clone(&live_config)),
+            "stepper",
+            Arc::clone(&engine),
+            None,
+            None,
+        )
+        .await
+        .expect("stepper assembles");
+        let file_download = owned
+            .tools_registry
+            .iter()
+            .find(|tool| tool.name() == "file_download")
+            .expect("file_download must be registered for the step agent");
+        let args = serde_json::json!({ "document_id": "doc-1", "dest_path": "out.bin" });
+
+        let first = file_download
+            .execute(args.clone())
+            .await
+            .expect("first run");
+        assert!(first.success, "allowlisted local endpoint should pass");
+
+        live_config
+            .write()
+            .file_download
+            .allowed_private_hosts
+            .clear();
+
+        let second = file_download.execute(args).await.expect("second run");
+        assert!(
+            !second.success,
+            "same reassembled step tool must observe live allowlist revocation"
+        );
+        assert!(
+            second
+                .error
+                .unwrap_or_default()
+                .contains("file_download.allowed_private_hosts")
+        );
     }
 
     /// A parent approval manager with a live back-channel survives delegation:
@@ -5555,6 +5715,7 @@ mod sop_step_reassembly_tests {
         );
         let owned = assemble_owned_execution(
             &config,
+            None,
             "restricted",
             Arc::clone(&engine),
             None,
@@ -5832,6 +5993,468 @@ mod sop_step_reassembly_tests {
         }
     }
 
+    struct BudgetToolCallingProvider;
+
+    impl ::zeroclaw_api::attribution::Attributable for BudgetToolCallingProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "BudgetToolCallingProvider"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for BudgetToolCallingProvider {
+        fn supports_native_tools(&self) -> bool {
+            true
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            Ok("ok".into())
+        }
+
+        async fn chat(
+            &self,
+            request: zeroclaw_api::model_provider::ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<ChatResponse> {
+            if request.tools.is_none_or(<[_]>::is_empty) {
+                return Ok(ChatResponse {
+                    text: Some("local-cap-summary".into()),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    reasoning_content: None,
+                });
+            }
+
+            Ok(ChatResponse {
+                text: Some(String::new()),
+                tool_calls: vec![ToolCall {
+                    id: "budget-call".into(),
+                    name: "shell".into(),
+                    arguments: "{}".into(),
+                    extra_content: None,
+                }],
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    async fn run_budgeted_test_loop(
+        provider: &dyn ModelProvider,
+        history: &mut Vec<ChatMessage>,
+        tools: &crate::tools::scoped::ScopedToolRegistry,
+        budget: ExecutionTreeBudget,
+        cancellation_token: CancellationToken,
+        max_tool_iterations: usize,
+    ) -> Result<String> {
+        run_budgeted_test_loop_with_hooks(
+            provider,
+            history,
+            tools,
+            budget,
+            cancellation_token,
+            max_tool_iterations,
+            None,
+        )
+        .await
+    }
+
+    async fn run_budgeted_test_loop_with_hooks(
+        provider: &dyn ModelProvider,
+        history: &mut Vec<ChatMessage>,
+        tools: &crate::tools::scoped::ScopedToolRegistry,
+        budget: ExecutionTreeBudget,
+        cancellation_token: CancellationToken,
+        max_tool_iterations: usize,
+        hooks: Option<&crate::hooks::HookRunner>,
+    ) -> Result<String> {
+        let observer = crate::observability::NoopObserver {};
+        let multimodal = zeroclaw_config::schema::MultimodalConfig::default();
+        let pacing = zeroclaw_config::schema::PacingConfig {
+            loop_detection_enabled: false,
+            ..zeroclaw_config::schema::PacingConfig::default()
+        };
+        let knobs = LoopKnobs {
+            dedup_enabled: false,
+            ..LoopKnobs::default()
+        };
+        let turn_id = uuid::Uuid::new_v4().to_string();
+
+        run_tool_call_loop(ToolLoop {
+            sop_reassembly: None,
+            exec: ResolvedAgentExecution::resolve(
+                ResolvedModelAccess {
+                    model_provider: provider,
+                    provider_name: "budget-test",
+                    model: "budget-test-model",
+                    dispatch_model: "hint:budget-test",
+                    temperature: None,
+                },
+                ResolvedIo {
+                    tools_registry: tools,
+                    observer: &observer,
+                    silent: true,
+                    approval: None,
+                    multimodal_config: &multimodal,
+                    config: None,
+                    hooks,
+                    activated_tools: None,
+                    model_switch_callback: None,
+                    receipt_generator: None,
+                },
+                ResolvedRuntimeKnobs {
+                    max_tool_iterations,
+                    excluded_tools: &[],
+                    dedup_exempt_tools: &[],
+                    pacing: &pacing,
+                    strict_tool_parsing: false,
+                    parallel_tools: false,
+                    max_tool_result_chars: 30_000,
+                    context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(
+                        100_000,
+                    ),
+                    context_limits_resolver: None,
+                    knobs: &knobs,
+                },
+            ),
+            history,
+            channel_name: "test",
+            channel_reply_target: None,
+            cancellation_token: Some(cancellation_token),
+            on_delta: None,
+            shared_budget: Some(budget),
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
+            channel: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            image_cache: None,
+            memory: None,
+            ingress: IngressContext::sub_turn(),
+            agent_alias: Some("budget-test"),
+            parent_agent_alias: None,
+            served_route_sink: None,
+            turn_id: &turn_id,
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn tree_budget_final_completion_prepares_images_and_honors_hooks() {
+        struct SummaryProbe(Arc<AtomicUsize>, &'static str);
+        impl zeroclaw_api::attribution::Attributable for SummaryProbe {
+            fn role(&self) -> zeroclaw_api::attribution::Role {
+                zeroclaw_api::attribution::Attributable::role(&TextProvider)
+            }
+            fn alias(&self) -> &str {
+                "summary-probe"
+            }
+        }
+        #[async_trait::async_trait]
+        impl ModelProvider for SummaryProbe {
+            fn capabilities(&self) -> zeroclaw_api::model_provider::ProviderCapabilities {
+                zeroclaw_api::model_provider::ProviderCapabilities {
+                    vision: true,
+                    ..Default::default()
+                }
+            }
+            async fn chat_with_system(
+                &self,
+                _: Option<&str>,
+                _: &str,
+                _: &str,
+                _: Option<f64>,
+            ) -> Result<String> {
+                anyhow::bail!("summary must use chat")
+            }
+            async fn chat(
+                &self,
+                request: zeroclaw_providers::ChatRequest<'_>,
+                model: &str,
+                _: Option<f64>,
+            ) -> Result<ChatResponse> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(model, self.1);
+                assert!(request.tools.is_none());
+                assert!(
+                    request
+                        .messages
+                        .iter()
+                        .any(|m| m.content.contains("data:image/png;base64,"))
+                );
+                assert!(request.messages.iter().any(|m| m.content == "hook-rewrite"));
+                Ok(ChatResponse {
+                    text: Some("prepared summary".into()),
+                    tool_calls: vec![],
+                    usage: None,
+                    reasoning_content: None,
+                })
+            }
+        }
+        struct SummaryHook {
+            cancel: bool,
+            change_model: bool,
+        }
+        #[async_trait::async_trait]
+        impl crate::hooks::HookHandler for SummaryHook {
+            fn name(&self) -> &str {
+                "summary-hook"
+            }
+            async fn before_llm_call(
+                &self,
+                messages: &mut Vec<ChatMessage>,
+                model: &mut String,
+            ) -> crate::hooks::HookResult<()> {
+                assert!(
+                    messages
+                        .iter()
+                        .any(|m| m.content.contains("data:image/png;base64,")),
+                    "hooks must see prepared images"
+                );
+                if self.cancel {
+                    return crate::hooks::HookResult::Cancel("summary denied".into());
+                }
+                if self.change_model {
+                    *model = "hook-selected-model".into();
+                }
+                messages.push(ChatMessage::user("hook-rewrite"));
+                crate::hooks::HookResult::Continue(())
+            }
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let image = tmp.path().join("summary.png");
+        // Image validation rejects a PNG signature without decodable pixels.
+        std::fs::write(
+            &image,
+            [
+                0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+                0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00,
+                0x00, 0x90, 0x77, 0x53, 0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54, 0x78,
+                0x9C, 0x63, 0xF8, 0xCF, 0xC0, 0x00, 0x00, 0x03, 0x01, 0x01, 0x00, 0xC9, 0xFE, 0x92,
+                0xEF, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+            ],
+        )
+        .unwrap();
+        let prompt = format!("describe [IMAGE:{}]", image.display());
+        let tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![]);
+        for (cancel, change_model) in [(false, false), (false, true), (true, true)] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let provider = SummaryProbe(
+                calls.clone(),
+                if change_model {
+                    "hook-selected-model"
+                } else {
+                    "hint:budget-test"
+                },
+            );
+            let mut hooks = crate::hooks::HookRunner::new();
+            hooks.register(Box::new(SummaryHook {
+                cancel,
+                change_model,
+            }));
+            let budget = ExecutionTreeBudget::root(1);
+            let mut history = vec![ChatMessage::user(prompt.clone())];
+            let result = run_budgeted_test_loop_with_hooks(
+                &provider,
+                &mut history,
+                &tools,
+                budget.clone(),
+                CancellationToken::new(),
+                10,
+                Some(&hooks),
+            )
+            .await;
+            assert_eq!(budget.remaining(), 0);
+            if cancel {
+                assert!(format!("{:#}", result.unwrap_err()).contains("summary denied"));
+                assert_eq!(
+                    history.len(),
+                    1,
+                    "cancelled preparation must remove the synthetic summary prompt"
+                );
+            } else {
+                let response = result.unwrap();
+                assert!(response.contains("execution-tree iteration budget"));
+                assert!(!response.contains("maximum tool iterations"));
+            }
+            assert_eq!(
+                history[0].content, prompt,
+                "preparation must not rewrite durable user history"
+            );
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                usize::from(!cancel),
+                "hook cancellation must prevent dispatch"
+            );
+        }
+        let mut history = vec![ChatMessage::user(prompt)];
+        let result = run_budgeted_test_loop(
+            &TextProvider,
+            &mut history,
+            &tools,
+            ExecutionTreeBudget::root(1),
+            CancellationToken::new(),
+            10,
+        )
+        .await;
+        assert!(
+            result
+                .unwrap_err()
+                .downcast_ref::<zeroclaw_providers::ProviderCapabilityError>()
+                .is_some(),
+            "synthetic prompt must not hide a fresh image from a text-only provider"
+        );
+        assert_eq!(history.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn root_local_iteration_cap_consumes_tree_budget_for_summary() {
+        let root_budget = ExecutionTreeBudget::root(2);
+        let tool_calls = Arc::new(AtomicUsize::new(0));
+        let tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+            ShellProbe {
+                calls: Arc::clone(&tool_calls),
+            },
+        )]);
+        let mut history = vec![ChatMessage::user("run one tool")];
+
+        let response = run_budgeted_test_loop(
+            &BudgetToolCallingProvider,
+            &mut history,
+            &tools,
+            root_budget.clone(),
+            CancellationToken::new(),
+            1,
+        )
+        .await
+        .expect("root should use its final reservation for the local-cap summary");
+
+        assert!(response.contains("local-cap-summary"));
+        assert_eq!(tool_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(root_budget.remaining(), 0);
+    }
+
+    #[tokio::test]
+    async fn child_local_iteration_cap_preserves_root_final_reservation() {
+        use crate::agent::execution_tree_budget::ExecutionTreeBudgetExhausted;
+
+        let root_budget = ExecutionTreeBudget::root(2);
+        let tool_calls = Arc::new(AtomicUsize::new(0));
+        let tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+            ShellProbe {
+                calls: Arc::clone(&tool_calls),
+            },
+        )]);
+        let mut history = vec![ChatMessage::user("run one child tool")];
+
+        let error = run_budgeted_test_loop(
+            &BudgetToolCallingProvider,
+            &mut history,
+            &tools,
+            root_budget.child(),
+            CancellationToken::new(),
+            1,
+        )
+        .await
+        .expect_err("child must not spend the root-only final reservation on a summary");
+
+        assert!(
+            error
+                .downcast_ref::<ExecutionTreeBudgetExhausted>()
+                .is_some(),
+            "child local-cap exhaustion must preserve the typed budget error: {error:#}"
+        );
+        assert_eq!(tool_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(root_budget.remaining(), 1);
+    }
+
+    #[tokio::test]
+    async fn child_exhaustion_preserves_root_final_completion_slot() {
+        use crate::agent::execution_tree_budget::ExecutionTreeBudgetExhausted;
+
+        let root_budget = ExecutionTreeBudget::root(3);
+        let cancellation_token = CancellationToken::new();
+        let tool_calls = Arc::new(AtomicUsize::new(0));
+        let tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+            ShellProbe {
+                calls: Arc::clone(&tool_calls),
+            },
+        )]);
+        let mut child_history = vec![ChatMessage::user("run tools")];
+
+        let child_error = run_budgeted_test_loop(
+            &BudgetToolCallingProvider,
+            &mut child_history,
+            &tools,
+            root_budget.child(),
+            cancellation_token.clone(),
+            10,
+        )
+        .await
+        .expect_err("child must stop at the shared tree allowance");
+
+        assert!(
+            child_error
+                .downcast_ref::<ExecutionTreeBudgetExhausted>()
+                .is_some(),
+            "child exhaustion must preserve the typed budget error: {child_error:#}"
+        );
+        assert_eq!(tool_calls.load(Ordering::SeqCst), 2);
+        assert!(!cancellation_token.is_cancelled());
+        assert_eq!(root_budget.remaining(), 1);
+
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let root_provider = CaptureProvider {
+            requests: Arc::clone(&requests),
+        };
+        let mut root_history = vec![ChatMessage::user("finish coherently")];
+        let response = run_budgeted_test_loop(
+            &root_provider,
+            &mut root_history,
+            &tools,
+            root_budget.clone(),
+            cancellation_token.clone(),
+            10,
+        )
+        .await
+        .expect("root must consume the retained final slot");
+
+        assert!(
+            response.starts_with("child-done"),
+            "root final completion must return the provider response: {response:?}"
+        );
+        assert_eq!(root_budget.remaining(), 0);
+        assert!(!cancellation_token.is_cancelled());
+        assert_eq!(tool_calls.load(Ordering::SeqCst), 2);
+        let captured = requests.lock().expect("capture lock");
+        assert_eq!(captured.len(), 1);
+        assert!(
+            captured[0].1.is_empty(),
+            "final completion must offer no tools"
+        );
+        assert_eq!(
+            root_history.last().map(|message| message.content.as_str()),
+            Some("child-done")
+        );
+    }
+
     /// Seed a step agent's owned execution context directly (the memo cache is
     /// caller-owned precisely so tests can drive the REAL nested loop with a
     /// scripted child provider — `assemble_owned_execution` binds providers
@@ -5902,6 +6525,7 @@ mod sop_step_reassembly_tests {
             admission_policy: Default::default(),
             max_pending_approvals: 0,
             agent: None,
+            decision: None,
         };
         let mut engine = crate::sop::SopEngine::new(SopConfig::default());
         engine.set_sops_for_test(vec![sop]);
@@ -5937,6 +6561,8 @@ mod sop_step_reassembly_tests {
         parent_tools: &crate::tools::scoped::ScopedToolRegistry,
         observer: &dyn crate::observability::Observer,
         history: &mut Vec<ChatMessage>,
+        history_has_trim_breadcrumb: Option<&mut bool>,
+        event_tx: Option<tokio::sync::mpsc::Sender<TurnEvent>>,
         new_messages_out: Option<&mut Vec<ChatMessage>>,
         agent_alias: Option<&str>,
         sop_reassembly: Option<SopStepReassembly<'_>>,
@@ -5954,10 +6580,13 @@ mod sop_step_reassembly_tests {
             audit: None,
             action,
         };
+        let mut local_history_has_trim_breadcrumb = false;
+        let history_has_trim_breadcrumb =
+            history_has_trim_breadcrumb.unwrap_or(&mut local_history_has_trim_breadcrumb);
         drive_live_sop_actions(
             vec![queued],
             history,
-            &mut false,
+            history_has_trim_breadcrumb,
             parent_provider,
             "mock",
             "mock-model",
@@ -5994,7 +6623,7 @@ mod sop_step_reassembly_tests {
             None,
             None,
             None,
-            None,
+            event_tx,
             new_messages_out,
             None,
             agent_alias,
@@ -6034,7 +6663,10 @@ mod sop_step_reassembly_tests {
     async fn cross_agent_step_never_sends_parent_history_to_child_provider() {
         let (engine, run_id, action) = start_single_cross_agent_step("stepper");
         let config = zeroclaw_config::schema::Config::default();
-        let handle = SopStepReassembly { config: &config };
+        let handle = SopStepReassembly {
+            config: &config,
+            live_config: None,
+        };
 
         let requests: Arc<std::sync::Mutex<Vec<CapturedRequest>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -6065,6 +6697,8 @@ mod sop_step_reassembly_tests {
             &parent_tools,
             &crate::observability::NoopObserver {},
             &mut history,
+            None,
+            None,
             Some(&mut new_out),
             Some("outer"),
             Some(handle),
@@ -6131,7 +6765,10 @@ mod sop_step_reassembly_tests {
 
         let (engine, run_id, action) = start_single_cross_agent_step("stepper");
         let config = zeroclaw_config::schema::Config::default();
-        let handle = SopStepReassembly { config: &config };
+        let handle = SopStepReassembly {
+            config: &config,
+            live_config: None,
+        };
 
         let requests: Arc<std::sync::Mutex<Vec<CapturedRequest>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -6176,6 +6813,8 @@ mod sop_step_reassembly_tests {
             &parent_tools,
             &crate::observability::NoopObserver {},
             &mut history,
+            None,
+            None,
             None,
             Some("outer"),
             Some(handle),
@@ -6224,7 +6863,10 @@ mod sop_step_reassembly_tests {
     async fn cross_agent_step_stamps_effective_identity_with_parent_correlation() {
         let (engine, run_id, action) = start_single_cross_agent_step("stepper");
         let config = zeroclaw_config::schema::Config::default();
-        let handle = SopStepReassembly { config: &config };
+        let handle = SopStepReassembly {
+            config: &config,
+            live_config: None,
+        };
 
         let requests: Arc<std::sync::Mutex<Vec<CapturedRequest>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -6252,6 +6894,8 @@ mod sop_step_reassembly_tests {
             &parent_tools,
             &observer,
             &mut history,
+            None,
+            None,
             None,
             Some("outer"),
             Some(handle),
@@ -6283,7 +6927,10 @@ mod sop_step_reassembly_tests {
     async fn same_agent_step_keeps_shared_history_and_identity() {
         let (engine, run_id, action) = start_single_cross_agent_step("outer");
         let config = zeroclaw_config::schema::Config::default();
-        let handle = SopStepReassembly { config: &config };
+        let handle = SopStepReassembly {
+            config: &config,
+            live_config: None,
+        };
 
         let observer = IdentityCapture::default();
         let parent_provider = TextProvider;
@@ -6298,6 +6945,8 @@ mod sop_step_reassembly_tests {
             &parent_tools,
             &observer,
             &mut history,
+            None,
+            None,
             None,
             Some("outer"),
             Some(handle),
@@ -6331,10 +6980,77 @@ mod sop_step_reassembly_tests {
     }
 
     #[tokio::test]
+    async fn same_agent_step_excludes_existing_breadcrumb_from_trim_turn_count() {
+        let (engine, _run_id, action) = start_single_cross_agent_step("outer");
+        let config = zeroclaw_config::schema::Config::default();
+        let handle = SopStepReassembly {
+            config: &config,
+            live_config: None,
+        };
+
+        let parent_provider = TextProvider;
+        let parent_tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
+        let mut history = vec![
+            ChatMessage::system("parent system prompt"),
+            crate::agent::history_trim::breadcrumb(),
+            ChatMessage::user("old ".repeat(120_000)),
+            ChatMessage::assistant("old reply"),
+            ChatMessage::user("recent request"),
+            ChatMessage::assistant("recent reply"),
+        ];
+        let mut history_has_trim_breadcrumb = true;
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
+        let mut exec_cache = std::collections::HashMap::new();
+
+        drive_step(
+            Arc::clone(&engine),
+            action,
+            &parent_provider,
+            &parent_tools,
+            &crate::observability::NoopObserver {},
+            &mut history,
+            Some(&mut history_has_trim_breadcrumb),
+            Some(event_tx),
+            None,
+            Some("outer"),
+            Some(handle),
+            None,
+            &mut exec_cache,
+        )
+        .await;
+
+        let dropped_turns = std::iter::from_fn(|| event_rx.try_recv().ok())
+            .find_map(|event| match event {
+                TurnEvent::HistoryTrimmed { dropped_turns, .. } => Some(dropped_turns),
+                _ => None,
+            })
+            .expect("the oversized old turn must emit a trim event");
+        assert_eq!(
+            dropped_turns, 1,
+            "the synthetic breadcrumb must not be reported as a dropped user turn"
+        );
+        assert!(history_has_trim_breadcrumb);
+        let breadcrumb = crate::agent::history_trim::breadcrumb();
+        assert_eq!(
+            history
+                .iter()
+                .filter(|message| {
+                    message.role == breadcrumb.role && message.content == breadcrumb.content
+                })
+                .count(),
+            1,
+            "repeated same-agent trimming must retain exactly one breadcrumb"
+        );
+    }
+
+    #[tokio::test]
     async fn same_agent_step_output_reaches_parent_capture_once() {
         let (engine, _run_id, action) = start_single_cross_agent_step("outer");
         let config = zeroclaw_config::schema::Config::default();
-        let handle = SopStepReassembly { config: &config };
+        let handle = SopStepReassembly {
+            config: &config,
+            live_config: None,
+        };
 
         let observer = IdentityCapture::default();
         let parent_provider = TextProvider;
@@ -6350,6 +7066,8 @@ mod sop_step_reassembly_tests {
             &parent_tools,
             &observer,
             &mut history,
+            None,
+            None,
             Some(&mut capture),
             Some("outer"),
             Some(handle),
@@ -6386,7 +7104,10 @@ mod sop_step_reassembly_tests {
         let (engine, run_id, action) = start_single_cross_agent_step("stepper");
         // Bare config: no "stepper" agent exists, so assembly must fail.
         let config = zeroclaw_config::schema::Config::default();
-        let handle = SopStepReassembly { config: &config };
+        let handle = SopStepReassembly {
+            config: &config,
+            live_config: None,
+        };
 
         let shell_calls = Arc::new(AtomicUsize::new(0));
         let parent_tools =
@@ -6406,6 +7127,8 @@ mod sop_step_reassembly_tests {
             &parent_tools,
             &crate::observability::NoopObserver {},
             &mut history,
+            None,
+            None,
             None,
             Some("outer"),
             Some(handle),
@@ -6454,6 +7177,8 @@ mod sop_step_reassembly_tests {
             &parent_tools,
             &crate::observability::NoopObserver {},
             &mut history,
+            None,
+            None,
             None,
             Some("outer"),
             None,
@@ -6582,7 +7307,10 @@ mod sop_step_reassembly_tests {
     async fn cross_agent_step_model_switch_never_leaks_into_parent_loop() {
         let (engine, run_id, action) = start_single_cross_agent_step("stepper");
         let config = zeroclaw_config::schema::Config::default();
-        let handle = SopStepReassembly { config: &config };
+        let handle = SopStepReassembly {
+            config: &config,
+            live_config: None,
+        };
 
         let mut exec_cache = std::collections::HashMap::new();
         let mut stepper_agent = zeroclaw_config::schema::AliasedAgentConfig::default();
@@ -6633,6 +7361,8 @@ mod sop_step_reassembly_tests {
             &parent_tools,
             &crate::observability::NoopObserver {},
             &mut history,
+            None,
+            None,
             None,
             Some("outer"),
             Some(handle),
@@ -6716,6 +7446,7 @@ mod sop_step_reassembly_tests {
             admission_policy: Default::default(),
             max_pending_approvals: 0,
             agent: None,
+            decision: None,
         };
         // A step is revisited every other iteration, so the per-step visit
         // bound must stay well above the drive budget for this test to prove
@@ -6755,6 +7486,8 @@ mod sop_step_reassembly_tests {
             &parent_tools,
             &crate::observability::NoopObserver {},
             &mut history,
+            None,
+            None,
             None,
             None,
             None,

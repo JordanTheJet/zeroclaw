@@ -19,7 +19,11 @@ There are two TLS layers, and only one of them is the security boundary:
 - **Inner mTLS (the real boundary).** TLS 1.3 only, mutually authenticated. The
   client presents a daemon-issued certificate; the daemon presents its server
   leaf. This is the RPC plane. There is **no** server-only / unauthenticated path
-  on it - a client certificate is always required.
+  on it - a client certificate is always required. The certificate admits the
+  *device*; it is not an RPC credential. Every remote `initialize` must also
+  carry a bearer `auth_token` that identifies the *principal*, or the daemon
+  refuses it with `AUTH_REQUIRED` (`-32010`). See
+  [Bearer token](./remote.md#bearer-token-required-for-every-connection).
 - **Outer TLS (a metadata boundary).** When a relay is in the path, the relay
   terminates an outer TLS + WebSocket session and forwards opaque ciphertext. It
   never holds a key that can read the inner RPC. On the direct topology there is
@@ -125,9 +129,16 @@ caches, under `<config-dir>/tls/`:
 | `ca.crt` | Daemon CA chain, pinned for the RPC plane | default umask |
 | `profile.json` | Cached `device_id`, `not_after`, relay profile | default umask |
 
-Every later run is zero-config (`zerocode --connect wss://<remote-host>:9781`,
-or just `zerocode` if `uri` is in config). The cert auto-renews at ~50% of its
-lifetime (~15 days) over the live mTLS session; a revoked cert cannot self-renew.
+Later runs reuse the cached certificate without enrolling again. The cert
+auto-renews at ~50% of its lifetime (~15 days) over the live mTLS session; a
+revoked cert cannot self-renew.
+
+Enrollment issues a certificate only, not a bearer token. Before the daemon
+accepts a session, pair with the gateway for a `zc_...` token and give it to
+zerocode via `ZEROCLAW_AUTH_TOKEN`, `auth_token_file`, or `auth_token` (see
+[Bearer token](./remote.md#bearer-token-required-for-every-connection)). With the
+token in place, `zerocode --connect wss://<remote-host>:9781` (or just `zerocode`
+if `uri` is in config) needs no more flags.
 
 Enrollment endpoint defaults: `--enroll-host` defaults to `--connect`'s host;
 `--enroll-port` defaults to `9782`.
@@ -170,6 +181,9 @@ ca_cert_path     = "/abs/path/ca.crt"
 client_cert_path = "/abs/path/client.crt"
 client_key_path  = "/abs/path/client.key"
 ```
+
+Plain `zerocode` still needs a bearer token, from `ZEROCLAW_AUTH_TOKEN` or from
+`auth_token_file` / `auth_token` under `[connection.wss]`.
 
 > A certless client that reaches the WSS plane without enrolling gets an
 > actionable "enroll first" message (and the daemon logs the rejected
@@ -503,6 +517,36 @@ enroll through it; daemon registration, zerocode clients, and the tunneled RPC
 plane are unaffected. The enrollment page itself carries the same trust note,
 and `zerorelay` logs a warning at startup while the frontdoor is on.
 
+#### Prefilled enrollment links
+
+To spare a phone user from typing a long node id, a link can carry the node id
+and the pairing code, and the page fills both fields when it loads:
+
+```text
+https://relay.example.com/#node=<node-id>&code=<pairing-code>
+https://relay.example.com/?node=<node-id>&code=<pairing-code>
+```
+
+Prefer the `#` form. A URL fragment is never sent to any server, so the pairing
+code stays out of reverse-proxy and CDN access logs; the `?` form is accepted
+too. The relay itself drops the query string before routing and never logs or
+reflects it, and serves the page with `cache-control: no-store` and
+`referrer-policy: no-referrer`.
+
+The page only fills the fields. It does not fetch the agent CA or submit
+anything: the user still presses **Fetch the agent CA** and confirms the
+short-auth-string. Values that do not match the node-id or pairing-code shape
+are ignored, and both parameters are removed from the address bar and the
+current history entry as soon as the page reads them, so a copied or bookmarked
+URL does not carry the code.
+
+The browser can still record the link as it was first opened in its own history
+database (Chrome does, for both the `?` and `#` forms); no page can rewrite that.
+What makes that copy harmless is the code itself: it is consumed by the first
+successful enrollment and expires ten minutes after it is minted, so the stored
+link is spent or dead. Treat a link that carries an unused code like the code
+itself, and prefer enrolling promptly after minting.
+
 ---
 
 ## Configuration reference
@@ -593,6 +637,9 @@ Subcommands: `healthcheck [--addr 127.0.0.1:8443]`, `status --file <path>`.
 | `direct_attempts` | `2` | - |
 | `direct_timeout_secs` | `3` | - |
 | `reprobe_secs` | `30` | - |
+| `auth_token` | (none) | `ZEROCLAW_AUTH_TOKEN` env (wins over both token keys) |
+| `auth_token_file` | (none) | - (wins over `auth_token`; must be owner-only) |
+| `auth_provider` | `native` (pairing token) | - (e.g. `oidc.<alias>`) |
 
 | `[connection.wss.tls]` key | Default | CLI override |
 |----------------------------|---------|--------------|
