@@ -1172,7 +1172,7 @@ fn audit_denial(
 /// Whether the credential behind `auth` is still live: not expired, not
 /// past its revalidation deadline, and, for a native pairing token, still
 /// paired.
-pub(crate) fn credential_is_live(
+fn credential_is_live(
     inbound: &crate::rpc::auth::RpcInboundAuth,
     auth: &crate::rpc::auth::ConnectionAuth,
 ) -> Result<(), crate::rpc::auth::AuthDenied> {
@@ -1182,7 +1182,7 @@ pub(crate) fn credential_is_live(
 /// The authority `auth` holds for `method` under the accepted policy in force
 /// now: a live credential, a fresh resolution, a generation that did not move
 /// underneath that resolution, and the method's coarse grant.
-pub(crate) fn current_authority(
+fn current_authority(
     inbound: &crate::rpc::auth::RpcInboundAuth,
     auth: &crate::rpc::auth::ConnectionAuth,
     method: Method,

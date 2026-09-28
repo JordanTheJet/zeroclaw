@@ -1488,7 +1488,11 @@ impl SessionStore {
     pub(crate) async fn wait_test_prompt_registration_pause(&self) {
         self.test_prompt_registration_pause
             .point
-            .wait_if_armed(true)
+            .wait_if_armed(
+                None,
+                crate::security::authority::test_pause::Stage::Access,
+                true,
+            )
             .await;
     }
 
