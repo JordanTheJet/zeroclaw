@@ -234,6 +234,15 @@ type GatedOpPause = (
 #[cfg(test)]
 type PromptRegistrationPause = (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>);
 
+/// The prompt-registration pause point, shared with the authority recheck
+/// machinery so every site parks the same way. The handle keeps the pause
+/// armed for the lifetime of the store.
+#[cfg(test)]
+struct PromptRegistrationPausePoint {
+    point: Arc<crate::security::authority::test_pause::TestPause>,
+    handle: std::sync::Mutex<Option<crate::security::authority::test_pause::PauseHandle>>,
+}
+
 #[cfg(test)]
 type PromptRehydrationPause = (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>);
 
@@ -272,7 +281,7 @@ pub struct SessionStore {
     /// token. Removal-race tests use this to issue close/kill/delete while the
     /// prompt owns admission but before any fallible setup or provider work.
     #[cfg(test)]
-    test_prompt_registration_pause: std::sync::Mutex<Option<PromptRegistrationPause>>,
+    test_prompt_registration_pause: PromptRegistrationPausePoint,
     #[cfg(test)]
     test_prompt_rehydration_pause: std::sync::Mutex<Option<PromptRehydrationPause>>,
     /// Test-only pause after a removal handler captures the target generation
@@ -340,7 +349,10 @@ impl SessionStore {
             #[cfg(test)]
             test_gated_op_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
-            test_prompt_registration_pause: std::sync::Mutex::new(None),
+            test_prompt_registration_pause: PromptRegistrationPausePoint {
+                point: Arc::new(crate::security::authority::test_pause::TestPause::default()),
+                handle: std::sync::Mutex::new(None),
+            },
             #[cfg(test)]
             test_prompt_rehydration_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
@@ -1470,30 +1482,33 @@ impl SessionStore {
         .await
     }
 
+    /// Park a prompt at registration if a test armed the pause. Registration
+    /// runs under the session admission permit, so the proof is held here.
     #[cfg(test)]
     pub(crate) async fn wait_test_prompt_registration_pause(&self) {
-        let (entered, release) = {
-            let guard = self.test_prompt_registration_pause.lock().unwrap();
-            match &*guard {
-                Some((entered, release)) => (Arc::clone(entered), Arc::clone(release)),
-                None => return,
-            }
-        };
-        entered.notify_one();
-        release.notified().await;
+        self.test_prompt_registration_pause
+            .point
+            .wait_if_armed(true)
+            .await;
     }
 
     #[cfg(not(test))]
     #[inline(always)]
     pub(crate) async fn wait_test_prompt_registration_pause(&self) {}
 
+    /// Arm the prompt-registration pause. Returns the legacy
+    /// `(entered, release)` pair; the underlying handle stays armed in the
+    /// store so dropping the pair does not disarm it.
     #[cfg(test)]
     pub(crate) fn set_test_prompt_registration_pause(&self) -> PromptRegistrationPause {
-        let entered = Arc::new(tokio::sync::Notify::new());
-        let release = Arc::new(tokio::sync::Notify::new());
-        *self.test_prompt_registration_pause.lock().unwrap() =
-            Some((Arc::clone(&entered), Arc::clone(&release)));
-        (entered, release)
+        let handle = self.test_prompt_registration_pause.point.arm();
+        let pair = handle.legacy_pair();
+        *self
+            .test_prompt_registration_pause
+            .handle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(handle);
+        pair
     }
 
     #[cfg(test)]
