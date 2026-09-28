@@ -73,12 +73,20 @@ pub enum Retirement {
     Rename { to: &'static [&'static str] },
 }
 
+/// A [`RetiredKey::path`] segment that matches every key of the table at that
+/// level, e.g. `&["agents", ANY_KEY, "max_tool_iterations"]` retires the key in
+/// every `[agents.<alias>]` block. In a [`Retirement::Rename`] target, each
+/// `ANY_KEY` is filled with the key the matching source wildcard matched, in
+/// order.
+pub const ANY_KEY: &str = "*";
+
 /// One retired config key.
 #[derive(Debug, Clone, Copy)]
 pub struct RetiredKey {
     /// The schema version whose migration step retires the key.
     pub retired_in: u32,
-    /// Path from the config root, one segment per table key.
+    /// Path from the config root, one segment per table key. [`ANY_KEY`]
+    /// matches every key at its level.
     pub path: &'static [&'static str],
     pub retirement: Retirement,
     /// Why it was retired and what to use instead. Shown to the operator.
@@ -90,13 +98,82 @@ pub struct RetiredKey {
 /// reappears is dropped with a notice rather than silently ignored. Retiring
 /// another key is one entry here plus removing its schema field, and a version
 /// bump (a new `MIGRATION_STEPS` entry) if no pending version already covers it.
-pub const RETIRED_KEYS: &[RetiredKey] = &[RetiredKey {
-    retired_in: 4,
-    path: &["security", "nevis"],
-    retirement: Retirement::Remove,
-    reason: "the Nevis IAM integration was removed; configure `[oidc.<alias>]` with \
-             `[users]` and `[permission_profiles]` instead",
-}];
+pub const RETIRED_KEYS: &[RetiredKey] = &[
+    RetiredKey {
+        retired_in: 4,
+        path: &["security", "nevis"],
+        retirement: Retirement::Remove,
+        reason: "the Nevis IAM integration was removed; configure `[oidc.<alias>]` with \
+                 `[users]` and `[permission_profiles]` instead",
+    },
+    // Agent-inline runtime tunables: superseded by runtime profiles (#6877)
+    // and never read from `[agents.<alias>]`. First identified in #8754.
+    RetiredKey {
+        retired_in: 4,
+        path: &["agents", ANY_KEY, "compact_context"],
+        retirement: Retirement::Remove,
+        reason: INERT_AGENT_TUNABLE,
+    },
+    RetiredKey {
+        retired_in: 4,
+        path: &["agents", ANY_KEY, "max_tool_iterations"],
+        retirement: Retirement::Remove,
+        reason: INERT_AGENT_TUNABLE,
+    },
+    RetiredKey {
+        retired_in: 4,
+        path: &["agents", ANY_KEY, "max_history_messages"],
+        retirement: Retirement::Remove,
+        reason: INERT_AGENT_TUNABLE,
+    },
+    RetiredKey {
+        retired_in: 4,
+        path: &["agents", ANY_KEY, "max_context_tokens"],
+        retirement: Retirement::Remove,
+        reason: INERT_AGENT_TUNABLE,
+    },
+    RetiredKey {
+        retired_in: 4,
+        path: &["agents", ANY_KEY, "memory_recall_limit"],
+        retirement: Retirement::Remove,
+        reason: INERT_AGENT_TUNABLE,
+    },
+    RetiredKey {
+        retired_in: 4,
+        path: &["agents", ANY_KEY, "parallel_tools"],
+        retirement: Retirement::Remove,
+        reason: INERT_AGENT_TUNABLE,
+    },
+    RetiredKey {
+        retired_in: 4,
+        path: &["agents", ANY_KEY, "tool_dispatcher"],
+        retirement: Retirement::Remove,
+        reason: INERT_AGENT_TUNABLE,
+    },
+    RetiredKey {
+        retired_in: 4,
+        path: &["agents", ANY_KEY, "strict_tool_parsing"],
+        retirement: Retirement::Remove,
+        reason: INERT_AGENT_TUNABLE,
+    },
+    RetiredKey {
+        retired_in: 4,
+        path: &[
+            "runtime_profiles",
+            ANY_KEY,
+            "context_compression",
+            "summary_model",
+        ],
+        retirement: Retirement::Remove,
+        reason: "the deprecated bare model id had no provider identity and was never read; \
+                 `summary_provider` replaced it (context compression itself is not \
+                 currently implemented in the runtime)",
+    },
+];
+
+const INERT_AGENT_TUNABLE: &str = "agent-inline runtime tunables were never read; runtime \
+     profiles are authoritative, so set this key on the agent's \
+     `[runtime_profiles.<profile>]` instead";
 
 pub(crate) struct ConfigLoadAttribution;
 
@@ -1018,6 +1095,8 @@ fn stamp_schema_version(mut value: toml::Value, version: u32) -> Result<toml::Va
 
 /// Apply every entry of `table` retired in `version`, recording a notice for
 /// each key that was actually present. Keys that are absent change nothing.
+/// An [`ANY_KEY`] segment expands to every key at its level, and each concrete
+/// match gets its own notice naming its real path.
 fn apply_retired_keys(
     value: &mut toml::Value,
     version: u32,
@@ -1028,34 +1107,96 @@ fn apply_retired_keys(
         return;
     };
     for key in table.iter().filter(|key| key.retired_in == version) {
-        let Some(taken) = take_path(root, key.path) else {
-            continue;
-        };
-        let from = key.path.join(".");
-        let notice = match key.retirement {
-            Retirement::Remove => MigrationNotice::Removed {
-                path: from,
-                reason: key.reason,
-            },
-            Retirement::Rename { to } => {
-                let to_path = to.join(".");
-                if put_path_if_vacant(root, to, taken) {
-                    MigrationNotice::Renamed {
-                        from,
-                        to: to_path,
-                        reason: key.reason,
-                    }
-                } else {
-                    MigrationNotice::RenameConflict {
-                        from,
-                        to: to_path,
-                        reason: key.reason,
+        for concrete in expand_path(root, key.path) {
+            let segments: Vec<&str> = concrete.iter().map(String::as_str).collect();
+            let Some(taken) = take_path(root, &segments) else {
+                continue;
+            };
+            let from = segments.join(".");
+            let notice = match key.retirement {
+                Retirement::Remove => MigrationNotice::Removed {
+                    path: from,
+                    reason: key.reason,
+                },
+                Retirement::Rename { to } => {
+                    let target = fill_wildcards(to, key.path, &segments);
+                    let target: Vec<&str> = target.iter().map(String::as_str).collect();
+                    let to_path = target.join(".");
+                    if put_path_if_vacant(root, &target, taken) {
+                        MigrationNotice::Renamed {
+                            from,
+                            to: to_path,
+                            reason: key.reason,
+                        }
+                    } else {
+                        MigrationNotice::RenameConflict {
+                            from,
+                            to: to_path,
+                            reason: key.reason,
+                        }
                     }
                 }
-            }
-        };
-        notices.push(notice);
+            };
+            notices.push(notice);
+        }
     }
+}
+
+/// Every concrete path in `root` that `pattern` matches, expanding each
+/// [`ANY_KEY`] to the keys present at that level. A literal segment matches
+/// only itself; intermediate segments must be tables.
+fn expand_path(root: &toml::Table, pattern: &[&str]) -> Vec<Vec<String>> {
+    fn walk(
+        table: &toml::Table,
+        pattern: &[&str],
+        prefix: &mut Vec<String>,
+        out: &mut Vec<Vec<String>>,
+    ) {
+        let Some((segment, rest)) = pattern.split_first() else {
+            return;
+        };
+        let keys: Vec<&String> = if *segment == ANY_KEY {
+            table.keys().collect()
+        } else {
+            table
+                .get_key_value(*segment)
+                .map(|(k, _)| k)
+                .into_iter()
+                .collect()
+        };
+        for key in keys {
+            prefix.push(key.clone());
+            if rest.is_empty() {
+                out.push(prefix.clone());
+            } else if let Some(next) = table.get(key.as_str()).and_then(toml::Value::as_table) {
+                walk(next, rest, prefix, out);
+            }
+            prefix.pop();
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, pattern, &mut Vec::new(), &mut out);
+    out
+}
+
+/// Fill each [`ANY_KEY`] in `target` with the key the corresponding
+/// [`ANY_KEY`] in `pattern` matched in `matched`, in order.
+fn fill_wildcards(target: &[&str], pattern: &[&str], matched: &[&str]) -> Vec<String> {
+    let mut captured = pattern
+        .iter()
+        .zip(matched)
+        .filter(|(segment, _)| **segment == ANY_KEY)
+        .map(|(_, key)| (*key).to_string());
+    target
+        .iter()
+        .map(|segment| {
+            if *segment == ANY_KEY {
+                captured.next().unwrap_or_else(|| ANY_KEY.to_string())
+            } else {
+                (*segment).to_string()
+            }
+        })
+        .collect()
 }
 
 /// Remove and return the value at `path`, if every segment exists.
@@ -3659,7 +3800,105 @@ client_secret = "plaintext-nevis-secret"
                 key.path
             );
             assert!(!key.path.is_empty() && !key.reason.is_empty(), "{key:?}");
+            if let Retirement::Rename { to } = key.retirement {
+                let wildcards = |p: &[&str]| p.iter().filter(|s| **s == ANY_KEY).count();
+                assert!(
+                    wildcards(to) <= wildcards(key.path),
+                    "{:?}: a rename target cannot use more wildcards than its source",
+                    key.path
+                );
+            }
         }
+    }
+
+    #[test]
+    fn v3_to_v4_retires_inert_tunables_in_every_agent_and_profile() {
+        let raw = r#"
+schema_version = 3
+
+[agents.coder]
+runtime_profile = "fast"
+max_tool_iterations = 40
+parallel_tools = true
+
+[agents.writer]
+compact_context = true
+
+[agents.plain]
+enabled = true
+
+[runtime_profiles.fast]
+max_tool_iterations = 12
+
+[runtime_profiles.fast.context_compression]
+summary_model = "haiku"
+threshold_ratio = 0.5
+
+[runtime_profiles.slow.context_compression]
+summary_model = "opus"
+"#;
+        let (migrated, notices) = migrate_file_with_notices(raw).unwrap().unwrap();
+        let value: toml::Value = toml::from_str(&migrated).unwrap();
+
+        let coder = value["agents"]["coder"].as_table().unwrap();
+        assert!(
+            !coder.contains_key("max_tool_iterations") && !coder.contains_key("parallel_tools")
+        );
+        assert_eq!(
+            coder["runtime_profile"].as_str(),
+            Some("fast"),
+            "live keys stay"
+        );
+        assert!(
+            !value["agents"]["writer"]
+                .as_table()
+                .unwrap()
+                .contains_key("compact_context")
+        );
+        assert_eq!(value["agents"]["plain"]["enabled"].as_bool(), Some(true));
+        assert_eq!(
+            value["runtime_profiles"]["fast"]["max_tool_iterations"].as_integer(),
+            Some(12),
+            "the runtime-profile copy of a tunable is the live one and is kept"
+        );
+        for profile in ["fast", "slow"] {
+            let cc = value["runtime_profiles"][profile]["context_compression"]
+                .as_table()
+                .unwrap();
+            assert!(!cc.contains_key("summary_model"), "{profile}: {cc:?}");
+        }
+        assert_eq!(
+            value["runtime_profiles"]["fast"]["context_compression"]["threshold_ratio"].as_float(),
+            Some(0.5)
+        );
+
+        let mut removed: Vec<&str> = notices
+            .iter()
+            .filter_map(|n| match n {
+                MigrationNotice::Removed { path, .. } => Some(path.as_str()),
+                _ => None,
+            })
+            .collect();
+        removed.sort_unstable();
+        assert_eq!(
+            removed,
+            [
+                "agents.coder.max_tool_iterations",
+                "agents.coder.parallel_tools",
+                "agents.writer.compact_context",
+                "runtime_profiles.fast.context_compression.summary_model",
+                "runtime_profiles.slow.context_compression.summary_model",
+            ],
+            "each concrete match is reported under its real path"
+        );
+    }
+
+    #[test]
+    fn a_wildcard_does_not_descend_into_non_tables() {
+        let raw = "schema_version = 3\nagents = \"not-a-table\"\n";
+        let (migrated, notices) = migrate_file_with_notices(raw).unwrap().unwrap();
+        assert!(notices.is_empty(), "{notices:?}");
+        assert!(migrated.contains("agents = \"not-a-table\""));
     }
 
     const TEST_RENAMES: &[RetiredKey] = &[
@@ -3676,6 +3915,14 @@ client_secret = "plaintext-nevis-secret"
             path: &["other"],
             retirement: Retirement::Remove,
             reason: "a different version",
+        },
+        RetiredKey {
+            retired_in: 7,
+            path: &["bots", ANY_KEY, "old_limit"],
+            retirement: Retirement::Rename {
+                to: &["bots", ANY_KEY, "limits", "max"],
+            },
+            reason: "wildcard rename for the test",
         },
     ];
 
@@ -3734,6 +3981,38 @@ client_secret = "plaintext-nevis-secret"
             toml::Value::Integer(2)
         ));
         assert_eq!(toml::Value::Table(root)["new"]["x"].as_integer(), Some(1));
+    }
+
+    #[test]
+    fn a_wildcard_rename_keeps_each_value_under_its_own_key() {
+        let (value, notices) = apply(
+            "[bots.a]\nold_limit = 1\n[bots.b]\nold_limit = 2\n[bots.b.limits]\nmax = 9\n[bots.c]\nkeep = 3\n",
+            7,
+        );
+        assert_eq!(value["bots"]["a"]["limits"]["max"].as_integer(), Some(1));
+        assert_eq!(
+            value["bots"]["b"]["limits"]["max"].as_integer(),
+            Some(9),
+            "an existing replacement wins"
+        );
+        assert!(value["bots"]["a"].get("old_limit").is_none());
+        assert!(value["bots"]["b"].get("old_limit").is_none());
+        assert_eq!(value["bots"]["c"]["keep"].as_integer(), Some(3));
+        assert!(
+            value["bots"]["c"].get("limits").is_none(),
+            "no match, no new table"
+        );
+        assert!(notices.contains(&MigrationNotice::Renamed {
+            from: "bots.a.old_limit".to_string(),
+            to: "bots.a.limits.max".to_string(),
+            reason: "wildcard rename for the test",
+        }));
+        assert!(notices.contains(&MigrationNotice::RenameConflict {
+            from: "bots.b.old_limit".to_string(),
+            to: "bots.b.limits.max".to_string(),
+            reason: "wildcard rename for the test",
+        }));
+        assert_eq!(notices.len(), 2);
     }
 
     #[test]

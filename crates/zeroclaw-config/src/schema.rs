@@ -4537,10 +4537,10 @@ impl Config {
     /// Effective context-compression summarizer provider for an agent:
     /// agent-level `summary_provider` override → the runtime profile's
     /// `context_compression.summary_provider` → `None` (the caller then reuses
-    /// the agent's own provider+model, optionally via the deprecated
-    /// `summary_model` swap). Unlike the inert agent-inline tunables below, the
-    /// agent-level override IS consulted — it's an explicit per-agent choice,
-    /// mirroring `classifier_provider`'s "empty = inherit" semantics.
+    /// the agent's own provider and model). Unlike the inert agent-inline
+    /// tunables below, the agent-level override IS consulted — it's an
+    /// explicit per-agent choice, mirroring `classifier_provider`'s
+    /// "empty = inherit" semantics.
     #[must_use]
     pub fn effective_summary_provider(
         &self,
@@ -5329,6 +5329,19 @@ pub const TEMPERATURE_RANGE: std::ops::RangeInclusive<f64> = 0.0..=2.0;
 /// [`Config::configured_model_context_window`] and say "not configured" when it
 /// returns `None`, rather than echoing this value as the model's real capacity.
 pub const UNCONFIGURED_CONTEXT_WINDOW_FALLBACK: usize = 32_000;
+
+/// The schema version whose on-disk layout moved `<install>/workspace/` into
+/// `<install>/agents/default/workspace/`. Later schema versions change no
+/// files outside `config.toml`.
+const V3_FILESYSTEM_LAYOUT_VERSION: u32 = 3;
+
+/// Whether an install whose `config.toml` is at `on_disk_version` still needs
+/// the one-time V2 → V3 filesystem relocation. Pinned to the V3 layout, not
+/// [`crate::migration::CURRENT_SCHEMA_VERSION`], so a later schema bump never
+/// re-runs the move on an install that already has the V3 layout.
+fn needs_v3_filesystem_layout_migration(on_disk_version: u32) -> bool {
+    on_disk_version < V3_FILESYSTEM_LAYOUT_VERSION
+}
 
 /// Defaults to 0 so configs without an explicit `schema_version` are recognized
 /// as pre-versioning and get migrated.
@@ -22267,20 +22280,21 @@ impl Config {
         //
         // Gate strictly on the on-disk config's `schema_version`:
         // - missing config.toml → fresh install, skip.
-        // - schema_version >= 3 → already V3, skip.
+        // - schema_version >= 3 → already at (or past) the V3 layout, skip.
         // - schema_version 1 or 2 → upgrade in progress, run.
         // Anything else (parse failure, weird value) is treated as
         // "don't touch the filesystem"; the TOML migrator will surface
-        // the real error.
+        // the real error. Pinned to the V3 layout version (not the moving
+        // CURRENT_SCHEMA_VERSION): the workspace relocation is a one-time
+        // V2 → V3 move, and later schema bumps introduce no filesystem
+        // change, so a V3+ config must never re-trigger it.
         let config_toml_path = zeroclaw_dir.join("config.toml");
         let needs_fs_migration = config_toml_path.is_file()
-            && matches!(
-                std::fs::read_to_string(&config_toml_path)
-                    .ok()
-                    .and_then(|raw| toml::from_str::<toml::Value>(&raw).ok())
-                    .and_then(|v| crate::migration::detect_version(&v).ok()),
-                Some(v) if v < crate::migration::CURRENT_SCHEMA_VERSION
-            );
+            && std::fs::read_to_string(&config_toml_path)
+                .ok()
+                .and_then(|raw| toml::from_str::<toml::Value>(&raw).ok())
+                .and_then(|v| crate::migration::detect_version(&v).ok())
+                .is_some_and(needs_v3_filesystem_layout_migration);
         if needs_fs_migration
             && let Err(e) = crate::schema::v2::migrate_v2_to_v3_install_filesystem(&zeroclaw_dir)
         {
@@ -22710,15 +22724,10 @@ impl Config {
         self.collect_codex_cli_extra_arg_warnings(&mut warnings);
         self.collect_fallback_warnings(&mut warnings);
         self.collect_server_fallback_model_warnings(&mut warnings);
-        self.collect_cross_provider_summary_model_warnings(&mut warnings);
         self.collect_a2a_exposed_skills_warnings(&mut warnings);
         self.collect_memory_semantic_search_warnings(&mut warnings);
         self.collect_dns_pinned_proxy_warnings(&mut warnings);
         self.collect_peer_groups_warnings(&mut warnings);
-        // Must run after `collect_cross_provider_summary_model_warnings`: it
-        // scans `warnings` to suppress its generic inert `summary_model`
-        // warning when the more specific cross-provider diagnostic already
-        // covers the same path.
         self.collect_context_compression_ignored_warnings(&mut warnings);
         self.collect_verifiable_intent_warnings(&mut warnings);
         self.collect_cron_claim_warnings(&mut warnings);
@@ -22979,101 +22988,6 @@ impl Config {
         }
     }
 
-    /// Surface cross-provider ambiguity in a legacy config while reporting
-    /// the current contract: context compression has no runtime consumer, so
-    /// this knob is inert like every other `context_compression` field (see
-    /// `collect_context_compression_ignored_warnings`). This diagnostic adds
-    /// config-shape detail as a more specific companion for the same line. The
-    /// deprecated
-    /// `runtime_profiles.<p>.context_compression.summary_model` is a bare
-    /// model id that names no provider of its own — it would need to be
-    /// resolved onto each consuming agent's OWN provider were the field ever
-    /// read again — so when a single profile is shared by agents resolving
-    /// to MORE THAN ONE distinct provider, that one bare id is ambiguous for
-    /// at least one of them. A `summary_provider` supplies provider identity
-    /// for this narrower diagnostic and excludes the corresponding value from
-    /// the ambiguity count; it does not make context compression functional.
-    ///
-    /// The diagnostic is offline and deterministic: no schema bump, no
-    /// network, and no model catalog. It names the profile, the affected
-    /// agents, and their differing providers, then recommends removing the
-    /// unsupported setting or waiting for an accepted compression design.
-    fn collect_cross_provider_summary_model_warnings(
-        &self,
-        warnings: &mut Vec<crate::validation_warnings::ValidationWarning>,
-    ) {
-        for (profile_alias, profile) in &self.runtime_profiles {
-            // Only the deprecated bare summary_model lacks provider identity.
-            // A profile-level summary_provider excludes this narrower
-            // ambiguity shape, but context compression remains inert.
-            if !profile
-                .context_compression
-                .summary_provider
-                .trim()
-                .is_empty()
-            {
-                continue;
-            }
-            let Some(summary_model) = profile.context_compression.summary_model.as_deref() else {
-                continue;
-            };
-            if summary_model.trim().is_empty() {
-                continue;
-            }
-
-            // Gather agents that reference this profile and have no agent-level
-            // summary_provider identity. An override excludes that agent from
-            // this ambiguity diagnostic but does not make compression
-            // functional. Resolve the provider that would be paired with the
-            // bare model if a future implementation consumed this config.
-            let mut affected: Vec<(String, String)> = Vec::new();
-            for (agent_alias, agent) in &self.agents {
-                if agent.runtime_profile.trim() != profile_alias {
-                    continue;
-                }
-                if !agent.summary_provider.trim().is_empty() {
-                    continue;
-                }
-                let provider_label = self.canonical_provider_label(agent.model_provider.trim());
-                affected.push((agent_alias.clone(), provider_label));
-            }
-
-            // Cross-provider ambiguity requires distinct providers. A
-            // same-provider bare id is still inert, but the generic
-            // context-compression warning reports that fact without this
-            // additional ambiguity detail.
-            let distinct: std::collections::BTreeSet<&str> =
-                affected.iter().map(|(_, p)| p.as_str()).collect();
-            if distinct.len() < 2 {
-                continue;
-            }
-
-            let mut agents_sorted: Vec<&(String, String)> = affected.iter().collect();
-            agents_sorted.sort_by(|a, b| a.0.cmp(&b.0));
-            let detail = agents_sorted
-                .iter()
-                .map(|(name, provider)| format!("{name} -> {provider}"))
-                .collect::<Vec<_>>()
-                .join(", ");
-
-            warnings.push(crate::validation_warnings::ValidationWarning::new(
-                "cross_provider_summary_model",
-                format!(
-                    "runtime_profiles.{profile_alias}.context_compression.summary_model \
-                     ({summary_model:?}) is set, but context compression is not currently \
-                     implemented in the runtime; this setting has no effect. It is also a \
-                     bare model id reused by agents resolving to different providers \
-                     ({detail}), which names no provider of its own and would be ambiguous \
-                     for at least one of them if compression were read again. Remove the \
-                     unsupported context_compression setting (every context_compression \
-                     field, including summary_provider, is currently inert), or wait for a \
-                     separately accepted compression design before configuring it."
-                ),
-                format!("runtime_profiles.{profile_alias}.context_compression.summary_model"),
-            ));
-        }
-    }
-
     /// Surface every non-default `context_compression` knob as inert: the
     /// runtime context compressor was removed and nothing in the
     /// workspace reads `context_compression` at runtime anymore, so the whole
@@ -23141,25 +23055,6 @@ impl Config {
             if cc.summary_provider != defaults.summary_provider {
                 inert.push("summary_provider");
             }
-            if cc.summary_model != defaults.summary_model {
-                // Ordering dependency: `collect_warnings()` runs
-                // `collect_cross_provider_summary_model_warnings` before this
-                // helper, so a cross-provider `summary_model` diagnostic for
-                // this same path is already in `warnings`. That diagnostic
-                // reports the same "has no effect" fact plus the specific
-                // cross-provider agents affected, so it wins and the generic
-                // inert warning is skipped to avoid printing two warnings
-                // for the same config line. All other `summary_model`
-                // shapes (single-provider, unshared) still get the inert
-                // warning; no other diagnostic covers them.
-                let summary_model_path =
-                    format!("runtime_profiles.{alias}.context_compression.summary_model");
-                if !warnings.iter().any(|w| {
-                    w.code == "cross_provider_summary_model" && w.path == summary_model_path
-                }) {
-                    inert.push("summary_model");
-                }
-            }
             if cc.identifier_policy != defaults.identifier_policy {
                 inert.push("identifier_policy");
             }
@@ -23182,22 +23077,6 @@ impl Config {
                     format!("runtime_profiles.{alias}.context_compression.{field}"),
                 ));
             }
-        }
-    }
-
-    /// Canonical label for an agent's resolved model provider, used to decide
-    /// whether two agents sit on distinct providers. A non-empty ref that
-    /// resolves through `[providers.models]` collapses to its canonical
-    /// `<family>.<alias>` so equivalent spellings (bare vs dotted) compare
-    /// equal; an empty or unresolved ref keeps its raw form (empty becomes a
-    /// stable sentinel) so it still participates as a distinct bucket.
-    fn canonical_provider_label(&self, provider_ref: &str) -> String {
-        if provider_ref.is_empty() {
-            return "<agent default provider>".to_string();
-        }
-        match self.providers.models.find_by_name(provider_ref) {
-            Some((family, alias, _)) => format!("{family}.{alias}"),
-            None => provider_ref.to_string(),
         }
     }
 
@@ -30176,6 +30055,20 @@ open_skills_enabled = false
             config.effective_skills_prompt_mode("pinned_full"),
             SkillsPromptInjectionMode::Full
         );
+    }
+
+    #[test]
+    async fn filesystem_relocation_is_pinned_to_the_v3_layout() {
+        // The workspace relocation is a one-time V2 -> V3 move. A later schema
+        // bump must never re-run it on an install already at the V3 layout,
+        // or it would push that install's workspace under a synthesized
+        // `default` alias.
+        assert!(needs_v3_filesystem_layout_migration(1));
+        assert!(needs_v3_filesystem_layout_migration(2));
+        assert!(!needs_v3_filesystem_layout_migration(3));
+        assert!(!needs_v3_filesystem_layout_migration(
+            crate::migration::CURRENT_SCHEMA_VERSION
+        ));
     }
 
     #[test]
@@ -41741,7 +41634,6 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
 
         let compression = crate::scattered_types::ContextCompressionConfig::default().prop_fields();
         assert_description(&compression, ".summary_provider", "<type>.<alias>");
-        assert_description(&compression, ".summary_model", "DEPRECATED bare model id");
 
         let email = crate::scattered_types::EmailConfig::default().prop_fields();
         assert_description(&email, ".observer_mode", "never modifies any IMAP flag");
@@ -46234,155 +46126,6 @@ allowed_users = []
         assert_eq!(cfg.effective_summary_provider("c"), None);
     }
 
-    // config-time diagnostic for the legacy cross-provider summary_model
-    // shape. A profile sets the deprecated bare summary_model and is shared by
-    // two agents on DIFFERENT providers with no summary_provider override -> the
-    // diagnostic fires and names the profile + the affected agents + providers.
-    #[tokio::test]
-    async fn collect_warnings_flags_cross_provider_summary_model() {
-        let toml = r#"
-            [providers.models.custom.p1]
-            api_key = "k"
-            model = "m1"
-            uri = "https://example.com/v1"
-            wire_api = "chat_completions"
-            [providers.models.custom.p2]
-            api_key = "k"
-            model = "m2"
-            uri = "https://example.com/v1"
-            wire_api = "chat_completions"
-
-            [risk_profiles.default]
-            level = "supervised"
-
-            [runtime_profiles.shared.context_compression]
-            summary_model = "haiku"
-
-            [agents.alpha]
-            enabled = true
-            model_provider = "custom.p1"
-            risk_profile = "default"
-            runtime_profile = "shared"
-
-            [agents.beta]
-            enabled = true
-            model_provider = "custom.p2"
-            risk_profile = "default"
-            runtime_profile = "shared"
-        "#;
-        let cfg: Config = toml::from_str(toml).unwrap();
-        let warnings = cfg.collect_warnings();
-        let w = warnings
-            .iter()
-            .find(|w| w.code == "cross_provider_summary_model")
-            .expect("expected cross_provider_summary_model warning");
-        assert_eq!(
-            w.path,
-            "runtime_profiles.shared.context_compression.summary_model"
-        );
-        assert!(
-            w.message.contains("haiku"),
-            "message names the model: {}",
-            w.message
-        );
-        assert!(
-            w.message.contains("alpha -> custom.p1"),
-            "message names alpha + provider: {}",
-            w.message
-        );
-        assert!(
-            w.message.contains("beta -> custom.p2"),
-            "message names beta + provider: {}",
-            w.message
-        );
-    }
-
-    // The `cross_provider_summary_model` diagnostic must report the setting
-    // as unsupported/inert like every other `context_compression` knob, not
-    // as something that is actively dispatched onto per-agent providers and
-    // fails at runtime — there is no runtime consumer left to dispatch
-    // anything. The cross-provider detail (which agents, which providers)
-    // must still be present since it is useful context for the fix, but the
-    // message must not claim any runtime behavior.
-    #[tokio::test]
-    async fn collect_warnings_cross_provider_summary_model_reports_inert_not_dispatch() {
-        let toml = r#"
-            [providers.models.custom.p1]
-            api_key = "k"
-            model = "m1"
-            uri = "https://example.com/v1"
-            wire_api = "chat_completions"
-            [providers.models.custom.p2]
-            api_key = "k"
-            model = "m2"
-            uri = "https://example.com/v1"
-            wire_api = "chat_completions"
-
-            [risk_profiles.default]
-            level = "supervised"
-
-            [runtime_profiles.shared.context_compression]
-            summary_model = "haiku"
-
-            [agents.alpha]
-            enabled = true
-            model_provider = "custom.p1"
-            risk_profile = "default"
-            runtime_profile = "shared"
-
-            [agents.beta]
-            enabled = true
-            model_provider = "custom.p2"
-            risk_profile = "default"
-            runtime_profile = "shared"
-        "#;
-        let cfg: Config = toml::from_str(toml).unwrap();
-        let warnings = cfg.collect_warnings();
-        let w = warnings
-            .iter()
-            .find(|w| w.code == "cross_provider_summary_model")
-            .expect("expected cross_provider_summary_model warning");
-        assert!(
-            w.message.contains("not currently implemented") && w.message.contains("no effect"),
-            "message must truthfully report the setting as unsupported/inert: {}",
-            w.message
-        );
-        assert!(
-            !w.message.contains("silently fails"),
-            "message must not claim the setting silently fails at runtime: {}",
-            w.message
-        );
-        assert!(
-            !w.message.contains("dispatched"),
-            "message must not claim the setting is dispatched to a provider at runtime: {}",
-            w.message
-        );
-        // Cross-provider specificity must survive the rewrite — it is still
-        // useful detail even though the setting is inert.
-        assert!(
-            w.message.contains("alpha -> custom.p1") && w.message.contains("beta -> custom.p2"),
-            "message must keep naming the affected agents and providers: {}",
-            w.message
-        );
-        // The remediation must NOT send the operator to another inert
-        // context_compression field: this PR's per-field pass classifies a
-        // non-default `summary_provider` as unsupported/inert too, so
-        // "migrate to context_compression.summary_provider" would just produce
-        // another no-effect setting and another warning.
-        assert!(
-            !w.message
-                .contains("Migrate to context_compression.summary_provider"),
-            "remediation must not recommend migrating to the inert summary_provider: {}",
-            w.message
-        );
-        assert!(
-            w.message
-                .contains("Remove the unsupported context_compression setting"),
-            "remediation should tell the operator to remove the inert setting: {}",
-            w.message
-        );
-    }
-
     // The runtime context compressor was removed; nothing reads
     // `context_compression` at runtime anymore, so an explicit
     // `enabled = true` on a named runtime profile is inert and must be
@@ -46543,104 +46286,6 @@ allowed_users = []
         );
     }
 
-    // Specific-warning-wins dedup: a bare cross-provider `summary_model`
-    // already draws the more specific `cross_provider_summary_model`
-    // diagnostic, which itself reports the setting as inert (same fact as
-    // `context_compression_unsupported`) plus the cross-provider detail, so
-    // the generic inert warning must NOT also fire for the identical path —
-    // doctor/gateway print both with no dedup, and it would just be the same
-    // statement twice.
-    #[tokio::test]
-    async fn collect_warnings_context_compression_defers_to_cross_provider_summary_model() {
-        let toml = r#"
-            [providers.models.custom.p1]
-            api_key = "k"
-            model = "m1"
-            uri = "https://example.com/v1"
-            wire_api = "chat_completions"
-            [providers.models.custom.p2]
-            api_key = "k"
-            model = "m2"
-            uri = "https://example.com/v1"
-            wire_api = "chat_completions"
-
-            [risk_profiles.default]
-            level = "supervised"
-
-            [runtime_profiles.shared.context_compression]
-            summary_model = "haiku"
-
-            [agents.alpha]
-            enabled = true
-            model_provider = "custom.p1"
-            risk_profile = "default"
-            runtime_profile = "shared"
-
-            [agents.beta]
-            enabled = true
-            model_provider = "custom.p2"
-            risk_profile = "default"
-            runtime_profile = "shared"
-        "#;
-        let cfg: Config = toml::from_str(toml).unwrap();
-        let warnings = cfg.collect_warnings();
-        let summary_model_warnings: Vec<_> = warnings
-            .iter()
-            .filter(|w| w.path == "runtime_profiles.shared.context_compression.summary_model")
-            .collect();
-        assert_eq!(
-            summary_model_warnings.len(),
-            1,
-            "exactly one warning for the summary_model path: {summary_model_warnings:?}"
-        );
-        assert_eq!(
-            summary_model_warnings[0].code, "cross_provider_summary_model",
-            "the specific cross-provider diagnostic wins for the shared path"
-        );
-    }
-
-    // Same-provider control: without a cross-provider diagnostic covering
-    // the path, the inert warning must still fire for `summary_model` — no
-    // other diagnostic covers the single-provider shape.
-    #[tokio::test]
-    async fn collect_warnings_context_compression_flags_same_provider_summary_model() {
-        let toml = r#"
-            [providers.models.custom.p1]
-            api_key = "k"
-            model = "m1"
-            uri = "https://example.com/v1"
-            wire_api = "chat_completions"
-
-            [risk_profiles.default]
-            level = "supervised"
-
-            [runtime_profiles.shared.context_compression]
-            summary_model = "haiku"
-
-            [agents.alpha]
-            enabled = true
-            model_provider = "custom.p1"
-            risk_profile = "default"
-            runtime_profile = "shared"
-
-            [agents.beta]
-            enabled = true
-            model_provider = "custom.p1"
-            risk_profile = "default"
-            runtime_profile = "shared"
-        "#;
-        let cfg: Config = toml::from_str(toml).unwrap();
-        let warnings = cfg.collect_warnings();
-        let w = warnings
-            .iter()
-            .find(|w| w.path == "runtime_profiles.shared.context_compression.summary_model")
-            .expect("expected a warning for the summary_model path");
-        assert_eq!(
-            w.code, "context_compression_unsupported",
-            "single-provider summary_model gets the inert warning"
-        );
-    }
-
     // exposed_skills set with no skill_bundles -> the agent card resolves no
     // skills (skills: []) silently; the diagnostic fires and names the agent.
     #[tokio::test]
@@ -46701,95 +46346,6 @@ allowed_users = []
                 .iter()
                 .any(|w| w.code == "a2a_exposed_skills_without_bundles"),
             "no exposed_skills warning when a bundle is declared: {warnings:?}"
-        );
-    }
-
-    // Control: same profile + summary_model but both agents on the SAME provider
-    // -> no diagnostic (deprecated-but-correct; runtime WARN still nudges).
-    #[tokio::test]
-    async fn collect_warnings_silent_for_same_provider_summary_model() {
-        let toml = r#"
-            [providers.models.custom.p1]
-            api_key = "k"
-            model = "m1"
-            uri = "https://example.com/v1"
-            wire_api = "chat_completions"
-
-            [risk_profiles.default]
-            level = "supervised"
-
-            [runtime_profiles.shared.context_compression]
-            summary_model = "haiku"
-
-            [agents.alpha]
-            enabled = true
-            model_provider = "custom.p1"
-            risk_profile = "default"
-            runtime_profile = "shared"
-
-            [agents.beta]
-            enabled = true
-            model_provider = "custom.p1"
-            risk_profile = "default"
-            runtime_profile = "shared"
-        "#;
-        let cfg: Config = toml::from_str(toml).unwrap();
-        assert!(
-            !cfg.collect_warnings()
-                .iter()
-                .any(|w| w.code == "cross_provider_summary_model"),
-            "same-provider use must not warn"
-        );
-    }
-
-    // Control: cross-provider agents but each sets an agent-level
-    // summary_provider override -> the override supersedes the bare id, so no
-    // diagnostic.
-    #[tokio::test]
-    async fn collect_warnings_silent_when_summary_provider_override_present() {
-        let toml = r#"
-            [providers.models.custom.p1]
-            api_key = "k"
-            model = "m1"
-            uri = "https://example.com/v1"
-            wire_api = "chat_completions"
-            [providers.models.custom.p2]
-            api_key = "k"
-            model = "m2"
-            uri = "https://example.com/v1"
-            wire_api = "chat_completions"
-            [providers.models.custom.sum]
-            api_key = "k"
-            model = "ms"
-            uri = "https://example.com/v1"
-            wire_api = "chat_completions"
-
-            [risk_profiles.default]
-            level = "supervised"
-
-            [runtime_profiles.shared.context_compression]
-            summary_model = "haiku"
-
-            [agents.alpha]
-            enabled = true
-            model_provider = "custom.p1"
-            risk_profile = "default"
-            runtime_profile = "shared"
-            summary_provider = "custom.sum"
-
-            [agents.beta]
-            enabled = true
-            model_provider = "custom.p2"
-            risk_profile = "default"
-            runtime_profile = "shared"
-            summary_provider = "custom.sum"
-        "#;
-        let cfg: Config = toml::from_str(toml).unwrap();
-        assert!(
-            !cfg.collect_warnings()
-                .iter()
-                .any(|w| w.code == "cross_provider_summary_model"),
-            "agent-level summary_provider override must suppress the warning"
         );
     }
 

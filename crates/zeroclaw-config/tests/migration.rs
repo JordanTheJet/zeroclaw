@@ -1,4 +1,4 @@
-//! End-to-end migration tests for the V1 → V2 → V3 chain.
+//! End-to-end migration tests for the V1 → V2 → V3 → V4 chain.
 
 use zeroclaw_config::autonomy::AutonomyLevel;
 use zeroclaw_config::migration::{
@@ -2992,4 +2992,50 @@ deny_all_tools = true
         !policy.is_tool_allowed("filesystem__write_file"),
         "deny_all_tools = true must deny MCP-shaped names; the __ auto-admit is nonempty-allowlist only"
     );
+}
+
+// ─────────────────────────────────────────────────────────────
+// V4 fixture: the committed at-rest V4 config loads and is idempotent.
+// Fixture and tests adapted from #8754 by @singlerider; the fixture is
+// regenerated from this chain with `zeroclaw config generate 4`.
+// ─────────────────────────────────────────────────────────────
+
+const V4_FIXTURE: &str = include_str!("../fixtures/v4.toml");
+
+#[test]
+fn v4_fixture_is_at_current_version() {
+    let v: toml::Value = toml::from_str(V4_FIXTURE).expect("V4 fixture parses as TOML");
+    assert_eq!(detect_version(&v).expect("detect V4"), 4);
+    assert_eq!(CURRENT_SCHEMA_VERSION, 4);
+}
+
+#[test]
+fn v4_fixture_loads_as_config() {
+    let cfg: Config = toml::from_str(V4_FIXTURE).expect("V4 fixture parses as Config");
+    assert_eq!(cfg.schema_version, CURRENT_SCHEMA_VERSION);
+}
+
+#[test]
+fn v4_fixture_is_migration_idempotent() {
+    assert!(
+        migrate_file(V4_FIXTURE)
+            .expect("migrate_file on V4 succeeds")
+            .is_none(),
+        "a config already at CURRENT_SCHEMA_VERSION with no retired key must not be rewritten"
+    );
+}
+
+#[test]
+fn v1_to_v4_round_trip_matches_committed_fixture() {
+    // The fixture is the acceptance record of exactly what the chain produces
+    // from the V1 fixture, so compare the generated text byte for byte. (A
+    // loaded `Config` holds hash maps whose serialization order varies, so
+    // re-serialized configs are not comparable as strings.)
+    let generated = generate(4, &GenerateOptions::default()).expect("generate V4");
+    assert!(
+        generated == V4_FIXTURE,
+        "the V1 -> V4 chain drifted from fixtures/v4.toml; if intended, regenerate it with \
+         `zeroclaw config generate 4 > crates/zeroclaw-config/fixtures/v4.toml`"
+    );
+    let _: Config = toml::from_str(&generated).expect("generated V4 parses as Config");
 }
