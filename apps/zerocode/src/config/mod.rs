@@ -239,6 +239,14 @@ pub(crate) struct WssSection {
     /// to the daemon's `native` pairing provider when unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_provider: Option<String>,
+    /// Gateway HTTP origin for interactive OIDC enrollment (e.g.
+    /// `https://gateway.example.com:9090`). Used only when
+    /// `auth_provider` names an `oidc.<alias>` provider and no
+    /// `auth_token` is available: zerocode then runs the device grant
+    /// through the gateway's enrollment API before connecting. The
+    /// token is held for the session only, never stored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enroll_url: Option<String>,
     #[serde(default, skip_serializing_if = "WssTlsSection::is_empty")]
     pub tls: WssTlsSection,
     /// Reach the daemon through a nominated relay at this `host:port` instead of
@@ -272,7 +280,9 @@ impl WssSection {
             && self.direct_timeout_secs.is_none()
             && self.reprobe_secs.is_none()
             && self.auth_token.is_none()
+            && self.auth_token_file.is_none()
             && self.auth_provider.is_none()
+            && self.enroll_url.is_none()
     }
 }
 
@@ -698,9 +708,12 @@ pub(crate) fn load_persisted(config_dir: &Path) -> Result<ZerocodeConfig> {
 
     let path = config_path(config_dir);
     if !path.exists() {
+        // Another writer may save a real config between the check above and
+        // this write, so the default is only ever created, never swapped in
+        // over a file that appeared meanwhile.
         let default = ZerocodeConfig::default();
         let body = toml::to_string_pretty(&default).context("serializing default config")?;
-        crate::secure_file::write_private_atomic(&path, body.as_bytes())
+        crate::secure_file::create_private_if_absent(&path, body.as_bytes())
             .with_context(|| format!("writing default {}", path.display()))?;
     } else {
         // An existing file may predate the owner-only rule, and reading it
@@ -832,8 +845,17 @@ pub(crate) fn load_persisted(config_dir: &Path) -> Result<ZerocodeConfig> {
 /// Load the on-disk file as a raw `toml::Table`. A missing or empty file
 /// yields an empty table; any other section the running struct does not
 /// model is carried through untouched so a partial write never clobbers it.
+///
+/// Any other read failure is an error, not an empty table: every persist
+/// rebuilds the whole file from this document and publishes it by rename, so
+/// treating an unreadable file as empty would replace the user's config,
+/// its `[connection.wss]` bearer included, with whatever is being saved.
 fn load_document(path: &Path) -> Result<toml::Table> {
-    let raw = std::fs::read_to_string(path).unwrap_or_default();
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
     if raw.trim().is_empty() {
         return Ok(toml::Table::new());
     }
@@ -1492,6 +1514,24 @@ mod tests {
     }
 
     #[test]
+    fn a_config_that_cannot_be_read_is_not_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        // Not valid UTF-8, so the read fails for a reason other than absence.
+        let bytes: &[u8] = b"[connection.wss]\nauth_token = \"keep-me\"\n\xff\xfe\n";
+        std::fs::write(config_path(dir.path()), bytes).unwrap();
+
+        assert!(
+            persist_theme(dir.path(), "gruvbox").is_err(),
+            "a persist must not treat an unreadable config as empty"
+        );
+        assert_eq!(
+            std::fs::read(config_path(dir.path())).unwrap(),
+            bytes,
+            "the unreadable config must be left as it was"
+        );
+    }
+
+    #[test]
     fn persist_theme_preserves_unmodeled_sections() {
         let dir = tempfile::tempdir().unwrap();
         seed(
@@ -2054,6 +2094,19 @@ mod tests {
         assert_eq!(
             back.connection.wss.tls.skip_verify_routes,
             vec!["wss://host:9781"]
+        );
+    }
+
+    #[test]
+    fn a_token_file_alone_keeps_the_connection_section() {
+        let mut c = ZerocodeConfig::default();
+        c.connection.wss.auth_token_file = Some("/etc/zeroclaw/zerocode-bearer".to_string());
+        let body = toml::to_string_pretty(&c).unwrap();
+        let back: ZerocodeConfig = toml::from_str(&body).unwrap();
+        assert_eq!(
+            back.connection.wss.auth_token_file.as_deref(),
+            Some("/etc/zeroclaw/zerocode-bearer"),
+            "got:\n{body}"
         );
     }
 

@@ -153,6 +153,21 @@ pub struct AcceptedAuthState {
     trust_daemon_uid: Arc<AtomicBool>,
     daemon_uid: u32,
     deny_all: bool,
+    /// The configuration this state was compiled from (see [`auth_inputs`]),
+    /// or `None` for the deny-all state, which was compiled from nothing.
+    auth_inputs: Option<serde_json::Value>,
+}
+
+/// The parts of a configuration an accepted authorization state is compiled
+/// from: the OIDC, roster, and permission-profile sections and the daemon-uid
+/// trust posture. The pairing authority is shared live state, not config.
+fn auth_inputs(config: &Config) -> anyhow::Result<serde_json::Value> {
+    Ok(serde_json::Value::Array(vec![
+        serde_json::to_value(&config.oidc)?,
+        serde_json::to_value(&config.users)?,
+        serde_json::to_value(&config.permission_profiles)?,
+        serde_json::Value::Bool(config.security.trust_daemon_uid),
+    ]))
 }
 
 impl AcceptedAuthState {
@@ -190,6 +205,7 @@ impl AcceptedAuthState {
             trust_daemon_uid,
             daemon_uid,
             deny_all: false,
+            auth_inputs: Some(auth_inputs(config)?),
         })
     }
 
@@ -218,6 +234,7 @@ impl AcceptedAuthState {
             trust_daemon_uid,
             daemon_uid,
             deny_all: true,
+            auth_inputs: None,
         }
     }
 
@@ -403,10 +420,21 @@ impl RpcInboundAuth {
     /// returned, which is what keeps a writer that was slow to publish from
     /// reinstalling superseded policy over a newer one.
     ///
+    /// A persistence that leaves every authorization input as it was (see
+    /// `auth_inputs`) records its revision without moving the generation.
+    /// Nothing the accepted state is compiled from changed, and moving the
+    /// generation would make every established binding re-resolve over an
+    /// unrelated edit, which an OIDC binding cannot survive.
+    ///
     /// Returns the generation in force after the call.
     pub fn publish_accepted(&self, config: &Config, revision: u64) -> anyhow::Result<u64> {
         let mut slot = self.state.write();
         if revision <= self.accepted_revision.load(Ordering::Acquire) {
+            return Ok(slot.resolver.generation());
+        }
+        config.validate_auth()?;
+        if slot.auth_inputs.as_ref() == Some(&auth_inputs(config)?) {
+            self.accepted_revision.store(revision, Ordering::Release);
             return Ok(slot.resolver.generation());
         }
         let generation = slot.resolver.generation().saturating_add(1);
@@ -456,6 +484,33 @@ impl RpcInboundAuth {
         state.resolve(&auth.identity)
     }
 
+    /// Resolve an established binding against the accepted policy, rechecking
+    /// its local credential evidence only when its stamped generation is no
+    /// longer current.
+    ///
+    /// At an unchanged generation that evidence cannot have been invalidated:
+    /// the OIDC verifiers, the uid roster, and the daemon-uid trust posture
+    /// change only through a new publication, and the caller checks expiry,
+    /// the revalidation deadline, and pairing liveness on every operation.
+    /// This is the rule the dispatcher's gate applies, and it is what keeps an
+    /// OIDC binding, whose bearer is never retained, usable until a
+    /// publication changes the authorization inputs; a config save that
+    /// leaves them unchanged does not move the generation. After such a
+    /// change, [`Self::revalidate_and_resolve`] applies and an OIDC binding
+    /// must initialize again.
+    pub fn resolve_current(&self, auth: &ConnectionAuth) -> Result<ResolvedPrincipal, DenyReason> {
+        let state = self.state();
+        if auth.generation != state.resolver.generation() {
+            state.revalidates_local_evidence(
+                &auth.identity,
+                &auth.local_evidence,
+                auth.native_token_hash.as_deref(),
+                &self.pairing,
+            )?;
+        }
+        state.resolve(&auth.identity)
+    }
+
     /// Authenticate one `initialize` handshake into a [`ConnectionAuth`].
     pub async fn authenticate(
         &self,
@@ -465,6 +520,12 @@ impl RpcInboundAuth {
         auth_provider: Option<&str>,
     ) -> Result<ConnectionAuth, AuthDenied> {
         let state = self.state();
+        // The generation the provider is about to verify against. Provider
+        // verification below may await an IdP round trip; a trusted config
+        // write can install a new generation during that await. Captured
+        // here so the post-await gate can tell whether verification completed
+        // under a policy that has since been superseded.
+        let verification_generation = state.resolver.generation();
         let (outcome, native_token_hash, local_evidence) = if let Some(token) = auth_token {
             // Explicit credential wins over the transport-intrinsic one.
             // Unnamed bearers select the native pairing provider — a fixed
@@ -521,7 +582,40 @@ impl RpcInboundAuth {
             AuthOutcome::Verified(identity) => identity,
             AuthOutcome::Denied { reason } => return Err(AuthDenied::from_deny_reason(reason)),
         };
-        let resolved = state
+        // Provider verification above may have awaited an IdP round trip
+        // (OIDC introspection / transport routing). A trusted config write
+        // can publish a new generation during that await — removing the
+        // resolving profile, or tightening the provider's verification
+        // requirements. Admitting the request against the pre-await snapshot
+        // would accept evidence produced under a superseded policy and admit
+        // it for the first time under authority that no longer holds.
+        //
+        // If the generation moved across the await, recheck the evidence
+        // against the state now in force BEFORE resolving — exactly the rule
+        // an established binding follows at a moved generation
+        // (`resolve_current`). Local evidence (native pairing, peercred,
+        // local-compat) is rechecked inline against the new roster/trust
+        // posture; OIDC evidence cannot be reverified here (the bearer is
+        // deliberately not retained), so a moved generation fails closed and
+        // the client must initialize again rather than being admitted on a
+        // verification the new verifier policy never sanctioned. At an
+        // unchanged generation the evidence cannot have been invalidated, so
+        // the recheck is skipped and grants resolve directly.
+        let current = self.state();
+        if verification_generation != current.resolver.generation() {
+            current
+                .revalidates_local_evidence(
+                    &identity,
+                    &local_evidence,
+                    native_token_hash.as_deref(),
+                    &self.pairing,
+                )
+                .map_err(AuthDenied::from_deny_reason)?;
+        }
+        // Resolve grants against the state currently in force, not the
+        // pre-await snapshot: a profile removed during the await fails closed
+        // here (NotEntitled) instead of admitting a stale grant.
+        let resolved = current
             .resolve(&identity)
             .map_err(AuthDenied::from_deny_reason)?;
         Ok(ConnectionAuth {
@@ -915,6 +1009,350 @@ mod tests {
         .expect("a compiling policy keeps the daemon uid on the trusted local path");
     }
 
+    fn oidc_config() -> Config {
+        let mut config = config_with_roster(4242);
+        config.oidc.insert(
+            "corp".into(),
+            OidcConfig {
+                issuer: "https://sso.example.com".into(),
+                audience: "zeroclaw".into(),
+                claim_path: "groups".into(),
+                profile_map: std::collections::HashMap::from([("ops".into(), "operator".into())]),
+                ..OidcConfig::default()
+            },
+        );
+        config
+    }
+
+    /// The binding `initialize` produces for a verified OIDC access token.
+    fn oidc_binding(auth: &RpcInboundAuth) -> ConnectionAuth {
+        let serde_json::Value::Object(claims) = serde_json::json!({ "groups": ["ops"] }) else {
+            unreachable!()
+        };
+        let identity = AuthenticatedIdentity::new(
+            zeroclaw_api::principal::IdentitySubject::Oidc {
+                issuer: "https://sso.example.com".into(),
+                subject: "alice".into(),
+            },
+            AuthMethod::Oidc,
+        )
+        .with_provider_alias("corp")
+        .with_claims(claims);
+        let resolved = auth.resolve(&identity).expect("the OIDC identity resolves");
+        ConnectionAuth {
+            identity,
+            principal: resolved.principal,
+            grants: resolved.grants,
+            generation: resolved.generation,
+            native_token_hash: None,
+            local_evidence: LocalCredentialEvidence::Oidc,
+        }
+    }
+
+    #[test]
+    fn resolve_current_keeps_an_oidc_binding_until_the_generation_moves() {
+        let config = oidc_config();
+        let auth = auth_for(&config, &[]);
+        let binding = oidc_binding(&auth);
+
+        let resolved = auth
+            .resolve_current(&binding)
+            .expect("an OIDC binding at its own generation stays usable");
+        assert!(resolved.grants.permits(Resource::Sessions, Verb::Read));
+        assert!(
+            auth.revalidate_and_resolve(&binding).is_err(),
+            "revalidation is for a changed generation, where an OIDC bearer cannot be reverified"
+        );
+
+        auth.refresh_from_config(&config)
+            .expect("republishing the same policy compiles");
+        assert!(
+            auth.resolve_current(&binding).is_err(),
+            "after a publication the OIDC binding must initialize again"
+        );
+    }
+
+    #[test]
+    fn publish_accepted_moves_the_generation_only_when_authorization_inputs_change() {
+        let config = oidc_config();
+        let auth = auth_for(&config, &[]);
+        let binding = oidc_binding(&auth);
+        let generation = auth.generation();
+
+        let mut unrelated = config.clone();
+        unrelated.gateway.port = unrelated.gateway.port.wrapping_add(1);
+        assert_eq!(
+            auth.publish_accepted(&unrelated, 1)
+                .expect("an unrelated save publishes"),
+            generation,
+            "a save that changes no authorization input keeps the generation"
+        );
+        assert_eq!(auth.accepted_revision(), 1);
+        auth.resolve_current(&binding)
+            .expect("an OIDC binding survives an unrelated save");
+
+        let mut narrowed = unrelated;
+        narrowed
+            .permission_profiles
+            .insert("reader".into(), PermissionProfileConfig::default());
+        let moved = auth
+            .publish_accepted(&narrowed, 2)
+            .expect("a profile change publishes");
+        assert!(moved > generation, "a profile change moves the generation");
+        assert!(
+            auth.resolve_current(&binding).is_err(),
+            "after an authorization change the OIDC binding must initialize again"
+        );
+    }
+
+    /// A roster uid changed by a save must take effect on both sides: the old
+    /// uid stops authenticating and the new one starts. Asserting only that the
+    /// generation moved would pass even if the accepted roster never changed.
+    #[tokio::test]
+    async fn publishing_a_uid_swap_moves_authorization_to_the_new_uid() {
+        let config = config_with_roster(4242);
+        let auth = auth_for(&config, &[]);
+        auth.authenticate(
+            TransportKind::Local,
+            Credential::Peercred { uid: 4242 },
+            None,
+            None,
+        )
+        .await
+        .expect("the rostered uid authenticates before the swap");
+
+        let mut swapped = config;
+        swapped.users.get_mut("alice").unwrap().uid = Some(4343);
+        auth.publish_accepted(&swapped, 1)
+            .expect("a roster uid swap publishes");
+
+        let denied = auth
+            .authenticate(
+                TransportKind::Local,
+                Credential::Peercred { uid: 4242 },
+                None,
+                None,
+            )
+            .await
+            .expect_err("the superseded uid must stop authenticating");
+        assert_eq!(denied.code, AUTH_REQUIRED);
+        auth.authenticate(
+            TransportKind::Local,
+            Credential::Peercred { uid: 4343 },
+            None,
+            None,
+        )
+        .await
+        .expect("the newly rostered uid authenticates after the swap");
+    }
+
+    /// Two writers publishing concurrently: the one that persisted an older
+    /// revision must not reinstall its superseded policy over the newer one.
+    /// The accepted roster, not just the revision counter, has to hold.
+    #[tokio::test]
+    async fn a_stale_concurrent_publication_cannot_reinstall_superseded_policy() {
+        let config = config_with_roster(4242);
+        let auth = auth_for(&config, &[]);
+
+        let mut newer = config.clone();
+        newer.users.get_mut("alice").unwrap().uid = Some(4343);
+        auth.publish_accepted(&newer, 2)
+            .expect("the newer revision publishes");
+
+        // The slow writer's candidate still carries the old uid at revision 1.
+        auth.publish_accepted(&config, 1)
+            .expect("a stale publication is a no-op, not an error");
+        assert_eq!(
+            auth.accepted_revision(),
+            2,
+            "a stale publication must not move the accepted revision back"
+        );
+
+        let denied = auth
+            .authenticate(
+                TransportKind::Local,
+                Credential::Peercred { uid: 4242 },
+                None,
+                None,
+            )
+            .await
+            .expect_err("the superseded uid must not be reinstated by a stale publish");
+        assert_eq!(denied.code, AUTH_REQUIRED);
+        auth.authenticate(
+            TransportKind::Local,
+            Credential::Peercred { uid: 4343 },
+            None,
+            None,
+        )
+        .await
+        .expect("the newer roster still governs after the stale publish");
+    }
+
+    /// Removing daemon-uid trust must reach connections already established on
+    /// it, not only new ones: the established binding has to revalidate and
+    /// lose its authorization at the next resolve.
+    #[tokio::test]
+    async fn removing_daemon_uid_trust_denies_an_established_connection() {
+        let mut trusting = config_with_roster(4242);
+        trusting.security.trust_daemon_uid = true;
+        let auth = auth_for(&trusting, &[]);
+        let daemon_uid = PeercredAuthProvider::current_process_uid();
+        let established = auth
+            .authenticate(
+                TransportKind::Local,
+                Credential::Peercred { uid: daemon_uid },
+                None,
+                None,
+            )
+            .await
+            .expect("the daemon uid is trusted before the change");
+        auth.resolve_current(&established)
+            .expect("the established connection resolves while the trust stands");
+
+        let mut untrusting = trusting;
+        untrusting.security.trust_daemon_uid = false;
+        auth.publish_accepted(&untrusting, 1)
+            .expect("removing daemon uid trust publishes");
+
+        assert!(
+            auth.resolve_current(&established).is_err(),
+            "an established daemon-uid connection must lose authorization once the trust is removed"
+        );
+    }
+
+    /// A connection established through the no-roster compatibility path must
+    /// be re-evaluated once a roster exists: compatibility is the migration
+    /// state, and adding a roster ends it for connections already open.
+    #[tokio::test]
+    async fn adding_a_roster_denies_an_established_compatibility_connection() {
+        let compat = base_config();
+        let auth = auth_for(&compat, &[]);
+        // With no roster the socket mode is the credential: a local connection
+        // presenting none is admitted as the shared operator.
+        let established = auth
+            .authenticate(TransportKind::Local, Credential::None, None, None)
+            .await
+            .expect("the compatibility path admits a local connection with no roster");
+        auth.resolve_current(&established)
+            .expect("the compatibility connection resolves while no roster exists");
+
+        auth.publish_accepted(&config_with_roster(4343), 1)
+            .expect("adding a roster publishes");
+
+        assert!(
+            auth.resolve_current(&established).is_err(),
+            "adding a roster must end the compatibility admission for an open connection"
+        );
+    }
+
+    /// Tightening `required_acr` through a save must reach connections already
+    /// established on the old requirement, not only fresh tokens: the OIDC
+    /// binding has to initialize again rather than keep resolving. Rejection of
+    /// a fresh token that lacks the acr is covered by the provider's own tests
+    /// in `security::auth_provider::oidc`.
+    #[test]
+    fn tightening_required_acr_forces_an_established_oidc_binding_to_reinitialize() {
+        let config = oidc_config();
+        let auth = auth_for(&config, &[]);
+        let binding = oidc_binding(&auth);
+        auth.resolve_current(&binding)
+            .expect("the OIDC binding resolves under the accepted requirement");
+
+        let mut tightened = config;
+        tightened
+            .oidc
+            .get_mut("corp")
+            .expect("the fixture provider exists")
+            .required_acr = vec!["urn:example:assurance:mfa".into()];
+        let moved = auth
+            .publish_accepted(&tightened, 1)
+            .expect("an ACR tightening publishes");
+        assert!(
+            moved > binding.generation,
+            "tightening the acr requirement must move the generation"
+        );
+        assert!(
+            auth.resolve_current(&binding).is_err(),
+            "an established OIDC binding must initialize again after the acr tightens"
+        );
+    }
+
+    #[test]
+    fn publish_accepted_moves_the_generation_for_every_authorization_input() {
+        type Mutation = fn(&mut Config);
+        let mutations: [(&str, Mutation); 6] = [
+            ("an OIDC field", |config| {
+                config.oidc.get_mut("corp").unwrap().audience = "zeroclaw-next".into();
+            }),
+            ("a nested OIDC claim mapping", |config| {
+                let corp = config.oidc.get_mut("corp").unwrap();
+                corp.profile_map =
+                    std::collections::HashMap::from([("admins".into(), "operator".into())]);
+            }),
+            ("a roster uid", |config| {
+                config.users.get_mut("alice").unwrap().uid = Some(4343);
+            }),
+            ("a new roster entry", |config| {
+                config.users.insert(
+                    "bob".into(),
+                    UserConfig {
+                        principal_id: None,
+                        uid: Some(4344),
+                        permission_profiles: vec!["operator".into()],
+                    },
+                );
+            }),
+            ("a permission profile grant", |config| {
+                config
+                    .permission_profiles
+                    .get_mut("operator")
+                    .unwrap()
+                    .grants
+                    .insert(Resource::Cost, vec![Verb::Read]);
+            }),
+            ("the daemon uid trust posture", |config| {
+                config.security.trust_daemon_uid = !config.security.trust_daemon_uid;
+            }),
+        ];
+        for (input, mutate) in mutations {
+            let config = oidc_config();
+            let auth = auth_for(&config, &[]);
+            let generation = auth.generation();
+            let mut changed = config;
+            mutate(&mut changed);
+            let moved = auth
+                .publish_accepted(&changed, 1)
+                .unwrap_or_else(|e| panic!("{input}: the change publishes: {e}"));
+            assert!(moved > generation, "{input} must move the generation");
+        }
+    }
+
+    #[test]
+    fn publish_accepted_replaces_a_deny_all_state_with_the_repaired_policy() {
+        let mut dangling = base_config();
+        dangling.users.insert(
+            "alice".into(),
+            UserConfig {
+                principal_id: None,
+                uid: Some(4242),
+                permission_profiles: vec!["not-configured".into()],
+            },
+        );
+        let auth = auth_for(&dangling, &[]);
+        assert!(auth.resolve(&shared_operator_identity()).is_err());
+
+        let mut repaired = dangling;
+        repaired
+            .permission_profiles
+            .insert("not-configured".into(), PermissionProfileConfig::default());
+        auth.publish_accepted(&repaired, 1)
+            .expect("the repaired policy publishes");
+        assert!(
+            auth.resolve(&shared_operator_identity()).is_ok(),
+            "publishing a compiling policy lifts the deny-all state"
+        );
+    }
+
     #[test]
     fn publish_accepted_refuses_an_older_revision() {
         let config = config_with_roster(4242);
@@ -955,6 +1393,389 @@ mod tests {
         assert!(
             auth.accepted_at_least(3).is_err(),
             "a revision that has not been published yet fails closed"
+        );
+    }
+
+    // ── Stage 6 evidence: two IdPs coexist; policy rollback fails closed ──
+
+    async fn introspection_idp(subject: &str, groups: &[&str]) -> wiremock::MockServer {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        let issuer = server.uri();
+        Mock::given(method("GET"))
+            .and(path("/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "issuer": issuer,
+                "introspection_endpoint": format!("{issuer}/introspect"),
+            })))
+            .mount(&server)
+            .await;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        Mock::given(method("POST"))
+            .and(path("/introspect"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "active": true,
+                "token_type": "Bearer",
+                "client_id": "daemon-client",
+                "iss": issuer,
+                "sub": subject,
+                "aud": "zeroclaw",
+                "exp": now + 600,
+                "groups": groups,
+            })))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    fn oidc_entry(issuer: &str, group: &str, profile: &str) -> zeroclaw_config::schema::OidcConfig {
+        zeroclaw_config::schema::OidcConfig {
+            issuer: issuer.to_string(),
+            audience: "zeroclaw".into(),
+            client_id: "daemon".into(),
+            client_secret: Some("s3cret".into()),
+            validation: zeroclaw_config::schema::OidcValidation::Introspection,
+            claim_path: "groups".into(),
+            profile_map: std::collections::HashMap::from([(
+                group.to_string(),
+                profile.to_string(),
+            )]),
+            // The provider classifies the actor from an operator declaration;
+            // an undeclared client is refused however well the token verifies.
+            // These fixtures stand in for interactive human sign-ins.
+            interactive_clients: vec!["daemon-client".into()],
+            ..zeroclaw_config::schema::OidcConfig::default()
+        }
+    }
+
+    /// Two independent issuers verify side by side, resolve to distinct
+    /// canonical principals with their own grant sets, and never accept
+    /// each other's tokens. Removing one entry from config and refreshing
+    /// policy revokes that issuer's resolution (fail closed) while the
+    /// other keeps working: the rollback path is a config edit away.
+    #[tokio::test]
+    async fn two_idps_coexist_and_config_rollback_revokes_one() {
+        let corp = introspection_idp("alice", &["ops"]).await;
+        let partner = introspection_idp("bob", &["ext"]).await;
+
+        let mut config = base_config();
+        config.permission_profiles.insert(
+            "operator".into(),
+            PermissionProfileConfig {
+                grants: std::collections::HashMap::from([(
+                    Resource::Sessions,
+                    vec![Verb::Read, Verb::Create],
+                )]),
+                ..PermissionProfileConfig::default()
+            },
+        );
+        config.permission_profiles.insert(
+            "guest".into(),
+            PermissionProfileConfig {
+                grants: std::collections::HashMap::from([(Resource::Sessions, vec![Verb::Read])]),
+                ..PermissionProfileConfig::default()
+            },
+        );
+        config
+            .oidc
+            .insert("corp".into(), oidc_entry(&corp.uri(), "ops", "operator"));
+        config
+            .oidc
+            .insert("partner".into(), oidc_entry(&partner.uri(), "ext", "guest"));
+
+        let auth = auth_for(&config, &[]);
+
+        // Both issuers verify, to DISTINCT canonical principals.
+        let corp_conn = auth
+            .authenticate(
+                TransportKind::Wss,
+                Credential::None,
+                Some("corp-at"),
+                Some("oidc.corp"),
+            )
+            .await
+            .expect("corp verifies");
+        let partner_conn = auth
+            .authenticate(
+                TransportKind::Wss,
+                Credential::None,
+                Some("partner-at"),
+                Some("oidc.partner"),
+            )
+            .await
+            .expect("partner verifies");
+        assert_ne!(
+            corp_conn.principal.id, partner_conn.principal.id,
+            "issuer+subject keying keeps the principals distinct"
+        );
+        assert!(corp_conn.grants.permits(Resource::Sessions, Verb::Create));
+        assert!(
+            !partner_conn
+                .grants
+                .permits(Resource::Sessions, Verb::Create)
+        );
+        assert!(partner_conn.grants.permits(Resource::Sessions, Verb::Read));
+
+        // Explicit selection: a corp token presented to the partner
+        // provider is that provider's denial, never a cross-check.
+        let cross = auth
+            .authenticate(
+                TransportKind::Wss,
+                Credential::None,
+                Some("corp-at"),
+                Some("oidc.partner"),
+            )
+            .await
+            .expect("the partner IdP answers for tokens sent to it");
+        assert_ne!(
+            cross.principal.id, corp_conn.principal.id,
+            "the partner introspection authority answers with its own subject"
+        );
+
+        // Rollback: drop [oidc.partner] from config and refresh. Alias
+        // lookup is policy driven, so the dropped alias is no longer a
+        // known provider and the connection must authenticate afresh:
+        // it fails closed immediately, before any token is examined.
+        config.oidc.remove("partner");
+        auth.refresh_from_config(&config)
+            .expect("dropping an alias is a valid refresh");
+        let denied = auth
+            .authenticate(
+                TransportKind::Wss,
+                Credential::None,
+                Some("partner-at"),
+                Some("oidc.partner"),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            denied.code, AUTH_REQUIRED,
+            "revoked issuer fails closed: a dropped alias is an unknown provider"
+        );
+        let still_ok = auth
+            .authenticate(
+                TransportKind::Wss,
+                Credential::None,
+                Some("corp-at"),
+                Some("oidc.corp"),
+            )
+            .await
+            .expect("the surviving issuer is unaffected");
+        assert_eq!(still_ok.principal.id, corp_conn.principal.id);
+    }
+
+    /// A trusted config write that removes the resolving profile WHILE an
+    /// introspection round trip is in flight must not admit the request with
+    /// the pre-await authority. `authenticate` resolves grants against the
+    /// state in force after the IdP await, so a profile deleted during the
+    /// await fails closed (NotEntitled) rather than admitting a stale grant.
+    #[tokio::test]
+    async fn policy_removed_during_introspection_await_fails_closed() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // A bespoke IdP whose introspection response is delayed, giving the
+        // test a deterministic window to move the policy under the await.
+        let server = MockServer::start().await;
+        let issuer = server.uri();
+        Mock::given(method("GET"))
+            .and(path("/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "issuer": issuer,
+                "introspection_endpoint": format!("{issuer}/introspect"),
+            })))
+            .mount(&server)
+            .await;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        Mock::given(method("POST"))
+            .and(path("/introspect"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({
+                        "active": true,
+                        "token_type": "Bearer",
+                        "client_id": "daemon-client",
+                        "iss": issuer,
+                        "sub": "alice",
+                        "aud": "zeroclaw",
+                        "exp": now + 600,
+                        "groups": ["ops"],
+                    }))
+                    .set_delay(std::time::Duration::from_millis(400)),
+            )
+            .mount(&server)
+            .await;
+
+        let mut config = base_config();
+        config.permission_profiles.insert(
+            "operator".into(),
+            PermissionProfileConfig {
+                grants: std::collections::HashMap::from([(
+                    Resource::Sessions,
+                    vec![Verb::Read, Verb::Create],
+                )]),
+                ..PermissionProfileConfig::default()
+            },
+        );
+        config
+            .oidc
+            .insert("corp".into(), oidc_entry(&issuer, "ops", "operator"));
+
+        let auth = std::sync::Arc::new(auth_for(&config, &[]));
+
+        // Baseline: without any concurrent edit the token resolves to the
+        // operator grants, proving the fixture verifies at all.
+        let baseline = auth
+            .authenticate(
+                TransportKind::Wss,
+                Credential::None,
+                Some("corp-at"),
+                Some("oidc.corp"),
+            )
+            .await
+            .expect("baseline verifies");
+        assert!(baseline.grants.permits(Resource::Sessions, Verb::Create));
+
+        // Now race a policy edit against the delayed introspection: start the
+        // handshake, then remove the "ops" -> "operator" mapping mid-await.
+        let auth_task = std::sync::Arc::clone(&auth);
+        let handshake = zeroclaw_spawn::spawn!(async move {
+            auth_task
+                .authenticate(
+                    TransportKind::Wss,
+                    Credential::None,
+                    Some("corp-at"),
+                    Some("oidc.corp"),
+                )
+                .await
+        });
+
+        // Let the handshake enter the introspection await, then drop the
+        // profile mapping and refresh policy before the IdP responds. The
+        // "operator" profile still exists (so the refresh is a valid policy),
+        // but the "ops" claim value no longer maps to it, so the verified
+        // identity is entitled to nothing under the new generation.
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        config.oidc.insert(
+            "corp".into(),
+            oidc_entry(&issuer, "other-group", "operator"),
+        );
+        auth.refresh_from_config(&config)
+            .expect("remapping a claim value is a valid refresh");
+
+        let outcome = handshake.await.expect("handshake task joins");
+        // The introspection verified the identity under the pre-await
+        // generation, but a new generation was published before it completed.
+        // An OIDC binding cannot be reverified inline (the bearer is not
+        // retained), so the moved generation fails the handshake closed and
+        // the client must initialize again — the request is never admitted on
+        // a verification the superseded policy produced. This is a
+        // reverification failure (AUTH_REQUIRED), stronger than a mere
+        // entitlement denial: the identity is not accepted at all.
+        let denied = outcome.expect_err("stale-authority admission must be refused");
+        assert_eq!(
+            denied.code, AUTH_REQUIRED,
+            "an OIDC identity verified under a superseded generation must reinitialize, \
+             not be admitted on stale verification"
+        );
+    }
+
+    /// Companion to the removal race: even when the resolving profile still
+    /// exists AND the claim still maps to it under the new generation, an OIDC
+    /// handshake whose verification completed under a superseded generation
+    /// must NOT be admitted on that stale verification. This isolates the
+    /// generation gate from grant resolution — grants would still resolve, so
+    /// only the moved-generation reverification requirement can reject it.
+    #[tokio::test]
+    async fn oidc_verification_under_superseded_generation_reinitializes() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let issuer = server.uri();
+        Mock::given(method("GET"))
+            .and(path("/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "issuer": issuer,
+                "introspection_endpoint": format!("{issuer}/introspect"),
+            })))
+            .mount(&server)
+            .await;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        Mock::given(method("POST"))
+            .and(path("/introspect"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({
+                        "active": true,
+                        "token_type": "Bearer",
+                        "client_id": "daemon-client",
+                        "iss": issuer,
+                        "sub": "alice",
+                        "aud": "zeroclaw",
+                        "exp": now + 600,
+                        "groups": ["ops"],
+                    }))
+                    .set_delay(std::time::Duration::from_millis(400)),
+            )
+            .mount(&server)
+            .await;
+
+        let mut config = base_config();
+        config.permission_profiles.insert(
+            "operator".into(),
+            PermissionProfileConfig {
+                grants: std::collections::HashMap::from([(
+                    Resource::Sessions,
+                    vec![Verb::Read, Verb::Create],
+                )]),
+                ..PermissionProfileConfig::default()
+            },
+        );
+        config
+            .oidc
+            .insert("corp".into(), oidc_entry(&issuer, "ops", "operator"));
+
+        let auth = std::sync::Arc::new(auth_for(&config, &[]));
+
+        let auth_task = std::sync::Arc::clone(&auth);
+        let handshake = zeroclaw_spawn::spawn!(async move {
+            auth_task
+                .authenticate(
+                    TransportKind::Wss,
+                    Credential::None,
+                    Some("corp-at"),
+                    Some("oidc.corp"),
+                )
+                .await
+        });
+
+        // Refresh with an IDENTICAL claim mapping mid-await: the "ops" claim
+        // still maps to "operator" under the new generation, so grants would
+        // resolve. Only the moved-generation reverification requirement can
+        // refuse the handshake.
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        config
+            .oidc
+            .insert("corp".into(), oidc_entry(&issuer, "ops", "operator"));
+        auth.refresh_from_config(&config)
+            .expect("an identical-mapping refresh is a valid generation bump");
+
+        let outcome = handshake.await.expect("handshake task joins");
+        let denied = outcome.expect_err("verification under a superseded generation is refused");
+        assert_eq!(
+            denied.code, AUTH_REQUIRED,
+            "a moved generation forces OIDC reinitialize even when the claim still maps"
         );
     }
 }

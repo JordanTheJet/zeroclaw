@@ -17,13 +17,14 @@ pub(crate) fn resolve_vision_provider(
     multimodal_config: &MultimodalConfig,
     provider_name: &str,
     model: &str,
+    dispatch_model: &str,
 ) -> Result<(Option<ResolvedVisionProvider>, bool)> {
     let image_marker_count = multimodal::count_image_markers(history);
     let latest_user_image_marker_count = multimodal::count_latest_user_image_markers(history);
 
     let mut degrade_strip_images = false;
     let vision_model_provider: Option<ResolvedVisionProvider> = if image_marker_count > 0
-        && !model_provider.capabilities_for_model(model).vision
+        && !model_provider.capabilities_for_model(dispatch_model).vision
     {
         if let Some(ref vp) = multimodal_config.vision_model_provider {
             // Resolve the configured vision provider through the alias-aware
@@ -139,11 +140,36 @@ pub(crate) async fn prepare_messages_for_iteration(
     degrade_strip_images: bool,
     image_cache: Option<&mut multimodal::LocalImageCache>,
 ) -> Result<multimodal::PreparedMessages> {
+    prepare_messages_with_source_rows(
+        history,
+        multimodal_config,
+        degrade_strip_images,
+        image_cache,
+    )
+    .await
+    .map(|(prepared, _)| prepared)
+}
+
+pub(super) async fn prepare_messages_with_source_rows(
+    history: &[ChatMessage],
+    multimodal_config: &MultimodalConfig,
+    degrade_strip_images: bool,
+    image_cache: Option<&mut multimodal::LocalImageCache>,
+) -> Result<(multimodal::PreparedMessages, Vec<usize>)> {
     // Enforce the universal leading-turn-order invariant before any provider
     // sees the history: strict providers reject a first non-system turn that is
     // not `user`, which context trims and session restores can produce.
     let mut sanitized = history.to_vec();
+    let system_end = sanitized
+        .iter()
+        .take_while(|message| message.is_system())
+        .count();
     ChatMessage::sanitize_leading_turn_order(&mut sanitized);
+    // Sanitization removes only the orphan span after leading system rows.
+    let removed = history.len() - sanitized.len();
+    let source_rows: Vec<usize> = (0..system_end)
+        .chain(system_end + removed..history.len())
+        .collect();
     if !sanitized.iter().any(ChatMessage::is_user) {
         anyhow::bail!(
             "refusing to dispatch to provider: prepared history has no user turn \
@@ -151,16 +177,22 @@ pub(crate) async fn prepare_messages_for_iteration(
         );
     }
     let history = sanitized.as_slice();
-    if degrade_strip_images {
+    let prepared = if degrade_strip_images {
         // Text-only fallback: replace every media marker with the prose
         // placeholder so no filesystem path or data URI reaches the
         // text-only provider, while surrounding text (captions, tool
-        // metadata) survives.
+        // metadata) survives. An assistant tool-call envelope is rewritten
+        // field-wise instead: signed thinking (`reasoning_content`) and
+        // tool-call signatures (`tool_calls[].extra_content`) must replay
+        // byte-for-byte, and a composite provider (the reliable wrapper)
+        // reports no vision whenever one of its fallbacks lacks it — so the
+        // primary that receives this degraded request may be the very
+        // provider that verifies those signatures.
         let stripped: Vec<ChatMessage> = history
             .iter()
             .map(|m| ChatMessage {
                 role: m.role.clone(),
-                content: multimodal::strip_media_markers(&m.content),
+                content: multimodal::strip_media_markers_model_visible(m),
             })
             .collect();
         match image_cache {
@@ -182,7 +214,12 @@ pub(crate) async fn prepare_messages_for_iteration(
             }
             None => multimodal::prepare_messages_for_provider(history, multimodal_config).await,
         }
-    }
+    }?;
+    anyhow::ensure!(
+        prepared.messages.len() == source_rows.len(),
+        "message preparation changed source-row cardinality"
+    );
+    Ok((prepared, source_rows))
 }
 
 #[cfg(test)]
@@ -190,11 +227,45 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn preparation_preserves_source_rows_across_sanitization_and_media() {
+        let history = vec![
+            ChatMessage::system("system"),
+            ChatMessage::assistant("orphan call"),
+            ChatMessage::tool("orphan result"),
+            ChatMessage::user("[Tool results] is literal user text"),
+            ChatMessage::assistant("current call"),
+            ChatMessage::user("[Tool results]\nresult"),
+            ChatMessage::user("new question [IMAGE:/unread.png]"),
+        ];
+        let (prepared, source_rows) =
+            prepare_messages_with_source_rows(&history, &MultimodalConfig::default(), true, None)
+                .await
+                .unwrap();
+        assert_eq!(source_rows, vec![0, 3, 4, 5, 6]);
+        assert_eq!(prepared.messages[1].content, history[3].content);
+        assert_eq!(prepared.messages[3].role, "user");
+        assert_eq!(prepared.messages[3].content, history[5].content);
+        assert!(!prepared.messages[4].content.contains("[IMAGE:"));
+        assert!(prepared.messages[4].content.contains("new question"));
+    }
+
+    #[tokio::test]
     async fn prepare_messages_for_iteration_populates_and_reuses_image_cache() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("shot.png");
-        // Minimal PNG signature — enough for MIME detection.
-        std::fs::write(&path, [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']).unwrap();
+        // A real 1x1 PNG: content validation drops undecodable bytes, so a
+        // bare signature would be skipped before reaching the provider.
+        std::fs::write(
+            &path,
+            [
+                0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+                0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00,
+                0x00, 0x90, 0x77, 0x53, 0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54, 0x78,
+                0x9C, 0x63, 0xF8, 0xCF, 0xC0, 0x00, 0x00, 0x03, 0x01, 0x01, 0x00, 0xC9, 0xFE, 0x92,
+                0xEF, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+            ],
+        )
+        .unwrap();
         let history = vec![ChatMessage::user(format!(
             "look [IMAGE:{}]",
             path.display()
@@ -271,6 +342,88 @@ mod tests {
             "audio path leaked to the provider payload: {joined}"
         );
         assert!(joined.contains(multimodal::MEDIA_PLACEHOLDER));
+    }
+
+    /// The text-only degrade path used to map `strip_media_markers` over
+    /// every message's whole string, rewriting a marker inside an assistant
+    /// envelope's signed reasoning while keeping its signature. The rewrite
+    /// is field-wise for envelopes now, so the reasoning replays
+    /// byte-for-byte even though the provider is text-only. The envelope is
+    /// built with the production `build_native_assistant_history` builder
+    /// the adapters parse back; the `/tmp` paths are literal text only —
+    /// nothing is read from disk on the degrade path.
+    #[tokio::test]
+    async fn degrade_strips_markers_field_wise_in_assistant_envelope() {
+        let path = "/tmp/a.png";
+        let marker = format!("[{}:{}]", "IMAGE", path);
+        let reasoning =
+            format!(r#"{{"thinking":"check {marker} before answering","signature":"sig_abc"}}"#);
+        let envelope = super::super::parse_response::build_native_assistant_history(
+            &format!("saved {marker}"),
+            &[zeroclaw_api::model_provider::ToolCall {
+                id: "toolu_1".into(),
+                name: "shell".into(),
+                arguments: "{}".into(),
+                extra_content: Some(serde_json::json!({
+                    "google": {"thought_signature": "sig_gemini"}
+                })),
+            }],
+            Some(&reasoning),
+        );
+        let history = vec![
+            ChatMessage::user(format!("look {marker}")),
+            ChatMessage::assistant(envelope),
+            ChatMessage::tool("done"),
+        ];
+        let cfg = MultimodalConfig::default();
+        let prepared = prepare_messages_for_iteration(&history, &cfg, true, None)
+            .await
+            .unwrap();
+
+        let assistant_prepared = prepared
+            .messages
+            .iter()
+            .find(|m| m.role == "assistant")
+            .expect("assistant envelope survives the degrade path");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&assistant_prepared.content).expect("envelope stays valid JSON");
+        assert_eq!(
+            parsed["reasoning_content"].as_str(),
+            Some(reasoning.as_str()),
+            "signed thinking must survive the degrade path byte-for-byte"
+        );
+        assert_eq!(
+            parsed["tool_calls"],
+            serde_json::json!([{
+                "id": "toolu_1",
+                "name": "shell",
+                "arguments": "{}",
+                "extra_content": {"google": {"thought_signature": "sig_gemini"}},
+            }]),
+            "tool calls (including extra_content signatures) must round-trip unchanged"
+        );
+        let content = parsed["content"].as_str().expect("content stays a string");
+        assert!(
+            content.contains(multimodal::MEDIA_PLACEHOLDER),
+            "the envelope's content marker is replaced: {content}"
+        );
+        assert!(
+            !content.contains(path),
+            "no raw path may survive in the envelope's content: {content}"
+        );
+
+        let user_prepared = prepared
+            .messages
+            .iter()
+            .find(|m| m.role == "user")
+            .expect("user message survives the degrade path");
+        assert!(
+            user_prepared
+                .content
+                .contains(multimodal::MEDIA_PLACEHOLDER),
+            "the whole-string rule still applies to other roles: {}",
+            user_prepared.content
+        );
     }
 
     #[tokio::test]
@@ -366,6 +519,7 @@ vision = false
             &multimodal,
             "primary",
             "primary-model",
+            "primary-model",
         )
         .err()
         .expect("a forced-off vision route must surface a capability error once its alias vision override is honored");
@@ -429,6 +583,7 @@ vision = false
             &multimodal,
             "primary",
             "primary-model",
+            "primary-model",
         )
         .err()
         .expect("a non-vision aggregate with no vision route must surface a capability error");
@@ -484,6 +639,7 @@ vision = false
             &history,
             &multimodal,
             "primary",
+            "primary-model",
             "primary-model",
         )
         .err()
@@ -592,6 +748,7 @@ model = "vision-model"
             &multimodal,
             "primary",
             "primary-model",
+            "primary-model",
         )
         .expect("a configured vision-capable alias must build");
         let vision_provider =
@@ -638,6 +795,7 @@ model = "vision-model"
             &history,
             &explicit,
             "primary",
+            "primary-model",
             "primary-model",
         )
         .expect("an explicit vision model must resolve");

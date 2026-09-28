@@ -19,6 +19,12 @@
 //! - JWKS refresh is bounded: an unknown `kid` may trigger at most one
 //!   fetch per cooldown window, so a stream of bad tokens cannot hammer
 //!   the IdP.
+//! - Actor class (human vs. service) is declared, never inferred from the
+//!   `sub`/`client_id` relationship: `service_clients` and
+//!   `interactive_clients` classify by verified `client_id`, and
+//!   `actor_claim` classifies a client that issues both kinds of token.
+//!   A token with no declaration and no configured claim evidence, or with
+//!   evidence contradicting its declaration, is denied.
 //! - Every ambiguity — unreachable issuer, malformed token, missing
 //!   claims, unmatched audience — is a denial, never a fallback.
 
@@ -33,7 +39,7 @@ use serde::Deserialize;
 use zeroclaw_api::principal::{
     AuthMethod, AuthOutcome, AuthenticatedIdentity, DenyReason, IdentitySubject,
 };
-use zeroclaw_config::schema::{OidcConfig, OidcValidation};
+use zeroclaw_config::schema::{OidcActorKind, OidcConfig, OidcValidation};
 
 use super::{AuthProvider, Credential};
 
@@ -48,8 +54,10 @@ const JWKS_REFRESH_COOLDOWN: Duration = Duration::from_secs(30);
 const JWKS_CACHE_TTL: Duration = Duration::from_secs(300);
 
 /// Bound all untrusted OIDC metadata and introspection payloads, even when a
-/// peer omits Content-Length or uses chunked transfer encoding.
-const MAX_OIDC_RESPONSE_BYTES: usize = 1024 * 1024;
+/// peer omits Content-Length or uses chunked transfer encoding. Shared with
+/// the enrollment sibling, which reads the same untrusted IdP documents and
+/// bounds them to the same ceiling.
+pub(super) const MAX_OIDC_RESPONSE_BYTES: usize = 1024 * 1024;
 
 /// A JWKS is an untrusted network document; cap its key cardinality before
 /// materializing the selection map.
@@ -129,6 +137,13 @@ struct Claims {
     client_id: Option<String>,
     #[serde(default)]
     token_type: Option<String>,
+    /// Issuer-specific purpose markers (Keycloak `typ`, Cognito
+    /// `token_use`). Not standardized, so absence proves nothing; a present
+    /// marker naming anything but an access token is a denial.
+    #[serde(default)]
+    typ: Option<String>,
+    #[serde(default)]
+    token_use: Option<String>,
     #[serde(default)]
     acr: Option<String>,
     #[serde(default)]
@@ -147,13 +162,124 @@ enum VerifiedVia {
     /// evidence, so `iss`/`aud`/`exp` are all mandatory.
     Jwks,
     /// A positive verdict from the configured issuer's authenticated
-    /// introspection endpoint: the endpoint is the authority, so RFC 7662
-    /// optional response fields are enforced only when present.
+    /// introspection endpoint. The endpoint is the authority, but its
+    /// `active` flag alone binds nothing: the response must also carry
+    /// `token_type: Bearer`, the configured audience, and a `client_id`
+    /// (see [`OidcValidation::Introspection`]). Only `iss` and `exp` stay
+    /// optional, since the authenticated endpoint speaks for the issuer.
     Introspection,
+}
+
+/// Which actor kind a verified token belongs to. Decided from the
+/// operator's declarations and the configured actor claim, never from the
+/// `sub`/`client_id` relationship.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ActorClass {
+    Service,
+    Human,
+}
+
+impl ActorClass {
+    fn other(self) -> Self {
+        match self {
+            Self::Service => Self::Human,
+            Self::Human => Self::Service,
+        }
+    }
+}
+
+impl From<OidcActorKind> for ActorClass {
+    fn from(kind: OidcActorKind) -> Self {
+        match kind {
+            OidcActorKind::Service => Self::Service,
+            OidcActorKind::Human => Self::Human,
+        }
+    }
+}
+
+/// Look up a dotted claim path (`realm_access.roles`) in the verified
+/// claim map. A JSON `null` is treated as absent.
+fn claim_at_path<'a>(
+    claims: &'a serde_json::Map<String, serde_json::Value>,
+    path: &str,
+) -> Option<&'a serde_json::Value> {
+    let mut cursor: Option<&serde_json::Value> = None;
+    for segment in path.split('.') {
+        cursor = match cursor {
+            None => claims.get(segment),
+            Some(value) => value.get(segment),
+        };
+        cursor?;
+    }
+    cursor.filter(|value| !value.is_null())
+}
+
+/// Explicit purpose markers are enforced wherever the issuer sends them.
+/// Keycloak stamps `typ` (`Bearer`, `Refresh`, `ID`, `Offline`) and Cognito
+/// stamps `token_use` (`access`, `id`) on tokens and introspection responses
+/// alike; neither is standardized, so absence proves nothing, but a marker
+/// naming anything other than an access token is a denial.
+fn purpose_markers_permit_access(claims: &Claims) -> bool {
+    let typ_permits = claims
+        .typ
+        .as_deref()
+        .is_none_or(|typ| typ.eq_ignore_ascii_case("Bearer") || is_access_token_type(Some(typ)));
+    let token_use_permits = claims
+        .token_use
+        .as_deref()
+        .is_none_or(|token_use| token_use.eq_ignore_ascii_case("access"));
+    typ_permits && token_use_permits
 }
 
 fn deny(reason: DenyReason) -> AuthOutcome {
     AuthOutcome::Denied { reason }
+}
+
+/// Build an HTTP `Authorization: Basic <b64>` header value from an OAuth client
+/// id and secret per RFC 6749 §2.3.1: each credential is
+/// `application/x-www-form-urlencoded` first, then the `id:secret` pair is
+/// base64-serialized with the standard alphabet (padded). This is what lets a
+/// credential containing `:`, `+`, a space, or other reserved bytes reach the
+/// IdP intact instead of being mangled by a raw base64 of the literal values.
+fn oauth_basic_authorization(client_id: &str, secret: &str) -> String {
+    use base64::engine::general_purpose::STANDARD;
+    let pair = format!(
+        "{}:{}",
+        form_urlencode_component(client_id),
+        form_urlencode_component(secret)
+    );
+    format!("Basic {}", STANDARD.encode(pair.as_bytes()))
+}
+
+/// `application/x-www-form-urlencoded` encoding of one component: unreserved
+/// characters (`ALPHA / DIGIT / - . _ ~`) pass through, a space becomes `+`,
+/// and every other byte becomes `%XX`. This matches the `x-www-form-urlencoded`
+/// serialization RFC 6749 §2.3.1 (via appendix B) requires for the Basic
+/// credentials.
+fn form_urlencode_component(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for &byte in input.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(byte as char);
+            }
+            b' ' => out.push('+'),
+            other => {
+                out.push('%');
+                out.push(
+                    char::from_digit((other >> 4) as u32, 16)
+                        .unwrap()
+                        .to_ascii_uppercase(),
+                );
+                out.push(
+                    char::from_digit((other & 0xf) as u32, 16)
+                        .unwrap()
+                        .to_ascii_uppercase(),
+                );
+            }
+        }
+    }
+    out
 }
 
 fn now_unix() -> u64 {
@@ -178,7 +304,12 @@ fn is_loopback_host(host: &str) -> bool {
 /// OIDC discovery endpoints are token-verification roots of trust. Apply the
 /// same HTTPS/exact-loopback transport rule as the configured issuer before
 /// a request can carry a bearer token or client credentials.
-fn validate_discovered_endpoint(endpoint: &str, field: &str) -> anyhow::Result<()> {
+/// The canonical URL policy for an endpoint a discovery document advertises:
+/// `https`, or `http` for an exact loopback host only, never with userinfo.
+/// Shared with the enrollment client, which must hold the endpoints it sends
+/// credentials to to the same rule the daemon holds its verification
+/// endpoints to.
+pub(super) fn validate_discovered_endpoint(endpoint: &str, field: &str) -> anyhow::Result<()> {
     let url = reqwest::Url::parse(endpoint)
         .map_err(|e| anyhow::Error::msg(format!("invalid discovery {field}: {e}")))?;
     if !url.username().is_empty() || url.password().is_some() {
@@ -194,7 +325,12 @@ fn validate_discovered_endpoint(endpoint: &str, field: &str) -> anyhow::Result<(
     }
 }
 
-async fn read_response_limited(mut response: reqwest::Response) -> anyhow::Result<Vec<u8>> {
+/// Read a response body whole, refusing anything past
+/// [`MAX_OIDC_RESPONSE_BYTES`] whether or not the peer declares a
+/// Content-Length. Shared with the enrollment sibling.
+pub(super) async fn read_response_limited(
+    mut response: reqwest::Response,
+) -> anyhow::Result<Vec<u8>> {
     if response
         .content_length()
         .is_some_and(|len| len > MAX_OIDC_RESPONSE_BYTES as u64)
@@ -481,10 +617,19 @@ impl OidcAuthProvider {
         let Some(secret) = self.config.client_secret.as_deref() else {
             return deny(DenyReason::Misconfigured);
         };
+        // RFC 6749 §2.3.1: the client identifier and secret carried in the HTTP
+        // Basic header must each be `application/x-www-form-urlencoded` BEFORE
+        // the `id:secret` pair is base64-serialized. `reqwest::basic_auth`
+        // base64s the raw values, so a client id or secret containing `:`, `+`,
+        // space, or other reserved bytes would be transmitted incorrectly and
+        // the IdP would reject an otherwise valid credential (e.g. `daemon:prod`
+        // / `s+cret` must become `daemon%3Aprod` / `s%2Bcret`). Encode each part
+        // ourselves and set the header directly.
+        let basic = oauth_basic_authorization(self.config.effective_client_id(), secret);
         let response = self
             .http
             .post(&endpoint)
-            .basic_auth(self.config.effective_client_id(), Some(secret))
+            .header(reqwest::header::AUTHORIZATION, basic)
             .form(&[("token", token), ("token_type_hint", "access_token")])
             .send()
             .await;
@@ -518,10 +663,45 @@ impl OidcAuthProvider {
         self.claims_to_identity(&claims, raw, VerifiedVia::Introspection)
     }
 
+    /// The operator's declaration for a verified client, if any.
+    fn declared_actor(&self, client_id: &str) -> Option<ActorClass> {
+        if self.config.service_clients.iter().any(|c| c == client_id) {
+            Some(ActorClass::Service)
+        } else if self
+            .config
+            .interactive_clients
+            .iter()
+            .any(|c| c == client_id)
+        {
+            Some(ActorClass::Human)
+        } else {
+            None
+        }
+    }
+
+    /// What the configured `actor_claim` says about this token: presence
+    /// proves the configured kind, absence proves the other. `None` when no
+    /// claim is configured.
+    fn actor_evidence(
+        &self,
+        raw: &serde_json::Map<String, serde_json::Value>,
+    ) -> Option<ActorClass> {
+        if self.config.actor_claim.is_empty() {
+            return None;
+        }
+        let marked = ActorClass::from(self.config.actor_claim_marks);
+        Some(if claim_at_path(raw, &self.config.actor_claim).is_some() {
+            marked
+        } else {
+            marked.other()
+        })
+    }
+
     /// Shared claim checks + identity assembly. `via` decides which absent
     /// claims are tolerable: a bare JWT must prove everything itself,
-    /// while an authenticated introspection verdict comes from the
-    /// configured authority and RFC 7662 leaves most fields optional.
+    /// while an authenticated introspection verdict speaks for the issuer
+    /// and RFC 7662 leaves `iss`/`exp` optional. Audience is mandatory on
+    /// both paths.
     fn claims_to_identity(
         &self,
         claims: &Claims,
@@ -535,10 +715,8 @@ impl OidcAuthProvider {
             (None, VerifiedVia::Introspection) => {}
             _ => return deny(DenyReason::BadCredential),
         }
-        match (&claims.aud, via) {
-            (Some(aud), _) if audience_matches(Some(aud), &self.config.audience) => {}
-            (None, VerifiedVia::Introspection) => {}
-            _ => return deny(DenyReason::BadCredential),
+        if !audience_matches(claims.aud.as_ref(), &self.config.audience) {
+            return deny(DenyReason::BadCredential);
         }
         match (claims.exp, via) {
             (Some(exp), _) if exp.saturating_add(CLOCK_LEEWAY_SECS) > now => {}
@@ -551,8 +729,9 @@ impl OidcAuthProvider {
             return deny(DenyReason::BadCredential);
         }
         // Token purpose: an ID token is authentication evidence for the
-        // browser flow, never an API/RPC bearer.
-        if claims.nonce.is_some() {
+        // browser flow, never an API/RPC bearer; an explicit issuer purpose
+        // marker naming a refresh/ID token is denied wherever it appears.
+        if claims.nonce.is_some() || !purpose_markers_permit_access(claims) {
             return deny(DenyReason::BadCredential);
         }
         if !self.config.allowed_authorized_parties.is_empty()
@@ -583,33 +762,47 @@ impl OidcAuthProvider {
             return deny(DenyReason::MfaRequired);
         }
 
-        // A verified client_id is the stable actor discriminator. Providers
-        // vary in their service-token `sub` shape, so an allowlisted client is
-        // always a service; a non-allowlisted client must have a distinct
-        // human subject and can never impersonate an equal service-shaped sub.
-        let client_identity = claims
+        // A verified client_id is mandatory (RFC 9068 §2.2; the introspection
+        // contract). It keys the operator's actor declarations; the
+        // `sub`/`client_id` relationship is never consulted because
+        // service-token subjects are provider-specific (`<client>@clients`,
+        // a service-account user id, or the client id itself).
+        let Some(client_id) = claims
             .client_id
             .as_deref()
-            .filter(|client_id| !client_id.trim().is_empty());
-        let human_subject = claims.sub.as_deref().filter(|sub| !sub.trim().is_empty());
-        let subject = match (client_identity, human_subject) {
-            (Some(client_id), _)
-                if self
-                    .config
-                    .service_clients
-                    .iter()
-                    .any(|allowed| allowed == client_id) =>
-            {
-                IdentitySubject::Service {
+            .filter(|client_id| !client_id.trim().is_empty())
+        else {
+            return deny(DenyReason::BadCredential);
+        };
+        let actor = match (self.declared_actor(client_id), self.actor_evidence(&raw)) {
+            // Evidence contradicting a declaration is ambiguity: deny rather
+            // than let either side win.
+            (Some(declared), Some(evidence)) if declared != evidence => {
+                return deny(DenyReason::BadCredential);
+            }
+            (Some(declared), _) => declared,
+            // A client declared nowhere is classified by the operator's
+            // actor claim alone (a shared human+machine client).
+            (None, Some(evidence)) => evidence,
+            // No declaration and no claim evidence: nothing positively
+            // establishes the actor class, so the token authenticates nobody.
+            (None, None) => return deny(DenyReason::BadCredential),
+        };
+        let subject = match actor {
+            ActorClass::Service => IdentitySubject::Service {
+                issuer: self.config.issuer.clone(),
+                client_id: client_id.to_owned(),
+            },
+            ActorClass::Human => {
+                let Some(subject) = claims.sub.as_deref().filter(|sub| !sub.trim().is_empty())
+                else {
+                    return deny(DenyReason::BadCredential);
+                };
+                IdentitySubject::Oidc {
                     issuer: self.config.issuer.clone(),
-                    client_id: client_id.to_owned(),
+                    subject: subject.to_owned(),
                 }
             }
-            (Some(client_id), Some(subject)) if subject != client_id => IdentitySubject::Oidc {
-                issuer: self.config.issuer.clone(),
-                subject: subject.to_owned(),
-            },
-            _ => return deny(DenyReason::BadCredential),
         };
 
         let mut identity = AuthenticatedIdentity::new(subject, AuthMethod::Oidc)
@@ -628,10 +821,6 @@ impl OidcAuthProvider {
                     .jti
                     .as_deref()
                     .is_none_or(|jti| jti.trim().is_empty())
-                    || claims
-                        .client_id
-                        .as_deref()
-                        .is_none_or(|client_id| client_id.trim().is_empty())
                 {
                     return deny(DenyReason::BadCredential);
                 }
@@ -700,8 +889,46 @@ mod tests {
         issuer: String,
     }
 
+    #[test]
+    fn oauth_basic_header_form_encodes_each_credential_before_base64() {
+        use base64::Engine as _;
+        use base64::engine::general_purpose::STANDARD;
+
+        // Reserved bytes in both the id and the secret: `:` and `+` must be
+        // percent-encoded per RFC 6749 §2.3.1 before the pair is base64'd, so
+        // the `:` inside the id cannot be mistaken for the id/secret delimiter
+        // and `+` is not silently turned into a space by a form decoder.
+        let header = oauth_basic_authorization("daemon:prod", "s+cret");
+        let b64 = header.strip_prefix("Basic ").expect("Basic scheme prefix");
+        let decoded = String::from_utf8(STANDARD.decode(b64).expect("valid base64")).unwrap();
+        assert_eq!(decoded, "daemon%3Aprod:s%2Bcret");
+    }
+
+    #[test]
+    fn oauth_basic_header_passes_ordinary_credentials_through() {
+        use base64::Engine as _;
+        use base64::engine::general_purpose::STANDARD;
+
+        // Control: unreserved credentials are unchanged, so the encoding does
+        // not perturb the common case.
+        let header = oauth_basic_authorization("daemon-client", "plainsecret123");
+        let b64 = header.strip_prefix("Basic ").expect("Basic scheme prefix");
+        let decoded = String::from_utf8(STANDARD.decode(b64).expect("valid base64")).unwrap();
+        assert_eq!(decoded, "daemon-client:plainsecret123");
+    }
+
+    #[test]
+    fn form_urlencode_component_maps_space_and_reserved_bytes() {
+        assert_eq!(form_urlencode_component("a b"), "a+b");
+        assert_eq!(form_urlencode_component("a:b/c?d"), "a%3Ab%2Fc%3Fd");
+        assert_eq!(form_urlencode_component("keep-._~"), "keep-._~");
+    }
+
     async fn start_idp() -> TestIdp {
-        let server = MockServer::start().await;
+        // Keep this authority's port owned until the test ends. A pooled server
+        // can hand the same port to another parallel test while a client still
+        // holds its issuer URL.
+        let server = MockServer::builder().start().await;
         let issuer = server.uri();
         let rng = SystemRandom::new();
         let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng).unwrap();
@@ -767,6 +994,9 @@ mod tests {
                 validation,
                 claim_path: "realm_access.roles".into(),
                 profile_map: HashMap::from([("ops".to_string(), "operator".to_string())]),
+                // The fixture's human tokens come from a declared
+                // interactive client; nothing is inferred from `sub`.
+                interactive_clients: vec!["zerocode-cli".into()],
                 ..OidcConfig::default()
             }
         }
@@ -996,7 +1226,7 @@ mod tests {
         for surface in ["discovery", "jwks", "introspection"] {
             for status in [302, 307, 308] {
                 let idp = start_idp().await;
-                let sink = MockServer::start().await;
+                let sink = MockServer::builder().start().await;
                 Mock::given(path("/capture"))
                     .respond_with(ResponseTemplate::new(200))
                     .expect(0)
@@ -1046,9 +1276,24 @@ mod tests {
                         b"token=opaque-token&token_type_hint=access_token"
                     );
                 }
+                let unexpected: Vec<_> = sink
+                    .received_requests()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .map(|request| {
+                        format!(
+                            "{} {} authorization={} body_present={}",
+                            request.method,
+                            request.url.path(),
+                            request.headers.contains_key("authorization"),
+                            !request.body.is_empty()
+                        )
+                    })
+                    .collect();
                 assert!(
-                    sink.received_requests().await.unwrap().is_empty(),
-                    "{surface} status {status} must not deliver any request to the redirect target"
+                    unexpected.is_empty(),
+                    "{surface} status {status} must not deliver any request to the redirect target; observed {unexpected:?}"
                 );
             }
         }
@@ -1514,17 +1759,20 @@ mod tests {
             }
         );
 
-        // A client credential not declared as a service must never fall back
-        // to its human-looking sub or profile map.
-        let mut claims = idp.good_claims();
-        claims["client_id"] = serde_json::json!("undeclared-client");
-        claims["sub"] = serde_json::json!("undeclared-client");
-        assert!(
-            !provider
-                .verify(&bearer(idp.mint(claims)))
-                .await
-                .is_allowed()
-        );
+        // A client declared nowhere carries no positive actor signal, so it
+        // is denied whatever its `sub` looks like: never a human fallback.
+        for sub in ["undeclared-client", "some-distinct-subject"] {
+            let mut claims = idp.good_claims();
+            claims["client_id"] = serde_json::json!("undeclared-client");
+            claims["sub"] = serde_json::json!(sub);
+            assert!(
+                !provider
+                    .verify(&bearer(idp.mint(claims)))
+                    .await
+                    .is_allowed(),
+                "undeclared client with sub {sub:?} must not authenticate"
+            );
+        }
 
         let mut claims = idp.good_claims();
         claims["client_id"] = serde_json::json!("reporting-batch");
@@ -1545,6 +1793,290 @@ mod tests {
                 .await
                 .is_allowed(),
             "a token without a stable client discriminator is denied"
+        );
+    }
+
+    /// A resolver policy mirroring `TestIdp::config`: `ops` → `operator` for
+    /// humans, `service_client` → `operator` for services.
+    fn resolver_policy(
+        idp: &TestIdp,
+        service_client: &str,
+    ) -> crate::security::principal_resolver::ResolverPolicy {
+        use crate::security::principal_resolver::{OidcMapping, ResolverPolicy};
+        use zeroclaw_api::grants::ResolvedGrants;
+        let mut grants = ResolvedGrants::none();
+        grants
+            .resources
+            .insert(Resource::Sessions, [Verb::Read].into());
+        ResolverPolicy {
+            profiles: HashMap::from([("operator".to_string(), grants)]),
+            oidc: HashMap::from([(
+                "test".to_string(),
+                OidcMapping {
+                    issuer: idp.issuer.clone(),
+                    claim_path: "realm_access.roles".into(),
+                    profile_map: HashMap::from([("ops".to_string(), "operator".to_string())]),
+                    service_profile_map: HashMap::from([(
+                        service_client.to_string(),
+                        "operator".to_string(),
+                    )]),
+                },
+            )]),
+            roster: HashMap::new(),
+            roster_conflict: false,
+        }
+    }
+
+    /// The machine-token subject shapes real issuers mint for client
+    /// credentials, all with a mapped human role claim attached.
+    fn machine_subject_shapes(client_id: &str) -> [(&'static str, String); 3] {
+        [
+            ("auth0 @clients", format!("{client_id}@clients")),
+            (
+                "keycloak service-account id",
+                "3f1c2d4e-5a6b-4c7d-8e9f-0a1b2c3d4e5f".to_string(),
+            ),
+            ("okta equal client", client_id.to_string()),
+        ]
+    }
+
+    #[tokio::test]
+    async fn undeclared_machine_tokens_are_denied_on_both_paths() {
+        // An undeclared client with a distinct `sub` used to become a human
+        // and reach `profile_map`. With no declaration and no actor claim,
+        // nothing establishes the actor class, so every shape is denied.
+        let idp = start_idp().await;
+        let config = idp.config(OidcValidation::Jwks);
+        assert!(
+            !config
+                .service_clients
+                .contains(&"reporting-batch".to_string())
+                && !config
+                    .interactive_clients
+                    .contains(&"reporting-batch".to_string())
+                && config.actor_claim.is_empty()
+        );
+        let provider = OidcAuthProvider::new("test", config).unwrap();
+        for (shape, sub) in machine_subject_shapes("reporting-batch") {
+            let mut claims = idp.good_claims();
+            claims["client_id"] = serde_json::json!("reporting-batch");
+            claims["sub"] = serde_json::json!(sub);
+            let outcome = provider.verify(&bearer(idp.mint(claims))).await;
+            assert!(
+                matches!(
+                    outcome,
+                    AuthOutcome::Denied {
+                        reason: DenyReason::BadCredential
+                    }
+                ),
+                "{shape}: undeclared machine token must not verify: {outcome:?}"
+            );
+        }
+
+        for (shape, sub) in machine_subject_shapes("reporting-batch") {
+            let idp = start_idp().await;
+            Mock::given(method("POST"))
+                .and(path("/introspect"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "active": true, "token_type": "Bearer", "iss": idp.issuer,
+                    "sub": sub, "aud": "zeroclaw", "client_id": "reporting-batch",
+                    "realm_access": {"roles": ["ops"]},
+                })))
+                .expect(1)
+                .mount(&idp.server)
+                .await;
+            let provider = idp.provider(OidcValidation::Introspection);
+            let outcome = provider.verify(&bearer("opaque-token")).await;
+            assert!(
+                !outcome.is_allowed(),
+                "{shape}: undeclared active introspection must not verify: {outcome:?}"
+            );
+            idp.server.verify().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn shared_client_tokens_classify_by_actor_claim_and_resolve_apart() {
+        // One client (`portal`) issues authorization-code user tokens and
+        // client-credentials tokens. It is declared in neither list; the
+        // operator names the claim the issuer stamps on one kind only.
+        use crate::security::principal_resolver::PrincipalResolver;
+
+        let idp = start_idp().await;
+        for (marks, claim, marker_value) in [
+            (OidcActorKind::Service, "gty", "client-credentials"),
+            (OidcActorKind::Human, "uid", "00u1abcd"),
+        ] {
+            let mut config = idp.config(OidcValidation::Jwks);
+            config.interactive_clients.clear();
+            config.actor_claim = claim.into();
+            config.actor_claim_marks = marks;
+            let provider = OidcAuthProvider::new("test", config).unwrap();
+            let policy = resolver_policy(&idp, "portal");
+            let resolver = PrincipalResolver::new(policy.clone());
+
+            let mut user = idp.good_claims();
+            user["client_id"] = serde_json::json!("portal");
+            user["sub"] = serde_json::json!("alice");
+            let mut machine = idp.good_claims();
+            machine["client_id"] = serde_json::json!("portal");
+            machine["sub"] = serde_json::json!("portal@clients");
+            match marks {
+                OidcActorKind::Service => machine[claim] = serde_json::json!(marker_value),
+                OidcActorKind::Human => user[claim] = serde_json::json!(marker_value),
+            }
+
+            let user_identity = provider
+                .verify(&bearer(idp.mint(user)))
+                .await
+                .identity()
+                .expect("genuine user on a shared client verifies")
+                .clone();
+            assert_eq!(
+                user_identity.subject,
+                IdentitySubject::Oidc {
+                    issuer: idp.issuer.clone(),
+                    subject: "alice".into(),
+                },
+                "{claim}: the user stays human"
+            );
+            let resolved = resolver.resolve(&user_identity).expect("human resolves");
+            assert_eq!(resolved.principal.actor, ActorKind::Human);
+            assert!(resolved.grants.permits(Resource::Sessions, Verb::Read));
+
+            let machine_identity = provider
+                .verify(&bearer(idp.mint(machine)))
+                .await
+                .identity()
+                .expect("machine token on a shared client verifies")
+                .clone();
+            assert_eq!(
+                machine_identity.subject,
+                IdentitySubject::Service {
+                    issuer: idp.issuer.clone(),
+                    client_id: "portal".into(),
+                },
+                "{claim}: the machine token is a service despite its mapped role claim"
+            );
+            let resolved = resolver
+                .resolve(&machine_identity)
+                .expect("service resolves");
+            assert_eq!(resolved.principal.actor, ActorKind::Service);
+            assert!(resolved.grants.permits(Resource::Sessions, Verb::Read));
+
+            // Mixed maps keep the two apart: without a service mapping the
+            // machine is entitled to nothing, and without a human mapping the
+            // user is, even though both carry the mapped `ops` role.
+            let mut service_only = policy.clone();
+            service_only
+                .oidc
+                .get_mut("test")
+                .unwrap()
+                .profile_map
+                .clear();
+            let service_only = PrincipalResolver::new(service_only);
+            assert!(matches!(
+                service_only.resolve(&user_identity),
+                Err(DenyReason::NotEntitled)
+            ));
+            assert!(service_only.resolve(&machine_identity).is_ok());
+            let mut human_only = policy;
+            human_only
+                .oidc
+                .get_mut("test")
+                .unwrap()
+                .service_profile_map
+                .clear();
+            let human_only = PrincipalResolver::new(human_only);
+            assert!(human_only.resolve(&user_identity).is_ok());
+            assert!(matches!(
+                human_only.resolve(&machine_identity),
+                Err(DenyReason::NotEntitled)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn actor_claim_evidence_contradicting_a_declaration_is_denied() {
+        let idp = start_idp().await;
+        let mut config = idp.config(OidcValidation::Jwks);
+        config.service_clients = vec!["reporting-batch".into()];
+        config.actor_claim = "gty".into();
+        config.actor_claim_marks = OidcActorKind::Service;
+        let provider = OidcAuthProvider::new("test", config).unwrap();
+
+        // Consistent: declared service carrying the service marker, declared
+        // interactive client without it.
+        let mut machine = idp.good_claims();
+        machine["client_id"] = serde_json::json!("reporting-batch");
+        machine["gty"] = serde_json::json!("client-credentials");
+        assert!(
+            provider
+                .verify(&bearer(idp.mint(machine)))
+                .await
+                .is_allowed()
+        );
+        assert!(
+            provider
+                .verify(&bearer(idp.mint(idp.good_claims())))
+                .await
+                .is_allowed()
+        );
+
+        // Contradictions: a declared interactive client presenting machine
+        // evidence, and a declared service without it.
+        let mut human_with_marker = idp.good_claims();
+        human_with_marker["gty"] = serde_json::json!("client-credentials");
+        assert!(
+            !provider
+                .verify(&bearer(idp.mint(human_with_marker)))
+                .await
+                .is_allowed(),
+            "an interactive client's token carrying the service marker is ambiguous"
+        );
+        let mut service_without_marker = idp.good_claims();
+        service_without_marker["client_id"] = serde_json::json!("reporting-batch");
+        assert!(
+            !provider
+                .verify(&bearer(idp.mint(service_without_marker)))
+                .await
+                .is_allowed(),
+            "a declared service's token lacking the service marker is ambiguous"
+        );
+
+        // A null marker is absence, not presence.
+        let mut null_marker = idp.good_claims();
+        null_marker["client_id"] = serde_json::json!("reporting-batch");
+        null_marker["gty"] = serde_json::Value::Null;
+        assert!(
+            !provider
+                .verify(&bearer(idp.mint(null_marker)))
+                .await
+                .is_allowed()
+        );
+    }
+
+    #[tokio::test]
+    async fn interactive_clients_need_a_subject_never_a_sub_client_relationship() {
+        let idp = start_idp().await;
+        let provider = idp.provider(OidcValidation::Jwks);
+        // The declared interactive client is the positive human signal; a
+        // token without a subject still authenticates nobody.
+        let mut claims = idp.good_claims();
+        claims.as_object_mut().unwrap().remove("sub");
+        assert!(
+            !provider
+                .verify(&bearer(idp.mint(claims)))
+                .await
+                .is_allowed()
+        );
+        let mut claims = idp.good_claims();
+        claims["sub"] = serde_json::json!("  ");
+        assert!(
+            !provider
+                .verify(&bearer(idp.mint(claims)))
+                .await
+                .is_allowed()
         );
     }
 
@@ -1710,7 +2242,7 @@ mod tests {
 
     #[tokio::test]
     async fn discovery_issuer_mismatch_fails_closed() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let issuer = server.uri();
         Mock::given(method("GET"))
             .and(path("/.well-known/openid-configuration"))
@@ -1770,21 +2302,27 @@ mod tests {
     #[tokio::test]
     async fn introspection_binds_active_tokens_to_bearer_purpose_and_audience() {
         for (token_type, audience, allowed) in [
-            (Some("Bearer"), "zeroclaw", true),
-            (Some("MAC"), "zeroclaw", false),
-            (None, "zeroclaw", false),
-            (Some("Bearer"), "other-resource", false),
+            (Some("Bearer"), Some("zeroclaw"), true),
+            (Some("MAC"), Some("zeroclaw"), false),
+            (None, Some("zeroclaw"), false),
+            (Some("Bearer"), Some("other-resource"), false),
+            // An active refresh credential reported with its own token type,
+            // and an active response that omits the audience entirely.
+            (Some("refresh_token"), Some("zeroclaw"), false),
+            (Some("Bearer"), None, false),
         ] {
             let idp = start_idp().await;
             let mut response = serde_json::json!({
                 "active": true,
                 "iss": idp.issuer,
                 "sub": "bob",
-                "aud": audience,
                 "client_id": "zerocode-cli",
             });
             if let Some(token_type) = token_type {
                 response["token_type"] = serde_json::json!(token_type);
+            }
+            if let Some(audience) = audience {
+                response["aud"] = serde_json::json!(audience);
             }
             Mock::given(method("POST"))
                 .and(path("/introspect"))
@@ -1796,7 +2334,7 @@ mod tests {
             assert_eq!(
                 provider.verify(&bearer("opaque-token")).await.is_allowed(),
                 allowed,
-                "token_type={token_type:?}, audience={audience}"
+                "token_type={token_type:?}, audience={audience:?}"
             );
             let request = idp
                 .server
@@ -1811,6 +2349,55 @@ mod tests {
                 b"token=opaque-token&token_type_hint=access_token"
             );
             idp.server.verify().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_purpose_markers_deny_non_access_credentials() {
+        // A generic `Bearer` token type cannot tell an access token from a
+        // refresh token; where the issuer stamps an explicit marker
+        // (Keycloak `typ`, Cognito `token_use`), it is enforced on both
+        // paths, and an access-token marker still verifies.
+        let rows: [(&str, &str, bool); 7] = [
+            ("typ", "Bearer", true),
+            ("typ", "at+jwt", true),
+            ("typ", "Refresh", false),
+            ("typ", "ID", false),
+            ("typ", "Offline", false),
+            ("token_use", "access", true),
+            ("token_use", "id", false),
+        ];
+        for (marker, value, allowed) in rows {
+            let idp = start_idp().await;
+            Mock::given(method("POST"))
+                .and(path("/introspect"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "active": true, "token_type": "Bearer", "iss": idp.issuer,
+                    "sub": "bob", "aud": "zeroclaw", "client_id": "zerocode-cli",
+                    marker: value,
+                })))
+                .expect(1)
+                .mount(&idp.server)
+                .await;
+            let provider = idp.provider(OidcValidation::Introspection);
+            assert_eq!(
+                provider.verify(&bearer("opaque-token")).await.is_allowed(),
+                allowed,
+                "introspection {marker}={value}"
+            );
+            idp.server.verify().await;
+
+            let provider = idp.provider(OidcValidation::Jwks);
+            let mut claims = idp.good_claims();
+            claims[marker] = serde_json::json!(value);
+            assert_eq!(
+                provider
+                    .verify(&bearer(idp.mint(claims)))
+                    .await
+                    .is_allowed(),
+                allowed,
+                "jwks payload {marker}={value}"
+            );
         }
     }
 
@@ -1862,12 +2449,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unreachable_idp_fails_closed() {
+    async fn introspection_transport_failure_fails_closed() {
         let idp = start_idp().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/introspect", listener.local_addr().unwrap());
+        Mock::given(method("GET"))
+            .and(path("/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "issuer": idp.issuer,
+                "introspection_endpoint": endpoint,
+            })))
+            .with_priority(1)
+            .mount(&idp.server)
+            .await;
+        let refusing_endpoint = ::zeroclaw_spawn::spawn!(async move {
+            while let Ok((connection, _)) = listener.accept().await {
+                drop(connection);
+            }
+        });
         let provider = idp.provider(OidcValidation::Introspection);
         assert!(provider.discovery().await.is_ok(), "warm discovery first");
-        drop(idp.server);
         let out = provider.verify(&bearer("opaque-token")).await;
+        refusing_endpoint.abort();
+        let _ = refusing_endpoint.await;
         assert!(matches!(
             out,
             AuthOutcome::Denied {
