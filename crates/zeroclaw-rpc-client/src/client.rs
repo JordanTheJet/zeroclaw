@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -29,6 +30,20 @@ const WRITER_QUEUE_DEPTH: usize = 64;
 const NOTIFICATION_CAPACITY: usize = 256;
 /// Largest frame accepted from the daemon. Mirrors the daemon's inbound cap.
 const MAX_FRAME_BYTES: u64 = 8 * 1024 * 1024;
+/// Server-initiated requests held for the application. Beyond this the
+/// client answers each new one with [`INBOUND_REQUEST_REJECTED`] instead of
+/// holding it, so a peer that floods requests nobody consumes cannot grow
+/// the client's memory.
+pub const INBOUND_REQUEST_QUEUE_DEPTH: usize = 32;
+/// Aggregate size of the held server-initiated requests, measured as the
+/// frames they arrived in. Bounds the lane even when every frame is under
+/// the 8 MiB per-frame cap.
+pub const INBOUND_REQUEST_BYTE_BUDGET: usize = 16 * 1024 * 1024;
+/// The error code this client returns to the daemon for a server-initiated
+/// request it will not hold: the queue or byte budget is full, or the
+/// application has dropped its inbound receiver. Outside the daemon's own
+/// code space so a caller can tell the two apart.
+pub const INBOUND_REQUEST_REJECTED: i32 = -32050;
 
 /// Why a dial or a request failed.
 #[derive(Debug)]
@@ -97,11 +112,106 @@ pub struct Notification {
 
 /// A server-initiated request that expects a response, such as
 /// `elicitation/create`. Answer it with [`RpcClient::respond`], echoing `id`.
+/// Dropping it releases its share of [`INBOUND_REQUEST_BYTE_BUDGET`].
 #[derive(Debug)]
 pub struct InboundRequest {
     pub id: Value,
     pub method: String,
     pub params: Value,
+    _held: HeldBytes,
+}
+
+/// The frame bytes one held request charges to the inbound budget, refunded
+/// when the application drops the request.
+#[derive(Debug)]
+struct HeldBytes {
+    budget: Arc<AtomicUsize>,
+    bytes: usize,
+}
+
+impl Drop for HeldBytes {
+    fn drop(&mut self) {
+        self.budget.fetch_sub(self.bytes, Ordering::AcqRel);
+    }
+}
+
+/// Where server-initiated requests go: a bounded queue, a byte budget, and a
+/// non-blocking path back to the writer for the refusals.
+struct InboundLane {
+    queue: mpsc::Sender<InboundRequest>,
+    budget: Arc<AtomicUsize>,
+    rejected: Arc<AtomicUsize>,
+    reject_tx: mpsc::Sender<String>,
+}
+
+impl InboundLane {
+    /// Answer a request this client will not hold. Never waits: when the
+    /// writer queue is also full the peer is flooding both directions, and
+    /// the refusal is dropped rather than stalling response dispatch.
+    fn reject(&self, id: Value, reason: &str) {
+        self.rejected.fetch_add(1, Ordering::Relaxed);
+        let response = JsonRpcResponse {
+            jsonrpc: JSONRPC_VERSION,
+            result: None,
+            error: Some(JsonRpcError {
+                code: INBOUND_REQUEST_REJECTED,
+                message: format!("client will not hold this request: {reason}"),
+                data: None,
+            }),
+            id,
+        };
+        if let Ok(body) = serde_json::to_string(&response) {
+            let _ = self.reject_tx.try_send(body);
+        }
+    }
+
+    fn offer(&self, id: Value, method: String, params: Value, frame_bytes: usize) {
+        let held = self.budget.fetch_add(frame_bytes, Ordering::AcqRel) + frame_bytes;
+        if held > INBOUND_REQUEST_BYTE_BUDGET {
+            self.budget.fetch_sub(frame_bytes, Ordering::AcqRel);
+            self.reject(id, "inbound byte budget exhausted");
+            return;
+        }
+        let request = InboundRequest {
+            id: id.clone(),
+            method,
+            params,
+            _held: HeldBytes {
+                budget: Arc::clone(&self.budget),
+                bytes: frame_bytes,
+            },
+        };
+        match self.queue.try_send(request) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(request)) => {
+                drop(request);
+                self.reject(id, "inbound request queue full");
+            }
+            Err(mpsc::error::TrySendError::Closed(request)) => {
+                drop(request);
+                self.reject(id, "no inbound request consumer");
+            }
+        }
+    }
+}
+
+/// Aborts a transport task unless ownership passes to the client. The tasks
+/// are spawned before the handshake completes, so a dial cancelled mid-way
+/// (an outer timeout, a dropped future) must not detach them.
+struct AbortOnDrop(Option<JoinHandle<()>>);
+
+impl AbortOnDrop {
+    fn release(mut self) -> JoinHandle<()> {
+        self.0.take().expect("transport task released once")
+    }
+}
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        if let Some(task) = self.0.take() {
+            task.abort();
+        }
+    }
 }
 
 /// What the client presents in `initialize`.
@@ -147,7 +257,8 @@ impl ConnectOptions {
 pub struct RpcClient {
     rpc: Arc<RpcOutbound>,
     notifications: broadcast::Sender<Notification>,
-    inbound: Mutex<Option<mpsc::UnboundedReceiver<InboundRequest>>>,
+    inbound: Mutex<Option<mpsc::Receiver<InboundRequest>>>,
+    rejected_inbound: Arc<AtomicUsize>,
     state: Arc<Mutex<ConnectionState>>,
     reader: JoinHandle<()>,
     writer: JoinHandle<()>,
@@ -199,8 +310,9 @@ async fn read_frame<R: AsyncRead + Unpin>(reader: &mut BufReader<R>) -> Option<S
 fn route_frame(
     rpc: &RpcOutbound,
     notifications: &broadcast::Sender<Notification>,
-    inbound: &mpsc::UnboundedSender<InboundRequest>,
+    inbound: &InboundLane,
     frame: JsonRpcFrame,
+    frame_bytes: usize,
 ) {
     match frame {
         JsonRpcFrame::Response { id, result } => {
@@ -210,11 +322,7 @@ fn route_frame(
         }
         JsonRpcFrame::Request(request) => match request.id {
             Some(id) if !id.is_null() => {
-                let _ = inbound.send(InboundRequest {
-                    id,
-                    method: request.method,
-                    params: request.params,
-                });
+                inbound.offer(id, request.method, request.params, frame_bytes);
             }
             _ => {
                 let _ = notifications.send(Notification {
@@ -241,10 +349,18 @@ impl RpcClient {
     {
         let (read_half, mut write_half) = tokio::io::split(stream);
         let (writer_tx, mut writer_rx) = mpsc::channel::<String>(WRITER_QUEUE_DEPTH);
+        let reject_tx = writer_tx.clone();
         let rpc = Arc::new(RpcOutbound::new(writer_tx));
         let state = Arc::new(Mutex::new(ConnectionState::Connected));
         let (notifications, _) = broadcast::channel::<Notification>(NOTIFICATION_CAPACITY);
-        let (inbound_tx, inbound_rx) = mpsc::unbounded_channel::<InboundRequest>();
+        let (inbound_tx, inbound_rx) = mpsc::channel::<InboundRequest>(INBOUND_REQUEST_QUEUE_DEPTH);
+        let rejected_inbound = Arc::new(AtomicUsize::new(0));
+        let inbound_lane = InboundLane {
+            queue: inbound_tx,
+            budget: Arc::new(AtomicUsize::new(0)),
+            rejected: Arc::clone(&rejected_inbound),
+            reject_tx,
+        };
 
         let writer_state = Arc::clone(&state);
         let writer = tokio::spawn(async move {
@@ -260,6 +376,7 @@ impl RpcClient {
             let _ = write_half.shutdown().await;
         });
         let writer_abort: AbortHandle = writer.abort_handle();
+        let writer = AbortOnDrop(Some(writer));
 
         let reader_rpc = Arc::clone(&rpc);
         let reader_state = Arc::clone(&state);
@@ -277,13 +394,20 @@ impl RpcClient {
                 let Ok(frame) = JsonRpcFrame::from_value(value) else {
                     continue;
                 };
-                route_frame(&reader_rpc, &reader_notifications, &inbound_tx, frame);
+                route_frame(
+                    &reader_rpc,
+                    &reader_notifications,
+                    &inbound_lane,
+                    frame,
+                    trimmed.len(),
+                );
             }
             set_disconnected(&reader_state, "daemon closed the connection".to_string());
             // Stopping the writer drops the queue receiver, which resolves
             // `RpcOutbound::closed()` and fails every request still waiting.
             writer_abort.abort();
         });
+        let reader = AbortOnDrop(Some(reader));
 
         let handshake_timeout = options
             .handshake_timeout
@@ -291,37 +415,43 @@ impl RpcClient {
         let params = match serde_json::to_value(options.initialize_params()) {
             Ok(params) => params,
             Err(e) => {
-                reader.abort();
-                writer.abort();
                 return Err(ClientError::Handshake(format!(
                     "encoding initialize params: {e}"
                 )));
             }
         };
-        let response = tokio::time::timeout(
-            handshake_timeout,
-            rpc.request(Method::Initialize.wire_name(), params),
-        )
+        // A daemon that drops the connection mid-handshake must fail the dial
+        // now, not after the ceiling: race the request against transport
+        // closure the same way ordinary requests do. `biased` keeps a reply
+        // that arrived just before EOF (an auth refusal, say) ahead of the
+        // closure. Every early return drops the two guards, which aborts the
+        // transport tasks; only a completed handshake hands them to the client.
+        let response = tokio::time::timeout(handshake_timeout, async {
+            tokio::select! {
+                biased;
+                result = rpc.request(Method::Initialize.wire_name(), params) => Some(result),
+                () = rpc.closed() => None,
+            }
+        })
         .await;
         let handshake = match response {
-            Ok(Ok(value)) => match serde_json::from_value::<InitializeResult>(value) {
+            Ok(Some(Ok(value))) => match serde_json::from_value::<InitializeResult>(value) {
                 Ok(result) => result,
                 Err(e) => {
-                    reader.abort();
-                    writer.abort();
                     return Err(ClientError::Handshake(format!(
                         "undecodable initialize result: {e}"
                     )));
                 }
             },
-            Ok(Err(error)) => {
-                reader.abort();
-                writer.abort();
-                return Err(ClientError::Rpc(error));
+            Ok(Some(Err(error))) => return Err(ClientError::Rpc(error)),
+            Ok(None) => {
+                let reason = match state.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+                    ConnectionState::Disconnected(reason) => reason,
+                    ConnectionState::Connected => "connection closed".to_string(),
+                };
+                return Err(ClientError::Disconnected(reason));
             }
             Err(_) => {
-                reader.abort();
-                writer.abort();
                 return Err(ClientError::Timeout {
                     method: Method::Initialize.wire_name().to_string(),
                     after: handshake_timeout,
@@ -333,9 +463,10 @@ impl RpcClient {
             rpc,
             notifications,
             inbound: Mutex::new(Some(inbound_rx)),
+            rejected_inbound,
             state,
-            reader,
-            writer,
+            reader: reader.release(),
+            writer: writer.release(),
             handshake,
         })
     }
@@ -426,12 +557,19 @@ impl RpcClient {
     }
 
     /// Claim the single receiver for server-initiated requests. `None` once
-    /// claimed. Requests that arrive before the claim are retained.
-    pub fn take_inbound_requests(&self) -> Option<mpsc::UnboundedReceiver<InboundRequest>> {
+    /// claimed. Up to [`INBOUND_REQUEST_QUEUE_DEPTH`] requests (within
+    /// [`INBOUND_REQUEST_BYTE_BUDGET`]) that arrive before the claim are
+    /// retained; the rest are answered with [`INBOUND_REQUEST_REJECTED`].
+    pub fn take_inbound_requests(&self) -> Option<mpsc::Receiver<InboundRequest>> {
         self.inbound
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take()
+    }
+
+    /// How many server-initiated requests this connection refused to hold.
+    pub fn rejected_inbound_requests(&self) -> usize {
+        self.rejected_inbound.load(Ordering::Relaxed)
     }
 
     /// Answer a server-initiated request. Returns `false` when the
@@ -704,6 +842,168 @@ mod tests {
             other => panic!("expected Disconnected, got {other:?}"),
         }
         assert!(matches!(client.state(), ConnectionState::Disconnected(_)));
+    }
+
+    #[tokio::test]
+    async fn cancelling_the_dial_releases_the_transport() {
+        let (client_half, server_half) = tokio::io::duplex(64 * 1024);
+        let (seen_tx, seen_rx) = tokio::sync::oneshot::channel::<()>();
+        // A peer that reads `initialize`, withholds its answer, and then
+        // reports whether the client's side ever closed.
+        let peer = tokio::spawn(async move {
+            let (read_half, write_half) = tokio::io::split(server_half);
+            let mut reader = BufReader::new(read_half);
+            let saw_initialize = read_frame(&mut reader).await.is_some();
+            let _ = seen_tx.send(());
+            let eof = read_frame(&mut reader).await.is_none();
+            drop(write_half);
+            (saw_initialize, eof)
+        });
+        let options = ConnectOptions {
+            handshake_timeout: Some(Duration::from_secs(30)),
+            ..ConnectOptions::default()
+        };
+        let dial = tokio::spawn(RpcClient::connect_over(client_half, options));
+        seen_rx.await.expect("peer saw initialize");
+        dial.abort();
+        let _ = dial.await;
+        let (saw_initialize, eof) = tokio::time::timeout(Duration::from_secs(2), peer)
+            .await
+            .expect("the cancelled dial must close its transport")
+            .expect("peer task");
+        assert!(saw_initialize);
+        assert!(eof, "peer must observe EOF once the dial is cancelled");
+    }
+
+    #[tokio::test]
+    async fn peer_eof_during_initialize_fails_promptly() {
+        let (client_half, server_half) = tokio::io::duplex(64 * 1024);
+        // Read the handshake, then drop the whole stream without replying.
+        tokio::spawn(async move {
+            let (read_half, _write_half) = tokio::io::split(server_half);
+            let mut reader = BufReader::new(read_half);
+            let _ = read_frame(&mut reader).await;
+        });
+        let options = ConnectOptions {
+            handshake_timeout: Some(Duration::from_secs(10)),
+            ..ConnectOptions::default()
+        };
+        let started = std::time::Instant::now();
+        match RpcClient::connect_over(client_half, options).await {
+            Err(ClientError::Disconnected(_)) => {}
+            Err(other) => panic!("expected Disconnected, got {other}"),
+            Ok(_) => panic!("handshake must fail"),
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "a dropped peer must not wait out the handshake ceiling"
+        );
+    }
+
+    #[tokio::test]
+    async fn unanswered_server_requests_are_bounded_and_responses_still_flow() {
+        const FLOOD: usize = 48;
+        let (client_half, server_half) = tokio::io::duplex(64 * 1024);
+        let rejected = Arc::new(AtomicUsize::new(0));
+        let (flooded_tx, flooded_rx) = tokio::sync::oneshot::channel::<()>();
+        let (status_id_tx, mut status_id_rx) = mpsc::unbounded_channel::<Value>();
+        let (init_id_tx, init_id_rx) = tokio::sync::oneshot::channel::<Value>();
+        let (read_half, mut write_half) = tokio::io::split(server_half);
+        // Peer reader: counts the client's refusals and forwards its `status`.
+        let peer_rejected = Arc::clone(&rejected);
+        tokio::spawn(async move {
+            let mut reader = BufReader::new(read_half);
+            let mut init_id_tx = Some(init_id_tx);
+            while let Some(line) = read_frame(&mut reader).await {
+                let Ok(frame) = serde_json::from_str::<Value>(line.trim()) else {
+                    continue;
+                };
+                match frame.get("method").and_then(Value::as_str) {
+                    Some("initialize") => {
+                        if let Some(tx) = init_id_tx.take() {
+                            let _ = tx.send(frame["id"].clone());
+                        }
+                    }
+                    Some("status") => {
+                        let _ = status_id_tx.send(frame["id"].clone());
+                    }
+                    Some(_) => {}
+                    None => {
+                        if frame["error"]["code"] == json!(INBOUND_REQUEST_REJECTED) {
+                            peer_rejected.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+            }
+        });
+        // Peer writer: answers initialize, floods 1 MiB requests, then serves
+        // the client's `status` once asked.
+        tokio::spawn(async move {
+            let Ok(init_id) = init_id_rx.await else {
+                return;
+            };
+            let init = json!({
+                "jsonrpc": "2.0", "id": init_id,
+                "result": {
+                    "protocol_version": 1, "server_version": "test", "server_pid": 7,
+                    "capabilities": ["status"], "principal_id": "shared-operator", "commands": [],
+                },
+            });
+            let _ = write_half.write_all(format!("{init}\n").as_bytes()).await;
+            let payload = "x".repeat(1024 * 1024);
+            for n in 0..FLOOD {
+                let ask = json!({
+                    "jsonrpc": "2.0", "id": format!("srv-{n}"),
+                    "method": "elicitation/create", "params": {"q": payload},
+                });
+                if write_half
+                    .write_all(format!("{ask}\n").as_bytes())
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            let _ = flooded_tx.send(());
+            if let Some(id) = status_id_rx.recv().await {
+                let response =
+                    json!({"jsonrpc": "2.0", "id": id, "result": {"active_sessions": 0}});
+                let _ = write_half
+                    .write_all(format!("{response}\n").as_bytes())
+                    .await;
+            }
+        });
+        let client = RpcClient::connect_over(client_half, ConnectOptions::default())
+            .await
+            .expect("handshake");
+        // Nobody claims the inbound receiver: the flood has no consumer.
+        tokio::time::timeout(Duration::from_secs(20), flooded_rx)
+            .await
+            .expect("flood completes")
+            .expect("peer alive");
+        let status = client
+            .request_with_timeout("status", json!({}), Duration::from_secs(5))
+            .await
+            .expect("responses still flow while the inbound lane is saturated");
+        assert_eq!(status["active_sessions"], json!(0));
+        let refused = client.rejected_inbound_requests();
+        assert!(
+            refused >= FLOOD - INBOUND_REQUEST_QUEUE_DEPTH,
+            "at most the queue depth may be held; refused {refused} of {FLOOD}"
+        );
+        assert!(
+            (FLOOD - refused) * 1024 * 1024 <= INBOUND_REQUEST_BYTE_BUDGET,
+            "held requests exceed the byte budget; refused {refused} of {FLOOD}"
+        );
+        // The refusals reached the peer as error responses.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while rejected.load(Ordering::Relaxed) < refused {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("peer receives every refusal");
+        assert_eq!(rejected.load(Ordering::Relaxed), refused);
     }
 
     #[tokio::test]
