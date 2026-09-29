@@ -746,15 +746,17 @@ async fn pairing_list_and_revoke_match_the_device_routes() {
         .into_response(),
     )
     .await;
+    let guard = state.config_write_lock.clone().lock_owned().await;
     let failure = zeroclaw_runtime::devices::revoke_device(
         registry.as_deref(),
         &state.pairing,
         state.config.clone(),
-        state.config_write_lock.clone(),
+        &guard,
         "no-such-device",
     )
     .await
     .unwrap_err();
+    drop(guard);
     assert_eq!(status, failure.http_status);
     assert_eq!(http, failure.message);
 }
@@ -796,14 +798,16 @@ async fn pairing_new_code_matches_the_admin_paircode_route() {
         .map(IntoResponse::into_response)
         .unwrap_or_else(IntoResponse::into_response);
         let (status, mut http) = body_json(response).await;
+        let guard = rpc_state.config_write_lock.clone().lock_owned().await;
         let (rpc_status, mut rpc) = zeroclaw_runtime::devices::new_pairing_code(
             rpc_state.device_registry.as_deref(),
             &rpc_state.pairing,
             rpc_state.config.clone(),
-            rpc_state.config_write_lock.clone(),
+            &guard,
             rotate,
         )
         .await;
+        drop(guard);
         assert_eq!(status, 200, "{rotate:?}: {http}");
         assert_eq!(status, rpc_status, "{rotate:?}");
         // Each call mints its own code; everything else must match.

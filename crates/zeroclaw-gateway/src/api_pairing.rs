@@ -243,11 +243,18 @@ pub async fn revoke_device(
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
+    // A revocation takes the config write lock before it drops the token,
+    // and the caller is authenticated again under it, so no revocation of
+    // the caller lands between that check and this one.
+    let guard = state.config_write_lock.clone().lock_owned().await;
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
     match zeroclaw_runtime::devices::revoke_device(
         state.device_registry.as_deref(),
         &state.pairing,
         state.config.clone(),
-        state.config_write_lock.clone(),
+        &guard,
         &device_id,
     )
     .await

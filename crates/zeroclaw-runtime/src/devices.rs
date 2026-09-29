@@ -362,15 +362,31 @@ pub async fn persist_pairing_tokens(
     pairing: &PairingGuard,
     config_write_lock: Arc<tokio::sync::Mutex<()>>,
 ) -> anyhow::Result<()> {
-    use anyhow::Context;
-    // Self-contained: no caller pre-reads config for modify, so this
-    // acquires the witness itself rather than taking it as a param. Held
-    // across the whole read-modify-save-swap below.
-    let _guard = Arc::clone(&config_write_lock).lock_owned().await;
+    // For a caller that holds no lock yet: the pairing flows that roll back
+    // a token they issued a moment ago. Held across the whole
+    // read-modify-save-swap below.
+    let guard = Arc::clone(&config_write_lock).lock_owned().await;
     debug_assert!(
         config_write_lock.try_lock().is_err(),
         "persist_pairing_tokens must hold config_write_lock across its read-modify-save-swap"
     );
+    persist_pairing_tokens_held(&config, pairing, &guard).await
+}
+
+/// [`persist_pairing_tokens`] for a caller that already holds the config
+/// write lock, which it proves by passing the guard.
+///
+/// Revoking a credential takes the same lock as every accepted policy
+/// change, before the token is dropped: an operation that has rechecked its
+/// caller's authority under that lock and commits under it cannot be
+/// overtaken by a revocation of that caller, just as it cannot be overtaken
+/// by a policy change.
+pub async fn persist_pairing_tokens_held(
+    config: &Arc<RwLock<Config>>,
+    pairing: &PairingGuard,
+    _guard: &tokio::sync::OwnedMutexGuard<()>,
+) -> anyhow::Result<()> {
+    use anyhow::Context;
     let paired_tokens = pairing.tokens();
     let mut updated_cfg = { config.read().clone() };
     updated_cfg.gateway.paired_tokens = paired_tokens;
@@ -405,11 +421,14 @@ pub fn list_devices_body(registry: Option<&DeviceRegistry>) -> Result<Value, Dev
 
 /// Revoke one paired device and its bearer token, then persist the token set.
 /// `DELETE /api/devices/{id}` and `pairing/revoke`.
+///
+/// The caller holds the config write lock for the whole call, and has
+/// authorized itself under it: see [`persist_pairing_tokens_held`].
 pub async fn revoke_device(
     registry: Option<&DeviceRegistry>,
     pairing: &PairingGuard,
     config: Arc<RwLock<Config>>,
-    config_write_lock: Arc<tokio::sync::Mutex<()>>,
+    config_write_guard: &tokio::sync::OwnedMutexGuard<()>,
     device_id: &str,
 ) -> Result<Value, DeviceFailure> {
     let Some(registry) = registry else {
@@ -426,7 +445,7 @@ pub async fn revoke_device(
         }
     };
     pairing.revoke_token_hash(&token_hash);
-    if let Err(e) = persist_pairing_tokens(config, pairing, config_write_lock).await {
+    if let Err(e) = persist_pairing_tokens_held(&config, pairing, config_write_guard).await {
         return Err(DeviceFailure::new(
             500,
             format!("Token revoked in memory but config persist failed: {e}"),
@@ -442,11 +461,17 @@ pub async fn revoke_device(
 /// (`rotate = "all"`) or one device's (`rotate = <device id>`) when asked.
 /// Returns the status and body of `POST /admin/paircode/new`, which
 /// `pairing/new-code` and `pairing/revoke-all` also serve.
+///
+/// The caller holds the config write lock for the whole call, and has
+/// authorized itself under it, so no policy change or revocation of the
+/// caller can land between that check and the code this returns. Rotating
+/// every token revokes the caller's own too; that is part of the authorized
+/// operation, not a loss of authority partway through it.
 pub async fn new_pairing_code(
     registry: Option<&DeviceRegistry>,
     pairing: &PairingGuard,
     config: Arc<RwLock<Config>>,
-    config_write_lock: Arc<tokio::sync::Mutex<()>>,
+    config_write_guard: &tokio::sync::OwnedMutexGuard<()>,
     rotate: Option<&str>,
 ) -> (u16, Value) {
     let failure = |status: u16, pairing_required: bool, message: String| {
@@ -477,9 +502,7 @@ pub async fn new_pairing_code(
                     format!("Tokens revoked in memory but device registry clear failed: {e}"),
                 );
             }
-            if let Err(e) =
-                persist_pairing_tokens(Arc::clone(&config), pairing, Arc::clone(&config_write_lock))
-                    .await
+            if let Err(e) = persist_pairing_tokens_held(&config, pairing, config_write_guard).await
             {
                 return failure(
                     500,
@@ -517,9 +540,7 @@ pub async fn new_pairing_code(
                 Err(e) => return failure(500, true, format!("Device registry error: {e}")),
             };
             pairing.revoke_token_hash(&token_hash);
-            if let Err(e) =
-                persist_pairing_tokens(Arc::clone(&config), pairing, Arc::clone(&config_write_lock))
-                    .await
+            if let Err(e) = persist_pairing_tokens_held(&config, pairing, config_write_guard).await
             {
                 return failure(
                     500,

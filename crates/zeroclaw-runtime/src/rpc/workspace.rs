@@ -26,7 +26,9 @@ type RpcResult = Result<Value, JsonRpcError>;
 /// text on both surfaces.
 fn browse_error(err: BrowseError) -> JsonRpcError {
     let code = match &err {
-        BrowseError::Escape(_) | BrowseError::NotADirectory(_) => error_codes::FS_INVALID_PATH,
+        BrowseError::Escape(_) | BrowseError::NotADirectory(_) | BrowseError::LinkedPath(_) => {
+            error_codes::FS_INVALID_PATH
+        }
         BrowseError::NotFound(_) => error_codes::FS_NOT_FOUND,
         BrowseError::Protected(_) | BrowseError::ProtectedFile(_) => {
             error_codes::FS_PERMISSION_DENIED

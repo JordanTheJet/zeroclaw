@@ -1369,6 +1369,122 @@ async fn canvas_needs_access_to_every_agent() {
     );
 }
 
+/// A principal entitled to one agent, allowed to open sessions on it and to
+/// run its `canvas` tool, and nothing else.
+fn scoped_canvas_session_config(tmp: &tempfile::TempDir) -> zeroclaw_config::schema::Config {
+    use std::collections::HashMap;
+    use zeroclaw_api::grants::{Resource, Verb};
+    use zeroclaw_config::schema::{PermissionProfileConfig, UserConfig};
+
+    let mut config = make_acp_test_config(tmp);
+    config.permission_profiles.insert(
+        "one-agent-canvas".into(),
+        PermissionProfileConfig {
+            allowed_agents: vec!["test-agent".into()],
+            allowed_tools: vec!["canvas".into()],
+            grants: HashMap::from([
+                (
+                    Resource::Sessions,
+                    vec![Verb::Create, Verb::Read, Verb::Execute],
+                ),
+                (Resource::Tools, vec![Verb::Execute]),
+            ]),
+            ..PermissionProfileConfig::default()
+        },
+    );
+    config.users.insert(
+        "scoped".into(),
+        UserConfig {
+            uid: Some(SCOPED),
+            permission_profiles: vec!["one-agent-canvas".into()],
+            ..UserConfig::default()
+        },
+    );
+    config
+}
+
+/// The shared canvas store is refused to a scoped principal on `canvas/*`,
+/// and its session's canvas tool must not reach it either: the tool gets a
+/// store of its own, so it can neither read, overwrite nor clear a frame
+/// another agent drew.
+#[tokio::test]
+async fn a_scoped_sessions_canvas_tool_cannot_reach_the_shared_store() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let ctx = enforcement_ctx(scoped_canvas_session_config(&tmp));
+
+    // Another agent's frame, drawn into the shared store.
+    let (mut operator, mut op_rx) = local_operator(&ctx).await;
+    let seeded = rpc(
+        &mut operator,
+        &mut op_rx,
+        1,
+        "canvas/render",
+        json!({"canvas_id": "default", "content_type": "text", "content": "beta's frame"}),
+    )
+    .await;
+    assert!(seeded["error"].is_null(), "{seeded}");
+
+    let (mut peer, mut rx) = roster_peer(&ctx, SCOPED).await;
+    let created = rpc(
+        &mut peer,
+        &mut rx,
+        1,
+        "session/new",
+        json!({"agent_alias": "test-agent", "session_id": "s-scoped-canvas"}),
+    )
+    .await;
+    assert_eq!(
+        created["result"]["session_id"],
+        json!("s-scoped-canvas"),
+        "{created}"
+    );
+    let agent = ctx
+        .sessions
+        .get_agent("s-scoped-canvas")
+        .await
+        .expect("session exists");
+    let agent = agent.lock().await;
+    let run = |args: Value| {
+        let agent = &agent;
+        async move {
+            agent
+                .execute_tool_for_test("canvas", args)
+                .await
+                .expect("the scoped session has the canvas tool")
+                .expect("the canvas tool runs")
+        }
+    };
+
+    let snapshot = run(json!({"action": "snapshot", "canvas_id": "default"})).await;
+    assert!(
+        !format!("{snapshot:?}").contains("beta's frame"),
+        "the scoped session read another agent's frame: {snapshot:?}"
+    );
+    let rendered = run(json!({
+        "action": "render",
+        "canvas_id": "default",
+        "content_type": "text",
+        "content": "written by the scoped session",
+    }))
+    .await;
+    assert!(rendered.success, "{rendered:?}");
+    let _ = run(json!({"action": "clear", "canvas_id": "default"})).await;
+
+    let got = rpc(
+        &mut operator,
+        &mut op_rx,
+        2,
+        "canvas/get",
+        json!({"canvas_id": "default"}),
+    )
+    .await;
+    assert_eq!(
+        got["result"]["frame"]["content"],
+        json!("beta's frame"),
+        "the shared frame was neither overwritten nor cleared: {got}"
+    );
+}
+
 // ── Adversarial review ────────────────────────────────────────────────────
 
 /// A link in agent alpha's workspace into agent beta's does not let a
@@ -1607,4 +1723,169 @@ async fn channels_bind_authorizes_the_peer_group_it_writes() {
     assert_forbidden(&refused, "a grant scoped to another channel's group");
     assert_eq!(channels.calls.lock().len(), 1);
     assert!(other.calls.lock().is_empty());
+}
+
+// ── Authority at the effect: pairing ─────────────────────────────────────
+
+/// A roster principal on a local peer credential whose only grant is
+/// `admin`, so a policy change can take it away.
+const PAIRING_ADMIN: u32 = 5104;
+
+fn admin_pairing_config(tmp: &tempfile::TempDir) -> zeroclaw_config::schema::Config {
+    use zeroclaw_config::schema::{PermissionProfileConfig, UserConfig};
+    let mut config = pairing_config(tmp, true);
+    config.gateway.paired_tokens = vec![PAIRED_TOKEN.to_string()];
+    config.permission_profiles.insert(
+        "pairing-admin".into(),
+        PermissionProfileConfig {
+            admin: true,
+            ..PermissionProfileConfig::default()
+        },
+    );
+    config.users.insert(
+        "pairing-admin".into(),
+        UserConfig {
+            uid: Some(PAIRING_ADMIN),
+            permission_profiles: vec!["pairing-admin".into()],
+            ..UserConfig::default()
+        },
+    );
+    config
+}
+
+fn register_paired_device(ctx: &Arc<RpcContext>) {
+    let now = chrono::Utc::now();
+    crate::devices::DeviceRegistry::shared(&ctx.config.read().data_dir)
+        .register(
+            zeroclaw_config::pairing::PairingGuard::token_hash(PAIRED_TOKEN),
+            crate::devices::DeviceInfo {
+                id: "device-1".into(),
+                name: Some("phone".into()),
+                device_type: None,
+                paired_at: now,
+                last_seen: now,
+                ip_address: None,
+                capabilities: None,
+            },
+        )
+        .unwrap();
+}
+
+/// Hold the config write lock, wait until `request` is queued on it (it has
+/// cloned the lock's `Arc` to wait), then run `while_queued` and release.
+/// Returns the request's response. Deterministic: no sleep decides whether
+/// the request got there first.
+async fn while_queued_on_the_config_lock(
+    ctx: &Arc<RpcContext>,
+    request: impl std::future::Future<Output = Value>,
+    while_queued: impl FnOnce(),
+) -> Value {
+    let held = Arc::clone(&ctx.config_write_lock).lock_owned().await;
+    let holders = Arc::strong_count(&ctx.config_write_lock);
+    let queue_and_release = async {
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            while Arc::strong_count(&ctx.config_write_lock) <= holders {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the request reached the config write lock");
+        while_queued();
+        drop(held);
+    };
+    let (response, ()) = tokio::join!(request, queue_and_release);
+    response
+}
+
+/// A rotation queued behind another config writer establishes the caller's
+/// authority again once it holds the lock: an administrator grant withdrawn
+/// while it waited stops it before any token is revoked or any code issued.
+#[test]
+fn pairing_rotation_after_admin_is_withdrawn_while_queued_issues_nothing() {
+    // A rotation that is not stopped goes on to persist the pairing tokens,
+    // whose config save exceeds the default debug test stack; see
+    // `run_on_a_large_stack`.
+    run_on_a_large_stack(|| async move {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ctx = enforcement_ctx(admin_pairing_config(&tmp));
+        register_paired_device(&ctx);
+        let (mut admin, mut rx) = roster_peer(&ctx, PAIRING_ADMIN).await;
+
+        let rotate = rpc(
+            &mut admin,
+            &mut rx,
+            1,
+            "pairing/new-code",
+            json!({"rotate": "device-1"}),
+        );
+        let response = while_queued_on_the_config_lock(&ctx, rotate, || {
+            let mut changed = ctx.config.read().clone();
+            changed
+                .permission_profiles
+                .get_mut("pairing-admin")
+                .expect("the fixture profile exists")
+                .admin = false;
+            *ctx.config.write() = changed.clone();
+            let revision = ctx.auth.accepted_revision().saturating_add(1);
+            ctx.auth
+                .publish_accepted(&changed, revision)
+                .expect("the narrowed policy publishes");
+        })
+        .await;
+
+        assert_forbidden(
+            &response,
+            "a rotation whose admin grant was withdrawn while it waited",
+        );
+        assert!(
+            !response.to_string().contains("pairing_code\":\""),
+            "no code was issued: {response}"
+        );
+        assert!(
+            ctx.auth.pairing().is_authenticated(PAIRED_TOKEN),
+            "device-1's token was not revoked"
+        );
+    });
+}
+
+/// Revoking a device's credential takes the config write lock before the
+/// token is dropped. So while a writer holds that lock, as `channels/bind`
+/// does from its authority recheck through its commit, the credential it
+/// rechecked stays valid: a revocation cannot land between that operation's
+/// check and its effect, and takes effect once the lock is released.
+#[test]
+fn a_device_revocation_waits_for_a_config_writer_in_progress() {
+    // The revocation persists the pairing tokens, whose config save exceeds
+    // the default debug test stack; see `run_on_a_large_stack`.
+    run_on_a_large_stack(|| async move {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ctx = paired_ctx(&tmp);
+        register_paired_device(&ctx);
+        let (mut operator, mut rx) = local_operator(&ctx).await;
+
+        let revoke = rpc(
+            &mut operator,
+            &mut rx,
+            1,
+            "pairing/revoke",
+            json!({"device_id": "device-1"}),
+        );
+        let response = while_queued_on_the_config_lock(&ctx, revoke, || {
+            assert!(
+                ctx.auth.pairing().is_authenticated(PAIRED_TOKEN),
+                "the credential was revoked while another writer held the config lock"
+            );
+        })
+        .await;
+
+        assert_eq!(
+            response["result"]["device_id"],
+            json!("device-1"),
+            "{response}"
+        );
+        assert!(
+            !ctx.auth.pairing().is_authenticated(PAIRED_TOKEN),
+            "the revocation took effect once the lock was released"
+        );
+    });
 }

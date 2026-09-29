@@ -1904,7 +1904,6 @@ impl RpcDispatcher {
         }
         let pairing = Arc::clone(self.ctx.auth.pairing());
         let config = Arc::clone(&self.ctx.config);
-        let lock = Arc::clone(&self.ctx.config_write_lock);
         let registry = {
             let current = config.read();
             crate::devices::registry_for(&current, &pairing)
@@ -1923,17 +1922,26 @@ impl RpcDispatcher {
                 Err(rpc_err(pairing_error_code(status), message))
             }
         };
+        if matches!(method, Method::PairingList) {
+            return crate::devices::list_devices_body(registry.as_deref()).map_err(device_error);
+        }
+        // Revoking a device and issuing a code decide who holds a credential.
+        // Take the config write lock first and establish the caller's
+        // authority again under it, on fresh grants: every accepted policy
+        // change and every revocation takes this same lock, so the caller
+        // cannot lose `admin`, or its own credential, between this check and
+        // the effect.
+        let guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
+        let grants = self.recheck_config_write_authority(method, None, &guard)?;
+        self.require_admin_grants(method, &grants)?;
         match method {
-            Method::PairingList => {
-                crate::devices::list_devices_body(registry.as_deref()).map_err(device_error)
-            }
             Method::PairingRevoke => {
                 let req: zeroclaw_api::jsonrpc::PairingRevokeRequest = parse_params(params)?;
                 crate::devices::revoke_device(
                     registry.as_deref(),
                     &pairing,
                     config,
-                    lock,
+                    &guard,
                     &req.device_id,
                 )
                 .await
@@ -1944,7 +1952,7 @@ impl RpcDispatcher {
                     registry.as_deref(),
                     &pairing,
                     config,
-                    lock,
+                    &guard,
                     Some("all"),
                 )
                 .await,
@@ -1956,7 +1964,7 @@ impl RpcDispatcher {
                         registry.as_deref(),
                         &pairing,
                         config,
-                        lock,
+                        &guard,
                         req.rotate.as_deref(),
                     )
                     .await,
@@ -2269,6 +2277,17 @@ impl RpcDispatcher {
         let Some(grants) = self.stamped_grants() else {
             return Err(rpc_err(AUTH_REQUIRED, "First call must be 'initialize'"));
         };
+        self.require_admin_grants(method, grants)
+    }
+
+    /// [`Self::require_admin`] on an explicit grant set, for a handler that
+    /// has resolved its caller's authority again after waiting for the config
+    /// write lock.
+    fn require_admin_grants(
+        &self,
+        method: Method,
+        grants: &zeroclaw_api::grants::ResolvedGrants,
+    ) -> Result<(), JsonRpcError> {
         if grants.admin {
             return Ok(());
         }
@@ -2573,6 +2592,25 @@ impl RpcDispatcher {
     ) -> bool {
         self.transport_kind == crate::rpc::transport::TransportKind::Local
             && grants.is_some_and(|grants| grants.admin)
+    }
+
+    /// The canvas store a session built for `grants` may draw into.
+    ///
+    /// The daemon's store is shared by every agent and the dashboard, and
+    /// canvas ids carry no owner, so a handle to it reads, overwrites and
+    /// clears every agent's frames. A session's canvas tool gets that handle
+    /// only under the rule `canvas/*` applies: the principal may use every
+    /// agent. Any other session gets `None` and draws into a store of its
+    /// own, so allowing the `canvas` tool does not grant authority over other
+    /// agents' canvases.
+    fn session_canvas_store(
+        &self,
+        grants: Option<&zeroclaw_api::grants::ResolvedGrants>,
+    ) -> Option<crate::tools::CanvasStore> {
+        let grants = grants.or_else(|| self.stamped_grants())?;
+        grants
+            .may_use_agent(zeroclaw_api::grants::WILDCARD)
+            .then(|| self.ctx.canvas_store.clone())
     }
 
     fn session_tui_env(
@@ -4732,7 +4770,7 @@ impl RpcDispatcher {
                     tui_env,
                     self.ctx.sop_engine.clone(),
                     self.ctx.sop_audit.clone(),
-                    Some(self.ctx.canvas_store.clone()),
+                    self.session_canvas_store(grants.as_ref()),
                     store,
                     self.principal_tool_narrowing(),
                 )
@@ -4747,7 +4785,7 @@ impl RpcDispatcher {
                     tui_env,
                     self.ctx.sop_engine.clone(),
                     self.ctx.sop_audit.clone(),
-                    Some(self.ctx.canvas_store.clone()),
+                    self.session_canvas_store(grants.as_ref()),
                     self.principal_tool_narrowing(),
                 )
                 .await
@@ -5791,7 +5829,7 @@ impl RpcDispatcher {
                 tui_env,
                 self.ctx.sop_engine.clone(),
                 self.ctx.sop_audit.clone(),
-                Some(self.ctx.canvas_store.clone()),
+                self.session_canvas_store(current_grants.as_ref()),
                 Arc::clone(&store),
                 self.principal_tool_narrowing(),
             )

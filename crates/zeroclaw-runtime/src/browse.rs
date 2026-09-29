@@ -48,6 +48,8 @@ pub enum BrowseError {
     ProtectedFile(String),
     #[error("file '{0}' exceeds the {1}-byte read cap; download via CLI or zeroclaw shell")]
     TooLarge(String, u64),
+    #[error("'{0}' passes through a link; it cannot be modified or removed through a link")]
+    LinkedPath(String),
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
@@ -151,13 +153,15 @@ pub fn remove_directory(config: &Config, raw: &str) -> Result<(), BrowseError> {
         return Err(BrowseError::Protected(format!("shared/{relative}")));
     }
     let dir = open_root(&shared, raw)?;
-    let metadata = dir
-        .symlink_metadata(&relative)
+    let (parent, name) = open_parent_nofollow(&dir, &relative, raw, &shared)?;
+    let metadata = parent
+        .symlink_metadata(&name)
         .map_err(confined(raw, &shared))?;
     if !metadata.is_dir() {
         return Err(BrowseError::NotADirectory(raw.to_string()));
     }
-    dir.remove_dir_all(&relative)
+    parent
+        .remove_dir_all(&name)
         .map_err(confined(raw, &shared))?;
     Ok(())
 }
@@ -190,6 +194,73 @@ const AGENT_WORKSPACE_PROTECTED_DIRS: &[&str] = &["sessions"];
 fn open_root(root: &std::path::Path, raw: &str) -> Result<cap_std::fs::Dir, BrowseError> {
     cap_std::fs::Dir::open_ambient_dir(root, cap_std::ambient_authority())
         .map_err(confined(raw, root))
+}
+
+/// Open the directory that holds the last component of `relative`, one
+/// component at a time and never following a link, and return it with that
+/// last component's name.
+///
+/// The root handle keeps a path inside the root, but on its own it still
+/// follows links that stay inside, so `via/SOUL.md` with `via -> .` names the
+/// protected `SOUL.md` while its text passes the protected-entry checks.
+/// Mutations act through the handle this returns instead: every directory on
+/// the way was opened as a real directory, so the path the checks ran on is
+/// the path the operation touches, and a link swapped in afterwards cannot
+/// redirect a handle already opened.
+fn open_parent_nofollow(
+    dir: &cap_std::fs::Dir,
+    relative: &str,
+    raw: &str,
+    root: &std::path::Path,
+) -> Result<(cap_std::fs::Dir, String), BrowseError> {
+    use cap_fs_ext::DirExt;
+    let mut components: Vec<&str> = relative.split('/').filter(|c| !c.is_empty()).collect();
+    let Some(name) = components.pop() else {
+        return Err(BrowseError::NotFound(raw.to_string()));
+    };
+    let mut parent = dir.try_clone().map_err(confined(raw, root))?;
+    for component in components {
+        if parent
+            .symlink_metadata(component)
+            .is_ok_and(|metadata| metadata.is_symlink())
+        {
+            return Err(BrowseError::LinkedPath(raw.to_string()));
+        }
+        parent = parent
+            .open_dir_nofollow(component)
+            .map_err(confined(raw, root))?;
+    }
+    Ok((parent, name.to_string()))
+}
+
+/// Create every missing directory along `relative` without following a
+/// link, for a move whose destination names directories that do not exist
+/// yet. An existing component that is a link is refused, as in
+/// [`open_parent_nofollow`].
+fn create_dirs_nofollow(
+    dir: &cap_std::fs::Dir,
+    relative: &str,
+    raw: &str,
+    root: &std::path::Path,
+) -> Result<(), BrowseError> {
+    use cap_fs_ext::DirExt;
+    let mut current = dir.try_clone().map_err(confined(raw, root))?;
+    for component in relative.split('/').filter(|c| !c.is_empty()) {
+        match current.symlink_metadata(component) {
+            Ok(metadata) if metadata.is_symlink() => {
+                return Err(BrowseError::LinkedPath(raw.to_string()));
+            }
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                current.create_dir(component).map_err(confined(raw, root))?;
+            }
+            Err(err) => return Err(confined(raw, root)(err)),
+        }
+        current = current
+            .open_dir_nofollow(component)
+            .map_err(confined(raw, root))?;
+    }
+    Ok(())
 }
 
 /// The path to hand a root handle for `relative`: the root itself when empty.
@@ -426,16 +497,18 @@ pub fn delete_agent_workspace_path(
         )));
     }
     let dir = open_root(&root, raw)?;
-    // The final component is examined without following it, so a link is
-    // removed as a link and never deletes what it points at.
-    let metadata = dir
-        .symlink_metadata(&relative)
+    // No intermediate link is followed, so the protected-entry checks above
+    // judged the entry this removes. The final component is examined without
+    // following it, so a link is removed as a link and never deletes what it
+    // points at.
+    let (parent, name) = open_parent_nofollow(&dir, &relative, raw, &root)?;
+    let metadata = parent
+        .symlink_metadata(&name)
         .map_err(confined(raw, &root))?;
     if metadata.is_dir() {
-        dir.remove_dir_all(&relative)
-            .map_err(confined(raw, &root))?;
+        parent.remove_dir_all(&name).map_err(confined(raw, &root))?;
     } else {
-        dir.remove_file(&relative).map_err(confined(raw, &root))?;
+        parent.remove_file(&name).map_err(confined(raw, &root))?;
     }
     Ok(())
 }
@@ -477,24 +550,29 @@ pub fn move_agent_workspace_path(
         )));
     }
     let dir = open_root(&root, from)?;
-    match dir.symlink_metadata(from_trimmed) {
+    // Both sides are reached without following an intermediate link, so the
+    // protected-entry checks above judged the entries this moves.
+    let (from_parent, from_name) = open_parent_nofollow(&dir, from_trimmed, from, &root)?;
+    match from_parent.symlink_metadata(&from_name) {
         Ok(_) => {}
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             return Err(BrowseError::NotFound(from.to_string()));
         }
         Err(err) => return Err(confined(from, &root)(err)),
     }
-    if dir.symlink_metadata(to_trimmed).is_ok() {
+    if let Some(parent) = std::path::Path::new(to_trimmed).parent()
+        && !parent.as_os_str().is_empty()
+    {
+        create_dirs_nofollow(&dir, &parent.to_string_lossy(), to, &root)?;
+    }
+    let (to_parent, to_name) = open_parent_nofollow(&dir, to_trimmed, to, &root)?;
+    if to_parent.symlink_metadata(&to_name).is_ok() {
         return Err(BrowseError::NotADirectory(format!(
             "target '{to_trimmed}' already exists"
         )));
     }
-    if let Some(parent) = std::path::Path::new(to_trimmed).parent()
-        && !parent.as_os_str().is_empty()
-    {
-        dir.create_dir_all(parent).map_err(confined(to, &root))?;
-    }
-    dir.rename(from_trimmed, &dir, to_trimmed)
+    from_parent
+        .rename(&from_name, &to_parent, &to_name)
         .map_err(confined(from, &root))?;
     Ok(())
 }
@@ -676,18 +754,23 @@ mod tests {
         std::os::unix::fs::symlink(alpha.join("notes"), alpha.join("absolute")).unwrap();
 
         let escaped = |r: &Result<_, BrowseError>| matches!(r, Err(BrowseError::Escape(_)));
+        // Mutations refuse any link on the way before the root handle is
+        // asked to resolve it; either refusal keeps beta out of reach.
+        let refused = |r: &Result<_, BrowseError>| {
+            matches!(r, Err(BrowseError::Escape(_) | BrowseError::LinkedPath(_)))
+        };
         assert!(escaped(
             &read_agent_workspace_file(&cfg, "alpha", "export/private.txt").map(|_| ())
         ));
         assert!(escaped(
             &list_agent_workspace(&cfg, "alpha", "export").map(|_| ())
         ));
-        assert!(escaped(&delete_agent_workspace_path(
+        assert!(refused(&delete_agent_workspace_path(
             &cfg,
             "alpha",
             "export/private.txt"
         )));
-        assert!(escaped(&move_agent_workspace_path(
+        assert!(refused(&move_agent_workspace_path(
             &cfg,
             "alpha",
             "export/private.txt",
@@ -718,6 +801,89 @@ mod tests {
         delete_agent_workspace_path(&cfg, "alpha", "export").unwrap();
         assert!(!alpha.join("export").exists());
         assert!(beta.join("private.txt").exists());
+    }
+
+    /// A link that stays inside the workspace cannot alias a protected
+    /// entry. `via -> .` makes `via/SOUL.md` name the real `SOUL.md` while its
+    /// text passes the protected-entry checks, so mutations refuse to follow
+    /// any link on the way and every protected entry stays as it was.
+    #[cfg(unix)]
+    #[test]
+    fn an_internal_link_cannot_alias_a_protected_entry() {
+        let (dir, cfg) = fixture();
+        let alpha = dir.path().join("agents/alpha/workspace");
+        std::fs::create_dir_all(alpha.join("sessions")).unwrap();
+        std::fs::create_dir_all(alpha.join("notes")).unwrap();
+        std::fs::write(alpha.join("SOUL.md"), b"soul").unwrap();
+        std::fs::write(alpha.join("sessions/sessions.db"), b"db").unwrap();
+        std::fs::write(alpha.join("notes/draft.md"), b"draft").unwrap();
+        std::os::unix::fs::symlink(".", alpha.join("via")).unwrap();
+
+        let linked = |r: &Result<(), BrowseError>| matches!(r, Err(BrowseError::LinkedPath(_)));
+        assert!(linked(&delete_agent_workspace_path(
+            &cfg,
+            "alpha",
+            "via/SOUL.md"
+        )));
+        assert!(linked(&delete_agent_workspace_path(
+            &cfg,
+            "alpha",
+            "via/sessions"
+        )));
+        assert!(linked(&move_agent_workspace_path(
+            &cfg,
+            "alpha",
+            "via/SOUL.md",
+            "notes/soul-copy.md"
+        )));
+        assert!(linked(&move_agent_workspace_path(
+            &cfg,
+            "alpha",
+            "via/sessions",
+            "notes/old-sessions"
+        )));
+        // Nor can a move land on a protected entry through the alias.
+        assert!(linked(&move_agent_workspace_path(
+            &cfg,
+            "alpha",
+            "notes/draft.md",
+            "via/SOUL.md"
+        )));
+        assert_eq!(std::fs::read(alpha.join("SOUL.md")).unwrap(), b"soul");
+        assert_eq!(
+            std::fs::read(alpha.join("sessions/sessions.db")).unwrap(),
+            b"db"
+        );
+        assert_eq!(
+            std::fs::read(alpha.join("notes/draft.md")).unwrap(),
+            b"draft"
+        );
+
+        // Paths without a link on the way still work, including a move whose
+        // destination directories do not exist yet.
+        move_agent_workspace_path(&cfg, "alpha", "notes/draft.md", "archive/2026/draft.md")
+            .unwrap();
+        assert_eq!(
+            std::fs::read(alpha.join("archive/2026/draft.md")).unwrap(),
+            b"draft"
+        );
+        delete_agent_workspace_path(&cfg, "alpha", "archive/2026/draft.md").unwrap();
+        assert!(!alpha.join("archive/2026/draft.md").exists());
+    }
+
+    /// The shared area's protected top-level directories cannot be removed
+    /// through a link that stays inside the shared root either.
+    #[cfg(unix)]
+    #[test]
+    fn an_internal_link_cannot_alias_a_protected_shared_directory() {
+        let (dir, cfg) = fixture();
+        let shared = dir.path().join("shared");
+        std::os::unix::fs::symlink(".", shared.join("via")).unwrap();
+        assert!(matches!(
+            remove_directory(&cfg, "via/skills"),
+            Err(BrowseError::LinkedPath(_))
+        ));
+        assert!(shared.join("skills/alpha").is_dir());
     }
 
     #[test]

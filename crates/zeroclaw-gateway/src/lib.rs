@@ -4838,11 +4838,16 @@ async fn handle_admin_paircode_new(
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     require_localhost(&peer)?;
     require_gateway_admin_token(&state, &headers)?;
+    // Issuing a code, and any rotation before it, runs under the config
+    // write lock with the admin token checked again under it, so the same
+    // lock that orders policy changes and revocations orders this too.
+    let guard = state.config_write_lock.clone().lock_owned().await;
+    require_gateway_admin_token(&state, &headers)?;
     let (status, body) = zeroclaw_runtime::devices::new_pairing_code(
         state.device_registry.as_deref(),
         &state.pairing,
         state.config.clone(),
-        state.config_write_lock.clone(),
+        &guard,
         params.rotate.as_deref(),
     )
     .await;
