@@ -2047,6 +2047,101 @@ async fn a_warm_session_narrowed_to_one_agent_cannot_reach_other_canvases() {
     }
 }
 
+/// An alias the config validator would refuse can still arrive through a
+/// hand-written `[agents."alpha/beta"]` table. Namespaced, it would share keys
+/// with `alpha`: `alpha` drawing `beta/default` and `alpha/beta` drawing
+/// `default` would be the one canvas `alpha/beta/default`. The session on
+/// `alpha/beta` gets a private store instead, and the shared store holds and
+/// lists only what `alpha` drew.
+#[tokio::test]
+async fn an_agent_alias_with_a_separator_shares_no_canvas_with_its_prefix() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let mut config = make_acp_test_config(&tmp);
+    let agent = config.agents["test-agent"].clone();
+    config.agents.insert("alpha".into(), agent.clone());
+    config.agents.insert("alpha/beta".into(), agent);
+    let ctx = enforcement_ctx(config);
+    // Each session is created on a connection of its own, and both stay open
+    // while the canvases are drawn.
+    let mut connections = Vec::new();
+    for (alias, session) in [("alpha", "s-alpha"), ("alpha/beta", "s-alpha-beta")] {
+        let (mut peer, mut peer_rx) = local_operator(&ctx).await;
+        let created = rpc(
+            &mut peer,
+            &mut peer_rx,
+            1,
+            "session/new",
+            json!({"agent_alias": alias, "session_id": session}),
+        )
+        .await;
+        assert_eq!(created["result"]["session_id"], json!(session), "{created}");
+        connections.push((peer, peer_rx));
+    }
+    let (mut operator, mut rx) = local_operator(&ctx).await;
+    let canvas = |session: &'static str, args: Value| {
+        let sessions = Arc::clone(&ctx.sessions);
+        async move {
+            let agent = sessions.get_agent(session).await.expect("session exists");
+            let agent = agent.lock().await;
+            agent
+                .execute_tool_for_test("canvas", args)
+                .await
+                .expect("the session has the canvas tool")
+                .expect("the canvas tool runs")
+        }
+    };
+
+    let drawn = canvas(
+        "s-alpha",
+        json!({"action": "render", "canvas_id": "beta/default",
+               "content_type": "text", "content": "alpha's frame"}),
+    )
+    .await;
+    assert!(drawn.success, "{drawn:?}");
+
+    let seen = canvas(
+        "s-alpha-beta",
+        json!({"action": "snapshot", "canvas_id": "default"}),
+    )
+    .await;
+    assert!(
+        !format!("{seen:?}").contains("alpha's frame"),
+        "alpha/beta read alpha's canvas: {seen:?}"
+    );
+    let overwritten = canvas(
+        "s-alpha-beta",
+        json!({"action": "render", "canvas_id": "default",
+               "content_type": "text", "content": "alpha/beta's frame"}),
+    )
+    .await;
+    assert!(overwritten.success, "{overwritten:?}");
+    let _ = canvas(
+        "s-alpha-beta",
+        json!({"action": "clear", "canvas_id": "default"}),
+    )
+    .await;
+
+    let got = rpc(
+        &mut operator,
+        &mut rx,
+        10,
+        "canvas/get",
+        json!({"canvas_id": "alpha/beta/default"}),
+    )
+    .await;
+    assert_eq!(
+        got["result"]["frame"]["content"],
+        json!("alpha's frame"),
+        "{got}"
+    );
+    let listed = rpc(&mut operator, &mut rx, 11, "canvas/list", json!({})).await;
+    assert_eq!(
+        listed["result"]["canvases"],
+        json!(["alpha/beta/default"]),
+        "only alpha's canvas reaches the shared store: {listed}"
+    );
+}
+
 /// A channel capability whose bind parks after the dispatcher has handed it
 /// the held config write lock, at the point the real capability reads the
 /// persisted peer policy, and records whether the caller's credential was

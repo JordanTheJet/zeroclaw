@@ -75,18 +75,27 @@ impl CanvasStore {
         }
     }
 
-    /// A handle to the same canvases that can address only `namespace`.
-    /// A handle that is already namespaced keeps its namespace.
+    /// A handle to the same canvases that can address only `namespace`, or
+    /// `None` when `namespace` cannot be one.
+    ///
+    /// A namespace is non-empty and contains no `/`. The stored key is
+    /// `<namespace>/<id>`, so the namespace is everything before the key's
+    /// first `/`: keys from different namespaces can never be equal, whatever
+    /// ids they are given. A namespace containing `/` would break that, since
+    /// `alpha` with id `beta/x` and `alpha/beta` with id `x` would share a
+    /// key. It is refused here, at the boundary, rather than trusted to every
+    /// caller. A handle that is already namespaced keeps its namespace.
     #[must_use]
-    pub fn namespaced(&self, namespace: &str) -> Self {
-        Self {
+    pub fn namespaced(&self, namespace: &str) -> Option<Self> {
+        let namespace = match &self.namespace {
+            Some(existing) => Arc::clone(existing),
+            None if namespace.is_empty() || namespace.contains('/') => return None,
+            None => Arc::from(namespace),
+        };
+        Some(Self {
             inner: Arc::clone(&self.inner),
-            namespace: Some(
-                self.namespace
-                    .clone()
-                    .unwrap_or_else(|| Arc::from(namespace)),
-            ),
-        }
+            namespace: Some(namespace),
+        })
     }
 
     /// The stored key for `canvas_id` as this handle addresses it.
@@ -720,7 +729,7 @@ mod tests {
         let shared = CanvasStore::new();
         shared.render("default", "text", "the dashboard's frame");
         shared.render("beta/default", "text", "beta's frame");
-        let alpha = shared.namespaced("alpha");
+        let alpha = shared.namespaced("alpha").expect("a plain namespace");
 
         for id in ["default", "beta/default", "../beta/default", "/default"] {
             assert!(alpha.snapshot(id).is_none(), "{id} resolved outside alpha");
@@ -748,6 +757,7 @@ mod tests {
         assert_eq!(
             alpha
                 .namespaced("beta")
+                .expect("a namespaced handle keeps its namespace")
                 .snapshot("default")
                 .map(|f| f.content),
             Some("alpha's frame".into()),
@@ -755,11 +765,47 @@ mod tests {
         );
     }
 
+    /// The stored key is `<namespace>/<id>`. Were `alpha/beta` a namespace,
+    /// `alpha` drawing `beta/default` and `alpha/beta` drawing `default` would
+    /// be one canvas, and `alpha`'s list would show `alpha/beta`'s canvases as
+    /// its own. A namespace with a `/` in it is refused, so each key belongs
+    /// to exactly one namespace, whatever ids either side draws.
+    #[test]
+    fn a_namespace_that_could_share_keys_with_another_is_refused() {
+        let shared = CanvasStore::new();
+        for namespace in ["alpha/beta", "alpha/", "/alpha", "a/b/c", ""] {
+            assert!(
+                shared.namespaced(namespace).is_none(),
+                "{namespace:?} was accepted as a namespace"
+            );
+        }
+
+        let alpha = shared.namespaced("alpha").expect("a plain namespace");
+        let alphabeta = shared.namespaced("alphabeta").expect("a plain namespace");
+        alpha.render("beta/default", "text", "alpha's frame");
+        alphabeta.render("default", "text", "alphabeta's frame");
+
+        assert_eq!(alpha.list(), vec!["beta/default"]);
+        assert_eq!(alphabeta.list(), vec!["default"]);
+        assert!(alpha.snapshot("default").is_none());
+        assert!(alphabeta.snapshot("beta/default").is_none());
+        let mut keys = shared.list();
+        keys.sort();
+        assert_eq!(keys, vec!["alpha/beta/default", "alphabeta/default"]);
+        for key in keys {
+            let (namespace, _) = key.split_once('/').expect("a namespaced key");
+            assert!(
+                ["alpha", "alphabeta"].contains(&namespace),
+                "{key} does not name one namespace by its first component"
+            );
+        }
+    }
+
     /// One namespace cannot fill the shared store for everyone else.
     #[test]
     fn a_namespace_is_capped_below_the_shared_limit() {
         let shared = CanvasStore::new();
-        let alpha = shared.namespaced("alpha");
+        let alpha = shared.namespaced("alpha").expect("a plain namespace");
         for i in 0..MAX_CANVASES_PER_NAMESPACE {
             assert!(alpha.render(&format!("c{i}"), "text", "x").is_some());
         }

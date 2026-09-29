@@ -340,12 +340,45 @@ fn agent_root(config: &Config, agent_alias: &str) -> Result<PathBuf, BrowseError
     }
 }
 
+/// Whether `rel` names the reserved top-level entry `reserved` on whatever
+/// filesystem holds the workspace. A case-insensitive volume (the default on
+/// macOS and Windows) resolves `soul.md` to `SOUL.md`, and Windows drops a
+/// trailing dot or space, so an exact comparison would let either spelling
+/// through to the entry it was meant to refuse.
+fn names_reserved(rel: &str, reserved: &str) -> bool {
+    let fold = |name: &str| {
+        name.trim_end_matches(['.', ' '])
+            .to_uppercase()
+            .to_lowercase()
+    };
+    fold(rel) == fold(reserved)
+}
+
 fn protected_file(rel: &str) -> bool {
-    AGENT_WORKSPACE_PROTECTED_FILES.contains(&rel)
+    AGENT_WORKSPACE_PROTECTED_FILES
+        .iter()
+        .any(|reserved| names_reserved(rel, reserved))
 }
 
 fn protected_dir(rel: &str) -> bool {
-    AGENT_WORKSPACE_PROTECTED_DIRS.contains(&rel)
+    AGENT_WORKSPACE_PROTECTED_DIRS
+        .iter()
+        .any(|reserved| names_reserved(rel, reserved))
+}
+
+/// The first leading run of `relative`'s components that is a protected
+/// file, if any.
+///
+/// Creating `SOUL.md/child` creates a `SOUL.md` directory on the way, which
+/// then stands where the bootstrap file belongs, although the whole path is
+/// not a protected name. Every operation that creates the directories along
+/// a path, or moves an entry out of one, checks each of them here.
+fn protected_file_along(relative: &str) -> Option<&str> {
+    relative
+        .match_indices('/')
+        .map(|(end, _)| &relative[..end])
+        .chain(std::iter::once(relative))
+        .find(|prefix| protected_file(prefix))
 }
 
 /// One-level listing inside the agent's workspace. Top-level entries that
@@ -371,8 +404,8 @@ pub fn list_agent_workspace(
 
 /// Create a directory under the agent's workspace. Idempotent — if the
 /// path already exists as a directory, returns Ok. Rejects path traversal
-/// and refuses to create over an existing file or to overwrite a protected
-/// top-level file path.
+/// and refuses to create over an existing file or to create any directory
+/// along the path at a protected top-level file path.
 pub fn make_agent_workspace_directory(
     config: &Config,
     agent_alias: &str,
@@ -383,8 +416,8 @@ pub fn make_agent_workspace_directory(
     if relative.is_empty() {
         return Err(BrowseError::NotFound(raw.to_string()));
     }
-    if protected_file(&relative) {
-        return Err(BrowseError::ProtectedFile(relative));
+    if let Some(protected) = protected_file_along(&relative) {
+        return Err(BrowseError::ProtectedFile(protected.to_string()));
     }
     make_directory_under(&root, raw)
 }
@@ -551,15 +584,11 @@ pub fn move_agent_workspace_path(
     if from_trimmed.is_empty() || to_trimmed.is_empty() {
         return Err(BrowseError::NotFound(from.to_string()));
     }
-    if protected_file(from_trimmed) || protected_file(to_trimmed) {
-        return Err(BrowseError::ProtectedFile(
-            if protected_file(from_trimmed) {
-                from_trimmed
-            } else {
-                to_trimmed
-            }
-            .to_string(),
-        ));
+    // `to`'s parents are created below, so every directory along it is
+    // checked, not only the entry it names.
+    if let Some(protected) = protected_file_along(from_trimmed).or(protected_file_along(to_trimmed))
+    {
+        return Err(BrowseError::ProtectedFile(protected.to_string()));
     }
     if protected_dir(from_trimmed) || protected_dir(to_trimmed) {
         return Err(BrowseError::Protected(format!(
@@ -1320,6 +1349,58 @@ mod tests {
     fn make_agent_workspace_directory_refuses_protected_file_path() {
         let (_dir, cfg) = workspace_fixture();
         let err = make_agent_workspace_directory(&cfg, "alpha", "IDENTITY.md").unwrap_err();
+        assert!(matches!(err, BrowseError::ProtectedFile(_)));
+    }
+
+    /// `SOUL.md/child` is not itself a protected name, but creating it
+    /// creates a `SOUL.md` directory where the bootstrap file belongs. Each
+    /// spelling a case-insensitive or Windows volume maps to `SOUL.md` is
+    /// refused too, and nothing is created.
+    #[test]
+    fn make_agent_workspace_directory_refuses_a_protected_file_along_the_path() {
+        let (dir, cfg) = workspace_fixture();
+        let soul = dir.path().join("agents/alpha/workspace/SOUL.md");
+        std::fs::remove_file(&soul).unwrap();
+        for raw in [
+            "SOUL.md/child",
+            "SOUL.md/a/b",
+            "soul.md/child",
+            "SOUL.md./child",
+            "SOUL.md",
+            "Soul.MD",
+        ] {
+            let err = make_agent_workspace_directory(&cfg, "alpha", raw).unwrap_err();
+            assert!(
+                matches!(&err, BrowseError::ProtectedFile(name) if protected_file(name)),
+                "mkdir {raw:?} must be refused as a protected file, got {err:?}"
+            );
+            assert!(
+                std::fs::symlink_metadata(&soul).is_err(),
+                "mkdir {raw:?} must not create anything at SOUL.md"
+            );
+        }
+        // A protected name deeper down is an ordinary directory.
+        make_agent_workspace_directory(&cfg, "alpha", "notes/SOUL.md").unwrap();
+    }
+
+    /// A move creates its destination's parents, so a destination under a
+    /// protected file name would create that directory; a source under one is
+    /// refused the same way.
+    #[test]
+    fn move_agent_workspace_path_refuses_a_protected_file_along_either_path() {
+        let (dir, cfg) = workspace_fixture();
+        let ws = dir.path().join("agents/alpha/workspace");
+        std::fs::remove_file(ws.join("SOUL.md")).unwrap();
+        for to in ["SOUL.md/a", "soul.md/a/b"] {
+            let err = move_agent_workspace_path(&cfg, "alpha", "notes", to).unwrap_err();
+            assert!(
+                matches!(&err, BrowseError::ProtectedFile(name) if protected_file(name)),
+                "move to {to:?} must be refused as a protected file, got {err:?}"
+            );
+            assert!(std::fs::symlink_metadata(ws.join("SOUL.md")).is_err());
+            assert!(ws.join("notes/draft.md").is_file());
+        }
+        let err = move_agent_workspace_path(&cfg, "alpha", "SOUL.md/x", "notes/x").unwrap_err();
         assert!(matches!(err, BrowseError::ProtectedFile(_)));
     }
 

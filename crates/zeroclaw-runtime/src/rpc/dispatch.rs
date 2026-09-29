@@ -2605,8 +2605,12 @@ impl RpcDispatcher {
     /// usable only while its principal may use that agent, which each prompt
     /// establishes again. The dashboard and `canvas/*` still see every
     /// namespace through the unrestricted store.
+    ///
+    /// An alias that cannot be a namespace, such as one containing `/` from
+    /// a hand-written `[agents."a/b"]` table, gets `None`: the session draws
+    /// into a private store of its own and reaches no shared canvas.
     fn session_canvas_store(&self, agent_alias: &str) -> Option<crate::tools::CanvasStore> {
-        Some(self.ctx.canvas_store.namespaced(agent_alias))
+        self.ctx.canvas_store.namespaced(agent_alias)
     }
 
     fn session_tui_env(
