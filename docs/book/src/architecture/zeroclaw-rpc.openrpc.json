@@ -1646,13 +1646,29 @@
         "type": "object"
       },
       "LogsSubscribeResult": {
+        "description": "Every notification of the subscription carries `subscription_id` and\nits `seq`. `seq` here is the newest sequence number at subscribe time.",
         "properties": {
+          "epoch": {
+            "description": "The hub's epoch: pass it back with `since_seq` to resume.",
+            "type": "string"
+          },
+          "seq": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
           "subscribed": {
             "type": "boolean"
+          },
+          "subscription_id": {
+            "type": "string"
           }
         },
         "required": [
-          "subscribed"
+          "subscribed",
+          "subscription_id",
+          "seq",
+          "epoch"
         ],
         "type": "object"
       },
@@ -3832,6 +3848,82 @@
           "protocol_version",
           "active_sessions",
           "session_ids"
+        ],
+        "type": "object"
+      },
+      "SubscribeParams": {
+        "description": "Parameters shared by every `X/subscribe` method.",
+        "properties": {
+          "epoch": {
+            "default": null,
+            "description": "The `epoch` the client's `since_seq` came from (returned by the\nsubscribe result). Sequence numbers restart in every hub, so\n`since_seq` resumes only when this matches the current epoch;\notherwise, or when omitted, every frame still buffered is replayed\nafter a `subscription/lagged` with `epoch_changed: true`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "since_seq": {
+            "default": null,
+            "description": "Resume after this sequence number: frames from `since_seq + 1`\nthat are still buffered are replayed before live delivery. Omit\nfor live frames only.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "SubscriptionCancelParams": {
+        "properties": {
+          "subscription_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "subscription_id"
+        ],
+        "type": "object"
+      },
+      "SubscriptionCancelResult": {
+        "properties": {
+          "cancelled": {
+            "description": "`false` when no subscription with that id is open on this\nconnection (already ended, or never existed).",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "cancelled"
+        ],
+        "type": "object"
+      },
+      "SubscriptionLagged": {
+        "description": "`subscription/lagged`: frames `from_seq` up to (not including)\n`resume_seq` are gone; delivery continues at `resume_seq`.",
+        "properties": {
+          "epoch_changed": {
+            "default": false,
+            "description": "The client's `since_seq` came from another epoch (the daemon\nrestarted or reloaded). Nothing it saw can be matched here: this\nepoch's frames from `resume_seq` on are replayed, and those before\nit are gone.",
+            "type": "boolean"
+          },
+          "from_seq": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "resume_seq": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "subscription_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "subscription_id",
+          "from_seq",
+          "resume_seq"
         ],
         "type": "object"
       },
@@ -6079,7 +6171,34 @@
     {
       "name": "logs/subscribe",
       "paramStructure": "by-name",
-      "params": [],
+      "params": [
+        {
+          "name": "epoch",
+          "required": false,
+          "schema": {
+            "default": null,
+            "description": "The `epoch` the client's `since_seq` came from (returned by the\nsubscribe result). Sequence numbers restart in every hub, so\n`since_seq` resumes only when this matches the current epoch;\notherwise, or when omitted, every frame still buffered is replayed\nafter a `subscription/lagged` with `epoch_changed: true`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "since_seq",
+          "required": false,
+          "schema": {
+            "default": null,
+            "description": "Resume after this sequence number: frames from `since_seq + 1`\nthat are still buffered are replayed before live delivery. Omit\nfor live frames only.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        }
+      ],
       "result": {
         "name": "result",
         "schema": {
@@ -6093,7 +6212,8 @@
         "verb": "read"
       },
       "x-zeroclaw-params": {
-        "shape": "none"
+        "shape": "typed",
+        "type": "SubscribeParams"
       }
     },
     {
@@ -6326,6 +6446,83 @@
       },
       "x-zeroclaw-params": {
         "shape": "none"
+      }
+    },
+    {
+      "name": "events/subscribe",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "epoch",
+          "required": false,
+          "schema": {
+            "default": null,
+            "description": "The `epoch` the client's `since_seq` came from (returned by the\nsubscribe result). Sequence numbers restart in every hub, so\n`since_seq` resumes only when this matches the current epoch;\notherwise, or when omitted, every frame still buffered is replayed\nafter a `subscription/lagged` with `epoch_changed: true`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "since_seq",
+          "required": false,
+          "schema": {
+            "default": null,
+            "description": "Resume after this sequence number: frames from `since_seq + 1`\nthat are still buffered are replayed before live delivery. Omit\nfor live frames only.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/LogsSubscribeResult"
+        },
+        "x-zeroclaw-shape": "typed"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "logs",
+        "verb": "read"
+      },
+      "x-zeroclaw-params": {
+        "shape": "typed",
+        "type": "SubscribeParams"
+      }
+    },
+    {
+      "name": "subscription/cancel",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "subscription_id",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/SubscriptionCancelResult"
+        },
+        "x-zeroclaw-shape": "typed"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "logs",
+        "verb": "read"
+      },
+      "x-zeroclaw-params": {
+        "shape": "typed",
+        "type": "SubscriptionCancelParams"
       }
     },
     {
@@ -7018,6 +7215,25 @@
         "schema": {
           "description": "Untyped event object.",
           "type": "object"
+        }
+      }
+    },
+    {
+      "name": "events/event",
+      "params": {
+        "name": "params",
+        "schema": {
+          "description": "Untyped event object.",
+          "type": "object"
+        }
+      }
+    },
+    {
+      "name": "subscription/lagged",
+      "params": {
+        "name": "params",
+        "schema": {
+          "$ref": "#/components/schemas/SubscriptionLagged"
         }
       }
     }
