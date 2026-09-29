@@ -20,11 +20,16 @@ zerocode spawns an ephemeral one.
 
 ## Session working directories
 
-Fresh **Chat** sessions, and fresh **Code** sessions on a local connection, use
-the selected agent's configured workspace, so file and shell tools operate there
-unless you choose a directory yourself. The daemon resolves that root and
-reports it back; zerocode does not substitute the directory you launched it
-from.
+Fresh **Code** sessions on a local connection start in the directory you
+launched zerocode from, so file and shell tools operate on that project. A
+restarted local Code session does the same. If zerocode cannot read that
+directory, or its path is not valid UTF-8, the session is not created and the
+reason is shown, rather than silently starting somewhere else.
+
+Fresh **Chat** sessions use the selected agent's configured workspace.
+
+Either way the daemon resolves the requested root, checks it against the
+agent's policy, and reports back the directory the session actually uses.
 
 Remote (WSS) **Code** always asks first. A fresh or restarted remote Code
 session opens the daemon-side directory picker before the session is created, so
@@ -58,9 +63,9 @@ Use the Sessions header `[+]` to add a sibling session and `[-]` to close the fo
 Closing a live session safely stops its current work while preserving durable history.
 
 Switching to an existing **Code** session resumes it at its own saved root,
-while **New session** starts fresh: at the selected agent's workspace over a
-local connection, or in the directory you pick in the daemon-side picker over
-WSS. Neither action changes the root of a session that is already running; use
+while **New session** starts fresh: a local Code session in the directory you
+launched zerocode from, a Chat session at the selected agent's workspace, and a
+remote Code session in the directory you pick in the daemon-side picker. Neither action changes the root of a session that is already running; use
 `/change-directory` when you want a Code session somewhere else.
 
 The in-app help overlay shows your live key bindings for these actions.
