@@ -929,6 +929,7 @@ pub async fn agent_turn(
         agent_alias,
         turn_id,
         None,
+        None,
     )
     .await
 }
@@ -969,6 +970,7 @@ async fn agent_turn_with_sop_reassembly(
     agent_alias: Option<&str>,
     turn_id: Option<&str>,
     sop_reassembly: Option<SopStepReassembly<'_>>,
+    capability_binding: Option<&crate::composition::BoundCapabilities>,
 ) -> Result<String> {
     let turn_id = turn_id.map_or_else(|| uuid::Uuid::new_v4().to_string(), str::to_string);
     let shared_budget = ExecutionTreeBudget::current()
@@ -1028,6 +1030,7 @@ async fn agent_turn_with_sop_reassembly(
     };
     let result = Box::pin(run_tool_call_loop(ToolLoop {
         sop_reassembly,
+        capability_binding,
         history_has_trim_breadcrumb,
         injected_memory_preamble,
         exec: ResolvedAgentExecution::resolve(
@@ -2204,6 +2207,7 @@ pub async fn run_with_capabilities(
                                 parent_agent_alias: None,
                                 turn_id: &turn_id,
                                 served_route_sink: None,
+                                capability_binding: Some(&bound_capabilities),
                                 sop_reassembly: Some(crate::agent::turn::SopStepReassembly {
                                     config: &config,
                                     capabilities: Some(&bound_capabilities),
@@ -2799,6 +2803,7 @@ pub async fn run_with_capabilities(
                                     parent_agent_alias: None,
                                     turn_id: &turn_id,
                                     served_route_sink: None,
+                                    capability_binding: Some(&bound_capabilities),
                                     sop_reassembly: Some(crate::agent::turn::SopStepReassembly {
                                         config: &config,
                                         capabilities: Some(&bound_capabilities),
@@ -3832,6 +3837,7 @@ async fn process_message_inner(
                         capabilities: Some(&bound_capabilities),
                         live_config,
                     }),
+                    Some(&bound_capabilities),
                 ),
             )
             .await
@@ -5508,6 +5514,7 @@ mod tests {
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -5755,6 +5762,7 @@ mod tests {
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -6187,6 +6195,7 @@ mod tests {
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -6272,6 +6281,7 @@ mod tests {
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -6386,6 +6396,7 @@ mod tests {
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -6467,6 +6478,7 @@ mod tests {
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -6564,6 +6576,7 @@ mod tests {
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -6646,6 +6659,7 @@ mod tests {
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -6731,6 +6745,7 @@ mod tests {
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -6817,6 +6832,7 @@ mod tests {
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -6890,6 +6906,7 @@ mod tests {
                 parent_agent_alias: None,
                 served_route_sink: None,
                 sop_reassembly: None,
+                capability_binding: None,
                 exec: ResolvedAgentExecution {
                     model_access: ResolvedModelAccess {
                         model_provider: &model_provider,
@@ -7086,6 +7103,7 @@ mod tests {
                 parent_agent_alias: None,
                 served_route_sink: None,
                 sop_reassembly: None,
+                capability_binding: None,
                 exec: ResolvedAgentExecution {
                     model_access: ResolvedModelAccess {
                         model_provider: &model_provider,
@@ -7219,6 +7237,7 @@ mod tests {
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -7304,6 +7323,7 @@ mod tests {
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -7388,6 +7408,7 @@ mod tests {
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -7557,6 +7578,7 @@ mod tests {
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -7726,6 +7748,7 @@ mod tests {
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -7861,6 +7884,7 @@ mod tests {
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -8030,6 +8054,7 @@ mod tests {
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -8258,6 +8283,7 @@ mod tests {
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -8411,6 +8437,7 @@ mod tests {
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -8591,6 +8618,7 @@ mod tests {
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -8707,6 +8735,7 @@ mod tests {
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -8807,6 +8836,7 @@ mod tests {
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -8899,6 +8929,7 @@ mod tests {
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -8999,6 +9030,7 @@ mod tests {
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -9102,6 +9134,7 @@ mod tests {
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -9211,6 +9244,7 @@ mod tests {
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -9312,6 +9346,7 @@ mod tests {
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -9439,6 +9474,7 @@ mod tests {
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -9544,6 +9580,7 @@ mod tests {
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -9654,6 +9691,7 @@ mod tests {
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -9754,6 +9792,7 @@ mod tests {
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -9858,6 +9897,7 @@ mod tests {
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -9964,6 +10004,7 @@ mod tests {
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -10056,6 +10097,7 @@ mod tests {
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -10152,6 +10194,7 @@ mod tests {
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
@@ -10243,6 +10286,7 @@ mod tests {
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
@@ -10332,6 +10376,7 @@ mod tests {
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
@@ -10427,6 +10472,7 @@ mod tests {
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
@@ -10535,6 +10581,7 @@ mod tests {
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
@@ -10629,6 +10676,7 @@ mod tests {
         let error = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -10727,6 +10775,7 @@ mod tests {
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
@@ -10808,6 +10857,7 @@ mod tests {
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
@@ -10890,6 +10940,7 @@ mod tests {
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
@@ -10972,6 +11023,7 @@ mod tests {
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
@@ -11056,6 +11108,7 @@ This is an example, not an invocation."#;
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
@@ -11144,6 +11197,7 @@ This is an example, not an invocation."#;
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
@@ -11244,6 +11298,7 @@ This is an example, not an invocation."#;
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
@@ -11328,6 +11383,7 @@ Done."#;
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
@@ -11415,6 +11471,7 @@ Done."#;
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
@@ -11500,6 +11557,7 @@ Done."#;
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
@@ -11586,6 +11644,7 @@ This is an example, not an invocation."#;
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
@@ -11729,6 +11788,7 @@ This is an example, not an invocation."#;
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
@@ -11823,6 +11883,7 @@ This is an example, not an invocation."#;
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
@@ -11920,6 +11981,7 @@ This is an example, not an invocation."#;
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
@@ -12040,6 +12102,7 @@ This is an example, not an invocation."#;
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -12173,6 +12236,7 @@ This is an example, not an invocation."#;
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -12276,6 +12340,7 @@ This is an example, not an invocation."#;
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -12390,6 +12455,7 @@ This is an example, not an invocation."#;
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
@@ -13291,6 +13357,7 @@ This is an example, not an invocation."#;
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -13407,6 +13474,7 @@ This is an example, not an invocation."#;
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -13518,6 +13586,7 @@ This is an example, not an invocation."#;
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -13629,6 +13698,7 @@ This is an example, not an invocation."#;
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -13797,6 +13867,7 @@ This is an example, not an invocation."#;
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &router,
@@ -16739,6 +16810,7 @@ Let me check the result."#;
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -16931,6 +17003,7 @@ Let me check the result."#;
                     parent_agent_alias: None,
                     served_route_sink: None,
                     sop_reassembly: None,
+                    capability_binding: None,
                     exec: ResolvedAgentExecution {
                         model_access: ResolvedModelAccess {
                             model_provider: &model_provider,
@@ -17058,6 +17131,7 @@ Let me check the result."#;
                 run_tool_call_loop(ToolLoop {
                     parent_agent_alias: None,
                     sop_reassembly: None,
+                    capability_binding: None,
                     served_route_sink: None,
                     exec: ResolvedAgentExecution {
                         model_access: ResolvedModelAccess {
@@ -17277,6 +17351,7 @@ Let me check the result."#;
                 run_tool_call_loop(ToolLoop {
                     parent_agent_alias: None,
                     sop_reassembly: None,
+                    capability_binding: None,
                     exec: ResolvedAgentExecution {
                         model_access: ResolvedModelAccess {
                             model_provider: &provider,
@@ -17384,6 +17459,7 @@ Let me check the result."#;
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
@@ -17512,6 +17588,7 @@ Let me check the result."#;
                     parent_agent_alias: None,
                     served_route_sink: None,
                     sop_reassembly: None,
+                    capability_binding: None,
                     exec: ResolvedAgentExecution {
                         model_access: ResolvedModelAccess {
                             model_provider: &model_provider,
@@ -17613,6 +17690,7 @@ Let me check the result."#;
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -17711,6 +17789,7 @@ Let me check the result."#;
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -19473,6 +19552,7 @@ Let me check the result."#;
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -19661,6 +19741,7 @@ Let me check the result."#;
         run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
@@ -19872,6 +19953,7 @@ Let me check the result."#;
         run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
@@ -19979,6 +20061,7 @@ Let me check the result."#;
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
@@ -20301,6 +20384,7 @@ Let me check the result."#;
             run_tool_call_loop(ToolLoop {
                 parent_agent_alias: None,
                 sop_reassembly: None,
+                capability_binding: None,
                 exec: ResolvedAgentExecution {
                     model_access: ResolvedModelAccess {
                         model_provider: &provider,
@@ -20690,6 +20774,7 @@ Let me check the result."#;
             run_tool_call_loop(ToolLoop {
                 parent_agent_alias: None,
                 sop_reassembly: None,
+                capability_binding: None,
                 exec: ResolvedAgentExecution {
                     model_access: ResolvedModelAccess {
                         model_provider: &provider,
@@ -20814,6 +20899,7 @@ Let me check the result."#;
             run_tool_call_loop(ToolLoop {
                 parent_agent_alias: None,
                 sop_reassembly: None,
+                capability_binding: None,
                 exec: ResolvedAgentExecution {
                     model_access: ResolvedModelAccess {
                         model_provider: if streaming {
@@ -21088,6 +21174,7 @@ Let me check the result."#;
             run_tool_call_loop(ToolLoop {
                 parent_agent_alias: None,
                 sop_reassembly: None,
+                capability_binding: None,
                 exec: ResolvedAgentExecution {
                     model_access: ResolvedModelAccess {
                         model_provider: &provider,

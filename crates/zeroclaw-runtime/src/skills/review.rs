@@ -123,6 +123,7 @@ pub async fn maybe_run_skill_review(
             crate::agent::loop_::run_tool_call_loop(crate::agent::loop_::ToolLoop {
                 served_route_sink: None,
                 sop_reassembly: None,
+                capability_binding: None,
                 exec: crate::agent::loop_::ResolvedAgentExecution::resolve(
                     crate::agent::loop_::ResolvedModelAccess {
                         model_provider: provider,

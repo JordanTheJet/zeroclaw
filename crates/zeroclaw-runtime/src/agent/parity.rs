@@ -147,6 +147,7 @@ async fn parity_l1_engine_honors_excluded_tools() {
         parent_agent_alias: None,
         served_route_sink: None,
         sop_reassembly: None,
+        capability_binding: None,
         exec: ResolvedAgentExecution::resolve(
             ResolvedModelAccess {
                 model_provider: &provider,

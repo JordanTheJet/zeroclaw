@@ -4143,6 +4143,7 @@ impl Agent {
                         // optional live policy handle survive via
                         // `provider_switch_config`; test builders without that
                         // context fail closed instead of inheriting this turn.
+                        capability_binding: self.supplied_capabilities.as_ref(),
                         sop_reassembly: self.provider_switch_config.as_ref().and_then(|c| {
                             c.config.as_deref().map(|config| {
                                 crate::agent::turn::SopStepReassembly {
@@ -4743,6 +4744,7 @@ impl Agent {
                             // and the optional live policy handle survive via
                             // `provider_switch_config`; test builders without
                             // that context fail closed instead of inheriting it.
+                            capability_binding: self.supplied_capabilities.as_ref(),
                             sop_reassembly: self.provider_switch_config.as_ref().and_then(|c| {
                                 c.config.as_deref().map(|config| {
                                     crate::agent::turn::SopStepReassembly {

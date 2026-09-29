@@ -9974,6 +9974,8 @@ async fn process_channel_message_body(
                 // with that agent's own gated tools/policy/MCP scope rather than
                 // this turn's.
                 served_route_sink: None,
+                // The channels orchestrator builds its turns from config.
+                capability_binding: None,
                 sop_reassembly: Some(zeroclaw_runtime::agent::loop_::SopStepReassembly {
                     config: ctx.prompt_config.as_ref(),
                     // The channels orchestrator builds its turns from config;

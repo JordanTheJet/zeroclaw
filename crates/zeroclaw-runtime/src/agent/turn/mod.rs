@@ -392,6 +392,12 @@ pub struct ToolLoop<'a> {
     /// FAILS CLOSED (the step errors rather than running with the parent
     /// agent's broader context).
     pub sop_reassembly: Option<SopStepReassembly<'a>>,
+    /// The capabilities and principal this turn was built from, when an entry
+    /// point supplied them. The loop resolves provider changes it makes on its
+    /// own, such as the vision route for an image, through this binding's
+    /// provider source. Independent of `sop_reassembly`: a loop can carry a
+    /// binding without being allowed to reassemble SOP steps.
+    pub capability_binding: Option<&'a crate::composition::BoundCapabilities>,
 }
 
 /// Project the token population of the NEXT provider request that would be
@@ -1066,17 +1072,13 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         turn_id,
         served_route_sink,
         sop_reassembly,
+        capability_binding,
     } = p;
     // A turn built from bound capabilities resolves its vision route through
-    // that binding's provider source, with its principal. The binding rides on
-    // the SOP reassembly context, the one place every capability-taking entry
-    // point hands this loop its sources.
-    let turn_vision_source = sop_reassembly
-        .as_ref()
-        .and_then(|reassembly| reassembly.capabilities)
-        .map(|binding| {
-            VisionProviderSource::from_binding(binding, agent_alias.unwrap_or_default())
-        });
+    // that binding's provider source, with its principal.
+    let turn_vision_source = capability_binding.map(|binding| {
+        VisionProviderSource::from_binding(binding, agent_alias.unwrap_or_default())
+    });
     let mut loop_local_image_cache = None;
     let mut image_cache = Some(match image_cache {
         Some(cache) => cache,
@@ -3613,6 +3615,12 @@ async fn drive_live_sop_actions(
                                     turn_id: &nested_turn_id,
                                     served_route_sink: None,
                                     sop_reassembly: sop_reassembly.clone(),
+                                    // The step runs on the enclosing turn's
+                                    // sources, which the reassembly context
+                                    // carries for exactly this purpose.
+                                    capability_binding: sop_reassembly
+                                        .as_ref()
+                                        .and_then(|reassembly| reassembly.capabilities),
                                     })),
                                 )
                             )
@@ -5545,6 +5553,7 @@ vision_model_provider = "custom.vision"
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution::resolve(
                 ResolvedModelAccess {
                     model_provider: &text_provider,
@@ -6433,6 +6442,7 @@ mod sop_step_reassembly_tests {
 
         run_tool_call_loop(ToolLoop {
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution::resolve(
                 ResolvedModelAccess {
                     model_provider: provider,
@@ -8318,6 +8328,7 @@ mod tool_lifecycle_abandonment_tests {
         run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: provider,
