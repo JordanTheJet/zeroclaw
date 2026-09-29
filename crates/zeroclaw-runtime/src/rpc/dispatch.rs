@@ -1938,6 +1938,41 @@ impl RpcDispatcher {
         Ok(())
     }
 
+    /// A live session and its shell share one immutable forwarded map. A
+    /// reconnect may reuse it only if its *current* grants select the same
+    /// environment; otherwise the caller must create a new incarnation.
+    fn authorize_resumed_environment(
+        &self,
+        grants: Option<&zeroclaw_api::grants::ResolvedGrants>,
+        retained: Option<&crate::tools::ForwardedEnvironment>,
+    ) -> Result<(), JsonRpcError> {
+        self.authorize_session_environment(
+            Method::SessionNew,
+            grants,
+            retained.is_some_and(|env| !env.is_empty()),
+        )?;
+        let current = self.session_tui_env(grants);
+        let retained = retained
+            .map(|env| env.as_ref())
+            .filter(|env| !env.is_empty());
+        let current = current.as_ref().filter(|env| !env.is_empty());
+        if retained != current {
+            let denied = rpc_err(
+                FORBIDDEN,
+                "Session environment differs from this connection; create a new session",
+            );
+            self.audit_auth_denial(
+                Method::SessionNew,
+                &crate::rpc::auth::AuthDenied {
+                    code: denied.code,
+                    message: denied.message.clone(),
+                },
+            );
+            return Err(denied);
+        }
+        Ok(())
+    }
+
     /// Apply a principal's posture to an agent: narrow its tool surface to the
     /// selector, and, for a principal without operator reach, disable nested
     /// tools that cannot carry the principal through. A handler that
@@ -3612,34 +3647,6 @@ impl RpcDispatcher {
         chat_mode: &crate::rpc::types::ChatMode,
         existing: crate::rpc::session::ResumedRpcSession,
     ) -> RpcResult {
-        // The canonical live agent keeps the shell tool it was built with,
-        // whose forwarded environment was filtered for the connection that
-        // FIRST constructed it. This resume may be a different connection —
-        // the same principal after losing `admin`, a WSS reconnect describing
-        // another host — so re-derive the forwarded shell environment against
-        // THIS connection's own registration before the resumed session runs a
-        // command. The registration env was already filtered for this
-        // connection's entitlement at `initialize` (an environment is retained
-        // only for a local operator, dropped and audited otherwise), so
-        // re-installing it neither widens a scoped principal's environment nor
-        // strands a permitted local operator's. A connection with no retained
-        // environment installs `None`, dropping any environment the prior
-        // incarnation carried.
-        //
-        // Like the approval-channel rebind below, this must NOT make the
-        // reconnect wait on an active turn that owns the Agent mutex: install
-        // the re-derived environment as soon as the predecessor releases the
-        // canonical Agent. The rebind is idempotent and the next turn cannot
-        // start a command before its own `session/prompt` acquires the lock, so
-        // applying it after the in-flight turn drains is correct — an in-flight
-        // command keeps the environment it began with.
-        let resumed_env = self
-            .tui_registration()
-            .and_then(|(id, epoch)| self.ctx.tui_registry.env_for_registration(id, epoch));
-        let env_agent = Arc::clone(&existing.agent);
-        zeroclaw_spawn::spawn!(async move {
-            env_agent.lock().await.rebind_shell_env(resumed_env);
-        });
         self.rebind_rpc_approval_channel(Arc::clone(&existing.agent), session_id.clone());
         if matches!(chat_mode, crate::rpc::types::ChatMode::Acp)
             && let Some(plan) = self.ctx.sessions.get_plan(&session_id).await
@@ -3721,14 +3728,10 @@ impl RpcDispatcher {
                     resolved_interaction_surface,
                     self.tui_id.clone(),
                     resume_scope.as_deref(),
-                    |alias, workspace, has_environment| {
+                    |alias, workspace, retained_environment| {
                         let grants = self.recheck_authority_after_admission(Method::SessionNew)?;
                         self.authorize_resumed_session(grants.as_ref(), alias, workspace)?;
-                        self.authorize_session_environment(
-                            Method::SessionNew,
-                            grants.as_ref(),
-                            has_environment,
-                        )
+                        self.authorize_resumed_environment(grants.as_ref(), retained_environment)
                     },
                 )
                 .await
@@ -3816,14 +3819,10 @@ impl RpcDispatcher {
                     resolved_interaction_surface,
                     self.tui_id.clone(),
                     resume_scope.as_deref(),
-                    |alias, workspace, has_environment| {
+                    |alias, workspace, retained_environment| {
                         let grants = self.recheck_authority_after_admission(Method::SessionNew)?;
                         self.authorize_resumed_session(grants.as_ref(), alias, workspace)?;
-                        self.authorize_session_environment(
-                            Method::SessionNew,
-                            grants.as_ref(),
-                            has_environment,
-                        )
+                        self.authorize_resumed_environment(grants.as_ref(), retained_environment)
                     },
                 )
                 .await
@@ -16909,27 +16908,6 @@ mod tests {
         result.output.into_string()
     }
 
-    /// Poll the shell environment until `pred` holds or a bounded number of
-    /// yields elapse. The resume path applies its environment rebind in a
-    /// spawned task (so the reconnect never waits on an in-flight turn), so a
-    /// test observing the rebound value must let that task run first.
-    #[cfg(unix)]
-    async fn wait_for_shell_env(
-        ctx: &Arc<RpcContext>,
-        session_id: &str,
-        pred: impl Fn(&str) -> bool,
-    ) -> String {
-        let mut last = String::new();
-        for _ in 0..200 {
-            last = session_shell_env(ctx, session_id).await;
-            if pred(&last) {
-                return last;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
-        last
-    }
-
     #[cfg(unix)]
     #[tokio::test]
     async fn session_new_ignores_a_foreign_request_tui_id_for_environment() {
@@ -17067,18 +17045,12 @@ mod tests {
         );
     }
 
-    /// Reviewer regression (discussion_r4109687906): reusing a canonical live
-    /// session must re-derive the forwarded shell environment against the
-    /// RESUMING connection, not keep the environment cloned into the shell tool
-    /// at first construction. A local operator creates an environment-bearing
-    /// session; the SAME connection then resumes it after its retained
-    /// environment is gone (reconnect re-registers the id with no environment,
-    /// e.g. the entitlement that kept it was lost). The resumed session's own
-    /// shell tool must stop overlaying the stale sentinel. Environment-free
-    /// reuse stays clean, and an unchanged retained environment survives reuse.
+    /// The environment is immutable for a live session. A reconnect carrying
+    /// a different map must create a new session; it cannot mutate the shell
+    /// underneath the session's admission record.
     #[cfg(unix)]
     #[tokio::test]
-    async fn resuming_a_session_re_derives_the_forwarded_shell_environment() {
+    async fn resuming_a_session_requires_its_original_environment() {
         let tmp = tempfile::TempDir::new().unwrap();
         let ctx = enforcement_ctx(shell_env_config(&tmp));
         let (tx, mut rx) = tokio::sync::mpsc::channel(64);
@@ -17113,11 +17085,7 @@ mod tests {
         );
         let canonical = ctx.sessions.get_agent("s-reuse").await.unwrap();
 
-        // ── Same session RESUMED after the retained environment is gone ──
-        // The reconnect re-registers the same id under a new epoch carrying no
-        // environment (the value `retained_tui_env` produces once the operator
-        // entitlement that kept it is lost). Resuming must re-derive the shell
-        // tool's environment, not keep the sentinel cloned in at construction.
+        // ── A different registration cannot mutate the same incarnation ──
         let epoch = ctx
             .tui_registry
             .register(crate::rpc::tui_identity::TuiEntry {
@@ -17136,23 +17104,18 @@ mod tests {
             json!({"agent_alias": "test-agent", "session_id": "s-reuse"}),
         )
         .await;
-        assert_eq!(
-            response["result"]["session_id"],
-            json!("s-reuse"),
-            "{response}"
-        );
+        assert_eq!(response["error"]["code"], FORBIDDEN, "{response}");
         assert!(
             Arc::ptr_eq(
                 &canonical,
                 &ctx.sessions.get_agent("s-reuse").await.unwrap()
             ),
-            "the resume rebinds the SAME canonical incarnation, not a fresh build"
+            "the refused resume leaves the canonical incarnation in place"
         );
-        let after = wait_for_shell_env(&ctx, "s-reuse", |env| !env.contains("REUSE_SOCK")).await;
+        let after = session_shell_env(&ctx, "s-reuse").await;
         assert!(
-            !after.contains("REUSE_SOCK"),
-            "resuming under a connection with no retained environment must drop the \
-             environment the first incarnation carried:\n{after}"
+            after.contains("REUSE_SOCK=/tmp/reuse.sock"),
+            "a refused resume must not change the shell environment:\n{after}"
         );
 
         // ── Permitted continuity: re-registering the SAME environment keeps it ──
@@ -17176,10 +17139,7 @@ mod tests {
             json!("s-reuse"),
             "{response}"
         );
-        let restored = wait_for_shell_env(&ctx, "s-reuse", |env| {
-            env.contains("REUSE_SOCK=/tmp/reuse.sock")
-        })
-        .await;
+        let restored = session_shell_env(&ctx, "s-reuse").await;
         assert!(
             restored.contains("REUSE_SOCK=/tmp/reuse.sock"),
             "an unchanged retained environment survives reuse:\n{restored}"
@@ -17187,7 +17147,9 @@ mod tests {
     }
 
     /// A session built with NO forwarded environment stays environment-free
-    /// across reuse — the rebind never invents one.
+    /// across reuse; a matching empty registration is still compatible, and a
+    /// connection that now forwards a map is refused instead of grafting it
+    /// onto the live incarnation.
     #[cfg(unix)]
     #[tokio::test]
     async fn resuming_an_environment_free_session_stays_environment_free() {
@@ -17222,6 +17184,39 @@ mod tests {
                 "{response}"
             );
         }
+        let canonical = ctx.sessions.get_agent("s-empty").await.unwrap();
+
+        // ── An environment-bearing registration cannot resume it ──
+        register_tui_env(
+            &ctx,
+            &mut client,
+            "tui_empty0001",
+            "REUSE_SOCK",
+            "/tmp/reuse.sock",
+        );
+        let response = rpc(
+            &mut client,
+            &mut rx,
+            3,
+            "session/new",
+            json!({"agent_alias": "test-agent", "session_id": "s-empty"}),
+        )
+        .await;
+        assert_eq!(response["error"]["code"], FORBIDDEN, "{response}");
+        assert!(
+            response["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("environment differs"),
+            "{response}"
+        );
+        assert!(
+            Arc::ptr_eq(
+                &canonical,
+                &ctx.sessions.get_agent("s-empty").await.unwrap()
+            ),
+            "the refused resume leaves the canonical incarnation in place"
+        );
         let env = session_shell_env(&ctx, "s-empty").await;
         assert!(
             !env.contains("REUSE_SOCK") && !env.contains("SENTINEL"),
@@ -17401,6 +17396,10 @@ mod tests {
 
     async fn environment_principal_fixture(tmp: &tempfile::TempDir) -> RpcDispatcher {
         let mut config = principal_test_config(tmp, &["*"], &["*"]);
+        let risk = config.risk_profiles.get_mut("test-profile").unwrap();
+        risk.allowed_tools.push("shell".into());
+        risk.allowed_commands = vec!["env".into()];
+        std::fs::create_dir_all(config.agent_workspace_dir("test-agent")).unwrap();
         config
             .permission_profiles
             .get_mut("principal-test")
@@ -17441,6 +17440,141 @@ mod tests {
             .unwrap()
             .admin = false;
         dispatcher.ctx.auth.refresh_from_config(&config).unwrap();
+    }
+
+    #[cfg(unix)]
+    struct ShellEnvironmentProbe(Arc<std::sync::Mutex<Option<String>>>);
+
+    #[cfg(unix)]
+    #[async_trait]
+    impl zeroclaw_api::model_provider::ModelProvider for ShellEnvironmentProbe {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("unused".to_string())
+        }
+
+        async fn chat(
+            &self,
+            request: zeroclaw_providers::ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<zeroclaw_providers::ChatResponse> {
+            if let Some(result) = request
+                .messages
+                .iter()
+                .rev()
+                .find(|message| message.role == "tool")
+            {
+                *self.0.lock().unwrap() = Some(result.content.clone());
+                return Ok(zeroclaw_providers::ChatResponse {
+                    text: Some("environment checked".to_string()),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    reasoning_content: None,
+                });
+            }
+            Ok(zeroclaw_providers::ChatResponse {
+                text: None,
+                tool_calls: vec![zeroclaw_providers::ToolCall {
+                    id: "shell-env".to_string(),
+                    name: "shell".to_string(),
+                    arguments: json!({"command": "env", "approved": true}).to_string(),
+                    extra_content: None,
+                }],
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    #[cfg(unix)]
+    impl zeroclaw_api::attribution::Attributable for ShellEnvironmentProbe {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Provider(
+                zeroclaw_api::attribution::ProviderKind::Model(
+                    zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "shell-environment-probe"
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn demoted_principal_cannot_restore_environment_on_fresh_session_resume() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = environment_principal_fixture(&tmp).await;
+        let ctx = Arc::clone(&dispatcher.ctx);
+        demote_environment_principal(&dispatcher);
+        assert!(!registered_env(&ctx, &dispatcher).is_empty());
+        // This probe exercises the shell result, not the operator approval
+        // channel. Keep shell execution automatic after preserving its grant.
+        ctx.config
+            .write()
+            .risk_profiles
+            .get_mut("test-profile")
+            .unwrap()
+            .level = zeroclaw_config::autonomy::AutonomyLevel::Full;
+
+        let params = json!({"agent_alias": "test-agent", "session_id": "env-fresh"});
+        dispatcher
+            .handle_session_new_for_test(&params)
+            .await
+            .unwrap();
+        assert_eq!(
+            ctx.sessions.has_forwarded_environment("env-fresh").await,
+            Some(false)
+        );
+        let agent = ctx.sessions.get_agent("env-fresh").await.unwrap();
+        let observed = Arc::new(std::sync::Mutex::new(None));
+        agent
+            .lock()
+            .await
+            .set_model_provider(Box::new(ShellEnvironmentProbe(Arc::clone(&observed))));
+
+        dispatcher
+            .handle_session_new_for_test(&params)
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(
+            &agent,
+            &ctx.sessions.get_agent("env-fresh").await.unwrap()
+        ));
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            dispatcher.handle_session_prompt(&json!({
+                "session_id": "env-fresh", "prompt": "Inspect the environment"
+            })),
+        )
+        .await
+        .expect("the shell probe must settle")
+        .unwrap();
+        let tool_result = observed
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the prompt executed shell env");
+        assert!(
+            tool_result.contains("ZEROCLAW_SESSION_ID=env-fresh"),
+            "the probe must observe a real shell run: {tool_result}"
+        );
+        assert!(
+            !tool_result.contains("ZEROCLAW_ENV_SENTINEL"),
+            "demoted owner recovered forwarded values: {tool_result}"
+        );
+        assert!(
+            !session_shell_env(&ctx, "env-fresh")
+                .await
+                .contains("ZEROCLAW_ENV_SENTINEL")
+        );
     }
 
     #[tokio::test]
