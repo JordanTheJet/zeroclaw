@@ -291,6 +291,11 @@ pub struct SessionStore {
     /// that reaches it.
     #[cfg(test)]
     test_upload_commit_pause: std::sync::Mutex<Option<RehydrateSeedPause>>,
+    /// Test-only hook an upload commit runs between its final authority
+    /// check and its write, while it holds the authority lease. Taken by the
+    /// first commit that reaches it.
+    #[cfg(test)]
+    test_upload_effect_hook: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 /// Generation-owned handle for the canonical cancellation-token registration.
@@ -356,6 +361,8 @@ impl SessionStore {
             test_rehydrate_seed_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
             test_upload_commit_pause: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            test_upload_effect_hook: std::sync::Mutex::new(None),
         }
     }
 
@@ -961,6 +968,26 @@ impl SessionStore {
     #[cfg(not(test))]
     #[inline(always)]
     async fn wait_test_upload_commit_pause(&self) {}
+
+    /// Arm a test-only hook for the next upload commit, run between its final
+    /// authority check and its write.
+    #[cfg(test)]
+    pub fn set_test_upload_effect_hook(&self, hook: impl FnOnce() + Send + 'static) {
+        *self.test_upload_effect_hook.lock().unwrap() = Some(Box::new(hook));
+    }
+
+    /// Run the hook armed by [`Self::set_test_upload_effect_hook`], if any.
+    #[cfg(test)]
+    pub(crate) fn run_test_upload_effect_hook(&self) {
+        let hook = self.test_upload_effect_hook.lock().unwrap().take();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    #[cfg(not(test))]
+    #[inline(always)]
+    pub(crate) fn run_test_upload_effect_hook(&self) {}
 
     pub async fn touch(&self, id: &str) {
         if let Some(s) = self.sessions.lock().await.get_mut(id) {

@@ -1246,6 +1246,27 @@ fn current_authority(
     Ok(grants)
 }
 
+/// [`current_authority`] answered from a held [`AuthorityLease`], so the
+/// decision stays in force until the lease is dropped.
+///
+/// [`AuthorityLease`]: crate::rpc::auth::AuthorityLease
+fn current_authority_under(
+    lease: &crate::rpc::auth::AuthorityLease<'_>,
+    auth: &crate::rpc::auth::ConnectionAuth,
+    method: Method,
+) -> Result<zeroclaw_api::grants::ResolvedGrants, crate::rpc::auth::AuthDenied> {
+    let grants = lease.current_grants(auth)?;
+    if let MethodAuthz::Requires(resource, verb) = method.authz()
+        && !grants.permits(resource, verb)
+    {
+        return Err(crate::rpc::auth::AuthDenied::forbidden(format!(
+            "Principal is not granted {resource}:{verb} (required by {})",
+            method.wire_name()
+        )));
+    }
+    Ok(grants)
+}
+
 impl RpcDispatcher {
     /// Fine-grained config-path selector. Composes with the coarse
     /// `Config` grant the gate already enforced: both are required.
@@ -9582,14 +9603,21 @@ impl RpcDispatcher {
     /// Everything that can wait happens before this: the owner check, the
     /// session reads, the chunk transfer, a path read. Here the session map
     /// lock is taken once, and under it, with no await in between, the
-    /// incarnation is confirmed unchanged, the caller's authority is
-    /// re-resolved against the policy in force now, and only then is the
-    /// file written and indexed. A credential, grant, or agent entitlement
-    /// revoked while the request waited, or a session closed, replaced, or
-    /// re-owned, stops the commit before any byte reaches disk.
+    /// incarnation is confirmed unchanged. Then the authority lease is taken
+    /// (see [`RpcInboundAuth::hold_authority`]), the caller's authority is
+    /// re-resolved from it, and the file is written and indexed before the
+    /// lease is dropped. A credential, grant, or agent entitlement revoked
+    /// while the request waited, or a session closed, replaced, or re-owned,
+    /// stops the commit before any byte reaches disk. A policy publication or
+    /// unpairing that arrives after the check waits for the lease, so it
+    /// completes after the upload is stored, never between the check and the
+    /// write.
     ///
-    /// Holding the session map across the write orders it with every session
-    /// change; the write is one file of at most `MAX_FILE_BYTES`.
+    /// The session map and the lease are held across one file write of at
+    /// most `MAX_FILE_BYTES`. Lock order: session map, then the authority
+    /// state, then the paired-token set; nothing takes them the other way.
+    ///
+    /// [`RpcInboundAuth::hold_authority`]: crate::rpc::auth::RpcInboundAuth::hold_authority
     async fn commit_upload(
         &self,
         method: Method,
@@ -9604,7 +9632,9 @@ impl RpcDispatcher {
                 target.generation,
                 target.owner.as_deref(),
                 |uploads| {
-                    self.recheck_upload_authority(method, target)?;
+                    let lease = self.ctx.auth.hold_authority();
+                    self.recheck_upload_authority(method, target, &lease)?;
+                    self.ctx.sessions.run_test_upload_effect_hook();
                     let upload_root = self
                         .ctx
                         .config
@@ -9626,21 +9656,24 @@ impl RpcDispatcher {
 
     /// The final authority check for an upload, made where it takes effect
     /// (see [`Self::commit_upload`]): the caller's authority re-resolved
-    /// against the policy in force now, including the method's
-    /// `files:create`, then the session owner and the agent entitlement
-    /// judged with those fresh grants rather than the ones stamped on the
-    /// connection before the wait.
+    /// from the held `lease`, including the method's `files:create`, then
+    /// the session owner and the agent entitlement judged with those fresh
+    /// grants rather than the ones stamped on the connection before the wait.
     fn recheck_upload_authority(
         &self,
         method: Method,
         target: &super::upload::UploadTarget,
+        lease: &crate::rpc::auth::AuthorityLease<'_>,
     ) -> Result<(), JsonRpcError> {
         // Only the direct unit-test handlers run unbound.
-        let Some(grants) = self.recheck_authority_after_admission(method)? else {
+        let Some(auth) = self.auth.as_ref() else {
             return Ok(());
         };
-        if let Some(auth) = self.auth.as_ref()
-            && !grants.admin
+        let grants = current_authority_under(lease, auth, method).map_err(|denied| {
+            self.audit_auth_denial(method, &denied);
+            rpc_err(denied.code, denied.message)
+        })?;
+        if !grants.admin
             && auth.principal.is_authenticated()
             && target.owner.as_deref() != Some(auth.principal.id.as_str())
         {
@@ -15581,6 +15614,202 @@ mod tests {
             "no file is written"
         );
         assert_eq!(upload_index_len(&ctx, sid).await, Some(0));
+    }
+
+    /// A revocation started from inside an upload commit, between its final
+    /// authority check and its write, and whether it could finish there.
+    struct RacedRevocation {
+        finished_before_the_write: Arc<std::sync::atomic::AtomicBool>,
+        thread: Arc<std::sync::Mutex<Option<std::thread::JoinHandle<()>>>>,
+    }
+
+    impl RacedRevocation {
+        /// Wait for the revocation to finish; returns whether it had already
+        /// finished before the commit wrote the upload.
+        fn settle(self) -> bool {
+            let thread = self.thread.lock().unwrap().take();
+            thread
+                .expect("the commit ran the hook")
+                .join()
+                .expect("the revocation completes");
+            self.finished_before_the_write
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    /// Arm the next upload commit to start `revoke` on another OS thread at
+    /// the point between its final authority check and its write, and to
+    /// give it a generous window to finish there before the write proceeds.
+    /// Nothing but the commit's hold on authority can keep a publication or
+    /// an unpairing, which take microseconds, from finishing in that window.
+    fn race_a_revocation_against_the_next_commit(
+        ctx: &Arc<RpcContext>,
+        revoke: impl FnOnce() + Send + 'static,
+    ) -> RacedRevocation {
+        let finished_before_the_write = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let thread = Arc::new(std::sync::Mutex::new(None));
+        let (finished, thread_slot) = (Arc::clone(&finished_before_the_write), Arc::clone(&thread));
+        ctx.sessions.set_test_upload_effect_hook(move || {
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let handle = std::thread::spawn(move || {
+                revoke();
+                let _ = done_tx.send(());
+            });
+            let done = done_rx
+                .recv_timeout(std::time::Duration::from_millis(500))
+                .is_ok();
+            finished.store(done, std::sync::atomic::Ordering::SeqCst);
+            *thread_slot.lock().unwrap() = Some(handle);
+        });
+        RacedRevocation {
+            finished_before_the_write,
+            thread,
+        }
+    }
+
+    /// A policy publication that revokes alice's agent entitlement lands
+    /// between the commit's final check and its write, through the real
+    /// publication path. It cannot finish until the upload is stored, so the
+    /// upload is ordered before the revocation, and the revocation binds the
+    /// next request.
+    #[tokio::test]
+    async fn a_publication_racing_the_final_check_finishes_only_after_the_upload_is_stored() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sid = "s-race-publication";
+        let (ctx, _agent_workspace) = upload_fixture(&tmp, sid).await;
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+        let upload_id = stage_upload(&mut alice, &mut rx, sid, b"ordered first", 1).await;
+
+        let revoking_ctx = Arc::clone(&ctx);
+        let race = race_a_revocation_against_the_next_commit(&ctx, move || {
+            narrow_alice_to_no_agents_via_publication(&revoking_ctx);
+        });
+        let committed = rpc(
+            &mut alice,
+            &mut rx,
+            10,
+            "file/upload/commit",
+            json!({"upload_id": upload_id}),
+        )
+        .await;
+        let path = committed["result"]["workspace_path"]
+            .as_str()
+            .unwrap_or_else(|| {
+                panic!("the upload checked before the publication lands: {committed}")
+            })
+            .to_string();
+        assert!(
+            !race.settle(),
+            "the publication must not finish between the final check and the write"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"ordered first");
+        assert_eq!(upload_index_len(&ctx, sid).await, Some(1));
+
+        let after = rpc(
+            &mut alice,
+            &mut rx,
+            11,
+            "file/upload/begin",
+            json!({"session_id": sid, "size_bytes": 1}),
+        )
+        .await;
+        assert_eq!(after["error"]["code"], json!(FORBIDDEN), "{after}");
+    }
+
+    /// The same race for credential revocation: the pairing token behind the
+    /// connection is unpaired between the final check and the write.
+    #[tokio::test]
+    async fn an_unpairing_racing_the_final_check_finishes_only_after_the_upload_is_stored() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sid = "s-race-unpair";
+        let (ctx, _agent_workspace, _backend) =
+            upload_fixture_owned_by(&tmp, sid, "user:alice", |config| {
+                config.gateway.paired_tokens = vec!["zc_tok".to_string()];
+            })
+            .await;
+        let (mut operator, mut rx) = local_peer(&ctx, 7777);
+        operator
+            .handle_initialize(&json!({"auth_token": "zc_tok"}))
+            .await
+            .expect("the paired token authenticates");
+        let upload_id = stage_upload(&mut operator, &mut rx, sid, b"paired when checked", 1).await;
+
+        let revoking_ctx = Arc::clone(&ctx);
+        let race = race_a_revocation_against_the_next_commit(&ctx, move || {
+            assert!(revoking_ctx.auth.pairing().revoke_token("zc_tok"));
+        });
+        let committed = rpc(
+            &mut operator,
+            &mut rx,
+            10,
+            "file/upload/commit",
+            json!({"upload_id": upload_id}),
+        )
+        .await;
+        let path = committed["result"]["workspace_path"]
+            .as_str()
+            .unwrap_or_else(|| panic!("the upload checked before the unpairing lands: {committed}"))
+            .to_string();
+        assert!(
+            !race.settle(),
+            "the unpairing must not finish between the final check and the write"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"paired when checked");
+
+        let after = rpc(
+            &mut operator,
+            &mut rx,
+            11,
+            "file/upload/begin",
+            json!({"session_id": sid, "size_bytes": 1}),
+        )
+        .await;
+        assert_eq!(after["error"]["code"], json!(AUTH_REQUIRED), "{after}");
+    }
+
+    /// A credential revoked while a commit waits for the session is refused
+    /// at the final check, with nothing written.
+    #[tokio::test]
+    async fn chunked_commit_parked_when_the_pairing_is_revoked_writes_nothing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sid = "s-park-unpair";
+        let (ctx, agent_workspace, _backend) =
+            upload_fixture_owned_by(&tmp, sid, "user:alice", |config| {
+                config.gateway.paired_tokens = vec!["zc_tok".to_string()];
+            })
+            .await;
+        let (mut operator, mut rx) = local_peer(&ctx, 7777);
+        operator
+            .handle_initialize(&json!({"auth_token": "zc_tok"}))
+            .await
+            .expect("the paired token authenticates");
+        let upload_id = stage_upload(&mut operator, &mut rx, sid, b"never stored", 1).await;
+        let files_before = files_under(&agent_workspace);
+
+        let change_ctx = Arc::clone(&ctx);
+        let refused = request_parked_at_the_commit(
+            &mut operator,
+            &mut rx,
+            &ctx,
+            10,
+            "file/upload/commit",
+            json!({"upload_id": upload_id}),
+            async move {
+                assert!(change_ctx.auth.pairing().revoke_token("zc_tok"));
+            },
+        )
+        .await;
+        assert_eq!(refused["error"]["code"], json!(AUTH_REQUIRED), "{refused}");
+        assert_eq!(
+            files_under(&agent_workspace),
+            files_before,
+            "no file is written"
+        );
+        assert_eq!(
+            upload_index_len(&ctx, sid).await,
+            Some(0),
+            "nothing is indexed"
+        );
     }
 
     /// A repeat of an indexed upload is not answered from the index alone:

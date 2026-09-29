@@ -233,7 +233,11 @@ checks the caller's credential, `files:create`, session ownership, and agent
 entitlement against the policy in force at that moment, and only then writes
 and indexes the file. A grant withdrawn while the upload was in progress, or
 a session closed or recreated under the same id, fails the commit before
-anything is written. `file/attach` stores through the same step and carries
+anything is written. The check and the write hold the accepted
+authorization policy and the set of paired tokens still, so a policy change or
+an unpairing that arrives after the check completes only once the file is
+stored: the upload is ordered before it, never between the check and the
+write. `file/attach` stores through the same step and carries
 the same ownership requirement.
 
 A repeat of an upload the session already indexed is checked against the file
