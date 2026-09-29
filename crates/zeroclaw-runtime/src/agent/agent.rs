@@ -18787,6 +18787,134 @@ mod capability_construction_tests {
         );
     }
 
+    /// Serves the first provider request (the agent's own construction) and
+    /// records every request; refuses the rest when `refuse_later` is set.
+    #[derive(Default)]
+    struct ServeFirstProviders {
+        refuse_later: bool,
+        seen: parking_lot::Mutex<Vec<crate::composition::test_support::SeenProviderRequest>>,
+    }
+
+    impl crate::composition::ProviderSource for ServeFirstProviders {
+        fn model_provider(
+            &self,
+            request: &crate::composition::ProviderRequest<'_>,
+        ) -> anyhow::Result<Arc<dyn ModelProvider>> {
+            let mut seen = self.seen.lock();
+            seen.push(crate::composition::test_support::SeenProviderRequest {
+                agent_alias: request.agent_alias.to_string(),
+                provider_ref: request.provider_ref.map(str::to_string),
+                model: request.model.map(str::to_string),
+                principal: request.principal.cloned(),
+            });
+            if self.refuse_later && seen.len() > 1 {
+                anyhow::bail!(crate::composition::test_support::REFUSAL);
+            }
+            Ok(Arc::new(crate::composition::test_support::StubProvider))
+        }
+    }
+
+    /// A `cron_run` registered on a capability-built agent runs the child
+    /// agent job on the agent's supplied capabilities. The child's provider is
+    /// asked of the source (for no principal, per the cron contract), and the
+    /// configured endpoint behind the counting fixture is never contacted,
+    /// whether the source serves the child or refuses it.
+    #[tokio::test]
+    async fn a_registered_cron_run_runs_the_child_job_on_the_supplied_capabilities() {
+        use crate::composition::test_support::{STUB_REPLY, counting_endpoint};
+
+        for refuse_later in [false, true] {
+            let endpoint = counting_endpoint().await;
+            let tmp = tempfile::TempDir::new().unwrap();
+            let mut config = two_provider_config(&tmp);
+            for entry in config.providers.models.openai.values_mut() {
+                entry.base.uri = Some(endpoint.url.clone());
+            }
+            config.scheduler.enabled = true;
+            let job = crate::cron::add_agent_job(
+                &config,
+                "test-agent",
+                Some("child".into()),
+                crate::cron::Schedule::Cron {
+                    expr: "0 8 * * *".into(),
+                    tz: None,
+                },
+                "say hello",
+                crate::cron::SessionTarget::Isolated,
+                None,
+                None,
+                false,
+                None,
+                false,
+            )
+            .expect("the child job is stored");
+            let providers = Arc::new(ServeFirstProviders {
+                refuse_later,
+                ..ServeFirstProviders::default()
+            });
+            let memory = Arc::new(RecordingMemory::default());
+            let principal = PrincipalId::for_oidc("https://issuer.example", "subject-cron");
+            let supplied = RuntimeCapabilities {
+                providers: Arc::clone(&providers) as Arc<dyn crate::composition::ProviderSource>,
+                memory: Arc::clone(&memory) as Arc<dyn crate::composition::MemorySource>,
+                tools: Arc::new(SuppliedTools),
+                channels: Arc::new(crate::composition::test_support::NoChannels),
+                observer: Arc::new(crate::observability::NoopObserver),
+            };
+
+            let agent = Agent::from_config_with_capabilities(
+                &config,
+                "test-agent",
+                &supplied,
+                Some(&principal),
+            )
+            .await
+            .expect("agent builds from supplied capabilities");
+            let cron_run = agent
+                .tools
+                .iter()
+                .find(|tool| tool.name() == "cron_run")
+                .expect("cron_run is registered");
+
+            let result = cron_run
+                .execute(serde_json::json!({"job_id": job.id}))
+                .await
+                .expect("cron_run returns a result");
+
+            let seen = providers.seen.lock();
+            assert!(
+                seen.len() >= 2,
+                "the agent and its cron child both ask the source: {seen:?}"
+            );
+            // Every request after the agent's own construction is the child's
+            // (the scheduler retries a failed attempt).
+            for child in &seen[1..] {
+                assert_eq!(child.agent_alias, "test-agent");
+                assert_eq!(
+                    child.principal, None,
+                    "cron children resolve for no principal"
+                );
+            }
+            if refuse_later {
+                assert!(
+                    !result.success,
+                    "a refused child must not succeed: {result:?}"
+                );
+                // Cron reports a generic failure to the caller rather than the
+                // source's error text; the zero-connection check below is what
+                // shows the refusal was not bypassed through config.
+            } else {
+                assert!(result.success, "child failed: {result:?}");
+                assert!(result.output.contains(STUB_REPLY), "{result:?}");
+            }
+            assert_eq!(
+                endpoint.connections(),
+                0,
+                "the configured endpoint was contacted (refuse_later = {refuse_later})"
+            );
+        }
+    }
+
     /// The registry's delegate resolves targets for the requesting principal,
     /// through a source that refuses anonymous requests.
     #[tokio::test]

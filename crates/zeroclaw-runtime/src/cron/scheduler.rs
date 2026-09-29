@@ -252,7 +252,7 @@ pub async fn run_manual_job(
     context: CronDeliveryContext,
     event_tx: &EventBroadcast,
 ) -> ManualCronRunResult {
-    run_manual_job_inner(config, job, context, event_tx, None, false).await
+    run_manual_job_inner(config, job, context, event_tx, None, false, None).await
 }
 
 pub(crate) async fn run_manual_job_with_runtime(
@@ -263,7 +263,40 @@ pub(crate) async fn run_manual_job_with_runtime(
     runtime: &dyn RuntimeAdapter,
     approved: bool,
 ) -> ManualCronRunResult {
-    run_manual_job_inner(config, job, context, event_tx, Some(runtime), approved).await
+    run_manual_job_inner(
+        config,
+        job,
+        context,
+        event_tx,
+        Some(runtime),
+        approved,
+        None,
+    )
+    .await
+}
+
+/// [`run_manual_job_with_runtime`] for a caller that holds capabilities, such
+/// as a `cron_run` tool bound by a supplied-capability turn: an agent job runs
+/// on `capabilities` instead of building a config-backed set.
+pub(crate) async fn run_manual_job_with_capabilities(
+    config: &Config,
+    job: &CronJob,
+    context: CronDeliveryContext,
+    event_tx: &EventBroadcast,
+    runtime: &dyn RuntimeAdapter,
+    approved: bool,
+    capabilities: &crate::composition::RuntimeCapabilities,
+) -> ManualCronRunResult {
+    run_manual_job_inner(
+        config,
+        job,
+        context,
+        event_tx,
+        Some(runtime),
+        approved,
+        Some(capabilities),
+    )
+    .await
 }
 
 async fn run_manual_job_inner(
@@ -273,6 +306,7 @@ async fn run_manual_job_inner(
     event_tx: &EventBroadcast,
     runtime: Option<&dyn RuntimeAdapter>,
     approved: bool,
+    capabilities: Option<&crate::composition::RuntimeCapabilities>,
 ) -> ManualCronRunResult {
     let started_at = Utc::now();
     // Resolve the executing identity exactly as execution will (a migrated
@@ -322,7 +356,8 @@ async fn run_manual_job_inner(
             finished_at,
         };
     }
-    let (success, output) = execute_job_now_with_runtime(config, job, runtime, approved).await;
+    let (success, output) =
+        execute_job_now_with_runtime(config, job, runtime, approved, capabilities).await;
     let finished_at = Utc::now();
     let duration_ms = (finished_at - started_at).num_milliseconds();
     let outcome = deliver_and_classify_run_result(config, job, success, output, context).await;
@@ -664,7 +699,7 @@ async fn skip_missed_jobs_on_startup(config: &Config) {
 }
 
 pub async fn execute_job_now(config: &Config, job: &CronJob) -> (bool, String) {
-    execute_job_now_with_runtime(config, job, None, false).await
+    execute_job_now_with_runtime(config, job, None, false, None).await
 }
 
 async fn execute_job_now_with_runtime(
@@ -672,6 +707,7 @@ async fn execute_job_now_with_runtime(
     job: &CronJob,
     runtime: Option<&dyn RuntimeAdapter>,
     approved: bool,
+    capabilities: Option<&crate::composition::RuntimeCapabilities>,
 ) -> (bool, String) {
     // Reject orphaned declarative jobs: a declarative row whose canonical
     // config declaration has been removed must not execute through any
@@ -707,7 +743,7 @@ async fn execute_job_now_with_runtime(
         job,
         runtime,
         approved,
-        None,
+        capabilities,
     ))
     .instrument(span)
     .await
@@ -2832,9 +2868,10 @@ mod tests {
         assert_eq!(seen[0].agent_alias, TEST_AGENT);
         assert_eq!(seen[0].principal, None);
         drop(seen);
+        let agents = memory.agents.lock();
         assert!(
-            memory.agents.lock().iter().all(|alias| alias == TEST_AGENT),
-            "the job's memory comes from the memory source"
+            !agents.is_empty() && agents.iter().all(|alias| alias == TEST_AGENT),
+            "the job's memory comes from the memory source: {agents:?}"
         );
     }
 

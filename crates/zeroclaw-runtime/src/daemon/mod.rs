@@ -2164,6 +2164,80 @@ async fn retry_heartbeat_mcp_registry(
     Ok(())
 }
 
+/// The store a heartbeat tick consolidates its output into.
+///
+/// With a generation's capabilities this is the heartbeat agent's memory from
+/// that generation's `MemorySource`; a refusal means the tick consolidates
+/// nothing, never that it falls back to a config-built store. Without them
+/// it is the config-built install memory, as it always was.
+async fn heartbeat_consolidation_memory(
+    config: &Config,
+    capabilities: Option<&crate::composition::RuntimeCapabilities>,
+    agent_alias: &str,
+) -> Option<std::sync::Arc<dyn zeroclaw_memory::Memory>> {
+    match capabilities {
+        Some(capabilities) => match capabilities.agent_memory(config, agent_alias).await {
+            Ok(memory) => Some(memory),
+            Err(error) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "agent": agent_alias,
+                            "error": format!("{error:#}"),
+                        })),
+                    "heartbeat: the memory source refused consolidation memory; not consolidating"
+                );
+                None
+            }
+        },
+        None => zeroclaw_memory::create_memory_from_config(
+            config,
+            config
+                .model_provider_for_agent(agent_alias)
+                .and_then(|e| e.api_key.as_deref()),
+        )
+        .ok()
+        .map(std::sync::Arc::from),
+    }
+}
+
+/// Store a heartbeat task's output as a Daily memory for cross-session
+/// awareness, when `[memory] auto_save` is on and the output is substantial.
+async fn consolidate_heartbeat_output(
+    config: &Config,
+    memory: Option<&dyn zeroclaw_memory::Memory>,
+    task_text: &str,
+    output: &str,
+) {
+    let Some(memory) = memory else {
+        return;
+    };
+    if !config.memory.auto_save || output.chars().count() < 50 {
+        return;
+    }
+    let key = format!("heartbeat_{}", uuid::Uuid::new_v4());
+    let summary = if output.len() > 500 {
+        // Find a valid UTF-8 char boundary at or before 500.
+        let mut end = 500;
+        while end > 0 && !output.is_char_boundary(end) {
+            end -= 1;
+        }
+        &output[..end]
+    } else {
+        output
+    };
+    let _ = memory
+        .store(
+            &key,
+            &format!("Heartbeat task '{task_text}': {summary}"),
+            zeroclaw_memory::MemoryCategory::Daily,
+            None,
+        )
+        .await;
+}
+
 /// One heartbeat turn: the generation's capabilities when the daemon has them,
 /// otherwise a config-backed set built for this turn, which is exactly what
 /// `agent::run` builds. `internal_principal` stamps the turn as the daemon's,
@@ -2452,14 +2526,8 @@ async fn run_heartbeat_worker(
             None
         };
 
-        let heartbeat_memory: Option<Box<dyn zeroclaw_memory::Memory>> =
-            zeroclaw_memory::create_memory_from_config(
-                &config,
-                config
-                    .model_provider_for_agent(&agent_alias)
-                    .and_then(|e| e.api_key.as_deref()),
-            )
-            .ok();
+        let heartbeat_memory =
+            heartbeat_consolidation_memory(&config, capabilities.as_ref(), &agent_alias).await;
 
         let mut tick_had_error = false;
         for task in &tasks_to_run {
@@ -2540,30 +2608,13 @@ async fn run_heartbeat_worker(
                         config.heartbeat.max_run_history,
                     );
                     // Consolidate heartbeat output to memory for cross-session awareness.
-                    if config.memory.auto_save
-                        && output.chars().count() >= 50
-                        && let Some(ref mem) = heartbeat_memory
-                    {
-                        let key = format!("heartbeat_{}", uuid::Uuid::new_v4());
-                        let summary = if output.len() > 500 {
-                            // Find a valid UTF-8 char boundary at or before 500.
-                            let mut end = 500;
-                            while end > 0 && !output.is_char_boundary(end) {
-                                end -= 1;
-                            }
-                            &output[..end]
-                        } else {
-                            &output
-                        };
-                        let _ = mem
-                            .store(
-                                &key,
-                                &format!("Heartbeat task '{}': {}", task.text, summary),
-                                zeroclaw_memory::MemoryCategory::Daily,
-                                None,
-                            )
-                            .await;
-                    }
+                    consolidate_heartbeat_output(
+                        &config,
+                        heartbeat_memory.as_deref(),
+                        &task.text,
+                        &output,
+                    )
+                    .await;
 
                     let announcement = if output.trim().is_empty() {
                         format!("💓 heartbeat task completed: {}", task.text)
@@ -2972,6 +3023,105 @@ fn has_supervised_channels(config: &Config) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `MemorySource` that serves one fixed store, or refuses.
+    struct FixedMemorySource(Option<std::sync::Arc<dyn zeroclaw_memory::Memory>>);
+
+    #[async_trait::async_trait]
+    impl crate::composition::MemorySource for FixedMemorySource {
+        async fn memory(
+            &self,
+            _request: &crate::composition::MemoryRequest<'_>,
+        ) -> anyhow::Result<std::sync::Arc<dyn zeroclaw_memory::Memory>> {
+            self.0
+                .clone()
+                .ok_or_else(|| anyhow::Error::msg("this memory source refuses"))
+        }
+    }
+
+    fn sqlite_memory_config(dir: &std::path::Path) -> Config {
+        let mut config = Config {
+            data_dir: dir.join("data"),
+            config_path: dir.join("config.toml"),
+            ..Config::default()
+        };
+        config.memory.backend = "sqlite".to_string();
+        config.memory.auto_save = true;
+        config
+    }
+
+    fn capabilities_with_memory(
+        memory: Option<std::sync::Arc<dyn zeroclaw_memory::Memory>>,
+    ) -> crate::composition::RuntimeCapabilities {
+        use crate::composition::test_support::{NoChannels, NoTools, RecordingProviders};
+        crate::composition::RuntimeCapabilities {
+            providers: std::sync::Arc::new(RecordingProviders::default()),
+            memory: std::sync::Arc::new(FixedMemorySource(memory)),
+            tools: std::sync::Arc::new(NoTools),
+            channels: std::sync::Arc::new(NoChannels),
+            observer: std::sync::Arc::new(crate::observability::NoopObserver),
+        }
+    }
+
+    async fn daily_records(memory: &dyn zeroclaw_memory::Memory) -> Vec<String> {
+        memory
+            .list(Some(&zeroclaw_memory::MemoryCategory::Daily), None)
+            .await
+            .expect("list daily records")
+            .into_iter()
+            .map(|entry| entry.content)
+            .collect()
+    }
+
+    /// With a generation's capabilities, heartbeat output consolidates into
+    /// the heartbeat agent's store from that generation's `MemorySource`, and
+    /// the config-built store is never written, not even after the source
+    /// refuses. Without capabilities the config-built store still receives it.
+    #[tokio::test]
+    async fn heartbeat_consolidates_into_the_generation_memory_source_not_config() {
+        let supplied_dir = tempfile::TempDir::new().unwrap();
+        let ambient_dir = tempfile::TempDir::new().unwrap();
+        let supplied_store: std::sync::Arc<dyn zeroclaw_memory::Memory> = std::sync::Arc::from(
+            zeroclaw_memory::create_memory_from_config(
+                &sqlite_memory_config(supplied_dir.path()),
+                None,
+            )
+            .expect("supplied store"),
+        );
+        let config = sqlite_memory_config(ambient_dir.path());
+        let ambient_store =
+            zeroclaw_memory::create_memory_from_config(&config, None).expect("ambient store");
+        let output = "Disk usage is at 42 percent; nothing needs attention right now.";
+        assert!(output.chars().count() >= 50);
+
+        // Supplied source: the record lands in the supplied store only.
+        let capabilities = capabilities_with_memory(Some(std::sync::Arc::clone(&supplied_store)));
+        let memory = heartbeat_consolidation_memory(&config, Some(&capabilities), "hb").await;
+        consolidate_heartbeat_output(&config, memory.as_deref(), "check disk", output).await;
+        let supplied = daily_records(supplied_store.as_ref()).await;
+        assert_eq!(supplied.len(), 1, "{supplied:?}");
+        assert!(
+            supplied[0].contains("Heartbeat task 'check disk'"),
+            "{supplied:?}"
+        );
+        assert!(
+            daily_records(ambient_store.as_ref()).await.is_empty(),
+            "the config-built store must not receive supplied-generation output"
+        );
+
+        // A refusing source: nothing is written anywhere.
+        let refusing = capabilities_with_memory(None);
+        let memory = heartbeat_consolidation_memory(&config, Some(&refusing), "hb").await;
+        assert!(memory.is_none(), "a refusal yields no consolidation store");
+        consolidate_heartbeat_output(&config, memory.as_deref(), "check disk", output).await;
+        assert!(daily_records(ambient_store.as_ref()).await.is_empty());
+        assert_eq!(daily_records(supplied_store.as_ref()).await.len(), 1);
+
+        // Unbound: the config-built store consolidates, as before.
+        let memory = heartbeat_consolidation_memory(&config, None, "hb").await;
+        consolidate_heartbeat_output(&config, memory.as_deref(), "check disk", output).await;
+        assert_eq!(daily_records(ambient_store.as_ref()).await.len(), 1);
+    }
     use tempfile::TempDir;
     use zeroclaw_config::schema::MattermostListenMode;
 

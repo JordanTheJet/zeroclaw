@@ -1236,9 +1236,16 @@ fn all_tools_with_runtime_on_thread(
         agent_alias,
         live_config.clone(),
     );
+    let cron_run_tool = CronRunTool::new_with_runtime(
+        config.clone(),
+        security.clone(),
+        agent_alias,
+        runtime.clone(),
+    );
     let mut capability_slots: Vec<crate::composition::CapabilitySlot> = vec![
         spawn_subagent_tool.capabilities_slot(),
         send_message_to_peer_tool.capabilities_slot(),
+        cron_run_tool.capabilities_slot(),
     ];
     let mut tool_arcs: Vec<Arc<dyn Tool>> = vec![
         Arc::new(RateLimitedTool::new(
@@ -1303,12 +1310,7 @@ fn all_tools_with_runtime_on_thread(
             agent_alias,
             runtime.clone(),
         )),
-        Arc::new(CronRunTool::new_with_runtime(
-            config.clone(),
-            security.clone(),
-            agent_alias,
-            runtime.clone(),
-        )),
+        Arc::new(cron_run_tool),
         Arc::new(CronRunsTool::new(config.clone(), agent_alias)),
         Arc::new(MemoryStoreTool::new(memory.clone(), security.clone())),
         Arc::new(MemoryRecallTool::new(memory.clone())),
