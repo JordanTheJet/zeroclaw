@@ -73,11 +73,18 @@ pub enum WebhookDispatch {
 /// procedure, evaluated at run admission on the normalized match set and
 /// after any decision-model wait (see [`SopAdmissionCheck`]). A procedure it
 /// refuses is reported as skipped with a `not authorized` reason.
+///
+/// `current_config` reads the daemon's live configuration. It is called for
+/// each driver after dispatch returns, not before, because dispatch can wait
+/// on a decision model: the driver checks that the step's agent is still
+/// configured and enabled and builds the step's tool policy from the
+/// configuration it is handed, so a copy taken before that wait would run an
+/// agent disabled or narrowed in the meantime under its former settings.
 pub async fn dispatch_webhook_event(
     engine: &Arc<Mutex<SopEngine>>,
     audit: &Arc<SopAuditLogger>,
     driver_handles: Option<&SopDriverHandles>,
-    config: &Config,
+    current_config: &(dyn Fn() -> Config + Sync),
     path: &str,
     payload: Option<&str>,
     admission_check: Option<SopAdmissionCheck<'_>>,
@@ -108,18 +115,19 @@ pub async fn dispatch_webhook_event(
         if let DispatchResult::Started { action, .. } = result
             && matches!(action.as_ref(), SopRunAction::ExecuteStep { .. })
         {
+            let config = current_config();
             match driver_handles {
                 Some(handles) => {
                     super::spawn_and_register_sop_driver(
                         handles,
-                        config.clone(),
+                        config,
                         Arc::clone(engine),
                         Some(Arc::clone(audit)),
                         action.as_ref().clone(),
                     );
                 }
                 None => drop(super::spawn_headless_run_driver(
-                    config.clone(),
+                    config,
                     Arc::clone(engine),
                     Some(Arc::clone(audit)),
                     action.as_ref().clone(),

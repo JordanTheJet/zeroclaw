@@ -10494,12 +10494,12 @@ impl RpcDispatcher {
             .payload
             .filter(|value| !value.is_null())
             .map(|value| value.to_string());
-        let config = self.ctx.config.read().clone();
+        let current_config = || self.ctx.config.read().clone();
         let dispatched = crate::sop::dispatch_webhook_event(
             engine,
             audit,
             self.ctx.sop_driver_handles.as_ref(),
-            &config,
+            &current_config,
             path,
             payload.as_deref(),
             Some(&admission_check),
@@ -21978,6 +21978,9 @@ mod tests {
         Publish(Box<zeroclaw_config::schema::Config>),
         /// Replace the loaded procedure with this definition.
         ReplaceSop(Box<crate::sop::types::Sop>),
+        /// Edit the daemon's live configuration, as `config/set` does,
+        /// leaving the caller's grants as they are.
+        EditLiveConfig(fn(&mut zeroclaw_config::schema::Config)),
     }
 
     /// The gated procedure: `gated-deploy`, run as `agent`, on `/sop/deploy`,
@@ -22018,6 +22021,24 @@ mod tests {
         Arc<std::sync::Mutex<crate::sop::SopEngine>>,
         tempfile::TempDir,
     ) {
+        dispatch_parked_at_the_decision_with(
+            gated_deploy_sop("alpha"),
+            dispatch_event_roster(&["alpha"]),
+            change,
+        )
+        .await
+    }
+
+    /// [`dispatch_parked_at_the_decision`] for a given procedure and roster.
+    async fn dispatch_parked_at_the_decision_with(
+        sop: crate::sop::types::Sop,
+        config: zeroclaw_config::schema::Config,
+        change: WhileParked,
+    ) -> (
+        RpcResult,
+        Arc<std::sync::Mutex<crate::sop::SopEngine>>,
+        tempfile::TempDir,
+    ) {
         let temp = tempfile::TempDir::new().unwrap();
         let consulted = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(tokio::sync::Notify::new());
@@ -22030,9 +22051,9 @@ mod tests {
                 "held".to_string(),
                 model,
             )]));
-        engine.set_sops_for_test(vec![gated_deploy_sop("alpha")]);
+        engine.set_sops_for_test(vec![sop]);
         let engine = Arc::new(std::sync::Mutex::new(engine));
-        let ctx = dispatch_event_ctx(dispatch_event_roster(&["alpha"]), &engine, &temp);
+        let ctx = dispatch_event_ctx(config, &engine, &temp);
         let alice = scoped_dispatcher(&ctx, 4242).await;
 
         let parked = std::sync::atomic::AtomicBool::new(false);
@@ -22049,6 +22070,7 @@ mod tests {
                 WhileParked::ReplaceSop(sop) => {
                     engine.lock().unwrap().set_sops_for_test(vec![*sop]);
                 }
+                WhileParked::EditLiveConfig(edit) => edit(&mut ctx.config.write()),
             }
             release.notify_one();
         };
@@ -22148,6 +22170,163 @@ mod tests {
         ))
         .await;
         assert_refused_with_no_run(result, &engine);
+    }
+
+    /// The gated procedure with one agent step owned by `alpha`. Started in
+    /// auto mode it goes to a headless driver rather than running inline, so
+    /// the configuration the driver is handed is what the step runs under.
+    fn gated_agent_step_sop() -> crate::sop::types::Sop {
+        let mut sop = gated_deploy_sop("alpha");
+        sop.execution_mode = crate::sop::types::SopExecutionMode::Auto;
+        sop.deterministic = false;
+        sop.steps = vec![crate::sop::types::SopStep {
+            number: 1,
+            title: "Deploy".to_string(),
+            kind: crate::sop::types::SopStepKind::Execute,
+            agent: Some("alpha".to_string()),
+            ..crate::sop::types::SopStep::default()
+        }];
+        sop
+    }
+
+    /// Alice's roster with `alpha`'s risk profile naming no configured
+    /// profile. The driver refuses a disabled owner before it builds a step
+    /// policy, and fails the step when the policy cannot be built, so either
+    /// outcome is recorded without a model turn ever running.
+    fn roster_with_unbuildable_alpha_policy() -> zeroclaw_config::schema::Config {
+        let mut config = dispatch_event_roster(&["alpha"]);
+        config
+            .agents
+            .get_mut("alpha")
+            .expect("the roster configures alpha")
+            .risk_profile = "no-such-profile".into();
+        config
+    }
+
+    fn started_run_id(result: RpcResult) -> String {
+        let result = result.expect("the caller's grants are unchanged, so the run is admitted");
+        assert_eq!(result["results"][0]["status"], "started", "{result}");
+        result["results"][0]["run_id"]
+            .as_str()
+            .expect("a started run carries its id")
+            .to_string()
+    }
+
+    /// The first step of `run_id` as the headless driver recorded it.
+    async fn driven_first_step(
+        engine: &Arc<std::sync::Mutex<crate::sop::SopEngine>>,
+        run_id: &str,
+    ) -> crate::sop::types::SopStepResult {
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            loop {
+                let recorded = engine.lock().unwrap().get_run(run_id).and_then(|run| {
+                    run.step_results
+                        .iter()
+                        .find(|result| result.step_number == 1)
+                        .cloned()
+                });
+                if let Some(result) = recorded {
+                    return result;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the headless driver records the first step")
+    }
+
+    /// Control: with the configuration unchanged while parked, the driver
+    /// resolves `alpha` as its enabled owner and goes on to build the step's
+    /// policy (which this roster makes unbuildable, so no turn runs).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sop_driver_unchanged_config_runs_as_the_configured_owner() {
+        let (result, engine, _temp) = dispatch_parked_at_the_decision_with(
+            gated_agent_step_sop(),
+            roster_with_unbuildable_alpha_policy(),
+            WhileParked::Nothing,
+        )
+        .await;
+        let run_id = started_run_id(result);
+        let step = driven_first_step(&engine, &run_id).await;
+        assert_eq!(step.effective_agent.as_deref(), Some("alpha"));
+        assert!(
+            step.output
+                .contains(crate::sop::executor::STEP_TURN_SCOPE_UNAVAILABLE),
+            "{}",
+            step.output
+        );
+    }
+
+    /// `alpha` is disabled while the decision model deliberates. The caller's
+    /// grants do not change, so the run is admitted, but the driver reads the
+    /// configuration after the wait and refuses the withdrawn agent: no step
+    /// policy is built and no turn runs as it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sop_driver_owner_disabled_while_parked_does_not_run() {
+        let (result, engine, _temp) = dispatch_parked_at_the_decision_with(
+            gated_agent_step_sop(),
+            roster_with_unbuildable_alpha_policy(),
+            WhileParked::EditLiveConfig(|config| {
+                config.agents.get_mut("alpha").unwrap().enabled = false;
+            }),
+        )
+        .await;
+        let run_id = started_run_id(result);
+        let step = driven_first_step(&engine, &run_id).await;
+        assert_eq!(step.status, crate::sop::types::SopStepStatus::Failed);
+        assert_eq!(
+            step.effective_agent, None,
+            "a refused step is attributed to no agent"
+        );
+        assert!(
+            step.output.contains("'alpha', which is disabled"),
+            "{}",
+            step.output
+        );
+    }
+
+    /// `alpha`'s risk profile is replaced while the decision model
+    /// deliberates. The step's tool policy is built from the configuration
+    /// after the wait: the new profile names nothing configured, so the step
+    /// fails on its policy instead of running under the profile `alpha` had
+    /// when the call arrived.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sop_driver_policy_changed_while_parked_builds_from_the_new_config() {
+        // Building a policy creates the agent's workspace under `data_dir`.
+        let data = tempfile::TempDir::new().unwrap();
+        let mut roster = dispatch_event_roster(&["alpha"]);
+        roster.data_dir = data.path().to_path_buf();
+        roster.config_path = data.path().join("config.toml");
+        roster.risk_profiles.insert(
+            "reviewer".into(),
+            zeroclaw_config::schema::RiskProfileConfig::default(),
+        );
+        roster
+            .agents
+            .get_mut("alpha")
+            .expect("the roster configures alpha")
+            .risk_profile = "reviewer".into();
+        assert!(
+            crate::sop::executor::step_turn_security(&roster, "alpha").is_ok(),
+            "the profile alpha starts with must build, or this test cannot tell the two apart"
+        );
+        let (result, engine, _temp) = dispatch_parked_at_the_decision_with(
+            gated_agent_step_sop(),
+            roster,
+            WhileParked::EditLiveConfig(|config| {
+                config.agents.get_mut("alpha").unwrap().risk_profile = "no-such-profile".into();
+            }),
+        )
+        .await;
+        let run_id = started_run_id(result);
+        let step = driven_first_step(&engine, &run_id).await;
+        assert_eq!(step.status, crate::sop::types::SopStepStatus::Failed);
+        assert!(
+            step.output
+                .contains(crate::sop::executor::STEP_TURN_SCOPE_UNAVAILABLE),
+            "{}",
+            step.output
+        );
     }
 
     #[test]

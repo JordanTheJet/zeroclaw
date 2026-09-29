@@ -59,12 +59,12 @@ pub(super) async fn dispatch_webhook_sop(
         return SopWebhookOutcome::Handled(unavailable());
     };
 
-    let config = state.config.read().clone();
+    let current_config = || state.config.read().clone();
     let (blocked_only, results) = match zeroclaw_runtime::sop::dispatch_webhook_event(
         engine,
         audit,
         state.sop_driver_handles.as_ref(),
-        &config,
+        &current_config,
         path,
         payload,
         None,
