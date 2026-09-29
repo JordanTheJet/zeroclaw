@@ -496,15 +496,13 @@ const MAX_TRACKED_IPS: usize = 4096;
 /// ([`MAX_CONTROL_FRAME`], 64 KiB) is the only bound a `Register` frame would
 /// otherwise hit, which is far too loose for a registry key that is retained
 /// per live daemon and echoed into status output and logs.
-pub const MAX_NODE_ID_LEN: usize = 128;
+pub use zeroclaw_relay_proto::MAX_NODE_ID_LEN;
 
 /// A node-id is a routing label, not free-form text: bounded, non-empty, and
 /// printable ASCII so it cannot smuggle control characters into operator
 /// surfaces or bloat the registry.
 fn valid_node_id(node_id: &str) -> bool {
-    !node_id.is_empty()
-        && node_id.len() <= MAX_NODE_ID_LEN
-        && node_id.chars().all(|c| c.is_ascii_graphic())
+    zeroclaw_relay_proto::is_valid_node_id(node_id)
 }
 
 struct Inner {

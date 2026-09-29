@@ -35,6 +35,9 @@ use zeroclaw_relay_proto::{
     ConnWindow, Control, INITIAL_WINDOW, MAX_CONTROL_FRAME, MAX_DATA_PAYLOAD, PEER_HINT_ENROLL,
     SUBPROTOCOL, TokenBucket, decode_data, encode_data,
 };
+/// The node-id rule a relay enforces at registration, for callers that persist a
+/// node-id (such as `relay claim`) and must not save one the relay refuses.
+pub use zeroclaw_relay_proto::{MAX_NODE_ID_LEN, is_valid_node_id};
 
 /// What the demux loop routes to a per-conn `bridge_conn` task: inbound inner
 /// bytes, plus the credit-window control frames (forwarded by the relay) that

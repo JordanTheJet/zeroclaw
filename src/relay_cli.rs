@@ -83,8 +83,8 @@ const MAX_CLAIM_RESPONSE_BYTES: usize = 64 * 1024;
 /// hostname, tight enough that a runaway value cannot bloat the written config.
 const MAX_RELAY_ADDR_LEN: usize = 255;
 
-/// Upper bound on the claimed node-id (an opaque ~32-hex capability in practice).
-const MAX_NODE_ID_LEN: usize = 128;
+/// Upper bound on the claimed node-id: the relay's own registration bound.
+const MAX_NODE_ID_LEN: usize = zeroclaw_runtime::relay::MAX_NODE_ID_LEN;
 
 /// A successful `/v1/claim` result: the relay to register against and the node-id
 /// bound to this daemon. Field names mirror the control plane's response body.
@@ -184,6 +184,14 @@ fn validate_node_id(node_id: &str) -> Result<()> {
         anyhow::bail!(
             "the control plane returned a `node_id` with whitespace or control characters; \
              no config was written"
+        );
+    }
+    // The relay registers only printable-ASCII node-ids. Anything else would be
+    // saved here and then refused at every registration.
+    if !zeroclaw_runtime::relay::is_valid_node_id(node_id) {
+        anyhow::bail!(
+            "the control plane returned a `node_id` the relay will not register (it must be \
+             printable ASCII); no config was written"
         );
     }
     Ok(())
@@ -359,7 +367,9 @@ fn refuse_claim_field_env_overrides(config: &Config) -> Result<()> {
     }
     let vars: Vec<String> = overridden
         .iter()
-        .map(|p| format!("ZEROCLAW_{}", p.replace('.', "__").to_uppercase()))
+        // The loader only reads `ZEROCLAW_<lowercase path>`, so name the exact
+        // variable; an upper-cased name is one the loader ignores.
+        .map(|p| format!("ZEROCLAW_{}", p.replace('.', "__")))
         .collect();
     anyhow::bail!(
         "these claim-managed settings are currently set by environment overrides: {}. \
@@ -708,6 +718,13 @@ mod tests {
         assert!(claim_outcome(200, "{\"node_id\":\"n\\u0000\",\"relay_addr\":\"h:1\"}").is_err());
         // Whitespace in the node-id.
         assert!(claim_outcome(200, r#"{"node_id":"n id","relay_addr":"h:1"}"#).is_err());
+        // Non-ASCII node-id: the relay refuses to register it.
+        let err = claim_outcome(200, r#"{"node_id":"n\u00f6de","relay_addr":"h:1"}"#)
+            .expect_err("a node-id the relay will not register must not be saved");
+        assert!(
+            format!("{err:#}").contains("no config was written"),
+            "{err:#}"
+        );
         // Over-long node-id.
         let huge = "n".repeat(MAX_NODE_ID_LEN + 1);
         let body = format!(r#"{{"node_id":"{huge}","relay_addr":"h:1"}}"#);
@@ -1089,6 +1106,11 @@ mod tests {
                 msg.contains("No request was sent"),
                 "the refusal must state that nothing was sent: {msg}"
             );
+            let var = format!("ZEROCLAW_{}", overridden.replace('.', "__"));
+            assert!(
+                msg.contains(&var),
+                "the refusal must name the variable the loader reads ({var}): {msg}"
+            );
             assert_eq!(
                 std::fs::read_to_string(&config.config_path).unwrap(),
                 before,
@@ -1096,6 +1118,24 @@ mod tests {
             );
         }
         // Mock `.expect(0)` is asserted on drop: no POST ever happened.
+    }
+
+    /// The refusal matches the paths the env-override loader records, which are
+    /// schema field names. A claim-managed path spelled any other way would
+    /// never match, and its override would be silently discarded again.
+    #[test]
+    fn claim_managed_paths_are_the_names_env_overrides_record() {
+        let fields: Vec<String> = Config::default()
+            .prop_fields()
+            .into_iter()
+            .map(|f| f.name)
+            .collect();
+        for path in CLAIM_MANAGED_PATHS {
+            assert!(
+                fields.iter().any(|f| f == path),
+                "{path} is not a schema field name, so an override of it is never detected"
+            );
+        }
     }
 
     #[tokio::test]
