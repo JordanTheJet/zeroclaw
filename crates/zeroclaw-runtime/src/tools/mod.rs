@@ -1784,12 +1784,26 @@ fn all_tools_with_runtime_on_thread(
 
     // Backup tool (enabled by default)
     if root_config.backup.enabled {
-        tool_arcs.push(Arc::new(BackupTool::new_with_data_root_and_security(
-            config.data_dir.clone(),
-            root_config.backup.include_dirs.clone(),
-            root_config.backup.max_keep,
-            security.clone(),
-        )));
+        // The install key lives beside the config file, as for every other
+        // SecretStore user; `encrypt` decides whether new backups use it.
+        let key_store = root_config
+            .config_path
+            .parent()
+            .map(|zeroclaw_dir| zeroclaw_config::secrets::SecretStore::new(zeroclaw_dir, true));
+        tool_arcs.push(Arc::new(
+            BackupTool::new_with_data_root_and_security(
+                config.data_dir.clone(),
+                root_config.backup.include_dirs.clone(),
+                root_config.backup.max_keep,
+                security.clone(),
+            )
+            .with_options(zeroclaw_tools::backup_tool::BackupOptions {
+                destination_dir: root_config.backup.destination_dir.clone(),
+                compress: root_config.backup.compress,
+                encrypt: root_config.backup.encrypt,
+                key_store,
+            }),
+        ));
     }
 
     // Data management tool (disabled by default)
