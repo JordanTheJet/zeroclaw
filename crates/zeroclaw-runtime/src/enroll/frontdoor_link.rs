@@ -46,8 +46,12 @@ fn relay_authority(relay_addr: &str) -> Option<String> {
     let mut rest = relay_addr.trim();
     // Only a TLS scheme is tolerated; the frontdoor is served over TLS. Any
     // other scheme (plaintext or unknown) yields no link rather than a guess.
+    // `get` rather than indexing: the prefix length can fall inside a multi-byte
+    // character of a non-ASCII host, where a byte slice would panic.
     for scheme in ["wss://", "https://"] {
-        if rest.len() >= scheme.len() && rest[..scheme.len()].eq_ignore_ascii_case(scheme) {
+        if let Some(prefix) = rest.get(..scheme.len())
+            && prefix.eq_ignore_ascii_case(scheme)
+        {
             rest = &rest[scheme.len()..];
             break;
         }
@@ -199,8 +203,31 @@ mod tests {
             let link = frontdoor_link(addr, NODE, CODE).expect("link");
             let (request_target, fragment) = link.split_once('#').expect("fragment form");
             assert!(!request_target.contains('?'), "no query string: {link}");
-            assert!(!request_target.contains(CODE), "code in request target: {link}");
+            assert!(
+                !request_target.contains(CODE),
+                "code in request target: {link}"
+            );
             assert_eq!(fragment, format!("node={NODE}&code={CODE}"));
+        }
+    }
+
+    /// A non-ASCII host puts a multi-byte character across the scheme-prefix
+    /// length (`relayé` has `é` at bytes 5..7, `wss://` is 6 bytes). That used
+    /// to panic on a byte slice; it must build the link like any other host.
+    #[test]
+    fn a_non_ascii_host_does_not_panic() {
+        for (addr, host) in [
+            ("relayé.example:443", "relayé.example"),
+            ("wss://relayé.example:9443/relay", "relayé.example:9443"),
+            ("https://ñ.example", "ñ.example"),
+            ("中继.example", "中继.example"),
+            ("é", "é"),
+        ] {
+            assert_eq!(
+                frontdoor_link(addr, NODE, CODE).as_deref(),
+                Some(format!("https://{host}/#node={NODE}&code={CODE}").as_str()),
+                "{addr}"
+            );
         }
     }
 
