@@ -40,9 +40,9 @@ pub use engine::{
     err_is_terminal_persistence_retained,
 };
 pub use executor::{
-    RegisteredSopDriver, SopDriverHandles, SopDriverRegistry, SopDriverSink, admit_sop_driver,
-    admit_sop_driver_for_run, drive_resumed_broker_action, spawn_and_register_sop_driver,
-    spawn_headless_run_driver,
+    RegisteredSopDriver, SopDriverConfig, SopDriverHandles, SopDriverRegistry, SopDriverSink,
+    admit_sop_driver, admit_sop_driver_for_run, drive_resumed_broker_action,
+    spawn_and_register_sop_driver, spawn_headless_run_driver,
 };
 pub use graph::{
     FlowRole, GraphDiagnostic, GraphLayout, GraphLegend, GraphNode, GraphPin, GraphSeverity,

@@ -10563,12 +10563,11 @@ impl RpcDispatcher {
             .payload
             .filter(|value| !value.is_null())
             .map(|value| value.to_string());
-        let current_config = || self.ctx.config.read().clone();
         let dispatched = crate::sop::dispatch_webhook_event(
             engine,
             audit,
             self.ctx.sop_driver_handles.as_ref(),
-            &current_config,
+            &self.ctx.config,
             path,
             payload.as_deref(),
             Some(&admission_check),
@@ -22335,23 +22334,11 @@ mod tests {
         let (result, engine, _temp) = dispatch_parked_at_the_decision_with(
             gated_agent_step_sop(),
             roster_with_unbuildable_alpha_policy(),
-            WhileParked::EditLiveConfig(|config| {
-                config.agents.get_mut("alpha").unwrap().enabled = false;
-            }),
+            WhileParked::EditLiveConfig(disable_alpha),
         )
         .await;
         let run_id = started_run_id(result);
-        let step = driven_first_step(&engine, &run_id).await;
-        assert_eq!(step.status, crate::sop::types::SopStepStatus::Failed);
-        assert_eq!(
-            step.effective_agent, None,
-            "a refused step is attributed to no agent"
-        );
-        assert!(
-            step.output.contains("'alpha', which is disabled"),
-            "{}",
-            step.output
-        );
+        assert_step_refused_disabled_owner(&driven_first_step(&engine, &run_id).await);
     }
 
     /// `alpha`'s risk profile is replaced while the decision model
@@ -22361,8 +22348,24 @@ mod tests {
     /// when the call arrived.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn sop_driver_policy_changed_while_parked_builds_from_the_new_config() {
-        // Building a policy creates the agent's workspace under `data_dir`.
         let data = tempfile::TempDir::new().unwrap();
+        let (result, engine, _temp) = dispatch_parked_at_the_decision_with(
+            gated_agent_step_sop(),
+            roster_with_buildable_alpha_policy(&data),
+            WhileParked::EditLiveConfig(make_alpha_policy_unbuildable),
+        )
+        .await;
+        let run_id = started_run_id(result);
+        assert_step_failed_on_its_policy(&driven_first_step(&engine, &run_id).await);
+    }
+
+    /// Alice's roster with `alpha` on a risk profile that builds. Building a
+    /// step policy creates the agent's workspace under `data_dir`, so that
+    /// points into `data`. Asserts the profile builds, or a test that changes
+    /// it could not tell the old configuration from the new one.
+    fn roster_with_buildable_alpha_policy(
+        data: &tempfile::TempDir,
+    ) -> zeroclaw_config::schema::Config {
         let mut roster = dispatch_event_roster(&["alpha"]);
         roster.data_dir = data.path().to_path_buf();
         roster.config_path = data.path().join("config.toml");
@@ -22377,18 +22380,37 @@ mod tests {
             .risk_profile = "reviewer".into();
         assert!(
             crate::sop::executor::step_turn_security(&roster, "alpha").is_ok(),
-            "the profile alpha starts with must build, or this test cannot tell the two apart"
+            "the profile alpha starts with must build"
         );
-        let (result, engine, _temp) = dispatch_parked_at_the_decision_with(
-            gated_agent_step_sop(),
-            roster,
-            WhileParked::EditLiveConfig(|config| {
-                config.agents.get_mut("alpha").unwrap().risk_profile = "no-such-profile".into();
-            }),
-        )
-        .await;
-        let run_id = started_run_id(result);
-        let step = driven_first_step(&engine, &run_id).await;
+        roster
+    }
+
+    fn make_alpha_policy_unbuildable(config: &mut zeroclaw_config::schema::Config) {
+        config.agents.get_mut("alpha").unwrap().risk_profile = "no-such-profile".into();
+    }
+
+    fn disable_alpha(config: &mut zeroclaw_config::schema::Config) {
+        config.agents.get_mut("alpha").unwrap().enabled = false;
+    }
+
+    /// The step was refused because its owner is disabled: it failed, is
+    /// attributed to no agent, and no policy or turn was built for it.
+    fn assert_step_refused_disabled_owner(step: &crate::sop::types::SopStepResult) {
+        assert_eq!(step.status, crate::sop::types::SopStepStatus::Failed);
+        assert_eq!(
+            step.effective_agent, None,
+            "a refused step is attributed to no agent"
+        );
+        assert!(
+            step.output.contains("'alpha', which is disabled"),
+            "{}",
+            step.output
+        );
+    }
+
+    /// The step resolved its owner and then failed building its policy from
+    /// an unbuildable profile, so no turn ran.
+    fn assert_step_failed_on_its_policy(step: &crate::sop::types::SopStepResult) {
         assert_eq!(step.status, crate::sop::types::SopStepStatus::Failed);
         assert!(
             step.output
@@ -22396,6 +22418,160 @@ mod tests {
             "{}",
             step.output
         );
+    }
+
+    /// [`gated_agent_step_sop`] named `name`, with no decision model: these
+    /// tests park the driver, not the dispatch. Each test uses its own name,
+    /// because the step-boundary pause is armed by procedure name.
+    fn agent_step_sop_named(name: &str) -> crate::sop::types::Sop {
+        let mut sop = gated_agent_step_sop();
+        sop.name = name.to_string();
+        sop.decision = None;
+        sop
+    }
+
+    fn agent_step_ctx(
+        sop: crate::sop::types::Sop,
+        config: zeroclaw_config::schema::Config,
+        temp: &tempfile::TempDir,
+    ) -> (
+        Arc<RpcContext>,
+        Arc<std::sync::Mutex<crate::sop::SopEngine>>,
+    ) {
+        let mut engine = crate::sop::SopEngine::new(zeroclaw_config::schema::SopConfig::default());
+        engine.set_sops_for_test(vec![sop]);
+        let engine = Arc::new(std::sync::Mutex::new(engine));
+        let ctx = dispatch_event_ctx(config, &engine, temp);
+        (ctx, engine)
+    }
+
+    fn deploy_event() -> Value {
+        json!({ "path": "/sop/deploy", "payload": { "ref": "main" } })
+    }
+
+    /// Dispatch the agent-step procedure `name` as alice and park its driver
+    /// at the step's execution boundary: past the decision, the run start,
+    /// the driver lease, generation admission and every engine lock the step
+    /// takes, and immediately before the step reads its configuration. Apply
+    /// `edit` to the live configuration there, release the driver, and return
+    /// the first step as it recorded it. This is the latest point a
+    /// configuration change can land before the step runs, so every earlier
+    /// wait is behind it.
+    async fn driver_step_after_edit_at_the_boundary(
+        name: &str,
+        config: zeroclaw_config::schema::Config,
+        edit: Option<fn(&mut zeroclaw_config::schema::Config)>,
+    ) -> crate::sop::types::SopStepResult {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (ctx, engine) = agent_step_ctx(agent_step_sop_named(name), config, &temp);
+        let alice = scoped_dispatcher(&ctx, 4242).await;
+        let (reached, release) = crate::sop::executor::step_boundary_pause::arm(name);
+        let run_id = started_run_id(alice.handle_sops_dispatch_event(&deploy_event()).await);
+        tokio::time::timeout(std::time::Duration::from_secs(20), reached.notified())
+            .await
+            .expect("the driver parks at the step's execution boundary");
+        assert!(
+            run_status(&engine, &run_id)
+                .is_some_and(|status| status == crate::sop::types::SopRunStatus::Running),
+            "parked with the run started and nothing recorded for the step yet"
+        );
+        if let Some(edit) = edit {
+            edit(&mut ctx.config.write());
+        }
+        release.notify_one();
+        driven_first_step(&engine, &run_id).await
+    }
+
+    /// Control: parked at the step's execution boundary with nothing
+    /// changed, the step resolves `alpha` and goes on to build its policy.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sop_driver_unchanged_at_the_step_boundary_runs_as_the_configured_owner() {
+        let step = driver_step_after_edit_at_the_boundary(
+            "boundary-unchanged",
+            roster_with_unbuildable_alpha_policy(),
+            None,
+        )
+        .await;
+        assert_eq!(step.effective_agent.as_deref(), Some("alpha"));
+        assert_step_failed_on_its_policy(&step);
+    }
+
+    /// `alpha` is disabled at the step's execution boundary, after every wait
+    /// the driver makes: the step is refused and nothing runs as `alpha`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sop_driver_owner_disabled_at_the_step_boundary_does_not_run() {
+        let step = driver_step_after_edit_at_the_boundary(
+            "boundary-disabled",
+            roster_with_unbuildable_alpha_policy(),
+            Some(disable_alpha),
+        )
+        .await;
+        assert_step_refused_disabled_owner(&step);
+    }
+
+    /// `alpha`'s risk profile is replaced at the step's execution boundary:
+    /// the step's policy is built from the replacement.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sop_driver_policy_changed_at_the_step_boundary_builds_from_the_new_config() {
+        let data = tempfile::TempDir::new().unwrap();
+        let step = driver_step_after_edit_at_the_boundary(
+            "boundary-policy",
+            roster_with_buildable_alpha_policy(&data),
+            Some(make_alpha_policy_unbuildable),
+        )
+        .await;
+        assert_step_failed_on_its_policy(&step);
+    }
+
+    /// The window between the dispatch handing its run to a driver and the
+    /// driver running: the run has started and the dispatch is waiting to
+    /// admit the driver into the generation (the test holds the generation's
+    /// driver registry, a production lock) when `alpha` is disabled. The
+    /// driver carries the live configuration through that wait and refuses
+    /// the withdrawn agent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sop_driver_owner_disabled_while_the_driver_awaits_admission_does_not_run() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (ctx, engine) = agent_step_ctx(
+            agent_step_sop_named("admission-wait-deploy"),
+            roster_with_unbuildable_alpha_policy(),
+            &temp,
+        );
+        let alice = scoped_dispatcher(&ctx, 4242).await;
+        let handles = ctx
+            .sop_driver_handles
+            .clone()
+            .expect("the context has driver handles");
+        // Hold the registry on a thread of its own, so no lock is held across
+        // this test's awaits.
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let _held = handles.lock().unwrap();
+            locked_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+        });
+        locked_rx.recv().expect("the registry is held");
+        let call = zeroclaw_spawn::spawn!(async move {
+            alice.handle_sops_dispatch_event(&deploy_event()).await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            while started_run_count(&engine) == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the run starts before its driver asks for admission");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            !call.is_finished(),
+            "the dispatch must be waiting to admit its driver when the change lands"
+        );
+        disable_alpha(&mut ctx.config.write());
+        release_tx.send(()).unwrap();
+        holder.join().expect("the registry holder does not panic");
+        let run_id = started_run_id(call.await.expect("the dispatch does not panic"));
+        assert_step_refused_disabled_owner(&driven_first_step(&engine, &run_id).await);
     }
 
     /// Run `call` on its own thread while this test holds the SOP engine

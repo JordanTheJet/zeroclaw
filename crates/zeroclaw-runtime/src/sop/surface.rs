@@ -10,7 +10,7 @@ use zeroclaw_config::schema::{Config, SopDecisionProvider};
 use super::audit::SopAuditLogger;
 use super::dispatch::{DispatchResult, SopAdmissionCheck, SopIngress, SopIngressOutcome};
 use super::engine::SopEngine;
-use super::executor::SopDriverHandles;
+use super::executor::{SopDriverConfig, SopDriverHandles};
 use super::types::{SopRunAction, SopTriggerSource};
 
 /// One `[decision_models.<alias>]` entry an SOP's `[decision] model` can
@@ -74,17 +74,17 @@ pub enum WebhookDispatch {
 /// after any decision-model wait (see [`SopAdmissionCheck`]). A procedure it
 /// refuses is reported as skipped with a `not authorized` reason.
 ///
-/// `current_config` reads the daemon's live configuration. It is called for
-/// each driver after dispatch returns, not before, because dispatch can wait
-/// on a decision model: the driver checks that the step's agent is still
-/// configured and enabled and builds the step's tool policy from the
-/// configuration it is handed, so a copy taken before that wait would run an
-/// agent disabled or narrowed in the meantime under its former settings.
+/// `live_config` is the daemon's live configuration, and each driver is handed
+/// the handle itself rather than a copy. Dispatch can wait on a decision
+/// model, and a driver waits for its lease, its generation and the engine
+/// lock before a step runs. The driver reads the configuration only at the
+/// step's execution boundary, after those waits, so an agent disabled or
+/// re-profiled during any of them does not run under its former settings.
 pub async fn dispatch_webhook_event(
     engine: &Arc<Mutex<SopEngine>>,
     audit: &Arc<SopAuditLogger>,
     driver_handles: Option<&SopDriverHandles>,
-    current_config: &(dyn Fn() -> Config + Sync),
+    live_config: &Arc<parking_lot::RwLock<Config>>,
     path: &str,
     payload: Option<&str>,
     admission_check: Option<SopAdmissionCheck<'_>>,
@@ -115,7 +115,7 @@ pub async fn dispatch_webhook_event(
         if let DispatchResult::Started { action, .. } = result
             && matches!(action.as_ref(), SopRunAction::ExecuteStep { .. })
         {
-            let config = current_config();
+            let config = SopDriverConfig::Live(Arc::clone(live_config));
             match driver_handles {
                 Some(handles) => {
                     super::spawn_and_register_sop_driver(
