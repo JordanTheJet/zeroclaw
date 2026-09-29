@@ -194,7 +194,75 @@ pub const RETIRED_KEYS: &[RetiredKey] = &[
         retirement: Retirement::Remove,
         reason: RETIRED_WATI,
     },
+    // Retired by the V2 -> V3 step, whose normalizer also surfaces the shared
+    // `[gateway.pairing_code]` policy. This entry covers files already at V3
+    // or later, which never pass through that step.
+    RetiredKey {
+        retired_in: 3,
+        path: &["gateway", "pairing_dashboard", "code_length"],
+        retirement: Retirement::Remove,
+        reason: "the dashboard no longer has its own pairing-code length; \
+                 `[gateway.pairing_code]` `length` sets it for every pairing surface",
+    },
+    // Also dropped by the V2 -> V3 step, which moves or discards them while
+    // restructuring. No current field reads them, so a V3 or later file that
+    // still holds one would otherwise keep it forever.
+    RetiredKey {
+        retired_in: 3,
+        path: &["swarms"],
+        retirement: Retirement::Remove,
+        reason: "swarms were removed in V3",
+    },
+    RetiredKey {
+        retired_in: 3,
+        path: &["reliability", "fallback_providers"],
+        retirement: Retirement::Remove,
+        reason: RETIRED_GLOBAL_FALLBACK,
+    },
+    RetiredKey {
+        retired_in: 3,
+        path: &["reliability", "model_fallbacks"],
+        retirement: Retirement::Remove,
+        reason: RETIRED_GLOBAL_FALLBACK,
+    },
+    RetiredKey {
+        retired_in: 3,
+        path: &["tts", "default_provider"],
+        retirement: Retirement::Remove,
+        reason: "there is no global default TTS provider; set `tts_provider` on each \
+                 `[agents.<alias>]` instead",
+    },
+    RetiredKey {
+        retired_in: 3,
+        path: &["transcription", "default_provider"],
+        retirement: Retirement::Remove,
+        reason: RETIRED_GLOBAL_TRANSCRIPTION,
+    },
+    RetiredKey {
+        retired_in: 3,
+        path: &["transcription", "default_model_provider"],
+        retirement: Retirement::Remove,
+        reason: RETIRED_GLOBAL_TRANSCRIPTION,
+    },
+    RetiredKey {
+        retired_in: 3,
+        path: &["transcription", "default_transcription_provider"],
+        retirement: Retirement::Remove,
+        reason: RETIRED_GLOBAL_TRANSCRIPTION,
+    },
+    RetiredKey {
+        retired_in: 3,
+        path: &["identity"],
+        retirement: Retirement::Remove,
+        reason: "identity is set per agent; move it to `[agents.<alias>.identity]`",
+    },
 ];
+
+const RETIRED_GLOBAL_FALLBACK: &str = "the global fallback lists were removed in V3; set \
+     `fallback` on each `[providers.models.<type>.<alias>]` instead";
+
+const RETIRED_GLOBAL_TRANSCRIPTION: &str = "there is no global default transcription provider; \
+     set `transcription_provider` on each `[agents.<alias>]` instead";
 
 const RETIRED_WATI: &str = "WATI support was removed; migrate to `[channels.whatsapp.<alias>]` \
      using the Cloud API or WhatsApp Web, then revoke the unused WATI API token";
@@ -4719,5 +4787,147 @@ summary_model = "opus"
                 "V{version}: only the retired table and the version may change"
             );
         }
+    }
+
+    // ── R1: the dashboard's retired pairing-code length ──
+
+    const RETIRED_CODE_LENGTH_BODY: &str = "locale = \"en\"\n\n\
+         [gateway.pairing_dashboard]\n\
+         code_length = 8\n\
+         code_ttl_secs = 3600\n\n\
+         [gateway.pairing_code]\n\
+         length = 20\n\
+         charset = \"unambiguous\"\n";
+
+    #[test]
+    fn retired_dashboard_code_length_is_removed_on_every_path() {
+        for version in [3, CURRENT_SCHEMA_VERSION] {
+            let raw = format!("schema_version = {version}\n{RETIRED_CODE_LENGTH_BODY}");
+            let expected = ["gateway.pairing_dashboard.code_length"];
+
+            let (migrated, notices) = migrate_file_with_notices(&raw)
+                .unwrap()
+                .unwrap_or_else(|| panic!("V{version}: the retired key must trigger a rewrite"));
+            assert_eq!(removed_paths(&notices), expected, "V{version}");
+            assert_eq!(
+                migrated,
+                format!(
+                    "schema_version = {CURRENT_SCHEMA_VERSION}\n{}",
+                    RETIRED_CODE_LENGTH_BODY.replace("code_length = 8\n", "")
+                ),
+                "V{version}: only the retired key and the version may change"
+            );
+
+            let load = migrate_to_current_salvaged(&raw);
+            assert_eq!(removed_paths(&load.notices), expected, "V{version} load");
+            assert_eq!(
+                load.config.gateway.pairing_code.length, 20,
+                "the live policy stays"
+            );
+
+            let (out, notices) = apply_doc(&raw);
+            assert_eq!(
+                removed_paths(&notices),
+                expected,
+                "V{version} document cleanup"
+            );
+            assert!(!out.contains("code_length") && out.contains("code_ttl_secs = 3600"));
+        }
+    }
+
+    /// Every other key the V2 -> V3 step drops, as found in a V3 or V4 file
+    /// next to the live keys of the same sections, which must stay.
+    const V3_RETIRED_BODY: &str = "locale = \"en\"\n\n\
+         [swarms.research]\nstrategy = \"sequential\"\n\n\
+         [reliability]\nprovider_retries = 3\nfallback_providers = [\"openai\"]\n\
+         model_fallbacks = { fast = [\"gpt-4o-mini\"] }\n\n\
+         [tts]\nenabled = true\ndefault_provider = \"openai\"\n\n\
+         [transcription]\nenabled = true\ndefault_provider = \"groq\"\n\
+         default_model_provider = \"groq\"\ndefault_transcription_provider = \"groq\"\n\n\
+         [identity]\nformat = \"openclaw\"\n";
+
+    const V3_RETIRED_PATHS: [&str; 8] = [
+        "identity",
+        "reliability.fallback_providers",
+        "reliability.model_fallbacks",
+        "swarms",
+        "transcription.default_model_provider",
+        "transcription.default_provider",
+        "transcription.default_transcription_provider",
+        "tts.default_provider",
+    ];
+
+    #[test]
+    fn keys_dropped_by_the_v3_step_are_retired_on_every_path() {
+        for version in [3, CURRENT_SCHEMA_VERSION] {
+            let raw = format!("schema_version = {version}\n{V3_RETIRED_BODY}");
+
+            let (migrated, notices) = migrate_file_with_notices(&raw)
+                .unwrap()
+                .unwrap_or_else(|| panic!("V{version}: retired keys must trigger a rewrite"));
+            assert_eq!(removed_paths(&notices), V3_RETIRED_PATHS, "V{version}");
+            let value: toml::Value = toml::from_str(&migrated).unwrap();
+            assert_eq!(
+                value["reliability"]["provider_retries"].as_integer(),
+                Some(3)
+            );
+            assert_eq!(value["tts"]["enabled"].as_bool(), Some(true));
+            assert_eq!(value["transcription"]["enabled"].as_bool(), Some(true));
+            assert_eq!(value["locale"].as_str(), Some("en"));
+            for gone in [
+                "swarms",
+                "fallback_providers",
+                "model_fallbacks",
+                "default_provider",
+                "default_model_provider",
+                "default_transcription_provider",
+                "[identity]",
+            ] {
+                assert!(
+                    !migrated.contains(gone),
+                    "V{version} kept {gone}:\n{migrated}"
+                );
+            }
+
+            let load = migrate_to_current_salvaged(&raw);
+            assert_eq!(
+                removed_paths(&load.notices),
+                V3_RETIRED_PATHS,
+                "V{version} load"
+            );
+            assert_eq!(load.config.reliability.provider_retries, 3);
+
+            let (out, notices) = apply_doc(&raw);
+            assert_eq!(
+                removed_paths(&notices),
+                V3_RETIRED_PATHS,
+                "V{version} cleanup"
+            );
+            assert!(out.contains("provider_retries = 3"), "{out}");
+        }
+    }
+
+    #[test]
+    fn a_v2_config_still_lifts_its_identity_into_agents() {
+        // The V3 entries apply only after the V2 -> V3 step, so that step
+        // still moves a top-level `[identity]` into the agents rather than
+        // the table deleting it first.
+        let raw = "schema_version = 2\n\n[identity]\nformat = \"openclaw\"\n\n\
+                   [agents.helper]\nprovider = \"openai\"\nmodel = \"gpt-4o-mini\"\n";
+        let migrated = migrate_to_current(raw).expect("a V2 config migrates");
+        assert!(
+            migrated
+                .agents
+                .values()
+                .any(|agent| agent.identity.format == "openclaw"),
+            "the identity must land on the agents"
+        );
+        let (_, notices) = migrate_file_with_notices(raw).unwrap().unwrap();
+        assert!(
+            !notices
+                .iter()
+                .any(|n| matches!(n, MigrationNotice::Removed { path, .. } if path == "identity")),
+            "a moved identity is not reported as removed: {notices:?}"
+        );
     }
 }

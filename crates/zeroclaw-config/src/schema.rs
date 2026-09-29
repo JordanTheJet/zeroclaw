@@ -40637,6 +40637,92 @@ bot_token = "enc:v1:UNRELATED-CIPHERTEXT-THAT-MUST-SURVIVE"
     }
 
     #[test]
+    async fn save_dirty_removes_retired_dashboard_code_length() {
+        // An unrelated incremental save must drop the retired dashboard
+        // length at V3 and V4 while keeping the live dashboard TTL and the
+        // shared pairing-code policy.
+        for version in [3, crate::migration::CURRENT_SCHEMA_VERSION] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let written = save_dirty_after_unrelated_edit(
+                tmp.path(),
+                &format!(
+                    "schema_version = {version}\n\n\
+                     [gateway.pairing_dashboard]\ncode_length = 8\ncode_ttl_secs = 3600\n\n\
+                     [gateway.pairing_code]\nlength = 20\ncharset = \"unambiguous\"\n\n\
+                     [observability]\nbackend = \"none\"\n"
+                ),
+            )
+            .await;
+            assert!(
+                !written.contains("code_length"),
+                "V{version}; got:\n{written}"
+            );
+            let reloaded = crate::migration::migrate_to_current_salvaged(&written);
+            assert!(
+                reloaded.notices.is_empty(),
+                "V{version}: {:?}",
+                reloaded.notices
+            );
+            assert_eq!(
+                reloaded.config.gateway.pairing_dashboard.code_ttl_secs,
+                3600
+            );
+            assert_eq!(reloaded.config.gateway.pairing_code.length, 20);
+            assert_eq!(
+                reloaded.config.observability.backend,
+                ObservabilityBackend::Otel
+            );
+        }
+    }
+
+    #[test]
+    async fn save_dirty_removes_keys_the_v3_step_retired() {
+        // Keys the V2 -> V3 step drops have no current field; a V3 or V4
+        // file still holding them must lose them on an unrelated save while
+        // the live keys beside them stay.
+        for version in [3, crate::migration::CURRENT_SCHEMA_VERSION] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let written = save_dirty_after_unrelated_edit(
+                tmp.path(),
+                &format!(
+                    "schema_version = {version}\n\n\
+                     [swarms.research]\nstrategy = \"sequential\"\n\n\
+                     [reliability]\nprovider_retries = 3\nfallback_providers = [\"openai\"]\n\n\
+                     [tts]\nenabled = true\ndefault_provider = \"openai\"\n\n\
+                     [transcription]\nenabled = true\ndefault_transcription_provider = \"groq\"\n\n\
+                     [identity]\nformat = \"openclaw\"\n\n\
+                     [observability]\nbackend = \"none\"\n"
+                ),
+            )
+            .await;
+            for gone in [
+                "swarms",
+                "fallback_providers",
+                "default_provider",
+                "default_transcription_provider",
+                "[identity]",
+            ] {
+                assert!(
+                    !written.contains(gone),
+                    "V{version} kept {gone}; got:\n{written}"
+                );
+            }
+            let reloaded = crate::migration::migrate_to_current_salvaged(&written);
+            assert!(
+                reloaded.notices.is_empty(),
+                "V{version}: {:?}",
+                reloaded.notices
+            );
+            assert_eq!(reloaded.config.reliability.provider_retries, 3);
+            assert!(reloaded.config.tts.enabled && reloaded.config.transcription.enabled);
+            assert_eq!(
+                reloaded.config.observability.backend,
+                ObservabilityBackend::Otel
+            );
+        }
+    }
+
+    #[test]
     async fn retired_key_doc_cleanup_handles_every_nevis_spelling() {
         // `[security.nevis]` header form, leaving a sibling key behind.
         let mut doc: toml_edit::DocumentMut =
