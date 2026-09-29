@@ -3577,6 +3577,15 @@ impl Agent {
         Ok(())
     }
 
+    /// This agent's provider source for its vision route: the supplied
+    /// source and principal of a capability-built agent, or `None` for an
+    /// adapter-built agent, which keeps the config-built vision route.
+    fn vision_provider_source(&self) -> Option<crate::agent::turn::VisionProviderSource<'_>> {
+        self.supplied_capabilities.as_ref().map(|supplied| {
+            crate::agent::turn::VisionProviderSource::from_binding(supplied, &self.agent_alias)
+        })
+    }
+
     fn try_apply_model_switch(
         &mut self,
         current_effective_model: &str,
@@ -3959,6 +3968,7 @@ impl Agent {
                     &selected_route.model,
                     &effective_model,
                     Some(self.security.as_ref()),
+                    self.vision_provider_source(),
                 )
                 .await
                 {
@@ -4434,6 +4444,7 @@ impl Agent {
                     &selected_route.model,
                     &effective_model,
                     Some(self.security.as_ref()),
+                    self.vision_provider_source(),
                 )
                 .await
                 {
@@ -18540,6 +18551,109 @@ mod capability_construction_tests {
             "a switch is not a session-start request"
         );
         assert_eq!(agent.model_provider_name, "openai.smart");
+    }
+
+    /// `two_provider_config` with `openai.smart` as the `[multimodal]` vision
+    /// route. The route's configured endpoint is unreachable, so a vision
+    /// provider built from config could only fail to connect; it can never
+    /// produce the supplied source's refusal or reply.
+    fn vision_route_config(tmp: &tempfile::TempDir) -> Config {
+        let mut config = two_provider_config(tmp);
+        config
+            .providers
+            .models
+            .openai
+            .get_mut("smart")
+            .expect("the fixture configures openai.smart")
+            .base
+            .uri = Some("http://127.0.0.1:9/v1".to_string());
+        config.multimodal.vision_model_provider = Some("openai.smart".to_string());
+        config
+    }
+
+    /// An image turn on a capability-built agent whose provider lacks vision
+    /// asks the supplied source for the configured vision route, for the
+    /// agent's principal, and a refusal ends the turn instead of falling back
+    /// to a config-built vision provider.
+    #[tokio::test]
+    async fn an_image_turn_asks_the_supplied_source_for_the_vision_route() {
+        use crate::composition::test_support::{
+            IMAGE_TURN, VISION_REFUSAL, VisionRouteProviders, capabilities_with_providers,
+        };
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = vision_route_config(&tmp);
+        let providers = Arc::new(VisionRouteProviders::refusing());
+        let principal = PrincipalId::for_oidc("https://issuer.example", "subject-vision");
+        let mut agent = Agent::from_config_with_capabilities(
+            &config,
+            "test-agent",
+            &capabilities_with_providers(Arc::clone(&providers) as _),
+            Some(&principal),
+        )
+        .await
+        .expect("agent builds from supplied capabilities");
+
+        let error = agent
+            .turn(IMAGE_TURN)
+            .await
+            .expect_err("the source refuses the vision route");
+        assert!(
+            format!("{error:#}").contains(VISION_REFUSAL),
+            "the source's refusal reaches the caller: {error:#}"
+        );
+        let vision = providers.vision.lock();
+        assert!(
+            !vision.is_empty(),
+            "the vision route is asked of the supplied source"
+        );
+        for request in vision.iter() {
+            assert_eq!(
+                request,
+                &SeenProviderRequest {
+                    agent_alias: "test-agent".into(),
+                    provider_ref: Some("openai.smart".into()),
+                    model: Some("gpt-4o".into()),
+                    principal: Some(principal.clone()),
+                }
+            );
+        }
+    }
+
+    /// The positive control: a source that serves the vision route answers
+    /// the image turn.
+    #[tokio::test]
+    async fn an_image_turn_is_served_by_the_supplied_vision_route() {
+        use crate::composition::test_support::{
+            IMAGE_TURN, VISION_REPLY, VisionRouteProviders, capabilities_with_providers,
+        };
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = vision_route_config(&tmp);
+        let providers = Arc::new(VisionRouteProviders::default());
+        let principal = PrincipalId::for_oidc("https://issuer.example", "subject-vision");
+        let mut agent = Agent::from_config_with_capabilities(
+            &config,
+            "test-agent",
+            &capabilities_with_providers(Arc::clone(&providers) as _),
+            Some(&principal),
+        )
+        .await
+        .expect("agent builds from supplied capabilities");
+
+        let reply = agent
+            .turn(IMAGE_TURN)
+            .await
+            .expect("the supplied vision route serves the turn");
+        assert!(reply.contains(VISION_REPLY), "unexpected reply: {reply}");
+        let vision = providers.vision.lock();
+        assert!(!vision.is_empty(), "the vision route came from the source");
+        assert!(
+            vision
+                .iter()
+                .all(|request| request.principal.as_ref() == Some(&principal)),
+            "every vision request carries the agent's principal: {vision:?}"
+        );
     }
 
     /// Supplied config-backed capabilities with no principal construct and

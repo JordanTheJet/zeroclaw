@@ -71,7 +71,9 @@ pub use steering::drain_steering_messages;
 #[cfg(test)]
 pub(crate) use stream_consume::consume_provider_streaming_response;
 pub(crate) use tool_specs::{IterationToolSpecs, build_iteration_tool_specs};
-pub(crate) use vision_route::{prepare_messages_for_iteration, resolve_vision_provider};
+pub(crate) use vision_route::{
+    VisionProviderSource, prepare_messages_for_iteration, resolve_vision_provider,
+};
 
 use crate::agent::execution_tree_budget::{ExecutionTreeBudget, ExecutionTreeReservation};
 use crate::agent::system_prompt::{NATIVE_TOOLS_TASK_FRAMING, NO_TOOLS_TASK_FRAMING};
@@ -1065,6 +1067,16 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         served_route_sink,
         sop_reassembly,
     } = p;
+    // A turn built from bound capabilities resolves its vision route through
+    // that binding's provider source, with its principal. The binding rides on
+    // the SOP reassembly context, the one place every capability-taking entry
+    // point hands this loop its sources.
+    let turn_vision_source = sop_reassembly
+        .as_ref()
+        .and_then(|reassembly| reassembly.capabilities)
+        .map(|binding| {
+            VisionProviderSource::from_binding(binding, agent_alias.unwrap_or_default())
+        });
     let mut loop_local_image_cache = None;
     let mut image_cache = Some(match image_cache {
         Some(cache) => cache,
@@ -1359,6 +1371,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                         &mut turn_state.crumb_present,
                         pending_reported_usage,
                         observer,
+                        turn_vision_source,
                     )
                     .await;
                     *history_has_trim_breadcrumb = turn_state.crumb_present;
@@ -1416,6 +1429,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             model,
             dispatch_model,
             security,
+            turn_vision_source,
         )
         .await?;
 
@@ -2693,6 +2707,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         &mut turn_state.crumb_present,
         pending_reported_usage,
         observer,
+        turn_vision_source,
     )
     .await;
     *history_has_trim_breadcrumb = turn_state.crumb_present;

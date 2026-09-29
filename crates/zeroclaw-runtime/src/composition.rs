@@ -226,6 +226,23 @@ pub trait ProviderSource: Send + Sync {
     ) -> anyhow::Result<Arc<dyn ModelProvider>> {
         self.model_provider(request)
     }
+
+    /// Return the provider that serves an image-bearing turn when the turn's
+    /// provider lacks vision and `[multimodal] vision_model_provider` names a
+    /// vision route. `provider_ref` is that route, `model` the vision model the
+    /// runtime resolved, and `principal` the one the turn was built for.
+    ///
+    /// Defaults to [`Self::model_provider`]. A refusal ends the turn's vision
+    /// routing; the runtime does not retry through config. Override it only
+    /// when a vision route resolves differently from starting a session on the
+    /// same reference, as the runtime's config-backed source does to keep the
+    /// existing vision-route construction.
+    fn vision_model_provider(
+        &self,
+        request: &ProviderRequest<'_>,
+    ) -> anyhow::Result<Arc<dyn ModelProvider>> {
+        self.model_provider(request)
+    }
 }
 
 /// What the runtime is asking a [`MemorySource`] for.
@@ -474,6 +491,118 @@ pub(crate) mod test_support {
             tools,
             channels: Arc::new(NoChannels),
             observer: Arc::new(crate::observability::NoopObserver),
+        }
+    }
+
+    /// Capabilities around `providers`, with no-op memory, tools and channels.
+    pub(crate) fn capabilities_with_providers(
+        providers: Arc<dyn ProviderSource>,
+    ) -> RuntimeCapabilities {
+        RuntimeCapabilities {
+            providers,
+            memory: Arc::new(RecordingMemory::default()),
+            tools: Arc::new(NoTools),
+            channels: Arc::new(NoChannels),
+            observer: Arc::new(crate::observability::NoopObserver),
+        }
+    }
+
+    pub(crate) const VISION_REFUSAL: &str = "this source does not serve the vision route";
+    pub(crate) const VISION_REPLY: &str = "vision stub reply";
+
+    /// A tiny valid PNG as an image marker, for image-bearing turns.
+    pub(crate) const IMAGE_TURN: &str = "describe this image [IMAGE:data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC]";
+
+    /// Serves session starts with the text-only [`StubProvider`], records
+    /// every vision-route request, and either refuses the route or serves it
+    /// with [`VisionStubProvider`].
+    #[derive(Default)]
+    pub(crate) struct VisionRouteProviders {
+        pub(crate) refuse_vision: bool,
+        pub(crate) seen: Mutex<Vec<SeenProviderRequest>>,
+        pub(crate) vision: Mutex<Vec<SeenProviderRequest>>,
+    }
+
+    impl VisionRouteProviders {
+        pub(crate) fn refusing() -> Self {
+            Self {
+                refuse_vision: true,
+                ..Self::default()
+            }
+        }
+    }
+
+    impl ProviderSource for VisionRouteProviders {
+        fn model_provider(
+            &self,
+            request: &ProviderRequest<'_>,
+        ) -> anyhow::Result<Arc<dyn ModelProvider>> {
+            self.seen
+                .lock()
+                .push(SeenProviderRequest::from_request(request));
+            Ok(Arc::new(StubProvider))
+        }
+
+        fn vision_model_provider(
+            &self,
+            request: &ProviderRequest<'_>,
+        ) -> anyhow::Result<Arc<dyn ModelProvider>> {
+            self.vision
+                .lock()
+                .push(SeenProviderRequest::from_request(request));
+            if self.refuse_vision {
+                anyhow::bail!(VISION_REFUSAL);
+            }
+            Ok(Arc::new(VisionStubProvider))
+        }
+    }
+
+    /// A vision-capable provider that answers every request with
+    /// [`VISION_REPLY`].
+    pub(crate) struct VisionStubProvider;
+
+    #[async_trait]
+    impl ModelProvider for VisionStubProvider {
+        fn supports_vision(&self) -> bool {
+            true
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok(VISION_REPLY.into())
+        }
+
+        async fn chat(
+            &self,
+            _request: zeroclaw_api::model_provider::ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<zeroclaw_api::model_provider::ChatResponse> {
+            Ok(zeroclaw_api::model_provider::ChatResponse {
+                text: Some(VISION_REPLY.into()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    impl zeroclaw_api::attribution::Attributable for VisionStubProvider {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Provider(
+                zeroclaw_api::attribution::ProviderKind::Model(
+                    zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "vision-stub"
         }
     }
 }

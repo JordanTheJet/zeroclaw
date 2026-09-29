@@ -136,6 +136,23 @@ impl ProviderSource for ConfigProviders {
         )?;
         Ok(Arc::from(provider))
     }
+
+    /// The vision route is built through the alias-aware factory the turn's
+    /// vision routing has always used, so its per-alias `vision` override,
+    /// endpoint and credentials are honored exactly as before.
+    fn vision_model_provider(
+        &self,
+        request: &ProviderRequest<'_>,
+    ) -> anyhow::Result<Arc<dyn ModelProvider>> {
+        let Some(provider_ref) = request.provider_ref else {
+            return self.model_provider(request);
+        };
+        let resolved = zeroclaw_providers::create_model_provider_from_ref_with_model(
+            request.config,
+            provider_ref,
+        )?;
+        Ok(Arc::from(resolved.provider))
+    }
 }
 
 /// Opens the agent's memory with the agent provider's credential, which

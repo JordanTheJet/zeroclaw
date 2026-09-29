@@ -22211,6 +22211,86 @@ mod capability_entry_point_tests {
         RiskProfileConfig,
     };
 
+    /// The shared turn loop resolves an image turn's vision route through the
+    /// turn's supplied source, for its principal, and stops at a refusal
+    /// rather than building the configured (unreachable) route from config.
+    #[tokio::test]
+    async fn process_message_asks_the_supplied_source_for_the_vision_route() {
+        use crate::composition::test_support::{
+            IMAGE_TURN, VISION_REFUSAL, VisionRouteProviders, capabilities_with_providers,
+        };
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Default::default()
+        };
+        config.memory.backend = "none".to_string();
+        config.memory.auto_save = false;
+        config
+            .risk_profiles
+            .insert("test-profile".to_string(), RiskProfileConfig::default());
+        for (alias, model) in [("fast", "gpt-4o-mini"), ("vision", "gpt-4o")] {
+            config.providers.models.openai.insert(
+                alias.to_string(),
+                OpenAIModelProviderConfig {
+                    base: ModelProviderConfig {
+                        model: Some(model.to_string()),
+                        // Unroutable: only the supplied source can answer.
+                        uri: Some("http://127.0.0.1:9".to_string()),
+                        ..Default::default()
+                    },
+                },
+            );
+        }
+        config.multimodal.vision_model_provider = Some("openai.vision".to_string());
+        config.agents.insert(
+            "test-agent".to_string(),
+            AliasedAgentConfig {
+                model_provider: "openai.fast".into(),
+                risk_profile: "test-profile".into(),
+                ..Default::default()
+            },
+        );
+        let providers = Arc::new(VisionRouteProviders::refusing());
+        let principal = PrincipalId::for_oidc("https://issuer.example", "subject-vision");
+
+        let error = super::process_message_with_capabilities(
+            Arc::new(config),
+            capabilities_with_providers(Arc::clone(&providers) as _),
+            Some(principal.clone()),
+            "test-agent",
+            IMAGE_TURN,
+            None,
+            TurnOrigin::SubTurn,
+            None,
+        )
+        .await
+        .expect_err("the source refuses the vision route");
+
+        assert!(
+            format!("{error:#}").contains(VISION_REFUSAL),
+            "the source's refusal reaches the caller: {error:#}"
+        );
+        let vision = providers.vision.lock();
+        assert!(
+            !vision.is_empty(),
+            "the vision route is asked of the source"
+        );
+        for request in vision.iter() {
+            assert_eq!(
+                request,
+                &SeenProviderRequest {
+                    agent_alias: "test-agent".into(),
+                    provider_ref: Some("openai.vision".into()),
+                    model: Some("gpt-4o".into()),
+                    principal: Some(principal.clone()),
+                }
+            );
+        }
+    }
+
     #[tokio::test]
     async fn process_message_serves_the_turn_from_the_supplied_provider_for_the_principal() {
         let tmp = tempfile::TempDir::new().unwrap();
