@@ -10049,19 +10049,11 @@ impl RpcDispatcher {
         // the principal must be entitled to every one of them before its
         // decision reaches the broker. The loaded run's procedure is what
         // executes, whatever is on disk.
-        if self.stamped_grants().is_some() {
-            let run_sop = {
-                let guard = engine
-                    .lock()
-                    .map_err(|_| rpc_err(INTERNAL_ERROR, "SOP engine lock poisoned"))?;
-                guard
-                    .get_run(&req.run_id)
-                    .and_then(|run| guard.get_sop(&run.sop_name))
-                    .cloned()
-            };
-            if let Some(run_sop) = run_sop {
-                self.authorize_sop_agents(Method::SopsDecide, &run_sop, true)?;
-            }
+        if let Some(grants) = self.stamped_grants() {
+            let guard = engine
+                .lock()
+                .map_err(|_| rpc_err(INTERNAL_ERROR, "SOP engine lock poisoned"))?;
+            self.authorize_decision_agents_with_grants(&guard, &req.run_id, grants)?;
         }
 
         let mut resolved_outcome = None;
@@ -10083,6 +10075,13 @@ impl RpcDispatcher {
                         req.run_id, run_sop_name, sop_name
                     ),
                 ));
+            }
+            // The entitlement check above used the grants stamped at the gate,
+            // before this lock was taken. Re-resolve the caller with the lock
+            // that resolves the decision held, so a grant or agent entitlement
+            // withdrawn while this request waited cannot resume the run.
+            if let Some(grants) = self.recheck_authority_after_admission(Method::SopsDecide)? {
+                self.authorize_decision_agents_with_grants(&guard, &req.run_id, &grants)?;
             }
             use crate::sop::approval::{BrokerOutcome, ResolveOutcome};
             let principal = self.approval_principal();
@@ -10410,6 +10409,29 @@ impl RpcDispatcher {
                     method.wire_name()
                 ),
             )),
+        }
+    }
+
+    /// The entitlement a checkpoint decision needs: approving resumes the run
+    /// headlessly as its loaded procedure's agents, so `grants` must allow
+    /// running every one of them. Reads the run from `engine`, whose lock the
+    /// caller holds. Admission passes the stamped grants and the recheck under
+    /// the lock that resolves the decision passes freshly resolved ones. A run
+    /// whose procedure is not loaded has no agents to check here.
+    fn authorize_decision_agents_with_grants(
+        &self,
+        engine: &crate::sop::SopEngine,
+        run_id: &str,
+        grants: &zeroclaw_api::grants::ResolvedGrants,
+    ) -> Result<(), JsonRpcError> {
+        match engine
+            .get_run(run_id)
+            .and_then(|run| engine.get_sop(&run.sop_name))
+        {
+            Some(run_sop) => {
+                self.authorize_sop_execution_with_grants(Method::SopsDecide, run_sop, grants)
+            }
+            None => Ok(()),
         }
     }
 
@@ -22529,6 +22551,67 @@ mod tests {
         );
         let error = cancel_parked_on_the_engine_lock(&ctx, &engine, alice, &run_id, Some(narrowed))
             .expect_err("a caller no longer entitled to the run's agent must not cancel");
+        assert_eq!(error.code, FORBIDDEN, "{}", error.message);
+        assert_eq!(run_state(&engine, &run_id), before);
+    }
+
+    /// A checkpoint run whose release group alice belongs to, by her
+    /// canonical principal id.
+    async fn alice_approves_checkpoint_fixture() -> (
+        Arc<RpcContext>,
+        Arc<std::sync::Mutex<crate::sop::SopEngine>>,
+        String,
+        tempfile::TempDir,
+    ) {
+        let (probe_ctx, _probe_engine, _probe_run, _probe_temp) =
+            make_checkpoint_rpc_fixture(1, &[], alice_roster);
+        let alice_id = scoped_dispatcher(&probe_ctx, 4242)
+            .await
+            .owner_principal_id()
+            .expect("a roster user has a canonical id");
+        make_checkpoint_rpc_fixture(1, &[&format!("principal:{alice_id}")], alice_roster)
+    }
+
+    fn approve_parked_on_the_engine_lock(
+        ctx: &Arc<RpcContext>,
+        engine: &Arc<std::sync::Mutex<crate::sop::SopEngine>>,
+        alice: RpcDispatcher,
+        run_id: &str,
+        change: Option<zeroclaw_config::schema::Config>,
+    ) -> RpcResult {
+        let params = json!({ "run_id": run_id, "decision": "approve" });
+        let runtime = tokio::runtime::Handle::current();
+        tokio::task::block_in_place(|| {
+            call_parked_on_the_engine_lock(ctx, engine, change, move || {
+                runtime.block_on(async move { alice.handle_sops_decide(&params).await })
+            })
+        })
+    }
+
+    /// Control: with nothing changed while the decision waits for the
+    /// engine, a group member's approval resumes the run.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sops_decide_unchanged_while_waiting_for_the_engine_resumes() {
+        let (ctx, engine, run_id, _temp) = alice_approves_checkpoint_fixture().await;
+        let alice = scoped_dispatcher(&ctx, 4242).await;
+        approve_parked_on_the_engine_lock(&ctx, &engine, alice, &run_id, None)
+            .expect("a group member's approval is accepted");
+        assert_ne!(
+            run_status(&engine, &run_id),
+            Some(crate::sop::types::SopRunStatus::PausedCheckpoint)
+        );
+    }
+
+    /// `sops:execute` is withdrawn while the decision waits for the engine:
+    /// the approval does not reach the broker and the run stays parked.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sops_decide_revoked_while_waiting_for_the_engine_has_no_effect() {
+        let (ctx, engine, run_id, _temp) = alice_approves_checkpoint_fixture().await;
+        let alice = scoped_dispatcher(&ctx, 4242).await;
+        let before = run_state(&engine, &run_id);
+        let revoked = roster_republished(&ctx, &["alpha"], &[zeroclaw_api::grants::Verb::Read]);
+        let error = approve_parked_on_the_engine_lock(&ctx, &engine, alice, &run_id, Some(revoked))
+            .expect_err("a caller whose execute grant was withdrawn must not approve");
         assert_eq!(error.code, FORBIDDEN, "{}", error.message);
         assert_eq!(run_state(&engine, &run_id), before);
     }
