@@ -543,21 +543,36 @@ pub async fn list_devices(State(state): State<AppState>, headers: HeaderMap) -> 
 /// row and the live token go in one synchronous step. A request dropped
 /// while it waits for the lock, by the gateway's request timeout say, leaves
 /// the device and its token in place, so the same revocation can simply be
-/// retried. Returns whether the device existed, and the held guard for
-/// persisting the token set under it.
-pub(crate) async fn revoke_device_credential(
+/// retried.
+///
+/// `reauthorize` checks the caller again once the lock is held, before
+/// anything is deleted. The caller was authenticated when the request
+/// arrived, but another revocation queued ahead of this one can revoke it
+/// while it waits: that caller is refused here and changes nothing, rather
+/// than deleting a device and, for a rotation, being handed a new pairing
+/// code. The caller keeps the returned guard until its response is decided.
+///
+/// Returns the refusal, or whether the device existed, and the held guard
+/// for persisting the token set under it.
+pub(crate) async fn revoke_device_credential<R>(
     state: &AppState,
     registry: &DeviceRegistry,
     device_id: &str,
-) -> (Result<bool, rusqlite::Error>, super::ConfigWriteGuard) {
+    reauthorize: impl FnOnce() -> Result<(), R>,
+) -> (
+    Result<Result<bool, rusqlite::Error>, R>,
+    super::ConfigWriteGuard,
+) {
     state
         .pairing
         .revoke_under_config_write_lock(state.config_write_lock.clone(), |pairing| {
-            let token_hash = registry.revoke(device_id)?;
-            if let Some(hash) = token_hash.as_deref() {
-                pairing.revoke_token_hash(hash);
-            }
-            Ok(token_hash.is_some())
+            reauthorize()?;
+            Ok(registry.revoke(device_id).map(|token_hash| {
+                if let Some(hash) = token_hash.as_deref() {
+                    pairing.revoke_token_hash(hash);
+                }
+                token_hash.is_some()
+            }))
         })
         .await
 }
@@ -580,8 +595,15 @@ pub async fn revoke_device(
             .into_response();
     };
 
-    let (revoked, config_write_guard) =
-        revoke_device_credential(&state, registry, &device_id).await;
+    let (reauthorized, config_write_guard) =
+        revoke_device_credential(&state, registry, &device_id, || {
+            require_auth(&state, &headers)
+        })
+        .await;
+    let revoked = match reauthorized {
+        Ok(revoked) => revoked,
+        Err(e) => return e.into_response(),
+    };
     match revoked {
         Ok(true) => {}
         Ok(false) => return (StatusCode::NOT_FOUND, "Device not found").into_response(),
@@ -686,8 +708,15 @@ pub async fn rotate_token(
             .into_response();
     };
 
-    let (revoked, config_write_guard) =
-        revoke_device_credential(&state, registry, &device_id).await;
+    let (reauthorized, config_write_guard) =
+        revoke_device_credential(&state, registry, &device_id, || {
+            require_auth(&state, &headers)
+        })
+        .await;
+    let revoked = match reauthorized {
+        Ok(revoked) => revoked,
+        Err(e) => return e.into_response(),
+    };
     match revoked {
         Ok(true) => {}
         Ok(false) => return (StatusCode::NOT_FOUND, "Device not found").into_response(),
@@ -716,10 +745,11 @@ pub async fn rotate_token(
         )
             .into_response();
     }
-    drop(config_write_guard);
 
-    // Issue the new pairing code atomically against the slot. If another
-    // flow holds the slot, the revoke still stands — return 200 with
+    // Issue the new pairing code while the config write guard is still held,
+    // so a revocation of this caller queued behind it cannot land between the
+    // check above and the code. The code is issued atomically against the
+    // slot. If another flow holds the slot, the revoke still stands — return 200 with
     // `pairing_code: null` and a message that tells the operator what
     // happened so they do not assume rotation failed.
     match state.pairing.generate_pairing_code_if_vacant(crate::live_pairing_code_policy(&state)) {
