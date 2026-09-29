@@ -39236,4 +39236,42 @@ mod tests {
         assert!(appended.get("error").is_none(), "{appended}");
         assert!(durable_holds(&backend, &format!("rpc_{sid}"), APPENDED));
     }
+
+    #[tokio::test]
+    async fn run_once_does_not_reveal_another_principals_session_id() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = session_cwd_config(&tmp, 4242, None);
+        let workspace = config.agent_workspace_dir("test-agent");
+        let (ctx, chat_backend, _acp_store) = persistence_enforcement_ctx(config);
+        let (provider, _handles) = scripted_turn_provider();
+        install_state_test_session_owned_at(
+            &ctx.sessions,
+            &chat_backend,
+            "s-bobs",
+            provider,
+            None,
+            Some("user:bob"),
+            &workspace,
+        )
+        .await;
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+
+        let response = rpc(
+            &mut alice,
+            &mut rx,
+            1,
+            "session/run-once",
+            json!({"agent_alias": "test-agent", "prompt": "hi", "session_id": "s-bobs"}),
+        )
+        .await;
+        assert_eq!(
+            response["error"]["code"],
+            json!(FORBIDDEN),
+            "another principal's id reads as not owned, not as already existing: {response}"
+        );
+        assert!(
+            ctx.sessions.get_agent("s-bobs").await.is_some(),
+            "run-once must not touch a session it did not create"
+        );
+    }
 }
