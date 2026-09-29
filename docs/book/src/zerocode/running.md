@@ -51,7 +51,11 @@ In the **Chat** and **Code** panes you can load or switch existing sessions with
 - **Switch session** opens the session list (default chord: Ctrl+S; rebindable in the keymap).
 - Use the list-navigation keys to move the selection (defaults: Up/Down).
 - **Enter** switches to the highlighted session.
-- **New session** starts fresh (default chord: Ctrl+N; rebindable).
+- **New session** opens the same add-agent picker as the sidebar `[+]` and adds a session for the agent you choose, leaving the focused session tracked (default chord: Ctrl+N; rebindable).
+
+Clicking a session row's body focuses it; clicking its right-edge `✕` closes that specific session without focusing it first.
+Use the Sessions header `[+]` to add a sibling session and `[-]` to close the focused session in the active pane.
+Closing a live session safely stops its current work while preserving durable history.
 
 Switching to an existing **Code** session resumes it at its own saved root,
 while **New session** starts fresh: at the selected agent's workspace over a

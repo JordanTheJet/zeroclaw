@@ -89,6 +89,7 @@ impl Acp {
         self.inner.add_agent_session(agent_alias).await;
     }
 
+    /// Close one tracked Code session while preserving its durable history.
     pub(crate) async fn close_session(&mut self, session_id: &str) -> bool {
         self.inner.close_session(session_id).await
     }
@@ -101,8 +102,47 @@ impl Acp {
         self.inner.tick_transport_events();
     }
 
-    pub(crate) fn draw(&mut self, frame: &mut ratatui::Frame, area: Rect) {
-        self.inner.draw(frame, area);
+    pub(crate) fn draw_with_dock(
+        &mut self,
+        frame: &mut ratatui::Frame,
+        area: Rect,
+        queue_area: Option<Rect>,
+        plan_area: Option<Rect>,
+    ) {
+        self.inner
+            .draw_with_dock(frame, area, queue_area, plan_area);
+    }
+
+    pub(crate) fn draw_dock_overlay(&self, frame: &mut ratatui::Frame) {
+        self.inner.draw_dock_overlay(frame);
+    }
+
+    pub(crate) fn context_menu_open(&self) -> bool {
+        self.inner.context_menu_open()
+    }
+
+    pub(crate) async fn handle_queue_mouse(&mut self, mouse: MouseEvent, area: Rect) {
+        self.inner.handle_queue_mouse(mouse, area).await;
+    }
+
+    pub(crate) async fn handle_context_menu_mouse(&mut self, mouse: MouseEvent) -> bool {
+        self.inner.handle_context_menu_mouse(mouse).await
+    }
+
+    pub(crate) fn plan_visible(&self) -> bool {
+        self.inner.plan_visible()
+    }
+
+    pub(crate) fn current_session_id(&self) -> Option<&str> {
+        self.inner.current_session_id()
+    }
+
+    pub(crate) fn set_plan_visible(&mut self, visible: bool) {
+        self.inner.set_plan_visible(visible);
+    }
+
+    pub(crate) fn take_plan_toggle_request(&mut self) -> bool {
+        self.inner.take_plan_toggle_request()
     }
 
     pub(crate) async fn handle_key(
@@ -135,6 +175,10 @@ impl Acp {
 
     pub(crate) fn take_help_request(&mut self) -> bool {
         self.inner.take_help_request()
+    }
+
+    pub(crate) fn take_add_session_request(&mut self) -> bool {
+        self.inner.take_add_session_request()
     }
 
     pub(crate) fn exit_browse_mode(&mut self) {

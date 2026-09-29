@@ -161,6 +161,10 @@ pub struct RpcContext {
     /// events as JSON-RPC notifications (`logs/subscribe`).
     pub event_tx: Option<tokio::sync::broadcast::Sender<Value>>,
 
+    /// Recent observer frames on the same bus (`events/history`). `None`
+    /// when there is no daemon event bus.
+    pub event_history: Option<Arc<crate::observability::EventBuffer>>,
+
     /// Write `true` to trigger a daemon-level config reload. Mirrors
     /// the gateway's `/admin/reload` mechanism.
     pub reload_tx: Option<tokio::sync::watch::Sender<bool>>,
@@ -267,6 +271,7 @@ impl RpcContext {
             memory: None,
             cost_tracker: None,
             event_tx: None,
+            event_history: None,
             reload_tx: None,
             gateway_shutdown_tx: None,
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -295,6 +300,7 @@ impl RpcContext {
             memory: None,
             cost_tracker: None,
             event_tx: None,
+            event_history: None,
             reload_tx: None,
             gateway_shutdown_tx: None,
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -332,6 +338,7 @@ impl RpcContext {
             memory: None,
             cost_tracker: None,
             event_tx: None,
+            event_history: None,
             reload_tx: None,
             gateway_shutdown_tx: None,
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -355,6 +362,32 @@ impl RpcContext {
         sessions: Arc<SessionStore>,
         event_tx: tokio::sync::broadcast::Sender<Value>,
     ) -> Arc<Self> {
+        Self::minimal_with_events(config, sessions, event_tx, None)
+    }
+
+    /// Like [`Self::minimal_with_event_tx`], wired to a whole daemon-style
+    /// [`EventBus`](crate::observability::EventBus): live sender and history.
+    #[cfg(test)]
+    pub fn minimal_with_event_bus(
+        config: Config,
+        sessions: Arc<SessionStore>,
+        bus: &crate::observability::EventBus,
+    ) -> Arc<Self> {
+        Self::minimal_with_events(
+            config,
+            sessions,
+            bus.sender().clone(),
+            Some(Arc::clone(bus.history())),
+        )
+    }
+
+    #[cfg(test)]
+    fn minimal_with_events(
+        config: Config,
+        sessions: Arc<SessionStore>,
+        event_tx: tokio::sync::broadcast::Sender<Value>,
+        event_history: Option<Arc<crate::observability::EventBuffer>>,
+    ) -> Arc<Self> {
         let auth = crate::rpc::auth::RpcInboundAuth::for_tests(&config);
         Arc::new(Self {
             config: Arc::new(RwLock::new(config)),
@@ -364,6 +397,7 @@ impl RpcContext {
             memory: None,
             cost_tracker: None,
             event_tx: Some(event_tx),
+            event_history,
             reload_tx: None,
             gateway_shutdown_tx: None,
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -396,6 +430,7 @@ impl RpcContext {
             memory: None,
             cost_tracker: None,
             event_tx: None,
+            event_history: None,
             reload_tx: None,
             gateway_shutdown_tx: None,
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -434,6 +469,7 @@ impl RpcContext {
             memory: None,
             cost_tracker: None,
             event_tx: None,
+            event_history: None,
             reload_tx: None,
             gateway_shutdown_tx: None,
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -465,6 +501,7 @@ impl RpcContext {
             memory: Some(memory),
             cost_tracker: None,
             event_tx: None,
+            event_history: None,
             reload_tx: None,
             gateway_shutdown_tx: None,
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -497,6 +534,7 @@ impl RpcContext {
             memory: None,
             cost_tracker: Some(cost_tracker),
             event_tx: None,
+            event_history: None,
             reload_tx: None,
             gateway_shutdown_tx: None,
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -530,6 +568,7 @@ impl RpcContext {
             memory: None,
             cost_tracker: None,
             event_tx: None,
+            event_history: None,
             reload_tx: None,
             gateway_shutdown_tx: None,
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -563,6 +602,7 @@ impl RpcContext {
             memory: None,
             cost_tracker: None,
             event_tx: None,
+            event_history: None,
             reload_tx,
             gateway_shutdown_tx,
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
