@@ -3154,8 +3154,9 @@ fn missing_schema_version_warns_and_migrates_instead_of_erroring() {
     let (_, notices) = migrate_file_with_notices(V1_FIXTURE).unwrap().unwrap();
     assert_eq!(notices.first(), Some(&MigrationNotice::AssumedV1));
 
-    // A modern config that only lost its `schema_version` line also migrates
-    // rather than erroring, warns, and loads without resetting any section.
+    // A modern config that only lost its `schema_version` line is plainly in
+    // the V3 shape, so it is read as V3 rather than V1: it migrates rather
+    // than erroring, says why, and loads without resetting any section.
     let unversioned: String = DEV_TEMPLATE
         .lines()
         .filter(|line| !line.starts_with("schema_version"))
@@ -3163,14 +3164,21 @@ fn missing_schema_version_warns_and_migrates_instead_of_erroring() {
         .join("\n");
     let (migrated, notices) = migrate_file_with_notices(&unversioned)
         .expect("an unversioned modern config does not error")
-        .expect("it is migrated from V1");
-    assert!(notices.contains(&MigrationNotice::AssumedV1), "{notices:?}");
+        .expect("it is migrated from V3");
+    assert!(
+        notices.contains(&MigrationNotice::InferredV3),
+        "{notices:?}"
+    );
+    assert!(
+        !notices.contains(&MigrationNotice::AssumedV1),
+        "{notices:?}"
+    );
     assert_eq!(
         detect_version(&toml::from_str(&migrated).unwrap()).unwrap(),
         CURRENT_SCHEMA_VERSION
     );
     let load = migrate_to_current_salvaged(&unversioned);
-    assert!(load.notices.contains(&MigrationNotice::AssumedV1));
+    assert!(load.notices.contains(&MigrationNotice::InferredV3));
     assert!(
         load.dropped.is_empty() && load.dropped_security.is_empty(),
         "dropped={:?} dropped_security={:?}",

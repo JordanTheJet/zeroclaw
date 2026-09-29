@@ -25630,7 +25630,8 @@ impl Config {
                 crate::migration::MigrationNotice::Removed { path, .. } => path.as_str(),
                 crate::migration::MigrationNotice::Renamed { from, .. }
                 | crate::migration::MigrationNotice::RenameConflict { from, .. } => from.as_str(),
-                crate::migration::MigrationNotice::AssumedV1 => continue,
+                crate::migration::MigrationNotice::AssumedV1
+                | crate::migration::MigrationNotice::InferredV3 => continue,
             };
             ::zeroclaw_log::record!(
                 INFO,

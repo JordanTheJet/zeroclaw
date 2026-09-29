@@ -22,6 +22,11 @@ pub enum MigrationNotice {
     /// from there. The V1 migration folds channel sections into a `default`
     /// alias, so a newer config missing only this key loses its aliases.
     AssumedV1,
+    /// The file has no `schema_version`, but its sections are plainly in the
+    /// V3 shape, so it was read as V3 and migrated from there (see
+    /// [`INFERRED_SCHEMA_VERSION`]). Nothing was reshaped; the key is missing
+    /// and should be added.
+    InferredV3,
     /// A retired key was removed.
     Removed { path: String, reason: &'static str },
     /// A retired key was moved to its replacement.
@@ -51,6 +56,10 @@ impl MigrationNotice {
                  written for a newer ZeroClaw, add `schema_version` at the top with the \
                  version it was written for, and restore any lost providers or channel \
                  aliases."
+                .to_string(),
+            Self::InferredV3 => "config has no `schema_version`, but its sections are in the V3 \
+                 format, so it was read as schema V3 and migrated from there. Run `zeroclaw \
+                 config migrate` to write the current `schema_version` into the file."
                 .to_string(),
             Self::Removed { path, reason } => {
                 format!("removed retired config key `{path}`: {reason}")
@@ -302,11 +311,20 @@ pub const V1_LEGACY_KEYS: &[&str] = &[
     "cron",
 ];
 
+/// The version a config with no `schema_version` key is read as when its
+/// sections are plainly in the V3 shape (see [`is_plainly_v3_shape`]).
+///
+/// Fixed at 3, not [`CURRENT_SCHEMA_VERSION`]: V3 is the newest shape such a
+/// file can be recognized by, and reading it as V3 runs every later migration
+/// step on it. Reading it as the current version would skip them.
+pub const INFERRED_SCHEMA_VERSION: u32 = 3;
+
 pub fn detect_version(value: &toml::Value) -> Result<u32> {
     let table = value
         .as_table()
         .context("config root must be a TOML table")?;
     match table.get("schema_version") {
+        None if is_plainly_v3_shape(table) => Ok(INFERRED_SCHEMA_VERSION),
         None => Ok(1),
         Some(toml::Value::Integer(n)) if *n >= 1 => Ok(*n as u32),
         Some(other) => {
@@ -319,6 +337,92 @@ pub fn detect_version(value: &toml::Value) -> Result<u32> {
             );
             anyhow::bail!("schema_version must be a positive integer, got {other}")
         }
+    }
+}
+
+/// [`V1_LEGACY_KEYS`] that are also top-level sections of the current schema
+/// (with a different shape), so their presence says nothing about the
+/// version. Kept in step with the schema by
+/// `v1_keys_still_current_are_exactly_the_current_top_level_sections`.
+const V1_KEYS_STILL_CURRENT: &[&str] = &["model_routes", "embedding_routes", "cron"];
+
+/// Whether a config with no `schema_version` key is unmistakably written in
+/// the V3 shape.
+///
+/// A missing key historically meant V1, since V1 files predate the key. But a
+/// hand-written or template-generated V3 file can omit it too, and running
+/// such a file through the V1 migration silently destroys it: alias-keyed
+/// channel sections collapse into `default` and the other aliases are
+/// dropped. So a missing key is read as V3 when the file carries the V3 shape
+/// and nothing older:
+///
+/// - no V1-only top-level key ([`V1_LEGACY_KEYS`] minus the keys still
+///   current);
+/// - at least one alias-keyed section, `providers.models.<family>` or
+///   `channels.<type>`, meaning a table whose every value is a table
+///   (`[providers.models.ollama.default]`, `[channels.discord.work]`);
+/// - no such section holding fields directly, which is the V2 shape
+///   (`[providers.models.ollama] model = "..."`, `[channels.discord]
+///   bot_token = "..."`).
+///
+/// Anything else keeps the V1 reading. A V4 file has the same shape, so an
+/// unversioned V4 file is read as V3 too; its V3 -> V4 step changes nothing
+/// it has not already done.
+fn is_plainly_v3_shape(table: &toml::Table) -> bool {
+    if V1_LEGACY_KEYS
+        .iter()
+        .filter(|key| !V1_KEYS_STILL_CURRENT.contains(key))
+        .any(|key| table.contains_key(*key))
+    {
+        return false;
+    }
+
+    let provider_families = table
+        .get("providers")
+        .and_then(toml::Value::as_table)
+        .and_then(|providers| providers.get("models"))
+        .and_then(toml::Value::as_table)
+        .into_iter()
+        .flat_map(toml::Table::values);
+    let channel_types = table
+        .get("channels")
+        .and_then(toml::Value::as_table)
+        .into_iter()
+        .flat_map(|channels| {
+            crate::schema::v2::V3_CHANNEL_TYPES
+                .iter()
+                .filter_map(|kind| channels.get(*kind))
+        });
+
+    let mut alias_keyed = false;
+    for section in provider_families.chain(channel_types) {
+        let Some(section) = section.as_table() else {
+            continue;
+        };
+        if section.is_empty() {
+            continue;
+        }
+        if section.values().all(toml::Value::is_table) {
+            alias_keyed = true;
+        } else {
+            // A field held directly on the section: the V2 shape.
+            return false;
+        }
+    }
+    alias_keyed
+}
+
+/// The notice for a config with no `schema_version` key, by the version it
+/// was read as: V1 by default, V3 when its shape leaves no doubt. `None` when
+/// the key is present.
+fn unversioned_notice(value: &toml::Value, detected: u32) -> Option<MigrationNotice> {
+    let unversioned = value
+        .as_table()
+        .is_some_and(|root| !root.contains_key("schema_version"));
+    match (unversioned, detected) {
+        (false, _) => None,
+        (true, INFERRED_SCHEMA_VERSION) => Some(MigrationNotice::InferredV3),
+        (true, _) => Some(MigrationNotice::AssumedV1),
     }
 }
 
@@ -364,13 +468,7 @@ fn migrate_toml(value: toml::Value) -> Result<Option<Migrated>> {
             "config schema_version {from} is newer than this binary supports ({CURRENT_SCHEMA_VERSION})"
         );
     }
-    let mut notices = Vec::new();
-    if value
-        .as_table()
-        .is_some_and(|root| !root.contains_key("schema_version"))
-    {
-        notices.push(MigrationNotice::AssumedV1);
-    }
+    let mut notices: Vec<MigrationNotice> = unversioned_notice(&value, from).into_iter().collect();
     let value = run_chain(value, from, &mut notices)?;
     log_notices(&notices);
     Ok(Some(Migrated { value, notices }))
@@ -408,7 +506,9 @@ pub fn migrate_file_with_notices(input: &str) -> Result<Option<(String, Vec<Migr
     if (FIRST_RETIREMENT_ONLY_VERSION..=CURRENT_SCHEMA_VERSION).contains(&from)
         && let Ok(mut doc) = input.parse::<toml_edit::DocumentMut>()
     {
-        let notices = apply_retired_keys_to_doc(doc.as_table_mut());
+        let mut notices: Vec<MigrationNotice> =
+            unversioned_notice(&value, from).into_iter().collect();
+        notices.extend(apply_retired_keys_to_doc(doc.as_table_mut()));
         if from == CURRENT_SCHEMA_VERSION && notices.is_empty() {
             return Ok(None);
         }
@@ -1410,7 +1510,7 @@ fn keep_emptied_tables_visible(root: &mut toml_edit::Table, notices: &[Migration
             MigrationNotice::Removed { path, .. } => path,
             MigrationNotice::Renamed { from, .. }
             | MigrationNotice::RenameConflict { from, .. } => from,
-            MigrationNotice::AssumedV1 => continue,
+            MigrationNotice::AssumedV1 | MigrationNotice::InferredV3 => continue,
         };
         let segments: Vec<&str> = from.split('.').collect();
         let parents = &segments[..segments.len().saturating_sub(1)];
@@ -4150,6 +4250,186 @@ client_secret = "plaintext-nevis-secret"
             unversioned.notices.first(),
             Some(&MigrationNotice::AssumedV1)
         );
+    }
+
+    // ── A missing `schema_version` on a plainly V3 file ─────────────
+
+    /// The case that lost a contributor's channels: a hand-written V3 file
+    /// with alias-keyed sections and no `schema_version`. It used to be read
+    /// as V1 and migrated, which collapsed `work`/`home` into `default`.
+    const HAND_WRITTEN_V3_WITHOUT_VERSION: &str = r#"
+[providers.models.ollama.default]
+model = "llama3"
+
+[channels.discord.work]
+enabled = true
+bot_token = "work-token"
+mention_only = true
+
+[channels.discord.home]
+enabled = true
+bot_token = "home-token"
+mention_only = false
+"#;
+
+    #[test]
+    fn a_plainly_v3_file_without_the_key_is_read_as_v3() {
+        let v: toml::Value = toml::from_str(HAND_WRITTEN_V3_WITHOUT_VERSION).unwrap();
+        assert_eq!(detect_version(&v).unwrap(), INFERRED_SCHEMA_VERSION);
+        assert_ne!(
+            INFERRED_SCHEMA_VERSION, CURRENT_SCHEMA_VERSION,
+            "read as the current version, the file would skip the V3 -> V4 step"
+        );
+    }
+
+    #[test]
+    fn an_inferred_v3_file_is_migrated_to_v4_and_keeps_every_channel_alias() {
+        let config =
+            migrate_to_current(HAND_WRITTEN_V3_WITHOUT_VERSION).expect("a V3-shaped file loads");
+        assert_eq!(config.schema_version, CURRENT_SCHEMA_VERSION);
+        let discord = &config.channels.discord;
+        assert!(discord.get("work").is_some_and(|work| work.mention_only));
+        assert!(discord.get("home").is_some_and(|home| !home.mention_only));
+        assert!(
+            !discord.contains_key("default"),
+            "nothing may be collapsed into a synthesized `default` alias"
+        );
+
+        let (migrated, notices) = migrate_file_with_notices(HAND_WRITTEN_V3_WITHOUT_VERSION)
+            .unwrap()
+            .expect("an inferred V3 file is carried to V4");
+        assert_eq!(notices, vec![MigrationNotice::InferredV3]);
+        assert_eq!(
+            detect_version(&toml::from_str(&migrated).unwrap()).unwrap(),
+            CURRENT_SCHEMA_VERSION
+        );
+        assert!(
+            migrated.contains("[channels.discord.work]")
+                && migrated.contains("[channels.discord.home]"),
+            "{migrated}"
+        );
+
+        let load = migrate_to_current_salvaged(HAND_WRITTEN_V3_WITHOUT_VERSION);
+        assert_eq!(load.notices, vec![MigrationNotice::InferredV3]);
+        assert!(load.dropped.is_empty() && load.dropped_security.is_empty());
+    }
+
+    #[test]
+    fn an_inferred_v3_file_still_loses_its_retired_keys() {
+        let raw = format!(
+            "{HAND_WRITTEN_V3_WITHOUT_VERSION}\n[agents.default]\nmax_tool_iterations = 7\n"
+        );
+        let (migrated, notices) = migrate_file_with_notices(&raw).unwrap().unwrap();
+        assert_eq!(notices.first(), Some(&MigrationNotice::InferredV3));
+        assert!(notices.iter().any(|n| matches!(
+            n,
+            MigrationNotice::Removed { path, .. } if path == "agents.default.max_tool_iterations"
+        )));
+        assert!(!migrated.contains("max_tool_iterations"), "{migrated}");
+        assert!(
+            !notices.contains(&MigrationNotice::AssumedV1),
+            "a V3 reading is not the V1 assumption"
+        );
+    }
+
+    #[test]
+    fn an_explicit_version_is_never_reported_as_inferred() {
+        let raw = format!("schema_version = 3\n{HAND_WRITTEN_V3_WITHOUT_VERSION}");
+        let v: toml::Value = toml::from_str(&raw).unwrap();
+        assert_eq!(detect_version(&v).unwrap(), 3);
+        let (_, notices) = migrate_file_with_notices(&raw).unwrap().unwrap();
+        assert!(
+            !notices.contains(&MigrationNotice::InferredV3)
+                && !notices.contains(&MigrationNotice::AssumedV1),
+            "{notices:?}"
+        );
+    }
+
+    #[test]
+    fn a_v2_shaped_file_without_the_key_keeps_the_v1_reading() {
+        // V2 held fields directly on the family and channel sections.
+        for raw in [
+            "[providers.models.ollama]\nmodel = \"llama3\"\n",
+            "[channels.discord]\nbot_token = \"t\"\nenabled = true\n",
+            // One alias-keyed section does not outvote a flat one.
+            "[providers.models.ollama.default]\nmodel = \"llama3\"\n\n[channels.discord]\nbot_token = \"t\"\n",
+        ] {
+            let v: toml::Value = toml::from_str(raw).unwrap();
+            assert_eq!(detect_version(&v).unwrap(), 1, "{raw}");
+            let (_, notices) = migrate_file_with_notices(raw).unwrap().unwrap();
+            assert_eq!(notices.first(), Some(&MigrationNotice::AssumedV1), "{raw}");
+        }
+    }
+
+    #[test]
+    fn a_v1_only_key_keeps_the_v1_reading() {
+        let raw = format!("default_model = \"gpt-4\"\n{HAND_WRITTEN_V3_WITHOUT_VERSION}");
+        let v: toml::Value = toml::from_str(&raw).unwrap();
+        assert_eq!(detect_version(&v).unwrap(), 1);
+    }
+
+    #[test]
+    fn keys_shared_with_the_current_schema_do_not_veto_the_inference() {
+        let raw =
+            format!("[cron.nightly]\nschedule = \"0 0 * * *\"\n{HAND_WRITTEN_V3_WITHOUT_VERSION}");
+        let v: toml::Value = toml::from_str(&raw).unwrap();
+        assert_eq!(detect_version(&v).unwrap(), INFERRED_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn a_file_with_no_alias_keyed_section_keeps_the_v1_reading() {
+        for raw in [
+            "",
+            "[gateway]\nport = 42617\n",
+            "[providers.models.ollama]\n",
+        ] {
+            let v: toml::Value = toml::from_str(raw).unwrap();
+            assert_eq!(detect_version(&v).unwrap(), 1, "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn the_bundled_v1_fixture_is_still_read_as_v1() {
+        let v: toml::Value = toml::from_str(V1_FIXTURE).unwrap();
+        assert_eq!(detect_version(&v).unwrap(), 1);
+    }
+
+    /// Every top-level section the current schema has, including keyed
+    /// sections that are empty by default.
+    fn current_top_level_sections() -> std::collections::BTreeSet<String> {
+        Config::default()
+            .prop_fields()
+            .iter()
+            .filter_map(|field| field.name.split('.').next().map(str::to_string))
+            .chain(
+                Config::map_key_sections()
+                    .iter()
+                    .filter_map(|section| section.path.split('.').next().map(str::to_string)),
+            )
+            .chain(
+                toml::Value::try_from(Config::default())
+                    .expect("serialize default config")
+                    .as_table()
+                    .expect("config is a table")
+                    .keys()
+                    .cloned(),
+            )
+            .collect()
+    }
+
+    /// `V1_KEYS_STILL_CURRENT` must name exactly the V1 legacy keys that are
+    /// also top-level sections today: missing one would let a current file
+    /// that uses it be read as V1; listing a V1-only key would let a V1 file
+    /// be read as V3.
+    #[test]
+    fn v1_keys_still_current_are_exactly_the_current_top_level_sections() {
+        let current = current_top_level_sections();
+        let shared: Vec<&str> = V1_LEGACY_KEYS
+            .iter()
+            .copied()
+            .filter(|key| current.contains(*key))
+            .collect();
+        assert_eq!(shared, V1_KEYS_STILL_CURRENT);
     }
 
     #[test]
