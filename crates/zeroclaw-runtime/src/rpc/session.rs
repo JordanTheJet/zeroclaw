@@ -267,6 +267,10 @@ pub struct SessionStore {
     sessions: Mutex<HashMap<String, RpcSession>>,
     #[cfg(test)]
     model_provider_update_waiting: Arc<tokio::sync::Notify>,
+    #[cfg(test)]
+    agent_lock_waiting: Arc<tokio::sync::Notify>,
+    #[cfg(test)]
+    pending_generation_waiting: Arc<tokio::sync::Notify>,
     cancel_tokens: std::sync::Mutex<HashMap<String, CancelTokenEntry>>,
     cancel_generation: std::sync::atomic::AtomicU64,
     cancel_causes: std::sync::Mutex<HashMap<String, CancelCause>>,
@@ -355,6 +359,10 @@ impl SessionStore {
             sessions: Mutex::new(HashMap::new()),
             #[cfg(test)]
             model_provider_update_waiting: Arc::new(tokio::sync::Notify::new()),
+            #[cfg(test)]
+            agent_lock_waiting: Arc::new(tokio::sync::Notify::new()),
+            #[cfg(test)]
+            pending_generation_waiting: Arc::new(tokio::sync::Notify::new()),
             cancel_tokens: std::sync::Mutex::new(HashMap::new()),
             cancel_generation: std::sync::atomic::AtomicU64::new(0),
             cancel_causes: std::sync::Mutex::new(HashMap::new()),
@@ -675,6 +683,51 @@ impl SessionStore {
         Arc::clone(&self.model_provider_update_waiting)
     }
 
+    /// Lock a session's Agent for a prompt's final authorization.
+    #[cfg(not(test))]
+    pub(crate) async fn lock_agent_for_prompt<'a>(
+        &self,
+        agent: &'a Mutex<Agent>,
+    ) -> tokio::sync::MutexGuard<'a, Agent> {
+        agent.lock().await
+    }
+
+    /// Lock a session's Agent for a prompt's final authorization. The first
+    /// time the lock is contended it notifies [`Self::agent_lock_waiting`],
+    /// so a test can change policy while the prompt waits here.
+    #[cfg(test)]
+    pub(crate) async fn lock_agent_for_prompt<'a>(
+        &self,
+        agent: &'a Mutex<Agent>,
+    ) -> tokio::sync::MutexGuard<'a, Agent> {
+        let waiting = Arc::clone(&self.agent_lock_waiting);
+        let mut lock = std::pin::pin!(agent.lock());
+        let mut notified = false;
+        std::future::poll_fn(
+            move |cx| match std::future::Future::poll(lock.as_mut(), cx) {
+                std::task::Poll::Pending => {
+                    if !notified {
+                        waiting.notify_one();
+                        notified = true;
+                    }
+                    std::task::Poll::Pending
+                }
+                ready => ready,
+            },
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn agent_lock_waiting(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.agent_lock_waiting)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_generation_waiting(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.pending_generation_waiting)
+    }
+
     /// Await confirmation of a session's provisional binding, waiting at most
     /// `timeout`.
     ///
@@ -733,6 +786,8 @@ impl SessionStore {
             Some(_) => {}
         }
         drop(current);
+        #[cfg(test)]
+        self.pending_generation_waiting.notify_one();
         tokio::time::timeout(timeout, notified)
             .await
             .map_err(|_| WaitForProviderUpdateError::Timeout)?;

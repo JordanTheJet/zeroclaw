@@ -5696,29 +5696,6 @@ impl RpcDispatcher {
         let admitted = self
             .revalidate_admitted_session(sid, authorized.as_ref())
             .await?;
-        // Admission can wait behind an active turn for as long as that turn
-        // runs, and the grants resolved before the lookup predate that wait.
-        // Re-resolve against the accepted policy now, so every decision from
-        // here on is made with a post-admission view.
-        let grants = match self.recheck_authority_after_admission(Method::SessionPrompt) {
-            Ok(grants) => grants,
-            Err(denied) => {
-                return Err(self
-                    .refuse_admitted_prompt(sid, req.client_turn_generation, denied)
-                    .await);
-            }
-        };
-        // `revalidate_admitted_session` judged ownership by the scope stamped
-        // on this connection before the wait. An administrator demoted while
-        // queued would still pass it, so hold the prompt to the admitted
-        // record's owner under the grants just resolved, before the Agent,
-        // the transcript, or the turn's totals are touched.
-        if let Err(denied) = self.require_ownership_under(grants.as_ref(), admitted.as_ref()) {
-            return Err(self
-                .refuse_admitted_prompt(sid, req.client_turn_generation, denied)
-                .await);
-        }
-
         // Session/new authorizes a binding only when it creates or reattaches
         // a session. Reused and rehydrated sessions enter through
         // session/prompt, so the same agent/tool posture and workspace
@@ -5731,36 +5708,35 @@ impl RpcDispatcher {
             .get_agent_alias(sid)
             .await
             .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
-        if grants.is_some() {
-            let binding = match self.ctx.sessions.get_workspace_dir(sid).await {
-                Some(workspace) => {
-                    let config = self.ctx.config.read();
-                    self.authorize_live_session_binding(
-                        Method::SessionPrompt,
-                        grants.as_ref(),
-                        &config,
-                        &agent_alias,
-                        &workspace,
-                    )
-                }
-                None => Err(rpc_err(SESSION_NOT_FOUND, "Session not found")),
-            };
-            if let Err(denied) = binding {
-                return Err(self
-                    .refuse_admitted_prompt(sid, req.client_turn_generation, denied)
-                    .await);
-            }
-        }
-
+        let workspace = self.ctx.sessions.get_workspace_dir(sid).await;
         let has_environment = self
             .ctx
             .sessions
             .has_forwarded_environment(sid)
             .await
             .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
-        if let Err(denied) = self.authorize_session_environment(
-            Method::SessionPrompt,
+        // Admission can wait behind an active turn for as long as that turn
+        // runs, and the grants resolved before the lookup predate that wait.
+        // Re-resolve against the accepted policy now, with no await before
+        // the attachment decisions and writes below that use it.
+        let grants = match self.recheck_authority_after_admission(Method::SessionPrompt) {
+            Ok(grants) => grants,
+            Err(denied) => {
+                return Err(self
+                    .refuse_admitted_prompt(sid, req.client_turn_generation, denied)
+                    .await);
+            }
+        };
+        // `revalidate_admitted_session` judged ownership by the scope stamped
+        // on this connection before the wait. An administrator demoted while
+        // queued would still pass it, so every decision here is made under the
+        // grants just resolved, before attachments are written. The same
+        // decisions are made again after the preparation waits below.
+        if let Err(denied) = self.authorize_admitted_prompt(
             grants.as_ref(),
+            admitted.as_ref(),
+            &agent_alias,
+            workspace.as_deref(),
             has_environment,
         ) {
             return Err(self
@@ -5902,27 +5878,6 @@ impl RpcDispatcher {
             }
         };
 
-        // Provider reconciliation can wait after admission. Re-resolve before
-        // executing so an environment-bearing session cannot use pre-wait grants.
-        let environment_grants = match self.recheck_authority_after_admission(Method::SessionPrompt)
-        {
-            Ok(grants) => grants,
-            Err(denied) => {
-                return Err(self
-                    .refuse_admitted_prompt(sid, req.client_turn_generation, denied)
-                    .await);
-            }
-        };
-        if let Err(denied) = self.authorize_session_environment(
-            Method::SessionPrompt,
-            environment_grants.as_ref(),
-            has_environment,
-        ) {
-            return Err(self
-                .refuse_admitted_prompt(sid, req.client_turn_generation, denied)
-                .await);
-        }
-
         // Resolve the canonical Agent only after admission and reconciliation;
         // this prevents executing through an orphaned predecessor handle.
         let agent = self
@@ -5932,25 +5887,50 @@ impl RpcDispatcher {
             .await
             .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
 
-        // The grants were re-resolved after admission, so apply that posture
-        // to this session's static and already-activated deferred tools. It is
-        // judged by those fresh grants rather than the connection's stamped
-        // copy, so a prompt that queued before its principal was narrowed
-        // executes under the narrowed ceiling. It runs on the canonical
-        // handle, not the pre-reconciliation one, so a replaced incarnation
-        // cannot carry a stale ceiling, and it runs before any prompt-side
-        // effect. Direct unit handlers bind no connection and keep their
-        // fixture semantics.
-        if let Some(grants) = grants.as_ref() {
-            // Owner isolation (this slice) replaced the parent's blanket
-            // refusal of a constrained principal here: the session is stamped
-            // with its owner and every resume/rehydration is owner-predicated,
-            // so a constrained principal's grants can only ever re-narrow ITS
-            // OWN session's Agent, never a shared victim's. A prompt whose
-            // principal was narrowed since creation therefore executes under
-            // the narrowed ceiling, applied on the canonical handle here.
-            let mut guard = agent.lock().await;
-            self.apply_principal_grants_to_agent(grants, &mut guard);
+        // Every wait before the turn is behind this prompt now: the session
+        // queue, provider reconciliation, the provider-update lock and the
+        // Agent lock. Re-resolve under the Agent lock and take every decision
+        // from that one view: ownership, the agent and workspace binding, the
+        // forwarded environment, and the tool ceiling applied to the Agent. A
+        // check passed under grants from before a wait does not carry over,
+        // so an administrator demoted during reconciliation is held to
+        // ownership, and a principal narrowed then runs under the narrowed
+        // ceiling. The ceiling is applied on the canonical handle, not the
+        // pre-reconciliation one, so a replaced incarnation cannot carry a
+        // stale ceiling.
+        //
+        // Owner isolation replaced the parent's blanket refusal of a
+        // constrained principal here: the session is stamped with its owner
+        // and every resume/rehydration is owner-predicated, so a constrained
+        // principal's grants can only ever re-narrow ITS OWN session's Agent,
+        // never a shared victim's. Direct unit handlers bind no connection
+        // and keep their fixture semantics.
+        {
+            let mut agent_guard = self.ctx.sessions.lock_agent_for_prompt(&agent).await;
+            let grants = match self.recheck_authority_after_admission(Method::SessionPrompt) {
+                Ok(grants) => grants,
+                Err(denied) => {
+                    drop(agent_guard);
+                    return Err(self
+                        .refuse_admitted_prompt(sid, req.client_turn_generation, denied)
+                        .await);
+                }
+            };
+            if let Err(denied) = self.authorize_admitted_prompt(
+                grants.as_ref(),
+                admitted.as_ref(),
+                &agent_alias,
+                workspace.as_deref(),
+                has_environment,
+            ) {
+                drop(agent_guard);
+                return Err(self
+                    .refuse_admitted_prompt(sid, req.client_turn_generation, denied)
+                    .await);
+            }
+            if let Some(grants) = grants.as_ref() {
+                self.apply_principal_grants_to_agent(grants, &mut agent_guard);
+            }
         }
 
         // Mark the durable row running only after every preflight wait has
@@ -6946,6 +6926,37 @@ impl RpcDispatcher {
             session_id: req.session_id,
             cancelled: true,
         })
+    }
+
+    /// Every authorization decision a prompt makes about its admitted
+    /// session, from one view of the caller's grants: ownership of the
+    /// admitted record, the agent and workspace binding, and the forwarded
+    /// environment. The prompt makes these decisions after each wait, always
+    /// together, so none of them is ever carried over from grants resolved
+    /// before a later wait.
+    fn authorize_admitted_prompt(
+        &self,
+        grants: Option<&zeroclaw_api::grants::ResolvedGrants>,
+        admitted: Option<&crate::rpc::session::SessionRecord>,
+        agent_alias: &str,
+        workspace: Option<&str>,
+        has_environment: bool,
+    ) -> Result<(), JsonRpcError> {
+        self.require_ownership_under(grants, admitted)?;
+        if grants.is_some() {
+            let Some(workspace) = workspace else {
+                return Err(rpc_err(SESSION_NOT_FOUND, "Session not found"));
+            };
+            let config = self.ctx.config.read();
+            self.authorize_live_session_binding(
+                Method::SessionPrompt,
+                grants,
+                &config,
+                agent_alias,
+                workspace,
+            )?;
+        }
+        self.authorize_session_environment(Method::SessionPrompt, grants, has_environment)
     }
 
     /// Hold a caller to a session's ownership under `grants`, freshly resolved
@@ -39547,13 +39558,51 @@ mod tests {
         tools: Vec<Box<dyn zeroclaw_api::tool::Tool>>,
         gated: bool,
     ) -> RecordingHandles {
+        install_recording_session_with(
+            ctx,
+            backend,
+            sid,
+            owner,
+            workspace,
+            tools,
+            gated,
+            SessionExtras::default(),
+        )
+        .await
+    }
+
+    /// What a recording session is built with beyond its owner and tools.
+    #[derive(Default)]
+    struct SessionExtras {
+        /// Memory that auto-saves each user turn; `None` is no memory.
+        auto_save_memory: Option<Arc<dyn zeroclaw_api::memory_traits::Memory>>,
+        /// A provisional binding the session's prompts wait on.
+        pending_generation: Option<Arc<tokio::sync::Notify>>,
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn install_recording_session_with(
+        ctx: &Arc<RpcContext>,
+        backend: &Arc<zeroclaw_infra::session_sqlite::SqliteSessionBackend>,
+        sid: &str,
+        owner: &str,
+        workspace: &std::path::Path,
+        tools: Vec<Box<dyn zeroclaw_api::tool::Tool>>,
+        gated: bool,
+        extras: SessionExtras,
+    ) -> RecordingHandles {
         let (provider, handles) = recording_provider(gated);
+        let auto_save = extras.auto_save_memory.is_some();
+        let memory = extras
+            .auto_save_memory
+            .unwrap_or_else(|| Arc::new(zeroclaw_memory::NoneMemory::new("none")));
         let agent = crate::agent::agent::Agent::builder()
             .model_provider(Box::new(provider))
             .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
                 tools,
             ))
-            .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
+            .memory(memory)
+            .auto_save(auto_save)
             .observer(Arc::new(crate::observability::noop::NoopObserver))
             .tool_dispatcher(Box::new(crate::agent::dispatcher::NativeToolDispatcher))
             .workspace_dir(workspace.to_path_buf())
@@ -39567,6 +39616,10 @@ mod tests {
             ChatMode::Chat,
         )
         .with_owner_principal(Some(owner.to_string()));
+        let session = match extras.pending_generation {
+            Some(pending) => session.with_pending_generation(pending),
+            None => session,
+        };
         ctx.sessions.insert(sid.to_string(), session).await.unwrap();
         let key = format!("rpc_{sid}");
         zeroclaw_infra::session_backend::SessionBackend::set_session_agent_alias(
@@ -39945,6 +39998,592 @@ mod tests {
             transcript,
             (true, true),
             "the prompt reaches both transcripts, so the refusal's (false, false) is meaningful"
+        );
+    }
+
+    // ── Steering batches across memory writes; prompts across every wait ──
+
+    /// Auto-save memory that records every write and parks the first write
+    /// whose content contains `gate_on` until released.
+    struct GatedMemory {
+        stored: Arc<std::sync::Mutex<Vec<String>>>,
+        gate_on: String,
+        started: tokio::sync::mpsc::UnboundedSender<()>,
+        release: tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    }
+
+    impl GatedMemory {
+        async fn write(&self, content: &str) {
+            self.stored.lock().unwrap().push(content.to_string());
+            if content.contains(&self.gate_on) {
+                let gate = self.release.lock().await.take();
+                if let Some(gate) = gate {
+                    let _ = self.started.send(());
+                    let _ = gate.await;
+                }
+            }
+        }
+    }
+
+    impl zeroclaw_api::attribution::Attributable for GatedMemory {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Memory(zeroclaw_api::attribution::MemoryKind::None)
+        }
+        fn alias(&self) -> &str {
+            "gated"
+        }
+    }
+
+    #[async_trait]
+    impl zeroclaw_api::memory_traits::Memory for GatedMemory {
+        fn name(&self) -> &str {
+            "gated"
+        }
+
+        async fn store(
+            &self,
+            _key: &str,
+            content: &str,
+            _category: zeroclaw_api::memory_traits::MemoryCategory,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            self.write(content).await;
+            Ok(())
+        }
+
+        async fn recall(
+            &self,
+            _query: &str,
+            _limit: usize,
+            _session_id: Option<&str>,
+            _since: Option<&str>,
+            _until: Option<&str>,
+        ) -> anyhow::Result<Vec<zeroclaw_api::memory_traits::MemoryEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn get(
+            &self,
+            _key: &str,
+        ) -> anyhow::Result<Option<zeroclaw_api::memory_traits::MemoryEntry>> {
+            Ok(None)
+        }
+
+        async fn list(
+            &self,
+            _category: Option<&zeroclaw_api::memory_traits::MemoryCategory>,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<Vec<zeroclaw_api::memory_traits::MemoryEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn forget(&self, _key: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        async fn forget_for_agent(&self, _key: &str, _agent_id: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        async fn purge_session_for_agent(
+            &self,
+            _session_id: &str,
+            _agent_id: &str,
+        ) -> anyhow::Result<usize> {
+            Ok(0)
+        }
+
+        async fn count(&self) -> anyhow::Result<usize> {
+            Ok(0)
+        }
+
+        async fn health_check(&self) -> bool {
+            true
+        }
+
+        async fn store_with_agent(
+            &self,
+            _key: &str,
+            content: &str,
+            _category: zeroclaw_api::memory_traits::MemoryCategory,
+            _session_id: Option<&str>,
+            _namespace: Option<&str>,
+            _importance: Option<f64>,
+            _agent_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            self.write(content).await;
+            Ok(())
+        }
+
+        async fn recall_for_agents(
+            &self,
+            _allowed_agent_ids: &[&str],
+            _query: &str,
+            _limit: usize,
+            _session_id: Option<&str>,
+            _since: Option<&str>,
+            _until: Option<&str>,
+        ) -> anyhow::Result<Vec<zeroclaw_api::memory_traits::MemoryEntry>> {
+            Ok(Vec::new())
+        }
+    }
+
+    const FIRST_STEER: &str = "first steer: check the deploy logs";
+    const SECOND_STEER: &str = "second steer: check the error budget";
+
+    /// Who sends a steer: Alice's second connection, which her policy
+    /// governs, or the shared local operator, which it does not.
+    #[derive(Clone, Copy)]
+    enum Steerer {
+        Alice,
+        Operator,
+    }
+
+    /// Which steer's memory write parks.
+    #[derive(Clone, Copy)]
+    enum ParkedWrite {
+        First,
+        Second,
+    }
+
+    struct TwoSteers {
+        stored: Vec<String>,
+        calls: Vec<RecordedCall>,
+        live: (bool, bool),
+        durable: (bool, bool),
+    }
+
+    /// Alice's turn on her own auto-saving session parks at its first model
+    /// call. `first` then `second` steer it, both accepted. The call is
+    /// released, and the memory write of the steer named by `parked` parks;
+    /// `change` edits Alice's policy while it waits. Returns every memory
+    /// write, every model call, and whether the live and durable transcripts
+    /// hold each steer.
+    async fn two_steers_with_a_parked_write(
+        first: Steerer,
+        second: Steerer,
+        parked: ParkedWrite,
+        change: impl FnOnce(&mut zeroclaw_config::schema::PermissionProfileConfig),
+    ) -> TwoSteers {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sid = "s-steer-batch";
+        let (ctx, backend, workspace) = steering_ctx(&tmp, |_| {});
+        let (write_started, mut write_started_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (release_write, write_gate) = tokio::sync::oneshot::channel();
+        let stored = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let memory = GatedMemory {
+            stored: Arc::clone(&stored),
+            gate_on: match parked {
+                ParkedWrite::First => FIRST_STEER,
+                ParkedWrite::Second => SECOND_STEER,
+            }
+            .to_string(),
+            started: write_started,
+            release: tokio::sync::Mutex::new(Some(write_gate)),
+        };
+        let mut handles = install_recording_session_with(
+            &ctx,
+            &backend,
+            sid,
+            "user:alice",
+            &workspace,
+            Vec::new(),
+            true,
+            SessionExtras {
+                auto_save_memory: Some(Arc::new(memory)),
+                ..SessionExtras::default()
+            },
+        )
+        .await;
+        let (mut prompter, mut prompter_rx) = roster_peer(&ctx, 4242).await;
+        let (mut alice, mut alice_rx) = roster_peer(&ctx, 4242).await;
+        let (mut operator, mut operator_rx) = local_operator(&ctx).await;
+
+        send_prompt(&mut prompter, 1, sid, 1).await;
+        handles.await_start().await;
+        for (id, steerer, text) in [(2, first, FIRST_STEER), (3, second, SECOND_STEER)] {
+            let params = json!({"session_id": sid, "content": text});
+            let response = match steerer {
+                Steerer::Alice => rpc(&mut alice, &mut alice_rx, id, "session/steer", params).await,
+                Steerer::Operator => {
+                    rpc(&mut operator, &mut operator_rx, id, "session/steer", params).await
+                }
+            };
+            assert_eq!(response["result"]["accepted"], json!(true), "{response}");
+        }
+        handles.release();
+        tokio::time::timeout(std::time::Duration::from_secs(10), write_started_rx.recv())
+            .await
+            .expect("the parked steer's memory write starts")
+            .expect("the memory stays alive");
+        republish_session_scoped(&ctx, change);
+        let _ = release_write.send(());
+        let (response, _) = response_and_notifications(&mut prompter_rx, 1).await;
+        assert!(
+            response.get("error").is_none(),
+            "the turn completes: {response}"
+        );
+
+        let key = format!("rpc_{sid}");
+        let stored = stored.lock().unwrap().clone();
+        TwoSteers {
+            stored,
+            calls: handles.calls().await,
+            live: (
+                live_holds(&ctx, sid, FIRST_STEER).await,
+                live_holds(&ctx, sid, SECOND_STEER).await,
+            ),
+            durable: (
+                durable_holds(&backend, &key, FIRST_STEER),
+                durable_holds(&backend, &key, SECOND_STEER),
+            ),
+        }
+    }
+
+    fn revoke_session_execute(profile: &mut zeroclaw_config::schema::PermissionProfileConfig) {
+        profile.grants.insert(
+            zeroclaw_api::grants::Resource::Sessions,
+            vec![zeroclaw_api::grants::Verb::Read],
+        );
+    }
+
+    fn wrote(outcome: &TwoSteers, text: &str) -> bool {
+        outcome.stored.iter().any(|content| content.contains(text))
+    }
+
+    fn sent(call: &RecordedCall, text: &str) -> bool {
+        call.0.contains(text)
+    }
+
+    #[tokio::test]
+    async fn two_queued_steers_both_reach_memory_and_the_model_without_a_policy_change() {
+        let outcome = two_steers_with_a_parked_write(
+            Steerer::Operator,
+            Steerer::Alice,
+            ParkedWrite::First,
+            |_| {},
+        )
+        .await;
+        assert!(wrote(&outcome, FIRST_STEER) && wrote(&outcome, SECOND_STEER));
+        assert_eq!(outcome.calls.len(), 2, "{:?}", outcome.calls);
+        assert!(sent(&outcome.calls[1], FIRST_STEER) && sent(&outcome.calls[1], SECOND_STEER));
+        assert_eq!(outcome.live, (true, true));
+        assert_eq!(
+            outcome.durable,
+            (true, true),
+            "the control's steers are durable"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_steer_revoked_during_an_earlier_steers_memory_write_reaches_nothing() {
+        let outcome = two_steers_with_a_parked_write(
+            Steerer::Operator,
+            Steerer::Alice,
+            ParkedWrite::First,
+            revoke_session_execute,
+        )
+        .await;
+        assert!(wrote(&outcome, FIRST_STEER), "{:?}", outcome.stored);
+        assert!(
+            !wrote(&outcome, SECOND_STEER),
+            "the revoked steer never reaches memory: {:?}",
+            outcome.stored
+        );
+        assert_eq!(outcome.calls.len(), 2, "{:?}", outcome.calls);
+        assert!(sent(&outcome.calls[1], FIRST_STEER));
+        assert!(
+            !sent(&outcome.calls[1], SECOND_STEER),
+            "nor the model: {:?}",
+            outcome.calls
+        );
+        assert_eq!(outcome.live, (true, false), "nor the live transcript");
+        assert_eq!(outcome.durable, (true, false), "nor the durable transcript");
+    }
+
+    #[tokio::test]
+    async fn a_steer_revoked_during_a_later_steers_memory_write_does_not_reach_the_model() {
+        let outcome = two_steers_with_a_parked_write(
+            Steerer::Alice,
+            Steerer::Operator,
+            ParkedWrite::Second,
+            revoke_session_execute,
+        )
+        .await;
+        assert!(
+            wrote(&outcome, FIRST_STEER),
+            "written while its sender was still authorized: {:?}",
+            outcome.stored
+        );
+        assert_eq!(outcome.calls.len(), 2, "{:?}", outcome.calls);
+        assert!(sent(&outcome.calls[1], SECOND_STEER));
+        assert!(
+            !sent(&outcome.calls[1], FIRST_STEER),
+            "judged again after the later write: {:?}",
+            outcome.calls
+        );
+        assert_eq!(outcome.live, (false, true));
+        assert_eq!(outcome.durable, (false, true));
+    }
+
+    #[tokio::test]
+    async fn steering_whose_senders_are_all_revoked_during_its_memory_writes_starts_no_round() {
+        let outcome = two_steers_with_a_parked_write(
+            Steerer::Alice,
+            Steerer::Alice,
+            ParkedWrite::First,
+            revoke_session_execute,
+        )
+        .await;
+        assert!(!wrote(&outcome, SECOND_STEER), "{:?}", outcome.stored);
+        assert_eq!(
+            outcome.calls.len(),
+            1,
+            "no round runs for refused steering: {:?}",
+            outcome.calls
+        );
+        assert_eq!(outcome.live, (false, false));
+        assert_eq!(outcome.durable, (false, false));
+    }
+
+    /// A wait a prompt passes through after the session queue.
+    #[derive(Clone, Copy, Debug)]
+    enum PromptWait {
+        PendingGeneration,
+        ProviderUpdate,
+        AgentLock,
+    }
+
+    const PROMPT_WAITS: [PromptWait; 3] = [
+        PromptWait::PendingGeneration,
+        PromptWait::ProviderUpdate,
+        PromptWait::AgentLock,
+    ];
+
+    struct PromptAfterWait {
+        result: RpcResult,
+        calls: Vec<RecordedCall>,
+        frames: Vec<Value>,
+        transcript: (bool, bool),
+    }
+
+    /// Alice, with her profile as `edit` leaves it, prompts `owner`'s session
+    /// (built with `tools`). The prompt is admitted and then parks at `wait`,
+    /// where `change` edits her profile before the wait is released.
+    async fn prompt_after_a_change_at(
+        wait: PromptWait,
+        owner: &str,
+        tools: Vec<Box<dyn zeroclaw_api::tool::Tool>>,
+        edit: impl FnOnce(&mut zeroclaw_config::schema::PermissionProfileConfig),
+        change: impl FnOnce(&mut zeroclaw_config::schema::PermissionProfileConfig),
+    ) -> PromptAfterWait {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sid = "s-prepared-prompt";
+        let (ctx, backend, workspace) = steering_ctx(&tmp, edit);
+        let pending = matches!(wait, PromptWait::PendingGeneration)
+            .then(|| Arc::new(tokio::sync::Notify::new()));
+        let handles = install_recording_session_with(
+            &ctx,
+            &backend,
+            sid,
+            owner,
+            &workspace,
+            tools,
+            false,
+            SessionExtras {
+                pending_generation: pending,
+                ..SessionExtras::default()
+            },
+        )
+        .await;
+        let (alice, mut alice_rx) = roster_peer(&ctx, 4242).await;
+
+        let mut held_update = None;
+        let mut held_agent = None;
+        let waiting = match wait {
+            PromptWait::PendingGeneration => ctx.sessions.pending_generation_waiting(),
+            PromptWait::ProviderUpdate => {
+                held_update = Some(ctx.sessions.lock_model_provider_update(sid).await.unwrap());
+                ctx.sessions.model_provider_update_waiting()
+            }
+            PromptWait::AgentLock => {
+                let agent = ctx.sessions.get_agent(sid).await.unwrap();
+                held_agent = Some(agent.lock_owned().await);
+                ctx.sessions.agent_lock_waiting()
+            }
+        };
+        let params = json!({"session_id": sid, "prompt": QUEUED_PROMPT});
+        let task =
+            zeroclaw_spawn::spawn!(async move { alice.handle_session_prompt(&params).await });
+        tokio::time::timeout(std::time::Duration::from_secs(5), waiting.notified())
+            .await
+            .unwrap_or_else(|_| panic!("the prompt parks at {wait:?}"));
+        republish_session_scoped(&ctx, change);
+        if matches!(wait, PromptWait::PendingGeneration) {
+            let generation = ctx.sessions.get_generation(sid).await.unwrap();
+            ctx.sessions.clear_pending_generation(sid, generation).await;
+        }
+        drop(held_update);
+        drop(held_agent);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), task)
+            .await
+            .expect("the prompt finishes")
+            .expect("the prompt task does not panic");
+
+        let mut frames = Vec::new();
+        while let Ok(frame) = alice_rx.try_recv() {
+            frames.push(serde_json::from_str(&frame).expect("valid JSON-RPC frame"));
+        }
+        let transcript = (
+            durable_holds(&backend, &format!("rpc_{sid}"), QUEUED_PROMPT),
+            live_holds(&ctx, sid, QUEUED_PROMPT).await,
+        );
+        PromptAfterWait {
+            result,
+            calls: handles.calls().await,
+            frames,
+            transcript,
+        }
+    }
+
+    /// Why `outcome` is not a refusal with no effect, or `None` when it is.
+    fn effect_of_refusal(outcome: &PromptAfterWait) -> Option<String> {
+        match &outcome.result {
+            Err(error) if error.code == FORBIDDEN => {}
+            other => return Some(format!("not refused with FORBIDDEN: {other:?}")),
+        }
+        if !outcome.calls.is_empty() {
+            return Some(format!("the model was called: {:?}", outcome.calls));
+        }
+        if outcome.transcript != (false, false) {
+            return Some(format!("a transcript changed: {:?}", outcome.transcript));
+        }
+        if !outcome.frames.iter().all(|frame| {
+            frame["params"].get("usage").is_none()
+                && frame["params"]["type"] != "agent_message_chunk"
+        }) {
+            return Some(format!(
+                "content or totals reached the caller: {:?}",
+                outcome.frames
+            ));
+        }
+        None
+    }
+
+    /// Run `case` at every wait and fail with the waits where it did not hold,
+    /// so a regression reports each wait it reopens rather than the first.
+    async fn at_every_prompt_wait<F, Fut>(case: F)
+    where
+        F: Fn(PromptWait) -> Fut,
+        Fut: std::future::Future<Output = Option<String>>,
+    {
+        let mut failures = Vec::new();
+        for wait in PROMPT_WAITS {
+            if let Some(failure) = case(wait).await {
+                failures.push(format!("{wait:?}: {failure}"));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    fn demote_admin(profile: &mut zeroclaw_config::schema::PermissionProfileConfig) {
+        profile.admin = false;
+    }
+
+    #[tokio::test]
+    async fn an_administrator_demoted_at_any_prompt_wait_does_not_run_on_another_principals_session()
+     {
+        at_every_prompt_wait(|wait| async move {
+            let outcome = prompt_after_a_change_at(
+                wait,
+                "user:bob",
+                Vec::new(),
+                |profile| profile.admin = true,
+                demote_admin,
+            )
+            .await;
+            effect_of_refusal(&outcome)
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn an_administrator_demoted_at_any_prompt_wait_still_runs_on_its_own_session() {
+        at_every_prompt_wait(|wait| async move {
+            let outcome = prompt_after_a_change_at(
+                wait,
+                "user:alice",
+                Vec::new(),
+                |profile| profile.admin = true,
+                demote_admin,
+            )
+            .await;
+            (outcome.result.is_err()
+                || outcome.calls.len() != 1
+                || outcome.transcript != (true, true))
+                .then(|| {
+                    format!(
+                        "did not run: {:?} {:?} {:?}",
+                        outcome.result, outcome.calls, outcome.transcript
+                    )
+                })
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_principal_that_loses_the_agent_at_any_prompt_wait_is_refused() {
+        at_every_prompt_wait(|wait| async move {
+            let outcome = prompt_after_a_change_at(
+                wait,
+                "user:alice",
+                Vec::new(),
+                |_| {},
+                |profile| profile.allowed_agents.clear(),
+            )
+            .await;
+            effect_of_refusal(&outcome)
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_principal_narrowed_at_any_prompt_wait_runs_under_the_narrowed_tool_ceiling() {
+        at_every_prompt_wait(|wait| async move {
+            let outcome = prompt_after_a_change_at(
+                wait,
+                "user:alice",
+                vec![Box::new(ProbeTool)],
+                |profile| profile.allowed_tools = vec!["probe".to_string()],
+                |profile| profile.allowed_tools.clear(),
+            )
+            .await;
+            match (&outcome.result, outcome.calls.as_slice()) {
+                (Ok(_), [(_, tools)]) if !tools.iter().any(|tool| tool == "probe") => None,
+                _ => Some(format!(
+                    "did not run once without the lost tool: {:?} {:?}",
+                    outcome.result, outcome.calls
+                )),
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_prompt_without_a_policy_change_is_offered_its_tools() {
+        let outcome = prompt_after_a_change_at(
+            PromptWait::ProviderUpdate,
+            "user:alice",
+            vec![Box::new(ProbeTool)],
+            |profile| profile.allowed_tools = vec!["probe".to_string()],
+            |_| {},
+        )
+        .await;
+        assert!(outcome.result.is_ok(), "{:?}", outcome.result);
+        assert!(
+            outcome.calls[0].1.iter().any(|tool| tool == "probe"),
+            "the narrowing test's tool is offered when nothing changes: {:?}",
+            outcome.calls
         );
     }
 }
