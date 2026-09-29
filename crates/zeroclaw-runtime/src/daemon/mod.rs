@@ -1207,6 +1207,10 @@ pub async fn run(
     // the socket listener uses) while the wait below counts their activity
     // alongside the socket clients. They stay out of the ephemeral-exit count
     // above on purpose; they are not external clients.
+    // Seal admission first, so a zero the wait below observes cannot be
+    // followed by a late in-process admission; the drain then joins what was
+    // admitted before the seal.
+    inproc_connector.close_admission();
     let inproc_for_drain = inproc_connector.clone();
     let (_aborted_inproc, drain) = tokio::join!(
         inproc_connector.drain(),
@@ -2954,6 +2958,113 @@ mod tests {
             settle_exit_against_drain(Err(anyhow::Error::msg("boom")), RpcDrain::Outstanding(1))
                 .is_err(),
             "a failed daemon run must keep reporting its failure"
+        );
+    }
+
+    /// Drive the real daemon through a reload while an authenticated
+    /// in-process connection holds activity for `hold`: the connection is
+    /// initialized with a paired token over `reload_controls.inproc`, then a
+    /// prompt's activity token is held (a model turn needs a provider this
+    /// harness has none of; the token is what such a task holds). Returns the
+    /// daemon's exit and whether the token was released before it exited.
+    async fn reload_with_held_in_process_activity(hold: Duration) -> (DaemonExit, bool) {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+        let _broadcast_guard = hold_broadcast_hooks().await;
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        config.gateway.require_pairing = true;
+        config.gateway.paired_tokens = vec!["zc_daemon_inproc_token".to_string()];
+
+        let released = Arc::new(AtomicBool::new(false));
+        let released_for_gateway = released.clone();
+        let mut registry = DaemonRegistry::new();
+        registry.register_socket(Box::new(move |_ctx, cancel, _client_count, readiness| {
+            Box::pin(async move {
+                if let Some(readiness) = readiness {
+                    readiness.report_ready();
+                }
+                cancel.cancelled().await;
+                Ok(())
+            })
+        }));
+        registry.register_gateway(Box::new(
+            move |_host, _port, _config, _event_bus, reload_controls, _tui_reg, _auth, _ready| {
+                let released = released_for_gateway.clone();
+                Box::pin(async move {
+                    let controls = reload_controls
+                        .expect("daemon should pass reload controls to gateway starter");
+                    let connector = controls
+                        .inproc
+                        .clone()
+                        .expect("daemon passes the connector");
+                    let client = connector.connect().await.expect("bound connector connects");
+                    let (read_half, mut write_half) = tokio::io::split(client);
+                    let mut reader = tokio::io::BufReader::new(read_half);
+                    let init = serde_json::json!({
+                        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                        "params": {"protocol_version": 1, "auth_token": "zc_daemon_inproc_token"},
+                    });
+                    write_half
+                        .write_all(format!("{init}\n").as_bytes())
+                        .await
+                        .expect("write initialize");
+                    let mut line = String::new();
+                    reader.read_line(&mut line).await.expect("read initialize");
+                    let frame: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+                    assert!(
+                        frame.get("result").is_some(),
+                        "paired token must be accepted over the in-process seam: {frame}"
+                    );
+                    // The prompt's activity, held past the reload request.
+                    let token = connector.activity_token();
+                    controls.reload_tx.send(true).expect("send reload signal");
+                    tokio::time::sleep(hold).await;
+                    drop(token);
+                    released.store(true, Ordering::SeqCst);
+                    // Keep the connection open like a real gateway would.
+                    let _keep = (reader, write_half);
+                    std::future::pending::<Result<()>>().await
+                })
+            },
+        ));
+        let exit = tokio::time::timeout(
+            Duration::from_secs(25),
+            run(config, "127.0.0.1".to_string(), 0, registry, false, false),
+        )
+        .await
+        .expect("daemon finishes inside the drain budget plus component grace")
+        .expect("daemon run should succeed");
+        (exit, released.load(Ordering::SeqCst))
+    }
+
+    /// In-process activity released within the drain budget: the generation
+    /// proves itself retired and the reload hands over.
+    #[tokio::test]
+    async fn reload_hands_over_once_held_in_process_activity_is_released() {
+        let (exit, released) =
+            reload_with_held_in_process_activity(Duration::from_millis(1200)).await;
+        assert!(
+            released,
+            "the daemon must wait for the in-process activity to end"
+        );
+        assert_eq!(exit, DaemonExit::Reload);
+    }
+
+    /// In-process activity that outlives the drain budget: the generation
+    /// cannot prove it retired, so the reload is downgraded to a shutdown.
+    /// Fails if the daemon stops counting in-process activity in its drain
+    /// (the socket count alone is zero here).
+    #[tokio::test]
+    async fn reload_is_downgraded_when_in_process_activity_outlives_the_drain_budget() {
+        let budget = crate::rpc::CONNECTION_DRAIN_GRACE + Duration::from_secs(3);
+        let (exit, _released) = reload_with_held_in_process_activity(budget).await;
+        assert_eq!(
+            exit,
+            DaemonExit::Shutdown,
+            "a reload must not hand over while in-process work is still live"
         );
     }
 

@@ -115,10 +115,26 @@ struct ConnectorInner {
     /// every task it started, released only when that task has ended. This is
     /// the connector's contribution to the daemon's generation-drain proof.
     connections: Arc<AtomicUsize>,
+    /// Admission and retirement share this lock: a connection is admitted
+    /// (final cancellation check, activity registered, task inserted) in one
+    /// critical section, and retirement seals admission and takes the task
+    /// set in another, so every connection either belongs to the drain or is
+    /// refused. A detached task, or a check outside the lock, would leave a
+    /// window in which the retired generation could still acquire work.
+    registry: std::sync::Mutex<Registry>,
+    /// Test hook: a `connect` parks here, after it has the context and before
+    /// it takes the registry lock, until the gate reads `true`.
+    #[cfg(test)]
+    admission_gate: Option<watch::Receiver<bool>>,
+}
+
+struct Registry {
+    /// `false` once retirement has begun; no further connection is admitted.
+    open: bool,
     /// The accepted connection tasks, owned here so a retiring generation can
     /// join them, and abort the ones that ignore cancellation, before it hands
-    /// over. A detached task would have no owner to establish that.
-    tasks: std::sync::Mutex<tokio::task::JoinSet<()>>,
+    /// over.
+    tasks: tokio::task::JoinSet<()>,
 }
 
 impl std::fmt::Debug for InprocConnector {
@@ -140,9 +156,56 @@ impl InprocConnector {
                 ctx,
                 cancel,
                 connections: Arc::new(AtomicUsize::new(0)),
-                tasks: std::sync::Mutex::new(tokio::task::JoinSet::new()),
+                registry: std::sync::Mutex::new(Registry {
+                    open: true,
+                    tasks: tokio::task::JoinSet::new(),
+                }),
+                #[cfg(test)]
+                admission_gate: None,
             }),
         }
+    }
+
+    /// A connector whose `connect` parks at the admission boundary until
+    /// `gate` reads `true`, so a test can retire the generation while a
+    /// connect is between its context wait and its admission.
+    #[cfg(test)]
+    pub(crate) fn with_admission_gate(
+        cancel: CancellationToken,
+        gate: watch::Receiver<bool>,
+    ) -> Self {
+        let (ctx, _initial_rx) = watch::channel(None);
+        Self {
+            inner: Arc::new(ConnectorInner {
+                ctx,
+                cancel,
+                connections: Arc::new(AtomicUsize::new(0)),
+                registry: std::sync::Mutex::new(Registry {
+                    open: true,
+                    tasks: tokio::task::JoinSet::new(),
+                }),
+                admission_gate: Some(gate),
+            }),
+        }
+    }
+
+    /// Connection tasks the registry currently owns (test observation).
+    #[cfg(test)]
+    pub(crate) fn registered_tasks(&self) -> usize {
+        self.inner
+            .registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .tasks
+            .len()
+    }
+
+    /// One more unit of this generation's in-process activity, the token a
+    /// prompt task spawned by an in-process connection holds until it ends
+    /// (test observation of the drain boundary without a model provider).
+    #[cfg(test)]
+    pub(crate) fn activity_token(&self) -> super::ConnectionActivity {
+        super::ConnectionActivity::new(Arc::clone(&self.inner.connections))
     }
 
     /// Attach the generation's RPC context. Waiters in
@@ -164,19 +227,37 @@ impl InprocConnector {
         self.inner.connections.load(Ordering::Relaxed)
     }
 
+    /// Seal admission: from this call on, every `connect` returns `None`.
+    /// Idempotent; [`InprocConnector::drain`] seals as well. The daemon calls
+    /// this before it starts counting the generation's remaining activity, so
+    /// a zero it observes cannot be followed by a late admission.
+    pub fn close_admission(&self) {
+        self.inner
+            .registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .open = false;
+    }
+
     /// Retire the accepted connections of this generation.
     ///
-    /// Call after cancelling the generation's token, which ends every
-    /// connection's dispatcher. Waits up to [`super::CONNECTION_DRAIN_GRACE`]
-    /// for the connection tasks to finish unwinding on their own, then aborts
+    /// Seals admission and takes the task set in one critical section, then
+    /// (after cancelling the generation's token, which ends every
+    /// connection's dispatcher) waits up to the listeners' connection drain grace
+    /// for the connection tasks to finish unwinding on their own, and aborts
     /// and joins whatever is left, the same sequence the local socket listener
     /// applies to its accepted connections. Returns how many connection tasks
     /// had to be aborted; a nonzero count means the retiring generation could
     /// not prove those connections finished cooperatively.
     pub async fn drain(&self) -> usize {
         let mut tasks = {
-            let mut guard = self.inner.tasks.lock().unwrap_or_else(|e| e.into_inner());
-            std::mem::take(&mut *guard)
+            let mut registry = self
+                .inner
+                .registry
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            registry.open = false;
+            std::mem::take(&mut registry.tasks)
         };
         tokio::select! {
             () = async {
@@ -210,19 +291,38 @@ impl InprocConnector {
                 }
             }
         };
-        if self.inner.cancel.is_cancelled() {
+        #[cfg(test)]
+        if let Some(gate) = &self.inner.admission_gate {
+            let mut gate = gate.clone();
+            while !*gate.borrow_and_update() {
+                if gate.changed().await.is_err() {
+                    return None;
+                }
+            }
+        }
+        // Admission is one critical section shared with retirement: the
+        // cancellation and seal checks, the activity registration and the
+        // task insertion happen under the registry lock, so a connect that
+        // gets here either lands in the set the drain will join or is
+        // refused. Nothing below awaits while the lock is held.
+        let mut registry = self
+            .inner
+            .registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if !registry.open || self.inner.cancel.is_cancelled() {
             return None;
         }
         let (client_half, server_half) = tokio::io::duplex(DUPLEX_BUFFER_BYTES);
         let conn_cancel = self.inner.cancel.child_token();
         let activity = super::ConnectionActivity::new(Arc::clone(&self.inner.connections));
-        {
-            let mut tasks = self.inner.tasks.lock().unwrap_or_else(|e| e.into_inner());
-            // Reap the connections that already ended so the set only holds
-            // live tasks; `JoinSet` keeps finished entries until polled.
-            while tasks.try_join_next().is_some() {}
-            tasks.spawn(serve(ctx, server_half, conn_cancel, activity));
-        }
+        // Reap the connections that already ended so the set only holds live
+        // tasks; `JoinSet` keeps finished entries until polled.
+        while registry.tasks.try_join_next().is_some() {}
+        registry
+            .tasks
+            .spawn(serve(ctx, server_half, conn_cancel, activity));
+        drop(registry);
         Some(client_half)
     }
 }
@@ -237,6 +337,12 @@ async fn serve(
     conn_cancel: CancellationToken,
     activity: super::ConnectionActivity,
 ) {
+    // Admitted under the lock but cancelled before this task ran: do not
+    // start a dispatcher for a generation that is already retiring. The
+    // activity token drops here, so the drain sees this task end.
+    if conn_cancel.is_cancelled() {
+        return;
+    }
     let _count_guard = activity.clone();
     let mut transport = InprocTransport::new(stream, conn_cancel.clone());
     let writer_tx = transport.writer();
@@ -495,6 +601,98 @@ mod tests {
             .expect("peer answers after drain")
             .expect("read");
         assert_eq!(eof, 0, "the client sees EOF once its connection is retired");
+    }
+
+    /// A connect parked at the admission boundary while the generation
+    /// retires must be refused, not admitted into a drained generation: the
+    /// seal and the final cancellation check live inside the admission
+    /// critical section, so nothing registers after the drain took the set.
+    #[tokio::test]
+    async fn connect_paused_at_admission_is_refused_once_retirement_is_sealed() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ctx = ctx_for(base_config(tmp.path()));
+        let cancel = CancellationToken::new();
+        let (gate_tx, gate_rx) = watch::channel(false);
+        let connector = InprocConnector::with_admission_gate(cancel.clone(), gate_rx);
+        connector.bind(ctx);
+        let parked = connector.clone();
+        let pending = zeroclaw_spawn::spawn!(async move { parked.connect().await.is_some() });
+        // Let the connect reach the gate: it has passed the bind wait and
+        // the optimistic checks and is about to admit itself.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(connector.registered_tasks(), 0);
+
+        // Retire the generation while the connect is parked.
+        cancel.cancel();
+        let aborted = connector.drain().await;
+        assert_eq!(aborted, 0);
+        assert_eq!(connector.connection_count(), 0);
+
+        // Resume the connect: it reaches admission after the seal.
+        gate_tx.send(true).unwrap();
+        let admitted = tokio::time::timeout(Duration::from_secs(2), pending)
+            .await
+            .expect("parked connect finishes")
+            .expect("connect task");
+        assert!(
+            !admitted,
+            "a connect that reaches admission after retirement must be refused"
+        );
+        assert_eq!(
+            connector.connection_count(),
+            0,
+            "no activity after the drain"
+        );
+        assert_eq!(
+            connector.registered_tasks(),
+            0,
+            "no task registered after the drain"
+        );
+    }
+
+    /// Many connects racing retirement: each one either belongs to the drain
+    /// (its connection is joined, the client sees EOF) or is refused; none
+    /// leaves activity or a task behind once the drain has returned.
+    #[tokio::test]
+    async fn concurrent_connects_racing_retirement_are_drained_or_refused() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ctx = ctx_for(base_config(tmp.path()));
+        let cancel = CancellationToken::new();
+        let connector = InprocConnector::new(cancel.clone());
+        connector.bind(ctx);
+        let mut connects = tokio::task::JoinSet::new();
+        for _ in 0..32 {
+            let c = connector.clone();
+            connects.spawn(async move {
+                tokio::task::yield_now().await;
+                c.connect().await
+            });
+        }
+        tokio::task::yield_now().await;
+        cancel.cancel();
+        let _aborted = connector.drain().await;
+        let mut admitted = 0usize;
+        while let Some(result) = connects.join_next().await {
+            if let Some(client) = result.expect("connect task") {
+                admitted += 1;
+                let (read_half, _write_half) = tokio::io::split(client);
+                let mut reader = tokio::io::BufReader::new(read_half);
+                let mut line = String::new();
+                let n = tokio::time::timeout(Duration::from_secs(2), reader.read_line(&mut line))
+                    .await
+                    .expect("an admitted connection is retired by the drain")
+                    .expect("read");
+                assert_eq!(n, 0, "admitted connections end with EOF");
+            }
+        }
+        assert_eq!(connector.connection_count(), 0, "admitted={admitted}");
+        assert_eq!(connector.registered_tasks(), 0, "admitted={admitted}");
+        assert!(
+            connector.connect().await.is_none(),
+            "admission stays sealed"
+        );
     }
 
     #[tokio::test]
