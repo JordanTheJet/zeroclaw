@@ -151,6 +151,20 @@ fn migration_notice_text(notice: &crate::config::migration::MigrationNotice, pat
             &[("key", key), ("path", path), ("reason", reason)],
             format!("warning: dropped retired config key `{key}` from {path}: {reason}"),
         ),
+        MigrationNotice::ReferenceRemoved {
+            path: key,
+            reference,
+            reason,
+        } => ta(
+            "cli-config-retired-reference-removed",
+            &[
+                ("reference", reference),
+                ("key", key),
+                ("path", path),
+                ("reason", reason),
+            ],
+            format!("warning: removed `{reference}` from `{key}` in {path}: {reason}"),
+        ),
         MigrationNotice::Renamed { from, to, reason } => ta(
             "cli-config-retired-key-renamed",
             &[

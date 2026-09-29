@@ -828,6 +828,7 @@ cli-config-section-degraded = 警告: {$path} の設定セクション `{$sectio
 cli-config-migration-assumed-v1 = 警告: {$path} に `schema_version` がないため、スキーマ V1 として読み込み、そこから移行しました。V1 の移行は新しいバージョン向けに書かれたセクションを組み替えます。プロバイダーのエントリが 1 段深くネストされることがあり、チャネルのセクションは `default` エイリアスにまとめられます。このファイルが新しい ZeroClaw 向けに書かれたものであれば、先頭に書かれた時点のバージョンで `schema_version` を追加してください（`zeroclaw config migrate` がすでに書き換えている場合は、先に `.backup` のコピーを復元してください）。
 cli-config-retired-key-removed = 警告: 廃止された設定キー `{$key}` を {$path} から削除しました: {$reason}
 cli-config-migration-inferred-v3 = 警告: {$path} に `schema_version` がありませんが、セクションが V3 形式のため、スキーマ V3 として読み込み、そこから移行しました。`zeroclaw config migrate` を実行して、現在の `schema_version` をファイルに書き込んでください。
+cli-config-retired-reference-removed = 警告: {$path} の `{$key}` から `{$reference}` を削除しました: {$reason}
 cli-config-retired-key-renamed = 警告: 廃止された設定キー `{$from}` を {$path} 内の `{$to}` に移動しました: {$reason}
 cli-config-retired-key-rename-conflict = 警告: `{$to}` がすでに設定されているため、廃止された設定キー `{$from}` を移動せずに {$path} から削除しました: {$reason}
 cli-config-migration-pending = 警告: これらの変更はこの実行にのみ適用されます。{$path} に書き込むには `zeroclaw config migrate` を実行してください。

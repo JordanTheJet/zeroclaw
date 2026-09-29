@@ -29,6 +29,14 @@ pub enum MigrationNotice {
     InferredV3,
     /// A retired key was removed.
     Removed { path: String, reason: &'static str },
+    /// An entry naming a retired channel was removed from the list at `path`
+    /// (for example `agents.<alias>.channels`). `reference` is the channel
+    /// reference itself, which names a channel and holds no secret.
+    ReferenceRemoved {
+        path: String,
+        reference: String,
+        reason: &'static str,
+    },
     /// A retired key was moved to its replacement.
     Renamed {
         from: String,
@@ -64,6 +72,11 @@ impl MigrationNotice {
             Self::Removed { path, reason } => {
                 format!("removed retired config key `{path}`: {reason}")
             }
+            Self::ReferenceRemoved {
+                path,
+                reference,
+                reason,
+            } => format!("removed `{reference}` from `{path}`: {reason}"),
             Self::Renamed { from, to, reason } => {
                 format!("moved retired config key `{from}` to `{to}`: {reason}")
             }
@@ -82,6 +95,13 @@ pub enum Retirement {
     Remove,
     /// Move the key's value to `to`, unless `to` is already set.
     Rename { to: &'static [&'static str] },
+    /// Retire a channel type: delete `[channels.<type>]` like [`Self::Remove`]
+    /// and every reference to it, so nothing is left naming a channel that no
+    /// longer exists. That is each `[agents.<alias>] channels` entry of the
+    /// type, and each `[peer_groups.<name>]` whose `channel` is of the type.
+    /// The path must be `["channels", "<type>"]`. References are pruned even
+    /// when the section itself is already gone.
+    RemoveChannel,
 }
 
 /// A [`RetiredKey::path`] segment that matches every key of the table at that
@@ -202,6 +222,32 @@ pub const RETIRED_KEYS: &[RetiredKey] = &[
         path: &["channels_config", "wati"],
         retirement: Retirement::Remove,
         reason: RETIRED_WATI,
+    },
+    // Spellings no schema field reads, so serde would ignore them silently.
+    // Twitter and Reddit stay channels (`[channels.twitter.<alias>]`,
+    // `[channels.reddit.<alias>]`) and Notion stays the top-level `[notion]`
+    // tool section; only these other spellings are dropped.
+    RetiredKey {
+        retired_in: 4,
+        path: &["twitter"],
+        retirement: Retirement::Remove,
+        reason: "a top-level `[twitter]` section is not read; configure the Twitter channel as \
+                 `[channels.twitter.<alias>]`",
+    },
+    RetiredKey {
+        retired_in: 4,
+        path: &["reddit"],
+        retirement: Retirement::Remove,
+        reason: "a top-level `[reddit]` section is not read; configure the Reddit channel as \
+                 `[channels.reddit.<alias>]`",
+    },
+    RetiredKey {
+        retired_in: 4,
+        path: &["channels", "notion"],
+        retirement: Retirement::RemoveChannel,
+        reason: "Notion is not a channel, so `[channels.notion]` and references to a `notion` \
+                 channel are not read; the Notion tool is configured in the top-level `[notion]` \
+                 section",
     },
     // Retired by the V2 -> V3 step, whose normalizer also surfaces the shared
     // `[gateway.pairing_code]` policy. This entry covers files already at V3
@@ -1352,7 +1398,7 @@ fn apply_retired_keys_to_doc_table(
             };
             let from = segments.join(".");
             let notice = match key.retirement {
-                Retirement::Remove => MigrationNotice::Removed {
+                Retirement::Remove | Retirement::RemoveChannel => MigrationNotice::Removed {
                     path: from,
                     reason: key.reason,
                 },
@@ -1376,6 +1422,142 @@ fn apply_retired_keys_to_doc_table(
                 }
             };
             notices.push(notice);
+        }
+        if let Some(channel_type) = retired_channel_type(key) {
+            prune_doc_channel_references(root, channel_type, key.reason, notices);
+        }
+    }
+}
+
+/// The channel type a [`Retirement::RemoveChannel`] entry retires, or `None`
+/// for every other retirement.
+fn retired_channel_type(key: &RetiredKey) -> Option<&'static str> {
+    match (key.retirement, key.path) {
+        (Retirement::RemoveChannel, ["channels", channel_type]) => Some(*channel_type),
+        _ => None,
+    }
+}
+
+/// The channel type a channel reference names: `"telegram"` names the type
+/// itself, `"telegram.work"` one alias of it.
+fn channel_reference_type(reference: &str) -> &str {
+    reference.split('.').next().unwrap_or(reference)
+}
+
+/// Remove every reference to the retired `channel_type` from a parsed config:
+/// its entries in each `[agents.<alias>] channels` list, and each
+/// `[peer_groups.<name>]` bound to it. Each removal gets its own notice.
+fn prune_channel_references(
+    root: &mut toml::Table,
+    channel_type: &str,
+    reason: &'static str,
+    notices: &mut Vec<MigrationNotice>,
+) {
+    if let Some(toml::Value::Table(agents)) = root.get_mut("agents") {
+        for (alias, agent) in agents.iter_mut() {
+            let Some(toml::Value::Array(channels)) = agent
+                .as_table_mut()
+                .and_then(|agent| agent.get_mut("channels"))
+            else {
+                continue;
+            };
+            channels.retain(|entry| match entry.as_str() {
+                Some(reference) if channel_reference_type(reference) == channel_type => {
+                    notices.push(MigrationNotice::ReferenceRemoved {
+                        path: format!("agents.{alias}.channels"),
+                        reference: reference.to_string(),
+                        reason,
+                    });
+                    false
+                }
+                _ => true,
+            });
+        }
+    }
+    if let Some(toml::Value::Table(groups)) = root.get_mut("peer_groups") {
+        let bound: Vec<String> = groups
+            .iter()
+            .filter(|(_, group)| {
+                group
+                    .get("channel")
+                    .and_then(toml::Value::as_str)
+                    .is_some_and(|reference| channel_reference_type(reference) == channel_type)
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
+        for name in bound {
+            groups.remove(&name);
+            notices.push(MigrationNotice::Removed {
+                path: format!("peer_groups.{name}"),
+                reason,
+            });
+        }
+    }
+}
+
+/// [`prune_channel_references`] over a document, in place, for every table
+/// spelling (`[a.b]` headers, dotted keys, inline tables).
+fn prune_doc_channel_references(
+    root: &mut toml_edit::Table,
+    channel_type: &str,
+    reason: &'static str,
+    notices: &mut Vec<MigrationNotice>,
+) {
+    if let Some(agents) = root
+        .get_mut("agents")
+        .and_then(toml_edit::Item::as_table_like_mut)
+    {
+        for (alias, agent) in agents.iter_mut() {
+            let alias = alias.get().to_string();
+            let Some(channels) = agent
+                .as_table_like_mut()
+                .and_then(|agent| agent.get_mut("channels"))
+                .and_then(toml_edit::Item::as_array_mut)
+            else {
+                continue;
+            };
+            let before = channels.len();
+            channels.retain(|entry| match entry.as_str() {
+                Some(reference) if channel_reference_type(reference) == channel_type => {
+                    notices.push(MigrationNotice::ReferenceRemoved {
+                        path: format!("agents.{alias}.channels"),
+                        reference: reference.to_string(),
+                        reason,
+                    });
+                    false
+                }
+                _ => true,
+            });
+            // The removed first entry's successor keeps the space that
+            // separated it from the comma; drop it so `[ "a"]` reads `["a"]`.
+            if channels.len() != before
+                && let Some(first) = channels.get_mut(0)
+            {
+                first.decor_mut().set_prefix("");
+            }
+        }
+    }
+    if let Some(groups) = root
+        .get_mut("peer_groups")
+        .and_then(toml_edit::Item::as_table_like_mut)
+    {
+        let bound: Vec<String> = groups
+            .iter()
+            .filter(|(_, group)| {
+                group
+                    .as_table_like()
+                    .and_then(|group| group.get("channel"))
+                    .and_then(toml_edit::Item::as_str)
+                    .is_some_and(|reference| channel_reference_type(reference) == channel_type)
+            })
+            .map(|(name, _)| name.to_string())
+            .collect();
+        for name in bound {
+            groups.remove(&name);
+            notices.push(MigrationNotice::Removed {
+                path: format!("peer_groups.{name}"),
+                reason,
+            });
         }
     }
 }
@@ -1510,7 +1692,9 @@ fn keep_emptied_tables_visible(root: &mut toml_edit::Table, notices: &[Migration
             MigrationNotice::Removed { path, .. } => path,
             MigrationNotice::Renamed { from, .. }
             | MigrationNotice::RenameConflict { from, .. } => from,
-            MigrationNotice::AssumedV1 | MigrationNotice::InferredV3 => continue,
+            MigrationNotice::AssumedV1
+            | MigrationNotice::InferredV3
+            | MigrationNotice::ReferenceRemoved { .. } => continue,
         };
         let segments: Vec<&str> = from.split('.').collect();
         let parents = &segments[..segments.len().saturating_sub(1)];
@@ -1565,7 +1749,7 @@ fn apply_retired_keys(
             };
             let from = segments.join(".");
             let notice = match key.retirement {
-                Retirement::Remove => MigrationNotice::Removed {
+                Retirement::Remove | Retirement::RemoveChannel => MigrationNotice::Removed {
                     path: from,
                     reason: key.reason,
                 },
@@ -1589,6 +1773,9 @@ fn apply_retired_keys(
                 }
             };
             notices.push(notice);
+        }
+        if let Some(channel_type) = retired_channel_type(key) {
+            prune_channel_references(root, channel_type, key.reason, notices);
         }
     }
 }
@@ -4430,6 +4617,189 @@ mention_only = false
             .filter(|key| current.contains(*key))
             .collect();
         assert_eq!(shared, V1_KEYS_STILL_CURRENT);
+    }
+
+    // ── V4 retirements of keys no schema field reads ────────────────
+
+    /// A retirement must never name a key the current schema still reads:
+    /// that would silently delete working configuration. Top-level removals
+    /// must not be current sections, and a retired channel type must not be a
+    /// live channel type.
+    #[test]
+    fn a_retirement_never_names_a_key_the_schema_still_reads() {
+        let sections = current_top_level_sections();
+        for key in RETIRED_KEYS {
+            if let ([section], Retirement::Remove) = (key.path, key.retirement) {
+                assert!(
+                    *section == ANY_KEY || !sections.contains(*section),
+                    "`{section}` is a current top-level section and cannot be retired"
+                );
+            }
+            if matches!(key.retirement, Retirement::RemoveChannel) {
+                let channel_type = retired_channel_type(key)
+                    .unwrap_or_else(|| panic!("{:?}: must be [\"channels\", <type>]", key.path));
+                assert!(
+                    !crate::schema::v2::V3_CHANNEL_TYPES.contains(&channel_type),
+                    "`{channel_type}` is a live channel type and cannot be retired"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn v3_to_v4_retires_top_level_twitter_and_reddit_but_not_the_channels() {
+        let raw = r#"schema_version = 3
+
+[twitter]
+bearer_token = "TWITTER-SENTINEL"
+
+[reddit]
+client_secret = "REDDIT-SENTINEL"
+
+[channels.twitter.main]
+enabled = true
+"#;
+        let (migrated, notices) = migrate_file_with_notices(raw).unwrap().unwrap();
+        assert_eq!(removed_paths(&notices), vec!["reddit", "twitter"]);
+        assert!(!migrated.contains("SENTINEL"), "{migrated}");
+        assert!(
+            migrated.contains("[channels.twitter.main]"),
+            "the Twitter channel itself is not retired: {migrated}"
+        );
+
+        let value: toml::Value = toml::from_str(raw).unwrap();
+        let Migrated { value, notices } = migrate_toml(value).unwrap().unwrap();
+        assert_eq!(removed_paths(&notices), vec!["reddit", "twitter"]);
+        let root = value.as_table().unwrap();
+        assert!(!root.contains_key("twitter") && !root.contains_key("reddit"));
+        assert!(root["channels"].get("twitter").is_some());
+    }
+
+    /// A V3 file that holds `[channels.notion]`, agents naming it and a peer
+    /// group bound to it.
+    const V3_WITH_NOTION_CHANNEL: &str = r#"schema_version = 3
+
+[channels.notion.main]
+token = "NOTION-SENTINEL"
+
+# operator comment kept by the in-place migration
+[channels.telegram.main]
+bot_token = "telegram-token"
+
+[agents.default]
+channels = ["notion.main", "telegram.main", "notion"]
+
+[agents.other]
+channels = ["telegram.main"]
+
+[peer_groups.notion_team]
+channel = "notion.main"
+agents = ["default"]
+
+[peer_groups.telegram_team]
+channel = "telegram"
+agents = ["default"]
+"#;
+
+    /// What retiring the notion channel from [`V3_WITH_NOTION_CHANNEL`] must
+    /// report, in a stable order.
+    fn notion_retirement_report(notices: &[MigrationNotice]) -> Vec<String> {
+        let mut report: Vec<String> = notices
+            .iter()
+            .map(|notice| match notice {
+                MigrationNotice::Removed { path, .. } => format!("removed {path}"),
+                MigrationNotice::ReferenceRemoved {
+                    path, reference, ..
+                } => format!("pruned {reference} from {path}"),
+                other => panic!("unexpected notice {other:?}"),
+            })
+            .collect();
+        report.sort();
+        report
+    }
+
+    const NOTION_RETIREMENT_REPORT: &[&str] = &[
+        "pruned notion from agents.default.channels",
+        "pruned notion.main from agents.default.channels",
+        "removed channels.notion",
+        "removed peer_groups.notion_team",
+    ];
+
+    #[test]
+    fn v3_to_v4_retires_the_notion_channel_with_every_reference_to_it() {
+        // The parsed-value path (load and the typed chain).
+        let value: toml::Value = toml::from_str(V3_WITH_NOTION_CHANNEL).unwrap();
+        let Migrated { value, notices } = migrate_toml(value).unwrap().unwrap();
+        assert_eq!(notion_retirement_report(&notices), NOTION_RETIREMENT_REPORT);
+        let root = value.as_table().unwrap();
+        assert!(root["channels"].get("notion").is_none());
+        assert!(root["channels"].get("telegram").is_some());
+        assert_eq!(
+            root["agents"]["default"]["channels"],
+            toml::Value::Array(vec!["telegram.main".into()])
+        );
+        assert_eq!(
+            root["agents"]["other"]["channels"],
+            toml::Value::Array(vec!["telegram.main".into()]),
+            "an agent with no notion reference is untouched"
+        );
+        assert!(root["peer_groups"].get("notion_team").is_none());
+        assert!(root["peer_groups"].get("telegram_team").is_some());
+
+        // The in-place document path (`config migrate` on a V3+ file).
+        let (migrated, notices) = migrate_file_with_notices(V3_WITH_NOTION_CHANNEL)
+            .unwrap()
+            .unwrap();
+        assert_eq!(notion_retirement_report(&notices), NOTION_RETIREMENT_REPORT);
+        assert!(!migrated.contains("notion"), "{migrated}");
+        assert!(migrated.contains("telegram_team"), "{migrated}");
+        assert!(
+            migrated.contains("channels = [\"telegram.main\"]"),
+            "a pruned list keeps a clean spelling: {migrated}"
+        );
+        assert!(
+            migrated.contains("# operator comment kept by the in-place migration"),
+            "{migrated}"
+        );
+        let reparsed: toml::Value = toml::from_str(&migrated).unwrap();
+        assert_eq!(
+            reparsed["agents"]["default"]["channels"],
+            toml::Value::Array(vec!["telegram.main".into()])
+        );
+        assert_eq!(detect_version(&reparsed).unwrap(), CURRENT_SCHEMA_VERSION);
+    }
+
+    /// References to a retired channel are pruned on every load and save of a
+    /// current file, not only by the migration step, and in every table
+    /// spelling: dotted keys and inline tables as well as headers. Here the
+    /// `[channels.notion]` section itself is already gone.
+    #[test]
+    fn notion_references_are_pruned_from_a_current_file_in_every_spelling() {
+        let raw = r#"schema_version = 4
+agents.default.channels = ["notion.work", "telegram.main"]
+peer_groups = { notion_team = { channel = "notion" }, keep = { channel = "telegram.main" } }
+"#;
+        let (out, notices) = apply_doc(raw);
+        assert_eq!(
+            notion_retirement_report(&notices),
+            vec![
+                "pruned notion.work from agents.default.channels",
+                "removed peer_groups.notion_team",
+            ]
+        );
+        let reparsed: toml::Value = toml::from_str(&out).unwrap();
+        assert_eq!(
+            reparsed["agents"]["default"]["channels"],
+            toml::Value::Array(vec!["telegram.main".into()])
+        );
+        assert!(reparsed["peer_groups"].get("notion_team").is_none());
+        assert!(reparsed["peer_groups"].get("keep").is_some());
+
+        let value: toml::Value = toml::from_str(raw).unwrap();
+        let Migrated { notices, .. } = migrate_toml(value)
+            .unwrap()
+            .expect("a current file holding retired references is cleaned on load");
+        assert_eq!(notion_retirement_report(&notices).len(), 2);
     }
 
     #[test]

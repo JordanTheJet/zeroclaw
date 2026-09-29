@@ -932,6 +932,7 @@ cli-plugin-list-entry-no-component = {$name} v{$version} — {$description} [no 
 cli-config-migration-assumed-v1 = warning: {$path} has no `schema_version`, so it was read as schema V1 and migrated from there. The V1 migration reshapes sections written for a newer version: provider entries can end up nested one level too deep, and channel sections are merged into a `default` alias. If this file was written for a newer ZeroClaw, add `schema_version` at the top with the version it was written for (restore the `.backup` copy first if `zeroclaw config migrate` already rewrote it).
 cli-config-retired-key-removed = warning: dropped retired config key `{$key}` from {$path}: {$reason}
 cli-config-migration-inferred-v3 = warning: {$path} has no `schema_version`, but its sections are in the V3 format, so it was read as schema V3 and migrated from there. Run `zeroclaw config migrate` to write the current `schema_version` into the file.
+cli-config-retired-reference-removed = warning: removed `{$reference}` from `{$key}` in {$path}: {$reason}
 cli-config-retired-key-renamed = warning: moved retired config key `{$from}` to `{$to}` in {$path}: {$reason}
 cli-config-retired-key-rename-conflict = warning: dropped retired config key `{$from}` from {$path} without moving it, because `{$to}` is already set: {$reason}
 cli-config-migration-pending = warning: these changes apply to this run only. Run `zeroclaw config migrate` to write them to {$path}.

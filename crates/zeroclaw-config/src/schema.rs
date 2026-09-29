@@ -25627,7 +25627,8 @@ impl Config {
         // leaves the retired keys on disk and must not claim otherwise.
         for notice in &retired {
             let path = match notice {
-                crate::migration::MigrationNotice::Removed { path, .. } => path.as_str(),
+                crate::migration::MigrationNotice::Removed { path, .. }
+                | crate::migration::MigrationNotice::ReferenceRemoved { path, .. } => path.as_str(),
                 crate::migration::MigrationNotice::Renamed { from, .. }
                 | crate::migration::MigrationNotice::RenameConflict { from, .. } => from.as_str(),
                 crate::migration::MigrationNotice::AssumedV1
