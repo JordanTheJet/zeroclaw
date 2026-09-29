@@ -2837,7 +2837,7 @@ pub(crate) async fn persist_pairing_tokens(
 
 /// [`persist_pairing_tokens`] for a caller that already holds the config
 /// write lock: a revocation that removed a live token under it, through
-/// [`PairingGuard::revoke_token_hash_ordered`], persists under the same guard.
+/// [`PairingGuard::revoke_under_config_write_lock`], persists under the same guard.
 pub(crate) async fn persist_pairing_tokens_under(
     config: Arc<RwLock<Config>>,
     pairing: &PairingGuard,
@@ -4952,20 +4952,27 @@ async fn handle_admin_paircode_new(
 
     let revocation_message = match rotate {
         Some("all") => {
-            let (revoked, config_write_guard) = state
+            // Every live token and every device row go in one step under
+            // the lock, so a dropped request leaves neither half behind.
+            let ((revoked, cleared), config_write_guard) = state
                 .pairing
-                .revoke_all_tokens_ordered(state.config_write_lock.clone())
+                .revoke_under_config_write_lock(state.config_write_lock.clone(), |pairing| {
+                    let revoked = pairing.revoke_all_tokens();
+                    let cleared = state
+                        .device_registry
+                        .as_ref()
+                        .map(|registry| registry.clear());
+                    (revoked, cleared)
+                })
                 .await;
-            if let Some(registry) = state.device_registry.as_ref() {
-                if let Err(e) = registry.clear() {
-                    let body = serde_json::json!({
-                        "success": false,
-                        "pairing_required": true,
-                        "pairing_code": null,
-                        "message": format!("Tokens revoked in memory but device registry clear failed: {e}"),
-                    });
-                    return Ok((StatusCode::INTERNAL_SERVER_ERROR, Json(body)));
-                }
+            if let Some(Err(e)) = cleared {
+                let body = serde_json::json!({
+                    "success": false,
+                    "pairing_required": true,
+                    "pairing_code": null,
+                    "message": format!("Tokens revoked in memory but device registry clear failed: {e}"),
+                });
+                return Ok((StatusCode::INTERNAL_SERVER_ERROR, Json(body)));
             }
             if let Err(e) = persist_pairing_tokens_under(
                 state.config.clone(),
@@ -5002,9 +5009,11 @@ async fn handle_admin_paircode_new(
                 });
                 return Ok((StatusCode::SERVICE_UNAVAILABLE, Json(body)));
             };
-            let token_hash = match registry.revoke(device_id) {
-                Ok(Some(hash)) => hash,
-                Ok(None) => {
+            let (revoked, config_write_guard) =
+                api_pairing::revoke_device_credential(&state, registry, device_id).await;
+            match revoked {
+                Ok(true) => {}
+                Ok(false) => {
                     let body = serde_json::json!({
                         "success": false,
                         "pairing_required": true,
@@ -5022,11 +5031,7 @@ async fn handle_admin_paircode_new(
                     });
                     return Ok((StatusCode::INTERNAL_SERVER_ERROR, Json(body)));
                 }
-            };
-            let (_, config_write_guard) = state
-                .pairing
-                .revoke_token_hash_ordered(state.config_write_lock.clone(), &token_hash)
-                .await;
+            }
             if let Err(e) = persist_pairing_tokens_under(
                 state.config.clone(),
                 &state.pairing,
@@ -6029,6 +6034,67 @@ path = "{trigger_path}"
                 .is_empty(),
             "rotate=all must clear the device registry"
         );
+    }
+
+    /// The admin rotate paths dropped while they wait for the config write
+    /// lock, as the gateway's request timeout drops them, must leave every
+    /// device row and token in place, and the retried request revokes them.
+    #[tokio::test]
+    async fn admin_paircode_rotate_dropped_while_waiting_can_be_retried() {
+        for target in ["dev-a", "all"] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let state = admin_paircode_state(&tmp, true, true);
+            let token_a = pair_device(&state, "dev-a").await;
+            let token_b = pair_device(&state, "dev-b").await;
+            let listed = |state: &AppState| -> Vec<String> {
+                let mut ids: Vec<String> = state
+                    .device_registry
+                    .as_ref()
+                    .unwrap()
+                    .list()
+                    .expect("test device registry list")
+                    .into_iter()
+                    .map(|device| device.id)
+                    .collect();
+                ids.sort();
+                ids
+            };
+            let call = |state: AppState| {
+                handle_admin_paircode_new(
+                    State(state.clone()),
+                    test_connect_info(),
+                    admin_headers(&state),
+                    Query(AdminPaircodeQuery {
+                        rotate: Some(target.into()),
+                    }),
+                )
+            };
+
+            let in_flight = Arc::clone(&state.config_write_lock).lock_owned().await;
+            let mut waiting = Box::pin(call(state.clone()));
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(
+                std::future::Future::poll(waiting.as_mut(), &mut cx).is_pending(),
+                "{target}: the rotation must wait for the config write lock"
+            );
+            drop(waiting);
+            drop(in_flight);
+
+            assert_eq!(listed(&state), vec!["dev-a", "dev-b"], "{target}");
+            assert!(state.pairing.is_authenticated(&token_a), "{target}");
+            assert!(state.pairing.is_authenticated(&token_b), "{target}");
+
+            let (status, _) = admin_paircode_response_json(call(state.clone()).await).await;
+            assert_eq!(status, StatusCode::OK, "{target}: the retry");
+            assert!(!state.pairing.is_authenticated(&token_a), "{target}");
+            if target == "all" {
+                assert!(listed(&state).is_empty());
+                assert!(!state.pairing.is_authenticated(&token_b));
+            } else {
+                assert_eq!(listed(&state), vec!["dev-b"]);
+                assert!(state.pairing.is_authenticated(&token_b));
+            }
+        }
     }
 
     #[tokio::test]
