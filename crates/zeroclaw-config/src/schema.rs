@@ -25514,25 +25514,39 @@ impl Config {
 
         // If an existing config file is present, sync the new values onto it
         // to preserve comments and formatting. Otherwise, use the fresh serialization.
-        let toml_str = if config_path.exists() {
-            let existing = fs::read_to_string(&config_path).await.unwrap_or_default();
-            if existing.is_empty() {
-                new_toml
-            } else {
-                let mut doc: toml_edit::DocumentMut = existing
-                    .parse()
-                    .context("Failed to parse existing config for comment preservation")?;
-                crate::migration::sync_table(doc.as_table_mut(), &new_table);
-                // sync_table preserves existing decor verbatim, so newly
-                // inserted sections lack the blank-line gap before their
-                // header until the post-processor runs.
-                ensure_blank_line_before_sections(&doc.to_string())
-            }
+        let existing = if config_path.exists() {
+            fs::read_to_string(&config_path).await.unwrap_or_default()
         } else {
+            String::new()
+        };
+        let mut doc: toml_edit::DocumentMut = if existing.is_empty() {
             new_toml
+                .parse()
+                .context("Failed to parse serialized config for retirement")?
+        } else {
+            let mut doc: toml_edit::DocumentMut = existing
+                .parse()
+                .context("Failed to parse existing config for comment preservation")?;
+            crate::migration::sync_table(doc.as_table_mut(), &new_table);
+            doc
         };
 
-        write_config_atomically(&config_path, &toml_str).await
+        // Apply the `RETIRED_KEYS` policy to what is about to be written, as
+        // the load path and `save_dirty` do. Most retired keys have no schema
+        // field and so cannot come out of serialization, but a retired channel
+        // is also removed from live fields (`[agents.<alias>] channels`,
+        // `[peer_groups.<name>] channel`), and a reference to it held in the
+        // typed config would otherwise be written straight back.
+        let retired = crate::migration::apply_retired_keys_to_doc(doc.as_table_mut());
+
+        // sync_table preserves existing decor verbatim, so newly inserted
+        // sections lack the blank-line gap before their header until the
+        // post-processor runs.
+        let toml_str = ensure_blank_line_before_sections(&doc.to_string());
+
+        write_config_atomically(&config_path, &toml_str).await?;
+        log_retirements_saved(&retired);
+        Ok(())
     }
 
     /// Incremental save: only the paths in `self.dirty_paths` are written
@@ -25623,34 +25637,39 @@ impl Config {
         let toml_str = ensure_blank_line_before_sections(&doc.to_string());
 
         write_config_atomically(&config_path, &toml_str).await?;
-        // Reported only now that the file is durably replaced: a failed write
-        // leaves the retired keys on disk and must not claim otherwise.
-        for notice in &retired {
-            let path = match notice {
-                crate::migration::MigrationNotice::Removed { path, .. }
-                | crate::migration::MigrationNotice::ReferenceRemoved { path, .. } => path.as_str(),
-                crate::migration::MigrationNotice::Renamed { from, .. }
-                | crate::migration::MigrationNotice::RenameConflict { from, .. } => from.as_str(),
-                crate::migration::MigrationNotice::AssumedV1
-                | crate::migration::MigrationNotice::InferredV3 => continue,
-            };
-            ::zeroclaw_log::record!(
-                INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Success)
-                    .with_attrs(::serde_json::json!({
-                        "retired_config": path,
-                        "notice": notice,
-                    })),
-                &format!(
-                    "Updated config.toml on save: {}. Backups taken before this save \
-                     still carry the original value.",
-                    notice.message()
-                )
-            );
-        }
+        log_retirements_saved(&retired);
         self.clear_dirty();
         Ok(())
+    }
+}
+
+/// Log each retired key a save removed from `config.toml`. Called only once
+/// the file is durably replaced: a failed write leaves the retired keys on
+/// disk and must not claim otherwise.
+fn log_retirements_saved(retired: &[crate::migration::MigrationNotice]) {
+    for notice in retired {
+        let path = match notice {
+            crate::migration::MigrationNotice::Removed { path, .. }
+            | crate::migration::MigrationNotice::ReferenceRemoved { path, .. } => path.as_str(),
+            crate::migration::MigrationNotice::Renamed { from, .. }
+            | crate::migration::MigrationNotice::RenameConflict { from, .. } => from.as_str(),
+            crate::migration::MigrationNotice::AssumedV1
+            | crate::migration::MigrationNotice::InferredV3 => continue,
+        };
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                .with_attrs(::serde_json::json!({
+                    "retired_config": path,
+                    "notice": notice,
+                })),
+            &format!(
+                "Updated config.toml on save: {}. Backups taken before this save \
+                 still carry the original value.",
+                notice.message()
+            )
+        );
     }
 }
 
@@ -40476,6 +40495,98 @@ bot_token = "enc:v1:UNRELATED-CIPHERTEXT-THAT-MUST-SURVIVE"
             written.contains("trust_daemon_uid = false"),
             "got:\n{written}"
         );
+    }
+
+    /// A typed config still holding references to a retired channel type, as
+    /// an in-process edit could restore them after load removed them: a
+    /// `notion.work` entry in an agent's channel list beside a live telegram
+    /// one, and a peer group bound to it beside one bound to telegram. The
+    /// typed fields accept any channel reference, so only the save can drop
+    /// them.
+    fn config_with_retired_channel_references(config_path: std::path::PathBuf) -> Config {
+        let mut config: Config = toml::from_str(
+            r#"schema_version = 4
+
+[channels.telegram.main]
+bot_token = "telegram-token"
+
+[agents.default]
+channels = ["notion.work", "telegram.main"]
+
+[peer_groups.notion_team]
+channel = "notion.work"
+
+[peer_groups.telegram_team]
+channel = "telegram.main"
+"#,
+        )
+        .expect("the typed fields accept a retired channel reference");
+        config.config_path = config_path;
+        config
+    }
+
+    fn assert_retired_channel_references_gone(written: &str) {
+        assert!(!written.contains("notion"), "got:\n{written}");
+        assert!(
+            written.contains("telegram.main") && written.contains("telegram_team"),
+            "the live telegram references must stay; got:\n{written}"
+        );
+        let reloaded =
+            crate::migration::migrate_to_current(written).expect("the written file loads");
+        assert_eq!(
+            reloaded.agents["default"].channels,
+            vec![crate::providers::ChannelRef::new("telegram.main")]
+        );
+        assert!(!reloaded.peer_groups.contains_key("notion_team"));
+        assert!(reloaded.peer_groups.contains_key("telegram_team"));
+    }
+
+    #[test]
+    async fn save_removes_retired_channel_references_from_a_new_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        let config = config_with_retired_channel_references(config_path.clone());
+        config.save().await.unwrap();
+        assert_retired_channel_references_gone(&std::fs::read_to_string(&config_path).unwrap());
+    }
+
+    #[test]
+    async fn save_removes_retired_channel_references_from_an_existing_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "schema_version = {}\n\n# Operator note that must survive the save.\n\
+                 [channels.telegram.main]\nbot_token = \"telegram-token\"\n",
+                crate::migration::CURRENT_SCHEMA_VERSION
+            ),
+        )
+        .unwrap();
+        let config = config_with_retired_channel_references(config_path.clone());
+        config.save().await.unwrap();
+        let written = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            written.contains("# Operator note that must survive the save."),
+            "got:\n{written}"
+        );
+        assert_retired_channel_references_gone(&written);
+    }
+
+    #[test]
+    async fn save_dirty_on_a_missing_file_removes_retired_channel_references() {
+        // With no file yet, `save_dirty` falls back to a full save, which must
+        // apply the same retirement pass.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        let mut config = config_with_retired_channel_references(config_path.clone());
+        config.mark_dirty("agents.default.channels");
+        config.save_dirty().await.unwrap();
+        assert!(
+            config.dirty_paths.is_empty(),
+            "a successful save clears the dirty set"
+        );
+        assert_retired_channel_references_gone(&std::fs::read_to_string(&config_path).unwrap());
     }
 
     #[test]
