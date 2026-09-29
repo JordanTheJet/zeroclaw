@@ -1519,7 +1519,8 @@ async fn channels_bind_narrowed_after_admission_has_no_effect() {
 /// A control against over-rejection: a grant added while the bind waited
 /// does not make the recheck refuse it. This alone does not show that the
 /// grants were resolved again, because a check against the admission-time
-/// grants would also pass; the revoked and narrowed tests above show that.
+/// grants would also pass. The narrowed test above shows the grants are
+/// resolved again, and the reowned test below shows the owner is.
 #[tokio::test]
 async fn channels_bind_widened_after_admission_is_honoured() {
     use zeroclaw_api::grants::{Resource, Verb};
