@@ -71,7 +71,7 @@ impl CancelCause {
     }
 }
 
-/// Result of [`SessionStore::steer_session`].
+/// Result of [`SessionStore::steer_session_generation`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SteerOutcome {
     Accepted,
