@@ -152,16 +152,6 @@ pub struct Config {
     /// section is impossible to miss.
     #[serde(skip)]
     pub degraded_sections: Vec<String>,
-    /// Retired WATI config section roots detected before migration and typed
-    /// deserialization erase them. Never serialized; the CLI surfaces each
-    /// path on stderr so an operator cannot miss the retired channel.
-    #[serde(skip)]
-    pub retired_wati_config_sections: Vec<String>,
-    /// Whether a retired `[node_transport]` section was present before
-    /// migration and typed deserialization erased it. Never serialized; the
-    /// CLI surfaces upgrade guidance without retaining the retired secret.
-    #[serde(skip)]
-    pub retired_node_transport_config: bool,
     /// What migrating this config to the current schema changed or assumed
     /// (retired keys removed or moved, a missing `schema_version` read as V1).
     /// Never serialized; the CLI surfaces each on stderr, since the matching
@@ -20934,8 +20924,6 @@ impl Default for Config {
             dirty_paths: std::collections::HashSet::new(),
             degraded_security: Vec::new(),
             degraded_sections: Vec::new(),
-            retired_wati_config_sections: Vec::new(),
-            retired_node_transport_config: false,
             migration_notices: Vec::new(),
             schema_version: crate::migration::CURRENT_SCHEMA_VERSION,
             providers: crate::providers::Providers::default(),
@@ -22102,7 +22090,12 @@ impl Config {
                 if crate::migration::V1_LEGACY_KEYS.contains(&key.as_str()) {
                     return false;
                 }
-                if key.as_str() == "node_transport" {
+                // A retired section is reported by the migration notices, so
+                // it is not also an unknown key.
+                if crate::migration::RETIRED_KEYS
+                    .iter()
+                    .any(|retired| retired.path == [key.as_str()].as_slice())
+                {
                     return false;
                 }
                 let mut t = toml::Table::new();
@@ -22117,35 +22110,6 @@ impl Config {
             })
             .cloned()
             .collect()
-    }
-
-    /// Return retired WATI section roots before migration and typed
-    /// deserialization erase them. V1 used `[channels_config.wati]`; V2/V3
-    /// channel aliases use `[channels.wati.<alias>]`.
-    fn retired_wati_config_sections(raw_toml: &str) -> Vec<String> {
-        let raw: toml::Table = match raw_toml.parse() {
-            Ok(t) => t,
-            Err(_) => return Vec::new(),
-        };
-
-        ["channels", "channels_config"]
-            .into_iter()
-            .filter(|root| {
-                raw.get(*root)
-                    .and_then(toml::Value::as_table)
-                    .is_some_and(|channels| channels.contains_key("wati"))
-            })
-            .map(|root| format!("{root}.wati"))
-            .collect()
-    }
-
-    /// Detect the retired top-level transport section without retaining any
-    /// of its values, including `shared_secret`.
-    fn has_retired_node_transport_config(raw_toml: &str) -> bool {
-        raw_toml
-            .parse::<toml::Table>()
-            .ok()
-            .is_some_and(|raw| raw.contains_key("node_transport"))
     }
 
     /// Return `<kind>.<family>` entries under `[providers]` in `raw_toml`
@@ -22397,37 +22361,6 @@ impl Config {
                 .await
                 .context("Failed to read config file")?;
 
-            let retired_wati_config_sections = Self::retired_wati_config_sections(&contents);
-            for path in &retired_wati_config_sections {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({
-                            "channel": "wati",
-                            "retired_config": path,
-                        })),
-                    &format!(
-                        "Retired WATI channel config section `{path}` is ignored because WATI \
-                         support was removed. Migrate to `[channels.whatsapp.<alias>]` using \
-                         the Cloud API or WhatsApp Web, then revoke the unused WATI API token."
-                    )
-                );
-            }
-            let retired_node_transport_config = Self::has_retired_node_transport_config(&contents);
-            if retired_node_transport_config {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({
-                            "retired_config": "node_transport",
-                        })),
-                    "Retired `[node_transport]` config is ignored because the legacy HMAC node \
-                     transport was removed. Delete the section from config.toml."
-                );
-            }
-
             // Deserialize the config with the standard TOML parser.
             //
             // Previously this used `serde_ignored::deserialize` for both
@@ -22463,8 +22396,6 @@ impl Config {
             let mut config: Config = salvage.config;
             config.degraded_security = salvage.dropped_security;
             config.degraded_sections = salvage.dropped;
-            config.retired_wati_config_sections = retired_wati_config_sections;
-            config.retired_node_transport_config = retired_node_transport_config;
             config.migration_notices = salvage.notices;
             if let Some(from_version) = stale_version {
                 ::zeroclaw_log::record!(
@@ -32050,8 +31981,6 @@ auto_save = true
             eval: crate::scattered_types::EvalHarnessConfig::default(),
             degraded_security: Vec::new(),
             degraded_sections: Vec::new(),
-            retired_wati_config_sections: Vec::new(),
-            retired_node_transport_config: false,
             migration_notices: Vec::new(),
             schema_version: crate::migration::CURRENT_SCHEMA_VERSION,
             providers: {
@@ -33365,8 +33294,6 @@ default_temperature = 0.7
             eval: crate::scattered_types::EvalHarnessConfig::default(),
             degraded_security: Vec::new(),
             degraded_sections: Vec::new(),
-            retired_wati_config_sections: Vec::new(),
-            retired_node_transport_config: false,
             migration_notices: Vec::new(),
             schema_version: crate::migration::CURRENT_SCHEMA_VERSION,
             providers,
@@ -36447,7 +36374,7 @@ default_model = "persisted-profile"
 
     #[test]
     #[allow(clippy::large_futures)]
-    async fn load_or_init_warns_for_current_and_legacy_wati_config() {
+    async fn load_or_init_reports_retired_wati_config_without_leaking_its_token() {
         let _env_guard = env_override_lock().await;
         let temp_home =
             std::env::temp_dir().join(format!("zeroclaw_test_home_{}", uuid::Uuid::new_v4()));
@@ -36464,7 +36391,6 @@ default_model = "persisted-profile"
 enabled = true
 api_token = "current-placeholder-token"
 "#,
-                "channels.wati",
                 "current-placeholder-token",
             ),
             (
@@ -36473,12 +36399,14 @@ api_token = "current-placeholder-token"
 enabled = true
 api_token = "legacy-placeholder-token"
 "#,
-                "channels_config.wati",
                 "legacy-placeholder-token",
             ),
         ];
 
-        for (case, raw, expected_path, secret_value) in cases {
+        // The V1 migration renames `channels_config` to `channels`, so both
+        // shapes are reported under the path the migrated config would hold.
+        let expected_path = "channels.wati";
+        for (case, raw, secret_value) in cases {
             let install = temp_home.join(case);
             fs::create_dir_all(&install).await.unwrap();
             fs::write(install.join("config.toml"), raw).await.unwrap();
@@ -36495,13 +36423,16 @@ api_token = "legacy-placeholder-token"
                     .all(|entry| entry.channel_type != "wati"),
                 "retired WATI config must not re-enable a live channel"
             );
-            assert_eq!(
-                config.retired_wati_config_sections,
-                vec![expected_path.to_string()],
-                "load-time diagnostics must preserve the retired section path"
+            assert!(
+                config.migration_notices.iter().any(|notice| matches!(
+                    notice,
+                    crate::migration::MigrationNotice::Removed { path, .. } if path == expected_path
+                )),
+                "load-time notices must name the retired section for {case}: {:?}",
+                config.migration_notices
             );
             assert!(
-                logs.contains("Retired WATI channel config section"),
+                logs.contains("removed retired config key `channels.wati`"),
                 "missing WATI retirement warning for {case}: {logs}"
             );
             assert!(
@@ -36519,7 +36450,7 @@ api_token = "legacy-placeholder-token"
 
     #[test]
     #[allow(clippy::large_futures)]
-    async fn load_or_init_warns_for_retired_node_transport_without_logging_secret() {
+    async fn load_or_init_reports_retired_node_transport_without_logging_secret() {
         let _env_guard = env_override_lock().await;
         let temp_home =
             std::env::temp_dir().join(format!("zeroclaw_test_home_{}", uuid::Uuid::new_v4()));
@@ -36546,13 +36477,20 @@ shared_secret = "retired-node-transport-sentinel"
         let config = Box::pin(Config::load_or_init()).await.unwrap();
         let logs = drain_captured(&mut rx);
 
-        assert!(config.retired_node_transport_config);
         assert!(
-            logs.contains("Retired `[node_transport]` config is ignored"),
+            config.migration_notices.iter().any(|notice| matches!(
+                notice,
+                crate::migration::MigrationNotice::Removed { path, .. } if path == "node_transport"
+            )),
+            "load-time notices must name the retired section: {:?}",
+            config.migration_notices
+        );
+        assert!(
+            logs.contains("removed retired config key `node_transport`"),
             "missing retirement warning: {logs}"
         );
         assert!(
-            logs.contains("\"retired_config\":\"node_transport\""),
+            logs.contains("\"path\":\"node_transport\""),
             "warning must carry structured retirement attribution: {logs}"
         );
         assert!(
@@ -40601,6 +40539,103 @@ bot_token = "enc:v1:UNRELATED-CIPHERTEXT-THAT-MUST-SURVIVE"
         );
     }
 
+    /// Write `raw` as the on-disk config, load it, make one unrelated edit
+    /// and persist it through `save_dirty`. Returns the written file.
+    async fn save_dirty_after_unrelated_edit(dir: &std::path::Path, raw: &str) -> String {
+        let config_path = dir.join("config.toml");
+        std::fs::write(&config_path, raw).unwrap();
+        let mut config = crate::migration::migrate_to_current_salvaged(raw).config;
+        config.config_path = config_path.clone();
+        config.observability.backend = ObservabilityBackend::Otel;
+        config.mark_dirty("observability.backend");
+        config.save_dirty().await.unwrap();
+        std::fs::read_to_string(&config_path).unwrap()
+    }
+
+    #[test]
+    async fn save_dirty_keeps_an_alias_emptied_through_dotted_keys() {
+        // `slow` and `worker` exist only as prefixes of retired dotted keys.
+        // Removing those keys must not delete the aliases, or the untouched
+        // `runtime_profile = "slow"` reference would dangle on reload.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let written = save_dirty_after_unrelated_edit(
+            tmp.path(),
+            &format!(
+                "schema_version = {}\n\
+                 runtime_profiles.slow.context_compression.summary_model = \"haiku\"\n\
+                 agents.worker.compact_context = true\n\n\
+                 [agents.coder]\nruntime_profile = \"slow\"\n\n\
+                 [observability]\nbackend = \"none\"\n",
+                crate::migration::CURRENT_SCHEMA_VERSION
+            ),
+        )
+        .await;
+        assert!(
+            !written.contains("summary_model") && !written.contains("compact_context"),
+            "got:\n{written}"
+        );
+        let reloaded = crate::migration::migrate_to_current_salvaged(&written);
+        assert!(
+            reloaded.config.runtime_profiles.contains_key("slow"),
+            "the referenced profile must survive the save; got:\n{written}"
+        );
+        assert!(
+            reloaded.config.agents.contains_key("worker"),
+            "the agent alias must survive the save; got:\n{written}"
+        );
+        assert_eq!(
+            reloaded.config.agents["coder"].runtime_profile.trim(),
+            "slow"
+        );
+        assert!(reloaded.notices.is_empty(), "{:?}", reloaded.notices);
+    }
+
+    #[test]
+    async fn save_dirty_removes_sections_retired_outside_v4_with_their_secrets() {
+        // `[node_transport]` and WATI sections were retired before V4 by code
+        // outside `RETIRED_KEYS`. Under V4 an unrelated incremental save must
+        // remove them and their secrets from disk, at V3 and at V4.
+        for version in [3, crate::migration::CURRENT_SCHEMA_VERSION] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let written = save_dirty_after_unrelated_edit(
+                tmp.path(),
+                &format!(
+                    "schema_version = {version}\n\n\
+                     # Comment on the retired section, removed with it.\n\
+                     [node_transport]\nenabled = true\nshared_secret = \"NODE-SENTINEL\"\n\n\
+                     [channels.wati.production]\nenabled = true\napi_token = \"WATI-SENTINEL\"\n\n\
+                     # Operator note that must survive the save.\n\
+                     [observability]\nbackend = \"none\"\n"
+                ),
+            )
+            .await;
+            for gone in [
+                "node_transport",
+                "NODE-SENTINEL",
+                "wati",
+                "WATI-SENTINEL",
+                "Comment on the retired section",
+            ] {
+                assert!(
+                    !written.contains(gone),
+                    "V{version}: `{gone}` must not survive an incremental save; got:\n{written}"
+                );
+            }
+            assert!(
+                written.contains("backend = \"otel\""),
+                "V{version}; got:\n{written}"
+            );
+            assert!(
+                written.contains("# Operator note that must survive the save."),
+                "V{version}; got:\n{written}"
+            );
+            assert!(written.starts_with(&format!(
+                "schema_version = {}",
+                crate::migration::CURRENT_SCHEMA_VERSION
+            )));
+        }
+    }
+
     #[test]
     async fn retired_key_doc_cleanup_handles_every_nevis_spelling() {
         // `[security.nevis]` header form, leaving a sibling key behind.
@@ -43219,40 +43254,6 @@ api_key = "op://zeroclaw/provider/openai-api-key"
         let mut tr_slots = crate::providers::TranscriptionProviders::slot_names().to_vec();
         tr_slots.sort_unstable();
         assert_eq!(tr_fields, tr_slots);
-    }
-
-    #[test]
-    async fn retired_wati_config_sections_cover_current_and_legacy_shapes() {
-        assert_eq!(
-            Config::retired_wati_config_sections(
-                "schema_version = 4\n[channels.wati.production]\nenabled = true\n",
-            ),
-            vec!["channels.wati".to_string()]
-        );
-        assert_eq!(
-            Config::retired_wati_config_sections(
-                "[channels_config.wati]\nenabled = true\napi_token = \"placeholder\"\n",
-            ),
-            vec!["channels_config.wati".to_string()]
-        );
-        assert!(
-            Config::retired_wati_config_sections(
-                "schema_version = 4\n[channels.whatsapp.production]\nenabled = true\n",
-            )
-            .is_empty()
-        );
-        assert!(Config::retired_wati_config_sections("not toml {{{").is_empty());
-    }
-
-    #[test]
-    async fn retired_node_transport_detector_keeps_only_presence() {
-        assert!(Config::has_retired_node_transport_config(
-            "schema_version = 4\n[node_transport]\nshared_secret = \"sentinel-secret\"\n",
-        ));
-        assert!(!Config::has_retired_node_transport_config(
-            "schema_version = 4\n[nodes]\nenabled = true\n",
-        ));
-        assert!(!Config::has_retired_node_transport_config("not toml {{{"));
     }
 
     #[test]

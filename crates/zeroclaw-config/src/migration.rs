@@ -171,7 +171,33 @@ pub const RETIRED_KEYS: &[RetiredKey] = &[
                  `summary_provider` replaced it (context compression itself is not \
                  currently implemented in the runtime)",
     },
+    // Retired before V4 and until now handled outside this table: the
+    // migration chain stripped `[node_transport]` silently after every step
+    // from V2 on, and load only warned about WATI sections. Under V4 they
+    // follow the same policy, so every load, migration and incremental save
+    // removes them, secrets included.
+    RetiredKey {
+        retired_in: 2,
+        path: &["node_transport"],
+        retirement: Retirement::Remove,
+        reason: "the legacy HMAC node transport was removed",
+    },
+    RetiredKey {
+        retired_in: 4,
+        path: &["channels", "wati"],
+        retirement: Retirement::Remove,
+        reason: RETIRED_WATI,
+    },
+    RetiredKey {
+        retired_in: 4,
+        path: &["channels_config", "wati"],
+        retirement: Retirement::Remove,
+        reason: RETIRED_WATI,
+    },
 ];
+
+const RETIRED_WATI: &str = "WATI support was removed; migrate to `[channels.whatsapp.<alias>]` \
+     using the Cloud API or WhatsApp Web, then revoke the unused WATI API token";
 
 const INERT_AGENT_TUNABLE: &str = "agent-inline runtime tunables were never read; runtime \
      profiles are authoritative, so set this key on the agent's \
@@ -298,9 +324,30 @@ pub fn migrate_file(input: &str) -> Result<Option<String>> {
     Ok(migrate_file_with_notices(input)?.map(|(migrated, _)| migrated))
 }
 
+/// The oldest schema version from which reaching [`CURRENT_SCHEMA_VERSION`]
+/// changes a config only by retiring keys and re-stamping `schema_version`.
+/// A file at or above it is migrated by editing its document in place, so
+/// everything the migration does not change keeps its exact bytes: quoting,
+/// number spelling, comments. Older files need the structural steps and are
+/// rebuilt from the migrated value. Raise this if a later version adds a
+/// structural migration step.
+const FIRST_RETIREMENT_ONLY_VERSION: u32 = 3;
+
 /// [`migrate_file`], also returning what the migration changed or assumed.
 pub fn migrate_file_with_notices(input: &str) -> Result<Option<(String, Vec<MigrationNotice>)>> {
     let value: toml::Value = toml::from_str(input).context("failed to parse config TOML")?;
+    let from = detect_version(&value)?;
+    if (FIRST_RETIREMENT_ONLY_VERSION..=CURRENT_SCHEMA_VERSION).contains(&from)
+        && let Ok(mut doc) = input.parse::<toml_edit::DocumentMut>()
+    {
+        let notices = apply_retired_keys_to_doc(doc.as_table_mut());
+        if from == CURRENT_SCHEMA_VERSION && notices.is_empty() {
+            return Ok(None);
+        }
+        stamp_doc_schema_version(doc.as_table_mut());
+        log_notices(&notices);
+        return Ok(Some((doc.to_string(), notices)));
+    }
     let Some(Migrated { value, notices }) = migrate_toml(value)? else {
         return Ok(None);
     };
@@ -322,6 +369,23 @@ pub fn migrate_file_with_notices(input: &str) -> Result<Option<(String, Vec<Migr
         let serialized = toml::to_string_pretty(&toml::Value::Table(migrated_table))
             .context("failed to serialize migrated config")?;
         Ok(Some((serialized, notices)))
+    }
+}
+
+/// Set `schema_version` to [`CURRENT_SCHEMA_VERSION`] in place, keeping the
+/// key's position and its surrounding comments.
+fn stamp_doc_schema_version(root: &mut toml_edit::Table) {
+    let version = i64::from(CURRENT_SCHEMA_VERSION);
+    if let Some(existing) = root
+        .get_mut("schema_version")
+        .and_then(toml_edit::Item::as_value_mut)
+    {
+        let decor = existing.decor().clone();
+        let mut stamped = toml_edit::Value::from(version);
+        *stamped.decor_mut() = decor;
+        *existing = stamped;
+    } else {
+        root.insert("schema_version", toml_edit::value(version));
     }
 }
 
@@ -1078,9 +1142,14 @@ fn run_chain_until(
         .skip(from as usize)
     {
         cur = step(cur)?;
-        // Step `index` produces schema version `index + 1`.
-        apply_retired_keys(&mut cur, index as u32 + 1, RETIRED_KEYS, notices);
-        strip_retired_node_transport(&mut cur);
+        // Step `index` produces schema version `index + 1`. Apply every key
+        // retired at or before that version: a file starting past an entry's
+        // version (a V3 file holding a key retired at V2) still loses it,
+        // while a key retired later survives until the step that retires it,
+        // so a structural step can still read it first.
+        for version in 2..=index as u32 + 1 {
+            apply_retired_keys(&mut cur, version, RETIRED_KEYS, notices);
+        }
     }
     Ok(cur)
 }
@@ -1193,13 +1262,29 @@ fn take_doc_path(
     if child.is_empty() {
         if prunable(pattern) {
             table.remove(first);
-        } else if let Some(alias) = table.get_mut(first).and_then(toml_edit::Item::as_table_mut) {
-            // An implicit table renders as nothing once empty, which would
-            // silently delete the alias; give it its own header instead.
-            alias.set_implicit(false);
+        } else if let Some(alias) = table.get_mut(first) {
+            keep_empty_table_rendered(alias);
         }
     }
     Some(taken)
+}
+
+/// Make an empty table serialize. `toml_edit` writes nothing for an empty
+/// table that is implicit (it only existed as a parent of other headers) or
+/// dotted (it only existed as a prefix of dotted keys, such as
+/// `runtime_profiles.slow.x = 1`); an empty dotted inline table vanishes the
+/// same way. Dropping such a table would silently delete an operator's alias
+/// and leave any reference to it dangling, so a header table gets its own
+/// `[a.b]` header and an inline table is written as `b = {}`.
+fn keep_empty_table_rendered(item: &mut toml_edit::Item) {
+    match item {
+        toml_edit::Item::Table(table) => {
+            table.set_dotted(false);
+            table.set_implicit(false);
+        }
+        toml_edit::Item::Value(toml_edit::Value::InlineTable(table)) => table.set_dotted(false),
+        _ => {}
+    }
 }
 
 /// [`put_path_if_vacant`] over a document. Missing parents are created as
@@ -1260,17 +1345,21 @@ fn keep_emptied_tables_visible(root: &mut toml_edit::Table, notices: &[Migration
             MigrationNotice::AssumedV1 => continue,
         };
         let segments: Vec<&str> = from.split('.').collect();
-        let mut table = &mut *root;
-        for segment in segments.iter().take(segments.len().saturating_sub(1)) {
-            let Some(next) = table
-                .get_mut(segment)
-                .and_then(toml_edit::Item::as_table_mut)
-            else {
+        let parents = &segments[..segments.len().saturating_sub(1)];
+        let mut table: &mut dyn toml_edit::TableLike = &mut *root;
+        for segment in parents {
+            let Some(item) = table.get_mut(segment) else {
                 break;
             };
-            if next.is_empty() {
-                next.set_implicit(false);
+            if item
+                .as_table_like()
+                .is_some_and(toml_edit::TableLike::is_empty)
+            {
+                keep_empty_table_rendered(item);
             }
+            let Some(next) = item.as_table_like_mut() else {
+                break;
+            };
             table = next;
         }
     }
@@ -1450,12 +1539,6 @@ fn put_path_if_vacant(root: &mut toml::Table, path: &[&str], value: toml::Value)
     }
     table.insert((*last).to_string(), value);
     true
-}
-
-fn strip_retired_node_transport(value: &mut toml::Value) {
-    if let Some(root) = value.as_table_mut() {
-        let _ = root.remove("node_transport");
-    }
 }
 
 pub(crate) fn sync_table(doc: &mut toml_edit::Table, new: &toml::Table) {
@@ -4425,5 +4508,216 @@ summary_model = "opus"
                 .is_empty(),
             "the document cleanup keeps it too: {out}"
         );
+    }
+
+    // ── F1: an alias emptied by retirement survives every TOML spelling ──
+
+    /// Configs whose aliases (`slow`, `worker`) hold only retired content,
+    /// spelled in the ways `toml_edit` would otherwise drop once emptied.
+    const DOTTED_ALIAS_CONFIGS: &[(&str, &str)] = &[
+        (
+            "dotted keys at the root",
+            "schema_version = 4\n\
+             runtime_profiles.slow.context_compression.summary_model = \"haiku\"\n\
+             agents.worker.compact_context = true\n\n\
+             [agents.coder]\nruntime_profile = \"slow\"\n",
+        ),
+        (
+            "dotted keys inside an inline table",
+            "schema_version = 4\n\
+             runtime_profiles = { slow.context_compression.summary_model = \"haiku\" }\n\
+             agents = { worker.compact_context = true, coder = { runtime_profile = \"slow\" } }\n",
+        ),
+        (
+            "nested inline tables",
+            "schema_version = 4\n\
+             runtime_profiles = { slow = { context_compression = { summary_model = \"haiku\" } } }\n\
+             agents = { worker = { compact_context = true }, coder = { runtime_profile = \"slow\" } }\n",
+        ),
+        (
+            "dotted keys under a header",
+            "schema_version = 4\n\n\
+             [runtime_profiles]\nslow.context_compression.summary_model = \"haiku\"\n\n\
+             [agents]\nworker.compact_context = true\ncoder.runtime_profile = \"slow\"\n",
+        ),
+    ];
+
+    fn assert_aliases_survive(case: &str, written: &str) {
+        let value: toml::Value = toml::from_str(written)
+            .unwrap_or_else(|e| panic!("{case}: output must stay valid TOML ({e}):\n{written}"));
+        assert!(
+            value["runtime_profiles"]["slow"]
+                .as_table()
+                .is_some_and(toml::Table::is_empty),
+            "{case}: the referenced profile alias must survive, empty:\n{written}"
+        );
+        assert!(
+            value["agents"]["worker"]
+                .as_table()
+                .is_some_and(toml::Table::is_empty),
+            "{case}: the agent alias must survive, empty:\n{written}"
+        );
+        assert_eq!(
+            value["agents"]["coder"]["runtime_profile"].as_str(),
+            Some("slow")
+        );
+        assert!(!written.contains("summary_model") && !written.contains("compact_context"));
+        let load = migrate_to_current_salvaged(written);
+        assert!(
+            load.config.runtime_profiles.contains_key("slow")
+                && load.config.agents.contains_key("worker"),
+            "{case}: the aliases must survive a reload"
+        );
+        assert!(load.notices.is_empty(), "{case}: {:?}", load.notices);
+        assert!(load.dropped.is_empty() && load.dropped_security.is_empty());
+    }
+
+    #[test]
+    fn doc_cleanup_keeps_aliases_in_every_toml_spelling() {
+        for (case, raw) in DOTTED_ALIAS_CONFIGS {
+            let (out, notices) = apply_doc(raw);
+            assert_eq!(
+                removed_paths(&notices),
+                [
+                    "agents.worker.compact_context",
+                    "runtime_profiles.slow.context_compression.summary_model",
+                ],
+                "{case}"
+            );
+            assert_aliases_survive(case, &out);
+        }
+    }
+
+    #[test]
+    fn config_migrate_keeps_aliases_in_every_toml_spelling() {
+        for (case, raw) in DOTTED_ALIAS_CONFIGS {
+            let (migrated, _) = migrate_file_with_notices(raw)
+                .unwrap()
+                .unwrap_or_else(|| panic!("{case}: retired keys must trigger a rewrite"));
+            assert_aliases_survive(case, &migrated);
+        }
+    }
+
+    #[test]
+    fn structural_migration_keeps_an_emptied_dotted_alias_rendered() {
+        // The V1/V2 route rebuilds the document and then walks each notice's
+        // parents; an empty dotted or implicit alias must still be written.
+        let mut doc: toml_edit::DocumentMut =
+            "a.slow.x = 1\n[b]\nc = { worker.y = 2 }\n".parse().unwrap();
+        doc["a"]["slow"].as_table_like_mut().unwrap().remove("x");
+        doc["b"]["c"]["worker"]
+            .as_table_like_mut()
+            .unwrap()
+            .remove("y");
+        let notices = [
+            MigrationNotice::Removed {
+                path: "a.slow.x".to_string(),
+                reason: "test",
+            },
+            MigrationNotice::Removed {
+                path: "b.c.worker.y".to_string(),
+                reason: "test",
+            },
+        ];
+        keep_emptied_tables_visible(doc.as_table_mut(), &notices);
+        let value: toml::Value = toml::from_str(&doc.to_string()).unwrap();
+        assert!(
+            value["a"]["slow"]
+                .as_table()
+                .is_some_and(toml::Table::is_empty),
+            "{doc}"
+        );
+        assert!(
+            value["b"]["c"]["worker"]
+                .as_table()
+                .is_some_and(toml::Table::is_empty),
+            "{doc}"
+        );
+    }
+
+    // ── F2: retirements that used to live outside the table ──
+
+    #[test]
+    fn node_transport_and_wati_are_retired_on_every_path() {
+        let retired = "\n[node_transport]\nenabled = true\nshared_secret = \"NODE-SENTINEL\"\n\n\
+                       [channels.wati.production]\nenabled = true\napi_token = \"WATI-SENTINEL\"\n\n\
+                       [channels_config.wati]\napi_token = \"LEGACY-WATI-SENTINEL\"\n";
+        let expected = ["channels.wati", "channels_config.wati", "node_transport"];
+        for version in [3, CURRENT_SCHEMA_VERSION] {
+            let raw = format!("schema_version = {version}\nlocale = \"en\"\n{retired}");
+            let (migrated, notices) = migrate_file_with_notices(&raw)
+                .unwrap()
+                .unwrap_or_else(|| panic!("V{version}: retired sections must trigger a rewrite"));
+            assert_eq!(removed_paths(&notices), expected, "V{version}");
+            for sentinel in ["NODE-SENTINEL", "WATI-SENTINEL", "node_transport", "wati"] {
+                assert!(
+                    !migrated.contains(sentinel),
+                    "V{version} kept {sentinel}:\n{migrated}"
+                );
+            }
+            let load = migrate_to_current_salvaged(&raw);
+            assert_eq!(removed_paths(&load.notices), expected, "V{version} load");
+
+            let (out, notices) = apply_doc(&raw);
+            assert_eq!(
+                removed_paths(&notices),
+                expected,
+                "V{version} document cleanup"
+            );
+            assert!(!out.contains("SENTINEL"), "{out}");
+        }
+
+        // A legacy V1 file is renamed by the V1 step, then retired.
+        let (migrated, notices) = migrate_file_with_notices(
+            "[channels_config.wati]\napi_token = \"LEGACY-WATI-SENTINEL\"\n",
+        )
+        .unwrap()
+        .unwrap();
+        assert!(notices.contains(&MigrationNotice::AssumedV1));
+        assert!(notices.iter().any(
+            |n| matches!(n, MigrationNotice::Removed { path, .. } if path == "channels.wati")
+        ));
+        assert!(!migrated.contains("SENTINEL"), "{migrated}");
+    }
+
+    // ── F3: `config migrate` from V3 or later edits the file in place ──
+
+    const UNTOUCHED_V3_BODY: &str = "locale = 'en'  # operator note: keep this explanation\n\
+         \n\
+         [gateway]\n\
+         port = 42_617 # underscores stay\n\
+         host = \"127.0.0.1\"\n\
+         \n\
+         # A comment block before a section.\n\
+         [cost]\n\
+         daily_limit_usd = 1e1\n\
+         warn_at_percent = 0x50\n";
+
+    #[test]
+    fn v3_migration_changes_only_the_version_line() {
+        let raw =
+            format!("schema_version = 3  # stamped by an older zeroclaw\n{UNTOUCHED_V3_BODY}");
+        let (migrated, notices) = migrate_file_with_notices(&raw).unwrap().unwrap();
+        assert!(notices.is_empty(), "{notices:?}");
+        assert_eq!(
+            migrated,
+            format!("schema_version = 4  # stamped by an older zeroclaw\n{UNTOUCHED_V3_BODY}"),
+            "everything but the version must keep its exact bytes"
+        );
+    }
+
+    #[test]
+    fn retirement_migration_keeps_untouched_bytes() {
+        let retired = "\n[security.nevis]\nclient_secret = 'RETIRED_SENTINEL'\n";
+        for version in [3, CURRENT_SCHEMA_VERSION] {
+            let raw = format!("schema_version = {version}\n{UNTOUCHED_V3_BODY}{retired}");
+            let (migrated, notices) = migrate_file_with_notices(&raw).unwrap().unwrap();
+            assert_eq!(removed_paths(&notices), ["security.nevis"], "V{version}");
+            assert_eq!(
+                migrated,
+                format!("schema_version = {CURRENT_SCHEMA_VERSION}\n{UNTOUCHED_V3_BODY}"),
+                "V{version}: only the retired table and the version may change"
+            );
+        }
     }
 }
