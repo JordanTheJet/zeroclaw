@@ -7758,8 +7758,13 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                         .map(|supervisor| supervisor.drivers.clone()),
                 );
 
-                let exit = Box::pin(daemon::run(
+                // One capability set per config generation: a reload re-reads
+                // config and builds the next generation's set on the next pass.
+                let capabilities =
+                    zeroclaw::composition::DefaultCapabilities::from_config(&current_config);
+                let exit = Box::pin(daemon::run_with_capabilities(
                     current_config.clone(),
+                    capabilities,
                     host.clone(),
                     port,
                     registry,

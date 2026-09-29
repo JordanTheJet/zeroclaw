@@ -542,8 +542,62 @@ async fn classify_gateway_bind_outcome(
     }
 }
 
+/// Run the daemon. The heartbeat and cron scheduler build their agents'
+/// capabilities from config for each turn, as they always have.
 pub async fn run(
+    config: Config,
+    host: String,
+    port: u16,
+    registry: DaemonRegistry,
+    ephemeral: bool,
+    startup_feedback_enabled: bool,
+) -> Result<DaemonExit> {
+    Box::pin(run_inner(
+        config,
+        None,
+        host,
+        port,
+        registry,
+        ephemeral,
+        startup_feedback_enabled,
+    ))
+    .await
+}
+
+/// Run the daemon for one config generation with `capabilities`: the
+/// heartbeat worker and the cron scheduler take their agents' providers,
+/// memory and observer from this set instead of building them per turn.
+///
+/// The generation's observer is flushed when the daemon returns, so a reload
+/// or shutdown does not strand buffered telemetry from its non-interactive
+/// turns.
+pub async fn run_with_capabilities(
+    config: Config,
+    capabilities: crate::composition::RuntimeCapabilities,
+    host: String,
+    port: u16,
+    registry: DaemonRegistry,
+    ephemeral: bool,
+    startup_feedback_enabled: bool,
+) -> Result<DaemonExit> {
+    let observer = std::sync::Arc::clone(&capabilities.observer);
+    let exit = Box::pin(run_inner(
+        config,
+        Some(capabilities),
+        host,
+        port,
+        registry,
+        ephemeral,
+        startup_feedback_enabled,
+    ))
+    .await;
+    observer.flush();
+    exit
+}
+
+async fn run_inner(
     mut config: Config,
+    capabilities: Option<crate::composition::RuntimeCapabilities>,
     host: String,
     port: u16,
     mut registry: DaemonRegistry,
@@ -1081,6 +1135,7 @@ pub async fn run(
 
     if config.heartbeat.enabled {
         let heartbeat_cfg = config.clone();
+        let heartbeat_capabilities = capabilities.clone();
         handles.push(spawn_component_supervisor(
             "heartbeat",
             initial_backoff,
@@ -1088,7 +1143,8 @@ pub async fn run(
             channels_cancel.clone(),
             move || {
                 let cfg = heartbeat_cfg.clone();
-                async move { Box::pin(run_heartbeat_worker(cfg)).await }
+                let capabilities = heartbeat_capabilities.clone();
+                async move { Box::pin(run_heartbeat_worker(cfg, capabilities)).await }
             },
         ));
     }
@@ -1097,6 +1153,7 @@ pub async fn run(
         let scheduler_cfg = config.clone();
         let scheduler_event_tx = event_tx.clone();
         let scheduler_cancel = channels_cancel.clone();
+        let scheduler_capabilities = capabilities.clone();
         handles.push(spawn_component_supervisor(
             "scheduler",
             initial_backoff,
@@ -1106,7 +1163,21 @@ pub async fn run(
                 let cfg = scheduler_cfg.clone();
                 let tx = scheduler_event_tx.clone();
                 let cancel = scheduler_cancel.clone();
-                async move { Box::pin(crate::cron::scheduler::run(cfg, Some(tx), cancel)).await }
+                let capabilities = scheduler_capabilities.clone();
+                async move {
+                    match capabilities {
+                        Some(capabilities) => {
+                            Box::pin(crate::cron::scheduler::run_with_capabilities(
+                                cfg,
+                                capabilities,
+                                Some(tx),
+                                cancel,
+                            ))
+                            .await
+                        }
+                        None => Box::pin(crate::cron::scheduler::run(cfg, Some(tx), cancel)).await,
+                    }
+                }
             },
         ));
     } else {
@@ -2093,7 +2164,53 @@ async fn retry_heartbeat_mcp_registry(
     Ok(())
 }
 
-async fn run_heartbeat_worker(config: Config) -> Result<()> {
+/// One heartbeat turn: the generation's capabilities when the daemon has them,
+/// otherwise a config-backed set built for this turn, which is exactly what
+/// `agent::run` builds. `internal_principal` stamps the turn as the daemon's,
+/// naming the heartbeat phase.
+///
+/// Returns the turn as a boxed `dyn Future + Send`: the heartbeat worker is
+/// spawned, and proving the turn future `Send` from inside the worker's state
+/// machine exceeds the auto-trait recursion limit. Erasing the type here proves
+/// it once, at this shallow boundary.
+fn heartbeat_turn<'a>(
+    config: Config,
+    capabilities: Option<&crate::composition::RuntimeCapabilities>,
+    agent_alias: &'a str,
+    prompt: String,
+    temperature: Option<f64>,
+    mcp_registry: Option<std::sync::Arc<crate::tools::McpRegistry>>,
+    internal_principal: zeroclaw_api::ingress::InternalPrincipal,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send + 'a>> {
+    let capabilities = capabilities
+        .cloned()
+        .unwrap_or_else(|| crate::composition::RuntimeCapabilities::config_backed(&config));
+    Box::pin(crate::agent::run_with_capabilities(
+        config,
+        capabilities,
+        None,
+        agent_alias,
+        Some(prompt),
+        None,
+        None,
+        temperature,
+        vec![],
+        false,
+        None,
+        None,
+        zeroclaw_api::ingress::TurnOrigin::Daemon,
+        crate::agent::loop_::AgentRunOverrides {
+            mcp_registry,
+            internal_principal: Some(internal_principal),
+            ..crate::agent::loop_::AgentRunOverrides::default()
+        },
+    ))
+}
+
+async fn run_heartbeat_worker(
+    config: Config,
+    capabilities: Option<crate::composition::RuntimeCapabilities>,
+) -> Result<()> {
     use crate::heartbeat::engine::{
         HeartbeatEngine, HeartbeatTask, TaskPriority, TaskStatus, compute_adaptive_interval,
     };
@@ -2115,8 +2232,12 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
     let mut shared_mcp_registry: Option<Arc<crate::tools::McpRegistry>> =
         connect_heartbeat_mcp_registry(&config, &agent_alias, None).await?;
 
-    let observer: std::sync::Arc<dyn crate::observability::Observer> =
-        std::sync::Arc::from(crate::observability::create_observer(&config.observability));
+    // With a generation's capabilities the engine reports through that
+    // generation's observer; without them it builds its own, as before.
+    let observer: std::sync::Arc<dyn crate::observability::Observer> = match &capabilities {
+        Some(capabilities) => Arc::clone(&capabilities.observer),
+        None => std::sync::Arc::from(crate::observability::create_observer(&config.observability)),
+    };
     let engine = HeartbeatEngine::new(config.heartbeat.clone(), heartbeat_workspace_dir, observer);
     let metrics = engine.metrics();
     let delivery = resolve_heartbeat_delivery(&config)?;
@@ -2241,26 +2362,17 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                 "[Heartbeat Task | decision] {}",
                 HeartbeatEngine::build_decision_prompt(&tasks),
             );
-            let phase1_fut = Box::pin(crate::agent::run(
+            let phase1_fut = heartbeat_turn(
                 config.clone(),
+                capabilities.as_ref(),
                 &agent_alias,
-                Some(decision_prompt),
-                None,
-                None,
+                decision_prompt,
                 Some(0.0),
-                vec![],
-                false,
-                None,
-                None,
-                zeroclaw_api::ingress::TurnOrigin::Daemon,
-                crate::agent::loop_::AgentRunOverrides {
-                    mcp_registry: shared_mcp_registry.as_ref().map(Arc::clone),
-                    internal_principal: Some(zeroclaw_api::ingress::InternalPrincipal::Daemon {
-                        task: "heartbeat:decision".to_string(),
-                    }),
-                    ..crate::agent::loop_::AgentRunOverrides::default()
+                shared_mcp_registry.as_ref().map(Arc::clone),
+                zeroclaw_api::ingress::InternalPrincipal::Daemon {
+                    task: "heartbeat:decision".to_string(),
                 },
-            ));
+            );
             let phase1_result = if config.heartbeat.task_timeout_secs > 0 {
                 match tokio::time::timeout(
                     Duration::from_secs(config.heartbeat.task_timeout_secs),
@@ -2365,29 +2477,20 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
             let temp: Option<f64> = config
                 .model_provider_for_agent(&agent_alias)
                 .and_then(|e| e.temperature);
-            let phase2_fut = Box::pin(crate::agent::run(
+            let phase2_fut = heartbeat_turn(
                 config.clone(),
+                capabilities.as_ref(),
                 &agent_alias,
-                Some(prompt),
-                None,
-                None,
+                prompt,
                 temp,
-                vec![],
-                false,
-                None,
-                None,
-                zeroclaw_api::ingress::TurnOrigin::Daemon,
-                crate::agent::loop_::AgentRunOverrides {
-                    mcp_registry: shared_mcp_registry.as_ref().map(Arc::clone),
-                    // Heartbeat tasks have no runtime-owned id (their text is
-                    // model-maintained content, which never enters the
-                    // principal), so the stamp names the pipeline phase.
-                    internal_principal: Some(zeroclaw_api::ingress::InternalPrincipal::Daemon {
-                        task: "heartbeat:execute".to_string(),
-                    }),
-                    ..crate::agent::loop_::AgentRunOverrides::default()
+                shared_mcp_registry.as_ref().map(Arc::clone),
+                // Heartbeat tasks have no runtime-owned id (their text is
+                // model-maintained content, which never enters the
+                // principal), so the stamp names the pipeline phase.
+                zeroclaw_api::ingress::InternalPrincipal::Daemon {
+                    task: "heartbeat:execute".to_string(),
                 },
-            ));
+            );
             let phase2_result = if config.heartbeat.task_timeout_secs > 0 {
                 match tokio::time::timeout(
                     Duration::from_secs(config.heartbeat.task_timeout_secs),
