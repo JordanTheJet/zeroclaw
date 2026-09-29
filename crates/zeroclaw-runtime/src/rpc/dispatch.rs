@@ -8234,9 +8234,10 @@ impl RpcDispatcher {
             crate::config_ops::document::apply_init(&mut working, req.section.as_deref())
                 .map_err(config_api_err)?;
         if !initialized.is_empty() {
+            // Authorize exactly what the save will persist.
             self.recheck_config_write_paths(
                 Method::ConfigInit,
-                initialized.iter().map(String::as_str),
+                working.dirty_paths.iter().map(String::as_str),
                 &config_write_guard,
             )?;
             self.save_and_swap_config(working, &config_write_guard)
@@ -8304,6 +8305,12 @@ impl RpcDispatcher {
         let mut working = self.ctx.config.read().clone();
         let response = context_window::apply(&mut working, &req.provider_type, &req.alias, fetched)
             .map_err(config_api_err)?;
+        // Authorize exactly what the save will persist, not only the target.
+        self.recheck_config_write_paths(
+            Method::ProvidersRefreshContextWindow,
+            working.dirty_paths.iter().map(String::as_str),
+            &config_write_guard,
+        )?;
         self.save_and_swap_config(working, &config_write_guard)
             .await?;
         to_result(response)
@@ -8777,6 +8784,17 @@ impl RpcDispatcher {
         } else {
             None
         };
+        let mut working = self.ctx.config.read().clone();
+        let prepared = delete::prepare_alias_delete(&mut working, &kind, &req.path, &req.key)
+            .map_err(config_api_err)?;
+        self.recheck_config_write_paths(
+            Method::ConfigMapKeyDelete,
+            working.dirty_paths.iter().map(String::as_str),
+            &config_write_guard,
+        )?;
+        // Opened only once every authorization has passed, so a refused
+        // request creates no memory store; still before the save, so a
+        // failure to open refuses before anything is written.
         // The owned-state cascade needs the memory backend. The daemon leaves
         // it unset when it booted with no agents, so open it from config then;
         // if that fails, refuse before mutating rather than orphan the
@@ -8802,14 +8820,6 @@ impl RpcDispatcher {
         } else {
             None
         };
-        let mut working = self.ctx.config.read().clone();
-        let prepared = delete::prepare_alias_delete(&mut working, &kind, &req.path, &req.key)
-            .map_err(config_api_err)?;
-        self.recheck_config_write_paths(
-            Method::ConfigMapKeyDelete,
-            working.dirty_paths.iter().map(String::as_str),
-            &config_write_guard,
-        )?;
         self.save_and_swap_config(working, &config_write_guard)
             .await?;
         // The lock stays held through the owned-state cleanup: released
@@ -34389,6 +34399,99 @@ mod tests {
             assert_eq!(err.code, FORBIDDEN, "{err:?}");
             assert!(ctx.config.read().agents.contains_key("bot"));
             assert_eq!(ctx.config.read().heartbeat.agent, "bot");
+        });
+    }
+
+    /// Roster principal writing `write_paths`, agent `alpha` with a
+    /// workspace, and a disabled heartbeat that names `alpha`: renaming the
+    /// agent rewrites `heartbeat.agent`, a path outside both rename
+    /// endpoints. Saved, so disk and memory start identical.
+    async fn agent_rename_roster_config(
+        tmp: &tempfile::TempDir,
+        write_paths: &[&str],
+    ) -> zeroclaw_config::schema::Config {
+        let mut config = config_write_roster_config(tmp, 4242, write_paths);
+        config
+            .create_map_key("agents", "alpha")
+            .expect("create agents.alpha");
+        config.heartbeat.enabled = false;
+        config.heartbeat.agent = "alpha".into();
+        config.mark_dirty("agents.alpha");
+        config.mark_dirty("heartbeat");
+        config.save_dirty().await.expect("seed the config file");
+        std::fs::create_dir_all(config.agent_workspace_dir("alpha")).unwrap();
+        config
+    }
+
+    #[test]
+    fn config_agent_rename_refuses_a_rewritten_reference_outside_the_selector() {
+        run_on_a_large_stack(|| async move {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config_path = tmp.path().join("config.toml");
+            // Both rename endpoints, and nothing else.
+            let config = agent_rename_roster_config(&tmp, &["agents.alpha", "agents.beta"]).await;
+            let old_workspace = config.agent_workspace_dir("alpha");
+            let new_workspace = config.agent_workspace_dir("beta");
+            let ctx = enforcement_ctx(config);
+            let (alice, _rx) = roster_peer(&ctx, 4242).await;
+            let before_disk = std::fs::read_to_string(&config_path).unwrap();
+            let before_revision = ctx.auth.accepted_revision();
+
+            let err = alice
+                .handle_config_map_key_rename(&json!({
+                    "path": "agents",
+                    "from": "alpha",
+                    "to": "beta"
+                }))
+                .await
+                .expect_err("the cascade rewrites heartbeat.agent, outside the selector");
+
+            assert_eq!(err.code, FORBIDDEN, "{err:?}");
+            assert!(err.message.contains("heartbeat.agent"), "{err:?}");
+            let live = ctx.config.read().clone();
+            assert!(live.agents.contains_key("alpha") && !live.agents.contains_key("beta"));
+            assert_eq!(live.heartbeat.agent, "alpha");
+            assert_eq!(std::fs::read_to_string(&config_path).unwrap(), before_disk);
+            assert_eq!(
+                ctx.auth.accepted_revision(),
+                before_revision,
+                "no policy may be published"
+            );
+            assert!(
+                old_workspace.exists() && !new_workspace.exists(),
+                "no workspace move"
+            );
+        });
+    }
+
+    #[test]
+    fn config_agent_rename_with_the_rewritten_reference_granted_succeeds() {
+        run_on_a_large_stack(|| async move {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config =
+                agent_rename_roster_config(&tmp, &["agents.alpha", "agents.beta", "heartbeat.*"])
+                    .await;
+            let new_workspace = config.agent_workspace_dir("beta");
+            let ctx = enforcement_ctx(config);
+            let (alice, _rx) = roster_peer(&ctx, 4242).await;
+
+            let result = alice
+                .handle_config_map_key_rename(&json!({
+                    "path": "agents",
+                    "from": "alpha",
+                    "to": "beta"
+                }))
+                .await
+                .expect("every rewritten path is inside the selector");
+
+            assert_eq!(result["renamed"], json!(true), "{result}");
+            let live = ctx.config.read().clone();
+            assert!(!live.agents.contains_key("alpha") && live.agents.contains_key("beta"));
+            assert_eq!(
+                live.heartbeat.agent, "beta",
+                "the reference follows the rename"
+            );
+            assert!(new_workspace.exists(), "the workspace moves with the agent");
         });
     }
 
