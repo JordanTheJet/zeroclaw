@@ -1455,10 +1455,22 @@ impl RpcDispatcher {
         let Some(auth) = self.auth.as_ref() else {
             return Err(rpc_err(AUTH_REQUIRED, "First call must be 'initialize'"));
         };
+        self.check_agent_selector_with_grants(method, &auth.grants, alias, require_configured)
+    }
+
+    /// [`Self::check_agent_selector`] evaluated against an explicit grant set,
+    /// for a handler that re-resolved its principal after a wait.
+    fn check_agent_selector_with_grants(
+        &self,
+        method: Method,
+        grants: &zeroclaw_api::grants::ResolvedGrants,
+        alias: &str,
+        require_configured: bool,
+    ) -> Result<(), JsonRpcError> {
         let configured = !require_configured
-            || auth.grants.admin
+            || grants.admin
             || self.ctx.config.read().agents.contains_key(alias);
-        if configured && auth.grants.may_use_agent(alias) {
+        if configured && grants.may_use_agent(alias) {
             return Ok(());
         }
         let denied = rpc_err(
@@ -9481,23 +9493,24 @@ impl RpcDispatcher {
     // ── File attachment handler ────────────────────────────────
 
     async fn handle_file_attach(&self, params: &Value) -> RpcResult {
-        use super::attachments::{MAX_REQUEST_BYTES, process_file_entry};
+        use super::attachments::{MAX_REQUEST_BYTES, load_file_entry};
 
         let req: FileAttachParams = parse_params(params)?;
-        let sid = &req.session_id;
-        let (agent_alias, upload_root) = self.upload_destination(Method::FileAttach, sid).await?;
+        let target = self
+            .upload_target(Method::FileAttach, &req.session_id)
+            .await?;
 
         let is_wss = self.peer_label.starts_with("wss:");
         // Resolve + authorize once; the returned slots are index-aligned with
         // req.files and carry the exact canonical target each read binds to. On
-        // WSS, path sources are rejected in process_file_entry.
+        // WSS, path sources are rejected in load_file_entry.
         let attachment_sources = if is_wss {
             Vec::new()
         } else {
             self.authorize_attachment_sources(
                 Method::FileAttach,
                 self.stamped_grants(),
-                &agent_alias,
+                &target.agent_alias,
                 &req.files,
             )?
         };
@@ -9507,10 +9520,8 @@ impl RpcDispatcher {
 
         for (idx, entry) in req.files.iter().enumerate() {
             let source = attachment_sources.get(idx).and_then(|s| s.as_ref());
-            let result =
-                process_file_entry(entry, sid, &upload_root, is_wss, source, &self.ctx.sessions)
-                    .await?;
-            total_bytes += result.size_bytes;
+            let (bytes, filename) = load_file_entry(entry, is_wss, source).await?;
+            total_bytes += bytes.len() as u64;
             if total_bytes > MAX_REQUEST_BYTES {
                 return Err(rpc_err(
                     INVALID_PARAMS,
@@ -9520,38 +9531,126 @@ impl RpcDispatcher {
                     ),
                 ));
             }
-            results.push(result);
+            results.push(
+                self.commit_upload(Method::FileAttach, &target, &bytes, &filename)
+                    .await?,
+            );
         }
 
         to_result(FileAttachResult { files: results })
     }
 
-    /// The agent and workspace directory uploads for session `sid` land in.
+    /// The session incarnation an upload for `sid` writes into, authorized
+    /// for this caller: a scoped principal must own the session, and the
+    /// caller must be entitled to the session's agent. Uploads land in that
+    /// agent's workspace, not the session cwd, the same way `session/prompt`
+    /// lands its inline attachments.
     ///
-    /// Uploads land in the per-agent workspace, not the session cwd, the same
-    /// way `session/prompt` lands its inline attachments. The session id is
-    /// caller-selected, so the session's agent must be one the principal may
-    /// use before anything is written into its workspace.
-    async fn upload_destination(
+    /// The owner check and the incarnation read are separate waits, so the
+    /// incarnation must be the one the owner check resolved; a session
+    /// replaced in between is refused as not found. This is admission only:
+    /// [`Self::commit_upload`] checks again where the upload takes effect.
+    async fn upload_target(
         &self,
         method: Method,
         sid: &str,
-    ) -> Result<(String, String), JsonRpcError> {
-        let agent_alias = self
+    ) -> Result<super::upload::UploadTarget, JsonRpcError> {
+        let record = self.authorize_session_owner(sid, method).await?;
+        let (generation, owner, agent_alias) = self
             .ctx
             .sessions
-            .get_agent_alias(sid)
+            .live_incarnation(sid)
             .await
+            .filter(|(generation, owner, _)| {
+                record.as_ref().is_some_and(|record| {
+                    record.live_generation == Some(*generation) && record.owner == *owner
+                })
+            })
             .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
         self.selector_agent(method, &agent_alias)?;
-        let upload_root = self
-            .ctx
-            .config
-            .read()
-            .agent_workspace_dir(&agent_alias)
-            .to_string_lossy()
-            .to_string();
-        Ok((agent_alias, upload_root))
+        Ok(super::upload::UploadTarget {
+            session_id: sid.to_owned(),
+            generation,
+            owner,
+            agent_alias,
+        })
+    }
+
+    /// Persist and index one upload into `target`'s exact session
+    /// incarnation: the point where an upload takes effect.
+    ///
+    /// Everything that can wait happens before this: the owner check, the
+    /// session reads, the chunk transfer, a path read. Here the session map
+    /// lock is taken once, and under it, with no await in between, the
+    /// incarnation is confirmed unchanged, the caller's authority is
+    /// re-resolved against the policy in force now, and only then is the
+    /// file written and indexed. A credential, grant, or agent entitlement
+    /// revoked while the request waited, or a session closed, replaced, or
+    /// re-owned, stops the commit before any byte reaches disk.
+    ///
+    /// Holding the session map across the write orders it with every session
+    /// change; the write is one file of at most `MAX_FILE_BYTES`.
+    async fn commit_upload(
+        &self,
+        method: Method,
+        target: &super::upload::UploadTarget,
+        bytes: &[u8],
+        filename: &str,
+    ) -> Result<FileEntryResult, JsonRpcError> {
+        self.ctx
+            .sessions
+            .with_incarnation_uploads(
+                &target.session_id,
+                target.generation,
+                target.owner.as_deref(),
+                |uploads| {
+                    self.recheck_upload_authority(method, target)?;
+                    let upload_root = self
+                        .ctx
+                        .config
+                        .read()
+                        .agent_workspace_dir(&target.agent_alias)
+                        .to_string_lossy()
+                        .to_string();
+                    super::attachments::persist_into_index(uploads, bytes, filename, &upload_root)
+                },
+            )
+            .await
+            .unwrap_or_else(|| {
+                Err(rpc_err(
+                    SESSION_NOT_FOUND,
+                    "The session was closed or replaced before the upload was stored",
+                ))
+            })
+    }
+
+    /// The final authority check for an upload, made where it takes effect
+    /// (see [`Self::commit_upload`]): the caller's authority re-resolved
+    /// against the policy in force now, including the method's
+    /// `files:create`, then the session owner and the agent entitlement
+    /// judged with those fresh grants rather than the ones stamped on the
+    /// connection before the wait.
+    fn recheck_upload_authority(
+        &self,
+        method: Method,
+        target: &super::upload::UploadTarget,
+    ) -> Result<(), JsonRpcError> {
+        // Only the direct unit-test handlers run unbound.
+        let Some(grants) = self.recheck_authority_after_admission(method)? else {
+            return Ok(());
+        };
+        if let Some(auth) = self.auth.as_ref()
+            && !grants.admin
+            && auth.principal.is_authenticated()
+            && target.owner.as_deref() != Some(auth.principal.id.as_str())
+        {
+            let denied = crate::rpc::auth::AuthDenied::forbidden(
+                "Session not found or not owned by this principal",
+            );
+            self.audit_auth_denial(method, &denied);
+            return Err(rpc_err(denied.code, denied.message));
+        }
+        self.check_agent_selector_with_grants(method, &grants, &target.agent_alias, true)
     }
 
     /// Chunked uploads are served on local connections only. The staging
@@ -9584,14 +9683,13 @@ impl RpcDispatcher {
 
         self.require_local_upload(Method::FileUploadBegin)?;
         let req: FileUploadBeginParams = parse_params(params)?;
-        let (agent_alias, _) = self
-            .upload_destination(Method::FileUploadBegin, &req.session_id)
+        let target = self
+            .upload_target(Method::FileUploadBegin, &req.session_id)
             .await?;
         let upload_id = self.upload_staging().begin(
             std::time::Instant::now(),
             BeginRequest {
-                session_id: req.session_id,
-                agent_alias,
+                target,
                 filename: req.filename,
                 size_bytes: req.size_bytes,
                 sha256: req.sha256,
@@ -9624,38 +9722,19 @@ impl RpcDispatcher {
     async fn handle_file_upload_commit(&self, params: &Value) -> RpcResult {
         self.require_local_upload(Method::FileUploadCommit)?;
         let req: FileUploadCommitParams = parse_params(params)?;
-        let (session_id, begun_for) =
-            self.upload_staging()
-                .binding(&req.upload_id)
-                .ok_or_else(|| {
-                    rpc_err(
-                        INVALID_PARAMS,
-                        format!("Unknown or expired upload `{}`", req.upload_id),
-                    )
-                })?;
-        // Authorize again at commit: the grant, the session, or the session's
-        // agent may have changed since the upload began, and nothing is
-        // written before this check passes.
-        let (agent_alias, upload_root) = self
-            .upload_destination(Method::FileUploadCommit, &session_id)
-            .await?;
-        if agent_alias != begun_for {
-            return Err(rpc_err(
-                INVALID_PARAMS,
-                "The session now runs a different agent than when the upload began; begin again",
-            ));
-        }
+        // Taking the upload consumes it: a commit that is refused below, or
+        // fails to store, needs a new `begin`.
         let upload = self
             .upload_staging()
             .take_complete(std::time::Instant::now(), &req.upload_id)?;
-        let result = super::attachments::persist_upload_bytes(
-            upload.bytes,
-            &upload.filename,
-            &upload.session_id,
-            &upload_root,
-            &self.ctx.sessions,
-        )
-        .await?;
+        let result = self
+            .commit_upload(
+                Method::FileUploadCommit,
+                &upload.target,
+                &upload.bytes,
+                &upload.filename,
+            )
+            .await?;
         to_result(result)
     }
 
@@ -14738,12 +14817,13 @@ mod tests {
         let (ctx, chat_backend, _acp_store) = persistence_enforcement_ctx(config);
         let (provider, _started_rx, _release_tx) = gated_provider();
         let sid = "s-attach";
-        install_state_test_session_at(
+        install_state_test_session_owned_at(
             &ctx.sessions,
             &chat_backend,
             sid,
             provider,
             None,
+            Some("user:alice"),
             &agent_workspace,
         )
         .await;
@@ -14778,12 +14858,30 @@ mod tests {
     }
 
     /// `session_cwd_config` with alice granted `Files:Create` and a live
-    /// session `sid` for `test-agent`; returns the context and that agent's
-    /// workspace.
+    /// session `sid` for `test-agent` that alice owns; returns the context
+    /// and that agent's workspace.
     async fn upload_fixture(
         tmp: &tempfile::TempDir,
         sid: &str,
     ) -> (Arc<RpcContext>, std::path::PathBuf) {
+        let (ctx, agent_workspace, _backend) =
+            upload_fixture_owned_by(tmp, sid, "user:alice", |_| {}).await;
+        (ctx, agent_workspace)
+    }
+
+    /// [`upload_fixture`] with the session owned by `owner` and `adjust`
+    /// applied to the config first; also returns the chat backend, so a test
+    /// can replace the session.
+    async fn upload_fixture_owned_by(
+        tmp: &tempfile::TempDir,
+        sid: &str,
+        owner: &str,
+        adjust: impl FnOnce(&mut zeroclaw_config::schema::Config),
+    ) -> (
+        Arc<RpcContext>,
+        std::path::PathBuf,
+        Arc<zeroclaw_infra::session_sqlite::SqliteSessionBackend>,
+    ) {
         let mut config = session_cwd_config(tmp, 4242, None);
         config
             .permission_profiles
@@ -14794,19 +14892,153 @@ mod tests {
                 zeroclaw_api::grants::Resource::Files,
                 vec![zeroclaw_api::grants::Verb::Create],
             );
+        adjust(&mut config);
         let agent_workspace = config.agent_workspace_dir("test-agent");
         let (ctx, chat_backend, _acp_store) = persistence_enforcement_ctx(config);
+        install_upload_session(&ctx, &chat_backend, sid, Some(owner), &agent_workspace).await;
+        (ctx, agent_workspace, chat_backend)
+    }
+
+    /// Install (or replace) the live session `sid` for `test-agent`.
+    /// Replacing an id installs a new incarnation with a new generation.
+    async fn install_upload_session(
+        ctx: &Arc<RpcContext>,
+        chat_backend: &Arc<zeroclaw_infra::session_sqlite::SqliteSessionBackend>,
+        sid: &str,
+        owner: Option<&str>,
+        agent_workspace: &std::path::Path,
+    ) {
         let (provider, _started_rx, _release_tx) = gated_provider();
-        install_state_test_session_at(
+        install_state_test_session_owned_at(
             &ctx.sessions,
-            &chat_backend,
+            chat_backend,
             sid,
             provider,
             None,
-            &agent_workspace,
+            owner,
+            agent_workspace,
         )
         .await;
-        (ctx, agent_workspace)
+    }
+
+    /// The response frame for request `id`, skipping interleaved frames.
+    async fn response_for(rx: &mut tokio::sync::mpsc::Receiver<String>, id: u64) -> Value {
+        loop {
+            let frame = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+                .await
+                .expect("a response within 10s")
+                .expect("writer channel open");
+            let value: Value = serde_json::from_str(&frame).expect("valid JSON-RPC frame");
+            if value.get("id") == Some(&json!(id)) {
+                return value;
+            }
+        }
+    }
+
+    /// Begin an upload of `payload` to `sid`, declaring its SHA-256, and send
+    /// every byte, using request ids from `first_id`. Returns the upload id.
+    async fn stage_upload(
+        dispatcher: &mut RpcDispatcher,
+        rx: &mut tokio::sync::mpsc::Receiver<String>,
+        sid: &str,
+        payload: &[u8],
+        first_id: u64,
+    ) -> String {
+        use base64::{Engine, engine::general_purpose::STANDARD};
+        use sha2::{Digest, Sha256};
+
+        let begun = rpc(
+            dispatcher,
+            rx,
+            first_id,
+            "file/upload/begin",
+            json!({
+                "session_id": sid,
+                "filename": "staged.bin",
+                "size_bytes": payload.len(),
+                "sha256": format!("{:x}", Sha256::digest(payload)),
+            }),
+        )
+        .await;
+        let upload_id = begun["result"]["upload_id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("an upload id: {begun}"))
+            .to_string();
+        let chunk = usize::try_from(crate::rpc::upload::UPLOAD_CHUNK_BYTES).unwrap();
+        for (index, part) in payload.chunks(chunk).enumerate() {
+            let sent = rpc(
+                dispatcher,
+                rx,
+                first_id + 1 + index as u64,
+                "file/upload/chunk",
+                json!({
+                    "upload_id": upload_id,
+                    "offset": index * chunk,
+                    "data_b64": STANDARD.encode(part),
+                }),
+            )
+            .await;
+            assert!(sent["result"]["received_bytes"].is_u64(), "{sent}");
+        }
+        upload_id
+    }
+
+    /// Entries in the live session's upload index, `None` if it is not live.
+    async fn upload_index_len(ctx: &Arc<RpcContext>, sid: &str) -> Option<usize> {
+        ctx.sessions
+            .with_session_uploads(sid, |uploads| uploads.len())
+            .await
+    }
+
+    /// Send one request through `dispatcher`'s request gate, park it at the
+    /// session wait its upload commit makes, apply `change` there, then
+    /// release it and return its response.
+    ///
+    /// The pause sits inside the commit, so reaching it proves the request
+    /// passed the gate and every check before the commit ahead of `change`;
+    /// a request that is refused earlier never parks and fails the timeout.
+    async fn request_parked_at_the_commit(
+        dispatcher: &mut RpcDispatcher,
+        rx: &mut tokio::sync::mpsc::Receiver<String>,
+        ctx: &Arc<RpcContext>,
+        id: u64,
+        method: &str,
+        params: Value,
+        change: impl std::future::Future<Output = ()>,
+    ) -> Value {
+        let (arrived, release) = ctx.sessions.set_test_upload_commit_pause();
+        let parked = std::sync::atomic::AtomicBool::new(false);
+        let line =
+            json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}).to_string();
+        let change_while_parked = async {
+            arrived.notified().await;
+            parked.store(true, std::sync::atomic::Ordering::SeqCst);
+            change.await;
+            release.notify_one();
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            tokio::join!(dispatcher.process_line(&line), change_while_parked)
+        })
+        .await
+        .expect("the request reaches the commit and completes");
+        assert!(
+            parked.load(std::sync::atomic::Ordering::SeqCst),
+            "the change must land while the commit is parked, or the test is vacuous"
+        );
+        response_for(rx, id).await
+    }
+
+    fn revoke_alice_files_create(ctx: &Arc<RpcContext>) {
+        let mut narrowed = ctx.config.read().clone();
+        narrowed
+            .permission_profiles
+            .get_mut("session-scoped")
+            .expect("the fixture profile exists")
+            .grants
+            .remove(&zeroclaw_api::grants::Resource::Files);
+        ctx.auth
+            .refresh_from_config(&narrowed)
+            .expect("the narrowed policy compiles");
     }
 
     #[tokio::test]
@@ -15034,6 +15266,371 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(commit.code, FORBIDDEN, "{}", commit.message);
+    }
+
+    /// Control for the parked-commit tests: with nothing changed while the
+    /// commit waits, it lands, and the index records it.
+    #[tokio::test]
+    async fn chunked_commit_parked_with_nothing_changed_lands() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sid = "s-park-control";
+        let (ctx, _agent_workspace) = upload_fixture(&tmp, sid).await;
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+        let upload_id = stage_upload(&mut alice, &mut rx, sid, b"parked bytes", 1).await;
+
+        let committed = request_parked_at_the_commit(
+            &mut alice,
+            &mut rx,
+            &ctx,
+            10,
+            "file/upload/commit",
+            json!({"upload_id": upload_id}),
+            async {},
+        )
+        .await;
+        let path = committed["result"]["workspace_path"]
+            .as_str()
+            .unwrap_or_else(|| panic!("committed: {committed}"));
+        assert_eq!(std::fs::read(path).unwrap(), b"parked bytes");
+        assert_eq!(upload_index_len(&ctx, sid).await, Some(1));
+    }
+
+    /// The agent entitlement is withdrawn by a published policy after the
+    /// commit passed its gate and while it waits for the session: nothing is
+    /// written and nothing is indexed.
+    #[tokio::test]
+    async fn chunked_commit_parked_when_the_agent_grant_is_revoked_writes_nothing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sid = "s-park-agent";
+        let (ctx, agent_workspace) = upload_fixture(&tmp, sid).await;
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+        let upload_id = stage_upload(&mut alice, &mut rx, sid, b"never stored", 1).await;
+        let files_before = files_under(&agent_workspace);
+
+        let change_ctx = Arc::clone(&ctx);
+        let refused = request_parked_at_the_commit(
+            &mut alice,
+            &mut rx,
+            &ctx,
+            10,
+            "file/upload/commit",
+            json!({"upload_id": upload_id}),
+            async move { narrow_alice_to_no_agents_via_publication(&change_ctx) },
+        )
+        .await;
+        assert_eq!(refused["error"]["code"], json!(FORBIDDEN), "{refused}");
+        assert_eq!(
+            files_under(&agent_workspace),
+            files_before,
+            "no file is written"
+        );
+        assert_eq!(
+            upload_index_len(&ctx, sid).await,
+            Some(0),
+            "nothing is indexed"
+        );
+    }
+
+    /// The coarse `files:create` grant is withdrawn while the commit waits.
+    #[tokio::test]
+    async fn chunked_commit_parked_when_files_create_is_revoked_writes_nothing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sid = "s-park-files";
+        let (ctx, agent_workspace) = upload_fixture(&tmp, sid).await;
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+        let upload_id = stage_upload(&mut alice, &mut rx, sid, b"never stored", 1).await;
+        let files_before = files_under(&agent_workspace);
+
+        let change_ctx = Arc::clone(&ctx);
+        let refused = request_parked_at_the_commit(
+            &mut alice,
+            &mut rx,
+            &ctx,
+            10,
+            "file/upload/commit",
+            json!({"upload_id": upload_id}),
+            async move { revoke_alice_files_create(&change_ctx) },
+        )
+        .await;
+        assert_eq!(refused["error"]["code"], json!(FORBIDDEN), "{refused}");
+        assert_eq!(
+            files_under(&agent_workspace),
+            files_before,
+            "no file is written"
+        );
+        assert_eq!(
+            upload_index_len(&ctx, sid).await,
+            Some(0),
+            "nothing is indexed"
+        );
+    }
+
+    /// `file/attach` takes effect at the same boundary, so a revocation while
+    /// it waits stops it the same way.
+    #[tokio::test]
+    async fn file_attach_parked_when_the_agent_grant_is_revoked_writes_nothing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sid = "s-park-attach";
+        let (ctx, agent_workspace) = upload_fixture(&tmp, sid).await;
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+        let files_before = files_under(&agent_workspace);
+
+        let change_ctx = Arc::clone(&ctx);
+        let refused = request_parked_at_the_commit(
+            &mut alice,
+            &mut rx,
+            &ctx,
+            1,
+            "file/attach",
+            json!({"session_id": sid, "files": [{"data_b64": "aGVsbG8=", "filename": "hello.txt"}]}),
+            async move { narrow_alice_to_no_agents_via_publication(&change_ctx) },
+        )
+        .await;
+        assert_eq!(refused["error"]["code"], json!(FORBIDDEN), "{refused}");
+        assert_eq!(
+            files_under(&agent_workspace),
+            files_before,
+            "no file is written"
+        );
+        assert_eq!(
+            upload_index_len(&ctx, sid).await,
+            Some(0),
+            "nothing is indexed"
+        );
+    }
+
+    /// Bob owns the session. Alice is entitled to its agent and holds
+    /// `files:create`, but may not add uploads to a session she does not own.
+    #[tokio::test]
+    async fn uploads_into_another_principals_session_are_refused_without_mutation() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sid = "s-bobs";
+        let (ctx, agent_workspace, _backend) =
+            upload_fixture_owned_by(&tmp, sid, "user:bob", |config| {
+                config.users.insert(
+                    "bob".into(),
+                    zeroclaw_config::schema::UserConfig {
+                        principal_id: None,
+                        uid: Some(4343),
+                        permission_profiles: vec!["session-scoped".into()],
+                    },
+                );
+            })
+            .await;
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+        let files_before = files_under(&agent_workspace);
+
+        let begun = rpc(
+            &mut alice,
+            &mut rx,
+            1,
+            "file/upload/begin",
+            json!({"session_id": sid, "size_bytes": 1}),
+        )
+        .await;
+        assert_eq!(begun["error"]["code"], json!(FORBIDDEN), "{begun}");
+        let attached = rpc(
+            &mut alice,
+            &mut rx,
+            2,
+            "file/attach",
+            json!({"session_id": sid, "files": [{"data_b64": "aGVsbG8=", "filename": "hello.txt"}]}),
+        )
+        .await;
+        assert_eq!(attached["error"]["code"], json!(FORBIDDEN), "{attached}");
+        assert_eq!(
+            files_under(&agent_workspace),
+            files_before,
+            "no file is written"
+        );
+        assert_eq!(
+            upload_index_len(&ctx, sid).await,
+            Some(0),
+            "bob's index is untouched"
+        );
+
+        // Bob, the owner, may.
+        let (mut bob, mut bob_rx) = roster_peer(&ctx, 4343).await;
+        let upload_id = stage_upload(&mut bob, &mut bob_rx, sid, b"bob's", 1).await;
+        let committed = rpc(
+            &mut bob,
+            &mut bob_rx,
+            10,
+            "file/upload/commit",
+            json!({"upload_id": upload_id}),
+        )
+        .await;
+        assert!(committed["result"]["ref_id"].is_string(), "{committed}");
+        assert_eq!(upload_index_len(&ctx, sid).await, Some(1));
+    }
+
+    /// The session an upload was begun for is closed and a new one is created
+    /// under the same id, for the same agent and owner. The upload belongs to
+    /// the old incarnation and is not committed into the new one.
+    #[tokio::test]
+    async fn chunked_commit_into_a_session_replaced_under_the_same_id_is_refused() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sid = "s-replaced";
+        let (ctx, agent_workspace, backend) =
+            upload_fixture_owned_by(&tmp, sid, "user:alice", |_| {}).await;
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+        let upload_id = stage_upload(&mut alice, &mut rx, sid, b"for the old one", 1).await;
+        let files_before = files_under(&agent_workspace);
+
+        install_upload_session(&ctx, &backend, sid, Some("user:alice"), &agent_workspace).await;
+        let refused = rpc(
+            &mut alice,
+            &mut rx,
+            10,
+            "file/upload/commit",
+            json!({"upload_id": upload_id}),
+        )
+        .await;
+        assert_eq!(
+            refused["error"]["code"],
+            json!(SESSION_NOT_FOUND),
+            "{refused}"
+        );
+        assert_eq!(
+            files_under(&agent_workspace),
+            files_before,
+            "no file is written"
+        );
+        assert_eq!(
+            upload_index_len(&ctx, sid).await,
+            Some(0),
+            "the new incarnation's index is untouched"
+        );
+    }
+
+    /// The session is removed while the commit waits for it: the commit fails
+    /// instead of reporting success for a file no session indexes.
+    #[tokio::test]
+    async fn chunked_commit_parked_while_the_session_is_removed_is_refused() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sid = "s-removed";
+        let (ctx, agent_workspace) = upload_fixture(&tmp, sid).await;
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+        let upload_id = stage_upload(&mut alice, &mut rx, sid, b"orphan?", 1).await;
+        let files_before = files_under(&agent_workspace);
+
+        let change_ctx = Arc::clone(&ctx);
+        let refused = request_parked_at_the_commit(
+            &mut alice,
+            &mut rx,
+            &ctx,
+            10,
+            "file/upload/commit",
+            json!({"upload_id": upload_id}),
+            async move {
+                assert!(change_ctx.sessions.remove("s-removed").await);
+            },
+        )
+        .await;
+        assert_eq!(
+            refused["error"]["code"],
+            json!(SESSION_NOT_FOUND),
+            "{refused}"
+        );
+        assert_eq!(
+            files_under(&agent_workspace),
+            files_before,
+            "no orphaned file"
+        );
+    }
+
+    /// The session is replaced while the commit waits for it.
+    #[tokio::test]
+    async fn chunked_commit_parked_while_the_session_is_replaced_is_refused() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sid = "s-swapped";
+        let (ctx, agent_workspace, backend) =
+            upload_fixture_owned_by(&tmp, sid, "user:alice", |_| {}).await;
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+        let upload_id = stage_upload(&mut alice, &mut rx, sid, b"for the old one", 1).await;
+        let files_before = files_under(&agent_workspace);
+
+        let (change_ctx, change_ws) = (Arc::clone(&ctx), agent_workspace.clone());
+        let refused = request_parked_at_the_commit(
+            &mut alice,
+            &mut rx,
+            &ctx,
+            10,
+            "file/upload/commit",
+            json!({"upload_id": upload_id}),
+            async move {
+                install_upload_session(
+                    &change_ctx,
+                    &backend,
+                    "s-swapped",
+                    Some("user:alice"),
+                    &change_ws,
+                )
+                .await;
+            },
+        )
+        .await;
+        assert_eq!(
+            refused["error"]["code"],
+            json!(SESSION_NOT_FOUND),
+            "{refused}"
+        );
+        assert_eq!(
+            files_under(&agent_workspace),
+            files_before,
+            "no file is written"
+        );
+        assert_eq!(upload_index_len(&ctx, sid).await, Some(0));
+    }
+
+    /// A repeat of an indexed upload is not answered from the index alone:
+    /// the indexed file was edited to other bytes of the same length, and the
+    /// repeat commit (with the right SHA-256) reinstates the uploaded bytes
+    /// at the returned path.
+    #[tokio::test]
+    async fn a_repeat_commit_reinstates_an_indexed_file_that_was_modified() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sid = "s-repeat";
+        let (ctx, _agent_workspace) = upload_fixture(&tmp, sid).await;
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+        let payload = b"the uploaded bytes".to_vec();
+
+        let first = stage_upload(&mut alice, &mut rx, sid, &payload, 1).await;
+        let committed = rpc(
+            &mut alice,
+            &mut rx,
+            10,
+            "file/upload/commit",
+            json!({"upload_id": first}),
+        )
+        .await;
+        let path = committed["result"]["workspace_path"]
+            .as_str()
+            .unwrap_or_else(|| panic!("committed: {committed}"))
+            .to_string();
+        std::fs::write(&path, b"EDITED edited byte").unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            payload.len() as u64
+        );
+
+        let second = stage_upload(&mut alice, &mut rx, sid, &payload, 20).await;
+        let again = rpc(
+            &mut alice,
+            &mut rx,
+            30,
+            "file/upload/commit",
+            json!({"upload_id": second}),
+        )
+        .await;
+        assert_eq!(again["result"]["deduplicated"], json!(true), "{again}");
+        assert_eq!(again["result"]["ref_id"], committed["result"]["ref_id"]);
+        assert_eq!(again["result"]["workspace_path"], json!(path));
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            payload,
+            "the returned path holds the uploaded bytes"
+        );
     }
 
     /// `session_cwd_config` with alice also granted `Files:Create`, plus a

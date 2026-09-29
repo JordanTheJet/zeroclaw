@@ -286,6 +286,11 @@ pub struct SessionStore {
     /// inside the window where the successor is live but unseeded.
     #[cfg(test)]
     test_rehydrate_seed_pause: std::sync::Mutex<Option<RehydrateSeedPause>>,
+    /// Test-only pause at the one wait an incarnation-bound upload commit
+    /// makes: just before it takes the session map. Taken by the first commit
+    /// that reaches it.
+    #[cfg(test)]
+    test_upload_commit_pause: std::sync::Mutex<Option<RehydrateSeedPause>>,
 }
 
 /// Generation-owned handle for the canonical cancellation-token registration.
@@ -349,6 +354,8 @@ impl SessionStore {
             test_prompt_admission_hook: std::sync::Mutex::new(None),
             #[cfg(test)]
             test_rehydrate_seed_pause: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            test_upload_commit_pause: std::sync::Mutex::new(None),
         }
     }
 
@@ -931,6 +938,30 @@ impl SessionStore {
     #[inline(always)]
     pub(crate) async fn wait_test_rehydrate_seed_pause(&self) {}
 
+    /// Arm a test-only pause for the next incarnation-bound upload commit,
+    /// before it takes the session map. Returns `(arrived, release)`.
+    #[cfg(test)]
+    pub fn set_test_upload_commit_pause(&self) -> RehydrateSeedPause {
+        let arrived = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        *self.test_upload_commit_pause.lock().unwrap() =
+            Some((Arc::clone(&arrived), Arc::clone(&release)));
+        (arrived, release)
+    }
+
+    #[cfg(test)]
+    async fn wait_test_upload_commit_pause(&self) {
+        let pause = self.test_upload_commit_pause.lock().unwrap().take();
+        if let Some((arrived, release)) = pause {
+            arrived.notify_one();
+            release.notified().await;
+        }
+    }
+
+    #[cfg(not(test))]
+    #[inline(always)]
+    async fn wait_test_upload_commit_pause(&self) {}
+
     pub async fn touch(&self, id: &str) {
         if let Some(s) = self.sessions.lock().await.get_mut(id) {
             s.last_active = Instant::now();
@@ -1132,21 +1163,56 @@ impl SessionStore {
             .map(|s| s.overrides.clone())
     }
 
-    /// Look up an existing upload by ref_id. Returns `None` if the session
-    /// or entry doesn't exist.
-    pub async fn get_upload(&self, session_id: &str, ref_id: &str) -> Option<UploadEntry> {
-        self.sessions
-            .lock()
-            .await
-            .get(session_id)
-            .and_then(|s| s.uploads.get(ref_id).cloned())
+    /// Run `f` on the upload index of the live session `session_id`, holding
+    /// the session map for the whole call. `None`, without calling `f`, when
+    /// no live session has that id.
+    ///
+    /// `f` is synchronous, so the dedup lookup, the file write it guards, and
+    /// the index insert happen with no session change in between.
+    pub async fn with_session_uploads<R>(
+        &self,
+        session_id: &str,
+        f: impl FnOnce(&mut HashMap<String, UploadEntry>) -> R,
+    ) -> Option<R> {
+        let mut sessions = self.sessions.lock().await;
+        let session = sessions.get_mut(session_id)?;
+        Some(f(&mut session.uploads))
     }
 
-    /// Insert (or overwrite) an upload entry in the session's index.
-    pub async fn insert_upload(&self, session_id: &str, entry: UploadEntry) {
-        if let Some(s) = self.sessions.lock().await.get_mut(session_id) {
-            s.uploads.insert(entry.ref_id.clone(), entry);
-        }
+    /// [`Self::with_session_uploads`] for one exact incarnation: `f` runs
+    /// only while `session_id` still names the live session of `generation`
+    /// owned by `owner`. A session closed or deleted, recreated under the same
+    /// id, or re-owned since the caller resolved it yields `None` and `f` is
+    /// not called.
+    pub async fn with_incarnation_uploads<R>(
+        &self,
+        session_id: &str,
+        generation: u64,
+        owner: Option<&str>,
+        f: impl FnOnce(&mut HashMap<String, UploadEntry>) -> R,
+    ) -> Option<R> {
+        self.wait_test_upload_commit_pause().await;
+        let mut sessions = self.sessions.lock().await;
+        let session = sessions
+            .get_mut(session_id)
+            .filter(|s| s.generation == generation && s.owner_principal_id.as_deref() == owner)?;
+        Some(f(&mut session.uploads))
+    }
+
+    /// The live incarnation of `session_id`, read in one snapshot: its
+    /// generation, owning principal, and agent alias. `None` if no live
+    /// session has that id.
+    pub async fn live_incarnation(
+        &self,
+        session_id: &str,
+    ) -> Option<(u64, Option<String>, String)> {
+        self.sessions.lock().await.get(session_id).map(|s| {
+            (
+                s.generation,
+                s.owner_principal_id.clone(),
+                s.agent_alias.clone(),
+            )
+        })
     }
 
     /// Get the workspace directory for a session.

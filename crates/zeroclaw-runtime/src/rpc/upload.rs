@@ -150,11 +150,29 @@ impl UploadBudget {
     }
 }
 
+/// The exact session incarnation an upload was begun for: the live session
+/// by id and generation, the principal that owns it, and the agent it runs.
+/// Commit writes only into this incarnation, so a session closed and
+/// recreated under the same id, re-owned, or moved to another agent while
+/// the upload was staged is refused rather than written into.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UploadTarget {
+    pub session_id: String,
+    pub generation: u64,
+    pub owner: Option<String>,
+    pub agent_alias: String,
+}
+
+impl UploadTarget {
+    fn retained_bytes(&self) -> usize {
+        self.session_id.len() + self.agent_alias.len() + self.owner.as_ref().map_or(0, String::len)
+    }
+}
+
 /// What an upload remembers about itself until it is committed.
 #[derive(Debug)]
 struct UploadMeta {
-    session_id: String,
-    agent_alias: String,
+    target: UploadTarget,
     filename: String,
     expected_sha256: Option<String>,
 }
@@ -163,8 +181,7 @@ impl UploadMeta {
     /// Heap bytes this metadata keeps resident, charged to the budget with
     /// the payload so metadata cannot stand in for bytes it never counted.
     fn retained_bytes(&self) -> u64 {
-        let len = self.session_id.len()
-            + self.agent_alias.len()
+        let len = self.target.retained_bytes()
             + self.filename.len()
             + self.expected_sha256.as_ref().map_or(0, String::len);
         len as u64
@@ -228,8 +245,7 @@ impl Drop for Slot {
 /// A fully received upload, handed to the commit path for persistence.
 #[derive(Debug)]
 pub struct CompletedUpload {
-    pub session_id: String,
-    pub agent_alias: String,
+    pub target: UploadTarget,
     pub filename: String,
     pub bytes: Vec<u8>,
 }
@@ -241,10 +257,9 @@ struct StagedUpload {
 }
 
 /// What `begin` needs to know about an upload, after the dispatcher has
-/// resolved the session's agent and authorized it.
+/// resolved the session incarnation and authorized it.
 pub struct BeginRequest {
-    pub session_id: String,
-    pub agent_alias: String,
+    pub target: UploadTarget,
     pub filename: Option<String>,
     pub size_bytes: u64,
     pub sha256: Option<String>,
@@ -309,8 +324,7 @@ impl UploadStaging {
             )));
         }
         let meta = UploadMeta {
-            session_id: request.session_id,
-            agent_alias: request.agent_alias,
+            target: request.target,
             filename: request.filename.unwrap_or_else(|| "upload".to_string()),
             expected_sha256,
         };
@@ -428,8 +442,7 @@ impl UploadStaging {
             if matches {
                 let bytes = std::mem::take(&mut state.data);
                 state.meta.take().map(|meta| CompletedUpload {
-                    session_id: meta.session_id,
-                    agent_alias: meta.agent_alias,
+                    target: meta.target,
                     filename: meta.filename,
                     bytes,
                 })
@@ -446,15 +459,12 @@ impl UploadStaging {
         })
     }
 
-    /// The session and agent an upload was begun for, for re-authorization
-    /// before commit.
-    pub fn binding(&self, upload_id: &str) -> Option<(String, String)> {
+    /// The session incarnation an upload was begun for, for
+    /// re-authorization before commit.
+    pub fn binding(&self, upload_id: &str) -> Option<UploadTarget> {
         let upload = self.uploads.get(upload_id)?;
         let state = upload.slot.lock_state();
-        state
-            .meta
-            .as_ref()
-            .map(|meta| (meta.session_id.clone(), meta.agent_alias.clone()))
+        state.meta.as_ref().map(|meta| meta.target.clone())
     }
 }
 
@@ -470,24 +480,33 @@ fn normalize_sha256(hex: &str) -> Result<String, JsonRpcError> {
 mod tests {
     use super::*;
 
+    fn target(session_id: &str, agent_alias: &str, owner: Option<&str>) -> UploadTarget {
+        UploadTarget {
+            session_id: session_id.into(),
+            generation: 1,
+            owner: owner.map(Into::into),
+            agent_alias: agent_alias.into(),
+        }
+    }
+
     fn request(size_bytes: u64) -> BeginRequest {
         BeginRequest {
-            session_id: "s1".into(),
-            agent_alias: "default".into(),
+            target: target("s1", "default", Some("alice")),
             filename: Some("notes.txt".into()),
             size_bytes,
             sha256: None,
         }
     }
 
-    /// Bytes of metadata `request` retains: session, agent, and filename.
-    const REQUEST_META_BYTES: u64 = ("s1".len() + "default".len() + "notes.txt".len()) as u64;
+    /// Bytes of metadata `request` retains: session, agent, owner, and
+    /// filename.
+    const REQUEST_META_BYTES: u64 =
+        ("s1".len() + "default".len() + "alice".len() + "notes.txt".len()) as u64;
 
     /// A request that retains no metadata, for exact budget arithmetic.
     fn bare(size_bytes: u64) -> BeginRequest {
         BeginRequest {
-            session_id: String::new(),
-            agent_alias: String::new(),
+            target: target("", "", None),
             filename: Some(String::new()),
             size_bytes,
             sha256: None,
@@ -703,8 +722,7 @@ mod tests {
         // but never counted. Oversized session ids stand in for any retained
         // field, since the filename is capped separately.
         let big = |size: u64| BeginRequest {
-            session_id: "s".repeat(4000),
-            agent_alias: String::new(),
+            target: target(&"s".repeat(4000), "", None),
             filename: Some(String::new()),
             size_bytes: size,
             sha256: None,
@@ -729,19 +747,37 @@ mod tests {
     }
 
     #[test]
+    fn the_owner_binding_is_charged_and_handed_back_at_commit() {
+        let (mut staging, budget) = staging(10_000);
+        let now = Instant::now();
+        let mut req = bare(1);
+        req.target.owner = Some("o".repeat(3000));
+        req.target.generation = 7;
+        let id = staging.begin(now, req).unwrap();
+        assert_eq!(budget.used(), 1 + 3000, "the retained owner is charged");
+        let bound = staging.binding(&id).expect("staged");
+        assert_eq!(bound.generation, 7);
+        assert_eq!(bound.owner.as_deref().map(str::len), Some(3000));
+        staging.chunk(now, &id, 0, b"x").unwrap();
+        let done = staging.take_complete(now, &id).unwrap();
+        assert_eq!(done.target, bound, "commit carries the begin-time binding");
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
     fn reclaiming_an_idle_upload_frees_its_metadata() {
         let budget = UploadBudget::new(5000);
         let mut silent = UploadStaging::new(Arc::clone(&budget));
         let mut other = UploadStaging::new(Arc::clone(&budget));
         let start = Instant::now();
         let mut held_req = bare(0);
-        held_req.session_id = "s".repeat(4000);
+        held_req.target.session_id = "s".repeat(4000);
         let held = silent.begin(start, held_req).unwrap();
         assert!(silent.binding(&held).is_some());
 
         let later = start + UPLOAD_IDLE_TIMEOUT + Duration::from_secs(1);
         let mut next = bare(0);
-        next.session_id = "t".repeat(2000);
+        next.target.session_id = "t".repeat(2000);
         other.begin(later, next).unwrap();
         assert_eq!(
             budget.used(),
