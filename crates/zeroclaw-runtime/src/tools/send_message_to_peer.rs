@@ -206,7 +206,7 @@ impl Tool for SendMessageToPeerTool {
             let body = message.clone();
             let live_config = self.live_config.clone();
             // Build the recipient's cost-tracking context from `&cfg` before
-            // `cfg` moves into `process_message_shared` below — a detached
+            // `cfg` moves into the recipient turn below — a detached
             // `zeroclaw_spawn::spawn!` task does not inherit the caller's
             // task-locals, so the recipient's turn would otherwise run with
             // no cost context and its spend would go unrecorded.
@@ -216,6 +216,8 @@ impl Tool for SendMessageToPeerTool {
                 .map(|_| Arc::new(Mutex::new(TurnUsage::default())));
             zeroclaw_spawn::spawn!(async move {
                 // Keep the large turn future out of the nested cost-scope wrappers.
+                // The recipient executes under its own alias; the sender's
+                // canonical alias is provenance for the detached turn.
                 let turn: Pin<Box<dyn Future<Output = Result<String>> + Send + '_>> =
                     if let Some(live_config) = live_config {
                         Box::pin(
@@ -226,6 +228,9 @@ impl Tool for SendMessageToPeerTool {
                                 &body,
                                 None,
                                 zeroclaw_api::ingress::TurnOrigin::AgentDirect,
+                                Some(zeroclaw_api::ingress::InternalPrincipal::PeerAgent {
+                                    sender_alias: sender.clone(),
+                                }),
                             ),
                         )
                     } else {
@@ -235,6 +240,9 @@ impl Tool for SendMessageToPeerTool {
                             &body,
                             None,
                             zeroclaw_api::ingress::TurnOrigin::AgentDirect,
+                            Some(zeroclaw_api::ingress::InternalPrincipal::PeerAgent {
+                                sender_alias: sender.clone(),
+                            }),
                         ))
                     };
                 if let Err(e) = deliver_peer_turn_with_cost_scope(cost_ctx, turn_usage, turn).await

@@ -573,16 +573,74 @@ means its memory tools refuse.
 
 ## Migrating from [security.nevis]
 
-The Nevis IAM integration was removed; its config table is accepted,
-ignored with a load-time warning, and dropped on the next config save.
-Its scope maps onto the current stack:
+The Nevis IAM integration was removed. It was never wired into any
+authentication path, so enabling it never authenticated anyone; retiring
+it changes no live behavior. Its config table is still accepted so an old
+`config.toml` keeps loading: the daemon discards every value in the table
+at load, logs one warning naming the replacement, and removes the table
+from `config.toml` on the next save, whether a full save or the
+incremental save the CLI, dashboard and RPC use for a single edit. The
+removal touches only that table; comments and other sections keep their
+bytes. Nothing is converted automatically: the replacement stack needs
+values (an audience, profile grants) the old table never held.
 
-| Nevis concept | Replacement |
-|---|---|
-| `instance_url` / `realm` token validation | `[oidc.<alias>]` `issuer` + `validation` (`jwks` or `introspection`) |
-| `role_mapping` role → permissions | `claim_path` + `profile_map` → `[permission_profiles.<alias>]` grants |
-| `require_mfa` | `[oidc.<alias>] require_mfa` / `required_acr` |
-| `session_timeout_secs` | `max_auth_lifetime_secs` (offline) / `revalidation_secs` (introspection) |
+**Before you upgrade**, copy `config.toml` somewhere protected. Every save
+after the upgrade writes `config.toml.bak` next to the file for the
+duration of the write and removes it once the write is durable, so a
+`.bak` is not a lasting backup. Any copy you keep yourself still carries
+the retired table, including a plaintext `client_secret` if one was
+configured, so treat those copies as secret material and revoke the
+Nevis client credential at the IdP once you no longer need it.
+
+Field by field:
+
+| `[security.nevis]` field | Replacement | Notes |
+|---|---|---|
+| `enabled` | none | Presence of an `[oidc.<alias>]` entry is what enables verification. |
+| `instance_url`, `realm` | `[oidc.<alias>] issuer` | The exact issuer URL the IdP advertises in its discovery document; the daemon refuses a discovery document whose `issuer` differs. |
+| `client_id` | `[oidc.<alias>] client_id` | Also used to build the `interactive_clients` / `service_clients` lists that classify who is signing in. |
+| `client_secret` | `[oidc.<alias>] client_secret` | Encrypted on disk through the secret store when `[secrets] encrypt` is on. Required for `validation = "introspection"` and for `client_credentials` service sign-ins. Not copied over from the old table: set it again. |
+| `token_validation = "local"` | `validation = "jwks"` | The JWKS URI comes from the issuer's discovery document. |
+| `token_validation = "remote"` | `validation = "introspection"` | Confidential client required. |
+| `jwks_url` | not supported | There is no custom JWKS override: the key-set URI must be advertised as `jwks_uri` by the configured issuer’s discovery document. That URI may point to a different endpoint; an unadvertised key-set URI cannot be configured. |
+| (none) | `[oidc.<alias>] audience` | **Required, and new.** The `aud` the IdP puts in access tokens for this daemon; there was no equivalent to carry over. |
+| `role_mapping[].nevis_role` | `[oidc.<alias>] claim_path` + `profile_map` | `claim_path` names the claim that carries the role (e.g. `groups`); each `profile_map` key is a claim value, each value a `[permission_profiles.<alias>]` name. Matching is exact, not case-insensitive as before. |
+| `role_mapping[].zeroclaw_permissions` (tool names, or `"all"`) | `[permission_profiles.<alias>] allowed_tools` + `grants.tools = ["execute"]` | Profiles are deny-by-default: `allowed_tools` composes with a coarse `tools = ["execute"]` grant, and every other resource class (`sessions`, `config`, `memory`, …) must be granted explicitly. `"all"` is closest to `admin = true`, which is much broader than "all tools" was; prefer listing resource grants. |
+| `role_mapping[].workspace_access` | not equivalent | There is no per-workspace grant. The nearest control is `allowed_agents`, which scopes a profile to agent aliases. |
+| `require_mfa` | `[oidc.<alias>] require_mfa` and/or `required_acr` | |
+| `session_timeout_secs` | `max_auth_lifetime_secs` (JWKS) / `revalidation_secs` (introspection) | |
+
+Validate before you restart, so a typo does not lock everyone out (see
+**Recovery** under *Local connections* for the way back if it does). Two
+routes do that:
+
+- Write the new `[oidc.<alias>]` and `[permission_profiles]` entries
+  through the daemon's RPC config methods (zerocode's config editor). The
+  daemon validates the authorization sections before anything is saved or
+  swapped in, so a dangling `profile_map` target or a missing `audience`
+  is refused with the reason and the previous policy stays in force.
+- If you edit `config.toml` by hand, run
+  `ZEROCLAW_AUTH_TOKEN="$(zeroclaw oidc login <alias>)"` from the CLI
+  first: it loads the edited file, refuses an `[oidc.<alias>]` entry that
+  does not validate (issuer, audience, validation mode, client fields),
+  and on success performs a real sign-in against the IdP with the
+  configured client, so the issuer, client id and secret are known good
+  before the daemon restarts on them. This checks the entry, not the
+  `profile_map` targets: a `profile_map` value that names no
+  `[permission_profiles]` entry is caught only by the daemon, which then
+  refuses to compile the policy and starts in the deny-all state
+  described under **Recovery**, so check those names by eye before the
+  restart, or use the RPC route.
+
+Remote connections that present no credential are refused throughout;
+neither route opens one.
+
+**Rolling back** is a config-data operation, not a code revert: reverting
+the binary restores the old types, but a table already removed from
+`config.toml` is not restored by anything. Put back the protected copy
+you took before the upgrade (or re-add the table by hand). The schema
+version does not change for this retirement, so a downgraded binary loads
+the restored file without a migration step.
 
 ## What this layer does not do (yet)
 
