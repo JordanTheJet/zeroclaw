@@ -702,6 +702,36 @@ impl PairingGuard {
         count
     }
 
+    /// [`Self::revoke_token_hash`] under `config_write_lock`, returning the
+    /// held guard so the caller persists the token set under it.
+    ///
+    /// A connection authenticated by a paired token is checked for liveness
+    /// under the process-wide config write lock before a guarded write, and
+    /// the write holds that lock until it commits. Removing the token only
+    /// once the lock is held orders the revocation against every such write:
+    /// one that checked first commits before the token goes, and one that
+    /// checks after sees it gone. Removing it first, and taking the lock
+    /// only to persist, lets a write that checked before the removal commit
+    /// after it.
+    pub async fn revoke_token_hash_ordered(
+        &self,
+        config_write_lock: Arc<tokio::sync::Mutex<()>>,
+        token_hash: &str,
+    ) -> (bool, tokio::sync::OwnedMutexGuard<()>) {
+        let guard = config_write_lock.lock_owned().await;
+        (self.revoke_token_hash(token_hash), guard)
+    }
+
+    /// [`Self::revoke_all_tokens`], ordered as
+    /// [`Self::revoke_token_hash_ordered`] is.
+    pub async fn revoke_all_tokens_ordered(
+        &self,
+        config_write_lock: Arc<tokio::sync::Mutex<()>>,
+    ) -> (usize, tokio::sync::OwnedMutexGuard<()>) {
+        let guard = config_write_lock.lock_owned().await;
+        (self.revoke_all_tokens(), guard)
+    }
+
     /// Generate a new pairing code that pairs an additional client.
     /// Does not revoke existing tokens. To rotate a compromised token,
     /// pair with `revoke_token`/`revoke_token_hash` + a config persist pass.

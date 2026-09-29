@@ -2827,11 +2827,22 @@ pub(crate) async fn persist_pairing_tokens(
     // Self-contained: no caller pre-reads config for modify, so this
     // acquires the witness itself rather than taking it as a param. Held
     // across the whole read-modify-save-swap below.
-    let _guard = Arc::clone(&config_write_lock).lock_owned().await;
+    let guard = Arc::clone(&config_write_lock).lock_owned().await;
     debug_assert!(
         config_write_lock.try_lock().is_err(),
         "persist_pairing_tokens must hold config_write_lock across its read-modify-save-swap"
     );
+    persist_pairing_tokens_under(config, pairing, &guard).await
+}
+
+/// [`persist_pairing_tokens`] for a caller that already holds the config
+/// write lock: a revocation that removed a live token under it, through
+/// [`PairingGuard::revoke_token_hash_ordered`], persists under the same guard.
+pub(crate) async fn persist_pairing_tokens_under(
+    config: Arc<RwLock<Config>>,
+    pairing: &PairingGuard,
+    _guard: &ConfigWriteGuard,
+) -> Result<()> {
     let paired_tokens = pairing.tokens();
     // This is needed because parking_lot's guard is not Send so we clone the inner
     // this should be removed once async mutexes are used everywhere
@@ -4941,7 +4952,10 @@ async fn handle_admin_paircode_new(
 
     let revocation_message = match rotate {
         Some("all") => {
-            let revoked = state.pairing.revoke_all_tokens();
+            let (revoked, config_write_guard) = state
+                .pairing
+                .revoke_all_tokens_ordered(state.config_write_lock.clone())
+                .await;
             if let Some(registry) = state.device_registry.as_ref() {
                 if let Err(e) = registry.clear() {
                     let body = serde_json::json!({
@@ -4953,10 +4967,10 @@ async fn handle_admin_paircode_new(
                     return Ok((StatusCode::INTERNAL_SERVER_ERROR, Json(body)));
                 }
             }
-            if let Err(e) = persist_pairing_tokens(
+            if let Err(e) = persist_pairing_tokens_under(
                 state.config.clone(),
                 &state.pairing,
-                state.config_write_lock.clone(),
+                &config_write_guard,
             )
             .await
             {
@@ -5009,11 +5023,14 @@ async fn handle_admin_paircode_new(
                     return Ok((StatusCode::INTERNAL_SERVER_ERROR, Json(body)));
                 }
             };
-            state.pairing.revoke_token_hash(&token_hash);
-            if let Err(e) = persist_pairing_tokens(
+            let (_, config_write_guard) = state
+                .pairing
+                .revoke_token_hash_ordered(state.config_write_lock.clone(), &token_hash)
+                .await;
+            if let Err(e) = persist_pairing_tokens_under(
                 state.config.clone(),
                 &state.pairing,
-                state.config_write_lock.clone(),
+                &config_write_guard,
             )
             .await
             {

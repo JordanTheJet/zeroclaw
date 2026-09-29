@@ -1826,12 +1826,12 @@ impl RpcDispatcher {
         Some(super::attachments::AttachmentSource { root, target })
     }
 
-    /// Admit a change to an agent cron job. The job keeps its stored tool
-    /// list and runs later under the agent's authority, with no connection
-    /// left to re-resolve whoever last changed it, so a new prompt from a
-    /// principal narrower than that tool list would run with more than the
-    /// principal holds. Only the shared operator, whose authority no grant
-    /// publication narrows, may change one. A scoped principal, or a named
+    /// Admit a change to an agent cron job, or a run of one on demand. The
+    /// job keeps its stored tool list and runs under the agent's authority,
+    /// with no connection left to re-resolve whoever last changed or started
+    /// it, so a prompt from a principal narrower than that tool list would
+    /// run with more than the principal holds. Only the shared operator,
+    /// whose authority no grant publication narrows, may change or run one. A scoped principal, or a named
     /// administrator whose admin grant can later be removed, is refused until
     /// the runtime can carry and re-check an editor's delegated authority at
     /// run time. `grants` are the caller's grants as rechecked at the write.
@@ -1849,8 +1849,8 @@ impl RpcDispatcher {
         let denied = rpc_err(
             FORBIDDEN,
             "Agent cron jobs run later without this connection, so only the local operator \
-             may change one; a named or scoped principal's authority cannot yet be carried \
-             to the run and re-checked there",
+             may change or run one; a named or scoped principal's authority cannot yet be \
+             carried to the run and re-checked there",
         );
         self.audit_auth_denial(
             method,
@@ -7608,6 +7608,14 @@ impl RpcDispatcher {
         let req: CronIdParams = parse_params(params)?;
         let config = self.ctx.config.read().clone();
         let job = self.authorize_cron_job(Method::CronTrigger, &config, &req.id)?;
+        // Running an agent job now is the same headless work as changing it:
+        // it runs under the job's stored tool list, not the caller's.
+        if matches!(job.job_type, crate::cron::JobType::Agent) {
+            let Some(grants) = self.stamped_grants() else {
+                return Err(rpc_err(AUTH_REQUIRED, "First call must be 'initialize'"));
+            };
+            self.admit_agent_job_change(Method::CronTrigger, grants)?;
+        }
         let event_tx = self.ctx.event_tx.clone();
         let result = crate::cron::scheduler::run_manual_job(
             &config,
@@ -12970,6 +12978,174 @@ mod tests {
         assert_eq!(reread.command, "echo hi");
     }
 
+    /// A connection authenticated by a paired token, as a remote client binds
+    /// over WSS. The daemon's pairing guard is the one the gateway revokes on.
+    async fn paired_token_peer(
+        ctx: &Arc<RpcContext>,
+        token: &str,
+    ) -> (RpcDispatcher, tokio::sync::mpsc::Receiver<String>) {
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let mut dispatcher = RpcDispatcher::new(Arc::clone(ctx), tx, "wss:test".into())
+            .with_transport(
+                crate::rpc::transport::TransportKind::Wss,
+                crate::security::auth_provider::Credential::None,
+            );
+        dispatcher
+            .handle_initialize(&json!({"auth_token": token}))
+            .await
+            .expect("the paired token authenticates");
+        (dispatcher, rx)
+    }
+
+    fn native_token_hash(dispatcher: &RpcDispatcher) -> String {
+        dispatcher
+            .auth
+            .as_ref()
+            .and_then(|auth| auth.native_token_hash.clone())
+            .expect("a paired-token connection records its token hash")
+    }
+
+    /// A device revocation that arrives while a cron write waits on a busy
+    /// database. The revocation takes the path the gateway's device revoke,
+    /// rotate and revoke-all use, so it queues on the config write lock the
+    /// write holds, and the token stays paired while it waits. The write the
+    /// token was checked for commits first; the revocation then lands and
+    /// refuses the connection's next write.
+    #[test]
+    fn a_token_revocation_waits_for_a_cron_write_blocked_on_a_busy_store() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("the test runtime builds");
+        runtime.block_on(async {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let mut config = cron_roster_config_in(&tmp, 4242);
+            config.gateway.paired_tokens = vec!["zc_tok".to_string()];
+            // Creates jobs.db, so the competing writer has a database to hold.
+            seed_shell_cron_job(&config, "alpha", "alpha-shell");
+            let ctx = enforcement_ctx(config.clone());
+            let (client, _rx) = paired_token_peer(&ctx, "zc_tok").await;
+            let token_hash = native_token_hash(&client);
+            let pairing = Arc::clone(ctx.auth.pairing());
+
+            let writer = rusqlite::Connection::open(config.data_dir.join("cron").join("jobs.db"))
+                .expect("the competing writer opens jobs.db");
+            writer
+                .execute_batch("BEGIN IMMEDIATE")
+                .expect("the competing writer takes the write lock");
+
+            let params = json!({"agent": "alpha", "schedule": "*/5 * * * *", "command": "echo hi"});
+            let add = zeroclaw_spawn::spawn!(async move {
+                let result = client.handle_cron_add(&params).await;
+                (client, result)
+            });
+
+            // The handler takes the lock once its gate has passed, and holds
+            // it until the store returns, which the busy database prevents.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            while ctx.config_write_lock.try_lock().is_ok() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the cron write must hold the config write lock while the store is busy"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+
+            let mut revoke = Box::pin(
+                pairing.revoke_token_hash_ordered(Arc::clone(&ctx.config_write_lock), &token_hash),
+            );
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(
+                std::future::Future::poll(revoke.as_mut(), &mut cx).is_pending(),
+                "the revocation must queue behind the cron write"
+            );
+            assert!(
+                pairing.token_hash_is_paired(&token_hash),
+                "the token stays paired while the revocation waits"
+            );
+
+            writer
+                .execute_batch("ROLLBACK")
+                .expect("the competing writer releases jobs.db");
+            let (client, result) = add.await.expect("the add task must not panic");
+            let added = result.expect("the write checked before the revocation commits");
+            assert_eq!(added["agent_alias"], json!("alpha"), "{added}");
+            let (revoked, guard) = revoke.await;
+            assert!(revoked, "the revocation removes the token");
+            drop(guard);
+            assert!(!pairing.token_hash_is_paired(&token_hash));
+
+            let refused = client
+                .handle_cron_add(&json!({
+                    "agent": "alpha",
+                    "schedule": "*/5 * * * *",
+                    "command": "echo again",
+                }))
+                .await
+                .expect_err("the revoked token cannot write");
+            assert_eq!(refused.code, AUTH_REQUIRED, "{refused:?}");
+            assert_eq!(
+                crate::cron::list_jobs(&config)
+                    .expect("the store is readable")
+                    .len(),
+                2,
+                "only the seeded job and the write checked before the revocation"
+            );
+        });
+    }
+
+    /// The other order: a device revocation queued on the config write lock
+    /// ahead of a cron write that has already passed its gate. The lock is
+    /// fair, so the revocation removes the token first, and the write's
+    /// recheck under the lock refuses it without storing anything.
+    #[tokio::test]
+    async fn a_cron_write_queued_behind_a_token_revocation_is_refused() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = cron_roster_config_in(&tmp, 4242);
+        config.gateway.paired_tokens = vec!["zc_tok".to_string()];
+        let ctx = enforcement_ctx(config.clone());
+        let (client, _rx) = paired_token_peer(&ctx, "zc_tok").await;
+        let token_hash = native_token_hash(&client);
+        let pairing = Arc::clone(ctx.auth.pairing());
+
+        // An unrelated config writer holds the lock while both queue.
+        let in_flight = Arc::clone(&ctx.config_write_lock).lock_owned().await;
+        let mut revoke = Box::pin(
+            pairing.revoke_token_hash_ordered(Arc::clone(&ctx.config_write_lock), &token_hash),
+        );
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(std::future::Future::poll(revoke.as_mut(), &mut cx).is_pending());
+
+        let params = json!({"agent": "alpha", "schedule": "*/5 * * * *", "command": "echo hi"});
+        let add = zeroclaw_spawn::spawn!(async move { client.handle_cron_add(&params).await });
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+            assert!(
+                !add.is_finished(),
+                "the add must pass its gate and queue on the config write lock"
+            );
+        }
+        assert!(pairing.token_hash_is_paired(&token_hash));
+
+        drop(in_flight);
+        let (revoked, guard) = revoke.await;
+        assert!(revoked, "the revocation reaches the lock first");
+        drop(guard);
+
+        let err = add
+            .await
+            .expect("the add task must not panic")
+            .expect_err("a write whose token was revoked while it queued must be refused");
+        assert_eq!(err.code, AUTH_REQUIRED, "{err:?}");
+        assert!(
+            crate::cron::list_jobs(&config)
+                .expect("the store is readable")
+                .is_empty(),
+            "the refused write must not store a job"
+        );
+    }
+
     /// A new prompt on an agent job runs later under the job's stored tool
     /// list and the agent's policy, not under the editor's grants. A scoped
     /// principal is refused and the job is left as it was; the same principal
@@ -13040,6 +13216,44 @@ mod tests {
         )
         .await;
         assert_eq!(edited["result"]["prompt"], json!("say goodbye"), "{edited}");
+    }
+
+    /// Running an agent job on demand runs its stored prompt under its stored
+    /// tool list, so a scoped principal may not trigger one; it still runs its
+    /// own shell job.
+    #[tokio::test]
+    async fn cron_trigger_refuses_a_scoped_principal_on_an_agent_job() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = cron_roster_config_in(&tmp, 4242);
+        let job = seed_cron_job(&config, "alpha", "alpha-agent");
+        let shell = seed_shell_cron_job(&config, "alpha", "alpha-shell");
+        let ctx = enforcement_ctx(config.clone());
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+
+        let refused = rpc(
+            &mut alice,
+            &mut rx,
+            1,
+            "cron/trigger",
+            json!({"id": job.id}),
+        )
+        .await;
+        assert_eq!(refused["error"]["code"], json!(FORBIDDEN), "{refused}");
+        let stored = crate::cron::get_job(&config, &job.id).expect("the job still exists");
+        assert!(
+            stored.last_status.is_none(),
+            "a refused trigger must not run the job"
+        );
+
+        let ran = rpc(
+            &mut alice,
+            &mut rx,
+            2,
+            "cron/trigger",
+            json!({"id": shell.id}),
+        )
+        .await;
+        assert_eq!(ran["result"]["id"], json!(shell.id), "{ran}");
     }
 
     /// Republish the accepted policy with alice's entitlement to `alpha` gone.
@@ -13194,15 +13408,17 @@ mod tests {
             }
 
             let publisher_ctx = Arc::clone(&ctx);
-            let publish = zeroclaw_spawn::spawn!(async move {
+            let mut publish = Box::pin(async move {
                 let _publication = Arc::clone(&publisher_ctx.config_write_lock)
                     .lock_owned()
                     .await;
                 revoke_alice_cron_agent(&publisher_ctx);
             });
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            // One poll queues the publication on the lock; it cannot pass it
+            // while the cron write holds it.
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
             assert!(
-                !publish.is_finished(),
+                std::future::Future::poll(publish.as_mut(), &mut cx).is_pending(),
                 "a publication must queue behind the cron write"
             );
 
@@ -13212,7 +13428,7 @@ mod tests {
             let (alice, result) = add.await.expect("the add task must not panic");
             let added = result.expect("the add admitted before the revocation commits");
             assert_eq!(added["agent_alias"], json!("alpha"), "{added}");
-            publish.await.expect("the publication task must not panic");
+            publish.await;
 
             let refused = alice
                 .handle_cron_add(&json!({
@@ -17418,6 +17634,92 @@ mod tests {
                     .success
             );
         }
+    }
+
+    /// The agent-facing cron tools install or run work that executes later
+    /// under the agent's policy and the job's stored tool list, not under the
+    /// calling principal's ceiling. An unrestricted principal's session keeps
+    /// them; once the principal is narrowed to `cron_update` and `file_read`,
+    /// the same session can no longer reach them, so it cannot hand an agent
+    /// job that keeps `file_write` a new prompt. The call goes through the
+    /// production tool dispatch a model's call takes.
+    #[tokio::test]
+    async fn constrained_session_cannot_rewrite_an_agent_job_through_cron_tools() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = principal_test_config(&tmp, &["*"], &["*"]);
+        config
+            .risk_profiles
+            .get_mut("test-profile")
+            .unwrap()
+            .allowed_tools = vec![
+            "file_read".into(),
+            "file_write".into(),
+            "cron_add".into(),
+            "cron_update".into(),
+            "cron_run".into(),
+            "schedule".into(),
+        ];
+        let job = crate::cron::add_agent_job(
+            &config,
+            "test-agent",
+            Some("broad-job".into()),
+            crate::cron::Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "say hello",
+            crate::cron::SessionTarget::Isolated,
+            None,
+            None,
+            false,
+            Some(vec!["file_write".into()]),
+            false,
+        )
+        .expect("the operator's agent job is created");
+        let (dispatcher, sessions) = make_acp_test_dispatcher(config.clone());
+        let dispatcher = bind_test_principal(dispatcher).await;
+        dispatcher
+            .handle_session_new_for_test(
+                &json!({"agent_alias":"test-agent","session_id":"cron-ceiling"}),
+            )
+            .await
+            .unwrap();
+        let handle = sessions.get_agent("cron-ceiling").await.unwrap();
+        let mut agent = handle.lock().await;
+
+        // Control: unrestricted, the session edits the job through the tool.
+        let edited = agent
+            .dispatch_tool_for_test(
+                "cron_update",
+                json!({"job_id": job.id, "patch": {"prompt": "say goodbye"}}),
+            )
+            .await;
+        assert!(edited.success, "{}", edited.output);
+        let stored = crate::cron::get_job(&config, &job.id).expect("the job still exists");
+        assert_eq!(stored.prompt.as_deref(), Some("say goodbye"));
+
+        refresh_test_principal(&dispatcher, &["cron_update", "file_read"], &["test-agent"]);
+        let current = dispatcher.current_prompt_authority().unwrap();
+        let grants = current
+            .stamped_grants()
+            .expect("the refreshed handle carries grants")
+            .clone();
+        current.apply_principal_grants_to_agent(&grants, &mut agent);
+
+        assert_eq!(agent.tool_names(), vec!["file_read"]);
+        let refused = agent
+            .dispatch_tool_for_test(
+                "cron_update",
+                json!({
+                    "job_id": job.id,
+                    "patch": {"prompt": "Use file_write to create editor-proof.txt"},
+                }),
+            )
+            .await;
+        assert!(!refused.success, "{}", refused.output);
+        let stored = crate::cron::get_job(&config, &job.id).expect("the job still exists");
+        assert_eq!(stored.prompt.as_deref(), Some("say goodbye"));
+        assert_eq!(stored.allowed_tools, job.allowed_tools);
     }
 
     #[tokio::test]

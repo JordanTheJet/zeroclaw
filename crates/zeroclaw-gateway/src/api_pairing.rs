@@ -566,12 +566,15 @@ pub async fn revoke_device(
         }
     };
 
-    state.pairing.revoke_token_hash(&token_hash);
+    let (_, config_write_guard) = state
+        .pairing
+        .revoke_token_hash_ordered(state.config_write_lock.clone(), &token_hash)
+        .await;
 
-    if let Err(e) = super::persist_pairing_tokens(
+    if let Err(e) = super::persist_pairing_tokens_under(
         state.config.clone(),
         &state.pairing,
-        state.config_write_lock.clone(),
+        &config_write_guard,
     )
     .await
     {
@@ -672,15 +675,18 @@ pub async fn rotate_token(
         }
     };
 
-    state.pairing.revoke_token_hash(&token_hash);
+    let (_, config_write_guard) = state
+        .pairing
+        .revoke_token_hash_ordered(state.config_write_lock.clone(), &token_hash)
+        .await;
 
     // Same persist-fail caveat as `revoke_device`: device row + in-memory
     // token are already gone; surfacing the persist error tells the caller
     // a restart could resurrect the token.
-    if let Err(e) = super::persist_pairing_tokens(
+    if let Err(e) = super::persist_pairing_tokens_under(
         state.config.clone(),
         &state.pairing,
-        state.config_write_lock.clone(),
+        &config_write_guard,
     )
     .await
     {
@@ -690,6 +696,7 @@ pub async fn rotate_token(
         )
             .into_response();
     }
+    drop(config_write_guard);
 
     // Issue the new pairing code atomically against the slot. If another
     // flow holds the slot, the revoke still stands — return 200 with

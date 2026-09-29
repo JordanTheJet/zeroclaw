@@ -5896,6 +5896,61 @@ pub(crate) mod tests {
         );
     }
 
+    /// A guarded RPC write holds the config write lock from its credential
+    /// check to its commit, so a device revocation or rotation changes the
+    /// live token set only once it holds that lock. While another writer
+    /// holds it, the handler waits with the token still authenticating, and
+    /// the revocation lands once the lock is released.
+    #[tokio::test]
+    async fn device_revoke_and_rotate_remove_the_live_token_only_under_the_config_write_lock() {
+        for rotate in [false, true] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let (state, old_token, device_id) = paired_state_with_device(&tmp).await;
+
+            let in_flight = std::sync::Arc::clone(&state.config_write_lock)
+                .lock_owned()
+                .await;
+            let mut revoke = if rotate {
+                Box::pin(async {
+                    rotate_device_token(
+                        State(state.clone()),
+                        bearer_headers(&old_token),
+                        Path(device_id.clone()),
+                    )
+                    .await
+                    .into_response()
+                }) as std::pin::Pin<Box<dyn std::future::Future<Output = _> + Send>>
+            } else {
+                Box::pin(async {
+                    revoke_device(
+                        State(state.clone()),
+                        bearer_headers(&old_token),
+                        Path(device_id.clone()),
+                    )
+                    .await
+                    .into_response()
+                })
+            };
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(
+                std::future::Future::poll(revoke.as_mut(), &mut cx).is_pending(),
+                "rotate={rotate}: the revocation must wait for the config write lock"
+            );
+            assert!(
+                state.pairing.is_authenticated(&old_token),
+                "rotate={rotate}: the token stays live while the revocation waits"
+            );
+
+            drop(in_flight);
+            let response = revoke.await;
+            assert_eq!(response.status(), StatusCode::OK, "rotate={rotate}");
+            assert!(
+                !state.pairing.is_authenticated(&old_token),
+                "rotate={rotate}: the token is revoked once the lock is released"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn rotate_unknown_device_returns_not_found() {
         let tmp = tempfile::TempDir::new().unwrap();
