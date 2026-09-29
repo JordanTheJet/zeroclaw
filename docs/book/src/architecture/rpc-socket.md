@@ -55,6 +55,8 @@ The local endpoint bounds what one client can hold:
 | Limit | Value | What the client sees |
 |---|---|---|
 | Frame size | 8 MiB per line | One `-32600` error with `id: null` and `data: {"reason": "frame_too_large", "limit_bytes": 8388608}`, then end of stream. The rest of the oversized line is never read, so the connection cannot continue. |
+| Initialize | 30 s from connect | A connection that has not completed `initialize` 30 s after it connected is closed with no reply, so a client that connects and sends nothing cannot hold a connection slot. |
+| Unfinished frame | 30 s from the frame's first byte | Once a frame starts, the whole line must arrive within 30 s of its first byte, however steadily the rest arrives. Past that the client receives one `-32600` error with `id: null` and `data: {"reason": "frame_timeout", "limit_ms": 30000}`, then end of stream. The wait between frames is not bounded, so an initialized client may stay idle. |
 | Write stall | 30 s per frame | A client that stops reading for 30 s while the daemon has output queued for it is disconnected. Other connections are unaffected. Disconnecting ends the turns that connection started, as any other disconnect does. That includes a suspended client: a zerocode stopped with Ctrl-Z, or frozen with Ctrl-S, while a turn streams has that turn cancelled after 30 s, where before it finished once the client resumed. |
 | Open connections | `rpc.max_local_connections`, default 512 | A connection past the ceiling receives one `-32004` error with `id: null` and `data: {"reason": "connection_limit", "limit": N}`, then end of stream. The daemon logs one warning when it starts refusing. The value is read when the listener starts. |
 
@@ -211,8 +213,8 @@ name it, and it is discarded when that connection closes. The limits:
 
 - A connection may stage four uploads at a time.
 - The daemon stages at most 256 MiB across all connections. The charge covers
-  each upload's payload and the metadata it keeps (session id, agent, filename,
-  declared hash), so an empty payload cannot hold memory for free. A
+  each upload's payload and the metadata it keeps (session id, owner, agent,
+  filename, declared hash), so an empty payload cannot hold memory for free. A
   `filename` longer than 255 bytes is refused.
 - An upload idle for five minutes is discarded. When a new upload does not
   fit in the budget, the daemon first reclaims every upload idle past that
@@ -220,9 +222,23 @@ name it, and it is discarded when that connection closes. The limits:
   cannot hold the budget.
 
 The three methods are served on local connections only; a WSS peer gets
-`-32012`. They need the `files:create` grant, and `begin` and `commit` each
-check that the principal may use the session's agent, so a grant withdrawn
-mid-upload stops the commit before anything is written.
+`-32012`. They need the `files:create` grant, and `begin` checks that the
+principal owns the session (for a principal without `admin`) and may use the
+session's agent.
+
+An upload is bound to the exact session it was begun for: the live session
+with that id, its owner, and its agent. `commit` stores it in one step under
+the session lock. It first confirms that session is still the same one, then
+checks the caller's credential, `files:create`, session ownership, and agent
+entitlement against the policy in force at that moment, and only then writes
+and indexes the file. A grant withdrawn while the upload was in progress, or
+a session closed or recreated under the same id, fails the commit before
+anything is written. `file/attach` stores through the same step and carries
+the same ownership requirement.
+
+A repeat of an upload the session already indexed is checked against the file
+on disk. If the file was edited, deleted, or replaced by a link, the uploaded
+bytes are written back at the indexed path before it is returned.
 
 ## Ephemeral mode
 
