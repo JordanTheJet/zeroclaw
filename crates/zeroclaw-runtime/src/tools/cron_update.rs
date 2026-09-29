@@ -79,6 +79,12 @@ impl CronUpdateTool {
 
 #[async_trait]
 impl Tool for CronUpdateTool {
+    // A patched job (prompt, command, tool list, schedule) runs later, headless,
+    // with nothing of the RPC principal's ceiling kept to re-check.
+    fn requires_unrestricted_principal(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "cron_update"
     }

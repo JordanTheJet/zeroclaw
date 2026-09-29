@@ -173,6 +173,12 @@ fn schedule_error_result(error: String) -> ToolResult {
 
 #[async_trait]
 impl Tool for CronAddTool {
+    // The job it stores runs later, headless, with only the tool list the model
+    // asked for: nothing of the RPC principal's ceiling is kept to re-check.
+    fn requires_unrestricted_principal(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "cron_add"
     }

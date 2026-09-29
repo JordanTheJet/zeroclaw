@@ -37563,6 +37563,144 @@ mod tests {
         );
     }
 
+    /// The model-facing twins of the RPC agent-job gate. `cron_add`,
+    /// `cron_update`, `cron_run` and `schedule` store or run work that later
+    /// executes headless without the RPC principal's ceiling, so a constrained
+    /// session does not get them, even when its selector names them or a skill
+    /// wraps one. The operator's session keeps them.
+    #[tokio::test]
+    async fn constrained_session_loses_the_model_facing_cron_scheduling_tools() {
+        use std::collections::HashMap;
+        use zeroclaw_api::grants::{Resource, Verb};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = p4_config(&tmp);
+        let names = [
+            "cron_add",
+            "ops__add",
+            "cron_update",
+            "cron_run",
+            "schedule",
+        ];
+        {
+            let profile = config
+                .permission_profiles
+                .get_mut("cron-alpha")
+                .expect("the roster profile exists");
+            profile.grants.insert(Resource::Tools, vec![Verb::Execute]);
+            profile.allowed_tools = names.map(String::from).to_vec();
+        }
+        let seeded = seed_cron_job(&config, "alpha", "seeded");
+        let ctx = enforcement_ctx(config.clone());
+        let (operator, _operator_rx) = local_operator(&ctx).await;
+        let (alice, _alice_rx) = roster_peer(&ctx, 4242).await;
+        let grants_of = |d: &RpcDispatcher| d.auth.as_ref().expect("bound").grants.clone();
+
+        let shared = Arc::new(config.clone());
+        let security = Arc::new(
+            zeroclaw_config::policy::SecurityPolicy::for_agent(&config, "alpha")
+                .expect("alpha's policy"),
+        );
+        let agent_with_cron_tools = || {
+            let cron_add: Arc<dyn zeroclaw_api::tool::Tool> = Arc::new(
+                crate::tools::CronAddTool::new(Arc::clone(&shared), Arc::clone(&security), "alpha"),
+            );
+            let skill_tool = crate::skills::SkillTool {
+                name: "add".into(),
+                description: "schedule a job".into(),
+                kind: "builtin".into(),
+                command: String::new(),
+                args: Default::default(),
+                target: Some("cron_add".into()),
+                locked_args: Default::default(),
+                timeout_secs: None,
+            };
+            let wrapper = crate::tools::SkillBuiltinTool::new(
+                "ops",
+                &skill_tool,
+                Arc::clone(&cron_add),
+                HashMap::new(),
+            );
+            crate::agent::agent::Agent::builder()
+                .model_provider(Box::new(DummyModelProvider))
+                .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                    vec![
+                        Box::new(crate::tools::ArcToolRef(cron_add)),
+                        Box::new(wrapper),
+                        Box::new(crate::tools::CronUpdateTool::new(
+                            Arc::clone(&shared),
+                            Arc::clone(&security),
+                            "alpha",
+                        )),
+                        Box::new(crate::tools::CronRunTool::new(
+                            Arc::clone(&shared),
+                            Arc::clone(&security),
+                            "alpha",
+                        )),
+                        Box::new(crate::tools::ScheduleTool::new(
+                            Arc::clone(&security),
+                            config.clone(),
+                            "alpha",
+                        )),
+                    ],
+                ))
+                .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
+                .observer(Arc::new(crate::observability::noop::NoopObserver))
+                .tool_dispatcher(Box::new(crate::agent::dispatcher::NativeToolDispatcher))
+                .workspace_dir(tmp.path().to_path_buf())
+                .build()
+                .unwrap()
+        };
+        let agent_job = json!({
+            "schedule": {"kind": "after", "after_seconds": 3600},
+            "job_type": "agent",
+            "prompt": "Use file_write to write marker.txt",
+            "allowed_tools": ["file_write"],
+        });
+
+        // A constrained principal whose selector names every one of them gets
+        // none, and a model call to any of them schedules or runs nothing.
+        let mut agent = agent_with_cron_tools();
+        alice.apply_principal_grants_to_agent(&grants_of(&alice), &mut agent);
+        assert!(agent.tool_names().is_empty(), "{:?}", agent.tool_names());
+        for (name, args) in [
+            ("cron_add", agent_job.clone()),
+            ("ops__add", agent_job.clone()),
+            (
+                "cron_update",
+                json!({"job_id": seeded.id, "patch": {"prompt": "Use file_write", "allowed_tools": ["file_write"]}}),
+            ),
+            ("cron_run", json!({"job_id": seeded.id})),
+            (
+                "schedule",
+                json!({"action": "create", "expression": "*/5 * * * *", "command": "echo hi"}),
+            ),
+        ] {
+            assert!(
+                !agent.dispatch_tool_for_test(name, args).await.success,
+                "{name} must not run for a constrained principal"
+            );
+        }
+        let jobs = crate::cron::list_jobs(&config).expect("store readable");
+        assert_eq!(jobs.len(), 1, "nothing was scheduled: {jobs:?}");
+        assert_eq!(jobs[0].prompt, seeded.prompt);
+        assert_eq!(jobs[0].allowed_tools, seeded.allowed_tools);
+        assert!(
+            crate::cron::list_runs(&config, &seeded.id, 10)
+                .expect("runs readable")
+                .is_empty(),
+            "nothing ran"
+        );
+
+        // Control: the operator's session keeps them, and they work.
+        let mut agent = agent_with_cron_tools();
+        operator.apply_principal_grants_to_agent(&grants_of(&operator), &mut agent);
+        assert_eq!(agent.tool_names(), names);
+        let added = agent.dispatch_tool_for_test("cron_add", agent_job).await;
+        assert!(added.success, "{}", added.output);
+        assert_eq!(crate::cron::list_jobs(&config).unwrap().len(), 2);
+    }
+
     /// The operator may submit agent jobs, but only with tools the agent's
     /// current policy admits, checked with the matcher the run uses.
     #[tokio::test]

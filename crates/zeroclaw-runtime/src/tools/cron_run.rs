@@ -99,6 +99,12 @@ impl CronRunTool {
 
 #[async_trait]
 impl Tool for CronRunTool {
+    // Runs a stored job now under the tool list stored with it, not under the
+    // RPC principal's ceiling.
+    fn requires_unrestricted_principal(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "cron_run"
     }

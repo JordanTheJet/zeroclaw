@@ -53,6 +53,12 @@ impl ScheduleTool {
 
 #[async_trait]
 impl Tool for ScheduleTool {
+    // The shell jobs it stores (or resumes) run later, headless, under the
+    // agent's policy, with nothing of the RPC principal's ceiling kept to re-check.
+    fn requires_unrestricted_principal(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "schedule"
     }
