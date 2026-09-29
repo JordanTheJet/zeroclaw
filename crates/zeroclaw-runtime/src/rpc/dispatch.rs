@@ -21998,6 +21998,7 @@ mod tests {
             ],
             mode_instructions: None,
             min_confidence: 0.7,
+            part_threshold: 0.5,
         });
         sop
     }
