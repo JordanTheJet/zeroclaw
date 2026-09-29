@@ -2,11 +2,15 @@
 //!
 //! When the daemon mints an enrollment pairing code and a relay is configured,
 //! the operator can hand a phone a ready-made link to the relay's browser
-//! enrollment page, `https://<relay>/?node=<node-id>&code=<pairing-code>`, and a
+//! enrollment page, `https://<relay>/#node=<node-id>&code=<pairing-code>`, and a
 //! terminal QR code of the same link. The page fills its two fields from the
 //! link and still waits for the user to fetch the agent CA and confirm the
 //! short-auth-string, so the link carries no more authority than the code it
 //! already shows.
+//!
+//! The parameters ride in the fragment, never the query string. A browser does
+//! not send the fragment to any server, so opening the link keeps the unused
+//! pairing code out of the request line that reverse proxies and CDNs log.
 //!
 //! The link contains the one-time pairing code, so it is treated exactly like
 //! the code: it is written only to the operator's console writer handed in by
@@ -31,7 +35,7 @@ pub fn frontdoor_link(relay_addr: &str, node_id: &str, pairing_code: &str) -> Op
     }
     let authority = relay_authority(relay_addr)?;
     Some(format!(
-        "https://{authority}/?node={}&code={}",
+        "https://{authority}/#node={}&code={}",
         urlencoding::encode(node_id),
         urlencoding::encode(pairing_code),
     ))
@@ -148,14 +152,14 @@ mod tests {
         assert_eq!(
             frontdoor_link("relay.example.com:9443", NODE, CODE).as_deref(),
             Some(
-                "https://relay.example.com:9443/?node=0d3c4f3e8b9a1d2c3b4a5968778695a4&code=Xy7Kq2Lm9Pz4"
+                "https://relay.example.com:9443/#node=0d3c4f3e8b9a1d2c3b4a5968778695a4&code=Xy7Kq2Lm9Pz4"
             )
         );
     }
 
     #[test]
     fn drops_the_default_port_scheme_and_path() {
-        let want = format!("https://relay.example.com/?node={NODE}&code={CODE}");
+        let want = format!("https://relay.example.com/#node={NODE}&code={CODE}");
         for addr in [
             "relay.example.com:443",
             "wss://relay.example.com:443/relay",
@@ -170,11 +174,11 @@ mod tests {
         }
         assert_eq!(
             frontdoor_link("[2001:db8::1]:443", NODE, CODE).as_deref(),
-            Some(format!("https://[2001:db8::1]/?node={NODE}&code={CODE}").as_str())
+            Some(format!("https://[2001:db8::1]/#node={NODE}&code={CODE}").as_str())
         );
         assert_eq!(
             frontdoor_link("[2001:db8::1]:9443", NODE, CODE).as_deref(),
-            Some(format!("https://[2001:db8::1]:9443/?node={NODE}&code={CODE}").as_str())
+            Some(format!("https://[2001:db8::1]:9443/#node={NODE}&code={CODE}").as_str())
         );
     }
 
@@ -183,8 +187,21 @@ mod tests {
         let link = frontdoor_link("relay:9443", "node&id=1#x", "ab+c/d").expect("link");
         assert_eq!(
             link,
-            "https://relay:9443/?node=node%26id%3D1%23x&code=ab%2Bc%2Fd"
+            "https://relay:9443/#node=node%26id%3D1%23x&code=ab%2Bc%2Fd"
         );
+    }
+
+    /// Everything before `#` is the request target a browser sends, and proxies
+    /// and CDNs log it. The pairing code must only appear after the `#`.
+    #[test]
+    fn the_pairing_code_stays_out_of_the_request_target() {
+        for addr in ["relay:9443", "wss://relay.example.com:443/relay"] {
+            let link = frontdoor_link(addr, NODE, CODE).expect("link");
+            let (request_target, fragment) = link.split_once('#').expect("fragment form");
+            assert!(!request_target.contains('?'), "no query string: {link}");
+            assert!(!request_target.contains(CODE), "code in request target: {link}");
+            assert_eq!(fragment, format!("node={NODE}&code={CODE}"));
+        }
     }
 
     #[test]
@@ -214,7 +231,7 @@ mod tests {
         .expect("write");
         assert!(wrote);
         let text = String::from_utf8(out).expect("utf8");
-        let link = format!("https://relay:9443/?node={NODE}&code={CODE}");
+        let link = format!("https://relay:9443/#node={NODE}&code={CODE}");
         assert!(text.contains(&format!("    link : {link}")), "{text}");
         let qr = render_terminal_qr(&link).expect("qr");
         assert!(
