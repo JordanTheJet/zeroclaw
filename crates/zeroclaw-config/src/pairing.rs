@@ -713,7 +713,8 @@ impl PairingGuard {
     /// entirely after it. `None` when the hash is not paired. `f` must not
     /// call back into this guard's token set.
     pub fn while_paired<R>(&self, token_hash: &str, f: impl FnOnce() -> R) -> Option<R> {
-        let tokens = self.paired_tokens.lock();
+        // A shared read: revocation takes the write side, so it waits.
+        let tokens = self.paired_tokens.read();
         if !tokens.contains(token_hash) {
             return None;
         }
