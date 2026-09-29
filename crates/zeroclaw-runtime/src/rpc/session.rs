@@ -550,7 +550,7 @@ impl SessionStore {
         interaction_surface: Option<crate::agent::prompt::InteractionSurface>,
         owner_tui_id: Option<String>,
         expected_owner: Option<&str>,
-        authorize: impl FnOnce(&str, &str, bool) -> Result<(), E>,
+        authorize: impl FnOnce(&str, &str, Option<&crate::tools::ForwardedEnvironment>) -> Result<(), E>,
     ) -> Result<Option<Result<ResumedRpcSession, E>>, &'static str> {
         let mut sessions = self.sessions.lock().await;
         let Some(session) = sessions.get_mut(id) else {
@@ -573,10 +573,7 @@ impl SessionStore {
         if let Err(refused) = authorize(
             &session.agent_alias,
             &session.workspace_dir,
-            session
-                .forwarded_environment
-                .as_ref()
-                .is_some_and(|env| !env.is_empty()),
+            session.forwarded_environment.as_ref(),
         ) {
             return Ok(Some(Err(refused)));
         }

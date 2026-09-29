@@ -76,7 +76,7 @@ the operating system:
 | Method | Direction | Description |
 |---|---|---|
 | `initialize` | client -> daemon | Authenticate and negotiate protocol version |
-| `session/new` | client -> daemon | Create an agent session (requires `agentAlias`, optional `cwd`, `sessionId`; an ID that is already live rebinds the caller to that canonical in-memory session instead of replacing its agent history; optional `keep_siblings` suppresses the idle same-mode sibling eviction for multi-session clients that manage sibling lifecycle themselves) |
+| `session/new` | client -> daemon | Create an agent session (requires `agentAlias`, optional `cwd`, `sessionId`; an ID that is already live rebinds the caller to that canonical in-memory session instead of replacing its agent history, and is refused with `FORBIDDEN` when the forwarded environment the caller may use under its current grants differs from the one that session was created with; optional `keep_siblings` suppresses the idle same-mode sibling eviction for multi-session clients that manage sibling lifecycle themselves) |
 | `session/close` | client -> daemon | Remove the live session owner; ACP durable history remains resumable |
 | `session/kill` | client -> daemon | Remove the live session and tombstone its ACP durable history |
 | `session/delete` | client -> daemon | Remove the live session and its selected durable history |
