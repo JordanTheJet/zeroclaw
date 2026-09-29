@@ -7509,7 +7509,6 @@ impl RpcDispatcher {
     async fn handle_cron_patch(&self, params: &Value) -> RpcResult {
         let req: CronPatchParams = parse_params(params)?;
         self.selector_agent(Method::CronPatch, &req.agent)?;
-        let config = self.ctx.config.read().clone();
         let patch = CronJobPatch {
             schedule: req.schedule.map(|s| Schedule::Cron {
                 expr: s,
@@ -7527,8 +7526,14 @@ impl RpcDispatcher {
         // The ownership test rides in the `UPDATE` itself for a scoped
         // principal, so an agent rename landing between the check and the
         // write cannot open a window. An operator-level principal patches
-        // any row, including the ownerless legacy ones.
-        let owner = self.authorize_cron_job(Method::CronPatch, &config, &req.id)?;
+        // any row, including the ownerless legacy ones. The config snapshot
+        // is dropped before the lock is awaited: held across it, a whole
+        // `Config` would live in this future and in the dispatch future
+        // that embeds it.
+        let owner = {
+            let config = self.ctx.config.read().clone();
+            self.authorize_cron_job(Method::CronPatch, &config, &req.id)?
+        };
         // Held through the update: see `recheck_cron_write_authority`. The
         // config is read again under it, so the command is validated against
         // the policy the write commits under.
