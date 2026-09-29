@@ -5416,10 +5416,61 @@ pub(crate) mod tests {
             .unwrap()
             .expect("device existed");
         assert_eq!(revoked_hash, PairingGuard::token_hash(&token));
-        assert!(pairing.revoke_token_hash(&revoked_hash));
+        assert!(
+            pairing.revoke_token_hash(
+                &revoked_hash,
+                &std::sync::Arc::new(tokio::sync::Mutex::new(()))
+                    .try_lock_owned()
+                    .expect("a fresh mutex is free"),
+            )
+        );
         assert!(
             !pairing.is_authenticated(&token),
             "token must not authenticate after revoke"
+        );
+    }
+
+    /// Rotating a device's token revokes an established credential, so it
+    /// takes the config write lock before it touches the device or the token.
+    /// While another writer holds that lock (an operation between its
+    /// authority check and its effect), the rotation is queued with the old
+    /// token still valid; it takes effect only once the lock is released.
+    #[tokio::test]
+    async fn rotate_token_waits_for_a_config_writer_in_progress() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (state, old_token, device_id) = paired_state_with_device(&tmp).await;
+        let held = state.config_write_lock.clone().lock_owned().await;
+        let holders = Arc::strong_count(&state.config_write_lock);
+
+        let rotate = async {
+            rotate_device_token(
+                State(state.clone()),
+                bearer_headers(&old_token),
+                Path(device_id.clone()),
+            )
+            .await
+            .into_response()
+        };
+        let observe_then_release = async {
+            tokio::time::timeout(std::time::Duration::from_secs(20), async {
+                while Arc::strong_count(&state.config_write_lock) <= holders {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("the rotation reached the config write lock");
+            assert!(
+                state.pairing.is_authenticated(&old_token),
+                "the token was revoked while another writer held the config lock"
+            );
+            drop(held);
+        };
+        let (response, ()) = tokio::join!(rotate, observe_then_release);
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            !state.pairing.is_authenticated(&old_token),
+            "the rotation took effect once the lock was released"
         );
     }
 

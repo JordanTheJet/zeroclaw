@@ -141,7 +141,10 @@ pub async fn submit_pairing_enhanced(
                             .with_attrs(::serde_json::json!({"error": format!("{e}")})),
                         "device registry insert failed after successful pairing; rolling back in-process token"
                     );
-                    state.pairing.revoke_token_hash(&token_hash);
+                    // A just-issued token that was never handed out; the revocation
+                    // still takes the config write lock, as every revocation does.
+                    let held = state.config_write_lock.clone().lock_owned().await;
+                    state.pairing.revoke_token_hash(&token_hash, &held);
                     return (
                         StatusCode::INTERNAL_SERVER_ERROR,
                         Json(serde_json::json!({
@@ -168,7 +171,8 @@ pub async fn submit_pairing_enhanced(
                         .with_attrs(::serde_json::json!({"error": format!("{e}")})),
                     "pairing token persistence failed; rolling back in-process token"
                 );
-                state.pairing.revoke_token_hash(&token_hash);
+                let held = state.config_write_lock.clone().lock_owned().await;
+                state.pairing.revoke_token_hash(&token_hash, &held);
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(serde_json::json!({
@@ -326,6 +330,14 @@ pub async fn rotate_token(
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
+    // Rotation revokes an established credential. It takes the config write
+    // lock before touching the device or the token, and the caller is
+    // authenticated again under it, so a rotation waits for any operation
+    // that is between its authority check and its effect under that lock.
+    let guard = state.config_write_lock.clone().lock_owned().await;
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
 
     let Some(registry) = state.device_registry.as_ref() else {
         return (
@@ -347,15 +359,15 @@ pub async fn rotate_token(
         }
     };
 
-    state.pairing.revoke_token_hash(&token_hash);
+    state.pairing.revoke_token_hash(&token_hash, &guard);
 
     // Same persist-fail caveat as `revoke_device`: device row + in-memory
     // token are already gone; surfacing the persist error tells the caller
     // a restart could resurrect the token.
-    if let Err(e) = super::persist_pairing_tokens(
-        state.config.clone(),
+    if let Err(e) = zeroclaw_runtime::devices::persist_pairing_tokens_held(
+        &state.config,
         &state.pairing,
-        state.config_write_lock.clone(),
+        &guard,
     )
     .await
     {

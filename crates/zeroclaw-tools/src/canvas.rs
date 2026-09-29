@@ -21,6 +21,10 @@ const BROADCAST_CAPACITY: usize = 64;
 /// Maximum number of concurrent canvases to prevent memory exhaustion.
 const MAX_CANVAS_COUNT: usize = 100;
 
+/// Canvases one namespace may hold, so a handle limited to one namespace
+/// cannot fill the shared store for everyone else.
+const MAX_CANVASES_PER_NAMESPACE: usize = 16;
+
 /// Allowed content types for canvas frames via the REST API.
 pub const ALLOWED_CONTENT_TYPES: &[&str] = &["html", "svg", "markdown", "text"];
 
@@ -46,9 +50,15 @@ struct CanvasEntry {
 
 /// Shared canvas store — holds all active canvases.
 /// Thread-safe and cheaply cloneable (wraps `Arc`).
+///
+/// A handle made by [`CanvasStore::namespaced`] shares the same canvases but
+/// can address only its own namespace: every id it is given is stored as
+/// `<namespace>/<id>`, and [`CanvasStore::list`] returns only that
+/// namespace's ids. No id it can be given names a canvas outside it.
 #[derive(Clone)]
 pub struct CanvasStore {
     inner: Arc<RwLock<HashMap<String, CanvasEntry>>>,
+    namespace: Option<Arc<str>>,
 }
 
 impl Default for CanvasStore {
@@ -61,6 +71,44 @@ impl CanvasStore {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(RwLock::new(HashMap::new())),
+            namespace: None,
+        }
+    }
+
+    /// A handle to the same canvases that can address only `namespace`.
+    /// A handle that is already namespaced keeps its namespace.
+    #[must_use]
+    pub fn namespaced(&self, namespace: &str) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+            namespace: Some(
+                self.namespace
+                    .clone()
+                    .unwrap_or_else(|| Arc::from(namespace)),
+            ),
+        }
+    }
+
+    /// The stored key for `canvas_id` as this handle addresses it.
+    fn key(&self, canvas_id: &str) -> String {
+        match &self.namespace {
+            Some(namespace) => format!("{namespace}/{canvas_id}"),
+            None => canvas_id.to_string(),
+        }
+    }
+
+    /// Whether this handle may add one more canvas to `store`.
+    fn may_add(&self, store: &HashMap<String, CanvasEntry>) -> bool {
+        if store.len() >= MAX_CANVAS_COUNT {
+            return false;
+        }
+        match &self.namespace {
+            Some(namespace) => {
+                let prefix = format!("{namespace}/");
+                store.keys().filter(|key| key.starts_with(&prefix)).count()
+                    < MAX_CANVASES_PER_NAMESPACE
+            }
+            None => true,
         }
     }
 
@@ -79,20 +127,19 @@ impl CanvasStore {
             timestamp: chrono::Utc::now().to_rfc3339(),
         };
 
+        let key = self.key(canvas_id);
         let mut store = self.inner.write();
 
         // Enforce canvas count limit for new canvases.
-        if !store.contains_key(canvas_id) && store.len() >= MAX_CANVAS_COUNT {
+        if !store.contains_key(&key) && !self.may_add(&store) {
             return None;
         }
 
-        let entry = store
-            .entry(canvas_id.to_string())
-            .or_insert_with(|| CanvasEntry {
-                current: None,
-                history: Vec::new(),
-                tx: broadcast::channel(BROADCAST_CAPACITY).0,
-            });
+        let entry = store.entry(key).or_insert_with(|| CanvasEntry {
+            current: None,
+            history: Vec::new(),
+            tx: broadcast::channel(BROADCAST_CAPACITY).0,
+        });
 
         entry.current = Some(frame.clone());
         entry.history.push(frame.clone());
@@ -110,14 +157,16 @@ impl CanvasStore {
     /// Get the current (most recent) frame for a canvas.
     pub fn snapshot(&self, canvas_id: &str) -> Option<CanvasFrame> {
         let store = self.inner.read();
-        store.get(canvas_id).and_then(|entry| entry.current.clone())
+        store
+            .get(&self.key(canvas_id))
+            .and_then(|entry| entry.current.clone())
     }
 
     /// Get the frame history for a canvas.
     pub fn history(&self, canvas_id: &str) -> Vec<CanvasFrame> {
         let store = self.inner.read();
         store
-            .get(canvas_id)
+            .get(&self.key(canvas_id))
             .map(|entry| entry.history.clone())
             .unwrap_or_default()
     }
@@ -125,7 +174,7 @@ impl CanvasStore {
     /// Clear a canvas (removes current content and history).
     pub fn clear(&self, canvas_id: &str) -> bool {
         let mut store = self.inner.write();
-        if let Some(entry) = store.get_mut(canvas_id) {
+        if let Some(entry) = store.get_mut(&self.key(canvas_id)) {
             entry.current = None;
             entry.history.clear();
             // Send an empty frame to signal clear to subscribers.
@@ -146,27 +195,35 @@ impl CanvasStore {
     /// Creates the canvas entry if it does not exist (subject to canvas count limit).
     /// Returns `None` if the canvas does not exist and the limit has been reached.
     pub fn subscribe(&self, canvas_id: &str) -> Option<broadcast::Receiver<CanvasFrame>> {
+        let key = self.key(canvas_id);
         let mut store = self.inner.write();
 
         // Enforce canvas count limit for new entries.
-        if !store.contains_key(canvas_id) && store.len() >= MAX_CANVAS_COUNT {
+        if !store.contains_key(&key) && !self.may_add(&store) {
             return None;
         }
 
-        let entry = store
-            .entry(canvas_id.to_string())
-            .or_insert_with(|| CanvasEntry {
-                current: None,
-                history: Vec::new(),
-                tx: broadcast::channel(BROADCAST_CAPACITY).0,
-            });
+        let entry = store.entry(key).or_insert_with(|| CanvasEntry {
+            current: None,
+            history: Vec::new(),
+            tx: broadcast::channel(BROADCAST_CAPACITY).0,
+        });
         Some(entry.tx.subscribe())
     }
 
     /// List all canvas IDs that currently have content.
     pub fn list(&self) -> Vec<String> {
         let store = self.inner.read();
-        store.keys().cloned().collect()
+        match &self.namespace {
+            Some(namespace) => {
+                let prefix = format!("{namespace}/");
+                store
+                    .keys()
+                    .filter_map(|key| key.strip_prefix(&prefix).map(str::to_string))
+                    .collect()
+            }
+            None => store.keys().cloned().collect(),
+        }
     }
 }
 
@@ -653,5 +710,71 @@ mod tests {
             .unwrap();
         assert!(!result.success);
         assert!(result.error.as_ref().unwrap().contains("expression"));
+    }
+
+    /// A namespaced handle shares the store's canvases but cannot name one
+    /// outside its namespace: every id it is given, including ids that look
+    /// like another namespace or a path, lands inside its own.
+    #[test]
+    fn a_namespaced_handle_cannot_reach_outside_its_namespace() {
+        let shared = CanvasStore::new();
+        shared.render("default", "text", "the dashboard's frame");
+        shared.render("beta/default", "text", "beta's frame");
+        let alpha = shared.namespaced("alpha");
+
+        for id in ["default", "beta/default", "../beta/default", "/default"] {
+            assert!(alpha.snapshot(id).is_none(), "{id} resolved outside alpha");
+            assert!(!alpha.clear(id), "{id} cleared outside alpha");
+        }
+        alpha.render("default", "text", "alpha's frame");
+        alpha.render("beta/default", "text", "still alpha's");
+
+        assert_eq!(
+            shared.snapshot("default").map(|f| f.content),
+            Some("the dashboard's frame".into())
+        );
+        assert_eq!(
+            shared.snapshot("beta/default").map(|f| f.content),
+            Some("beta's frame".into())
+        );
+        assert_eq!(
+            shared.snapshot("alpha/default").map(|f| f.content),
+            Some("alpha's frame".into()),
+            "the unrestricted store sees alpha's canvas under its namespace"
+        );
+        let mut listed = alpha.list();
+        listed.sort();
+        assert_eq!(listed, vec!["beta/default", "default"]);
+        assert_eq!(
+            alpha
+                .namespaced("beta")
+                .snapshot("default")
+                .map(|f| f.content),
+            Some("alpha's frame".into()),
+            "a namespaced handle cannot be re-namespaced out of its namespace"
+        );
+    }
+
+    /// One namespace cannot fill the shared store for everyone else.
+    #[test]
+    fn a_namespace_is_capped_below_the_shared_limit() {
+        let shared = CanvasStore::new();
+        let alpha = shared.namespaced("alpha");
+        for i in 0..MAX_CANVASES_PER_NAMESPACE {
+            assert!(alpha.render(&format!("c{i}"), "text", "x").is_some());
+        }
+        assert!(
+            alpha.render("one-too-many", "text", "x").is_none(),
+            "the namespace is full"
+        );
+        assert!(
+            alpha
+                .render("c0", "text", "an existing canvas still updates")
+                .is_some()
+        );
+        assert!(
+            shared.render("dashboard", "text", "x").is_some(),
+            "the shared store still has room"
+        );
     }
 }

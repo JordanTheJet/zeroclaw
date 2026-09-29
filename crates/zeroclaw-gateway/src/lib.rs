@@ -2686,7 +2686,8 @@ async fn handle_pair(
                             .with_attrs(::serde_json::json!({"error": format!("{e}")})),
                         "device registry insert failed after successful legacy /pair; rolling back in-process token"
                     );
-                    state.pairing.revoke_token_hash(&token_hash);
+                    let held = state.config_write_lock.clone().lock_owned().await;
+                    state.pairing.revoke_token_hash(&token_hash, &held);
                     let body = serde_json::json!({
                         "paired": false,
                         "persisted": false,
@@ -2710,7 +2711,8 @@ async fn handle_pair(
                         .with_attrs(::serde_json::json!({"error": format!("{}", err)})),
                     "pairing token persistence failed; rolling back in-process token"
                 );
-                state.pairing.revoke_token_hash(&token_hash);
+                let held = state.config_write_lock.clone().lock_owned().await;
+                state.pairing.revoke_token_hash(&token_hash, &held);
                 let body = serde_json::json!({
                     "paired": false,
                     "persisted": false,

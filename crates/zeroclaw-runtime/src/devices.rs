@@ -444,7 +444,7 @@ pub async fn revoke_device(
             ));
         }
     };
-    pairing.revoke_token_hash(&token_hash);
+    pairing.revoke_token_hash(&token_hash, config_write_guard);
     if let Err(e) = persist_pairing_tokens_held(&config, pairing, config_write_guard).await {
         return Err(DeviceFailure::new(
             500,
@@ -492,7 +492,7 @@ pub async fn new_pairing_code(
 
     let revocation_message = match rotate {
         Some("all") => {
-            let revoked = pairing.revoke_all_tokens();
+            let revoked = pairing.revoke_all_tokens(config_write_guard);
             if let Some(registry) = registry
                 && let Err(e) = registry.clear()
             {
@@ -539,7 +539,7 @@ pub async fn new_pairing_code(
                 }
                 Err(e) => return failure(500, true, format!("Device registry error: {e}")),
             };
-            pairing.revoke_token_hash(&token_hash);
+            pairing.revoke_token_hash(&token_hash, config_write_guard);
             if let Err(e) = persist_pairing_tokens_held(&config, pairing, config_write_guard).await
             {
                 return failure(

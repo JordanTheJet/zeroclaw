@@ -2594,23 +2594,19 @@ impl RpcDispatcher {
             && grants.is_some_and(|grants| grants.admin)
     }
 
-    /// The canvas store a session built for `grants` may draw into.
+    /// The canvas store a session on `agent_alias` draws into: the daemon's
+    /// store, addressed only through that agent's namespace.
     ///
-    /// The daemon's store is shared by every agent and the dashboard, and
-    /// canvas ids carry no owner, so a handle to it reads, overwrites and
-    /// clears every agent's frames. A session's canvas tool gets that handle
-    /// only under the rule `canvas/*` applies: the principal may use every
-    /// agent. Any other session gets `None` and draws into a store of its
-    /// own, so allowing the `canvas` tool does not grant authority over other
-    /// agents' canvases.
-    fn session_canvas_store(
-        &self,
-        grants: Option<&zeroclaw_api::grants::ResolvedGrants>,
-    ) -> Option<crate::tools::CanvasStore> {
-        let grants = grants.or_else(|| self.stamped_grants())?;
-        grants
-            .may_use_agent(zeroclaw_api::grants::WILDCARD)
-            .then(|| self.ctx.canvas_store.clone())
+    /// Canvas ids carry no owner, so an unrestricted handle to the shared
+    /// store reads, overwrites and clears every agent's frames, and deciding
+    /// once at construction would outlive a later change to the principal's
+    /// grants. A namespaced handle cannot name a canvas outside its agent's
+    /// namespace, whatever the principal holds now or later, and a session is
+    /// usable only while its principal may use that agent, which each prompt
+    /// establishes again. The dashboard and `canvas/*` still see every
+    /// namespace through the unrestricted store.
+    fn session_canvas_store(&self, agent_alias: &str) -> Option<crate::tools::CanvasStore> {
+        Some(self.ctx.canvas_store.namespaced(agent_alias))
     }
 
     fn session_tui_env(
@@ -4770,7 +4766,7 @@ impl RpcDispatcher {
                     tui_env,
                     self.ctx.sop_engine.clone(),
                     self.ctx.sop_audit.clone(),
-                    self.session_canvas_store(grants.as_ref()),
+                    self.session_canvas_store(&req.agent_alias),
                     store,
                     self.principal_tool_narrowing(),
                 )
@@ -4785,7 +4781,7 @@ impl RpcDispatcher {
                     tui_env,
                     self.ctx.sop_engine.clone(),
                     self.ctx.sop_audit.clone(),
-                    self.session_canvas_store(grants.as_ref()),
+                    self.session_canvas_store(&req.agent_alias),
                     self.principal_tool_narrowing(),
                 )
                 .await
@@ -5829,7 +5825,7 @@ impl RpcDispatcher {
                 tui_env,
                 self.ctx.sop_engine.clone(),
                 self.ctx.sop_audit.clone(),
-                self.session_canvas_store(current_grants.as_ref()),
+                self.session_canvas_store(&data.agent_alias),
                 Arc::clone(&store),
                 self.principal_tool_narrowing(),
             )
@@ -12804,7 +12800,14 @@ mod tests {
 
         // Live revocation on the shared guard denies the ESTABLISHED
         // connection before its next privileged operation.
-        assert!(ctx.auth.pairing().revoke_token("zc_tok"));
+        assert!(
+            ctx.auth.pairing().revoke_token(
+                "zc_tok",
+                &Arc::clone(&ctx.config_write_lock)
+                    .try_lock_owned()
+                    .expect("no writer holds the test lock")
+            )
+        );
         let denied = dispatcher
             .authorize(Method::Status, Resource::System, Verb::Read)
             .expect_err("revoked pairing token invalidates the connection");

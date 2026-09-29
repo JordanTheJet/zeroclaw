@@ -126,17 +126,39 @@ pub fn make_directory(config: &Config, raw: &str) -> Result<(), BrowseError> {
 /// Create `raw` beneath `root`, creating the configured root itself first
 /// when it is missing. Idempotent for an existing directory.
 fn make_directory_under(root: &std::path::Path, raw: &str) -> Result<(), BrowseError> {
+    use cap_fs_ext::DirExt;
     let (_, relative) = resolve_relative(root, raw)?;
     std::fs::create_dir_all(root)?;
     let dir = open_root(root, raw)?;
-    let target = here(&relative);
-    match dir.metadata(target) {
-        Ok(meta) if meta.is_dir() => return Ok(()),
-        Ok(_) => return Err(BrowseError::NotADirectory(raw.to_string())),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => return Err(confined(raw, root)(err)),
+    // Created one component at a time without following a link, the last
+    // one included, so the protected-entry checks the caller ran on the
+    // lexical path judged the entry this creates: `via/SOUL.md` with
+    // `via -> .` cannot create a directory at a protected name.
+    let mut current = dir;
+    for component in relative.split('/').filter(|c| !c.is_empty()) {
+        match current.symlink_metadata(component) {
+            Ok(metadata) if metadata.is_symlink() => {
+                return Err(BrowseError::LinkedPath(raw.to_string()));
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(BrowseError::NotADirectory(raw.to_string()));
+            }
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                match current.create_dir(component) {
+                    Ok(()) => {}
+                    // Created by someone else meanwhile: the no-follow open
+                    // below decides whether it is a usable directory.
+                    Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(err) => return Err(confined(raw, root)(err)),
+                }
+            }
+            Err(err) => return Err(confined(raw, root)(err)),
+        }
+        current = current
+            .open_dir_nofollow(component)
+            .map_err(confined(raw, root))?;
     }
-    dir.create_dir_all(target).map_err(confined(raw, root))?;
     Ok(())
 }
 
@@ -776,7 +798,7 @@ mod tests {
             "export/private.txt",
             "stolen.txt"
         )));
-        assert!(escaped(&make_agent_workspace_directory(
+        assert!(refused(&make_agent_workspace_directory(
             &cfg,
             "alpha",
             "export/planted"
@@ -869,6 +891,41 @@ mod tests {
         );
         delete_agent_workspace_path(&cfg, "alpha", "archive/2026/draft.md").unwrap();
         assert!(!alpha.join("archive/2026/draft.md").exists());
+    }
+
+    /// Creating a directory cannot take a protected name through an internal
+    /// link either. With `SOUL.md` absent, `via/SOUL.md` with `via -> .`
+    /// would otherwise create a directory where the bootstrap file belongs.
+    #[cfg(unix)]
+    #[test]
+    fn mkdir_through_an_internal_link_cannot_take_a_protected_name() {
+        let (dir, cfg) = fixture();
+        let alpha = dir.path().join("agents/alpha/workspace");
+        std::fs::create_dir_all(&alpha).unwrap();
+        std::os::unix::fs::symlink(".", alpha.join("via")).unwrap();
+
+        assert!(matches!(
+            make_agent_workspace_directory(&cfg, "alpha", "via/SOUL.md"),
+            Err(BrowseError::LinkedPath(_))
+        ));
+        assert!(matches!(
+            make_agent_workspace_directory(&cfg, "alpha", "via/fresh/inner"),
+            Err(BrowseError::LinkedPath(_))
+        ));
+        assert!(
+            !alpha.join("SOUL.md").exists(),
+            "no protected name was taken"
+        );
+        assert!(!alpha.join("fresh").exists());
+        assert!(matches!(
+            make_agent_workspace_directory(&cfg, "alpha", "SOUL.md"),
+            Err(BrowseError::ProtectedFile(_))
+        ));
+
+        // A path without a link on the way is created, idempotently.
+        make_agent_workspace_directory(&cfg, "alpha", "notes/2026").unwrap();
+        make_agent_workspace_directory(&cfg, "alpha", "notes/2026").unwrap();
+        assert!(alpha.join("notes/2026").is_dir());
     }
 
     /// The shared area's protected top-level directories cannot be removed

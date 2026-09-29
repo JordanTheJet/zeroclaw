@@ -425,7 +425,8 @@ async fn catalog_methods_route_through_the_gate() {
 // ── Canvas ────────────────────────────────────────────────────────────────
 
 /// Before the daemon's canvas store reached the RPC context, an RPC-built
-/// agent's canvas tool wrote to a private store no reader could see.
+/// agent's canvas tool wrote to a private store no reader could see. It now
+/// draws into the shared store, under its agent's namespace.
 #[tokio::test]
 async fn a_canvas_drawn_by_an_rpc_built_agent_is_the_one_canvas_rpc_serves() {
     let tmp = tempfile::TempDir::new().unwrap();
@@ -472,7 +473,7 @@ async fn a_canvas_drawn_by_an_rpc_built_agent_is_the_one_canvas_rpc_serves() {
         &mut rx,
         2,
         "canvas/get",
-        json!({"canvas_id": "board"}),
+        json!({"canvas_id": "test-agent/board"}),
     )
     .await;
     assert_eq!(
@@ -481,7 +482,11 @@ async fn a_canvas_drawn_by_an_rpc_built_agent_is_the_one_canvas_rpc_serves() {
         "{got}"
     );
     let listed = rpc(&mut operator, &mut rx, 3, "canvas/list", json!({})).await;
-    assert_eq!(listed["result"]["canvases"], json!(["board"]), "{listed}");
+    assert_eq!(
+        listed["result"]["canvases"],
+        json!(["test-agent/board"]),
+        "an agent's canvas is listed under its agent's namespace: {listed}"
+    );
 }
 
 #[tokio::test]
@@ -1886,6 +1891,309 @@ fn a_device_revocation_waits_for_a_config_writer_in_progress() {
         assert!(
             !ctx.auth.pairing().is_authenticated(PAIRED_TOKEN),
             "the revocation took effect once the lock was released"
+        );
+    });
+}
+
+// ── Authority at the effect: canvas and bind ─────────────────────────────
+
+/// A non-admin principal that starts with access to every agent.
+const WIDE: u32 = 5105;
+
+fn wide_canvas_session_config(tmp: &tempfile::TempDir) -> zeroclaw_config::schema::Config {
+    use std::collections::HashMap;
+    use zeroclaw_api::grants::{Resource, Verb};
+    use zeroclaw_config::schema::{PermissionProfileConfig, UserConfig};
+
+    let mut config = make_acp_test_config(tmp);
+    config.permission_profiles.insert(
+        "wide".into(),
+        PermissionProfileConfig {
+            allowed_agents: vec!["*".into()],
+            allowed_tools: vec!["canvas".into()],
+            grants: HashMap::from([
+                (
+                    Resource::Sessions,
+                    vec![Verb::Create, Verb::Read, Verb::Execute],
+                ),
+                (Resource::Tools, vec![Verb::Execute]),
+            ]),
+            ..PermissionProfileConfig::default()
+        },
+    );
+    config.users.insert(
+        "wide".into(),
+        UserConfig {
+            uid: Some(WIDE),
+            permission_profiles: vec!["wide".into()],
+            ..UserConfig::default()
+        },
+    );
+    config
+}
+
+/// A session's canvas handle is bound to its agent, not to the grants its
+/// principal held when it was built: a principal created with every-agent
+/// access and then narrowed to one agent still cannot, through the session
+/// it already has, read, overwrite or clear a canvas outside that agent's
+/// namespace, whether the dashboard's or another agent's.
+#[tokio::test]
+async fn a_warm_session_narrowed_to_one_agent_cannot_reach_other_canvases() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let ctx = enforcement_ctx(wide_canvas_session_config(&tmp));
+    let (mut operator, mut op_rx) = local_operator(&ctx).await;
+    for (id, (canvas_id, content)) in [
+        ("default", "the dashboard's frame"),
+        ("beta/default", "beta's frame"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let seeded = rpc(
+            &mut operator,
+            &mut op_rx,
+            id as u64 + 1,
+            "canvas/render",
+            json!({"canvas_id": canvas_id, "content_type": "text", "content": content}),
+        )
+        .await;
+        assert!(seeded["error"].is_null(), "{seeded}");
+    }
+
+    let (mut peer, mut rx) = roster_peer(&ctx, WIDE).await;
+    let created = rpc(
+        &mut peer,
+        &mut rx,
+        1,
+        "session/new",
+        json!({"agent_alias": "test-agent", "session_id": "s-warm-canvas"}),
+    )
+    .await;
+    assert_eq!(
+        created["result"]["session_id"],
+        json!("s-warm-canvas"),
+        "{created}"
+    );
+
+    // Narrow the principal to one agent after the session exists.
+    let mut narrowed = ctx.config.read().clone();
+    narrowed
+        .permission_profiles
+        .get_mut("wide")
+        .expect("the fixture profile exists")
+        .allowed_agents = vec!["test-agent".into()];
+    *ctx.config.write() = narrowed.clone();
+    let revision = ctx.auth.accepted_revision().saturating_add(1);
+    ctx.auth
+        .publish_accepted(&narrowed, revision)
+        .expect("the narrowed policy publishes");
+
+    let agent = ctx
+        .sessions
+        .get_agent("s-warm-canvas")
+        .await
+        .expect("session exists");
+    let agent = agent.lock().await;
+    let run = |args: Value| {
+        let agent = &agent;
+        async move {
+            agent
+                .execute_tool_for_test("canvas", args)
+                .await
+                .expect("the session has the canvas tool")
+                .expect("the canvas tool runs")
+        }
+    };
+    for canvas_id in ["default", "beta/default"] {
+        let snapshot = run(json!({"action": "snapshot", "canvas_id": canvas_id})).await;
+        let shown = format!("{snapshot:?}");
+        assert!(
+            !shown.contains("dashboard's frame") && !shown.contains("beta's frame"),
+            "{canvas_id} reached another canvas: {shown}"
+        );
+    }
+    let rendered = run(json!({
+        "action": "render",
+        "canvas_id": "default",
+        "content_type": "text",
+        "content": "drawn after narrowing",
+    }))
+    .await;
+    assert!(rendered.success, "{rendered:?}");
+    let _ = run(json!({"action": "clear", "canvas_id": "beta/default"})).await;
+    drop(agent);
+
+    for (id, (canvas_id, expected)) in [
+        ("default", "the dashboard's frame"),
+        ("beta/default", "beta's frame"),
+        ("test-agent/default", "drawn after narrowing"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let got = rpc(
+            &mut operator,
+            &mut op_rx,
+            id as u64 + 10,
+            "canvas/get",
+            json!({"canvas_id": canvas_id}),
+        )
+        .await;
+        assert_eq!(
+            got["result"]["frame"]["content"],
+            json!(expected),
+            "{canvas_id}: {got}"
+        );
+    }
+}
+
+/// A channel capability whose bind parks after the dispatcher has handed it
+/// the held config write lock, at the point the real capability reads the
+/// persisted peer policy, and records whether the caller's credential was
+/// still valid when it went on to commit.
+#[derive(Default)]
+struct ParkingChannels {
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+    live_at_commit: parking_lot::Mutex<Option<bool>>,
+    probe: parking_lot::Mutex<Option<Arc<dyn Fn() -> bool + Send + Sync>>>,
+}
+
+#[async_trait::async_trait]
+impl crate::rpc::channels::ChannelControl for ParkingChannels {
+    fn list(
+        &self,
+        _config: &zeroclaw_config::schema::Config,
+        _pairing: &zeroclaw_config::pairing::PairingGuard,
+    ) -> Value {
+        json!({"channels": []})
+    }
+
+    fn relink(
+        &self,
+        _config: &zeroclaw_config::schema::Config,
+        channel: &str,
+    ) -> Result<Value, JsonRpcError> {
+        Ok(json!({"channel": channel, "outcome": "nothing_to_clear"}))
+    }
+
+    async fn bind(
+        &self,
+        _config: &Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>,
+        _config_write_guard: &tokio::sync::OwnedMutexGuard<()>,
+        channel_type: &str,
+        alias: &str,
+        _identity: &str,
+        authorize_write: &(dyn for<'p> Fn(&'p str) -> Result<(), JsonRpcError> + Send + Sync),
+    ) -> Result<Value, JsonRpcError> {
+        self.entered.notify_one();
+        self.release.notified().await;
+        let probe = self
+            .probe
+            .lock()
+            .clone()
+            .expect("the test installs a probe");
+        *self.live_at_commit.lock() = Some(probe());
+        authorize_write(&format!(
+            "peer_groups.{channel_type}_{alias}.external_peers"
+        ))?;
+        Ok(json!({"saved": true, "already_bound": false}))
+    }
+}
+
+/// The caller's credential cannot be revoked between a bind's authority
+/// recheck and its commit. The bind is parked inside its lock-held window;
+/// an administrator's revocation of the binder's device is shown queued on
+/// the config write lock with the binder's token still valid, the bind
+/// commits with that token still valid, and only then does the revocation
+/// take effect.
+#[test]
+fn a_revocation_cannot_land_inside_a_binds_authority_window() {
+    // The revocation persists the pairing tokens, whose config save exceeds
+    // the default debug test stack; see `run_on_a_large_stack`.
+    run_on_a_large_stack(|| async move {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = binder_config(&tmp, &["*"], &["peer_groups.*"]);
+        // No roster: a native pairing token binds as the shared operator.
+        config.users.clear();
+        config.data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        config.gateway.require_pairing = true;
+        config.gateway.paired_tokens = vec![PAIRED_TOKEN.to_string()];
+        let mut ctx = enforcement_ctx(config);
+        let channels = Arc::new(ParkingChannels::default());
+        Arc::get_mut(&mut ctx)
+            .expect("a fresh context is unshared")
+            .channel_control =
+            Some(Arc::clone(&channels) as Arc<dyn crate::rpc::channels::ChannelControl>);
+        register_paired_device(&ctx);
+        let pairing = Arc::clone(ctx.auth.pairing());
+        *channels.probe.lock() = Some(Arc::new(move || pairing.is_authenticated(PAIRED_TOKEN)));
+
+        // The binder authenticates with the device's own pairing token.
+        let (tx, mut binder_rx) = tokio::sync::mpsc::channel(64);
+        let mut binder = RpcDispatcher::new(Arc::clone(&ctx), tx, "wss:test".into())
+            .with_transport(
+                crate::rpc::transport::TransportKind::Wss,
+                crate::security::auth_provider::Credential::None,
+            );
+        binder
+            .handle_initialize(&json!({"auth_token": PAIRED_TOKEN}))
+            .await
+            .expect("the device's token authenticates");
+        let (mut operator, mut op_rx) = local_operator(&ctx).await;
+
+        let bind = rpc(
+            &mut binder,
+            &mut binder_rx,
+            1,
+            "channels/bind",
+            json!({"channel_type": "telegram", "alias": "main", "identity": "123456789"}),
+        );
+        let revoke_inside_the_window = async {
+            channels.entered.notified().await;
+            // The bind is parked holding the config write lock.
+            let holders = Arc::strong_count(&ctx.config_write_lock);
+            let revoke = rpc(
+                &mut operator,
+                &mut op_rx,
+                2,
+                "pairing/revoke",
+                json!({"device_id": "device-1"}),
+            );
+            let observe_then_release = async {
+                tokio::time::timeout(std::time::Duration::from_secs(20), async {
+                    while Arc::strong_count(&ctx.config_write_lock) <= holders {
+                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .expect("the revocation reached the config write lock");
+                assert!(
+                    ctx.auth.pairing().is_authenticated(PAIRED_TOKEN),
+                    "the binder's credential was revoked inside the bind's window"
+                );
+                channels.release.notify_one();
+            };
+            let (revoked, ()) = tokio::join!(revoke, observe_then_release);
+            revoked
+        };
+        let (bound, revoked) = tokio::join!(bind, revoke_inside_the_window);
+
+        assert_eq!(bound["result"]["saved"], json!(true), "{bound}");
+        assert_eq!(
+            *channels.live_at_commit.lock(),
+            Some(true),
+            "the bind committed with its caller's credential still valid"
+        );
+        assert_eq!(
+            revoked["result"]["device_id"],
+            json!("device-1"),
+            "{revoked}"
+        );
+        assert!(
+            !ctx.auth.pairing().is_authenticated(PAIRED_TOKEN),
+            "the revocation took effect after the bind released the lock"
         );
     });
 }
