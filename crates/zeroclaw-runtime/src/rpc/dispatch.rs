@@ -6817,9 +6817,10 @@ impl RpcDispatcher {
         })
     }
 
-    /// The durable chat key an append or rename writes, from a resolved
-    /// session record. ACP transcripts live in their own store, which has no
-    /// display names and replays structured turns, so both are refused there.
+    /// The durable chat key a rename writes, from a resolved session record.
+    /// Only the name column changes, which no turn rewrites, so any chat row
+    /// the caller owns can be renamed. ACP sessions have no display names and
+    /// are refused. (Append is stricter; see `rpc_chat_writer_key`.)
     fn durable_chat_key(
         record: Option<crate::rpc::session::SessionRecord>,
         method: Method,
@@ -6829,6 +6830,40 @@ impl RpcDispatcher {
             Some(DurableSession::Acp) => Err(rpc_err(
                 INVALID_PARAMS,
                 format!("{} is not supported for ACP sessions", method.wire_name()),
+            )),
+            None => Err(rpc_err(SESSION_NOT_FOUND, "Session not found")),
+        }
+    }
+
+    /// The durable key `session/append` may write for `session_id`: only an
+    /// RPC chat session addressed by its own id, whose durable row is
+    /// `rpc_<id>`. This handler serializes on the session's RPC queue and
+    /// updates the RPC session store's live Agent, so it can only keep a
+    /// session whose writer is that store. Anything else the resolver
+    /// accepts is refused rather than written:
+    ///
+    /// - a prefixed alias of an RPC session (`rpc_s` for session `s`): it
+    ///   finds `s`'s row but would lock queue `rpc_s` and miss Agent `s`, and
+    ///   `s`'s next turn would replace the row and erase the append;
+    /// - a gateway session (`gw_<id>`) or a channel session (raw key): their
+    ///   own surfaces run their turns and write their transcripts, so an RPC
+    ///   append can race a running turn there and be lost the same way;
+    /// - an ACP session, whose store replays structured turns.
+    fn rpc_chat_writer_key(
+        session_id: &str,
+        record: Option<crate::rpc::session::SessionRecord>,
+    ) -> Result<String, JsonRpcError> {
+        match record.and_then(|rec| rec.durable) {
+            Some(DurableSession::Chat { key }) if key == format!("rpc_{session_id}") => Ok(key),
+            Some(DurableSession::Chat { .. }) => Err(rpc_err(
+                INVALID_PARAMS,
+                "session/append writes only RPC chat sessions addressed by their own session_id; \
+                 this id names a session another surface writes (a gateway or channel session) \
+                 or a prefixed alias of an RPC session",
+            )),
+            Some(DurableSession::Acp) => Err(rpc_err(
+                INVALID_PARAMS,
+                "session/append is not supported for ACP sessions",
             )),
             None => Err(rpc_err(SESSION_NOT_FOUND, "Session not found")),
         }
@@ -6882,7 +6917,7 @@ impl RpcDispatcher {
                 "Session not found or not owned by this principal",
             ));
         }
-        let key = Self::durable_chat_key(admitted, Method::SessionAppend)?;
+        let key = Self::rpc_chat_writer_key(sid, admitted)?;
         let message = zeroclaw_providers::ChatMessage::assistant(&req.content);
         backend.append(&key, &message).map_err(|e| {
             rpc_err(
@@ -38912,6 +38947,96 @@ mod tests {
         assert!(
             live_holds(&ctx, sid, APPENDED).await,
             "the live write happened"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_append_refuses_a_prefixed_alias_of_an_rpc_session() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sid = "s-alias";
+        let (ctx, backend, _handles) = turn_parity_fixture(&tmp, sid, None).await;
+        let (mut operator, mut rx) = local_operator(&ctx).await;
+        let key = format!("rpc_{sid}");
+
+        // `rpc_s-alias` resolves to session `s-alias`'s durable row, but its
+        // queue and live Agent are named `s-alias`.
+        let refused = rpc(
+            &mut operator,
+            &mut rx,
+            1,
+            "session/append",
+            json!({"session_id": key, "content": APPENDED}),
+        )
+        .await;
+
+        assert_eq!(refused["error"]["code"], json!(INVALID_PARAMS), "{refused}");
+        assert!(!durable_holds(&backend, &key, APPENDED), "no durable write");
+        assert!(!live_holds(&ctx, sid, APPENDED).await, "no live write");
+    }
+
+    #[tokio::test]
+    async fn session_append_refuses_a_gateway_session() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (ctx, backend, _handles) = turn_parity_fixture(&tmp, "s-unrelated", None).await;
+        let gateway_key = "gw_web-chat";
+        zeroclaw_infra::session_backend::SessionBackend::set_session_agent_alias(
+            backend.as_ref(),
+            gateway_key,
+            "test-agent",
+        )
+        .expect("a gateway row exists");
+        let (mut operator, mut rx) = local_operator(&ctx).await;
+
+        let refused = rpc(
+            &mut operator,
+            &mut rx,
+            1,
+            "session/append",
+            json!({"session_id": "web-chat", "content": APPENDED}),
+        )
+        .await;
+
+        assert_eq!(refused["error"]["code"], json!(INVALID_PARAMS), "{refused}");
+        assert!(
+            !durable_holds(&backend, gateway_key, APPENDED),
+            "the gateway's transcript is not written from RPC"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_canonical_append_survives_the_next_turn() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sid = "s-append-then-turn";
+        let (ctx, backend, (mut started, release, _requests)) =
+            turn_parity_fixture(&tmp, sid, None).await;
+        let (mut operator, mut rx) = local_operator(&ctx).await;
+        let key = format!("rpc_{sid}");
+
+        let appended = rpc(
+            &mut operator,
+            &mut rx,
+            1,
+            "session/append",
+            json!({"session_id": sid, "content": APPENDED}),
+        )
+        .await;
+        assert!(appended.get("error").is_none(), "{appended}");
+
+        // The next turn replaces the durable transcript from the live Agent's
+        // history; the append must be in that history to survive it.
+        send_prompt(&mut operator, 2, sid, 1).await;
+        await_provider_start(&mut started).await;
+        release.send(()).unwrap();
+        let (response, _notifications) = response_and_notifications(&mut rx, 2).await;
+        assert!(response.get("error").is_none(), "{response}");
+
+        assert!(
+            durable_holds(&backend, &key, APPENDED),
+            "the appended message is still in the durable transcript after the turn"
+        );
+        assert!(
+            durable_holds(&backend, &key, "reply-1"),
+            "and the turn's own reply was persisted with it"
         );
     }
 }
