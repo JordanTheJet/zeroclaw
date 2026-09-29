@@ -1840,10 +1840,10 @@ impl RpcDispatcher {
         method: Method,
         grants: &zeroclaw_api::grants::ResolvedGrants,
     ) -> Result<(), JsonRpcError> {
-        let Some(auth) = self.auth.as_ref() else {
+        if self.auth.is_none() {
             return Err(rpc_err(AUTH_REQUIRED, "First call must be 'initialize'"));
-        };
-        if grants.admin && !auth.principal.is_authenticated() {
+        }
+        if self.is_shared_operator(grants) {
             return Ok(());
         }
         let denied = rpc_err(
@@ -1949,8 +1949,8 @@ impl RpcDispatcher {
     }
 
     /// Apply a principal's posture to an agent: narrow its tool surface to the
-    /// selector, and, for a principal without operator reach, disable nested
-    /// tools that cannot carry the principal through. A handler that
+    /// selector, and, for any principal but the shared operator, disable the
+    /// nested and scheduling tools that cannot carry the principal through. A handler that
     /// re-resolved its principal after waiting for admission passes the fresh
     /// grants here: the stamped copy is only as current as the last gate, and
     /// a prompt that queued before its principal was narrowed must execute
@@ -1972,14 +1972,29 @@ impl RpcDispatcher {
         // rehydration, and subsequent prompts.
         let narrowing = principal_tool_ceiling(grants);
         agent.narrow_to_principal_tools(narrowing.as_deref());
-        if !grants.admin
-            && !grants
-                .allowed_agents
-                .iter()
-                .any(|alias| alias.as_str() == zeroclaw_api::grants::WILDCARD)
-        {
+        // Nested tools (delegate, spawn_subagent, pipeline) and scheduling
+        // tools (cron_add, cron_update, cron_run, schedule) start work that
+        // runs without this connection, so nothing re-checks the principal
+        // before its effect: a job outlives its submitter's session, and a
+        // nested run can rebuild the scheduling tools. The rule is the one
+        // `admit_agent_job_change` applies to the RPC cron methods. Only the
+        // shared operator keeps them; a named administrator, or a principal
+        // with wildcard tools and agents, does not, because its grants can be
+        // withdrawn while the work it started still runs.
+        if !self.is_shared_operator(grants) {
             agent.disable_principal_unaware_nested_tools();
         }
+    }
+
+    /// Whether this connection's principal, holding `grants`, is the shared
+    /// operator: the install's own principal, whose authority no grant
+    /// publication narrows. A named administrator is not.
+    fn is_shared_operator(&self, grants: &zeroclaw_api::grants::ResolvedGrants) -> bool {
+        grants.admin
+            && self
+                .auth
+                .as_ref()
+                .is_some_and(|auth| !auth.principal.is_authenticated())
     }
 
     /// Queued prompts must not execute with the transport-time grants clone.
@@ -17638,11 +17653,12 @@ mod tests {
 
     /// The agent-facing cron tools install or run work that executes later
     /// under the agent's policy and the job's stored tool list, not under the
-    /// calling principal's ceiling. An unrestricted principal's session keeps
-    /// them; once the principal is narrowed to `cron_update` and `file_read`,
-    /// the same session can no longer reach them, so it cannot hand an agent
-    /// job that keeps `file_write` a new prompt. The call goes through the
-    /// production tool dispatch a model's call takes.
+    /// calling principal's grants. A session with no principal applied keeps
+    /// them and can edit the job through `cron_update`. A named principal's
+    /// session does not have them, with wildcard tools and agents or narrowed
+    /// to `cron_update` and `file_read`, so it cannot hand an agent job that
+    /// keeps `file_write` a new prompt. The calls go through the production
+    /// tool dispatch a model's call takes.
     #[tokio::test]
     async fn constrained_session_cannot_rewrite_an_agent_job_through_cron_tools() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -17677,6 +17693,27 @@ mod tests {
         )
         .expect("the operator's agent job is created");
         let (dispatcher, sessions) = make_acp_test_dispatcher(config.clone());
+
+        // Control: with no principal applied, the session edits the job.
+        dispatcher
+            .handle_session_new_for_test(
+                &json!({"agent_alias":"test-agent","session_id":"unbound-control"}),
+            )
+            .await
+            .unwrap();
+        let handle = sessions.get_agent("unbound-control").await.unwrap();
+        let edited = handle
+            .lock()
+            .await
+            .dispatch_tool_for_test(
+                "cron_update",
+                json!({"job_id": job.id, "patch": {"prompt": "say goodbye"}}),
+            )
+            .await;
+        assert!(edited.success, "{}", edited.output);
+        let stored = crate::cron::get_job(&config, &job.id).expect("the job still exists");
+        assert_eq!(stored.prompt.as_deref(), Some("say goodbye"));
+
         let dispatcher = bind_test_principal(dispatcher).await;
         dispatcher
             .handle_session_new_for_test(
@@ -17686,17 +17723,13 @@ mod tests {
             .unwrap();
         let handle = sessions.get_agent("cron-ceiling").await.unwrap();
         let mut agent = handle.lock().await;
-
-        // Control: unrestricted, the session edits the job through the tool.
-        let edited = agent
-            .dispatch_tool_for_test(
-                "cron_update",
-                json!({"job_id": job.id, "patch": {"prompt": "say goodbye"}}),
-            )
-            .await;
-        assert!(edited.success, "{}", edited.output);
-        let stored = crate::cron::get_job(&config, &job.id).expect("the job still exists");
-        assert_eq!(stored.prompt.as_deref(), Some("say goodbye"));
+        let mut names = agent.tool_names();
+        names.sort();
+        assert_eq!(
+            names,
+            vec!["file_read", "file_write"],
+            "a named wildcard principal's session has no scheduling tools"
+        );
 
         refresh_test_principal(&dispatcher, &["cron_update", "file_read"], &["test-agent"]);
         let current = dispatcher.current_prompt_authority().unwrap();
@@ -17745,6 +17778,25 @@ mod tests {
                     .unwrap()
                     .delegation_policy = toml::from_str("mode = 'allow'").unwrap();
                 let (dispatcher, sessions) = make_acp_test_dispatcher(config);
+                // Positive control: with no principal applied, the agent's own
+                // configuration does provide the delegate.
+                dispatcher
+                    .handle_session_new_for_test(
+                        &json!({"agent_alias":"test-agent","session_id":"unbound-control"}),
+                    )
+                    .await
+                    .unwrap();
+                assert!(
+                    sessions
+                        .get_agent("unbound-control")
+                        .await
+                        .unwrap()
+                        .lock()
+                        .await
+                        .tool_names()
+                        .contains(&"delegate"),
+                    "positive control must actually have a delegate"
+                );
                 let dispatcher = bind_test_principal(dispatcher).await;
                 dispatcher
                     .handle_session_new_for_test(
@@ -17753,9 +17805,12 @@ mod tests {
                     .await
                     .unwrap();
                 let handle = sessions.get_agent("principal-delegate").await.unwrap();
+                // A named principal is not the shared operator, so even with
+                // wildcard tools and agents its session starts without nested
+                // delegation, whose work would outlive a withdrawal of its grants.
                 assert!(
-                    handle.lock().await.tool_names().contains(&"delegate"),
-                    "positive control must actually have a delegate"
+                    !handle.lock().await.tool_names().contains(&"delegate"),
+                    "a named wildcard principal gets no delegate"
                 );
                 if agent_only {
                     refresh_test_principal(&dispatcher, &["*"], &["test-agent"]);
