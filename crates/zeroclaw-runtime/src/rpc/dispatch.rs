@@ -2897,7 +2897,30 @@ impl RpcDispatcher {
             Method::SessionKill => self.handle_session_kill(&req.params).await,
             Method::SessionSteer => Box::pin(self.handle_session_steer(&req.params)).await,
             Method::SessionAbort => Box::pin(self.handle_session_abort(&req.params)).await,
-            Method::SessionAppend => Box::pin(self.handle_session_append(&req.params)).await,
+            Method::SessionAppend => {
+                // Spawned like `session/prompt`: an append waits for its
+                // session's queue, which can be as long as the turn ahead of
+                // it, and this connection must keep reading cancel and
+                // approval messages meanwhile. The task is tracked with the
+                // connection's prompts, so teardown and the reload drain
+                // still join it.
+                let handle = self.spawn_handle();
+                let id_clone = req_id.clone();
+                let params_clone = req.params.clone();
+                let is_notif = is_notification;
+                self.prompt_tasks.retain(|task| !task.is_finished());
+                let task = zeroclaw_spawn::spawn!(async move {
+                    let result = Box::pin(handle.handle_session_append(&params_clone)).await;
+                    if !is_notif {
+                        match result {
+                            Ok(value) => handle.send_result(id_clone, value).await,
+                            Err(e) => handle.send_error(id_clone, e.code, &e.message).await,
+                        }
+                    }
+                });
+                self.prompt_tasks.push(task);
+                return;
+            }
             Method::SessionRename => Box::pin(self.handle_session_rename(&req.params)).await,
             Method::SessionRunOnce => {
                 // Spawned like `session/prompt`: the call spans a whole turn,
@@ -39177,5 +39200,40 @@ mod tests {
             .await
             .expect("a close bound to this incarnation closes it");
         assert!(ctx.sessions.get_agent(sid).await.is_none(), "closed");
+    }
+
+    #[tokio::test]
+    async fn a_queued_append_does_not_block_its_connection() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sid = "s-append-reader";
+        let (ctx, backend, _handles) = turn_parity_fixture(&tmp, sid, None).await;
+        let (mut operator, mut rx) = local_operator(&ctx).await;
+        let permit = ctx
+            .sessions
+            .session_queue
+            .acquire(sid)
+            .await
+            .expect("the test holds the session's permit");
+
+        let append = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "session/append",
+            "params": {"session_id": sid, "content": APPENDED},
+        })
+        .to_string();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            operator.process_line(&append),
+        )
+        .await
+        .expect("a queued append must not hold the connection's reader");
+
+        // The connection still answers other requests while the append waits.
+        let listed = rpc(&mut operator, &mut rx, 2, "session/list", json!({})).await;
+        assert!(listed.get("error").is_none(), "{listed}");
+
+        drop(permit);
+        let (appended, _) = response_and_notifications(&mut rx, 1).await;
+        assert!(appended.get("error").is_none(), "{appended}");
+        assert!(durable_holds(&backend, &format!("rpc_{sid}"), APPENDED));
     }
 }
