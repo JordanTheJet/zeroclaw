@@ -1516,9 +1516,10 @@ async fn channels_bind_narrowed_after_admission_has_no_effect() {
     );
 }
 
-/// The recheck resolves the principal again rather than comparing against
-/// what it held at admission: a grant added while the bind waited leaves it
-/// free to proceed.
+/// A control against over-rejection: a grant added while the bind waited
+/// does not make the recheck refuse it. This alone does not show that the
+/// grants were resolved again, because a check against the admission-time
+/// grants would also pass; the revoked and narrowed tests above show that.
 #[tokio::test]
 async fn channels_bind_widened_after_admission_is_honoured() {
     use zeroclaw_api::grants::{Resource, Verb};
