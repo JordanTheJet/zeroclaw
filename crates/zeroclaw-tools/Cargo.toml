@@ -75,6 +75,21 @@ libc = "0.2"
 default = []
 browser-native = ["dep:fantoccini"]
 probe = ["dep:probe-rs"]
+# SaaS and coding-CLI integrations. Each is opt-in; the root crate forwards
+# one `tool-*` feature per integration and bundles them as `tools-saas` and
+# `tools-coding-cli`.
+tool-jira = []
+tool-notion = []
+tool-linkedin = []
+tool-composio = []
+tool-google-workspace = []
+tool-microsoft365 = []
+tool-project-intel = []
+tool-claude-code = []
+tool-claude-code-runner = []
+tool-codex-cli = []
+tool-gemini-cli = []
+tool-opencode-cli = []
 # Exposes cross-crate test-only constructors (e.g.
 # `McpRegistry::for_test_with_server_count`) so downstream test
 # suites can build registry fixtures without spawning real stdio
