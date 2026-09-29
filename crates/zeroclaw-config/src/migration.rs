@@ -358,7 +358,9 @@ pub const V1_LEGACY_KEYS: &[&str] = &[
 ];
 
 /// The version a config with no `schema_version` key is read as when its
-/// sections are plainly in the V3 shape (see [`is_plainly_v3_shape`]).
+/// sections are plainly in the V3 shape: at least one alias-keyed
+/// `providers.models.<family>` or `channels.<type>` section, none holding
+/// fields directly (the V2 shape), and no V1-only top-level key.
 ///
 /// Fixed at 3, not [`CURRENT_SCHEMA_VERSION`]: V3 is the newest shape such a
 /// file can be recognized by, and reading it as V3 runs every later migration
