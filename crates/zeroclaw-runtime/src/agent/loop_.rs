@@ -2374,6 +2374,7 @@ pub async fn run_with_capabilities(
                             agent.resolved.effective_context_budget(),
                             None, // cancellation_token — no parent token in single-shot run
                             Some(agent_alias),
+                            Some(&bound_capabilities),
                         ),
                     )
                     .await;
@@ -17905,6 +17906,105 @@ Let me check the result."#;
         ]
     }
 
+    /// The skill-review fork reuses the reviewed turn's provider and history.
+    /// When that history holds an image and the provider lacks vision, the
+    /// fork's vision route goes through the turn's binding, for its principal,
+    /// and the configured route behind the counting endpoint is never
+    /// contacted, whether the source refuses the route or serves it.
+    #[tokio::test]
+    async fn skill_review_routes_vision_through_the_turns_binding() {
+        use crate::composition::test_support::{
+            IMAGE_TURN, VisionRouteProviders, capabilities_with_providers, counting_endpoint,
+        };
+        use crate::observability::noop::NoopObserver;
+
+        let principal =
+            zeroclaw_api::principal::PrincipalId::for_oidc("https://issuer.example", "subject-sr");
+        for refuse in [true, false] {
+            let endpoint = counting_endpoint().await;
+            let workspace = tempfile::TempDir::new().unwrap();
+            let mut config = Config {
+                data_dir: workspace.path().join("data"),
+                config_path: workspace.path().join("config.toml"),
+                ..Config::default()
+            };
+            config.providers.models.custom.insert(
+                "vision".to_string(),
+                zeroclaw_config::schema::CustomModelProviderConfig {
+                    base: zeroclaw_config::schema::ModelProviderConfig {
+                        uri: Some(endpoint.url.clone()),
+                        model: Some("vision-model".to_string()),
+                        api_key: Some("ambient-key".to_string()),
+                        ..zeroclaw_config::schema::ModelProviderConfig::default()
+                    },
+                },
+            );
+            config.multimodal.vision_model_provider = Some("custom.vision".to_string());
+            let providers = Arc::new(if refuse {
+                VisionRouteProviders::refusing()
+            } else {
+                VisionRouteProviders::default()
+            });
+            let bound = crate::composition::BoundCapabilities {
+                capabilities: capabilities_with_providers(Arc::clone(&providers) as _),
+                principal: Some(principal.clone()),
+            };
+            let model_provider = ScriptedModelProvider {
+                responses: Arc::new(Mutex::new(VecDeque::from([ChatResponse {
+                    text: Some("Nothing to save.".to_string()),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    reasoning_content: None,
+                }]))),
+                capabilities: ProviderCapabilities::default(),
+            };
+            let mut history = review_test_history();
+            history[1] = ChatMessage::user(IMAGE_TURN);
+            let review_config = zeroclaw_config::schema::SkillImprovementConfig {
+                enabled: true,
+                cooldown_secs: 0,
+                nudge_interval_iterations: 1,
+                max_review_iterations: 2,
+            };
+
+            crate::skills::review::maybe_run_skill_review(
+                Some(&config),
+                workspace.path().to_path_buf(),
+                review_config,
+                false,
+                history,
+                Vec::new(),
+                &model_provider,
+                "mock-provider",
+                "mock-model",
+                &NoopObserver,
+                &config.multimodal,
+                &zeroclaw_config::schema::PacingConfig::default(),
+                0,
+                0,
+                None,
+                Some("reviewed-agent"),
+                Some(&bound),
+            )
+            .await;
+
+            let vision = providers.vision.lock();
+            assert!(
+                !vision.is_empty(),
+                "the review fork asks the turn's source for the vision route (refuse = {refuse})"
+            );
+            for request in vision.iter() {
+                assert_eq!(request.provider_ref.as_deref(), Some("custom.vision"));
+                assert_eq!(request.principal.as_ref(), Some(&principal));
+            }
+            assert_eq!(
+                endpoint.connections(),
+                0,
+                "the configured vision route was contacted (refuse = {refuse})"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn skill_review_fork_records_cost_usage_under_parent_scope() {
         use super::{TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoopCostTrackingContext};
@@ -17963,7 +18063,8 @@ Let me check the result."#;
                     0,
                     0,
                     None,
-                    None, // agent_alias — no parent alias in the review-fork test fixture
+                    None, // agent_alias — no parent alias in the review-fork test fixture,
+                    None,
                 ),
             )
             .await;
@@ -18049,7 +18150,8 @@ Let me check the result."#;
                     0,
                     0,
                     None,
-                    None, // agent_alias — no parent alias in the review-fork test fixture
+                    None, // agent_alias — no parent alias in the review-fork test fixture,
+                    None,
                 ),
             )
             .await;
@@ -18160,7 +18262,8 @@ Let me check the result."#;
             // reported-budget trim mid-fork.
             100,
             None,
-            None, // agent_alias — no parent alias in the review-fork test fixture
+            None, // agent_alias — no parent alias in the review-fork test fixture,
+            None,
         )
         .await;
     }

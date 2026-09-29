@@ -507,6 +507,48 @@ pub(crate) mod test_support {
         }
     }
 
+    /// A live TCP endpoint that counts every connection it accepts and then
+    /// drops it. Configured as an ambient provider route, it observes the
+    /// effect itself: any request built from config instead of the supplied
+    /// source must connect here first.
+    pub(crate) struct CountingEndpoint {
+        pub(crate) url: String,
+        pub(crate) connections: Arc<std::sync::atomic::AtomicUsize>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl CountingEndpoint {
+        pub(crate) fn connections(&self) -> usize {
+            self.connections.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl Drop for CountingEndpoint {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    pub(crate) async fn counting_endpoint() -> CountingEndpoint {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind the counting endpoint");
+        let address = listener.local_addr().expect("counting endpoint address");
+        let connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&connections);
+        let task = zeroclaw_spawn::spawn!(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                drop(socket);
+            }
+        });
+        CountingEndpoint {
+            url: format!("http://{address}/v1"),
+            connections,
+            task,
+        }
+    }
+
     pub(crate) const VISION_REFUSAL: &str = "this source does not serve the vision route";
     pub(crate) const VISION_REPLY: &str = "vision stub reply";
 
@@ -604,5 +646,69 @@ pub(crate) mod test_support {
         fn alias(&self) -> &str {
             "vision-stub"
         }
+    }
+}
+
+#[cfg(test)]
+mod binding_ratchet_tests {
+    /// No production turn loop in the runtime drops the capability binding.
+    ///
+    /// Every `ToolLoop` the runtime builds outside tests passes an explicit
+    /// binding expression, so a nested or forked loop cannot quietly resolve
+    /// its own provider changes (the vision route for an image) from config
+    /// inside a supplied-capability turn. A new production loop that truly has
+    /// no binding must say so here, reviewed, rather than pass `None` by
+    /// default.
+    #[test]
+    fn no_production_tool_loop_drops_the_capability_binding() {
+        const ALLOWED: &[&str] = &[];
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let test_start =
+            regex::Regex::new(r"(?m)^#\[cfg\(test\)\]\s*\n\s*(pub(\(crate\))? )?mod \w+")
+                .expect("test-module pattern compiles");
+        let mut offenders = Vec::new();
+        let mut stack = vec![root.clone()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).expect("source directory is readable") {
+                let path = entry.expect("directory entry").path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+                    continue;
+                }
+                let relative = path
+                    .strip_prefix(&root)
+                    .expect("under src")
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                // Test-only modules (declared `#[cfg(test)]` by their parent).
+                if relative.ends_with("/tests.rs")
+                    || relative == "agent/safety_net.rs"
+                    || relative == "agent/parity.rs"
+                {
+                    continue;
+                }
+                let source = std::fs::read_to_string(&path).expect("source is readable");
+                let production = test_start
+                    .find(&source)
+                    .map_or(source.as_str(), |test_module| {
+                        &source[..test_module.start()]
+                    });
+                for (index, line) in production.lines().enumerate() {
+                    let location = format!("{relative}:{}", index + 1);
+                    if line.contains("capability_binding: None")
+                        && !ALLOWED.contains(&location.as_str())
+                    {
+                        offenders.push(location);
+                    }
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "production loops drop the capability binding: {offenders:?}"
+        );
     }
 }
