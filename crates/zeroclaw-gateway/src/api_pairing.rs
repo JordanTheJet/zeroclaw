@@ -536,6 +536,32 @@ pub async fn list_devices(State(state): State<AppState>, headers: HeaderMap) -> 
     .into_response()
 }
 
+/// Delete `device_id` and invalidate its bearer token as one revocation.
+///
+/// Runs through [`zeroclaw_config::pairing::PairingGuard::revoke_under_config_write_lock`]:
+/// nothing changes until the config write lock is held, and then the device
+/// row and the live token go in one synchronous step. A request dropped
+/// while it waits for the lock, by the gateway's request timeout say, leaves
+/// the device and its token in place, so the same revocation can simply be
+/// retried. Returns whether the device existed, and the held guard for
+/// persisting the token set under it.
+pub(crate) async fn revoke_device_credential(
+    state: &AppState,
+    registry: &DeviceRegistry,
+    device_id: &str,
+) -> (Result<bool, rusqlite::Error>, super::ConfigWriteGuard) {
+    state
+        .pairing
+        .revoke_under_config_write_lock(state.config_write_lock.clone(), |pairing| {
+            let token_hash = registry.revoke(device_id)?;
+            if let Some(hash) = token_hash.as_deref() {
+                pairing.revoke_token_hash(hash);
+            }
+            Ok(token_hash.is_some())
+        })
+        .await
+}
+
 /// DELETE /api/devices/{id} — revoke a paired device and its bearer token.
 pub async fn revoke_device(
     State(state): State<AppState>,
@@ -554,9 +580,11 @@ pub async fn revoke_device(
             .into_response();
     };
 
-    let token_hash = match registry.revoke(&device_id) {
-        Ok(Some(hash)) => hash,
-        Ok(None) => return (StatusCode::NOT_FOUND, "Device not found").into_response(),
+    let (revoked, config_write_guard) =
+        revoke_device_credential(&state, registry, &device_id).await;
+    match revoked {
+        Ok(true) => {}
+        Ok(false) => return (StatusCode::NOT_FOUND, "Device not found").into_response(),
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -564,14 +592,12 @@ pub async fn revoke_device(
             )
                 .into_response();
         }
-    };
+    }
 
-    state.pairing.revoke_token_hash(&token_hash);
-
-    if let Err(e) = super::persist_pairing_tokens(
+    if let Err(e) = super::persist_pairing_tokens_under(
         state.config.clone(),
         &state.pairing,
-        state.config_write_lock.clone(),
+        &config_write_guard,
     )
     .await
     {
@@ -660,9 +686,11 @@ pub async fn rotate_token(
             .into_response();
     };
 
-    let token_hash = match registry.revoke(&device_id) {
-        Ok(Some(hash)) => hash,
-        Ok(None) => return (StatusCode::NOT_FOUND, "Device not found").into_response(),
+    let (revoked, config_write_guard) =
+        revoke_device_credential(&state, registry, &device_id).await;
+    match revoked {
+        Ok(true) => {}
+        Ok(false) => return (StatusCode::NOT_FOUND, "Device not found").into_response(),
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -670,17 +698,15 @@ pub async fn rotate_token(
             )
                 .into_response();
         }
-    };
-
-    state.pairing.revoke_token_hash(&token_hash);
+    }
 
     // Same persist-fail caveat as `revoke_device`: device row + in-memory
     // token are already gone; surfacing the persist error tells the caller
     // a restart could resurrect the token.
-    if let Err(e) = super::persist_pairing_tokens(
+    if let Err(e) = super::persist_pairing_tokens_under(
         state.config.clone(),
         &state.pairing,
-        state.config_write_lock.clone(),
+        &config_write_guard,
     )
     .await
     {
@@ -690,6 +716,7 @@ pub async fn rotate_token(
         )
             .into_response();
     }
+    drop(config_write_guard);
 
     // Issue the new pairing code atomically against the slot. If another
     // flow holds the slot, the revoke still stands — return 200 with

@@ -99,8 +99,10 @@ impl CronRunTool {
 
 #[async_trait]
 impl Tool for CronRunTool {
-    // Runs a stored job now under the tool list stored with it, not under the
-    // RPC principal's ceiling.
+    /// It runs a stored job under the agent's own policy and the job's stored
+    /// tool list, not under the calling principal's ceiling. An RPC session of
+    /// any principal but the shared operator must not reach it until a job can
+    /// carry and re-check that principal's authority.
     fn requires_unrestricted_principal(&self) -> bool {
         true
     }
