@@ -926,6 +926,10 @@ pub struct RpcDispatcher {
     /// Owned by the connection: dropped, with their staged bytes, when it
     /// closes.
     uploads: std::sync::Mutex<super::upload::UploadStaging>,
+    /// When a connection that has not completed `initialize` is closed.
+    /// Set by the local listener, cleared once `initialize` succeeds; `None`
+    /// leaves the wait unbounded.
+    initialize_deadline: Option<tokio::time::Instant>,
     /// SHA-256 fingerprint of the client certificate presented on the mTLS
     /// handshake (remote WSS plane only; `None` on the local socket). This is the
     /// transport identity: it keys the issued-cert ledger, so the renew RPC gates
@@ -1023,6 +1027,7 @@ impl RpcDispatcher {
             prompt_tasks: Vec::new(),
             subscriptions: Arc::default(),
             uploads: std::sync::Mutex::default(),
+            initialize_deadline: None,
             peer_cert_fingerprint: None,
         }
     }
@@ -1036,6 +1041,15 @@ impl RpcDispatcher {
         activity: crate::rpc::ConnectionActivity,
     ) -> Self {
         self.connection_activity = Some(activity);
+        self
+    }
+
+    /// Close this connection if it has not completed `initialize` by
+    /// `deadline`, so a client that connects and never initializes cannot
+    /// hold a listener slot for as long as it stays open.
+    #[must_use]
+    pub(crate) fn with_initialize_deadline(mut self, deadline: tokio::time::Instant) -> Self {
+        self.initialize_deadline = Some(deadline);
         self
     }
 
@@ -2480,6 +2494,8 @@ impl RpcDispatcher {
             // Prompt handles never serve upload methods; staging stays with
             // the connection's own dispatcher.
             uploads: std::sync::Mutex::default(),
+            // Prompt handles do not read frames.
+            initialize_deadline: None,
             peer_cert_fingerprint: self.peer_cert_fingerprint.clone(),
         }
     }
@@ -2717,12 +2733,39 @@ impl RpcDispatcher {
 
     /// Read frames from transport, dispatch, repeat.
     pub async fn run(&mut self, transport: &mut (dyn RpcTransport + Send)) {
-        while let Some(line) = transport.next_frame().await {
+        loop {
+            let frame = match self.initialize_deadline {
+                Some(deadline) if self.auth.is_none() => {
+                    match tokio::time::timeout_at(deadline, transport.next_frame()).await {
+                        Ok(frame) => frame,
+                        Err(_) => {
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                )
+                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                .with_attrs(::serde_json::json!({"peer": self.peer_label})),
+                                "local RPC client did not initialize in time; closing its connection"
+                            );
+                            return;
+                        }
+                    }
+                }
+                _ => transport.next_frame().await,
+            };
+            let Some(line) = frame else {
+                return;
+            };
             let trimmed = line.trim();
             if trimmed.is_empty() {
                 continue;
             }
             self.process_line(trimmed).await;
+            if self.auth.is_some() {
+                self.initialize_deadline = None;
+            }
         }
     }
 

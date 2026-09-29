@@ -31,6 +31,17 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 /// that feed its queue indefinitely.
 const LOCAL_PEER_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Deadline for a new connection to complete `initialize`, counted from
+/// accept. A client that connects and never initializes would otherwise hold
+/// one of the `rpc.max_local_connections` slots for as long as it stays open.
+const LOCAL_INITIALIZE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Deadline for receiving one frame, counted from its first byte. The wait
+/// between frames is not bounded, so an initialized client may sit idle; a
+/// frame that is started and never finished is, however slowly its bytes
+/// arrive.
+const LOCAL_FRAME_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// How long the reader waits for a terminal error frame to reach the peer
 /// before it closes the connection anyway.
 const TERMINAL_FRAME_TIMEOUT: Duration = Duration::from_secs(5);
@@ -49,6 +60,10 @@ pub struct LocalListenerLimits {
     pub max_connections: usize,
     /// Deadline for writing one frame to a peer.
     pub write_timeout: Duration,
+    /// Deadline for a new connection to complete `initialize`.
+    pub initialize_timeout: Duration,
+    /// Deadline for receiving one frame once its first byte has arrived.
+    pub frame_read_timeout: Duration,
 }
 
 impl LocalListenerLimits {
@@ -61,6 +76,8 @@ impl LocalListenerLimits {
                 .max_local_connections
                 .clamp(1, tokio::sync::Semaphore::MAX_PERMITS),
             write_timeout: LOCAL_PEER_WRITE_TIMEOUT,
+            initialize_timeout: LOCAL_INITIALIZE_TIMEOUT,
+            frame_read_timeout: LOCAL_FRAME_READ_TIMEOUT,
         }
     }
 }
@@ -97,6 +114,17 @@ fn frame_too_large_line() -> String {
         zeroclaw_api::jsonrpc::error_codes::INVALID_REQUEST,
         format!("Frame exceeds the {MAX_FRAME_BYTES}-byte local RPC frame limit"),
         serde_json::json!({ "reason": "frame_too_large", "limit_bytes": MAX_FRAME_BYTES }),
+    )
+}
+
+fn frame_timeout_line(timeout: Duration) -> String {
+    unattributed_error_line(
+        zeroclaw_api::jsonrpc::error_codes::INVALID_REQUEST,
+        format!(
+            "Frame was not completed within {} ms of its first byte",
+            timeout.as_millis()
+        ),
+        serde_json::json!({ "reason": "frame_timeout", "limit_ms": timeout.as_millis() as u64 }),
     )
 }
 
@@ -157,6 +185,8 @@ pub struct LocalTransport {
     /// when the kernel query fails — absence of a credential, never a
     /// credential of its own.
     peer_uid: Option<u32>,
+    /// Deadline for one frame, counted from its first byte.
+    frame_read_timeout: Duration,
 }
 
 /// Timing bounds for one connection's writer task.
@@ -255,7 +285,12 @@ async fn run_writer<W>(
 }
 
 impl LocalTransport {
-    pub fn new(stream: LocalStream, cancel: CancellationToken, write_timeout: Duration) -> Self {
+    pub fn new(
+        stream: LocalStream,
+        cancel: CancellationToken,
+        write_timeout: Duration,
+        frame_read_timeout: Duration,
+    ) -> Self {
         let peer_label = platform::peer_label_from(&stream);
         let peer_uid = platform::peer_uid_from(&stream);
         let (read_half, write_half) = tokio::io::split(stream);
@@ -285,6 +320,7 @@ impl LocalTransport {
             terminal_tx,
             peer_label,
             peer_uid,
+            frame_read_timeout,
         }
     }
 
@@ -326,9 +362,37 @@ impl RpcTransport for LocalTransport {
     }
 
     async fn next_frame(&mut self) -> Option<String> {
+        // The wait for a frame to start is not bounded here: an initialized
+        // client may stay idle, and the dispatcher bounds the wait for
+        // `initialize` itself.
+        match self.reader.fill_buf().await {
+            Ok(available) if !available.is_empty() => {}
+            _ => return None,
+        }
+        // A frame has started, and it must finish within the read deadline
+        // counted from this first byte, so a peer that dribbles bytes cannot
+        // hold its connection, and a frame's worth of buffer, indefinitely.
+        let deadline = tokio::time::Instant::now() + self.frame_read_timeout;
         let mut buf: Vec<u8> = Vec::new();
         let mut limited = (&mut self.reader).take(MAX_FRAME_BYTES + 1);
-        match limited.read_until(b'\n', &mut buf).await {
+        let Ok(read) = tokio::time::timeout_at(deadline, limited.read_until(b'\n', &mut buf)).await
+        else {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "peer": self.peer_label,
+                        "frame_read_timeout_ms": self.frame_read_timeout.as_millis() as u64,
+                        "received_bytes": buf.len(),
+                    })),
+                "local RPC peer did not finish a frame in time; closing the connection"
+            );
+            self.send_terminal(frame_timeout_line(self.frame_read_timeout))
+                .await;
+            return None;
+        };
+        match read {
             Ok(0) => None,
             Ok(_) => {
                 if buf.len() as u64 > MAX_FRAME_BYTES {
@@ -501,12 +565,14 @@ pub async fn run_local_listener_with_limits(
                 // connection is visible to the daemon immediately.
                 let activity = crate::rpc::ConnectionActivity::new(client_count.clone());
                 let write_timeout = limits.write_timeout;
+                let frame_read_timeout = limits.frame_read_timeout;
+                let initialize_deadline = tokio::time::Instant::now() + limits.initialize_timeout;
 
                 connection_tasks.spawn(async move {
                     let _permit = permit;
                     let _count_guard = activity.clone();
                     let mut transport =
-                        LocalTransport::new(stream, conn_cancel.clone(), write_timeout);
+                        LocalTransport::new(stream, conn_cancel.clone(), write_timeout, frame_read_timeout);
                     let peer = transport.peer_label();
                     let writer_tx = transport.writer();
                     let mut dispatcher = RpcDispatcher::new_with_connection_cancel(
@@ -516,6 +582,7 @@ pub async fn run_local_listener_with_limits(
                         conn_cancel.clone(),
                     )
                     .with_connection_activity(activity)
+                    .with_initialize_deadline(initialize_deadline)
                     // The transport's kind and kernel-supplied peer credential
                     // feed principal authentication at `initialize`.
                     .with_transport(transport.kind(), transport.credential());
@@ -2723,6 +2790,8 @@ mod tests {
                 LocalListenerLimits {
                     max_connections: 8,
                     write_timeout: Duration::from_secs(2),
+                    initialize_timeout: LOCAL_INITIALIZE_TIMEOUT,
+                    frame_read_timeout: LOCAL_FRAME_READ_TIMEOUT,
                 },
             )
             .await;
@@ -2804,6 +2873,8 @@ mod tests {
                 LocalListenerLimits {
                     max_connections: 1,
                     write_timeout: LOCAL_PEER_WRITE_TIMEOUT,
+                    initialize_timeout: LOCAL_INITIALIZE_TIMEOUT,
+                    frame_read_timeout: LOCAL_FRAME_READ_TIMEOUT,
                 },
             )
             .await;
@@ -2854,6 +2925,164 @@ mod tests {
         cancel.cancel();
     }
 
+    /// Start a listener with `limits` on a fresh context.
+    #[cfg(unix)]
+    async fn listener_with_limits(
+        tmp: &tempfile::TempDir,
+        limits: LocalListenerLimits,
+    ) -> (std::path::PathBuf, Arc<AtomicUsize>, CancellationToken) {
+        let ctx = test_ctx(tmp.path());
+        let sock_path = ctx.config.read().data_dir.join("daemon.sock");
+        let cancel = CancellationToken::new();
+        let count = Arc::new(AtomicUsize::new(0));
+        let (server_cancel, server_count) = (cancel.clone(), count.clone());
+        zeroclaw_spawn::spawn!(async move {
+            let _ = run_local_listener_with_limits(ctx, server_cancel, server_count, None, limits)
+                .await;
+        });
+        wait_for_socket(&sock_path).await;
+        (sock_path, count, cancel)
+    }
+
+    /// Every line the server sends before end of stream, which must arrive
+    /// `within` the deadline.
+    #[cfg(unix)]
+    async fn lines_until_eof(
+        reader: &mut (impl tokio::io::AsyncBufRead + Unpin),
+        within: Duration,
+    ) -> Vec<String> {
+        tokio::time::timeout(within, async {
+            let mut lines = Vec::new();
+            loop {
+                let mut line = String::new();
+                match reader.read_line(&mut line).await {
+                    Ok(0) | Err(_) => return lines,
+                    Ok(_) => lines.push(line),
+                }
+            }
+        })
+        .await
+        .expect("the server closes the connection in time")
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_client_that_never_initializes_is_closed_and_its_slot_reused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (sock_path, count, cancel) = listener_with_limits(
+            &tmp,
+            LocalListenerLimits {
+                max_connections: 1,
+                write_timeout: LOCAL_PEER_WRITE_TIMEOUT,
+                initialize_timeout: Duration::from_millis(300),
+                frame_read_timeout: LOCAL_FRAME_READ_TIMEOUT,
+            },
+        )
+        .await;
+
+        // It takes the only slot and sends nothing, so nothing is ever written
+        // to it and the write deadline never starts.
+        let silent = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
+        wait_for_client_count(&count, 1).await;
+        let mut silent = tokio::io::BufReader::new(silent);
+        let lines = lines_until_eof(&mut silent, Duration::from_secs(5)).await;
+        assert!(lines.is_empty(), "closed without a reply: {lines:?}");
+        wait_for_client_count(&count, 0).await;
+
+        let (_reader, _writer) = do_initialize(&sock_path).await;
+        wait_for_client_count(&count, 1).await;
+        cancel.cancel();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_frame_dribbled_past_its_read_deadline_is_closed_and_its_slot_reused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let frame_read_timeout = Duration::from_millis(500);
+        let (sock_path, count, cancel) = listener_with_limits(
+            &tmp,
+            LocalListenerLimits {
+                max_connections: 1,
+                write_timeout: LOCAL_PEER_WRITE_TIMEOUT,
+                initialize_timeout: LOCAL_INITIALIZE_TIMEOUT,
+                frame_read_timeout,
+            },
+        )
+        .await;
+
+        let stream = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
+        wait_for_client_count(&count, 1).await;
+        let (read_half, mut write_half) = stream.into_split();
+        // A frame that is started and never finished: one byte every 100 ms,
+        // no newline, for far longer than the deadline. Steady progress must
+        // not keep extending it.
+        let started = std::time::Instant::now();
+        let dribble = zeroclaw_spawn::spawn!(async move {
+            let _ = write_half.write_all(b"{\"jsonrpc\"").await;
+            for _ in 0..50 {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                if write_half.write_all(b" ").await.is_err() {
+                    break;
+                }
+            }
+            write_half
+        });
+        let mut reader = tokio::io::BufReader::new(read_half);
+        let lines = lines_until_eof(&mut reader, Duration::from_secs(4)).await;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(2500),
+            "closed at the deadline counted from the first byte, not the last: {elapsed:?}"
+        );
+        assert_eq!(lines.len(), 1, "one closing error: {lines:?}");
+        let frame: serde_json::Value = serde_json::from_str(lines[0].trim()).unwrap();
+        assert_eq!(
+            frame["error"]["code"],
+            zeroclaw_api::jsonrpc::error_codes::INVALID_REQUEST,
+            "{frame}"
+        );
+        assert_eq!(frame["error"]["data"]["reason"], "frame_timeout", "{frame}");
+        assert_eq!(frame["error"]["data"]["limit_ms"], 500, "{frame}");
+        assert!(frame["id"].is_null(), "{frame}");
+        drop(dribble);
+        wait_for_client_count(&count, 0).await;
+
+        let (_reader, _writer) = do_initialize(&sock_path).await;
+        wait_for_client_count(&count, 1).await;
+        cancel.cancel();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_initialized_client_may_stay_idle_past_both_deadlines() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (sock_path, _count, cancel) = listener_with_limits(
+            &tmp,
+            LocalListenerLimits {
+                max_connections: 1,
+                write_timeout: LOCAL_PEER_WRITE_TIMEOUT,
+                initialize_timeout: Duration::from_millis(200),
+                frame_read_timeout: Duration::from_millis(200),
+            },
+        )
+        .await;
+
+        let (mut reader, mut writer) = do_initialize(&sock_path).await;
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        writer
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"no/such/method\"}\n")
+            .await
+            .unwrap();
+        let mut line = String::new();
+        tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
+            .await
+            .expect("the idle client is still served")
+            .expect("read the reply");
+        let frame: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(frame["id"], 2, "{frame}");
+        cancel.cancel();
+    }
+
     #[test]
     fn listener_limits_come_from_the_rpc_section() {
         let mut config = Config::default();
@@ -2871,6 +3100,9 @@ mod tests {
             LocalListenerLimits::from_config(&config).write_timeout,
             LOCAL_PEER_WRITE_TIMEOUT
         );
+        let limits = LocalListenerLimits::from_config(&config);
+        assert_eq!(limits.initialize_timeout, LOCAL_INITIALIZE_TIMEOUT);
+        assert_eq!(limits.frame_read_timeout, LOCAL_FRAME_READ_TIMEOUT);
         config.rpc.max_local_connections = usize::MAX;
         let limits = LocalListenerLimits::from_config(&config);
         assert_eq!(limits.max_connections, tokio::sync::Semaphore::MAX_PERMITS);
@@ -2966,6 +3198,8 @@ mod tests {
                 LocalListenerLimits {
                     max_connections: 1,
                     write_timeout: LOCAL_PEER_WRITE_TIMEOUT,
+                    initialize_timeout: LOCAL_INITIALIZE_TIMEOUT,
+                    frame_read_timeout: LOCAL_FRAME_READ_TIMEOUT,
                 },
             )
             .await
