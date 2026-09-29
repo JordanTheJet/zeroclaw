@@ -25666,14 +25666,15 @@ impl Config {
             apply_dirty_path(doc.as_table_mut(), path, &full_table, &default_table)?;
         }
 
-        // Retire the inert `[security.nevis]` table from the file. The shim
-        // discards its content at load and `skip_serializing` keeps it out of
-        // a full save, but an incremental save reparses the original file and
-        // rewrites only dirty paths, so without this the retired table (and a
-        // plaintext `client_secret` it may carry) would outlive every ordinary
-        // CLI/dashboard edit. Only that one table is touched; comments and
-        // unrelated ciphertext elsewhere in the file are preserved.
-        let retired_nevis = retire_nevis_table_in_doc(doc.as_table_mut());
+        // Remove retired keys from the file, using the same `RETIRED_KEYS`
+        // policy the load path applies. Loading drops them, so they are never
+        // dirty paths, and an incremental save reparses the original file and
+        // rewrites only dirty paths: without this, a retired table (and a
+        // plaintext secret it may carry, as `[security.nevis]` can) would
+        // outlive every ordinary CLI, dashboard or RPC edit. Only retired
+        // keys are touched; comments and unrelated ciphertext elsewhere in
+        // the file are preserved.
+        let retired = crate::migration::apply_retired_keys_to_doc(doc.as_table_mut());
 
         // Stamp the current schema version. An incremental save writes
         // current-schema-shaped sections (e.g. the dashboard saving a single
@@ -25691,17 +25692,28 @@ impl Config {
         let toml_str = ensure_blank_line_before_sections(&doc.to_string());
 
         write_config_atomically(&config_path, &toml_str).await?;
-        if retired_nevis {
+        // Reported only now that the file is durably replaced: a failed write
+        // leaves the retired keys on disk and must not claim otherwise.
+        for notice in &retired {
+            let path = match notice {
+                crate::migration::MigrationNotice::Removed { path, .. } => path.as_str(),
+                crate::migration::MigrationNotice::Renamed { from, .. }
+                | crate::migration::MigrationNotice::RenameConflict { from, .. } => from.as_str(),
+                crate::migration::MigrationNotice::AssumedV1 => continue,
+            };
             ::zeroclaw_log::record!(
                 INFO,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                     .with_outcome(::zeroclaw_log::EventOutcome::Success)
                     .with_attrs(::serde_json::json!({
-                        "retired_config": "security.nevis",
+                        "retired_config": path,
+                        "notice": notice,
                     })),
-                "Removed the retired [security.nevis] table from config.toml on save; \
-                 the Nevis integration no longer exists. Backups taken before this \
-                 save still carry the original table."
+                &format!(
+                    "Updated config.toml on save: {}. Backups taken before this save \
+                     still carry the original value.",
+                    notice.message()
+                )
             );
         }
         self.clear_dirty();
@@ -26844,34 +26856,6 @@ fn delete_path_in_doc(root: &mut toml_edit::Table, segs: &[&str]) {
         };
     }
     cursor.remove(last);
-}
-
-/// Remove the retired `[security.nevis]` table from an on-disk document
-/// during an incremental save. Returns whether anything was removed.
-///
-/// The removed Nevis integration's table is tolerated at load (see
-/// `deserialize_inert_nevis`), but the loaded config carries none of its
-/// content, so nothing about it is ever a dirty path and `save_dirty` would
-/// otherwise carry the original bytes forward indefinitely. Both spellings
-/// are handled: a `[security.nevis]` header (a `nevis` key inside the
-/// `security` table) and a dotted or inline `nevis = { ... }` entry. A
-/// `[security]` table left empty by the removal is dropped too, so a file
-/// that only had the retired table does not keep an empty header; a
-/// `[security]` table with other keys keeps them and their comments.
-fn retire_nevis_table_in_doc(root: &mut toml_edit::Table) -> bool {
-    let Some(security) = root
-        .get_mut("security")
-        .and_then(|item| item.as_table_like_mut())
-    else {
-        return false;
-    };
-    if security.remove("nevis").is_none() {
-        return false;
-    }
-    if security.is_empty() {
-        root.remove("security");
-    }
-    true
 }
 
 /// Same `TableLike` traversal as `delete_path_in_doc`, for the same
@@ -40555,13 +40539,76 @@ bot_token = "enc:v1:UNRELATED-CIPHERTEXT-THAT-MUST-SURVIVE"
     }
 
     #[test]
-    async fn retire_nevis_table_in_doc_handles_every_spelling() {
+    async fn save_dirty_removes_retired_agent_tunables_from_disk() {
+        // The eight agent-inline tunables are retired through an `ANY_KEY`
+        // wildcard. An incremental save must clean them from every
+        // `[agents.<alias>]` block on disk, not only through `config migrate`,
+        // while keeping each alias and its live keys.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "schema_version = {}\n\n\
+                 # Coder agent.\n\
+                 [agents.coder]\n\
+                 runtime_profile = \"fast\"\n\
+                 max_tool_iterations = 40\n\
+                 parallel_tools = true\n\n\
+                 [agents.writer]\n\
+                 compact_context = true\n\n\
+                 [runtime_profiles.fast]\n\
+                 max_tool_iterations = 12\n\n\
+                 [observability]\n\
+                 backend = \"none\"\n",
+                crate::migration::CURRENT_SCHEMA_VERSION
+            ),
+        )
+        .unwrap();
+        let mut config: Config =
+            toml::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+        config.config_path = config_path.clone();
+
+        config.observability.backend = ObservabilityBackend::Otel;
+        config.mark_dirty("observability.backend");
+        config.save_dirty().await.unwrap();
+
+        let written = std::fs::read_to_string(&config_path).unwrap();
+        let value: toml::Value = toml::from_str(&written).unwrap();
+        let coder = value["agents"]["coder"].as_table().unwrap();
+        assert!(
+            !coder.contains_key("max_tool_iterations") && !coder.contains_key("parallel_tools"),
+            "retired agent tunables must not survive an incremental save; got:\n{written}"
+        );
+        assert_eq!(
+            coder["runtime_profile"].as_str(),
+            Some("fast"),
+            "live keys stay"
+        );
+        assert!(
+            value["agents"]["writer"].as_table().unwrap().is_empty(),
+            "an alias whose only key was retired is kept; got:\n{written}"
+        );
+        assert_eq!(
+            value["runtime_profiles"]["fast"]["max_tool_iterations"].as_integer(),
+            Some(12),
+            "the live runtime-profile tunable is untouched"
+        );
+        assert!(written.contains("backend = \"otel\""), "got:\n{written}");
+        assert!(
+            written.contains("# Coder agent."),
+            "comments survive; got:\n{written}"
+        );
+    }
+
+    #[test]
+    async fn retired_key_doc_cleanup_handles_every_nevis_spelling() {
         // `[security.nevis]` header form, leaving a sibling key behind.
         let mut doc: toml_edit::DocumentMut =
             "[security]\ntrust_daemon_uid = false\n\n[security.nevis]\nenabled = true\n"
                 .parse()
                 .unwrap();
-        assert!(retire_nevis_table_in_doc(doc.as_table_mut()));
+        assert!(!crate::migration::apply_retired_keys_to_doc(doc.as_table_mut()).is_empty());
         let out = doc.to_string();
         assert!(!out.contains("nevis"), "got:\n{out}");
         assert!(out.contains("trust_daemon_uid = false"), "got:\n{out}");
@@ -40571,25 +40618,25 @@ bot_token = "enc:v1:UNRELATED-CIPHERTEXT-THAT-MUST-SURVIVE"
             "security.nevis = { enabled = true, client_secret = \"x\" }\n"
                 .parse()
                 .unwrap();
-        assert!(retire_nevis_table_in_doc(doc.as_table_mut()));
+        assert!(!crate::migration::apply_retired_keys_to_doc(doc.as_table_mut()).is_empty());
         assert!(!doc.to_string().contains("nevis"));
 
         // A `[security]` table that held only the retired table is dropped
         // rather than left as an empty header.
         let mut doc: toml_edit::DocumentMut = "[security.nevis]\nenabled = true\n".parse().unwrap();
-        assert!(retire_nevis_table_in_doc(doc.as_table_mut()));
+        assert!(!crate::migration::apply_retired_keys_to_doc(doc.as_table_mut()).is_empty());
         assert!(!doc.to_string().contains("security"), "got:\n{}", doc);
 
         // Nothing to do: a config without the table is untouched, byte for byte.
         let original = "[security]\ntrust_daemon_uid = false\n";
         let mut doc: toml_edit::DocumentMut = original.parse().unwrap();
-        assert!(!retire_nevis_table_in_doc(doc.as_table_mut()));
+        assert!(crate::migration::apply_retired_keys_to_doc(doc.as_table_mut()).is_empty());
         assert_eq!(doc.to_string(), original);
 
         // No `[security]` table at all.
         let mut doc: toml_edit::DocumentMut =
             "[observability]\nbackend = \"none\"\n".parse().unwrap();
-        assert!(!retire_nevis_table_in_doc(doc.as_table_mut()));
+        assert!(crate::migration::apply_retired_keys_to_doc(doc.as_table_mut()).is_empty());
     }
 
     #[test]
