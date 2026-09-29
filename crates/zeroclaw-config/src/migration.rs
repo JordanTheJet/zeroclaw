@@ -316,6 +316,7 @@ pub fn migrate_file_with_notices(input: &str) -> Result<Option<(String, Vec<Migr
     // already succeeded on it), fall back to a fresh serialization.
     if let Ok(mut doc) = input.parse::<toml_edit::DocumentMut>() {
         sync_table(doc.as_table_mut(), &migrated_table);
+        keep_emptied_tables_visible(doc.as_table_mut(), &notices);
         Ok(Some((doc.to_string(), notices)))
     } else {
         let serialized = toml::to_string_pretty(&toml::Value::Table(migrated_table))
@@ -1084,6 +1085,197 @@ fn run_chain_until(
     Ok(cur)
 }
 
+/// Apply every retired key, through the current schema version, to an
+/// on-disk document in place. This is the same [`RETIRED_KEYS`] policy the
+/// migration chain applies to a parsed value, used where a file is edited
+/// rather than rewritten (an incremental save). Only retired keys change:
+/// comments, formatting and every other entry, including ciphertext, are left
+/// byte for byte. All three spellings are handled (`[a.b]` headers, dotted
+/// keys and inline tables). Returns what changed, for the caller to report
+/// once the file is safely written.
+pub fn apply_retired_keys_to_doc(root: &mut toml_edit::Table) -> Vec<MigrationNotice> {
+    let mut notices = Vec::new();
+    for version in 2..=CURRENT_SCHEMA_VERSION {
+        apply_retired_keys_to_doc_table(root, version, RETIRED_KEYS, &mut notices);
+    }
+    notices
+}
+
+fn apply_retired_keys_to_doc_table(
+    root: &mut toml_edit::Table,
+    version: u32,
+    table: &[RetiredKey],
+    notices: &mut Vec<MigrationNotice>,
+) {
+    for key in table.iter().filter(|key| key.retired_in == version) {
+        for concrete in expand_doc_path(root, key.path) {
+            let segments: Vec<&str> = concrete.iter().map(String::as_str).collect();
+            let Some(taken) = take_doc_path(root, &segments, key.path) else {
+                continue;
+            };
+            let from = segments.join(".");
+            let notice = match key.retirement {
+                Retirement::Remove => MigrationNotice::Removed {
+                    path: from,
+                    reason: key.reason,
+                },
+                Retirement::Rename { to } => {
+                    let target = fill_wildcards(to, key.path, &segments);
+                    let target: Vec<&str> = target.iter().map(String::as_str).collect();
+                    let to_path = target.join(".");
+                    if put_doc_path_if_vacant(root, &target, taken) {
+                        MigrationNotice::Renamed {
+                            from,
+                            to: to_path,
+                            reason: key.reason,
+                        }
+                    } else {
+                        MigrationNotice::RenameConflict {
+                            from,
+                            to: to_path,
+                            reason: key.reason,
+                        }
+                    }
+                }
+            };
+            notices.push(notice);
+        }
+    }
+}
+
+/// [`expand_path`] over a document: every concrete path `pattern` matches,
+/// descending through header, dotted and inline tables alike.
+fn expand_doc_path(root: &toml_edit::Table, pattern: &[&str]) -> Vec<Vec<String>> {
+    fn walk(
+        table: &dyn toml_edit::TableLike,
+        pattern: &[&str],
+        prefix: &mut Vec<String>,
+        out: &mut Vec<Vec<String>>,
+    ) {
+        let Some((segment, rest)) = pattern.split_first() else {
+            return;
+        };
+        let keys: Vec<String> = if *segment == ANY_KEY {
+            table.iter().map(|(key, _)| key.to_string()).collect()
+        } else if table.contains_key(segment) {
+            vec![(*segment).to_string()]
+        } else {
+            Vec::new()
+        };
+        for key in keys {
+            prefix.push(key.clone());
+            if rest.is_empty() {
+                out.push(prefix.clone());
+            } else if let Some(next) = table.get(&key).and_then(toml_edit::Item::as_table_like) {
+                walk(next, rest, prefix, out);
+            }
+            prefix.pop();
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, pattern, &mut Vec::new(), &mut out);
+    out
+}
+
+/// [`take_path`] over a document, with the same [`prunable`] rule for
+/// containers the removal leaves empty.
+fn take_doc_path(
+    table: &mut dyn toml_edit::TableLike,
+    path: &[&str],
+    pattern: &[&str],
+) -> Option<toml_edit::Item> {
+    let (first, rest) = path.split_first()?;
+    if rest.is_empty() {
+        return table.remove(first);
+    }
+    let child = table.get_mut(first)?.as_table_like_mut()?;
+    let taken = take_doc_path(child, rest, pattern.get(1..).unwrap_or_default())?;
+    if child.is_empty() {
+        if prunable(pattern) {
+            table.remove(first);
+        } else if let Some(alias) = table.get_mut(first).and_then(toml_edit::Item::as_table_mut) {
+            // An implicit table renders as nothing once empty, which would
+            // silently delete the alias; give it its own header instead.
+            alias.set_implicit(false);
+        }
+    }
+    Some(taken)
+}
+
+/// [`put_path_if_vacant`] over a document. Missing parents are created as
+/// implicit tables, so no empty header is written for them.
+fn put_doc_path_if_vacant(
+    root: &mut toml_edit::Table,
+    path: &[&str],
+    item: toml_edit::Item,
+) -> bool {
+    let Some((last, parents)) = path.split_last() else {
+        return false;
+    };
+    // Check the whole path first, so a refusal creates no parent tables.
+    let mut probe: Option<&dyn toml_edit::TableLike> = Some(&*root);
+    for segment in parents {
+        probe = match probe.and_then(|table| table.get(segment)) {
+            None => None,
+            Some(item) => match item.as_table_like() {
+                Some(next) => Some(next),
+                None => return false,
+            },
+        };
+    }
+    if probe.is_some_and(|table| table.contains_key(last)) {
+        return false;
+    }
+    let mut table: &mut dyn toml_edit::TableLike = root;
+    for segment in parents {
+        if !table.contains_key(segment) {
+            let mut implicit = toml_edit::Table::new();
+            implicit.set_implicit(true);
+            table.insert(segment, toml_edit::Item::Table(implicit));
+        }
+        let Some(next) = table
+            .get_mut(segment)
+            .and_then(toml_edit::Item::as_table_like_mut)
+        else {
+            return false;
+        };
+        table = next;
+    }
+    table.insert(last, item);
+    true
+}
+
+/// Give every table on the path to a retired key an explicit header if the
+/// retirement left it empty. An implicit table renders as nothing once empty,
+/// so without this an alias whose only content was retired (for example a
+/// runtime profile that only set `context_compression.summary_model`) would
+/// vanish from the written file while it still exists in the migrated value,
+/// leaving any reference to it dangling.
+fn keep_emptied_tables_visible(root: &mut toml_edit::Table, notices: &[MigrationNotice]) {
+    for notice in notices {
+        let from = match notice {
+            MigrationNotice::Removed { path, .. } => path,
+            MigrationNotice::Renamed { from, .. }
+            | MigrationNotice::RenameConflict { from, .. } => from,
+            MigrationNotice::AssumedV1 => continue,
+        };
+        let segments: Vec<&str> = from.split('.').collect();
+        let mut table = &mut *root;
+        for segment in segments.iter().take(segments.len().saturating_sub(1)) {
+            let Some(next) = table
+                .get_mut(segment)
+                .and_then(toml_edit::Item::as_table_mut)
+            else {
+                break;
+            };
+            if next.is_empty() {
+                next.set_implicit(false);
+            }
+            table = next;
+        }
+    }
+}
+
 fn stamp_schema_version(mut value: toml::Value, version: u32) -> Result<toml::Value> {
     value
         .as_table_mut()
@@ -1111,7 +1303,7 @@ fn apply_retired_keys(
     for key in table.iter().filter(|key| key.retired_in == version) {
         for concrete in expand_path(root, key.path) {
             let segments: Vec<&str> = concrete.iter().map(String::as_str).collect();
-            let Some(taken) = take_path(root, &segments) else {
+            let Some(taken) = take_path(root, &segments, key.path) else {
                 continue;
             };
             let from = segments.join(".");
@@ -1201,14 +1393,30 @@ fn fill_wildcards(target: &[&str], pattern: &[&str], matched: &[&str]) -> Vec<St
         .collect()
 }
 
-/// Remove and return the value at `path`, if every segment exists.
-fn take_path(root: &mut toml::Table, path: &[&str]) -> Option<toml::Value> {
-    let (last, parents) = path.split_last()?;
-    let mut table = root;
-    for segment in parents {
-        table = table.get_mut(*segment)?.as_table_mut()?;
+/// Remove and return the value at `path`, if every segment exists. A
+/// container the removal leaves empty is dropped too when [`prunable`] allows
+/// it for that level of `pattern`.
+fn take_path(root: &mut toml::Table, path: &[&str], pattern: &[&str]) -> Option<toml::Value> {
+    let (first, rest) = path.split_first()?;
+    if rest.is_empty() {
+        return root.remove(*first);
     }
-    table.remove(*last)
+    let child = root.get_mut(*first)?.as_table_mut()?;
+    let taken = take_path(child, rest, pattern.get(1..).unwrap_or_default())?;
+    if child.is_empty() && prunable(pattern) {
+        root.remove(*first);
+    }
+    Some(taken)
+}
+
+/// Whether a container matched by the first segment of `pattern` may be
+/// dropped once a retirement leaves it empty. A literal segment names
+/// structure that exists only to hold keys (`security`, `context_compression`),
+/// so an empty one carries nothing. An [`ANY_KEY`] segment matches an
+/// operator-named alias (`[agents.coder]`), whose existence is meaningful even
+/// when empty, so it is always kept.
+fn prunable(pattern: &[&str]) -> bool {
+    pattern.first().is_some_and(|segment| *segment != ANY_KEY)
 }
 
 /// Insert `value` at `path`, creating missing parent tables. Returns `false`,
@@ -3863,15 +4071,15 @@ summary_model = "opus"
             Some(12),
             "the runtime-profile copy of a tunable is the live one and is kept"
         );
-        for profile in ["fast", "slow"] {
-            let cc = value["runtime_profiles"][profile]["context_compression"]
-                .as_table()
-                .unwrap();
-            assert!(!cc.contains_key("summary_model"), "{profile}: {cc:?}");
-        }
-        assert_eq!(
-            value["runtime_profiles"]["fast"]["context_compression"]["threshold_ratio"].as_float(),
-            Some(0.5)
+        let fast_cc = value["runtime_profiles"]["fast"]["context_compression"]
+            .as_table()
+            .unwrap();
+        assert!(!fast_cc.contains_key("summary_model"), "{fast_cc:?}");
+        assert_eq!(fast_cc["threshold_ratio"].as_float(), Some(0.5));
+        let slow = value["runtime_profiles"]["slow"].as_table().unwrap();
+        assert!(
+            !slow.contains_key("context_compression"),
+            "a literal container left empty is dropped: {slow:?}"
         );
 
         let mut removed: Vec<&str> = notices
@@ -3960,7 +4168,10 @@ summary_model = "opus"
     fn a_retired_rename_never_overwrites_the_replacement() {
         let (value, notices) = apply("[old]\nknob = 7\n[new.section]\nknob = 1\n", 9);
         assert_eq!(value["new"]["section"]["knob"].as_integer(), Some(1));
-        assert!(value["old"].get("knob").is_none());
+        assert!(
+            value.get("old").is_none(),
+            "a literal container left empty is dropped"
+        );
         assert!(matches!(
             notices.as_slice(),
             [MigrationNotice::RenameConflict { from, to, .. }] if from == "old.knob" && to == "new.section.knob"
@@ -4026,6 +4237,193 @@ summary_model = "opus"
         assert!(
             notices.is_empty(),
             "version 9 entries do not apply at version 8"
+        );
+    }
+
+    fn apply_doc(raw: &str) -> (String, Vec<MigrationNotice>) {
+        let mut doc: toml_edit::DocumentMut = raw.parse().unwrap();
+        let notices = apply_retired_keys_to_doc(doc.as_table_mut());
+        (doc.to_string(), notices)
+    }
+
+    fn removed_paths(notices: &[MigrationNotice]) -> Vec<&str> {
+        let mut paths: Vec<&str> = notices
+            .iter()
+            .map(|notice| match notice {
+                MigrationNotice::Removed { path, .. } => path.as_str(),
+                other => panic!("only removals expected, got {other:?}"),
+            })
+            .collect();
+        paths.sort_unstable();
+        paths
+    }
+
+    #[test]
+    fn doc_cleanup_removes_retired_nevis_in_every_spelling() {
+        // A `[security.nevis]` header next to a populated `[security]`.
+        let (out, notices) = apply_doc(
+            "# keep me\n[security]\ntrust_daemon_uid = false\n\n[security.nevis]\nclient_secret = \"s\"\n",
+        );
+        assert_eq!(removed_paths(&notices), ["security.nevis"]);
+        assert!(
+            !out.contains("nevis") && !out.contains("client_secret"),
+            "{out}"
+        );
+        assert!(
+            out.contains("# keep me") && out.contains("trust_daemon_uid = false"),
+            "{out}"
+        );
+
+        // Dotted keys at the root.
+        let (out, notices) = apply_doc("security.nevis.enabled = true\nlocale = \"en\"\n");
+        assert_eq!(removed_paths(&notices), ["security.nevis"]);
+        assert_eq!(out, "locale = \"en\"\n");
+
+        // Inline tables, with a sibling that stays.
+        let (out, notices) =
+            apply_doc("security = { nevis = { enabled = true }, trust_daemon_uid = false }\n");
+        assert_eq!(removed_paths(&notices), ["security.nevis"]);
+        assert!(
+            !out.contains("nevis") && out.contains("trust_daemon_uid = false"),
+            "{out}"
+        );
+
+        // A `[security]` left empty by the removal is dropped, whether it was
+        // implicit or had its own header.
+        for raw in [
+            "[security.nevis]\nenabled = true\n",
+            "[security]\n\n[security.nevis]\nenabled = true\n",
+        ] {
+            let (out, notices) = apply_doc(raw);
+            assert_eq!(removed_paths(&notices), ["security.nevis"]);
+            assert!(!out.contains("security"), "{raw:?} -> {out:?}");
+        }
+    }
+
+    #[test]
+    fn doc_cleanup_uses_the_same_wildcard_entries_as_migration() {
+        let raw = "[agents.coder]\nmax_tool_iterations = 40\n\n\
+                   [agents.writer]\nruntime_profile = \"fast\"\nparallel_tools = true\n\n\
+                   [runtime_profiles.fast]\nmax_tool_iterations = 12\n\n\
+                   [runtime_profiles.fast.context_compression]\nsummary_model = \"haiku\"\n";
+        let (out, notices) = apply_doc(raw);
+        assert_eq!(
+            removed_paths(&notices),
+            [
+                "agents.coder.max_tool_iterations",
+                "agents.writer.parallel_tools",
+                "runtime_profiles.fast.context_compression.summary_model",
+            ]
+        );
+        let value: toml::Value = toml::from_str(&out).unwrap();
+        assert!(
+            value["agents"]["coder"].as_table().unwrap().is_empty(),
+            "an operator-named alias is kept even when its only key was retired: {out}"
+        );
+        assert_eq!(
+            value["agents"]["writer"]["runtime_profile"].as_str(),
+            Some("fast")
+        );
+        assert_eq!(
+            value["runtime_profiles"]["fast"]["max_tool_iterations"].as_integer(),
+            Some(12)
+        );
+        assert!(
+            value["runtime_profiles"]["fast"]
+                .get("context_compression")
+                .is_none(),
+            "a literal container left empty is dropped: {out}"
+        );
+
+        // The same entries, through the migration path, report the same paths.
+        let (_, migration_notices) =
+            migrate_file_with_notices(&format!("schema_version = {CURRENT_SCHEMA_VERSION}\n{raw}"))
+                .unwrap()
+                .unwrap();
+        assert_eq!(removed_paths(&migration_notices), removed_paths(&notices));
+    }
+
+    #[test]
+    fn doc_cleanup_leaves_everything_else_byte_for_byte() {
+        let untouched = "schema_version = 4\n\n\
+                         # Operator note.\n\
+                         [channels.telegram.main]\n\
+                         bot_token = \"enc:v1:UNRELATED-CIPHERTEXT\"   # trailing comment\n";
+        let (out, notices) = apply_doc(untouched);
+        assert!(notices.is_empty());
+        assert_eq!(
+            out, untouched,
+            "a document without retired keys is not reformatted"
+        );
+
+        let with_retired = format!("{untouched}\n[security.nevis]\nclient_secret = \"x\"\n");
+        let (out, notices) = apply_doc(&with_retired);
+        assert_eq!(removed_paths(&notices), ["security.nevis"]);
+        assert!(
+            out.starts_with(untouched.trim_end()),
+            "unrelated lines are preserved byte for byte:\n{out}"
+        );
+        let (again, notices) = apply_doc(&out);
+        assert!(notices.is_empty());
+        assert_eq!(again, out, "a second cleanup changes nothing");
+    }
+
+    #[test]
+    fn doc_cleanup_applies_wildcard_renames_without_overwriting() {
+        let mut doc: toml_edit::DocumentMut =
+            "[bots.a]\nold_limit = 1\n\n[bots.b]\nold_limit = 2\n\n[bots.b.limits]\nmax = 9\n"
+                .parse()
+                .unwrap();
+        let mut notices = Vec::new();
+        apply_retired_keys_to_doc_table(doc.as_table_mut(), 7, TEST_RENAMES, &mut notices);
+        let value: toml::Value = toml::from_str(&doc.to_string()).unwrap();
+        assert_eq!(value["bots"]["a"]["limits"]["max"].as_integer(), Some(1));
+        assert_eq!(value["bots"]["b"]["limits"]["max"].as_integer(), Some(9));
+        assert!(value["bots"]["a"].get("old_limit").is_none());
+        assert!(value["bots"]["b"].get("old_limit").is_none());
+        assert_eq!(notices.len(), 2);
+        assert!(notices.iter().any(|n| matches!(n, MigrationNotice::RenameConflict { from, .. } if from == "bots.b.old_limit")));
+    }
+
+    #[test]
+    fn an_alias_emptied_by_retirement_stays_in_the_written_file() {
+        // The profile's only content is the retired key, and an agent refers to
+        // it. Dropping the implicit `slow` table on write would leave that
+        // reference dangling.
+        let raw = format!(
+            "schema_version = {CURRENT_SCHEMA_VERSION}\n\n\
+             [agents.coder]\nruntime_profile = \"slow\"\n\n\
+             [runtime_profiles.slow.context_compression]\nsummary_model = \"haiku\"\n"
+        );
+        let (migrated, notices) = migrate_file_with_notices(&raw).unwrap().unwrap();
+        assert_eq!(
+            removed_paths(&notices),
+            ["runtime_profiles.slow.context_compression.summary_model"]
+        );
+        let value: toml::Value = toml::from_str(&migrated).unwrap();
+        assert!(
+            value["runtime_profiles"]["slow"]
+                .as_table()
+                .unwrap()
+                .is_empty(),
+            "the alias survives, empty: {migrated}"
+        );
+        let load = migrate_to_current_salvaged(&migrated);
+        assert!(load.config.runtime_profiles.contains_key("slow"));
+        assert!(load.dropped.is_empty() && load.dropped_security.is_empty());
+
+        let (out, notices) = apply_doc(&raw);
+        assert_eq!(
+            removed_paths(&notices),
+            ["runtime_profiles.slow.context_compression.summary_model"]
+        );
+        let value: toml::Value = toml::from_str(&out).unwrap();
+        assert!(
+            value["runtime_profiles"]["slow"]
+                .as_table()
+                .unwrap()
+                .is_empty(),
+            "the document cleanup keeps it too: {out}"
         );
     }
 }
