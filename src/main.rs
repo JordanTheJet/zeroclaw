@@ -136,7 +136,7 @@ fn migration_notice_text(notice: &crate::config::migration::MigrationNotice, pat
             "cli-config-migration-assumed-v1",
             &[("path", path)],
             format!(
-                "warning: {path} has no `schema_version`, so it was read as schema V1 and migrated from there. The V1 migration merges channel sections into a `default` alias. If this file was written for a newer ZeroClaw, add `schema_version` at the top with the version it was written for (restore the `.backup` copy first if `zeroclaw config migrate` already rewrote it)."
+                "warning: {path} has no `schema_version`, so it was read as schema V1 and migrated from there. The V1 migration reshapes sections written for a newer version: provider entries can end up nested one level too deep, and channel sections are merged into a `default` alias. If this file was written for a newer ZeroClaw, add `schema_version` at the top with the version it was written for (restore the `.backup` copy first if `zeroclaw config migrate` already rewrote it)."
             ),
         ),
         MigrationNotice::Removed { path: key, reason } => ta(

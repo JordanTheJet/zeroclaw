@@ -2,9 +2,10 @@
 
 use zeroclaw_config::autonomy::AutonomyLevel;
 use zeroclaw_config::migration::{
-    CURRENT_SCHEMA_VERSION, GenerateOptions, MigrateReport, detect_version, encrypt_secret_strings,
-    ensure_disk_at_current_version, generate, migrate_file, migrate_file_in_place,
-    migrate_to_current,
+    CURRENT_SCHEMA_VERSION, GenerateOptions, MigrateReport, MigrationNotice, detect_version,
+    encrypt_secret_strings, ensure_disk_at_current_version, generate, migrate_file,
+    migrate_file_in_place, migrate_file_with_notices, migrate_to_current,
+    migrate_to_current_salvaged,
 };
 use zeroclaw_config::schema::Config;
 use zeroclaw_config::schema::v2::V2Config;
@@ -3038,4 +3039,141 @@ fn v1_to_v4_round_trip_matches_committed_fixture() {
          `zeroclaw config generate 4 > crates/zeroclaw-config/fixtures/v4.toml`"
     );
     let _: Config = toml::from_str(&generated).expect("generated V4 parses as Config");
+}
+
+// ─────────────────────────────────────────────────────────────
+// Retired keys and a missing schema_version against real configs
+// ─────────────────────────────────────────────────────────────
+
+/// Drop every table that is empty, recursively, so two configs that differ
+/// only in empty tables compare equal.
+fn prune_empty_tables(value: &mut toml::Value) {
+    if let Some(table) = value.as_table_mut() {
+        for (_, child) in table.iter_mut() {
+            prune_empty_tables(child);
+        }
+        table.retain(|_, child| child.as_table().is_none_or(|t| !t.is_empty()));
+    }
+}
+
+/// A real, current-format config: the checked-in dev template.
+const DEV_TEMPLATE: &str = include_str!("../../../dev/config.template.toml");
+
+/// The dev template with one key from each retired shape added: a literal
+/// table, a per-agent tunable, and a per-profile nested key.
+fn dev_template_with_retired_keys() -> String {
+    let with_agent_tunable = DEV_TEMPLATE.replacen(
+        "[agents.default]\n",
+        "[agents.default]\nmax_tool_iterations = 40\n",
+        1,
+    );
+    assert_ne!(
+        with_agent_tunable, DEV_TEMPLATE,
+        "the template has [agents.default]"
+    );
+    format!(
+        "{with_agent_tunable}\n\
+         [runtime_profiles.default.context_compression]\n\
+         summary_model = \"haiku\"\n\n\
+         [security.nevis]\n\
+         client_secret = \"plaintext-nevis-secret\"\n"
+    )
+}
+
+#[test]
+fn current_config_without_retired_keys_is_not_rewritten() {
+    assert_eq!(
+        detect_version(&toml::from_str(DEV_TEMPLATE).unwrap()).unwrap(),
+        CURRENT_SCHEMA_VERSION
+    );
+    assert!(migrate_file_with_notices(DEV_TEMPLATE).unwrap().is_none());
+    let load = migrate_to_current_salvaged(DEV_TEMPLATE);
+    assert!(load.notices.is_empty(), "{:?}", load.notices);
+}
+
+#[test]
+fn current_config_with_retired_keys_migrates_only_those_keys() {
+    let raw = dev_template_with_retired_keys();
+    let (migrated, notices) = migrate_file_with_notices(&raw)
+        .expect("a current config holding retired keys migrates")
+        .expect("and is rewritten");
+
+    let mut removed: Vec<&str> = notices
+        .iter()
+        .map(|notice| match notice {
+            MigrationNotice::Removed { path, .. } => path.as_str(),
+            other => panic!("only removals expected, got {other:?}"),
+        })
+        .collect();
+    removed.sort_unstable();
+    assert_eq!(
+        removed,
+        [
+            "agents.default.max_tool_iterations",
+            "runtime_profiles.default.context_compression.summary_model",
+            "security.nevis",
+        ]
+    );
+
+    // Everything else is untouched: apart from tables left empty by the
+    // removals, the migrated file equals the template.
+    let mut migrated_value: toml::Value = toml::from_str(&migrated).unwrap();
+    let mut template_value: toml::Value = toml::from_str(DEV_TEMPLATE).unwrap();
+    prune_empty_tables(&mut migrated_value);
+    prune_empty_tables(&mut template_value);
+    assert_eq!(migrated_value, template_value);
+
+    assert!(!migrated.contains("plaintext-nevis-secret"));
+    assert!(
+        migrated.contains("# Ollama runs on the host."),
+        "comments in the operator's file survive the migration"
+    );
+    let _: zeroclaw_config::schema::Config =
+        toml::from_str(&migrated).expect("the migrated file loads");
+    assert!(
+        migrate_file(&migrated).unwrap().is_none(),
+        "a second migration has nothing to do"
+    );
+
+    let load = migrate_to_current_salvaged(&raw);
+    assert!(load.dropped.is_empty() && load.dropped_security.is_empty());
+    assert_eq!(load.notices, notices);
+}
+
+#[test]
+fn missing_schema_version_warns_and_migrates_instead_of_erroring() {
+    // detect_version keeps its V1 assumption for a missing key.
+    assert_eq!(
+        detect_version(&toml::from_str("foo = 1").unwrap()).unwrap(),
+        1
+    );
+
+    // A legacy V1 config without the key migrates and reports the assumption.
+    assert!(!V1_FIXTURE.lines().any(|l| l.starts_with("schema_version")));
+    let (_, notices) = migrate_file_with_notices(V1_FIXTURE).unwrap().unwrap();
+    assert_eq!(notices.first(), Some(&MigrationNotice::AssumedV1));
+
+    // A modern config that only lost its `schema_version` line also migrates
+    // rather than erroring, warns, and loads without resetting any section.
+    let unversioned: String = DEV_TEMPLATE
+        .lines()
+        .filter(|line| !line.starts_with("schema_version"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let (migrated, notices) = migrate_file_with_notices(&unversioned)
+        .expect("an unversioned modern config does not error")
+        .expect("it is migrated from V1");
+    assert!(notices.contains(&MigrationNotice::AssumedV1), "{notices:?}");
+    assert_eq!(
+        detect_version(&toml::from_str(&migrated).unwrap()).unwrap(),
+        CURRENT_SCHEMA_VERSION
+    );
+    let load = migrate_to_current_salvaged(&unversioned);
+    assert!(load.notices.contains(&MigrationNotice::AssumedV1));
+    assert!(
+        load.dropped.is_empty() && load.dropped_security.is_empty(),
+        "dropped={:?} dropped_security={:?}",
+        load.dropped,
+        load.dropped_security
+    );
 }

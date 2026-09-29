@@ -45,10 +45,12 @@ impl MigrationNotice {
     pub fn message(&self) -> String {
         match self {
             Self::AssumedV1 => "config has no `schema_version`, so it was read as schema V1 and \
-                 migrated from there. The V1 migration merges channel sections into a \
-                 `default` alias; if this file was written for a newer ZeroClaw, add \
-                 `schema_version` at the top with the version it was written for, \
-                 restore any lost channel aliases, and run `zeroclaw config migrate`."
+                 migrated from there. The V1 migration reshapes sections written for a \
+                 newer version: provider entries can end up nested one level too deep, and \
+                 channel sections are merged into a `default` alias. If this file was \
+                 written for a newer ZeroClaw, add `schema_version` at the top with the \
+                 version it was written for, and restore any lost providers or channel \
+                 aliases."
                 .to_string(),
             Self::Removed { path, reason } => {
                 format!("removed retired config key `{path}`: {reason}")
