@@ -3056,8 +3056,9 @@ fn prune_empty_tables(value: &mut toml::Value) {
     }
 }
 
-/// A real, current-format config: the checked-in dev template.
-const DEV_TEMPLATE: &str = include_str!("../../../dev/config.template.toml");
+/// A real, current-format config: the checked-in dev template, reached through
+/// an in-crate symlink so the published crate stays self-contained.
+const DEV_TEMPLATE: &str = include_str!("../fixtures/dev-config.template.toml");
 
 /// The dev template with one key from each retired shape added: a literal
 /// table, a per-agent tunable, and a per-profile nested key.
