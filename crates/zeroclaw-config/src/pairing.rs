@@ -695,6 +695,18 @@ impl PairingGuard {
         HeldPairedTokens(self.paired_tokens.read())
     }
 
+    /// Whether a pairing or revocation has claimed the paired-token set and
+    /// is waiting behind a reader that still holds it (see
+    /// [`Self::hold_paired_tokens`]). False once no reader holds it, whether
+    /// the writer is then running, finished, or never came. A diagnostic for
+    /// tests that must observe a writer queued behind a hold; it keeps no
+    /// lock.
+    #[doc(hidden)]
+    pub fn token_write_queued_behind_a_hold(&self) -> bool {
+        self.paired_tokens.is_locked_exclusive()
+            && self.paired_tokens.try_read_recursive().is_some()
+    }
+
     /// Returns true if the gateway is already paired (has at least one token).
     pub fn is_paired(&self) -> bool {
         let tokens = self.paired_tokens.read();

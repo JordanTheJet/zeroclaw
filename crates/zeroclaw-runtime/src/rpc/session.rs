@@ -296,6 +296,11 @@ pub struct SessionStore {
     /// first commit that reaches it.
     #[cfg(test)]
     test_upload_effect_hook: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Test-only hook an upload commit runs right after its write and index
+    /// insert, while it still holds the authority lease. Taken by the first
+    /// commit that reaches it.
+    #[cfg(test)]
+    test_upload_written_hook: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 /// Generation-owned handle for the canonical cancellation-token registration.
@@ -363,6 +368,8 @@ impl SessionStore {
             test_upload_commit_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
             test_upload_effect_hook: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            test_upload_written_hook: std::sync::Mutex::new(None),
         }
     }
 
@@ -988,6 +995,26 @@ impl SessionStore {
     #[cfg(not(test))]
     #[inline(always)]
     pub(crate) fn run_test_upload_effect_hook(&self) {}
+
+    /// Arm a test-only hook for the next upload commit, run right after its
+    /// write and index insert, before it releases the authority lease.
+    #[cfg(test)]
+    pub fn set_test_upload_written_hook(&self, hook: impl FnOnce() + Send + 'static) {
+        *self.test_upload_written_hook.lock().unwrap() = Some(Box::new(hook));
+    }
+
+    /// Run the hook armed by [`Self::set_test_upload_written_hook`], if any.
+    #[cfg(test)]
+    pub(crate) fn run_test_upload_written_hook(&self) {
+        let hook = self.test_upload_written_hook.lock().unwrap().take();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    #[cfg(not(test))]
+    #[inline(always)]
+    pub(crate) fn run_test_upload_written_hook(&self) {}
 
     pub async fn touch(&self, id: &str) {
         if let Some(s) = self.sessions.lock().await.get_mut(id) {

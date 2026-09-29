@@ -9660,7 +9660,15 @@ impl RpcDispatcher {
                         .agent_workspace_dir(&target.agent_alias)
                         .to_string_lossy()
                         .to_string();
-                    super::attachments::persist_into_index(uploads, bytes, filename, &upload_root)
+                    let stored = super::attachments::persist_into_index(
+                        uploads,
+                        bytes,
+                        filename,
+                        &upload_root,
+                    );
+                    self.ctx.sessions.run_test_upload_written_hook();
+                    drop(lease);
+                    stored
                 },
             )
             .await
@@ -15634,62 +15642,108 @@ mod tests {
         assert_eq!(upload_index_len(&ctx, sid).await, Some(0));
     }
 
-    /// A revocation started from inside an upload commit, between its final
-    /// authority check and its write, and whether it could finish there.
-    struct RacedRevocation {
-        finished_before_the_write: Arc<std::sync::atomic::AtomicBool>,
-        thread: Arc<std::sync::Mutex<Option<std::thread::JoinHandle<()>>>>,
-    }
+    /// What an upload commit and a revocation racing it did, in the order
+    /// they did it.
+    type RaceTimeline = Arc<std::sync::Mutex<Vec<&'static str>>>;
 
-    impl RacedRevocation {
-        /// Wait for the revocation to finish; returns whether it had already
-        /// finished before the commit wrote the upload.
-        fn settle(self) -> bool {
-            let thread = self.thread.lock().unwrap().take();
-            thread
-                .expect("the commit ran the hook")
-                .join()
-                .expect("the revocation completes");
-            self.finished_before_the_write
-                .load(std::sync::atomic::Ordering::SeqCst)
-        }
-    }
-
-    /// Arm the next upload commit to start `revoke` on another OS thread at
-    /// the point between its final authority check and its write, and to
-    /// give it a generous window to finish there before the write proceeds.
-    /// Nothing but the commit's hold on authority can keep a publication or
-    /// an unpairing, which take microseconds, from finishing in that window.
-    fn race_a_revocation_against_the_next_commit(
+    /// Race `revoke` against the next upload commit and record the order of
+    /// events at the commit's effect boundary.
+    ///
+    /// Between the commit's final authority check and its write, `revoke`
+    /// starts on another OS thread and the commit waits until `queued()`
+    /// reports that writer has claimed the lock the revocation mutates and
+    /// is blocked behind a reader that still holds it: an acknowledgement
+    /// read from the lock, not a timeout. Right after the write and index
+    /// insert, before the commit's lease is released, it records whether the
+    /// writer is still queued behind it and unfinished. The revoking thread
+    /// records when it finishes. A lease released anywhere between the check
+    /// and the end of the write lets the queued writer through first, and the
+    /// timeline shows it.
+    fn race_a_revocation_through_the_commit(
         ctx: &Arc<RpcContext>,
         revoke: impl FnOnce() + Send + 'static,
-    ) -> RacedRevocation {
-        let finished_before_the_write = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        queued: impl Fn() -> bool + Send + Sync + 'static,
+    ) -> (
+        RaceTimeline,
+        Arc<std::sync::Mutex<Option<std::thread::JoinHandle<()>>>>,
+    ) {
+        let timeline: RaceTimeline = Arc::default();
+        let revoked = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let thread = Arc::new(std::sync::Mutex::new(None));
-        let (finished, thread_slot) = (Arc::clone(&finished_before_the_write), Arc::clone(&thread));
-        ctx.sessions.set_test_upload_effect_hook(move || {
-            let (done_tx, done_rx) = std::sync::mpsc::channel();
-            let handle = std::thread::spawn(move || {
-                revoke();
-                let _ = done_tx.send(());
+        let queued = Arc::new(queued);
+        {
+            let (timeline, revoked, thread, queued) = (
+                Arc::clone(&timeline),
+                Arc::clone(&revoked),
+                Arc::clone(&thread),
+                Arc::clone(&queued),
+            );
+            ctx.sessions.set_test_upload_effect_hook(move || {
+                let handle = {
+                    let (timeline, revoked) = (Arc::clone(&timeline), Arc::clone(&revoked));
+                    std::thread::spawn(move || {
+                        revoke();
+                        revoked.store(true, std::sync::atomic::Ordering::SeqCst);
+                        timeline.lock().unwrap().push("revocation finished");
+                    })
+                };
+                let started = std::time::Instant::now();
+                while !queued() {
+                    assert!(
+                        !revoked.load(std::sync::atomic::Ordering::SeqCst),
+                        "the revocation finished between the final check and the write"
+                    );
+                    assert!(
+                        started.elapsed() < std::time::Duration::from_secs(10),
+                        "the revocation never reached its lock"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                timeline
+                    .lock()
+                    .unwrap()
+                    .push("revocation queued behind the commit");
+                *thread.lock().unwrap() = Some(handle);
             });
-            let done = done_rx
-                .recv_timeout(std::time::Duration::from_millis(500))
-                .is_ok();
-            finished.store(done, std::sync::atomic::Ordering::SeqCst);
-            *thread_slot.lock().unwrap() = Some(handle);
-        });
-        RacedRevocation {
-            finished_before_the_write,
-            thread,
         }
+        {
+            let (timeline, revoked) = (Arc::clone(&timeline), Arc::clone(&revoked));
+            ctx.sessions.set_test_upload_written_hook(move || {
+                let held = queued() && !revoked.load(std::sync::atomic::Ordering::SeqCst);
+                timeline.lock().unwrap().push(if held {
+                    "upload written while the revocation was still queued"
+                } else {
+                    "upload written after the revocation got through"
+                });
+            });
+        }
+        (timeline, thread)
     }
 
-    /// A policy publication that revokes alice's agent entitlement lands
+    /// The order a race recorded, once the revoking thread has finished.
+    fn race_order(
+        timeline: RaceTimeline,
+        thread: Arc<std::sync::Mutex<Option<std::thread::JoinHandle<()>>>>,
+    ) -> Vec<&'static str> {
+        let handle = thread.lock().unwrap().take();
+        handle
+            .expect("the commit reached the point between its check and its write")
+            .join()
+            .expect("the revocation completes");
+        timeline.lock().unwrap().clone()
+    }
+
+    const UPLOAD_ORDERED_BEFORE_THE_REVOCATION: [&str; 3] = [
+        "revocation queued behind the commit",
+        "upload written while the revocation was still queued",
+        "revocation finished",
+    ];
+
+    /// A policy publication that revokes alice's agent entitlement arrives
     /// between the commit's final check and its write, through the real
-    /// publication path. It cannot finish until the upload is stored, so the
-    /// upload is ordered before the revocation, and the revocation binds the
-    /// next request.
+    /// publication path. It queues at the accepted-state lock, the upload is
+    /// written and indexed while it waits, it finishes only afterwards, and
+    /// it binds the next request.
     #[tokio::test]
     async fn a_publication_racing_the_final_check_finishes_only_after_the_upload_is_stored() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -15698,10 +15752,12 @@ mod tests {
         let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
         let upload_id = stage_upload(&mut alice, &mut rx, sid, b"ordered first", 1).await;
 
-        let revoking_ctx = Arc::clone(&ctx);
-        let race = race_a_revocation_against_the_next_commit(&ctx, move || {
-            narrow_alice_to_no_agents_via_publication(&revoking_ctx);
-        });
+        let (revoking_ctx, probing_ctx) = (Arc::clone(&ctx), Arc::clone(&ctx));
+        let (timeline, thread) = race_a_revocation_through_the_commit(
+            &ctx,
+            move || narrow_alice_to_no_agents_via_publication(&revoking_ctx),
+            move || probing_ctx.auth.publication_queued_behind_a_lease(),
+        );
         let committed = rpc(
             &mut alice,
             &mut rx,
@@ -15716,9 +15772,9 @@ mod tests {
                 panic!("the upload checked before the publication lands: {committed}")
             })
             .to_string();
-        assert!(
-            !race.settle(),
-            "the publication must not finish between the final check and the write"
+        assert_eq!(
+            race_order(timeline, thread),
+            UPLOAD_ORDERED_BEFORE_THE_REVOCATION
         );
         assert_eq!(std::fs::read(&path).unwrap(), b"ordered first");
         assert_eq!(upload_index_len(&ctx, sid).await, Some(1));
@@ -15734,8 +15790,9 @@ mod tests {
         assert_eq!(after["error"]["code"], json!(FORBIDDEN), "{after}");
     }
 
-    /// The same race for credential revocation: the pairing token behind the
-    /// connection is unpaired between the final check and the write.
+    /// The same order for credential revocation: the pairing token behind the
+    /// connection is unpaired between the final check and the write, and
+    /// queues at the paired-token lock until the upload is stored.
     #[tokio::test]
     async fn an_unpairing_racing_the_final_check_finishes_only_after_the_upload_is_stored() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -15752,10 +15809,17 @@ mod tests {
             .expect("the paired token authenticates");
         let upload_id = stage_upload(&mut operator, &mut rx, sid, b"paired when checked", 1).await;
 
-        let revoking_ctx = Arc::clone(&ctx);
-        let race = race_a_revocation_against_the_next_commit(&ctx, move || {
-            assert!(revoking_ctx.auth.pairing().revoke_token("zc_tok"));
-        });
+        let (revoking_ctx, probing_ctx) = (Arc::clone(&ctx), Arc::clone(&ctx));
+        let (timeline, thread) = race_a_revocation_through_the_commit(
+            &ctx,
+            move || assert!(revoking_ctx.auth.pairing().revoke_token("zc_tok")),
+            move || {
+                probing_ctx
+                    .auth
+                    .pairing()
+                    .token_write_queued_behind_a_hold()
+            },
+        );
         let committed = rpc(
             &mut operator,
             &mut rx,
@@ -15768,9 +15832,9 @@ mod tests {
             .as_str()
             .unwrap_or_else(|| panic!("the upload checked before the unpairing lands: {committed}"))
             .to_string();
-        assert!(
-            !race.settle(),
-            "the unpairing must not finish between the final check and the write"
+        assert_eq!(
+            race_order(timeline, thread),
+            UPLOAD_ORDERED_BEFORE_THE_REVOCATION
         );
         assert_eq!(std::fs::read(&path).unwrap(), b"paired when checked");
 

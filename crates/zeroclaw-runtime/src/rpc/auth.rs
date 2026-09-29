@@ -367,6 +367,15 @@ impl RpcInboundAuth {
         (arrived, release)
     }
 
+    /// Test-only: whether a policy publication has claimed the accepted-state
+    /// lock and is waiting behind a reader that still holds it, such as an
+    /// [`AuthorityLease`]. False once no reader holds it, whether the
+    /// publication is then running, finished, or never came.
+    #[cfg(test)]
+    pub(crate) fn publication_queued_behind_a_lease(&self) -> bool {
+        self.state.is_locked_exclusive() && self.state.try_read_recursive().is_some()
+    }
+
     /// Test-only permissive layer: empty auth config, fresh pairing guard.
     /// Local connections resolve through the legacy shared-operator path.
     pub fn for_tests(config: &Config) -> Arc<Self> {
@@ -828,6 +837,76 @@ mod tests {
             )),
         )
         .expect("valid")
+    }
+
+    /// Wait until `queued()` holds, failing if `writer` finishes first.
+    fn wait_until_queued(queued: impl Fn() -> bool, writer: &std::thread::JoinHandle<impl Send>) {
+        let started = std::time::Instant::now();
+        while !queued() {
+            assert!(
+                !writer.is_finished(),
+                "the writer finished while a lease was held"
+            );
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(10),
+                "the writer never reached its lock"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    /// Negative control for the upload race tests: while a lease is held a
+    /// publication queues and the probe reports it; once the lease is
+    /// released the publication goes through and the probe turns false. A
+    /// lease released before an upload's write therefore changes what those
+    /// tests observe at the write.
+    #[test]
+    fn a_publication_waits_for_a_held_lease_and_proceeds_once_it_is_released() {
+        let auth = Arc::new(auth_for(&base_config(), &["zc_tok"]));
+        let before = auth.generation();
+        let lease = auth.hold_authority();
+        let publisher = {
+            let auth = Arc::clone(&auth);
+            std::thread::spawn(move || auth.refresh_from_config(&base_config()).unwrap())
+        };
+        wait_until_queued(|| auth.publication_queued_behind_a_lease(), &publisher);
+        drop(lease);
+        assert_eq!(publisher.join().unwrap(), before + 1);
+        assert!(!auth.publication_queued_behind_a_lease());
+        assert_eq!(auth.generation(), before + 1);
+    }
+
+    /// The same control for an unpairing, which queues at the paired-token
+    /// lock rather than the accepted-state lock.
+    #[test]
+    fn an_unpairing_waits_for_a_held_lease_and_proceeds_once_it_is_released() {
+        let auth = Arc::new(auth_for(&base_config(), &["zc_tok"]));
+        let lease = auth.hold_authority();
+        let revoker = {
+            let auth = Arc::clone(&auth);
+            std::thread::spawn(move || auth.pairing().revoke_token("zc_tok"))
+        };
+        wait_until_queued(
+            || auth.pairing().token_write_queued_behind_a_hold(),
+            &revoker,
+        );
+        drop(lease);
+        assert!(
+            revoker.join().unwrap(),
+            "the token was paired and is now revoked"
+        );
+        assert!(!auth.pairing().token_write_queued_behind_a_hold());
+        assert!(!auth.pairing().token_is_paired("zc_tok"));
+    }
+
+    /// A lease answers from what it holds: a publication that landed before
+    /// it was taken is what it sees.
+    #[test]
+    fn a_lease_taken_after_a_publication_sees_that_publication() {
+        let auth = auth_for(&base_config(), &["zc_tok"]);
+        let generation = auth.refresh_from_config(&base_config()).unwrap();
+        let lease = auth.hold_authority();
+        assert_eq!(lease.state.resolver.generation(), generation);
     }
 
     #[tokio::test]
