@@ -19450,8 +19450,11 @@ mod tests {
         let _hook = crate::observability::HOOK_TEST_LOCK.lock().await;
         crate::observability::clear_broadcast_hook();
 
-        // What `daemon::run` does, and nothing the gateway does.
-        let bus = EventBus::with_capacities(64, 16);
+        // What `daemon::run` does, and nothing the gateway does. The daemon's
+        // capacities, not small test ones: while this bus holds the
+        // process-wide hook, parallel tests record into its history too, and
+        // a 16-slot ring let them evict this turn before it was read back.
+        let bus = EventBus::new();
         let _daemon_hook = bus.install_hook();
         let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
         let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
