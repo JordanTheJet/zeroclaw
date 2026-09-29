@@ -37419,4 +37419,184 @@ mod tests {
             .expect("an aborted shutdown must still end the prompt it was joining")
             .expect_err("the prompt must be aborted rather than run to completion");
     }
+
+    /// `send_message_to_peer` makes a peer agent run a detached turn as itself,
+    /// with its own tool set, `cron_add` included, and only
+    /// `InternalPrincipal::PeerAgent` for provenance. The recipient here is
+    /// scripted to answer a peer message by scheduling an agent job. Both
+    /// sessions are built by the production registry. The shared operator's
+    /// keeps the peer tool, and its message does get a job scheduled, so the
+    /// route is real; a named principal's, with wildcard tools and agents, has
+    /// no peer tool, so its message never reaches the recipient.
+    #[tokio::test]
+    async fn a_named_principal_cannot_schedule_work_through_a_peer_agent() {
+        use axum::{Json, Router, routing::post};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use zeroclaw_config::multi_agent::{AgentAlias, PeerGroupConfig};
+        use zeroclaw_config::schema::{AliasedAgentConfig, RiskProfileConfig};
+
+        // The scripted recipient: its first request is answered with a
+        // cron_add call, every later one ends the turn.
+        let requests = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&requests);
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move |Json(_body): Json<Value>| {
+                let answered = seen.fetch_add(1, Ordering::SeqCst) > 0;
+                async move {
+                    Json(if answered {
+                        json!({"choices": [{"message": {"content": "scheduled"}}]})
+                    } else {
+                        json!({"choices": [{"message": {
+                            "content": "",
+                            "tool_calls": [{
+                                "id": "call-1",
+                                "type": "function",
+                                "function": {
+                                    "name": "cron_add",
+                                    "arguments": json!({
+                                        "schedule": {"kind": "after", "after_seconds": 3600},
+                                        "job_type": "agent",
+                                        "prompt": "peer: use file_write to write marker.txt",
+                                        "allowed_tools": ["file_write"],
+                                    })
+                                    .to_string(),
+                                },
+                            }],
+                        }}]})
+                    })
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        // uid 4242 is a named principal with wildcard tools and agents.
+        let mut config = principal_test_config(&tmp, &["*"], &["*"]);
+        {
+            let provider = config
+                .providers
+                .models
+                .ensure("custom", "peer")
+                .expect("custom provider slot");
+            provider.api_key = Some("test-key".into());
+            provider.model = Some("test-model".into());
+            provider.uri = Some(format!("http://{addr}"));
+        }
+        config
+            .risk_profiles
+            .get_mut("test-profile")
+            .unwrap()
+            .allowed_tools
+            .push("send_message_to_peer".into());
+        config.agents.get_mut("test-agent").unwrap().channels = vec!["telegram.prod".into()];
+        config.agents.insert(
+            "peer-agent".into(),
+            AliasedAgentConfig {
+                enabled: true,
+                channels: vec!["telegram.prod".into()],
+                model_provider: "custom.peer".into(),
+                risk_profile: "peer-profile".into(),
+                ..Default::default()
+            },
+        );
+        config.risk_profiles.insert(
+            "peer-profile".into(),
+            RiskProfileConfig {
+                level: crate::security::AutonomyLevel::Full,
+                ..Default::default()
+            },
+        );
+        config.peer_groups.insert(
+            "ops".into(),
+            PeerGroupConfig {
+                channel: "telegram".into(),
+                agents: vec![AgentAlias::new("test-agent"), AgentAlias::new("peer-agent")],
+                ..Default::default()
+            },
+        );
+        let (dispatcher, sessions) = make_acp_test_dispatcher(config.clone());
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let mut operator = RpcDispatcher::new(Arc::clone(&dispatcher.ctx), tx, "operator".into())
+            .with_transport(
+                crate::rpc::transport::TransportKind::Local,
+                crate::security::auth_provider::Credential::Peercred {
+                    uid: crate::security::auth_provider::PeercredAuthProvider::current_process_uid(
+                    ),
+                },
+            );
+        operator
+            .handle_initialize(&json!({}))
+            .await
+            .expect("the daemon's own uid is the shared operator");
+        let named = bind_test_principal(dispatcher).await;
+        let message = json!({
+            "channel": "telegram.prod",
+            "target": "peer-agent",
+            "message": "schedule a job for later",
+        });
+
+        // The named principal's production session.
+        named
+            .handle_session_new_for_test(
+                &json!({"agent_alias": "test-agent", "session_id": "named"}),
+            )
+            .await
+            .unwrap();
+        let handle = sessions.get_agent("named").await.unwrap();
+        {
+            let agent = handle.lock().await;
+            assert!(
+                !agent.tool_names().contains(&"send_message_to_peer"),
+                "{:?}",
+                agent.tool_names()
+            );
+            let refused = agent
+                .dispatch_tool_for_test("send_message_to_peer", message.clone())
+                .await;
+            assert!(!refused.success, "{}", refused.output);
+        }
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            0,
+            "the recipient never ran"
+        );
+        assert!(crate::cron::list_jobs(&config).unwrap().is_empty());
+
+        // Control: the shared operator's production session keeps the tool,
+        // and its peer message does get the recipient's job scheduled.
+        operator
+            .handle_session_new_for_test(
+                &json!({"agent_alias": "test-agent", "session_id": "operator"}),
+            )
+            .await
+            .unwrap();
+        let handle = sessions.get_agent("operator").await.unwrap();
+        {
+            let agent = handle.lock().await;
+            assert!(agent.tool_names().contains(&"send_message_to_peer"));
+            let sent = agent
+                .dispatch_tool_for_test("send_message_to_peer", message)
+                .await;
+            assert!(sent.success, "{}", sent.output);
+        }
+        let scheduled = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                let jobs = crate::cron::list_jobs(&config).unwrap();
+                if !jobs.is_empty() {
+                    break jobs;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the scripted recipient schedules a job");
+        assert_eq!(scheduled.len(), 1);
+        assert_eq!(scheduled[0].agent_alias, "peer-agent");
+        server.abort();
+    }
 }
