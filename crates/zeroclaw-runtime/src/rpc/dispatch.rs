@@ -1959,6 +1959,9 @@ impl RpcDispatcher {
         method: Method,
         grants: &zeroclaw_api::grants::ResolvedGrants,
     ) -> Result<(), JsonRpcError> {
+        if self.auth.is_none() {
+            return Err(rpc_err(AUTH_REQUIRED, "First call must be 'initialize'"));
+        }
         if self.is_shared_operator(grants) {
             return Ok(());
         }
@@ -17952,12 +17955,12 @@ mod tests {
 
     /// The agent-facing cron tools install or run work that executes later
     /// under the agent's policy and the job's stored tool list, not under the
-    /// calling principal's ceiling. A session with no principal applied keeps
-    /// them and edits the job through them; a named principal's session, with
-    /// wildcard tools and agents or narrowed to `cron_update` and `file_read`,
-    /// never reaches them, so it cannot hand an agent job that keeps
-    /// `file_write` a new prompt. The call goes through the production tool
-    /// dispatch a model's call takes.
+    /// calling principal's grants. A session with no principal applied keeps
+    /// them and can edit the job through `cron_update`. A named principal's
+    /// session does not have them, with wildcard tools and agents or narrowed
+    /// to `cron_update` and `file_read`, so it cannot hand an agent job that
+    /// keeps `file_write` a new prompt. The calls go through the production
+    /// tool dispatch a model's call takes.
     #[tokio::test]
     async fn constrained_session_cannot_rewrite_an_agent_job_through_cron_tools() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -17993,16 +17996,15 @@ mod tests {
         .expect("the operator's agent job is created");
         let (dispatcher, sessions) = make_acp_test_dispatcher(config.clone());
 
-        // Control: with no principal applied, the session edits the job
-        // through the tool.
+        // Control: with no principal applied, the session edits the job.
         dispatcher
             .handle_session_new_for_test(
                 &json!({"agent_alias":"test-agent","session_id":"unbound-control"}),
             )
             .await
             .unwrap();
-        let control = sessions.get_agent("unbound-control").await.unwrap();
-        let edited = control
+        let handle = sessions.get_agent("unbound-control").await.unwrap();
+        let edited = handle
             .lock()
             .await
             .dispatch_tool_for_test(
@@ -18023,12 +18025,12 @@ mod tests {
             .unwrap();
         let handle = sessions.get_agent("cron-ceiling").await.unwrap();
         let mut agent = handle.lock().await;
-        // Wildcard tools and agents, but a named principal: not the shared
-        // operator, so the session starts without the cron tools.
-        assert!(
-            !agent.tool_names().contains(&"cron_update"),
-            "{:?}",
-            agent.tool_names()
+        let mut names = agent.tool_names();
+        names.sort();
+        assert_eq!(
+            names,
+            vec!["file_read", "file_write"],
+            "a named wildcard principal's session has no scheduling tools"
         );
 
         refresh_test_principal(&dispatcher, &["cron_update", "file_read"], &["test-agent"]);

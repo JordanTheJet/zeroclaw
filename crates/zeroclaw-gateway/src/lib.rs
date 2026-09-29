@@ -5009,8 +5009,12 @@ async fn handle_admin_paircode_new(
                 });
                 return Ok((StatusCode::SERVICE_UNAVAILABLE, Json(body)));
             };
-            let (revoked, config_write_guard) =
-                api_pairing::revoke_device_credential(&state, registry, device_id).await;
+            let (reauthorized, config_write_guard) =
+                api_pairing::revoke_device_credential(&state, registry, device_id, || {
+                    require_gateway_admin_token(&state, &headers)
+                })
+                .await;
+            let revoked = reauthorized?;
             match revoked {
                 Ok(true) => {}
                 Ok(false) => {

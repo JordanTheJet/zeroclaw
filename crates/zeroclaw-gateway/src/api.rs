@@ -5967,6 +5967,110 @@ pub(crate) mod tests {
             .any(|device| device.id == device_id)
     }
 
+    /// Pair one more device on `state` and return its bearer token.
+    async fn add_paired_device(state: &AppState, device_id: &str) -> String {
+        let code = state
+            .pairing
+            .generate_new_pairing_code(zeroclaw_config::pairing::PairingCodePolicy::default())
+            .expect("pairing is enabled");
+        let token = state
+            .pairing
+            .try_pair(&code, device_id)
+            .await
+            .unwrap()
+            .unwrap();
+        state
+            .device_registry
+            .as_ref()
+            .expect("the fixture has a device registry")
+            .register(
+                PairingGuard::token_hash(&token),
+                DeviceInfo {
+                    id: device_id.to_string(),
+                    name: None,
+                    device_type: None,
+                    paired_at: Utc::now(),
+                    last_seen: Utc::now(),
+                    ip_address: None,
+                    capabilities: None,
+                },
+            )
+            .expect("test device registry insert");
+        token
+    }
+
+    /// A device request is authenticated when it arrives, but it acts only
+    /// once it holds the config write lock, and a revocation queued ahead of
+    /// it can revoke its caller meanwhile. Device B deletes device A while A,
+    /// still valid when it asked, waits to rotate or delete B. A must be
+    /// refused once the lock is held: B keeps its device and its token, and
+    /// A is not handed a new pairing code.
+    #[tokio::test]
+    async fn a_device_request_queued_behind_its_callers_revocation_is_refused() {
+        for rotate in [false, true] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let (state, token_a, device_a) = paired_state_with_device(&tmp).await;
+            let token_b = add_paired_device(&state, "dev-b").await;
+            assert!(
+                state.pairing.pairing_code().is_none(),
+                "the pairing-code slot starts empty"
+            );
+
+            let in_flight = std::sync::Arc::clone(&state.config_write_lock)
+                .lock_owned()
+                .await;
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            let mut delete_a = Box::pin({
+                let state = state.clone();
+                let token_b = token_b.clone();
+                let device_a = device_a.clone();
+                async move {
+                    revoke_device(State(state), bearer_headers(&token_b), Path(device_a))
+                        .await
+                        .into_response()
+                }
+            });
+            assert!(std::future::Future::poll(delete_a.as_mut(), &mut cx).is_pending());
+            let mut against_b = Box::pin({
+                let state = state.clone();
+                let token_a = token_a.clone();
+                async move {
+                    let path = Path("dev-b".to_string());
+                    if rotate {
+                        rotate_device_token(State(state), bearer_headers(&token_a), path)
+                            .await
+                            .into_response()
+                    } else {
+                        revoke_device(State(state), bearer_headers(&token_a), path)
+                            .await
+                            .into_response()
+                    }
+                }
+            });
+            assert!(
+                std::future::Future::poll(against_b.as_mut(), &mut cx).is_pending(),
+                "rotate={rotate}: A's request passes its first check and waits"
+            );
+
+            drop(in_flight);
+            assert_eq!(delete_a.await.status(), StatusCode::OK);
+            assert!(!state.pairing.is_authenticated(&token_a));
+
+            let refused = against_b.await;
+            assert_eq!(
+                refused.status(),
+                StatusCode::UNAUTHORIZED,
+                "rotate={rotate}: the revoked caller is refused under the lock"
+            );
+            assert!(device_listed(&state, "dev-b"), "rotate={rotate}");
+            assert!(state.pairing.is_authenticated(&token_b), "rotate={rotate}");
+            assert!(
+                state.pairing.pairing_code().is_none(),
+                "rotate={rotate}: no pairing code is issued to the revoked caller"
+            );
+        }
+    }
+
     /// The gateway's request timeout drops a handler future that is still
     /// waiting. A revoke or rotate dropped while it waits for the config
     /// write lock must leave the device row and its token as they were, so
