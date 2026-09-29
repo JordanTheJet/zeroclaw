@@ -7604,7 +7604,17 @@ impl RpcDispatcher {
                 ));
             }
         }
-        let (command, prompt) = (req.command, req.prompt);
+        // As on `PATCH /api/cron/{id}`: `command` or `prompt` (command wins if
+        // both are sent) patches the instruction the job actually runs, which
+        // is an agent job's prompt and a shell job's command. An agent job only
+        // reaches here through the headless-work gate above; a shell job's new
+        // command is validated below whichever field carried it.
+        let instruction = req.command.or(req.prompt);
+        let (command, prompt) = if is_agent {
+            (None, instruction)
+        } else {
+            (instruction, None)
+        };
         // Validate a replacement command under the owning agent's policy
         // before it is persisted, and without pre-approval: a command that
         // policy gates behind approval is refused, as it is over HTTP and on
@@ -37318,5 +37328,74 @@ mod tests {
             .unwrap_or_else(|| panic!("{accepted}"));
         let job = crate::cron::get_job(&config, id).expect("the operator's job exists");
         assert_eq!(job.allowed_tools, Some(vec!["file_read".to_string()]));
+    }
+
+    /// `cron/patch` maps `command` and `prompt` onto the field the job runs,
+    /// as HTTP does, and a shell command stays policy-validated whichever
+    /// field carried it.
+    #[tokio::test]
+    async fn cron_patch_maps_command_and_prompt_to_the_field_the_job_runs() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = p4_config(&tmp);
+        let agent_job = seed_cron_job(&config, "alpha", "agent-job");
+        let shell_job = crate::cron::add_shell_job_with_approval(
+            &config,
+            "alpha",
+            Some("shell-job".into()),
+            Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "echo hi",
+            None,
+            false,
+        )
+        .expect("an allowed command is added");
+        let ctx = enforcement_ctx(config.clone());
+        let (mut operator, mut rx) = local_operator(&ctx).await;
+
+        // `command` on an agent job rewrites its prompt, not an unused column.
+        let r = rpc(
+            &mut operator,
+            &mut rx,
+            1,
+            "cron/patch",
+            json!({"id": agent_job.id, "agent": "alpha", "command": "summarise the day"}),
+        )
+        .await;
+        assert!(r.get("error").is_none(), "{r}");
+        let stored = crate::cron::get_job(&config, &agent_job.id).expect("agent job exists");
+        assert_eq!(stored.prompt.as_deref(), Some("summarise the day"));
+        assert_eq!(
+            stored.command, agent_job.command,
+            "the command column is untouched"
+        );
+
+        // `prompt` on a shell job rewrites the command that executes.
+        let r = rpc(
+            &mut operator,
+            &mut rx,
+            2,
+            "cron/patch",
+            json!({"id": shell_job.id, "agent": "alpha", "prompt": "echo bye"}),
+        )
+        .await;
+        assert!(r.get("error").is_none(), "{r}");
+        let stored = crate::cron::get_job(&config, &shell_job.id).expect("shell job exists");
+        assert_eq!(stored.command, "echo bye");
+
+        // The alias does not skip validation: an approval-gated command sent as
+        // `prompt` is refused and the job keeps its command.
+        let r = rpc(
+            &mut operator,
+            &mut rx,
+            3,
+            "cron/patch",
+            json!({"id": shell_job.id, "agent": "alpha", "prompt": "git rebase main"}),
+        )
+        .await;
+        assert_eq!(r["error"]["code"], json!(INVALID_PARAMS), "{r}");
+        let stored = crate::cron::get_job(&config, &shell_job.id).expect("shell job exists");
+        assert_eq!(stored.command, "echo bye");
     }
 }
