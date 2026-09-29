@@ -515,6 +515,50 @@ impl RpcInboundAuth {
     /// past its revalidation deadline, and, for a native pairing token, still
     /// paired.
     pub fn credential_is_live(&self, auth: &ConnectionAuth) -> Result<(), AuthDenied> {
+        self.credential_deadlines_live(auth)?;
+        if let Some(hash) = auth.native_token_hash.as_deref()
+            && !self.pairing.token_hash_is_paired(hash)
+        {
+            return Err(AuthDenied::auth_required(
+                crate::i18n::get_required_cli_string("rpc-auth-pairing-revoked"),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Run `effect` only while the credential behind `auth` is live, ordered
+    /// against its revocation: for a native pairing token the paired set is
+    /// held from the membership check through `effect`, so an unpairing lands
+    /// entirely before (and `effect` does not run) or entirely after it.
+    /// Expiry and revalidation deadlines are read immediately before `effect`
+    /// with nothing awaited between. Policy publication is ordered by the
+    /// caller's config write lock, not here.
+    pub fn commit_while_live<R>(
+        &self,
+        auth: &ConnectionAuth,
+        effect: impl FnOnce() -> R,
+    ) -> Result<R, AuthDenied> {
+        match auth.native_token_hash.as_deref() {
+            Some(hash) => self
+                .pairing
+                .while_paired(hash, || {
+                    self.credential_deadlines_live(auth).map(|()| effect())
+                })
+                .unwrap_or_else(|| {
+                    Err(AuthDenied::auth_required(
+                        crate::i18n::get_required_cli_string("rpc-auth-pairing-revoked"),
+                    ))
+                }),
+            None => {
+                self.credential_deadlines_live(auth)?;
+                Ok(effect())
+            }
+        }
+    }
+
+    /// The time-bound half of liveness: not expired and not past the
+    /// revalidation deadline.
+    fn credential_deadlines_live(&self, auth: &ConnectionAuth) -> Result<(), AuthDenied> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -531,13 +575,6 @@ impl RpcInboundAuth {
         {
             return Err(AuthDenied::auth_required(
                 crate::i18n::get_required_cli_string("rpc-auth-revalidation-due"),
-            ));
-        }
-        if let Some(hash) = auth.native_token_hash.as_deref()
-            && !self.pairing.token_hash_is_paired(hash)
-        {
-            return Err(AuthDenied::auth_required(
-                crate::i18n::get_required_cli_string("rpc-auth-pairing-revoked"),
             ));
         }
         Ok(())

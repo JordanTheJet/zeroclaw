@@ -103,12 +103,15 @@ pub struct MigrateOutcome {
 /// validate the migrated snapshot, write it to a temp file, back up the
 /// original to `.toml.bak`, then atomically replace it. `accept` sees the
 /// migrated snapshot before anything is written and can refuse it (the RPC
-/// surface rejects an invalid authorization policy there). The caller holds
+/// surface rejects an invalid authorization policy there). `commit_gate`
+/// decides at the canonical replacement, after the temp file and backup are
+/// written and synced, whether the migration takes effect. The caller holds
 /// its config write lock across this and the swap.
 pub async fn migrate_config_file(
     config_path: &Path,
     data_dir: PathBuf,
     accept: impl FnOnce(&Config) -> Result<(), ConfigApiError>,
+    commit_gate: &dyn zeroclaw_config::commit_gate::ConfigCommitGate,
 ) -> Result<MigrateOutcome, ConfigApiError> {
     let raw = match tokio::fs::read_to_string(&config_path).await {
         Ok(s) => s,
@@ -217,9 +220,26 @@ pub async fn migrate_config_file(
                 ));
             }
 
-            // 3. Atomic rename. On failure, restore from backup.
-            if let Err(e) = tokio::fs::rename(&temp_path, &config_path).await {
+            // 3. Atomic rename, decided by the gate at this instant. A
+            // refusal leaves the original file untouched; a failed rename
+            // restores it from the backup.
+            let replace_attempted = std::sync::atomic::AtomicBool::new(false);
+            let committed = {
+                let mut replace = || {
+                    replace_attempted.store(true, std::sync::atomic::Ordering::Relaxed);
+                    std::fs::rename(&temp_path, config_path)
+                };
+                commit_gate.commit(&mut replace)
+            };
+            if let Err(e) = committed {
                 let _ = tokio::fs::remove_file(&temp_path).await;
+                if !replace_attempted.load(std::sync::atomic::Ordering::Relaxed) {
+                    let _ = tokio::fs::remove_file(&backup_path).await;
+                    return Err(ConfigApiError::new(
+                        ConfigApiCode::InternalError,
+                        format!("migration was refused at commit: {e}"),
+                    ));
+                }
                 if backup_path.exists() {
                     let _ = tokio::fs::copy(&backup_path, &config_path).await;
                 }

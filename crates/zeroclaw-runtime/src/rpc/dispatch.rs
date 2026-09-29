@@ -521,6 +521,9 @@ enum ConfigWriteAuthority {
     /// A whole-submission apply with no path selector (Quickstart): a live
     /// credential and the method's coarse grant.
     WholeSubmission { method: Method },
+    /// The write already took effect, under its own commit-time check (the
+    /// Quickstart helper saves through a gate); only publication remains.
+    AlreadyCommitted,
 }
 
 impl ConfigWriteAuthority {
@@ -538,6 +541,128 @@ impl ConfigWriteAuthority {
             crate::config_ops::write_set::pin(pinned, path, verb);
         }
         self
+    }
+}
+
+/// A staged config write's authority check, resolved once its write set is
+/// fixed.
+enum ConfigCommitCheck {
+    Effects {
+        method: Method,
+        writes: Vec<(String, zeroclaw_api::grants::Verb)>,
+    },
+    WholeSubmission {
+        method: Method,
+    },
+    AlreadyCommitted,
+}
+
+impl ConfigCommitCheck {
+    fn method(&self) -> Option<Method> {
+        match self {
+            Self::Effects { method, .. } | Self::WholeSubmission { method } => Some(*method),
+            Self::AlreadyCommitted => None,
+        }
+    }
+}
+
+/// Holds a config write to its caller's authority at the instant it takes
+/// effect. When the writer has finished every wait (the temporary file and
+/// backup are written and synced), the gate re-resolves the caller's grants
+/// and authorizes every effect, then, holding what orders credential
+/// revocation, rechecks liveness and replaces the canonical file. Nothing is
+/// awaited from the first check to the rename. Policy publication cannot
+/// interleave: it happens only under the config write lock the caller holds.
+struct RpcCommitGate<'a> {
+    dispatcher: &'a RpcDispatcher,
+    check: ConfigCommitCheck,
+    guard: &'a ConfigWriteGuard,
+    refusal: std::sync::Mutex<Option<JsonRpcError>>,
+    committed: std::sync::atomic::AtomicBool,
+}
+
+impl<'a> RpcCommitGate<'a> {
+    fn new(
+        dispatcher: &'a RpcDispatcher,
+        check: ConfigCommitCheck,
+        guard: &'a ConfigWriteGuard,
+    ) -> Self {
+        Self {
+            dispatcher,
+            check,
+            guard,
+            refusal: std::sync::Mutex::new(None),
+            committed: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// The authorization refusal the gate returned, if it refused.
+    fn take_refusal(&self) -> Option<JsonRpcError> {
+        self.refusal
+            .lock()
+            .ok()
+            .and_then(|mut refusal| refusal.take())
+    }
+
+    /// Whether the canonical file was replaced.
+    fn committed(&self) -> bool {
+        self.committed.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn refuse(&self, error: JsonRpcError) -> anyhow::Error {
+        let message = format!("config write refused at commit: {}", error.message);
+        if let Ok(mut refusal) = self.refusal.lock() {
+            *refusal = Some(error);
+        }
+        // The refusal was audited where it was decided.
+        anyhow::Error::msg(message)
+    }
+}
+
+impl zeroclaw_config::commit_gate::ConfigCommitGate for RpcCommitGate<'_> {
+    fn commit(&self, replace: &mut dyn FnMut() -> std::io::Result<()>) -> anyhow::Result<()> {
+        #[cfg(test)]
+        self.dispatcher
+            .ctx
+            .pause_config_replace(crate::rpc::context::ConfigReplacePoint::BeforeAuthority);
+        if let Err(error) = self
+            .dispatcher
+            .run_config_commit_check(&self.check, self.guard)
+        {
+            return Err(self.refuse(error));
+        }
+        let Some(method) = self.check.method() else {
+            replace()?;
+            self.committed
+                .store(true, std::sync::atomic::Ordering::Release);
+            return Ok(());
+        };
+        let Some(auth) = self.dispatcher.auth.as_ref() else {
+            return Err(self.refuse(rpc_err(AUTH_REQUIRED, "First call must be 'initialize'")));
+        };
+        let replaced = self.dispatcher.ctx.auth.commit_while_live(auth, || {
+            #[cfg(test)]
+            self.dispatcher.ctx.pause_config_replace(
+                crate::rpc::context::ConfigReplacePoint::InsideLiveCredential,
+            );
+            replace()
+        });
+        match replaced {
+            Ok(result) => {
+                result?;
+                self.committed
+                    .store(true, std::sync::atomic::Ordering::Release);
+                #[cfg(test)]
+                self.dispatcher
+                    .ctx
+                    .pause_config_replace(crate::rpc::context::ConfigReplacePoint::AfterReplace);
+                Ok(())
+            }
+            Err(denied) => {
+                self.dispatcher.audit_auth_denial(method, &denied);
+                Err(self.refuse(rpc_err(denied.code, denied.message)))
+            }
+        }
     }
 }
 
@@ -1451,13 +1576,26 @@ impl RpcDispatcher {
 
     /// Authorize the staged `working` config under `authority`, against the
     /// live config it would replace. Called by the handler before its side
-    /// effects, and by the persistence boundary after every wait.
+    /// effects, by the persistence boundary before any I/O, and by the commit
+    /// gate at the replacement itself.
     fn authorize_config_effects(
         &self,
         working: &zeroclaw_config::schema::Config,
         authority: &ConfigWriteAuthority,
         guard: &ConfigWriteGuard,
     ) -> Result<(), JsonRpcError> {
+        let check = self.config_commit_check(working, authority);
+        self.run_config_commit_check(&check, guard)
+    }
+
+    /// The authority check a staged write needs, resolved against the live
+    /// config it would replace. The write set is fixed once staged, so it is
+    /// classified here and rechecked on fresh grants wherever it runs.
+    fn config_commit_check(
+        &self,
+        working: &zeroclaw_config::schema::Config,
+        authority: &ConfigWriteAuthority,
+    ) -> ConfigCommitCheck {
         match authority {
             ConfigWriteAuthority::Effects { method, pinned } => {
                 let mut writes = {
@@ -1471,14 +1609,35 @@ impl RpcDispatcher {
                 for (path, verb) in pinned {
                     crate::config_ops::write_set::pin(&mut writes, path.clone(), *verb);
                 }
-                self.authorize_config_write_set(*method, &writes, guard)
+                ConfigCommitCheck::Effects {
+                    method: *method,
+                    writes,
+                }
             }
             ConfigWriteAuthority::WholeSubmission { method } => {
+                ConfigCommitCheck::WholeSubmission { method: *method }
+            }
+            ConfigWriteAuthority::AlreadyCommitted => ConfigCommitCheck::AlreadyCommitted,
+        }
+    }
+
+    /// Run `check` on grants re-resolved now.
+    fn run_config_commit_check(
+        &self,
+        check: &ConfigCommitCheck,
+        guard: &ConfigWriteGuard,
+    ) -> Result<(), JsonRpcError> {
+        match check {
+            ConfigCommitCheck::Effects { method, writes } => {
+                self.authorize_config_write_set(*method, writes, guard)
+            }
+            ConfigCommitCheck::WholeSubmission { method } => {
                 if self.recheck_authority_after_admission(*method)?.is_none() {
                     return Err(rpc_err(AUTH_REQUIRED, "First call must be 'initialize'"));
                 }
                 Ok(())
             }
+            ConfigCommitCheck::AlreadyCommitted => Ok(()),
         }
     }
 
@@ -2705,21 +2864,23 @@ impl RpcDispatcher {
             self.ctx.config_write_lock.try_lock().is_err(),
             "save_and_swap_config caller must hold ctx.config_write_lock"
         );
+        // Refuse before any I/O when the caller's authority is already gone,
+        // e.g. lost while live-session preparation waited behind a turn.
+        let check = self.config_commit_check(&snapshot, &authority);
+        self.run_config_commit_check(&check, guard)?;
         // Validate the auth sections BEFORE anything is persisted or swapped:
         // an invalid authorization policy must be rejected without being
         // installed, and the caller should learn why rather than find the
         // previous policy silently still in effect after a "successful" save.
-        // The point of effect. The caller's authority is rechecked here,
-        // after every wait the caller made (live-session preparation can wait
-        // behind a running turn), and nothing is awaited between this check
-        // and the write below: a credential that expired or was revoked
-        // during those waits refuses the write.
-        self.authorize_config_effects(&snapshot, &authority, guard)?;
         self.validate_config_auth(&snapshot)?;
-        snapshot
-            .save_dirty()
-            .await
-            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Config save failed: {e}")))?;
+        // The save's own waits (reading, writing and syncing the files) come
+        // next; the gate rechecks authority at the canonical replacement.
+        let gate = RpcCommitGate::new(self, check, guard);
+        if let Err(error) = snapshot.save_dirty_gated(&gate).await {
+            return Err(gate.take_refusal().unwrap_or_else(|| {
+                rpc_err(INTERNAL_ERROR, format!("Config save failed: {error}"))
+            }));
+        }
         self.install_saved_config(snapshot);
         Ok(())
     }
@@ -8348,17 +8509,37 @@ impl RpcDispatcher {
             let live = self.ctx.config.read();
             (live.config_path.clone(), live.data_dir.clone())
         };
-        let outcome =
-            crate::config_ops::document::migrate_config_file(&config_path, data_dir, |migrated| {
+        // Whole-config write authority, rechecked at the replacement after
+        // the migration's own file waits.
+        let gate = RpcCommitGate::new(
+            self,
+            ConfigCommitCheck::Effects {
+                method: Method::ConfigMigrate,
+                writes: vec![(
+                    zeroclaw_api::grants::WILDCARD.to_string(),
+                    zeroclaw_api::grants::Verb::Update,
+                )],
+            },
+            &config_write_guard,
+        );
+        let outcome = crate::config_ops::document::migrate_config_file(
+            &config_path,
+            data_dir,
+            |migrated| {
                 self.validate_config_auth(migrated).map_err(|e| {
                     zeroclaw_config::api_error::ConfigApiError::new(
                         zeroclaw_config::api_error::ConfigApiCode::ValidationFailed,
                         e.message,
                     )
                 })
-            })
-            .await
-            .map_err(config_api_err)?;
+            },
+            &gate,
+        )
+        .await;
+        if let Some(refusal) = gate.take_refusal() {
+            return Err(refusal);
+        }
+        let outcome = outcome.map_err(config_api_err)?;
         if outcome.needs_reload {
             self.ctx
                 .pending_reload
@@ -10900,6 +11081,13 @@ impl RpcDispatcher {
         let mut working = self.ctx.config.read().clone();
         // The staged policy is compiled BEFORE Quickstart's first write, so a
         // rejected one cannot reach disk and then be reported as not saved.
+        // The helper saves internally; its gate holds the caller to a live
+        // credential and the Quickstart grant at the canonical replacement.
+        let gate = RpcCommitGate::new(
+            self,
+            self.config_commit_check(&working, &authority),
+            &config_write_guard,
+        );
         let result = crate::quickstart::apply_with_surface_checked(
             req.submission,
             &mut working,
@@ -10910,12 +11098,36 @@ impl RpcDispatcher {
                     .validate_refresh_from_config(staged)
                     .map_err(|e| e.to_string())
             },
+            &gate,
         )
         .await;
+        if let Some(refusal) = gate.take_refusal() {
+            // Refused at the replacement: nothing was written.
+            return Err(refusal);
+        }
+        let committed = gate.committed();
+        drop(gate);
+        if result.is_err() && committed {
+            // The config landed before a later step failed (the personality
+            // files): publish it, so live config matches disk, and report
+            // the errors.
+            self.save_and_swap_config(
+                working.clone(),
+                &config_write_guard,
+                ConfigWriteAuthority::AlreadyCommitted,
+            )
+            .await?;
+        }
         let body = match result {
             Ok(agent) => {
-                self.save_and_swap_config(working, &config_write_guard, authority.clone())
-                    .await?;
+                // Committed under the gate's check; a later revocation does
+                // not undo it, so publish and report what is on disk.
+                self.save_and_swap_config(
+                    working,
+                    &config_write_guard,
+                    ConfigWriteAuthority::AlreadyCommitted,
+                )
+                .await?;
                 let reload_signalled = self.signal_daemon_reload();
                 QuickstartApplyResult::Applied {
                     agent,
@@ -33278,6 +33490,7 @@ mod tests {
         runner.register(Box::new(_hook));
         let ctx = Arc::new(crate::rpc::context::RpcContext {
             config_commit_pause: None,
+            config_replace_pause: None,
             config: Arc::new(parking_lot::RwLock::new(
                 zeroclaw_config::schema::Config::default(),
             )),
@@ -33329,6 +33542,7 @@ mod tests {
         runner.register(Box::new(_hook));
         let ctx = Arc::new(crate::rpc::context::RpcContext {
             config_commit_pause: None,
+            config_replace_pause: None,
             config: Arc::new(parking_lot::RwLock::new(
                 zeroclaw_config::schema::Config::default(),
             )),
@@ -33439,6 +33653,7 @@ mod tests {
 
         let ctx = Arc::new(crate::rpc::context::RpcContext {
             config_commit_pause: None,
+            config_replace_pause: None,
             config: Arc::new(parking_lot::RwLock::new(
                 zeroclaw_config::schema::Config::default(),
             )),
@@ -34851,6 +35066,299 @@ mod tests {
                     .openai
                     .contains_key("renamed")
             );
+        });
+    }
+
+    // ── The write takes effect only under live authority ─────────────
+    //
+    // A config write finishes every wait (reading, writing and syncing the
+    // temporary file and the backup) before its commit gate re-resolves the
+    // caller's authority and, holding the paired-token set, replaces the
+    // canonical file. These tests park inside that commit.
+
+    /// Run `body` on a multi-threaded runtime: the commit parks
+    /// synchronously on a worker thread while the test drives the world.
+    fn run_on_a_multi_threaded_runtime<F>(body: impl FnOnce() -> F + Send + 'static)
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        let handle = std::thread::Builder::new()
+            .name("config-commit-ordering".into())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(move || {
+                tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(2)
+                    .thread_stack_size(8 * 1024 * 1024)
+                    .enable_all()
+                    .build()
+                    .expect("the test runtime builds")
+                    .block_on(body());
+            })
+            .expect("the test thread spawns");
+        if let Err(panic) = handle.join() {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    /// A paired-bearer writer on a context whose config writes park at `at`
+    /// inside their commit. Returns the ends the test drives the park with.
+    async fn paired_writer_with_replace_pause(
+        mut config: zeroclaw_config::schema::Config,
+        at: crate::rpc::context::ConfigReplacePoint,
+    ) -> (
+        Arc<RpcContext>,
+        RpcDispatcher,
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+        config.gateway.paired_tokens = vec!["zc_tok".to_string()];
+        config.save().await.expect("seed the config file");
+        let (arrived_tx, arrived_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let mut inner = Arc::try_unwrap(RpcContext::minimal(config, sessions))
+            .unwrap_or_else(|_| panic!("freshly constructed ctx must be uniquely owned"));
+        inner.config_replace_pause = Some(Arc::new(crate::rpc::context::ConfigReplacePause {
+            at,
+            arrived: arrived_tx,
+            release: std::sync::Mutex::new(release_rx),
+        }));
+        let ctx = Arc::new(inner);
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let mut writer = RpcDispatcher::new(Arc::clone(&ctx), tx, "wss:test".into())
+            .with_transport(
+                crate::rpc::transport::TransportKind::Wss,
+                crate::security::auth_provider::Credential::None,
+            );
+        writer
+            .handle_initialize(&json!({"auth_token": "zc_tok"}))
+            .await
+            .expect("the paired bearer authenticates");
+        (ctx, writer, arrived_rx, release_tx)
+    }
+
+    fn files_beside_config(dir: &std::path::Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(".config.toml.tmp-") || name == "config.toml.bak")
+            .collect();
+        names.sort();
+        names
+    }
+
+    const PARK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+    #[test]
+    fn config_write_revoked_after_its_file_waits_is_refused_at_the_replacement() {
+        run_on_a_multi_threaded_runtime(|| async move {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config_path = tmp.path().join("config.toml");
+            let (ctx, writer, arrived, release) = paired_writer_with_replace_pause(
+                make_two_provider_test_config(&tmp),
+                crate::rpc::context::ConfigReplacePoint::BeforeAuthority,
+            )
+            .await;
+            let before_disk = std::fs::read_to_string(&config_path).unwrap();
+            let before_revision = ctx.auth.accepted_revision();
+
+            let params = json!({
+                "path": "providers.models.openai",
+                "from": "default",
+                "to": "renamed"
+            });
+            let task = zeroclaw_spawn::spawn!(async move {
+                writer.handle_config_map_key_rename(&params).await
+            });
+            arrived
+                .recv_timeout(PARK_TIMEOUT)
+                .expect("the write must reach its commit; a timeout is a failure");
+            // Guard: every earlier check passed and every wait of the save is
+            // done. The synced temporary file and the backup are on disk and
+            // only the replacement remains.
+            let staged = files_beside_config(tmp.path());
+            assert!(
+                staged
+                    .iter()
+                    .any(|name| name.starts_with(".config.toml.tmp-")),
+                "{staged:?}"
+            );
+            assert!(
+                staged.iter().any(|name| name == "config.toml.bak"),
+                "{staged:?}"
+            );
+            assert!(ctx.config_write_lock.try_lock().is_err());
+            assert!(!task.is_finished());
+
+            assert!(ctx.auth.pairing().revoke_token("zc_tok"));
+            release.send(()).unwrap();
+            let result = task.await.expect("the write task completes");
+
+            let err = result.expect_err("the credential died before the replacement");
+            assert_eq!(err.code, AUTH_REQUIRED, "{err:?}");
+            assert_eq!(std::fs::read_to_string(&config_path).unwrap(), before_disk);
+            assert!(
+                files_beside_config(tmp.path()).is_empty(),
+                "nothing left behind"
+            );
+            let live = ctx.config.read().clone();
+            assert!(live.providers.models.openai.contains_key("default"));
+            assert!(!live.providers.models.openai.contains_key("renamed"));
+            assert_eq!(ctx.auth.accepted_revision(), before_revision);
+        });
+    }
+
+    #[test]
+    fn a_revocation_racing_the_replacement_is_ordered_after_it() {
+        run_on_a_multi_threaded_runtime(|| async move {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config_path = tmp.path().join("config.toml");
+            let (ctx, writer, arrived, release) = paired_writer_with_replace_pause(
+                make_two_provider_test_config(&tmp),
+                crate::rpc::context::ConfigReplacePoint::InsideLiveCredential,
+            )
+            .await;
+
+            let params = json!({
+                "path": "providers.models.openai",
+                "from": "default",
+                "to": "renamed"
+            });
+            let task = zeroclaw_spawn::spawn!(async move {
+                let result = writer.handle_config_map_key_rename(&params).await;
+                (writer, result)
+            });
+            arrived
+                .recv_timeout(PARK_TIMEOUT)
+                .expect("the write must reach its commit; a timeout is a failure");
+
+            // Authority passed; the replacement has not happened yet. A
+            // revocation issued now must wait for it rather than land inside
+            // the window between the check and the rename.
+            let pairing = Arc::clone(ctx.auth.pairing());
+            let (revoked_tx, revoked) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = revoked_tx.send(pairing.revoke_token("zc_tok"));
+            });
+            assert!(
+                revoked
+                    .recv_timeout(std::time::Duration::from_millis(300))
+                    .is_err(),
+                "the revocation must not complete while the replacement is in flight"
+            );
+            release.send(()).unwrap();
+            let (writer, result) = task.await.expect("the write task completes");
+
+            let result = result.expect("the write held its authority through the replacement");
+            assert_eq!(result["renamed"], json!(true), "{result}");
+            assert_eq!(
+                revoked.recv_timeout(PARK_TIMEOUT),
+                Ok(true),
+                "the revocation lands once the replacement is done"
+            );
+            let on_disk = std::fs::read_to_string(&config_path).unwrap();
+            assert!(on_disk.contains("renamed"), "{on_disk}");
+            assert!(
+                ctx.config
+                    .read()
+                    .providers
+                    .models
+                    .openai
+                    .contains_key("renamed")
+            );
+
+            // And it binds the connection's next write.
+            let err = writer
+                .handle_config_set(&json!({
+                    "prop": "providers.models.anthropic.default.model",
+                    "value": "after-revocation"
+                }))
+                .await
+                .expect_err("the revoked bearer writes nothing further");
+            assert_eq!(err.code, AUTH_REQUIRED, "{err:?}");
+        });
+    }
+
+    fn quickstart_commit_config(tmp: &tempfile::TempDir) -> zeroclaw_config::schema::Config {
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        config
+    }
+
+    #[test]
+    fn quickstart_revoked_before_its_replacement_writes_nothing() {
+        run_on_a_multi_threaded_runtime(|| async move {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config_path = tmp.path().join("config.toml");
+            let (ctx, writer, arrived, release) = paired_writer_with_replace_pause(
+                quickstart_commit_config(&tmp),
+                crate::rpc::context::ConfigReplacePoint::BeforeAuthority,
+            )
+            .await;
+            let before_disk = std::fs::read_to_string(&config_path).unwrap();
+            let before_revision = ctx.auth.accepted_revision();
+
+            let submission = quickstart_apply_test_submission();
+            let task = zeroclaw_spawn::spawn!(async move {
+                writer
+                    .handle_quickstart_apply(&json!({ "submission": submission }))
+                    .await
+            });
+            arrived
+                .recv_timeout(PARK_TIMEOUT)
+                .expect("Quickstart must reach its commit; a timeout is a failure");
+            assert!(ctx.auth.pairing().revoke_token("zc_tok"));
+            release.send(()).unwrap();
+            let result = task.await.expect("the apply task completes");
+
+            let err = result.expect_err("the credential died before the replacement");
+            assert_eq!(err.code, AUTH_REQUIRED, "{err:?}");
+            assert_eq!(std::fs::read_to_string(&config_path).unwrap(), before_disk);
+            assert!(!ctx.config.read().agents.contains_key("quickstart_bot"));
+            assert_eq!(ctx.auth.accepted_revision(), before_revision);
+        });
+    }
+
+    #[test]
+    fn quickstart_revoked_after_its_replacement_reports_and_publishes_the_commit() {
+        run_on_a_multi_threaded_runtime(|| async move {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config_path = tmp.path().join("config.toml");
+            let (ctx, writer, arrived, release) = paired_writer_with_replace_pause(
+                quickstart_commit_config(&tmp),
+                crate::rpc::context::ConfigReplacePoint::AfterReplace,
+            )
+            .await;
+            let before_revision = ctx.auth.accepted_revision();
+
+            let submission = quickstart_apply_test_submission();
+            let task = zeroclaw_spawn::spawn!(async move {
+                writer
+                    .handle_quickstart_apply(&json!({ "submission": submission }))
+                    .await
+            });
+            arrived
+                .recv_timeout(PARK_TIMEOUT)
+                .expect("Quickstart must reach its commit; a timeout is a failure");
+            // The canonical file is already replaced.
+            let on_disk = std::fs::read_to_string(&config_path).unwrap();
+            assert!(on_disk.contains("quickstart_bot"), "{on_disk}");
+            assert!(ctx.auth.pairing().revoke_token("zc_tok"));
+            release.send(()).unwrap();
+            let result = task.await.expect("the apply task completes");
+
+            // What landed is reported and published, so disk and live agree.
+            let result = result.expect("a committed apply is not reported as refused");
+            assert_eq!(result["kind"], "applied", "{result:#?}");
+            assert!(ctx.config.read().agents.contains_key("quickstart_bot"));
+            assert!(ctx.auth.accepted_revision() > before_revision);
         });
     }
 

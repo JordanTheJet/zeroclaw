@@ -671,6 +671,21 @@ impl PairingGuard {
         self.paired_tokens.lock().contains(token_hash)
     }
 
+    /// Run `f` only while `token_hash` is paired, holding the paired set for
+    /// its duration so a concurrent revocation waits until `f` returns: the
+    /// revocation is ordered entirely before `f` (and `f` does not run) or
+    /// entirely after it. `None` when the hash is not paired. `f` must not
+    /// call back into this guard's token set.
+    pub fn while_paired<R>(&self, token_hash: &str, f: impl FnOnce() -> R) -> Option<R> {
+        let tokens = self.paired_tokens.lock();
+        if !tokens.contains(token_hash) {
+            return None;
+        }
+        let result = f();
+        drop(tokens);
+        Some(result)
+    }
+
     /// Returns true if the gateway is already paired (has at least one token).
     pub fn is_paired(&self) -> bool {
         let tokens = self.paired_tokens.lock();

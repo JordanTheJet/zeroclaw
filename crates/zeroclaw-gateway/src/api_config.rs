@@ -2064,7 +2064,15 @@ pub async fn handle_migrate(
             )
         })
     };
-    match migrate_config_file(&config_path, data_dir, accept).await {
+    // Authorized in full above, under the config write lock.
+    match migrate_config_file(
+        &config_path,
+        data_dir,
+        accept,
+        &zeroclaw_config::commit_gate::UngatedCommit,
+    )
+    .await
+    {
         Ok(outcome) => {
             if outcome.needs_reload {
                 state

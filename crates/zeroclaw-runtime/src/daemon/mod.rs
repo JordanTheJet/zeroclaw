@@ -906,6 +906,8 @@ pub async fn run(
         Some(std::sync::Arc::new(RpcContext {
             #[cfg(test)]
             config_commit_pause: None,
+            #[cfg(test)]
+            config_replace_pause: None,
             config: std::sync::Arc::clone(&live_config),
             config_write_lock: zeroclaw_config::write_lock::shared_config_write_lock(),
             sessions,
