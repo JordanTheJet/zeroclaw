@@ -958,6 +958,53 @@ fn check_tools_admitted_by_agent_policy(
     }
 }
 
+/// The schedule a `cron/patch` stores, as on `PATCH /api/cron/{id}`: a new
+/// expression keeps the job's timezone unless one is sent, a timezone alone
+/// re-times the existing cron expression, and the result is validated before
+/// it is stored. `None` when neither changes.
+fn patched_cron_schedule(
+    existing: &Schedule,
+    expr: Option<String>,
+    tz: Option<String>,
+    clear_tz: Option<bool>,
+) -> Result<Option<Schedule>, String> {
+    let tz = match tz {
+        Some(raw) if raw.trim().is_empty() => {
+            return Err(
+                "tz must be a non-empty IANA timezone; use clear_tz=true to clear it".to_string(),
+            );
+        }
+        Some(raw) => Some(raw.trim().to_string()),
+        None => None,
+    };
+    let clear_tz = clear_tz.unwrap_or(false);
+    if clear_tz && tz.is_some() {
+        return Err("Provide either tz or clear_tz=true, not both".to_string());
+    }
+    let expr = expr
+        .map(|expr| expr.trim().to_string())
+        .filter(|expr| !expr.is_empty());
+    if expr.is_none() && tz.is_none() && !clear_tz {
+        return Ok(None);
+    }
+    let existing_cron = match existing {
+        Schedule::Cron { expr, tz } => Some((expr.clone(), tz.clone())),
+        _ => None,
+    };
+    let (expr, existing_tz) = match (expr, existing_cron) {
+        (Some(expr), existing) => (expr, existing.and_then(|(_, tz)| tz)),
+        (None, Some(existing)) => existing,
+        (None, None) => return Err("tz can only be updated on cron schedules".to_string()),
+    };
+    let schedule = Schedule::Cron {
+        expr,
+        tz: if clear_tz { None } else { tz.or(existing_tz) },
+    };
+    crate::cron::validate_schedule(&schedule, chrono::Utc::now())
+        .map_err(|e| format!("Invalid cron schedule: {e}"))?;
+    Ok(Some(schedule))
+}
+
 /// The surface a quickstart RPC call reports: `tui` when the caller does not
 /// say, which is what every RPC client was labelled before. `test` is refused
 /// so a client cannot tag production telemetry as test traffic.
@@ -7625,15 +7672,10 @@ impl RpcDispatcher {
             crate::cron::validate_shell_command(&config, &owner.agent_alias, command, false)
                 .map_err(|e| rpc_err(INVALID_PARAMS, format!("Cron patch rejected: {e}")))?;
         }
+        let schedule = patched_cron_schedule(&owner.schedule, req.schedule, req.tz, req.clear_tz)
+            .map_err(|e| rpc_err(INVALID_PARAMS, e))?;
         let patch = CronJobPatch {
-            schedule: req.schedule.map(|s| Schedule::Cron {
-                expr: s,
-                tz: if req.clear_tz == Some(true) {
-                    None
-                } else {
-                    req.tz
-                },
-            }),
+            schedule,
             command,
             prompt,
             name: req.name,
@@ -36972,6 +37014,111 @@ mod tests {
         assert_eq!(
             stored.command, "echo hi",
             "a refused patch must not change the job"
+        );
+    }
+
+    /// `cron/patch` schedule fields follow `PATCH /api/cron/{id}`.
+    #[test]
+    fn patched_cron_schedule_follows_the_http_timezone_rules() {
+        let cron = |expr: &str, tz: Option<&str>| Schedule::Cron {
+            expr: expr.into(),
+            tz: tz.map(Into::into),
+        };
+        let existing = cron("*/5 * * * *", Some("America/New_York"));
+        let patch = |expr: Option<&str>, tz: Option<&str>, clear: Option<bool>| {
+            super::patched_cron_schedule(&existing, expr.map(Into::into), tz.map(Into::into), clear)
+        };
+
+        assert_eq!(patch(None, None, None), Ok(None), "nothing to change");
+        assert_eq!(patch(Some("  "), None, None), Ok(None), "blank expression");
+        assert_eq!(
+            patch(Some("0 9 * * *"), None, None),
+            Ok(Some(cron("0 9 * * *", Some("America/New_York")))),
+            "a new expression keeps the job's timezone"
+        );
+        assert_eq!(
+            patch(None, Some(" UTC "), None),
+            Ok(Some(cron("*/5 * * * *", Some("UTC")))),
+            "a timezone alone re-times the existing expression"
+        );
+        assert_eq!(
+            patch(None, None, Some(true)),
+            Ok(Some(cron("*/5 * * * *", None))),
+            "clear_tz alone drops the timezone"
+        );
+        assert!(patch(None, Some(" "), None).is_err_and(|e| e.contains("non-empty IANA timezone")));
+        assert!(
+            patch(None, Some("UTC"), Some(true)).is_err_and(|e| e.contains("not both")),
+            "tz and clear_tz together"
+        );
+        assert!(
+            patch(None, Some("Not/AZone"), None)
+                .is_err_and(|e| e.contains("Invalid cron schedule"))
+        );
+        assert_eq!(
+            super::patched_cron_schedule(
+                &Schedule::Every { every_ms: 60_000 },
+                None,
+                Some("UTC".into()),
+                None
+            ),
+            Err("tz can only be updated on cron schedules".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn cron_patch_over_rpc_changes_the_timezone_alone() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = p4_config(&tmp);
+        let job = crate::cron::add_shell_job_with_approval(
+            &config,
+            "alpha",
+            Some("safe".into()),
+            Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: Some("America/New_York".into()),
+            },
+            "echo hi",
+            None,
+            false,
+        )
+        .expect("an allowed command is added");
+        let ctx = enforcement_ctx(config.clone());
+        let (mut operator, mut rx) = local_operator(&ctx).await;
+
+        let response = rpc(
+            &mut operator,
+            &mut rx,
+            1,
+            "cron/patch",
+            json!({"id": job.id, "agent": "alpha", "tz": "UTC"}),
+        )
+        .await;
+        assert!(response.get("error").is_none(), "{response}");
+        assert_eq!(
+            crate::cron::get_job(&config, &job.id).unwrap().schedule,
+            Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: Some("UTC".into()),
+            }
+        );
+
+        let response = rpc(
+            &mut operator,
+            &mut rx,
+            2,
+            "cron/patch",
+            json!({"id": job.id, "agent": "alpha", "schedule": "0 9 * * *"}),
+        )
+        .await;
+        assert!(response.get("error").is_none(), "{response}");
+        assert_eq!(
+            crate::cron::get_job(&config, &job.id).unwrap().schedule,
+            Schedule::Cron {
+                expr: "0 9 * * *".into(),
+                tz: Some("UTC".into()),
+            },
+            "a new expression keeps the timezone"
         );
     }
 
