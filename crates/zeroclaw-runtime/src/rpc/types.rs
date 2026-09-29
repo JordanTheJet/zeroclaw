@@ -1237,6 +1237,8 @@ rpc_type! {
         pub content: String,
         /// The mtime the editor last saw. When set, the write is refused
         /// with `PRECONDITION_FAILED` if the file on disk has changed since.
+        /// The error's `current_content` and `current_mtime_ms` are included
+        /// only for a caller that also holds `personality:read`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub expected_mtime_ms: Option<i64>,
     }

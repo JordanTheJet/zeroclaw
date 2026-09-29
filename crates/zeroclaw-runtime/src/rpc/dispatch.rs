@@ -9200,7 +9200,10 @@ impl RpcDispatcher {
         // Disk-drift guard, as on `PUT /api/personality/{filename}`: when the
         // editor says which mtime it saw, refuse the write if the file has
         // moved since, and hand back what is on disk now. Read through the
-        // same no-follow handle as every other personality read.
+        // same no-follow handle as every other personality read. This method
+        // needs only `personality:update`; what is on disk (content and mtime)
+        // is `personality:read` data, so it rides along only for a caller that
+        // holds that grant too.
         if let Some(expected) = req.expected_mtime_ms {
             let (current_content, current_mtime_ms) =
                 match read_personality_file(&workspace, &req.filename) {
@@ -9213,12 +9216,21 @@ impl RpcDispatcher {
                     PRECONDITION_FAILED,
                     format!("{} changed on disk since it was read", req.filename),
                 );
-                err.data = Some(serde_json::json!({
+                let mut data = serde_json::json!({
                     "error": "personality_disk_drift",
                     "filename": req.filename,
-                    "current_content": current_content,
-                    "current_mtime_ms": current_mtime_ms,
-                }));
+                });
+                let may_read = self.auth.as_ref().is_some_and(|auth| {
+                    auth.grants.permits(
+                        zeroclaw_api::grants::Resource::Personality,
+                        zeroclaw_api::grants::Verb::Read,
+                    )
+                });
+                if may_read {
+                    data["current_content"] = Value::String(current_content);
+                    data["current_mtime_ms"] = serde_json::json!(current_mtime_ms);
+                }
+                err.data = Some(data);
                 return Err(err);
             }
         }
@@ -37248,6 +37260,130 @@ mod tests {
         )
         .await;
         assert!(current.get("error").is_none(), "{current}");
+    }
+
+    /// `personality/put` needs only `personality:update`. A stale conditional
+    /// put from a caller without `personality:read` is refused without handing
+    /// back the file it may not read; one holding both gets the disk state.
+    #[tokio::test]
+    async fn personality_put_conflict_withholds_disk_state_without_read() {
+        use std::collections::HashMap;
+        use zeroclaw_api::grants::{Resource, Verb};
+        use zeroclaw_config::schema::{PermissionProfileConfig, UserConfig};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = p4_config(&tmp);
+        for (profile, verbs) in [
+            ("personality-update", vec![Verb::Update]),
+            ("personality-read-update", vec![Verb::Read, Verb::Update]),
+        ] {
+            config.permission_profiles.insert(
+                profile.into(),
+                PermissionProfileConfig {
+                    allowed_agents: vec!["alpha".into()],
+                    grants: HashMap::from([(Resource::Personality, verbs)]),
+                    ..PermissionProfileConfig::default()
+                },
+            );
+        }
+        config
+            .users
+            .get_mut("alice")
+            .expect("the roster user exists")
+            .permission_profiles = vec!["personality-update".into()];
+        config.users.insert(
+            "bob".into(),
+            UserConfig {
+                principal_id: None,
+                uid: Some(4243),
+                permission_profiles: vec!["personality-read-update".into()],
+            },
+        );
+        let ctx = enforcement_ctx(config);
+        let (mut operator, mut operator_rx) = local_operator(&ctx).await;
+        let (mut alice, mut alice_rx) = roster_peer(&ctx, 4242).await;
+        let (mut bob, mut bob_rx) = roster_peer(&ctx, 4243).await;
+
+        let seeded = rpc(
+            &mut operator,
+            &mut operator_rx,
+            1,
+            "personality/put",
+            json!({"agent": "alpha", "filename": "SOUL.md", "content": "private sentinel"}),
+        )
+        .await;
+        let mtime = seeded["result"]["mtime_ms"]
+            .as_i64()
+            .unwrap_or_else(|| panic!("{seeded}"));
+
+        let get = rpc(
+            &mut alice,
+            &mut alice_rx,
+            1,
+            "personality/get",
+            json!({"agent": "alpha", "filename": "SOUL.md"}),
+        )
+        .await;
+        assert_eq!(get["error"]["code"], json!(FORBIDDEN), "{get}");
+
+        let stale = rpc(
+            &mut alice,
+            &mut alice_rx,
+            2,
+            "personality/put",
+            json!({
+                "agent": "alpha",
+                "filename": "SOUL.md",
+                "content": "unused",
+                "expected_mtime_ms": -1,
+            }),
+        )
+        .await;
+        assert_eq!(
+            stale["error"]["code"],
+            json!(PRECONDITION_FAILED),
+            "{stale}"
+        );
+        assert!(
+            !stale.to_string().contains("private sentinel"),
+            "an update-only caller must not read the file: {stale}"
+        );
+        assert!(
+            stale["error"]["data"].get("current_content").is_none()
+                && stale["error"]["data"].get("current_mtime_ms").is_none(),
+            "{stale}"
+        );
+
+        let (content, on_disk_mtime) =
+            read_personality_file(&ctx.config.read().agent_workspace_dir("alpha"), "SOUL.md")
+                .expect("the file is readable");
+        assert_eq!(content, "private sentinel", "a refused put must not write");
+        assert_eq!(on_disk_mtime, Some(mtime));
+
+        // Control: read and update together get the disk state back.
+        let stale = rpc(
+            &mut bob,
+            &mut bob_rx,
+            1,
+            "personality/put",
+            json!({
+                "agent": "alpha",
+                "filename": "SOUL.md",
+                "content": "unused",
+                "expected_mtime_ms": -1,
+            }),
+        )
+        .await;
+        assert_eq!(
+            stale["error"]["data"]["current_content"],
+            json!("private sentinel"),
+            "{stale}"
+        );
+        assert_eq!(
+            stale["error"]["data"]["current_mtime_ms"],
+            json!(mtime),
+            "{stale}"
+        );
     }
 
     #[tokio::test]
