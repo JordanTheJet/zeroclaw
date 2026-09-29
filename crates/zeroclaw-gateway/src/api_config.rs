@@ -565,6 +565,7 @@ pub async fn handle_api_channel_bind(
     let authorization = match authorize_config_write(
         &principal,
         ConfigWriteSet::by_effect(&before, &working, [external_peers.as_str()]),
+        &_cfg_guard,
     ) {
         Ok(authorization) => authorization,
         Err(denied) => return denied.into_response(),
@@ -687,6 +688,7 @@ pub async fn handle_prop_put(
             &new_config,
             new_config.dirty_paths.iter().map(String::as_str),
         ),
+        &_cfg_guard,
     ) {
         Ok(authorization) => authorization,
         Err(denied) => return denied.into_response(),
@@ -759,6 +761,7 @@ pub async fn handle_prop_delete(
             new_config.dirty_paths.iter().map(String::as_str),
         )
         .with(q.path.clone(), Verb::Delete),
+        &_cfg_guard,
     ) {
         Ok(authorization) => authorization,
         Err(denied) => return denied.into_response(),
@@ -1004,6 +1007,7 @@ pub async fn handle_delete_map_key(
                 working.dirty_paths.iter().map(String::as_str),
             )
             .with(removed_path, Verb::Delete),
+            &cfg_guard,
         ) {
             Ok(authorization) => authorization,
             Err(denied) => return denied.into_response(),
@@ -1041,7 +1045,10 @@ async fn delete_alias_cascade(
     // delete it only when it owns every one; read under the lock the commit
     // and cleanup run under, and the owner also rides the delete statement.
     let owner = if is_agent {
-        crate::principal_gate::scoped_principal_id(principal)
+        match crate::principal_gate::scoped_principal_id(principal, &guard) {
+            Ok(owner) => owner,
+            Err(denied) => return denied.into_response(),
+        }
     } else {
         None
     };
@@ -1072,6 +1079,7 @@ async fn delete_alias_cascade(
             working.dirty_paths.iter().map(String::as_str),
         )
         .with(format!("{path}.{key}"), Verb::Delete),
+        &guard,
     ) {
         Ok(authorization) => authorization,
         Err(denied) => return denied.into_response(),
@@ -1179,6 +1187,7 @@ pub async fn handle_map_key(
                 working.dirty_paths.iter().map(String::as_str),
             )
             .with(created_path, Verb::Create),
+            &_cfg_guard,
         ) {
             Ok(authorization) => authorization,
             Err(denied) => return denied.into_response(),
@@ -1331,6 +1340,7 @@ pub async fn handle_rename_map_key(
                     )
                     .with(from_path, Verb::Delete)
                     .with(to_path, Verb::Create),
+                    &_cfg_guard,
                 ) {
                     Ok(authorization) => authorization,
                     Err(denied) => return denied.into_response(),
@@ -1376,7 +1386,7 @@ async fn rename_config_cascade(
     }
     let before = state.config.read().clone();
     let authorization =
-        match authorize_config_write(principal, rename_write_set(&before, &working, body)) {
+        match authorize_config_write(principal, rename_write_set(&before, &working, body), guard) {
             Ok(authorization) => authorization,
             Err(denied) => return denied.into_response(),
         };
@@ -1512,6 +1522,7 @@ async fn rename_agent_cascade(
         ConfigWriteSet::default()
             .with(format!("{}.{from}", body.path), Verb::Delete)
             .with(format!("{}.{to}", body.path), Verb::Create),
+        &guard,
     ) {
         return denied.into_response();
     }
@@ -1533,6 +1544,7 @@ async fn rename_agent_cascade(
                 let authorization = match authorize_config_write(
                     principal,
                     rename_write_set(&before, &working, body),
+                    &guard,
                 ) {
                     Ok(authorization) => authorization,
                     Err(denied) => return denied.into_response(),
@@ -1610,15 +1622,20 @@ pub async fn handle_refresh_context_window(
 
     // Authorized before the provider fetch, which sends the profile's stored
     // credentials: a principal that may not write the result must not be
-    // able to trigger that request.
-    if let Err(denied) = authorize_config_write(
-        &principal,
-        ConfigWriteSet::default().with(
-            context_window::target_path(&provider_type, &alias),
-            Verb::Update,
-        ),
-    ) {
-        return denied.into_response();
+    // able to trigger that request. Checked under the config write lock on
+    // current grants, then the lock is released for the fetch.
+    {
+        let preflight_guard = Arc::clone(&state.config_write_lock).lock_owned().await;
+        if let Err(denied) = authorize_config_write(
+            &principal,
+            ConfigWriteSet::default().with(
+                context_window::target_path(&provider_type, &alias),
+                Verb::Update,
+            ),
+            &preflight_guard,
+        ) {
+            return denied.into_response();
+        }
     }
 
     // Deliberately NOT under `config_write_lock`: the outbound provider fetch
@@ -1654,6 +1671,7 @@ pub async fn handle_refresh_context_window(
             &working,
             working.dirty_paths.iter().map(String::as_str),
         ),
+        &_cfg_guard,
     ) {
         Ok(authorization) => authorization,
         Err(denied) => return denied.into_response(),
@@ -1933,7 +1951,7 @@ pub async fn handle_patch(
     for op in ops.iter().filter(|op| op.op == "remove") {
         writes = writes.with(json_pointer_to_dotted(&op.path), Verb::Delete);
     }
-    let authorization = match authorize_config_write(&principal, writes) {
+    let authorization = match authorize_config_write(&principal, writes, &_cfg_guard) {
         Ok(authorization) => authorization,
         Err(denied) => return denied.into_response(),
     };
@@ -2009,7 +2027,7 @@ pub async fn handle_init(
         ),
         |writes, section| writes.with(section.clone(), Verb::Create),
     );
-    let authorization = match authorize_config_write(&principal, writes) {
+    let authorization = match authorize_config_write(&principal, writes, &_cfg_guard) {
         Ok(authorization) => authorization,
         Err(denied) => return denied.into_response(),
     };
@@ -2029,7 +2047,7 @@ pub async fn handle_migrate(
     // A migration rewrites the file as a whole; its write set cannot be
     // enumerated up front, so a scoped principal needs the wildcard
     // selector.
-    if let Err(denied) = authorize_whole_config_write(&principal, &[Verb::Update]) {
+    if let Err(denied) = authorize_whole_config_write(&principal, &[Verb::Update], &_cfg_guard) {
         return denied.into_response();
     }
     let (config_path, data_dir) = {

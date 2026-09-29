@@ -1,5 +1,6 @@
 use crate::agent::dispatcher::{NativeToolDispatcher, ToolDispatcher, XmlToolDispatcher};
 use crate::agent::eval::AutoClassifyExt;
+use crate::agent::execution_tree_budget::ExecutionTreeBudget;
 use crate::agent::prompt::{
     InteractionContext, PromptContext, SystemPromptBuilder, append_timestamp_orientation,
 };
@@ -539,6 +540,9 @@ pub type ConfigGeneration =
 #[derive(Clone, Debug, Default)]
 pub struct ProviderSwitchConfig {
     pub config: Option<std::sync::Arc<zeroclaw_config::schema::Config>>,
+    /// Live shared config used by tools whose security policy must reflect the
+    /// next dispatch even when model/provider state remains generation-pinned.
+    pub live_config: Option<std::sync::Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
     /// Live shared config this snapshot is refreshed from when the caller owns
     /// an acknowledged model-generation refresh transaction. `None` for
     /// one-shot/test agents and direct ACP/WS agents pinned until reconnect.
@@ -1674,6 +1678,7 @@ impl Agent {
             None => {
                 self.provider_switch_config = Some(ProviderSwitchConfig {
                     config: Some(config_generation),
+                    live_config: None,
                     live: None,
                 });
             }
@@ -2596,7 +2601,7 @@ impl Agent {
             };
 
         let structured_history_turn_limit_resolver: Arc<dyn Fn() -> usize + Send + Sync> =
-            if let Some(cap_config) = live_config {
+            if let Some(cap_config) = live_config.clone() {
                 let cap_agent_alias = agent_alias.to_string();
                 Arc::new(move || {
                     cap_config
@@ -2675,6 +2680,7 @@ impl Agent {
                         .as_ref()
                         .map_or_else(|| Arc::new(config.clone()), |cell| Arc::clone(&cell.read())),
                 ),
+                live_config: live_config.clone(),
                 live: live_config_for_generation,
             });
         if let Some(generation) = config_generation {
@@ -3448,6 +3454,8 @@ impl Agent {
             &self.config.resolved.tool_receipts,
         );
         let agent_alias_for_loop = self.observer_agent_alias();
+        let execution_tree_budget =
+            ExecutionTreeBudget::from_limit(self.config.resolved.max_execution_tree_iterations);
         let turn_loop = crate::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
             Some(cost_context.clone()),
             crate::agent::tool_receipts::scope_receipts(
@@ -3501,7 +3509,7 @@ impl Agent {
                         channel_reply_target: None,
                         cancellation_token: None,
                         on_delta: None,
-                        shared_budget: None,
+                        shared_budget: execution_tree_budget.clone(),
                         channel: None,
                         collected_receipts: receipt_scope
                             .as_ref()
@@ -3528,15 +3536,18 @@ impl Agent {
                         // route snapshot.
                         served_route_sink: None,
                         // Live-daemon SOP path: re-assemble a nested step's agent
-                        // when it delegates elsewhere. Config survives only via
-                        // `provider_switch_config`; with `None` (test builder) a
-                        // cross-agent step FAILS CLOSED rather than inheriting
-                        // this turn's context.
-                        sop_reassembly: self
-                            .provider_switch_config
-                            .as_ref()
-                            .and_then(|c| c.config.as_deref())
-                            .map(|config| crate::agent::turn::SopStepReassembly { config }),
+                        // when it delegates elsewhere. Snapshot config and the
+                        // optional live policy handle survive via
+                        // `provider_switch_config`; test builders without that
+                        // context fail closed instead of inheriting this turn.
+                        sop_reassembly: self.provider_switch_config.as_ref().and_then(|c| {
+                            c.config.as_deref().map(|config| {
+                                crate::agent::turn::SopStepReassembly {
+                                    config,
+                                    live_config: c.live_config.clone(),
+                                }
+                            })
+                        }),
                     },
                 )),
             ),
@@ -3948,6 +3959,8 @@ impl Agent {
         let receipt_scope = crate::agent::tool_receipts::ReceiptScope::from_config(
             &self.config.resolved.tool_receipts,
         );
+        let execution_tree_budget =
+            ExecutionTreeBudget::from_limit(self.config.resolved.max_execution_tree_iterations);
 
         // ── Round loop: one tool-call-loop run per steering round ──────────
         // Sink the loop writes the final serving route into each round, so the
@@ -4083,7 +4096,7 @@ impl Agent {
                             channel_reply_target: None,
                             cancellation_token: cancel_token.clone(),
                             on_delta: None,
-                            shared_budget: None,
+                            shared_budget: execution_tree_budget.clone(),
                             channel: approval_bridge.as_deref(),
                             collected_receipts: receipt_scope
                                 .as_ref()
@@ -4107,15 +4120,18 @@ impl Agent {
                             turn_id: &turn_id,
                             served_route_sink: Some(served_route_sink.clone()),
                             // Live-daemon SOP path: re-assemble a nested step's
-                            // agent when it delegates elsewhere. Config survives
-                            // only via `provider_switch_config`; with `None`
-                            // (test builder) a cross-agent step FAILS CLOSED
-                            // rather than inheriting this turn's context.
-                            sop_reassembly: self
-                                .provider_switch_config
-                                .as_ref()
-                                .and_then(|c| c.config.as_deref())
-                                .map(|config| crate::agent::turn::SopStepReassembly { config }),
+                            // agent when it delegates elsewhere. Snapshot config
+                            // and the optional live policy handle survive via
+                            // `provider_switch_config`; test builders without
+                            // that context fail closed instead of inheriting it.
+                            sop_reassembly: self.provider_switch_config.as_ref().and_then(|c| {
+                                c.config.as_deref().map(|config| {
+                                    crate::agent::turn::SopStepReassembly {
+                                        config,
+                                        live_config: c.live_config.clone(),
+                                    }
+                                })
+                            }),
                         },
                     )),
                 ),
@@ -4232,9 +4248,16 @@ impl Agent {
                     let notice = self.trim_history(Some(&turn_id));
                     forward_history_trim_notice(&event_tx, notice).await;
 
+                    // Spending the root's reserved final slot is terminal for
+                    // the whole turn. Steering that arrives during that
+                    // tools-free completion cannot start another round on the
+                    // already exhausted tree budget.
+                    let tree_budget_finalized = execution_tree_budget
+                        .as_ref()
+                        .is_some_and(|budget| budget.remaining() == 0);
                     let has_more_steering =
                         steering_rx.as_deref_mut().is_some_and(|rx| !rx.is_empty());
-                    if has_more_steering {
+                    if has_more_steering && !tree_budget_finalized {
                         continue;
                     }
 
@@ -6910,6 +6933,59 @@ mod tests {
         }
         fn alias(&self) -> &str {
             "StreamingSteeringModelProvider"
+        }
+    }
+
+    struct GatedFinalCompletionProvider {
+        calls: Arc<AtomicUsize>,
+        started: tokio::sync::mpsc::Sender<()>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl ModelProvider for GatedFinalCompletionProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            Ok("root-final".into())
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<zeroclaw_providers::ChatResponse> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.started
+                .send(())
+                .await
+                .expect("final-completion test should still be observing the provider");
+            self.release.notified().await;
+            Ok(zeroclaw_providers::ChatResponse {
+                text: Some("root-final".into()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for GatedFinalCompletionProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "GatedFinalCompletionProvider"
         }
     }
 
@@ -13106,6 +13182,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tree_budget_final_completion_is_terminal_when_steering_arrives() {
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (started_tx, mut started_rx) = tokio::sync::mpsc::channel(1);
+        let release = Arc::new(tokio::sync::Notify::new());
+        let mut config = zeroclaw_config::schema::AliasedAgentConfig::default();
+        config.resolved.max_execution_tree_iterations = Some(1);
+        let mut agent = Agent::builder()
+            .model_provider(Box::new(GatedFinalCompletionProvider {
+                calls: Arc::clone(&calls),
+                started: started_tx,
+                release: Arc::clone(&release),
+            }))
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
+            .memory(mem)
+            .observer(Arc::from(crate::observability::NoopObserver {}))
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .config(config)
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+        let (steering_tx, mut steering_rx) = tokio::sync::mpsc::channel::<String>(4);
+        let handle = zeroclaw_spawn::spawn!(async move {
+            agent
+                .turn_streamed_with_steering_state("first", event_tx, None, Some(&mut steering_rx))
+                .await
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), started_rx.recv())
+            .await
+            .expect("final-completion provider should start")
+            .expect("final-completion provider signal should remain connected");
+        steering_tx
+            .send("too late for another budgeted round".into())
+            .await
+            .expect("steering message should enqueue during final completion");
+        release.notify_one();
+
+        let outcome = handle
+            .await
+            .expect("turn task should finish")
+            .expect("the reserved final completion must remain successful");
+        assert!(outcome.response.contains("root-final"));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "queued steering must not start a second round on the exhausted tree budget"
+        );
+    }
+
+    #[tokio::test]
     async fn turn_streamed_with_steering_error_returns_committed_partial_output() {
         let memory_cfg = zeroclaw_config::schema::MemoryConfig {
             backend: "none".into(),
@@ -15186,6 +15324,7 @@ vision_model_provider = "custom.vision"
             .multimodal_config(config.multimodal.clone())
             .provider_switch_config(ProviderSwitchConfig {
                 config: Some(Arc::new(config.clone())),
+                live_config: None,
                 live: None,
             })
             // Auto-approve so the image-injecting tool runs and the vision route
@@ -15517,6 +15656,7 @@ model_provider = "custom.primary"
             .model_name("primary-model".into())
             .provider_switch_config(ProviderSwitchConfig {
                 config: Some(Arc::new(config.clone())),
+                live_config: None,
                 live: None,
             })
             .build()
@@ -15734,6 +15874,7 @@ model_provider = "custom.only"
             .model_name("large-model".into())
             .provider_switch_config(ProviderSwitchConfig {
                 config: Some(Arc::new(config.clone())),
+                live_config: None,
                 live: None,
             })
             .build()
@@ -16048,6 +16189,7 @@ model_provider = "custom.only"
             "large-v1",
             Some(ProviderSwitchConfig {
                 config: Some(Arc::clone(&generation.read())),
+                live_config: None,
                 live: Some(Arc::clone(&live)),
             }),
         );
@@ -16127,6 +16269,7 @@ model_provider = "custom.only"
             "large-v1",
             Some(ProviderSwitchConfig {
                 config: Some(Arc::clone(&generation.read())),
+                live_config: None,
                 live: None,
             }),
         );
@@ -16314,6 +16457,7 @@ model_provider = "custom.only"
 
         let switch_config = ProviderSwitchConfig {
             config: Some(Arc::new(config)),
+            live_config: None,
             live: None,
         };
         let mut agent = build_test_agent("openai.primary", "current-model", Some(switch_config));
@@ -16345,6 +16489,7 @@ model_provider = "custom.only"
             config: Some(std::sync::Arc::new(
                 zeroclaw_config::schema::Config::default(),
             )),
+            live_config: None,
             live: None,
         };
 
@@ -16390,6 +16535,7 @@ model_provider = "custom.only"
         let cfg_arc = std::sync::Arc::new(cfg);
         let switch_cfg = ProviderSwitchConfig {
             config: Some(cfg_arc.clone()),
+            live_config: None,
             live: None,
         };
 
@@ -16430,6 +16576,7 @@ model_provider = "custom.only"
             config: Some(std::sync::Arc::new(
                 zeroclaw_config::schema::Config::default(),
             )),
+            live_config: None,
             live: None,
         };
 
@@ -16483,6 +16630,7 @@ model_provider = "custom.only"
             config: Some(std::sync::Arc::new(
                 zeroclaw_config::schema::Config::default(),
             )),
+            live_config: None,
             live: None,
         };
         let mut agent = build_test_agent("ollama.large", "large", Some(switch_cfg));
@@ -16544,6 +16692,7 @@ model_provider = "custom.only"
         };
         let switch_cfg = ProviderSwitchConfig {
             config: Some(std::sync::Arc::new(route_config)),
+            live_config: None,
             live: None,
         };
 
@@ -16739,6 +16888,7 @@ model_provider = "custom.only"
                 },
                 ..zeroclaw_config::schema::Config::default()
             })),
+            live_config: None,
             live: None,
         };
         let agent_config = zeroclaw_config::schema::AliasedAgentConfig {

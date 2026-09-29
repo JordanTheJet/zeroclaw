@@ -511,6 +511,60 @@ impl RpcInboundAuth {
         state.resolve(&auth.identity)
     }
 
+    /// Whether the credential behind `auth` is still live: not expired, not
+    /// past its revalidation deadline, and, for a native pairing token, still
+    /// paired.
+    pub fn credential_is_live(&self, auth: &ConnectionAuth) -> Result<(), AuthDenied> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        if let Some(expires_at) = auth.principal.expires_at
+            && expires_at <= now
+        {
+            return Err(AuthDenied::auth_required(
+                crate::i18n::get_required_cli_string("rpc-auth-credential-expired"),
+            ));
+        }
+        if let Some(revalidate_by) = auth.principal.revalidate_by
+            && revalidate_by <= now
+        {
+            return Err(AuthDenied::auth_required(
+                crate::i18n::get_required_cli_string("rpc-auth-revalidation-due"),
+            ));
+        }
+        if let Some(hash) = auth.native_token_hash.as_deref()
+            && !self.pairing.token_hash_is_paired(hash)
+        {
+            return Err(AuthDenied::auth_required(
+                crate::i18n::get_required_cli_string("rpc-auth-pairing-revoked"),
+            ));
+        }
+        Ok(())
+    }
+
+    /// The grants `auth` holds under the accepted policy in force now, not
+    /// the ones stamped on it at admission: a live credential, a fresh
+    /// resolution, and a generation that did not move underneath that
+    /// resolution.
+    ///
+    /// A surface that acts on an admitted binding after a wait calls this at
+    /// the effect, so a revocation that lands during the wait binds it.
+    pub fn current_grants(&self, auth: &ConnectionAuth) -> Result<ResolvedGrants, AuthDenied> {
+        self.credential_is_live(auth)?;
+        let resolved = self
+            .resolve_current(auth)
+            .map_err(AuthDenied::from_deny_reason)?;
+        if resolved.generation != self.generation() {
+            // The accepted state moved between the resolution and this read.
+            // Fail closed rather than act under a policy nobody observed.
+            return Err(AuthDenied::auth_required(
+                crate::i18n::get_required_cli_string("rpc-auth-revalidation-due"),
+            ));
+        }
+        Ok(resolved.grants)
+    }
+
     /// Authenticate one `initialize` handshake into a [`ConnectionAuth`].
     pub async fn authenticate(
         &self,

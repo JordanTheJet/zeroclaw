@@ -447,6 +447,7 @@ pub async fn handle_section_select(
     if let Err(denied) = crate::principal_gate::authorize_config_write(
         &principal,
         crate::principal_gate::ConfigWriteSet::default().with(target, verb),
+        &_cfg_guard,
     ) {
         return denied.into_response();
     }
@@ -473,10 +474,11 @@ pub async fn handle_section_select(
             zeroclaw_api::grants::Verb::Create,
         );
     }
-    let authorization = match crate::principal_gate::authorize_config_write(&principal, writes) {
-        Ok(authorization) => authorization,
-        Err(denied) => return denied.into_response(),
-    };
+    let authorization =
+        match crate::principal_gate::authorize_config_write(&principal, writes, &_cfg_guard) {
+            Ok(authorization) => authorization,
+            Err(denied) => return denied.into_response(),
+        };
     if let Err(e) = persist_and_swap(&state, &authorization, working, &_cfg_guard).await {
         return e;
     }
