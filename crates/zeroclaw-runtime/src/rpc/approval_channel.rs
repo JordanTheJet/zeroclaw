@@ -704,7 +704,7 @@ mod tests {
     async fn a_session_owned_prompt_with_no_viewer_fails_closed_as_unreachable() {
         let (rpc, mut write_rx) = make_rpc();
         let hub = Arc::new(crate::rpc::subscription::SubscriptionHub::new());
-        let _route = hub.route_session("sess-1");
+        let _route = hub.route_session("sess-1", hub.session_source("sess-1"), None);
         let ch = ring_channel(rpc, make_pending(), &hub);
 
         let outcome = ch
@@ -728,12 +728,13 @@ mod tests {
         let (rpc, mut write_rx) = make_rpc();
         let pending = make_pending();
         let hub = Arc::new(crate::rpc::subscription::SubscriptionHub::new());
-        let _route = hub.route_session("sess-1");
+        let _route = hub.route_session("sess-1", hub.session_source("sess-1"), None);
         hub.add_viewer(
             "sess-1",
             "viewer",
             1,
             tokio_util::sync::CancellationToken::new(),
+            false,
         );
         let source = hub.session_source("sess-1");
         let ch = ring_channel(rpc, Arc::clone(&pending), &hub);
@@ -776,12 +777,13 @@ mod tests {
         let (rpc, _write_rx) = make_rpc();
         let pending = make_pending();
         let hub = Arc::new(crate::rpc::subscription::SubscriptionHub::new());
-        let _route = hub.route_session("sess-1");
+        let _route = hub.route_session("sess-1", hub.session_source("sess-1"), None);
         hub.add_viewer(
             "sess-1",
             "viewer",
             1,
             tokio_util::sync::CancellationToken::new(),
+            false,
         );
         let ch = ring_channel(rpc, Arc::clone(&pending), &hub);
         let task = {
@@ -834,12 +836,13 @@ mod tests {
         let (rpc, mut write_rx) = make_rpc();
         let hub = Arc::new(crate::rpc::subscription::SubscriptionHub::new());
         let ch = make_channel_form_caps(rpc, make_pending()).with_subscriptions(Arc::clone(&hub));
-        let _route = hub.route_session("sess-1");
+        let _route = hub.route_session("sess-1", hub.session_source("sess-1"), None);
         hub.add_viewer(
             "sess-1",
             "viewer",
             1,
             tokio_util::sync::CancellationToken::new(),
+            false,
         );
 
         let choices = vec!["a".to_string(), "b".to_string()];

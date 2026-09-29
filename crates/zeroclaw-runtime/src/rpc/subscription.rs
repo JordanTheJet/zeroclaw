@@ -25,7 +25,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use parking_lot::Mutex;
 use serde_json::Value;
@@ -123,14 +123,70 @@ struct Viewer {
     /// The connection that attached it (see [`SubscriptionHub::add_viewer`]).
     connection: u64,
     cancel: CancellationToken,
+    /// Bounded to one turn: it ends with that turn, so it does not count as
+    /// the connection viewing the session for later turns.
+    turn_scoped: bool,
 }
 
-/// Per-session bookkeeping: the ring handle, its viewers, and whether a turn
-/// is currently delivering through the ring.
+/// Per-session bookkeeping: the ring handle, its viewers, whether a turn is
+/// currently delivering through the ring, and which session the ring belongs
+/// to.
 struct SessionEntry {
     id: u64,
     viewers: HashMap<String, Viewer>,
     routed: usize,
+    /// The session incarnation the ring holds frames for, as given by the
+    /// caller that created it. `None` only for a ring created without one,
+    /// which the first identified caller adopts. A ring is never handed to
+    /// a different identity: that caller retires it and gets a fresh ring,
+    /// so a session recreated under a reused id cannot read the old frames.
+    identity: Option<String>,
+}
+
+/// The end of one turn's stream, for a viewer bounded to that turn. Open
+/// while the turn runs; closed at the ring's head when the turn ended, after
+/// which the viewer delivers nothing further.
+pub struct TurnScope {
+    /// The ring's head when the turn ended, or [`Self::OPEN`] while it runs.
+    last_seq: AtomicU64,
+    closed: Notify,
+}
+
+impl Default for TurnScope {
+    fn default() -> Self {
+        Self {
+            last_seq: AtomicU64::new(Self::OPEN),
+            closed: Notify::new(),
+        }
+    }
+}
+
+impl TurnScope {
+    /// No sequence number reaches it, so it cannot be mistaken for a real
+    /// bound. A turn that ends on an empty ring closes at 0, which bounds
+    /// its viewer to nothing at all.
+    const OPEN: u64 = u64::MAX;
+
+    /// The ring's head when the turn ended, once it has.
+    #[must_use]
+    pub fn last_seq(&self) -> Option<u64> {
+        match self.last_seq.load(Ordering::Acquire) {
+            Self::OPEN => None,
+            seq => Some(seq),
+        }
+    }
+
+    /// End the scope at `seq`, the turn's last frame.
+    pub fn close_at(&self, seq: u64) {
+        self.last_seq.store(seq, Ordering::Release);
+        self.closed.notify_waiters();
+    }
+
+    /// Resolves when the scope closes. Enable it before reading
+    /// [`Self::last_seq`] so a close in between is not missed.
+    pub fn closed(&self) -> tokio::sync::futures::Notified<'_> {
+        self.closed.notified()
+    }
 }
 
 #[derive(Default)]
@@ -415,12 +471,49 @@ impl SubscriptionHub {
     #[inline(always)]
     pub(crate) async fn wait_test_delivery_facts_pause(&self) {}
 
-    /// The ring for `session_id`, created on first use.
+    /// The ring for `session_id`, created on first use without an identity.
+    /// Production callers use [`Self::session_source_for`]; this form serves
+    /// callers that only publish into a ring that already exists.
     pub fn session_source(&self, session_id: &str) -> Source {
         let mut sessions = self.sessions.lock();
         if let Some(entry) = sessions.by_id.get(session_id) {
             return Source::Session(entry.id);
         }
+        Self::create_session_entry(&mut sessions, session_id, None)
+    }
+
+    /// The ring holding frames for the session incarnation `identity` names
+    /// under `session_id`, created on first use. A ring kept for a different
+    /// incarnation under the same id (a session deleted, or replaced by
+    /// another owner, without its ring being released) is retired first: its
+    /// viewers end and its frames are dropped, so they can never be replayed
+    /// to the new session.
+    pub fn session_source_for(&self, session_id: &str, identity: &str) -> Source {
+        let mut sessions = self.sessions.lock();
+        if let Some(entry) = sessions.by_id.get_mut(session_id) {
+            match entry.identity.as_deref() {
+                Some(current) if current == identity => return Source::Session(entry.id),
+                None => {
+                    entry.identity = Some(identity.to_string());
+                    return Source::Session(entry.id);
+                }
+                Some(_) => {}
+            }
+        }
+        let retired = sessions.by_id.remove(session_id);
+        let source = Self::create_session_entry(&mut sessions, session_id, Some(identity));
+        drop(sessions);
+        if let Some(entry) = retired {
+            self.retire_session_entry(entry);
+        }
+        source
+    }
+
+    fn create_session_entry(
+        sessions: &mut Sessions,
+        session_id: &str,
+        identity: Option<&str>,
+    ) -> Source {
         sessions.next_id += 1;
         let id = sessions.next_id;
         sessions.by_id.insert(
@@ -429,6 +522,7 @@ impl SubscriptionHub {
                 id,
                 viewers: HashMap::new(),
                 routed: 0,
+                identity: identity.map(str::to_string),
             },
         );
         Source::Session(id)
@@ -443,6 +537,7 @@ impl SubscriptionHub {
         subscription_id: &str,
         connection: u64,
         cancel: CancellationToken,
+        turn_scoped: bool,
     ) {
         let source = self.session_source(session_id);
         let mut sessions = self.sessions.lock();
@@ -451,9 +546,14 @@ impl SubscriptionHub {
             .get_mut(session_id)
             .filter(|entry| Source::Session(entry.id) == source)
         {
-            entry
-                .viewers
-                .insert(subscription_id.to_string(), Viewer { connection, cancel });
+            entry.viewers.insert(
+                subscription_id.to_string(),
+                Viewer {
+                    connection,
+                    cancel,
+                    turn_scoped,
+                },
+            );
         }
         drop(sessions);
         self.viewers_changed.notify_waiters();
@@ -483,7 +583,8 @@ impl SubscriptionHub {
             .map_or(0, |entry| entry.viewers.len())
     }
 
-    /// Whether `connection` already views `session_id`.
+    /// Whether `connection` already views `session_id` beyond a single turn.
+    /// A turn-scoped viewer ends with its turn, so it does not count.
     #[must_use]
     pub fn viewed_by(&self, session_id: &str, connection: u64) -> bool {
         self.sessions
@@ -494,7 +595,7 @@ impl SubscriptionHub {
                 entry
                     .viewers
                     .values()
-                    .any(|viewer| viewer.connection == connection)
+                    .any(|viewer| viewer.connection == connection && !viewer.turn_scoped)
             })
     }
 
@@ -512,16 +613,29 @@ impl SubscriptionHub {
         }
     }
 
-    /// Deliver `session_id`'s turn notifications through its ring until the
-    /// returned guard drops.
-    pub fn route_session(self: &Arc<Self>, session_id: &str) -> SessionRoute {
-        let _ = self.session_source(session_id);
-        if let Some(entry) = self.sessions.lock().by_id.get_mut(session_id) {
+    /// Deliver `session_id`'s turn notifications through `source`, its ring,
+    /// until the returned guard drops. When the guard drops it closes `scope`,
+    /// if given, at the ring's newest sequence number: the turn's last frame.
+    pub fn route_session(
+        self: &Arc<Self>,
+        session_id: &str,
+        source: Source,
+        scope: Option<Arc<TurnScope>>,
+    ) -> SessionRoute {
+        if let Some(entry) = self
+            .sessions
+            .lock()
+            .by_id
+            .get_mut(session_id)
+            .filter(|entry| Source::Session(entry.id) == source)
+        {
             entry.routed += 1;
         }
         SessionRoute {
             hub: Arc::clone(self),
             session_id: session_id.to_string(),
+            source,
+            scope,
         }
     }
 
@@ -543,6 +657,11 @@ impl SubscriptionHub {
         let Some(entry) = self.sessions.lock().by_id.remove(session_id) else {
             return;
         };
+        self.retire_session_entry(entry);
+    }
+
+    /// End a removed ring's viewers and drop its frames.
+    fn retire_session_entry(&self, entry: SessionEntry) {
         let source = Source::Session(entry.id);
         for viewer in entry.viewers.values() {
             viewer.cancel.cancel();
@@ -613,12 +732,24 @@ impl SubscriptionHub {
 pub struct SessionRoute {
     hub: Arc<SubscriptionHub>,
     session_id: String,
+    source: Source,
+    scope: Option<Arc<TurnScope>>,
 }
 
 impl Drop for SessionRoute {
     fn drop(&mut self) {
-        if let Some(entry) = self.hub.sessions.lock().by_id.get_mut(&self.session_id) {
+        if let Some(entry) = self
+            .hub
+            .sessions
+            .lock()
+            .by_id
+            .get_mut(&self.session_id)
+            .filter(|entry| Source::Session(entry.id) == self.source)
+        {
             entry.routed = entry.routed.saturating_sub(1);
+        }
+        if let Some(scope) = self.scope.take() {
+            scope.close_at(self.hub.head_seq(self.source));
         }
     }
 }
@@ -793,7 +924,7 @@ mod tests {
         assert!(hub.total_bytes() > 0);
 
         let viewer = CancellationToken::new();
-        hub.add_viewer("s1", "sub-1", 7, viewer.clone());
+        hub.add_viewer("s1", "sub-1", 7, viewer.clone(), false);
         assert_eq!(hub.viewer_count("s1"), 1);
         assert!(hub.viewed_by("s1", 7));
         assert!(!hub.viewed_by("s1", 8));
@@ -813,18 +944,88 @@ mod tests {
     fn a_route_lasts_as_long_as_its_guard() {
         let hub = Arc::new(small_hub(64));
         assert_eq!(hub.routed_source("s1"), None);
-        let route = hub.route_session("s1");
+        let route = hub.route_session("s1", hub.session_source("s1"), None);
         assert_eq!(hub.routed_source("s1"), Some(hub.session_source("s1")));
         drop(route);
         assert_eq!(hub.routed_source("s1"), None);
+    }
+
+    #[test]
+    fn a_ring_is_never_handed_to_a_different_session_incarnation() {
+        let hub = Arc::new(small_hub(64));
+        let bob = hub.session_source_for("s1", "bob-incarnation");
+        hub.publish(bob, json!({"text": "bob's private frame"}));
+        let viewer = CancellationToken::new();
+        hub.add_viewer("s1", "sub-bob", 7, viewer.clone(), false);
+        assert_eq!(
+            hub.session_source_for("s1", "bob-incarnation"),
+            bob,
+            "the same incarnation keeps its ring and its replay"
+        );
+
+        let alice = hub.session_source_for("s1", "alice-incarnation");
+        assert_ne!(alice, bob, "a reused id gets a fresh ring");
+        assert!(
+            frames(hub.read(alice, 1, 64)).is_empty(),
+            "nothing of the previous incarnation is readable from the new ring"
+        );
+        assert!(
+            viewer.is_cancelled(),
+            "the previous incarnation's viewers end"
+        );
+        assert_eq!(
+            hub.total_bytes(),
+            0,
+            "the retired ring's bytes are returned"
+        );
+    }
+
+    #[test]
+    fn a_ring_created_without_an_identity_is_adopted_not_retired() {
+        let hub = Arc::new(small_hub(64));
+        let source = hub.session_source("s1");
+        hub.publish(source, json!({"text": "published before identification"}));
+        assert_eq!(hub.session_source_for("s1", "the-incarnation"), source);
+        assert_eq!(frames(hub.read(source, 1, 64)), vec![1]);
+    }
+
+    #[test]
+    fn a_turn_scope_closes_at_the_last_frame_when_its_route_drops() {
+        let hub = Arc::new(small_hub(64));
+        let source = hub.session_source_for("s1", "incarnation");
+        let scope = Arc::new(TurnScope::default());
+        hub.add_viewer("s1", "implicit", 7, CancellationToken::new(), true);
+        assert!(
+            !hub.viewed_by("s1", 7),
+            "a turn-scoped viewer does not count as viewing the session"
+        );
+        let route = hub.route_session("s1", source, Some(Arc::clone(&scope)));
+        hub.publish(source, json!({"text": "one"}));
+        hub.publish(source, json!({"text": "two"}));
+        assert_eq!(scope.last_seq(), None, "open while the turn runs");
+        drop(route);
+        assert_eq!(scope.last_seq(), Some(2), "closed at the turn's last frame");
+    }
+
+    #[test]
+    fn a_turn_that_published_nothing_on_an_empty_ring_bounds_its_viewer_to_nothing() {
+        let hub = Arc::new(small_hub(64));
+        let source = hub.session_source_for("s1", "incarnation");
+        let scope = Arc::new(TurnScope::default());
+        drop(hub.route_session("s1", source, Some(Arc::clone(&scope))));
+        assert_eq!(
+            scope.last_seq(),
+            Some(0),
+            "the bound is the empty head, not the next turn's first frame"
+        );
     }
 
     #[tokio::test]
     async fn viewers_gone_resolves_when_the_last_viewer_leaves() {
         let hub = Arc::new(small_hub(64));
         hub.viewers_gone("s1").await; // none attached: immediate
-        hub.add_viewer("s1", "a", 1, CancellationToken::new());
-        hub.add_viewer("s1", "b", 2, CancellationToken::new());
+        hub.add_viewer("s1", "a", 1, CancellationToken::new(), false);
+        hub.add_viewer("s1", "b", 2, CancellationToken::new(), false);
         let waiter = {
             let hub = Arc::clone(&hub);
             zeroclaw_spawn::spawn!(async move { hub.viewers_gone("s1").await })

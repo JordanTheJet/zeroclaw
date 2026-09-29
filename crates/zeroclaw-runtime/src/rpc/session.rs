@@ -173,6 +173,10 @@ pub struct SessionRecord {
     pub durable: Option<DurableSession>,
     /// The owning principal; `None` for legacy / unscoped-creator records.
     pub owner: Option<String>,
+    /// When the durable row was created, if there is one. Together with the
+    /// owner and storage domain it names the durable incarnation: a row
+    /// deleted and recreated under the same id has a different value.
+    pub durable_created_at: Option<String>,
 }
 
 /// Canonical live-session data returned when `session/new` reattaches to an
@@ -300,6 +304,10 @@ pub struct SessionStore {
     /// point for the revocation tests. Fires once.
     #[cfg(test)]
     test_append_admission_pause: std::sync::Mutex<Option<PromptRegistrationPause>>,
+    /// Test-only pause right after `session/steer` or `session/abort` has
+    /// resolved the session's owner, before it rechecks authority. Fires once.
+    #[cfg(test)]
+    test_control_lookup_pause: std::sync::Mutex<Option<PromptRegistrationPause>>,
     #[cfg(test)]
     test_prompt_rehydration_pause: std::sync::Mutex<Option<PromptRehydrationPause>>,
     /// Test-only pause after a removal handler captures the target generation
@@ -371,6 +379,8 @@ impl SessionStore {
             test_prompt_registration_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
             test_append_admission_pause: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            test_control_lookup_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
             test_prompt_rehydration_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
@@ -1550,6 +1560,28 @@ impl SessionStore {
     }
 
     #[cfg(test)]
+    pub(crate) async fn wait_test_control_lookup_pause(&self) {
+        let Some((entered, release)) = self.test_control_lookup_pause.lock().unwrap().take() else {
+            return;
+        };
+        entered.notify_one();
+        release.notified().await;
+    }
+
+    #[cfg(not(test))]
+    #[inline(always)]
+    pub(crate) async fn wait_test_control_lookup_pause(&self) {}
+
+    #[cfg(test)]
+    pub(crate) fn set_test_control_lookup_pause(&self) -> PromptRegistrationPause {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        *self.test_control_lookup_pause.lock().unwrap() =
+            Some((Arc::clone(&entered), Arc::clone(&release)));
+        (entered, release)
+    }
+
+    #[cfg(test)]
     pub(crate) async fn wait_test_prompt_rehydration_pause(&self) {
         let (entered, release) = {
             let guard = self.test_prompt_rehydration_pause.lock().unwrap();
@@ -1648,6 +1680,13 @@ impl SessionStore {
         self.signal_cancellation(id, CancelCause::OperatorAbort)
     }
 
+    /// Abort only the turn running in the live incarnation `session_generation`
+    /// names, so a replacement published after the caller was authorized is
+    /// not interrupted.
+    pub fn abort_session_generation(&self, id: &str, session_generation: Option<u64>) -> bool {
+        self.signal_cancellation_for_generation(id, session_generation, CancelCause::OperatorAbort)
+    }
+
     /// Signal an in-flight turn before a close/delete handler waits for the
     /// session admission permit. The handler removes the session only after
     /// the admitted prompt has finalized under its original incarnation.
@@ -1731,13 +1770,35 @@ impl SessionStore {
             .insert(id.to_string(), (generation, sender));
     }
 
-    /// Queue a steering message for the session's running turn.
-    pub fn steer_session(&self, id: &str, content: String) -> SteerOutcome {
+    /// Queue a steering message for the turn running in one live incarnation
+    /// of the session: the one `session_generation` names. A turn that
+    /// belongs to another incarnation under the same id (a replacement
+    /// published after the caller was authorized) does not receive it.
+    pub fn steer_session_generation(
+        &self,
+        id: &str,
+        session_generation: Option<u64>,
+        content: String,
+    ) -> SteerOutcome {
+        let Some(session_generation) = session_generation else {
+            return SteerOutcome::NoActiveTurn;
+        };
+        let turn = self
+            .cancel_tokens
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(id)
+            .filter(|(_, registered, _)| *registered == Some(session_generation))
+            .map(|(turn, _, _)| *turn);
+        let Some(turn) = turn else {
+            return SteerOutcome::NoActiveTurn;
+        };
         let sender = self
             .steering
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(id)
+            .filter(|(registered_turn, _)| *registered_turn == turn)
             .map(|(_, sender)| sender.clone());
         let Some(sender) = sender else {
             return SteerOutcome::NoActiveTurn;
