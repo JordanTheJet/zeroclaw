@@ -4441,9 +4441,18 @@ permissions = ["http_client"]
         );
     }
 
-    #[tokio::test]
-    async fn backup_and_data_management_use_shared_data_dir_not_agent_workspace() {
-        let tmp = TempDir::new().unwrap();
+    /// Registers the tool set against a shared data dir and a separate agent
+    /// workspace, then drives `backup` through create, list, verify and
+    /// restore. `destination_dir` of `None` keeps the `BackupConfig` default;
+    /// nothing here pins what that default is. Every assertion follows the
+    /// implemented behaviour: the backup lands under
+    /// `data_dir/<destination_dir>/<name>`, `location` reports that directory,
+    /// stored files keep their names whether or not they are compressed, and
+    /// nothing is created under the agent workspace.
+    async fn backup_round_trip_in_shared_data_dir(
+        tmp: &TempDir,
+        destination_dir: Option<&str>,
+    ) -> (AllToolsResult, std::path::PathBuf, std::path::PathBuf) {
         let data_dir = tmp.path().join("shared-data");
         let workspace_dir = tmp.path().join("agent-workspace");
         std::fs::create_dir_all(data_dir.join("config")).unwrap();
@@ -4482,10 +4491,13 @@ permissions = ["http_client"]
         let http = zeroclaw_config::schema::HttpRequestConfig::default();
         let web = zeroclaw_config::schema::WebFetchConfig::default();
         let risk = zeroclaw_config::schema::RiskProfileConfig::default();
-        let mut root_config = test_config(&tmp);
+        let mut root_config = test_config(tmp);
         root_config.data_dir = data_dir.clone();
         root_config.backup.enabled = true;
         root_config.backup.include_dirs = vec!["config".into()];
+        if let Some(destination_dir) = destination_dir {
+            root_config.backup.destination_dir = destination_dir.into();
+        }
         root_config.data_retention.enabled = true;
         root_config.data_retention.retention_days = 1;
         let config = Config {
@@ -4493,7 +4505,7 @@ permissions = ["http_client"]
             ..Config::default()
         };
 
-        let tools = all_tools_with_runtime(
+        let registry = all_tools_with_runtime(
             Arc::new(config),
             &security,
             &risk,
@@ -4516,11 +4528,11 @@ permissions = ["http_client"]
             None,
             None,
         )
-        .expect("tool registry builds")
-        .tools;
+        .expect("tool registry builds");
         assert!(!security.allowed_roots.contains(&data_dir));
 
-        let backup = tools
+        let backup = registry
+            .tools
             .iter()
             .find(|tool| tool.name() == "backup")
             .expect("enabled backup tool must register");
@@ -4530,28 +4542,34 @@ permissions = ["http_client"]
             .unwrap();
         assert!(created.success, "backup failed: {:?}", created.error);
         let created: serde_json::Value = serde_json::from_str(&created.output).unwrap();
-        let backup_name = created["backup"].as_str().unwrap();
-        assert!(
-            data_dir
-                .join("backups")
-                .join(backup_name)
-                .join("manifest.json")
-                .exists()
+        let backup_name = created["backup"].as_str().unwrap().to_string();
+
+        // The tool writes wherever `backup.destination_dir` points, relative to
+        // the shared data dir, and reports that directory back.
+        let destination = root_config.backup.destination_dir.clone();
+        assert_eq!(
+            created["location"], destination,
+            "create must report the directory it wrote to"
         );
-        assert!(
-            data_dir
-                .join("backups")
-                .join(backup_name)
-                .join("config/shared.txt")
-                .exists()
+        assert_eq!(
+            created["compressed"], root_config.backup.compress,
+            "create must report whether it stored files compressed"
         );
+        assert_eq!(created["encrypted"], false);
+        let backup_dir = data_dir.join(&destination).join(&backup_name);
         assert!(
-            !data_dir
-                .join("backups")
-                .join(backup_name)
-                .join("config/agent.txt")
-                .exists()
+            backup_dir.join("manifest.json").exists(),
+            "manifest missing under {}",
+            backup_dir.display()
         );
+        assert!(backup_dir.join("config/shared.txt").exists());
+        assert!(!backup_dir.join("config/agent.txt").exists());
+        assert_eq!(
+            backup_dir.join("backup-format.json").exists(),
+            root_config.backup.compress || root_config.backup.encrypt,
+            "the format descriptor exists exactly when stored files are encoded"
+        );
+        assert!(!workspace_dir.join(&destination).exists());
         assert!(!workspace_dir.join("backups").exists());
 
         let listed = backup
@@ -4565,7 +4583,7 @@ permissions = ["http_client"]
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|entry| entry["name"] == backup_name)
+                .any(|entry| entry["name"] == backup_name && entry["location"] == destination)
         );
 
         let verified = backup
@@ -4577,6 +4595,8 @@ permissions = ["http_client"]
             .unwrap();
         assert!(verified.success, "verify failed: {:?}", verified.error);
 
+        // Restore proves the stored copy decodes back to the original bytes,
+        // compressed or not.
         std::fs::write(data_dir.join("config/shared.txt"), "changed").unwrap();
         let restored = backup
             .execute(serde_json::json!({
@@ -4595,6 +4615,30 @@ permissions = ["http_client"]
             std::fs::read_to_string(workspace_dir.join("config/agent.txt")).unwrap(),
             "agent"
         );
+
+        (registry, data_dir, workspace_dir)
+    }
+
+    #[tokio::test]
+    async fn backup_and_data_management_use_shared_data_dir_not_agent_workspace() {
+        let tmp = TempDir::new().unwrap();
+        let (registry, data_dir, workspace_dir) =
+            backup_round_trip_in_shared_data_dir(&tmp, None).await;
+        let tools = &registry.tools;
+
+        // Whatever `BackupConfig` makes the default destination, the backup
+        // must be there and the data-management stats must count its top-level
+        // directory (`backups` for a destination of `backups`, `state` for
+        // `state/backups`, and so on).
+        let default_destination = Config::default().backup.destination_dir;
+        assert!(data_dir.join(&default_destination).is_dir());
+        let destination_root = std::path::Path::new(&default_destination)
+            .components()
+            .next()
+            .expect("the default destination has a first component")
+            .as_os_str()
+            .to_string_lossy()
+            .into_owned();
 
         let data_management = tools
             .iter()
@@ -4623,8 +4667,32 @@ permissions = ["http_client"]
             .unwrap();
         assert!(stats.success, "stats failed: {:?}", stats.error);
         let stats: serde_json::Value = serde_json::from_str(&stats.output).unwrap();
-        assert!(stats["subdirectories"].get("backups").is_some());
+        assert!(
+            stats["subdirectories"]
+                .get(destination_root.as_str())
+                .is_some(),
+            "stats must count the backup destination's top-level directory {destination_root}: {stats}"
+        );
         assert!(!workspace_dir.join("backups").exists());
+    }
+
+    #[tokio::test]
+    async fn backup_honours_a_configured_destination_dir() {
+        let tmp = TempDir::new().unwrap();
+        let (_registry, data_dir, workspace_dir) =
+            backup_round_trip_in_shared_data_dir(&tmp, Some("archive/nightly")).await;
+
+        assert!(data_dir.join("archive/nightly").is_dir());
+        let default_destination = Config::default().backup.destination_dir;
+        assert!(
+            !data_dir.join(default_destination).exists(),
+            "a configured destination must not also write to the default one"
+        );
+        assert!(
+            !data_dir.join("backups").exists(),
+            "a configured destination must not also write to the legacy backups/ directory"
+        );
+        assert!(!workspace_dir.join("archive").exists());
     }
 
     #[tokio::test]
