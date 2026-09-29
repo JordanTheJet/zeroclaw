@@ -3278,7 +3278,10 @@ fn resolve_sender_role_turn(
     };
     let registry: &[Box<dyn Tool>] = &ctx.tools_registry[..];
     let mut narrowed = agent_profile.narrowed_for_sender_role(role_profile);
-    let wrapped_always_ask = sender_role_wrapped_always_ask(registry, &narrowed.always_ask);
+    // Wrappers are matched against the role's approval gate itself, so an
+    // entry the gate accepts for a direct call reaches the wrapper too.
+    let direct_gate = ctx.approval_manager.derive_for_risk_profile(&narrowed);
+    let wrapped_always_ask = sender_role_wrapped_always_ask(registry, &direct_gate);
     narrowed.always_ask.extend(wrapped_always_ask);
     SenderRoleOutcome::Role(Box::new(SenderRoleTurn {
         group: role.group,
@@ -3324,42 +3327,43 @@ fn wrapper_chain(tool: &dyn Tool) -> Vec<&dyn Tool> {
 /// execution without carrying the caller's ceiling. Until those paths carry
 /// the sender's restrictions, a role turn does not reach them at all.
 fn sender_role_excluded_tools(registry: &[Box<dyn Tool>], role_excluded: &[String]) -> Vec<String> {
-    let blocked_name = |name: &str| {
-        SENDER_ROLE_UNFOLLOWED_TOOLS.contains(&name)
-            || role_excluded.iter().any(|excluded| excluded == name)
-    };
+    use zeroclaw_runtime::agent::tool_execution::is_excluded_tool;
     let mut excluded: Vec<String> = role_excluded.to_vec();
     for name in SENDER_ROLE_UNFOLLOWED_TOOLS {
-        if !excluded.iter().any(|tool| tool == name) {
+        if !is_excluded_tool(name, &excluded) {
             excluded.push((*name).to_string());
         }
     }
+    // Matched as the execution gate matches, so a padded or differently cased
+    // entry that blocks a direct call blocks the same tool behind a wrapper.
+    let base = excluded.clone();
     for tool in registry {
-        let blocked = wrapper_chain(tool.as_ref())
-            .into_iter()
-            .any(|link| link.requires_unrestricted_principal() || blocked_name(link.name()));
-        if blocked && !excluded.iter().any(|name| name == tool.name()) {
+        let blocked = wrapper_chain(tool.as_ref()).into_iter().any(|link| {
+            link.requires_unrestricted_principal() || is_excluded_tool(link.name(), &base)
+        });
+        if blocked && !is_excluded_tool(tool.name(), &excluded) {
             excluded.push(tool.name().to_string());
         }
     }
     excluded
 }
 
-/// Registered wrappers whose chain reaches a tool in `always_ask`. They ask
-/// too, so a renamed wrapper cannot run the tool without the approval the
-/// role requires for it.
+/// Registered wrappers whose chain reaches a tool `gate` always asks about.
+/// They ask too, so a renamed wrapper cannot run the tool without the
+/// approval the role requires for it. `gate` is the role's own approval
+/// manager, so the match is the one it applies to a direct call.
 fn sender_role_wrapped_always_ask(
     registry: &[Box<dyn Tool>],
-    always_ask: &[String],
+    gate: &ApprovalManager,
 ) -> Vec<String> {
     registry
         .iter()
-        .filter(|tool| !always_ask.iter().any(|name| name == tool.name()))
+        .filter(|tool| !gate.always_asks(tool.name()))
         .filter(|tool| {
             wrapper_chain(tool.as_ref())
                 .into_iter()
                 .skip(1)
-                .any(|link| always_ask.iter().any(|name| name == link.name()))
+                .any(|link| gate.always_asks(link.name()))
         })
         .map(|tool| tool.name().to_string())
         .collect()
@@ -28639,6 +28643,140 @@ BTC is currently around $65,000 based on latest tool output."#
             );
             assert_eq!(executions.load(Ordering::SeqCst), expected_runs, "{label}");
         }
+    }
+
+    #[tokio::test]
+    async fn a_padded_or_recased_exclusion_reaches_the_tool_behind_a_wrapper() {
+        let mut failures = Vec::new();
+        for spelling in [" mock_price ", "MOCK_PRICE", " Mock_Price "] {
+            // The direct call is the control that the entry is active; the
+            // owner's wrapper call is the control that the wrapper works.
+            for (sender, via_wrapper, expected) in [
+                ("mallory", false, 0),
+                ("mallory", true, 0),
+                ("alice", true, 1),
+            ] {
+                let executions = Arc::new(AtomicUsize::new(0));
+                let target: Arc<dyn Tool> = Arc::new(CountingPriceTool(Arc::clone(&executions)));
+                let wrapper = skill_wrapper("price", Arc::clone(&target));
+                let called = if via_wrapper {
+                    wrapper.name().to_string()
+                } else {
+                    "mock_price".to_string()
+                };
+                let guest = zeroclaw_config::schema::RiskProfileConfig {
+                    excluded_tools: vec![spelling.to_string()],
+                    ..open_guest()
+                };
+                let room = Arc::new(SenderRoleTestChannel::new("test-channel", None));
+                run_sender_turn(
+                    open_sender_role_config(guest),
+                    sender,
+                    &called,
+                    vec![
+                        Box::new(zeroclaw_runtime::tools::ArcToolRef(target)),
+                        Box::new(wrapper),
+                    ],
+                    vec![room as Arc<dyn Channel>],
+                )
+                .await;
+                let runs = executions.load(Ordering::SeqCst);
+                if runs != expected {
+                    failures.push(format!(
+                        "{spelling:?} excluded, {sender} calls {called}: {runs} runs, expected {expected}"
+                    ));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[tokio::test]
+    async fn a_padded_always_ask_reaches_the_tool_behind_a_wrapper() {
+        let mut failures = Vec::new();
+        for (answer, expected) in [
+            (zeroclaw_api::channel::ChannelApprovalResponse::Approve, 1),
+            (zeroclaw_api::channel::ChannelApprovalResponse::Deny, 0),
+        ] {
+            let label = format!("{answer:?}");
+            // The direct call is the control that the padded entry is active.
+            for via_wrapper in [false, true] {
+                let executions = Arc::new(AtomicUsize::new(0));
+                let target: Arc<dyn Tool> = Arc::new(CountingPriceTool(Arc::clone(&executions)));
+                let wrapper = skill_wrapper("price", Arc::clone(&target));
+                let called = if via_wrapper {
+                    wrapper.name().to_string()
+                } else {
+                    "mock_price".to_string()
+                };
+                let room = Arc::new(SenderRoleTestChannel::new(
+                    "test-channel",
+                    Some(zeroclaw_api::channel::ChannelApprovalResponse::Approve),
+                ));
+                let ops = Arc::new(SenderRoleTestChannel::new("ops", Some(answer.clone())));
+                let guest = zeroclaw_config::schema::RiskProfileConfig {
+                    always_ask: vec![" mock_price ".into()],
+                    approval_route: Some(guest_route("ops")),
+                    ..open_guest()
+                };
+                run_sender_turn(
+                    open_sender_role_config(guest),
+                    "mallory",
+                    &called,
+                    vec![
+                        Box::new(zeroclaw_runtime::tools::ArcToolRef(target)),
+                        Box::new(wrapper),
+                    ],
+                    vec![
+                        room.clone() as Arc<dyn Channel>,
+                        ops.clone() as Arc<dyn Channel>,
+                    ],
+                )
+                .await;
+                let asked = ops.approvals.lock().await.clone();
+                let runs = executions.load(Ordering::SeqCst);
+                if !room.approvals.lock().await.is_empty()
+                    || asked != [("admins".to_string(), called.clone())]
+                    || runs != expected
+                {
+                    failures.push(format!(
+                        "{label}, {called}: approver asked {asked:?}, {runs} runs, expected {expected}"
+                    ));
+                }
+            }
+        }
+        // Owner control: the wrapper runs without asking anyone.
+        let executions = Arc::new(AtomicUsize::new(0));
+        let target: Arc<dyn Tool> = Arc::new(CountingPriceTool(Arc::clone(&executions)));
+        let wrapper = skill_wrapper("price", Arc::clone(&target));
+        let called = wrapper.name().to_string();
+        let ops = Arc::new(SenderRoleTestChannel::new(
+            "ops",
+            Some(zeroclaw_api::channel::ChannelApprovalResponse::Deny),
+        ));
+        let guest = zeroclaw_config::schema::RiskProfileConfig {
+            always_ask: vec![" mock_price ".into()],
+            approval_route: Some(guest_route("ops")),
+            ..open_guest()
+        };
+        run_sender_turn(
+            open_sender_role_config(guest),
+            "alice",
+            &called,
+            vec![
+                Box::new(zeroclaw_runtime::tools::ArcToolRef(target)),
+                Box::new(wrapper),
+            ],
+            vec![
+                Arc::new(SenderRoleTestChannel::new("test-channel", None)) as Arc<dyn Channel>,
+                ops.clone() as Arc<dyn Channel>,
+            ],
+        )
+        .await;
+        if executions.load(Ordering::SeqCst) != 1 || !ops.approvals.lock().await.is_empty() {
+            failures.push("the owner's wrapper call must run without the role's approver".into());
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
     #[tokio::test]
