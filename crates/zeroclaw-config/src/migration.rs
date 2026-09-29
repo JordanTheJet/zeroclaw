@@ -372,9 +372,31 @@ pub fn detect_version(value: &toml::Value) -> Result<u32> {
         .as_table()
         .context("config root must be a TOML table")?;
     match table.get("schema_version") {
-        None if is_plainly_v3_shape(table) => Ok(INFERRED_SCHEMA_VERSION),
-        None => Ok(1),
-        Some(toml::Value::Integer(n)) if *n >= 1 => Ok(*n as u32),
+        None => match unversioned_shape(table) {
+            UnversionedShape::V3 => Ok(INFERRED_SCHEMA_VERSION),
+            UnversionedShape::NotV3 => Ok(1),
+            UnversionedShape::Ambiguous { section, key } => {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({ "section": section, "key": key })),
+                    "config has no schema_version and its shape is ambiguous"
+                );
+                anyhow::bail!(
+                    "config has no `schema_version`, and `[{section}.{key}]` reads either as the \
+                     `{key}` field of a V2 `{section}` entry or as a V3 alias named `{key}`. \
+                     Add `schema_version = 2` or `schema_version = 3` as the first line of the \
+                     file so it is not guessed"
+                )
+            }
+        },
+        Some(toml::Value::Integer(n)) if *n >= 1 => u32::try_from(*n).map_err(|_| {
+            anyhow::Error::msg(format!(
+                "config schema_version {n} is newer than this binary supports \
+                 ({CURRENT_SCHEMA_VERSION})"
+            ))
+        }),
         Some(other) => {
             ::zeroclaw_log::record!(
                 ERROR,
@@ -393,6 +415,18 @@ pub fn detect_version(value: &toml::Value) -> Result<u32> {
 /// version. Kept in step with the schema by
 /// `v1_keys_still_current_are_exactly_the_current_top_level_sections`.
 const V1_KEYS_STILL_CURRENT: &[&str] = &["model_routes", "embedding_routes", "cron"];
+
+/// How a config with no `schema_version` key reads, by its shape.
+enum UnversionedShape {
+    /// Unmistakably the V3 shape: read it as [`INFERRED_SCHEMA_VERSION`].
+    V3,
+    /// Not the V3 shape: keep the historical V1 reading.
+    NotV3,
+    /// The V3 shape, but `[<section>.<key>]` also reads as the `<key>` field
+    /// of a V2 entry. Either reading can lose configuration, so neither is
+    /// chosen and the operator must state the version.
+    Ambiguous { section: String, key: String },
+}
 
 /// Whether a config with no `schema_version` key is unmistakably written in
 /// the V3 shape.
@@ -413,16 +447,22 @@ const V1_KEYS_STILL_CURRENT: &[&str] = &["model_routes", "embedding_routes", "cr
 ///   (`[providers.models.ollama] model = "..."`, `[channels.discord]
 ///   bot_token = "..."`).
 ///
+/// A V2 entry whose only content is map-valued fields has the alias-keyed
+/// shape too: `[providers.models.openai.extra_headers]` is either the V2
+/// `openai` profile's headers or a V3 alias named `extra_headers`. When a
+/// child table of an alias-keyed section also reads as a field of a V2 entry
+/// (see [`keys_read_as_v2_entry_fields`]), the shape is ambiguous.
+///
 /// Anything else keeps the V1 reading. A V4 file has the same shape, so an
 /// unversioned V4 file is read as V3 too; its V3 -> V4 step changes nothing
 /// it has not already done.
-fn is_plainly_v3_shape(table: &toml::Table) -> bool {
+fn unversioned_shape(table: &toml::Table) -> UnversionedShape {
     if V1_LEGACY_KEYS
         .iter()
         .filter(|key| !V1_KEYS_STILL_CURRENT.contains(key))
         .any(|key| table.contains_key(*key))
     {
-        return false;
+        return UnversionedShape::NotV3;
     }
 
     let provider_families = table
@@ -431,7 +471,11 @@ fn is_plainly_v3_shape(table: &toml::Table) -> bool {
         .and_then(|providers| providers.get("models"))
         .and_then(toml::Value::as_table)
         .into_iter()
-        .flat_map(toml::Table::values);
+        .flat_map(|families| {
+            families
+                .iter()
+                .map(|(family, section)| (V2EntryKind::ModelProvider, family.as_str(), section))
+        });
     let channel_types = table
         .get("channels")
         .and_then(toml::Value::as_table)
@@ -439,25 +483,101 @@ fn is_plainly_v3_shape(table: &toml::Table) -> bool {
         .flat_map(|channels| {
             crate::schema::v2::V3_CHANNEL_TYPES
                 .iter()
-                .filter_map(|kind| channels.get(*kind))
+                .filter_map(|kind| {
+                    channels
+                        .get(*kind)
+                        .map(|section| (V2EntryKind::Channel, *kind, section))
+                })
         });
 
     let mut alias_keyed = false;
-    for section in provider_families.chain(channel_types) {
+    let mut ambiguous = None;
+    for (entry_kind, name, section) in provider_families.chain(channel_types) {
         let Some(section) = section.as_table() else {
             continue;
         };
         if section.is_empty() {
             continue;
         }
-        if section.values().all(toml::Value::is_table) {
-            alias_keyed = true;
-        } else {
+        if !section.values().all(toml::Value::is_table) {
             // A field held directly on the section: the V2 shape.
-            return false;
+            return UnversionedShape::NotV3;
+        }
+        alias_keyed = true;
+        if ambiguous.is_none()
+            && let Some(key) = keys_read_as_v2_entry_fields(entry_kind, name, section)
+                .into_iter()
+                .next()
+        {
+            ambiguous = Some((format!("{}.{name}", entry_kind.path()), key));
         }
     }
-    alias_keyed
+    match (alias_keyed, ambiguous) {
+        (true, Some((section, key))) => UnversionedShape::Ambiguous { section, key },
+        (true, None) => UnversionedShape::V3,
+        (false, _) => UnversionedShape::NotV3,
+    }
+}
+
+/// The kind of entry an alias-keyed section holds.
+#[derive(Clone, Copy)]
+enum V2EntryKind {
+    ModelProvider,
+    Channel,
+}
+
+impl V2EntryKind {
+    fn path(self) -> &'static str {
+        match self {
+            Self::ModelProvider => "providers.models",
+            Self::Channel => "channels",
+        }
+    }
+}
+
+/// The child keys of `section` (the `name` family or channel type) that also
+/// read as fields when the section is taken as one V2 entry rather than a
+/// table of V3 aliases.
+///
+/// Answered by the schema itself rather than a hand-kept list: the section is
+/// deserialized as a single entry of its real type and serialized back, and a
+/// child key that survives is a field of that entry. A key whose table does
+/// not fit the field's type, or a section that does not read as a single
+/// entry at all, does not survive, so only a genuine second reading counts.
+fn keys_read_as_v2_entry_fields(
+    kind: V2EntryKind,
+    name: &str,
+    section: &toml::Table,
+) -> Vec<String> {
+    const PROBE: &str = "__unversioned_shape_probe__";
+    let mut slot = toml::Table::new();
+    slot.insert(PROBE.to_string(), toml::Value::Table(section.clone()));
+    let mut wrapped = toml::Table::new();
+    wrapped.insert(name.to_string(), toml::Value::Table(slot));
+    let wrapped = toml::Value::Table(wrapped);
+    let round_tripped = match kind {
+        V2EntryKind::ModelProvider => wrapped
+            .try_into::<crate::providers::ModelProviders>()
+            .ok()
+            .and_then(|parsed| toml::Value::try_from(parsed).ok()),
+        V2EntryKind::Channel => wrapped
+            .try_into::<crate::schema::ChannelsConfig>()
+            .ok()
+            .and_then(|parsed| toml::Value::try_from(parsed).ok()),
+    };
+    let Some(entry) = round_tripped
+        .as_ref()
+        .and_then(|value| value.get(name))
+        .and_then(|slot| slot.get(PROBE))
+        .and_then(toml::Value::as_table)
+    else {
+        return Vec::new();
+    };
+    section
+        .keys()
+        .filter(|key| entry.contains_key(key.as_str()))
+        .cloned()
+        .collect()
 }
 
 /// The notice for a config with no `schema_version` key, by the version it
@@ -4581,6 +4701,103 @@ mention_only = false
     fn the_bundled_v1_fixture_is_still_read_as_v1() {
         let v: toml::Value = toml::from_str(V1_FIXTURE).unwrap();
         assert_eq!(detect_version(&v).unwrap(), 1);
+    }
+
+    /// A V2 provider profile holding only a map-valued field has the shape of
+    /// a V3 family with one alias. Neither reading is safe, so the version is
+    /// required rather than guessed; stated, each reading keeps its data.
+    #[test]
+    fn a_map_only_v2_provider_profile_requires_an_explicit_version() {
+        let raw = "[providers.models.openai.extra_headers]\nX-Trace = \"keep\"\n";
+        let err = detect_version(&toml::from_str(raw).unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("[providers.models.openai.extra_headers]")
+                && err.contains("schema_version = 2")
+                && err.contains("schema_version = 3"),
+            "{err}"
+        );
+        assert!(migrate_file_with_notices(raw).is_err());
+
+        // Stated as V2, the headers stay on the migrated `default` alias.
+        let value: toml::Value = toml::from_str(&format!("schema_version = 2\n{raw}")).unwrap();
+        let Migrated { value, .. } = migrate_toml(value).unwrap().unwrap();
+        assert_eq!(
+            value["providers"]["models"]["openai"]["default"]["extra_headers"]["X-Trace"].as_str(),
+            Some("keep"),
+            "{value:#?}"
+        );
+
+        // Stated as V3, `extra_headers` is the operator's own alias.
+        let value: toml::Value = toml::from_str(&format!("schema_version = 3\n{raw}")).unwrap();
+        let Migrated { value, .. } = migrate_toml(value).unwrap().unwrap();
+        assert!(
+            value["providers"]["models"]["openai"]
+                .get("extra_headers")
+                .is_some(),
+            "{value:#?}"
+        );
+    }
+
+    /// The same holds for a channel whose only content is a map-valued field.
+    #[test]
+    fn a_map_only_v2_channel_requires_an_explicit_version() {
+        let raw = "[channels.git.events.push]\nmessage = true\n";
+        let err = detect_version(&toml::from_str(raw).unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("[channels.git.events]"), "{err}");
+    }
+
+    /// An ordinary V2 profile holds scalar fields beside its maps, so it is
+    /// plainly not the V3 shape and keeps the V1 reading, as before.
+    #[test]
+    fn an_ordinary_v2_profile_with_a_map_field_keeps_the_v1_reading() {
+        let raw = "[providers.models.openai]\nmodel = \"gpt-4o\"\n\n\
+                   [providers.models.openai.extra_headers]\nX-Trace = \"keep\"\n";
+        assert_eq!(detect_version(&toml::from_str(raw).unwrap()).unwrap(), 1);
+    }
+
+    /// A V3 alias named like a field is ambiguous only when its contents also
+    /// fit that field. `extra_headers` takes string values, so an alias of
+    /// that name holding `model = "..."` reads both ways and needs the
+    /// version. `pricing` takes numbers, so an alias named `pricing` holding
+    /// the same entry is no V2 field and is read as V3.
+    #[test]
+    fn a_v3_alias_named_like_a_field_is_ambiguous_only_if_it_fits_the_field() {
+        let headers = "[providers.models.openai.extra_headers]\nmodel = \"gpt-4o\"\n";
+        assert!(detect_version(&toml::from_str(headers).unwrap()).is_err());
+        let stated = format!("schema_version = 3\n{headers}");
+        assert_eq!(
+            detect_version(&toml::from_str(&stated).unwrap()).unwrap(),
+            3
+        );
+
+        let pricing = "[providers.models.openai.pricing]\nmodel = \"gpt-4o\"\n";
+        assert_eq!(
+            detect_version(&toml::from_str(pricing).unwrap()).unwrap(),
+            INFERRED_SCHEMA_VERSION
+        );
+    }
+
+    /// A `schema_version` past `u32` is refused as newer than the binary, not
+    /// narrowed: `4294967300` would otherwise wrap to 4.
+    #[test]
+    fn a_schema_version_beyond_u32_is_refused_not_wrapped() {
+        let wrapped = "schema_version = 4294967300\n\n[security.nevis]\nenabled = true\n";
+        let err = detect_version(&toml::from_str(wrapped).unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("newer than this binary supports"), "{err}");
+        assert!(migrate_file_with_notices(wrapped).is_err());
+
+        let max = format!("schema_version = {}\n", u32::MAX);
+        assert_eq!(
+            detect_version(&toml::from_str(&max).unwrap()).unwrap(),
+            u32::MAX
+        );
+        assert!(migrate_file_with_notices(&max).is_err());
     }
 
     /// Every top-level section the current schema has, including keyed
