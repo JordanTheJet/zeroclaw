@@ -137,7 +137,11 @@
         "description": "Complete builder submission consumed by the shared Quickstart apply path.",
         "properties": {
           "agent": {
-            "$ref": "#/components/schemas/AgentIdentity",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/AgentIdentity"
+              }
+            ],
             "description": "Agent identity (always create-new — there's no reuse path)."
           },
           "channels": {
@@ -148,11 +152,19 @@
             "type": "array"
           },
           "memory": {
-            "$ref": "#/components/schemas/SelectorChoice3",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/SelectorChoice3"
+              }
+            ],
             "description": "Memory step. Either a fresh [`MemoryChoice`] or the alias of\nan existing `storage.<type>.<alias>` entry."
           },
           "model_provider": {
-            "$ref": "#/components/schemas/SelectorChoice",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/SelectorChoice"
+              }
+            ],
             "description": "Model provider step submission. Always a `Create new` shape\nin this initial cut — `Use existing` is represented by\n[`SelectorChoice::Existing`] in the wrapper enum below."
           },
           "peer_groups": {
@@ -164,11 +176,19 @@
             "type": "array"
           },
           "risk_profile": {
-            "$ref": "#/components/schemas/SelectorChoice2",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/SelectorChoice2"
+              }
+            ],
             "description": "Risk profile preset key from [`RISK_PRESETS`], or the alias\nof an existing `risk-profiles.<alias>`."
           },
           "runtime_profile": {
-            "$ref": "#/components/schemas/SelectorChoice2",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/SelectorChoice2"
+              }
+            ],
             "description": "Runtime profile preset key from [`RUNTIME_PRESETS`], or the\nalias of an existing `runtime-profiles.<alias>`."
           }
         },
@@ -1012,7 +1032,11 @@
             ]
           },
           "source": {
-            "$ref": "#/components/schemas/FileSource",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/FileSource"
+              }
+            ],
             "default": "file"
           }
         },
@@ -1118,7 +1142,11 @@
             "type": "integer"
           },
           "geometry": {
-            "$ref": "#/components/schemas/LayoutGeometry",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/LayoutGeometry"
+              }
+            ],
             "default": {
               "col_gap": 130.0,
               "node_h": 84.0,
@@ -1153,7 +1181,11 @@
             "type": "array"
           },
           "kind": {
-            "$ref": "#/components/schemas/NodeKind",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/NodeKind"
+              }
+            ],
             "default": "step"
           },
           "outputs": {
@@ -1574,9 +1606,7 @@
           "next_cursor": {
             "deprecated": true,
             "description": "Legacy cursor. Deprecated since 0.8.0; tracked for removal in\n<https://github.com/zeroclaw-labs/zeroclaw/issues/8012>.",
-            "maxItems": 2,
-            "minItems": 2,
-            "prefixItems": [
+            "items": [
               {
                 "type": "string"
               },
@@ -1584,6 +1614,8 @@
                 "type": "string"
               }
             ],
+            "maxItems": 2,
+            "minItems": 2,
             "type": [
               "array",
               "null"
@@ -1924,7 +1956,11 @@
             "type": "string"
           },
           "kind": {
-            "$ref": "#/components/schemas/MessageEntryKind",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/MessageEntryKind"
+              }
+            ],
             "default": "message"
           },
           "role": {
@@ -2288,11 +2324,19 @@
             "type": "string"
           },
           "priority": {
-            "$ref": "#/components/schemas/PlanPriority",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/PlanPriority"
+              }
+            ],
             "default": "medium"
           },
           "status": {
-            "$ref": "#/components/schemas/PlanStatus",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/PlanStatus"
+              }
+            ],
             "default": "pending"
           }
         },
@@ -2812,7 +2856,11 @@
       "SessionConfigureParams": {
         "properties": {
           "overrides": {
-            "$ref": "#/components/schemas/SessionOverrides",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/SessionOverrides"
+              }
+            ],
             "default": {}
           },
           "session_id": {
@@ -3684,7 +3732,11 @@
             "type": "array"
           },
           "layout": {
-            "$ref": "#/components/schemas/GraphLayout",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/GraphLayout"
+              }
+            ],
             "default": {
               "columns": 0,
               "geometry": {
@@ -4089,6 +4141,20 @@
       "paramStructure": "by-name",
       "params": [
         {
+          "name": "prompt",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "session_id",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
           "name": "attachments",
           "required": false,
           "schema": {
@@ -4110,20 +4176,6 @@
               "integer",
               "null"
             ]
-          }
-        },
-        {
-          "name": "prompt",
-          "required": true,
-          "schema": {
-            "type": "string"
-          }
-        },
-        {
-          "name": "session_id",
-          "required": true,
-          "schema": {
-            "type": "string"
           }
         }
       ],
@@ -4149,18 +4201,22 @@
       "paramStructure": "by-name",
       "params": [
         {
-          "name": "overrides",
-          "required": false,
-          "schema": {
-            "$ref": "#/components/schemas/SessionOverrides",
-            "default": {}
-          }
-        },
-        {
           "name": "session_id",
           "required": true,
           "schema": {
             "type": "string"
+          }
+        },
+        {
+          "name": "overrides",
+          "required": false,
+          "schema": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/SessionOverrides"
+              }
+            ],
+            "default": {}
           }
         }
       ],
@@ -4309,6 +4365,13 @@
       "paramStructure": "by-name",
       "params": [
         {
+          "name": "session_id",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
           "name": "before_index",
           "required": false,
           "schema": {
@@ -4343,13 +4406,6 @@
               "integer",
               "null"
             ]
-          }
-        },
-        {
-          "name": "session_id",
-          "required": true,
-          "schema": {
-            "type": "string"
           }
         }
       ],
@@ -4440,16 +4496,6 @@
           }
         },
         {
-          "name": "replacement",
-          "required": false,
-          "schema": {
-            "type": [
-              "string",
-              "null"
-            ]
-          }
-        },
-        {
           "name": "request_id",
           "required": true,
           "schema": {
@@ -4461,6 +4507,16 @@
           "required": true,
           "schema": {
             "type": "string"
+          }
+        },
+        {
+          "name": "replacement",
+          "required": false,
+          "schema": {
+            "type": [
+              "string",
+              "null"
+            ]
           }
         }
       ],
@@ -4578,6 +4634,13 @@
       "paramStructure": "by-name",
       "params": [
         {
+          "name": "query",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
           "name": "agent",
           "required": false,
           "schema": {
@@ -4606,13 +4669,6 @@
               "string",
               "null"
             ]
-          }
-        },
-        {
-          "name": "query",
-          "required": true,
-          "schema": {
-            "type": "string"
           }
         },
         {
@@ -4668,6 +4724,13 @@
       "paramStructure": "by-name",
       "params": [
         {
+          "name": "key",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
           "name": "agent",
           "required": false,
           "schema": {
@@ -4675,13 +4738,6 @@
               "string",
               "null"
             ]
-          }
-        },
-        {
-          "name": "key",
-          "required": true,
-          "schema": {
-            "type": "string"
           }
         },
         {
@@ -4718,6 +4774,20 @@
       "paramStructure": "by-name",
       "params": [
         {
+          "name": "content",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "key",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
           "name": "agent",
           "required": false,
           "schema": {
@@ -4735,20 +4805,6 @@
               "string",
               "null"
             ]
-          }
-        },
-        {
-          "name": "content",
-          "required": true,
-          "schema": {
-            "type": "string"
-          }
-        },
-        {
-          "name": "key",
-          "required": true,
-          "schema": {
-            "type": "string"
           }
         },
         {
@@ -4795,6 +4851,13 @@
       "paramStructure": "by-name",
       "params": [
         {
+          "name": "key",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
           "name": "agent",
           "required": false,
           "schema": {
@@ -4802,13 +4865,6 @@
               "string",
               "null"
             ]
-          }
-        },
-        {
-          "name": "key",
-          "required": true,
-          "schema": {
-            "type": "string"
           }
         },
         {
@@ -4927,6 +4983,13 @@
           }
         },
         {
+          "name": "id",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
           "name": "clear_tz",
           "required": false,
           "schema": {
@@ -4944,13 +5007,6 @@
               "string",
               "null"
             ]
-          }
-        },
-        {
-          "name": "id",
-          "required": true,
-          "schema": {
-            "type": "string"
           }
         },
         {
@@ -6970,6 +7026,7 @@
     "framing": "ndjson",
     "generator": "cargo generate openrpc",
     "protocol_version": 1,
+    "schema_dialect": "http://json-schema.org/draft-07/schema#",
     "source": "crates/zeroclaw-rpc-proto",
     "transports": [
       "unix-socket",

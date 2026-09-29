@@ -30,10 +30,17 @@ fn workspace_root() -> PathBuf {
     crate::util::repo_root()
 }
 
+/// OpenRPC 1.3.2 schema objects are JSON Schema Draft 7. Schemars' Draft 7
+/// settings rewrite the newer keywords (`prefixItems` for tuples,
+/// `unevaluatedProperties`, `$ref` siblings) when the definitions are taken
+/// with transforms applied, so every schema in the document is Draft 7.
+pub const SCHEMA_DIALECT: &str = "http://json-schema.org/draft-07/schema#";
+
 fn generator() -> SchemaGenerator {
-    let mut settings = SchemaSettings::draft2020_12();
+    let mut settings = SchemaSettings::draft07();
     settings.definitions_path = DEFINITIONS_PATH.into();
     settings.inline_subschemas = false;
+    settings.meta_schema = None;
     settings.into_generator()
 }
 
@@ -47,7 +54,7 @@ fn generator() -> SchemaGenerator {
 /// free-form object, or a type another crate owns without an exported
 /// schema) produce no descriptors and are marked in `x-zeroclaw-params`, so
 /// a consumer never sees an invented `params` wrapper as a real key.
-fn param_descriptors(generator: &mut SchemaGenerator, shape: Shape) -> (Vec<Value>, Value) {
+fn param_descriptors(schemas: &Map<String, Value>, shape: Shape) -> (Vec<Value>, Value) {
     match shape {
         Shape::None => (Vec::new(), json!({ "shape": "none" })),
         Shape::Untyped => (
@@ -57,32 +64,31 @@ fn param_descriptors(generator: &mut SchemaGenerator, shape: Shape) -> (Vec<Valu
                 "description": "Free-form JSON object shaped by the daemon at runtime; keys are not enumerable here.",
             }),
         ),
-        Shape::Typed(name) => match schema::subschema_for_named(generator, name) {
-            Some(_) => {
-                let definition = generator
-                    .definitions()
-                    .get(name)
-                    .cloned()
-                    .unwrap_or(Value::Null);
+        Shape::Typed(name) => match schemas.get(name) {
+            Some(definition) => {
                 let required: Vec<&str> = definition["required"]
                     .as_array()
                     .map(|r| r.iter().filter_map(Value::as_str).collect())
                     .unwrap_or_default();
-                let descriptors: Vec<Value> = definition["properties"]
+                // OpenRPC orders every required parameter before every
+                // optional one; within each group the wire-key order is
+                // alphabetical so the document stays deterministic.
+                let mut props: Vec<(&String, &Value)> = definition["properties"]
                     .as_object()
-                    .map(|props| {
-                        props
-                            .iter()
-                            .map(|(prop, schema)| {
-                                json!({
-                                    "name": prop,
-                                    "required": required.contains(&prop.as_str()),
-                                    "schema": schema,
-                                })
-                            })
-                            .collect()
-                    })
+                    .map(|props| props.iter().collect())
                     .unwrap_or_default();
+                props
+                    .sort_by_key(|(prop, _)| (!required.contains(&prop.as_str()), (*prop).clone()));
+                let descriptors: Vec<Value> = props
+                    .into_iter()
+                    .map(|(prop, schema)| {
+                        json!({
+                            "name": prop,
+                            "required": required.contains(&prop.as_str()),
+                            "schema": schema,
+                        })
+                    })
+                    .collect();
                 let marker = if descriptors.is_empty() {
                     json!({
                         "shape": "typed",
@@ -162,16 +168,18 @@ fn authorization(method: Method) -> Value {
 pub fn render() -> anyhow::Result<String> {
     let mut generator = generator();
 
-    let methods: Vec<Value> = Method::ALL
+    // Pass one registers every typed shape with the generator (results as
+    // `$ref` values, params by name); pass two, after the definitions have
+    // been taken with the Draft 7 transforms applied, expands the params from
+    // those transformed definitions so copied property schemas are Draft 7
+    // too.
+    let registered: Vec<(Method, &str, Shape, Value)> = Method::ALL
         .iter()
         .map(|(method, wire)| {
             let contract = method.contract();
-            let mut entry = Map::new();
-            entry.insert("name".into(), json!(wire));
-            entry.insert("paramStructure".into(), json!("by-name"));
-            let (params, params_marker) = param_descriptors(&mut generator, contract.params);
-            entry.insert("params".into(), Value::Array(params));
-            entry.insert("x-zeroclaw-params".into(), params_marker);
+            if let Shape::Typed(name) = contract.params {
+                let _ = schema::subschema_for_named(&mut generator, name);
+            }
             let result = shape_value(&mut generator, contract.result).map_or_else(
                 || json!({ "name": "result", "schema": { "type": "null" } }),
                 |mut r| {
@@ -181,9 +189,7 @@ pub fn render() -> anyhow::Result<String> {
                     r
                 },
             );
-            entry.insert("result".into(), result);
-            entry.insert("x-zeroclaw-authorization".into(), authorization(*method));
-            Value::Object(entry)
+            (*method, *wire, contract.params, result)
         })
         .collect();
 
@@ -211,6 +217,21 @@ pub fn render() -> anyhow::Result<String> {
 
     let schemas = generator.take_definitions(true);
 
+    let methods: Vec<Value> = registered
+        .into_iter()
+        .map(|(method, wire, params_shape, result)| {
+            let mut entry = Map::new();
+            entry.insert("name".into(), json!(wire));
+            entry.insert("paramStructure".into(), json!("by-name"));
+            let (params, params_marker) = param_descriptors(&schemas, params_shape);
+            entry.insert("params".into(), Value::Array(params));
+            entry.insert("x-zeroclaw-params".into(), params_marker);
+            entry.insert("result".into(), result);
+            entry.insert("x-zeroclaw-authorization".into(), authorization(method));
+            Value::Object(entry)
+        })
+        .collect();
+
     let document = json!({
         "openrpc": "1.3.2",
         "info": {
@@ -220,6 +241,7 @@ pub fn render() -> anyhow::Result<String> {
         },
         "x-zeroclaw": {
             "protocol_version": RPC_PROTOCOL_VERSION,
+            "schema_dialect": SCHEMA_DIALECT,
             "framing": "ndjson",
             "transports": ["unix-socket", "windows-named-pipe", "wss"],
             "source": "crates/zeroclaw-rpc-proto",
@@ -353,6 +375,93 @@ mod tests {
             if shape == "untyped" || shape == "external" || shape == "none" {
                 assert!(m["params"].as_array().unwrap().is_empty(), "{}", m["name"]);
             }
+        }
+    }
+
+    /// OpenRPC 1.3.2 schema objects are Draft 7: no keyword from a later
+    /// dialect may appear anywhere in the document, or a Draft 7 consumer
+    /// silently ignores it and accepts values the wire type rejects.
+    #[test]
+    fn every_schema_in_the_document_is_draft_7() {
+        const LATER_DIALECT_KEYWORDS: &[&str] = &[
+            "prefixItems",
+            "$defs",
+            "unevaluatedProperties",
+            "unevaluatedItems",
+            "dependentRequired",
+            "dependentSchemas",
+            "$dynamicRef",
+            "$dynamicAnchor",
+            "$recursiveRef",
+            "$anchor",
+        ];
+        let doc: Value = serde_json::from_str(&render().expect("render")).expect("valid JSON");
+        assert_eq!(doc["x-zeroclaw"]["schema_dialect"], json!(SCHEMA_DIALECT));
+        fn walk(v: &Value, path: &str, out: &mut Vec<String>) {
+            match v {
+                Value::Object(map) => {
+                    for (k, child) in map {
+                        if LATER_DIALECT_KEYWORDS.contains(&k.as_str()) {
+                            out.push(format!("{path}/{k}"));
+                        }
+                        walk(child, &format!("{path}/{k}"), out);
+                    }
+                }
+                Value::Array(items) => items
+                    .iter()
+                    .enumerate()
+                    .for_each(|(i, child)| walk(child, &format!("{path}/{i}"), out)),
+                _ => {}
+            }
+        }
+        let mut offenders = Vec::new();
+        walk(&doc, "", &mut offenders);
+        assert!(offenders.is_empty(), "non-Draft-7 keywords: {offenders:?}");
+        // The tuple that motivated the check: `LogsQueryResult.next_cursor`
+        // is `Option<(String, String)>`; under Draft 7 a validator must take
+        // `null` and two strings, and reject anything else.
+        let cursor = &doc["components"]["schemas"]["LogsQueryResult"]["properties"]["next_cursor"];
+        let validator = jsonschema::options()
+            .with_draft(jsonschema::Draft::Draft7)
+            .build(cursor)
+            .expect("Draft 7 schema compiles");
+        for accepted in [json!(null), json!(["timestamp", "id"])] {
+            assert!(
+                validator.is_valid(&accepted),
+                "{cursor} must accept {accepted}"
+            );
+        }
+        for rejected in [
+            json!([1, 2]),
+            json!(["only-one"]),
+            json!(["a", "b", "c"]),
+            json!(["a", 1]),
+            json!("timestamp:id"),
+        ] {
+            assert!(
+                !validator.is_valid(&rejected),
+                "{cursor} must reject {rejected}"
+            );
+        }
+    }
+
+    /// OpenRPC orders every required parameter before every optional one.
+    #[test]
+    fn required_descriptors_precede_optional_ones() {
+        let doc: Value = serde_json::from_str(&render().expect("render")).expect("valid JSON");
+        for m in doc["methods"].as_array().expect("methods") {
+            let flags: Vec<bool> = m["params"]
+                .as_array()
+                .expect("params array")
+                .iter()
+                .map(|p| p["required"].as_bool().expect("required flag"))
+                .collect();
+            let first_optional = flags.iter().position(|r| !r).unwrap_or(flags.len());
+            assert!(
+                flags[first_optional..].iter().all(|r| !r),
+                "{}: a required parameter follows an optional one: {flags:?}",
+                m["name"]
+            );
         }
     }
 

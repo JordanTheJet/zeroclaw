@@ -13849,6 +13849,7 @@ dependencies = [
  "cargo_metadata 0.18.1",
  "clap",
  "fluent-syntax 0.12.0",
+ "jsonschema",
  "pulldown-cmark",
  "reqwest 0.12.28",
  "schemars 1.2.2",
