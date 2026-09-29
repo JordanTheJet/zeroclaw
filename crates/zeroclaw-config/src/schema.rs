@@ -22790,6 +22790,7 @@ impl Config {
         self.collect_context_compression_ignored_warnings(&mut warnings);
         self.collect_verifiable_intent_warnings(&mut warnings);
         self.collect_cron_claim_warnings(&mut warnings);
+        self.collect_compiled_out_tool_warnings(&mut warnings);
         warnings.extend(validate_memory_semantics(&self.memory));
         for (alias, wa) in &self.channels.whatsapp {
             warnings.extend(validate_whatsapp_semantics(alias, wa));
@@ -22898,6 +22899,30 @@ impl Config {
                 "proxy.scope"
             },
         ));
+    }
+
+    /// One warning per enabled section whose tool this build was compiled
+    /// without: the section has no effect, and `validate()` does not check
+    /// the tool's own settings, so this is the one place it is reported.
+    fn collect_compiled_out_tool_warnings(
+        &self,
+        warnings: &mut Vec<crate::validation_warnings::ValidationWarning>,
+    ) {
+        for tool in crate::opt_in_tools::OptInTool::ALL {
+            if tool.compiled() || !tool.enabled_in(self) {
+                continue;
+            }
+            let (section, feature) = (tool.section(), tool.feature());
+            warnings.push(crate::validation_warnings::ValidationWarning::new(
+                crate::validation_warnings::TOOL_COMPILED_OUT,
+                format!(
+                    "[{section}] is enabled, but this build was compiled without the \
+                     `{feature}` feature, so the tool is unavailable and its settings are not \
+                     checked. Use a build that includes `{feature}`, or disable the section."
+                ),
+                format!("{section}.enabled"),
+            ));
+        }
     }
 
     fn collect_codex_cli_extra_arg_warnings(
@@ -24421,8 +24446,13 @@ impl Config {
             }
         }
 
+        // An opt-in tool's own settings are checked only in a build that
+        // carries the tool. Its section still parses everywhere, and
+        // `collect_warnings` reports it as compiled out instead of this
+        // demanding credentials or resources for a tool that cannot run.
+        //
         // Microsoft 365
-        if self.microsoft365.enabled {
+        if crate::opt_in_tools::OptInTool::Microsoft365.runs_in(self) {
             let tenant = self
                 .microsoft365
                 .tenant_id
@@ -24460,47 +24490,6 @@ impl Config {
             {
                 anyhow::bail!(
                     "microsoft365.client_secret must not be empty when auth_flow is 'client_credentials'"
-                );
-            }
-        }
-
-        // Microsoft 365
-        if self.microsoft365.enabled {
-            let tenant = self
-                .microsoft365
-                .tenant_id
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty());
-            if tenant.is_none() {
-                anyhow::bail!(
-                    "microsoft365.tenant_id must not be empty when microsoft365 is enabled"
-                );
-            }
-            let client = self
-                .microsoft365
-                .client_id
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty());
-            if client.is_none() {
-                anyhow::bail!(
-                    "microsoft365.client_id must not be empty when microsoft365 is enabled"
-                );
-            }
-            let flow = self.microsoft365.auth_flow.trim();
-            if flow != "client_credentials" && flow != "device_code" {
-                anyhow::bail!("microsoft365.auth_flow must be client_credentials or device_code");
-            }
-            if flow == "client_credentials"
-                && self
-                    .microsoft365
-                    .client_secret
-                    .as_deref()
-                    .is_none_or(|s| s.trim().is_empty())
-            {
-                anyhow::bail!(
-                    "microsoft365.client_secret must not be empty when auth_flow is client_credentials"
                 );
             }
         }
@@ -24678,7 +24667,7 @@ impl Config {
         }
 
         // Project intelligence
-        if self.project_intel.enabled {
+        if crate::opt_in_tools::OptInTool::ProjectIntel.runs_in(self) {
             let lang = &self.project_intel.default_language;
             if !["en", "de", "fr", "it"].contains(&lang.as_str()) {
                 anyhow::bail!(
@@ -24747,7 +24736,7 @@ impl Config {
         }
 
         // Notion
-        if self.notion.enabled {
+        if crate::opt_in_tools::OptInTool::Notion.runs_in(self) {
             if self.notion.database_id.trim().is_empty() {
                 anyhow::bail!("notion.database_id must not be empty when notion.enabled = true");
             }
@@ -24801,7 +24790,7 @@ impl Config {
         }
 
         // Jira
-        if self.jira.enabled {
+        if crate::opt_in_tools::OptInTool::Jira.runs_in(self) {
             if self.jira.base_url.trim().is_empty() {
                 anyhow::bail!("jira.base_url must not be empty when jira.enabled = true");
             }
@@ -37396,6 +37385,7 @@ runtime_profile = "default"
         assert!(config.validate().is_ok());
     }
 
+    #[cfg(feature = "tool-jira")]
     #[test]
     async fn validate_rejects_unknown_jira_actions() {
         for action in ["delete_ticket", "drop_database", ""] {
@@ -37412,6 +37402,97 @@ runtime_profile = "default"
             assert!(
                 err.contains("jira.allowed_actions contains unknown action"),
                 "expected Jira allowed action error for {action:?}, got: {err}"
+            );
+        }
+    }
+
+    /// A config written for a full build validates in a build without its
+    /// opt-in tools. Each tool's own checks, which would demand credentials,
+    /// an endpoint, a database or an existing templates directory, run only
+    /// where the tool can, and each enabled section is reported once as
+    /// compiled out.
+    #[cfg(not(any(
+        feature = "tool-jira",
+        feature = "tool-notion",
+        feature = "tool-microsoft365",
+        feature = "tool-project-intel"
+    )))]
+    #[test]
+    async fn a_lean_build_validates_enabled_sections_for_tools_it_lacks() {
+        assert!(
+            !Config::default()
+                .collect_warnings()
+                .iter()
+                .any(|warning| warning.code == crate::validation_warnings::TOOL_COMPILED_OUT),
+            "a disabled section is not reported"
+        );
+
+        let mut config = Config::default();
+        config.microsoft365.enabled = true;
+        config.project_intel.enabled = true;
+        config.project_intel.templates_dir = Some("/nonexistent/zeroclaw-templates".into());
+        config.notion.enabled = true;
+        config.jira.enabled = true;
+        config.jira.allowed_actions = vec!["drop_database".into()];
+        config
+            .validate()
+            .expect("a build without these tools does not check their settings");
+
+        let compiled_out: Vec<String> = config
+            .collect_warnings()
+            .into_iter()
+            .filter(|warning| warning.code == crate::validation_warnings::TOOL_COMPILED_OUT)
+            .map(|warning| warning.path)
+            .collect();
+        assert_eq!(
+            compiled_out,
+            [
+                "jira.enabled",
+                "notion.enabled",
+                "microsoft365.enabled",
+                "project_intel.enabled"
+            ],
+            "one warning per enabled section this build lacks"
+        );
+    }
+
+    /// The counterpart in a build that carries the tools: their settings are
+    /// still checked, and nothing is reported as compiled out.
+    #[cfg(all(
+        feature = "tool-jira",
+        feature = "tool-notion",
+        feature = "tool-microsoft365",
+        feature = "tool-project-intel"
+    ))]
+    #[test]
+    async fn a_build_with_the_tools_checks_their_settings() {
+        type Enable = fn(&mut Config);
+        let cases: [(&str, Enable); 4] = [
+            ("microsoft365.tenant_id", |c| c.microsoft365.enabled = true),
+            ("project_intel.templates_dir", |c| {
+                c.project_intel.enabled = true;
+                c.project_intel.templates_dir = Some("/nonexistent/zeroclaw-templates".into());
+            }),
+            ("notion.database_id", |c| c.notion.enabled = true),
+            ("jira.base_url", |c| c.jira.enabled = true),
+        ];
+        for (field, enable) in cases {
+            let mut config = Config::default();
+            enable(&mut config);
+            let err = config
+                .validate()
+                .expect_err("a build with the tool checks its settings")
+                .to_string();
+            assert!(
+                err.contains(field),
+                "expected an error on {field}, got: {err}"
+            );
+            assert!(
+                !config
+                    .collect_warnings()
+                    .iter()
+                    .any(|warning| warning.code == crate::validation_warnings::TOOL_COMPILED_OUT),
+                "{field}: a compiled-in tool is not reported as compiled out"
             );
         }
     }

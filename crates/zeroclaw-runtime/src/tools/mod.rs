@@ -277,7 +277,9 @@ pub fn composio_tool_available(config: &Config) -> bool {
 }
 
 /// An integration enabled in config whose tool this build was compiled
-/// without. Mirrors the channel orchestrator's "compiled without" notice.
+/// without. Mirrors the channel orchestrator's "compiled without" notice, and
+/// carries the code `Config::collect_warnings` reports the same section under
+/// for `config/validate`, the config API and `doctor`.
 #[cfg(not(all(
     feature = "tool-jira",
     feature = "tool-notion",
@@ -292,13 +294,17 @@ pub fn composio_tool_available(config: &Config) -> bool {
     feature = "tool-gemini-cli",
     feature = "tool-opencode-cli"
 )))]
-fn warn_tool_compiled_out(enabled: bool, section: &str, feature: &str) {
-    if enabled {
+fn warn_tool_compiled_out(root_config: &Config, tool: zeroclaw_config::opt_in_tools::OptInTool) {
+    if tool.enabled_in(root_config) {
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                 .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                .with_attrs(::serde_json::json!({ "section": section, "feature": feature })),
+                .with_attrs(::serde_json::json!({
+                    "code": zeroclaw_config::validation_warnings::TOOL_COMPILED_OUT,
+                    "section": tool.section(),
+                    "feature": tool.feature(),
+                })),
             "a tool is enabled in config but this build was compiled without its feature; skipping it"
         );
     }
@@ -1747,7 +1753,10 @@ fn all_tools_with_runtime_on_thread(
 
     // Notion API tool (conditionally registered)
     #[cfg(not(feature = "tool-notion"))]
-    warn_tool_compiled_out(root_config.notion.enabled, "notion", "tool-notion");
+    warn_tool_compiled_out(
+        root_config,
+        zeroclaw_config::opt_in_tools::OptInTool::Notion,
+    );
     #[cfg(feature = "tool-notion")]
     if root_config.notion.enabled {
         let notion_api_key = if root_config.notion.api_key.trim().is_empty() {
@@ -1769,7 +1778,7 @@ fn all_tools_with_runtime_on_thread(
 
     // Jira integration (config-gated)
     #[cfg(not(feature = "tool-jira"))]
-    warn_tool_compiled_out(root_config.jira.enabled, "jira", "tool-jira");
+    warn_tool_compiled_out(root_config, zeroclaw_config::opt_in_tools::OptInTool::Jira);
     #[cfg(feature = "tool-jira")]
     if root_config.jira.enabled {
         let api_token = if root_config.jira.api_token.trim().is_empty() {
@@ -1826,9 +1835,8 @@ fn all_tools_with_runtime_on_thread(
     // Project delivery intelligence
     #[cfg(not(feature = "tool-project-intel"))]
     warn_tool_compiled_out(
-        root_config.project_intel.enabled,
-        "project_intel",
-        "tool-project-intel",
+        root_config,
+        zeroclaw_config::opt_in_tools::OptInTool::ProjectIntel,
     );
     #[cfg(feature = "tool-project-intel")]
     if root_config.project_intel.enabled {
@@ -1877,9 +1885,8 @@ fn all_tools_with_runtime_on_thread(
     // Google Workspace CLI (gws) integration — requires shell access
     #[cfg(not(feature = "tool-google-workspace"))]
     warn_tool_compiled_out(
-        root_config.google_workspace.enabled,
-        "google_workspace",
-        "tool-google-workspace",
+        root_config,
+        zeroclaw_config::opt_in_tools::OptInTool::GoogleWorkspace,
     );
     #[cfg(feature = "tool-google-workspace")]
     if root_config.google_workspace.enabled && has_shell_access {
@@ -1914,9 +1921,8 @@ fn all_tools_with_runtime_on_thread(
     // Claude Code delegation tool
     #[cfg(not(feature = "tool-claude-code"))]
     warn_tool_compiled_out(
-        root_config.claude_code.enabled,
-        "claude_code",
-        "tool-claude-code",
+        root_config,
+        zeroclaw_config::opt_in_tools::OptInTool::ClaudeCode,
     );
     #[cfg(feature = "tool-claude-code")]
     if register_coding_cli_tools && root_config.claude_code.enabled {
@@ -1933,9 +1939,8 @@ fn all_tools_with_runtime_on_thread(
     // Claude Code task runner with Slack progress and SSH handoff
     #[cfg(not(feature = "tool-claude-code-runner"))]
     warn_tool_compiled_out(
-        root_config.claude_code_runner.enabled,
-        "claude_code_runner",
-        "tool-claude-code-runner",
+        root_config,
+        zeroclaw_config::opt_in_tools::OptInTool::ClaudeCodeRunner,
     );
     #[cfg(feature = "tool-claude-code-runner")]
     if root_config.claude_code_runner.enabled {
@@ -1955,7 +1960,10 @@ fn all_tools_with_runtime_on_thread(
 
     // Codex CLI delegation tool
     #[cfg(not(feature = "tool-codex-cli"))]
-    warn_tool_compiled_out(root_config.codex_cli.enabled, "codex_cli", "tool-codex-cli");
+    warn_tool_compiled_out(
+        root_config,
+        zeroclaw_config::opt_in_tools::OptInTool::CodexCli,
+    );
     #[cfg(feature = "tool-codex-cli")]
     if register_coding_cli_tools && root_config.codex_cli.enabled {
         tool_arcs.push(Arc::new(RateLimitedTool::new(
@@ -1971,9 +1979,8 @@ fn all_tools_with_runtime_on_thread(
     // Gemini CLI delegation tool
     #[cfg(not(feature = "tool-gemini-cli"))]
     warn_tool_compiled_out(
-        root_config.gemini_cli.enabled,
-        "gemini_cli",
-        "tool-gemini-cli",
+        root_config,
+        zeroclaw_config::opt_in_tools::OptInTool::GeminiCli,
     );
     #[cfg(feature = "tool-gemini-cli")]
     if register_coding_cli_tools && root_config.gemini_cli.enabled {
@@ -1990,9 +1997,8 @@ fn all_tools_with_runtime_on_thread(
     // OpenCode CLI delegation tool
     #[cfg(not(feature = "tool-opencode-cli"))]
     warn_tool_compiled_out(
-        root_config.opencode_cli.enabled,
-        "opencode_cli",
-        "tool-opencode-cli",
+        root_config,
+        zeroclaw_config::opt_in_tools::OptInTool::OpenCodeCli,
     );
     #[cfg(feature = "tool-opencode-cli")]
     if register_coding_cli_tools && root_config.opencode_cli.enabled {
@@ -2048,7 +2054,10 @@ fn all_tools_with_runtime_on_thread(
 
     // LinkedIn integration (config-gated)
     #[cfg(not(feature = "tool-linkedin"))]
-    warn_tool_compiled_out(root_config.linkedin.enabled, "linkedin", "tool-linkedin");
+    warn_tool_compiled_out(
+        root_config,
+        zeroclaw_config::opt_in_tools::OptInTool::LinkedIn,
+    );
     #[cfg(feature = "tool-linkedin")]
     if root_config.linkedin.enabled {
         tool_arcs.push(Arc::new(LinkedInTool::new(
@@ -2189,11 +2198,12 @@ fn all_tools_with_runtime_on_thread(
 
     #[cfg(not(feature = "tool-composio"))]
     {
-        let _ = composio_entity_id;
+        // Reported whenever the section is enabled: the usual caller passes no
+        // key when the section has none, which is exactly when it matters.
+        let _ = (composio_key, composio_entity_id);
         warn_tool_compiled_out(
-            composio_key.is_some_and(|key| !key.is_empty()),
-            "composio",
-            "tool-composio",
+            root_config,
+            zeroclaw_config::opt_in_tools::OptInTool::Composio,
         );
     }
     #[cfg(feature = "tool-composio")]
@@ -2258,9 +2268,8 @@ fn all_tools_with_runtime_on_thread(
     // Microsoft 365 Graph API integration
     #[cfg(not(feature = "tool-microsoft365"))]
     warn_tool_compiled_out(
-        root_config.microsoft365.enabled,
-        "microsoft365",
-        "tool-microsoft365",
+        root_config,
+        zeroclaw_config::opt_in_tools::OptInTool::Microsoft365,
     );
     #[cfg(feature = "tool-microsoft365")]
     if root_config.microsoft365.enabled {

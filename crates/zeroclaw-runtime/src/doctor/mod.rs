@@ -2487,6 +2487,36 @@ mod tests {
         );
     }
 
+    /// A build without an opt-in tool reports an enabled section for it once,
+    /// as compiled out, and nothing about the tool's own settings; a build
+    /// with the tool reports no such line.
+    #[test]
+    fn diagnose_reports_an_enabled_tool_the_build_lacks_once() {
+        use zeroclaw_config::opt_in_tools::OptInTool;
+        let mut config = Config::default();
+        config.project_intel.enabled = true;
+        config.project_intel.templates_dir = Some("/nonexistent/zeroclaw-templates".into());
+
+        let results = diagnose(&config);
+        let compiled_out: Vec<_> = results
+            .iter()
+            .filter(|item| item.message.contains("tool-project-intel"))
+            .collect();
+        if OptInTool::ProjectIntel.compiled() {
+            assert!(compiled_out.is_empty(), "{results:?}");
+        } else {
+            assert_eq!(compiled_out.len(), 1, "{results:?}");
+            assert_eq!(compiled_out[0].severity, Severity::Warn);
+            assert!(compiled_out[0].message.contains("project_intel.enabled"));
+            assert!(
+                !results
+                    .iter()
+                    .any(|item| item.message.contains("templates_dir")),
+                "nothing about the settings of a tool the build lacks: {results:?}"
+            );
+        }
+    }
+
     #[test]
     fn degraded_sections_reported_as_warning() {
         let config = Config {

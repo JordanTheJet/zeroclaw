@@ -110,6 +110,7 @@ pub mod wrappers;
     test,
     unix,
     feature = "tool-claude-code",
+    feature = "tool-claude-code-runner",
     feature = "tool-codex-cli",
     feature = "tool-gemini-cli",
     feature = "tool-opencode-cli"
