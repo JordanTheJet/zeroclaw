@@ -14013,6 +14013,7 @@ dependencies = [
  "which",
  "wiremock",
  "zeroclaw-api",
+ "zeroclaw-buildinfo",
  "zeroclaw-channels",
  "zeroclaw-config",
  "zeroclaw-eval",
@@ -14050,6 +14051,10 @@ dependencies = [
  "tokio-util",
  "tracing",
 ]
+
+[[package]]
+name = "zeroclaw-buildinfo"
+version = "0.8.5"
 
 [[package]]
 name = "zeroclaw-channel-egress-plugin-fixture"
@@ -14300,7 +14305,6 @@ dependencies = [
  "zeroclaw-api",
  "zeroclaw-channels",
  "zeroclaw-config",
- "zeroclaw-hardware",
  "zeroclaw-infra",
  "zeroclaw-log",
  "zeroclaw-memory",
@@ -14421,6 +14425,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "filetime",
+ "libc",
  "parking_lot",
  "postgres",
  "regex",
@@ -14824,6 +14829,7 @@ dependencies = [
  "tokio-rustls",
  "tokio-tungstenite 0.29.0",
  "toml 1.1.2+spec-1.1.0",
+ "toml_edit 0.25.12+spec-1.1.0",
  "unic-langid",
  "unicode-segmentation",
  "unicode-width 0.2.2",
@@ -14915,6 +14921,7 @@ dependencies = [
  "tokio-rustls",
  "tokio-tungstenite 0.29.0",
  "toml 1.1.2+spec-1.1.0",
+ "zeroclaw-buildinfo",
  "zeroclaw-relay-proto",
  "zeroclaw-tls",
 ]

@@ -989,11 +989,15 @@ enum EstopLevelArg {
     ToolFreeze,
 }
 
+/// Package version and `git describe` build id stamped by `build.rs`, so
+/// `--version` and `status` name the commit this binary was built from.
+const VERSION: &str = env!("ZEROCLAW_VERSION");
+
 /// `ZeroClaw` - Zero overhead. Zero compromise. 100% Rust.
 #[derive(Parser, Debug)]
 #[command(name = "zeroclaw")]
 #[command(author = "theonlyhennygod")]
-#[command(version)]
+#[command(version = VERSION)]
 // i18n-exempt: clap derive help — framework requires a compile-time literal
 #[command(about = "The fastest, smallest AI assistant.", long_about = None)]
 struct Cli {
@@ -6295,6 +6299,20 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
 
     #[cfg(feature = "agent-runtime")]
     if let Commands::Service {
+        service_command: ServiceCommands::RunWindowsDaemon,
+        ..
+    } = &cli.command
+    {
+        let config_dir = cli
+            .config_dir
+            .as_deref()
+            .map(std::path::Path::new)
+            .context("Windows task runner requires --config-dir")?;
+        return service::run_windows_daemon(config_dir).await;
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    if let Commands::Service {
         service_command: ServiceCommands::RunDesktopDaemon { port },
         ..
     } = &cli.command
@@ -7831,14 +7849,7 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
             }
             println!("{}", t("cli-status-title", "🦀 ZeroClaw Status"));
             println!();
-            println!(
-                "{}",
-                ta(
-                    "cli-status-version",
-                    &[("v", env!("CARGO_PKG_VERSION"))],
-                    "Version"
-                )
-            );
+            println!("{}", ta("cli-status-version", &[("v", VERSION)], "Version"));
             println!(
                 "{}",
                 ta(
@@ -8586,6 +8597,10 @@ Add pricing to the active provider profile or supply a catalog entry."
                     }
                     _ => None,
                 };
+
+                // With no daemon, this command owns the live-pricing refresher,
+                // as the daemon does when it runs the channels.
+                zeroclaw_runtime::daemon::spawn_pricing_refresher(&config);
 
                 let result = Box::pin(channels::start_channels(
                     config,
@@ -12519,12 +12534,23 @@ async fn run_gateway_if_enabled(
     // can self-respawn after the listener is released. Must mirror the same
     // call in the Daemon branch.
     zeroclaw_runtime::restart::record_launch();
+    // With no daemon, this command owns what the daemon would: the
+    // live-pricing refresher and the gateway-start hook, which fires once
+    // the listener reports its bound address.
+    zeroclaw_runtime::daemon::spawn_pricing_refresher(&config);
+    let hooks = config.hooks.enabled.then(|| {
+        std::sync::Arc::new(zeroclaw_runtime::hooks::HookRunner::from_config(
+            &config.hooks,
+        ))
+    });
+    let readiness =
+        zeroclaw_runtime::daemon::gateway_start_hook_reporter(hooks, host.to_string(), None);
     // Standalone gateway (no daemon supervisor): pass None for reload_tx so
     // /admin/reload returns 503 with a clear "no supervisor; restart
     // manually" message, None for tui_registry (no TUI socket), and None
     // for canvas_store so the gateway falls back to its own default.
     let result = Box::pin(gateway::run_gateway(
-        host, port, config, event_bus, None, None, None, None, None, None, None, None,
+        host, port, config, event_bus, None, None, None, None, None, None, None, readiness,
     ))
     .await;
     // Self-respawn after the listener is released, if an in-app upgrade
@@ -14281,6 +14307,36 @@ mod tests {
 
         let help = Cli::command().render_help().to_string();
         assert!(!help.contains("run-desktop-daemon"));
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn windows_daemon_cli_requires_config_dir_and_stays_hidden() {
+        let cli = Cli::try_parse_from([
+            "zeroclaw",
+            "--config-dir",
+            "C:\\Users\\agent\\Zero Claw",
+            "service",
+            "run-windows-daemon",
+        ])
+        .expect("internal Windows task runner should parse");
+        assert_eq!(
+            cli.config_dir.as_deref(),
+            Some("C:\\Users\\agent\\Zero Claw")
+        );
+        assert!(matches!(
+            cli.command,
+            Commands::Service {
+                service_command: ServiceCommands::RunWindowsDaemon,
+                ..
+            }
+        ));
+        assert!(
+            !Cli::command()
+                .render_help()
+                .to_string()
+                .contains("run-windows-daemon")
+        );
     }
 
     #[test]

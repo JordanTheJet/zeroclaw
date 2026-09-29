@@ -3492,6 +3492,7 @@ fn notification_for_turn_event(session_id: &str, event: &TurnEvent) -> Option<Js
             tokens_before_source,
             tokens_after_source,
             unsatisfiable_floor,
+            retained_context: _,
         } => {
             let mut params = serde_json::json!({
                 "sessionId": session_id,
@@ -6122,6 +6123,7 @@ mod tests {
                 tokens_before_source: Some(zeroclaw_api::agent::TokenCountSource::Provider),
                 tokens_after_source: Some(zeroclaw_api::agent::TokenCountSource::Calibrated),
                 unsatisfiable_floor: None,
+                retained_context: None,
             },
         )
         .expect("history trim must produce an ACP notification");

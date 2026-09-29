@@ -268,6 +268,8 @@ mod tests {
 
     #[tokio::test]
     async fn acp_ws_front_door_omitted_cwd_uses_agent_workspace() {
+        // `run_gateway` binds the process-global pricing config handle.
+        let _pricing_binding = crate::PRICING_BINDING_TEST_LOCK.lock().await;
         let tmp = tempfile::tempdir().unwrap();
         let install_root = tmp.path();
         let cfg = front_door_config(install_root);
