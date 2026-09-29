@@ -6866,6 +6866,22 @@ impl RpcDispatcher {
         let admitted = self
             .revalidate_admitted_session(sid, authorized.as_ref())
             .await?;
+        // The queue wait can be as long as the turn ahead of it. Re-resolve
+        // the caller's authority against the policy in force now: a revoked
+        // grant or credential refuses the append before either write, and a
+        // principal that lost administrator scope while it waited is held to
+        // ownership again.
+        let grants = self.recheck_authority_after_admission(Method::SessionAppend)?;
+        if let Some(grants) = grants.as_ref()
+            && !grants.admin
+            && let Some(me) = self.owner_principal_id()
+            && admitted.as_ref().and_then(|rec| rec.owner.as_deref()) != Some(me.as_str())
+        {
+            return Err(rpc_err(
+                FORBIDDEN,
+                "Session not found or not owned by this principal",
+            ));
+        }
         let key = Self::durable_chat_key(admitted, Method::SessionAppend)?;
         let message = zeroclaw_providers::ChatMessage::assistant(&req.content);
         backend.append(&key, &message).map_err(|e| {
@@ -38731,6 +38747,171 @@ mod tests {
         assert!(
             content.contains("operator_abort") && !content.contains("connection_closed"),
             "the disconnect must not overwrite the operator's cause: {done}"
+        );
+    }
+
+    // ── Review findings: append authority and writer, run-once, reader ─
+
+    const APPENDED: &str = "an operator note appended between turns";
+
+    /// Alice (roster uid 4242) with every session verb, admin as given, and
+    /// one live RPC chat session owned by `owner`.
+    async fn append_review_fixture(
+        tmp: &tempfile::TempDir,
+        sid: &str,
+        owner: &str,
+        admin: bool,
+    ) -> (
+        Arc<RpcContext>,
+        Arc<zeroclaw_infra::session_sqlite::SqliteSessionBackend>,
+        String,
+    ) {
+        use zeroclaw_api::grants::{Resource, Verb};
+        let mut config = session_cwd_config(tmp, 4242, None);
+        {
+            let profile = config
+                .permission_profiles
+                .get_mut("session-scoped")
+                .expect("the fixture profile exists");
+            profile.admin = admin;
+            profile.grants.insert(
+                Resource::Sessions,
+                vec![Verb::Create, Verb::Read, Verb::Execute, Verb::Update],
+            );
+        }
+        let workspace = config.agent_workspace_dir("test-agent");
+        let (ctx, chat_backend, _acp_store) = persistence_enforcement_ctx(config);
+        let (provider, _handles) = scripted_turn_provider();
+        let key = install_state_test_session_owned_at(
+            &ctx.sessions,
+            &chat_backend,
+            sid,
+            provider,
+            None,
+            Some(owner),
+            &workspace,
+        )
+        .await;
+        (ctx, chat_backend, key)
+    }
+
+    fn republish_session_scoped(
+        ctx: &Arc<RpcContext>,
+        edit: impl FnOnce(&mut zeroclaw_config::schema::PermissionProfileConfig),
+    ) {
+        let mut next = ctx.config.read().clone();
+        edit(
+            next.permission_profiles
+                .get_mut("session-scoped")
+                .expect("the fixture profile exists"),
+        );
+        ctx.auth
+            .refresh_from_config(&next)
+            .expect("the republished policy compiles");
+    }
+
+    fn durable_holds(
+        backend: &Arc<zeroclaw_infra::session_sqlite::SqliteSessionBackend>,
+        key: &str,
+        text: &str,
+    ) -> bool {
+        zeroclaw_infra::session_backend::SessionBackend::load(backend.as_ref(), key)
+            .iter()
+            .any(|message| message.content.contains(text))
+    }
+
+    async fn live_holds(ctx: &Arc<RpcContext>, sid: &str, text: &str) -> bool {
+        let Some(agent) = ctx.sessions.get_agent(sid).await else {
+            return false;
+        };
+        agent.lock().await.history().iter().any(
+            |message| matches!(message, ConversationMessage::Chat(chat) if chat.content.contains(text)),
+        )
+    }
+
+    /// Alice's append to `sid`, queued behind a held permit while `change`
+    /// runs; returns the append's result once the permit is released.
+    async fn append_after_queued_change(
+        ctx: &Arc<RpcContext>,
+        sid: &str,
+        change: impl FnOnce(&Arc<RpcContext>),
+    ) -> RpcResult {
+        let (alice, _rx) = roster_peer(ctx, 4242).await;
+        let params = json!({"session_id": sid, "content": APPENDED});
+        rpc_result_after_midwait_session_admission(
+            Arc::clone(ctx),
+            sid,
+            async move { alice.handle_session_append(&params).await },
+            change,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_queued_append_is_refused_when_its_grant_is_revoked_while_it_waits() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sid = "s-append-revoked";
+        let (ctx, backend, key) = append_review_fixture(&tmp, sid, "user:alice", false).await;
+
+        let result = append_after_queued_change(&ctx, sid, |ctx| {
+            republish_session_scoped(ctx, |profile| {
+                profile.grants.insert(
+                    zeroclaw_api::grants::Resource::Sessions,
+                    vec![zeroclaw_api::grants::Verb::Read],
+                );
+            });
+        })
+        .await;
+
+        assert_eq!(result.expect_err("revoked while queued").code, FORBIDDEN);
+        assert!(!durable_holds(&backend, &key, APPENDED), "no durable write");
+        assert!(!live_holds(&ctx, sid, APPENDED).await, "no live write");
+    }
+
+    #[tokio::test]
+    async fn a_queued_append_by_a_demoted_administrator_is_held_to_ownership() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sid = "s-append-demoted";
+        // Alice appends to Bob's session as an administrator and loses admin,
+        // but not sessions:update, while the append waits.
+        let (ctx, backend, key) = append_review_fixture(&tmp, sid, "user:bob", true).await;
+
+        let result = append_after_queued_change(&ctx, sid, |ctx| {
+            republish_session_scoped(ctx, |profile| profile.admin = false);
+        })
+        .await;
+
+        assert_eq!(result.expect_err("demoted while queued").code, FORBIDDEN);
+        assert!(!durable_holds(&backend, &key, APPENDED), "no durable write");
+        assert!(!live_holds(&ctx, sid, APPENDED).await, "no live write");
+    }
+
+    #[tokio::test]
+    async fn a_queued_append_is_honoured_when_its_grants_widen_while_it_waits() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sid = "s-append-widened";
+        let (ctx, backend, key) = append_review_fixture(&tmp, sid, "user:alice", false).await;
+
+        // An unrelated grant moves the policy generation; the recheck must
+        // re-resolve rather than refuse on any change.
+        let result = append_after_queued_change(&ctx, sid, |ctx| {
+            republish_session_scoped(ctx, |profile| {
+                profile.grants.insert(
+                    zeroclaw_api::grants::Resource::Memory,
+                    vec![zeroclaw_api::grants::Verb::Read],
+                );
+            });
+        })
+        .await;
+
+        result.expect("a widened principal still appends");
+        assert!(
+            durable_holds(&backend, &key, APPENDED),
+            "the durable write happened"
+        );
+        assert!(
+            live_holds(&ctx, sid, APPENDED).await,
+            "the live write happened"
         );
     }
 }
