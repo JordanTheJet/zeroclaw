@@ -38,6 +38,8 @@ pub const RPC_PROTOCOL_VERSION: u64 = 1;
 mod notification {
     pub const SESSION_UPDATE: &str = "session/update";
     pub const LOGS_EVENT: &str = "logs/event";
+    pub const EVENTS_EVENT: &str = "events/event";
+    pub const SUBSCRIPTION_LAGGED: &str = "subscription/lagged";
 }
 
 #[derive(Debug)]
@@ -168,6 +170,8 @@ pub enum Method {
     LogsQuery,
     LogsGet,
     EventsHistory,
+    EventsSubscribe,
+    SubscriptionCancel,
 
     // TUI
     TuiList,
@@ -288,6 +292,8 @@ impl Method {
         (Method::LogsSubscribe, "logs/subscribe"),
         (Method::LogsQuery, "logs/query"),
         (Method::EventsHistory, "events/history"),
+        (Method::EventsSubscribe, "events/subscribe"),
+        (Method::SubscriptionCancel, "subscription/cancel"),
         (Method::LogsGet, "logs/get"),
         // TUI
         (Method::TuiList, "tui/list"),
@@ -416,9 +422,17 @@ impl Method {
             }
             M::PersonalityPut => (Resource::Personality, Verb::Update),
 
-            M::LogsSubscribe | M::LogsQuery | M::LogsGet | M::EventsHistory => {
-                (Resource::Logs, Verb::Read)
-            }
+            // `subscription/cancel` ends only a subscription this connection
+            // opened (the id is looked up in the connection's own registry).
+            // It takes the same grant as the subscribe methods that create
+            // subscriptions, so whoever could open one can end it. A future
+            // source under a different grant must revisit this arm.
+            M::LogsSubscribe
+            | M::LogsQuery
+            | M::LogsGet
+            | M::EventsHistory
+            | M::EventsSubscribe
+            | M::SubscriptionCancel => (Resource::Logs, Verb::Read),
 
             M::TuiList => (Resource::Tui, Verb::Read),
 
@@ -896,6 +910,10 @@ pub struct RpcDispatcher {
     /// one (direct dispatcher construction outside an accepted connection).
     connection_activity: Option<crate::rpc::ConnectionActivity>,
     prompt_tasks: Vec<JoinHandle<()>>,
+    /// Open subscriptions on this connection, by id. Shared with every
+    /// [`Self::spawn_handle`] clone; each token is a child of
+    /// `connection_cancel`, so teardown ends them all.
+    subscriptions: Arc<parking_lot::Mutex<std::collections::HashMap<String, CancellationToken>>>,
     /// SHA-256 fingerprint of the client certificate presented on the mTLS
     /// handshake (remote WSS plane only; `None` on the local socket). This is the
     /// transport identity: it keys the issued-cert ledger, so the renew RPC gates
@@ -991,6 +1009,7 @@ impl RpcDispatcher {
             owns_connection: true,
             connection_activity: None,
             prompt_tasks: Vec::new(),
+            subscriptions: Arc::default(),
             peer_cert_fingerprint: None,
         }
     }
@@ -1875,6 +1894,41 @@ impl RpcDispatcher {
         Ok(())
     }
 
+    /// A live session and its shell share one immutable forwarded map. A
+    /// reconnect may reuse it only if its *current* grants select the same
+    /// environment; otherwise the caller must create a new incarnation.
+    fn authorize_resumed_environment(
+        &self,
+        grants: Option<&zeroclaw_api::grants::ResolvedGrants>,
+        retained: Option<&crate::tools::ForwardedEnvironment>,
+    ) -> Result<(), JsonRpcError> {
+        self.authorize_session_environment(
+            Method::SessionNew,
+            grants,
+            retained.is_some_and(|env| !env.is_empty()),
+        )?;
+        let current = self.session_tui_env(grants);
+        let retained = retained
+            .map(|env| env.as_ref())
+            .filter(|env| !env.is_empty());
+        let current = current.as_ref().filter(|env| !env.is_empty());
+        if retained != current {
+            let denied = rpc_err(
+                FORBIDDEN,
+                "Session environment differs from this connection; create a new session",
+            );
+            self.audit_auth_denial(
+                Method::SessionNew,
+                &crate::rpc::auth::AuthDenied {
+                    code: denied.code,
+                    message: denied.message.clone(),
+                },
+            );
+            return Err(denied);
+        }
+        Ok(())
+    }
+
     /// Apply a principal's posture to an agent: narrow its tool surface to the
     /// selector, and, for a principal without operator reach, disable nested
     /// tools that cannot carry the principal through. A handler that
@@ -2409,6 +2463,7 @@ impl RpcDispatcher {
             // until that task's future is dropped.
             connection_activity: self.connection_activity.clone(),
             prompt_tasks: Vec::new(),
+            subscriptions: Arc::clone(&self.subscriptions),
             peer_cert_fingerprint: self.peer_cert_fingerprint.clone(),
         }
     }
@@ -2891,7 +2946,9 @@ impl RpcDispatcher {
             }
 
             // Logs
-            Method::LogsSubscribe => self.handle_logs_subscribe().await,
+            Method::LogsSubscribe => self.handle_logs_subscribe(&req.params),
+            Method::EventsSubscribe => self.handle_events_subscribe(&req.params),
+            Method::SubscriptionCancel => self.handle_subscription_cancel(&req.params),
             Method::LogsQuery => self.handle_logs_query(&req.params).await,
             Method::EventsHistory => self.handle_events_history(),
             Method::LogsGet => self.handle_logs_get(&req.params).await,
@@ -3462,34 +3519,6 @@ impl RpcDispatcher {
         chat_mode: &crate::rpc::types::ChatMode,
         existing: crate::rpc::session::ResumedRpcSession,
     ) -> RpcResult {
-        // The canonical live agent keeps the shell tool it was built with,
-        // whose forwarded environment was filtered for the connection that
-        // FIRST constructed it. This resume may be a different connection —
-        // the same principal after losing `admin`, a WSS reconnect describing
-        // another host — so re-derive the forwarded shell environment against
-        // THIS connection's own registration before the resumed session runs a
-        // command. The registration env was already filtered for this
-        // connection's entitlement at `initialize` (an environment is retained
-        // only for a local operator, dropped and audited otherwise), so
-        // re-installing it neither widens a scoped principal's environment nor
-        // strands a permitted local operator's. A connection with no retained
-        // environment installs `None`, dropping any environment the prior
-        // incarnation carried.
-        //
-        // Like the approval-channel rebind below, this must NOT make the
-        // reconnect wait on an active turn that owns the Agent mutex: install
-        // the re-derived environment as soon as the predecessor releases the
-        // canonical Agent. The rebind is idempotent and the next turn cannot
-        // start a command before its own `session/prompt` acquires the lock, so
-        // applying it after the in-flight turn drains is correct — an in-flight
-        // command keeps the environment it began with.
-        let resumed_env = self
-            .tui_registration()
-            .and_then(|(id, epoch)| self.ctx.tui_registry.env_for_registration(id, epoch));
-        let env_agent = Arc::clone(&existing.agent);
-        zeroclaw_spawn::spawn!(async move {
-            env_agent.lock().await.rebind_shell_env(resumed_env);
-        });
         self.rebind_rpc_approval_channel(Arc::clone(&existing.agent), session_id.clone());
         if matches!(chat_mode, crate::rpc::types::ChatMode::Acp)
             && let Some(plan) = self.ctx.sessions.get_plan(&session_id).await
@@ -3571,14 +3600,10 @@ impl RpcDispatcher {
                     resolved_interaction_surface,
                     self.tui_id.clone(),
                     resume_scope.as_deref(),
-                    |alias, workspace, has_environment| {
+                    |alias, workspace, retained_environment| {
                         let grants = self.recheck_authority_after_admission(Method::SessionNew)?;
                         self.authorize_resumed_session(grants.as_ref(), alias, workspace)?;
-                        self.authorize_session_environment(
-                            Method::SessionNew,
-                            grants.as_ref(),
-                            has_environment,
-                        )
+                        self.authorize_resumed_environment(grants.as_ref(), retained_environment)
                     },
                 )
                 .await
@@ -3666,14 +3691,10 @@ impl RpcDispatcher {
                     resolved_interaction_surface,
                     self.tui_id.clone(),
                     resume_scope.as_deref(),
-                    |alias, workspace, has_environment| {
+                    |alias, workspace, retained_environment| {
                         let grants = self.recheck_authority_after_admission(Method::SessionNew)?;
                         self.authorize_resumed_session(grants.as_ref(), alias, workspace)?;
-                        self.authorize_session_environment(
-                            Method::SessionNew,
-                            grants.as_ref(),
-                            has_environment,
-                        )
+                        self.authorize_resumed_environment(grants.as_ref(), retained_environment)
                     },
                 )
                 .await
@@ -9142,72 +9163,132 @@ impl RpcDispatcher {
 
     // ── Logs handler ─────────────────────────────────────────────
 
-    async fn handle_logs_subscribe(&self) -> RpcResult {
+    fn handle_logs_subscribe(&self, params: &Value) -> RpcResult {
+        to_result(self.open_subscription(
+            crate::rpc::subscription::Source::Logs,
+            Method::LogsSubscribe,
+            notification::LOGS_EVENT,
+            params,
+        )?)
+    }
+
+    /// Observer frames only (agent, tool, LLM, history-trim, error): the
+    /// live twin of `events/history`, from the daemon's bus.
+    fn handle_events_subscribe(&self, params: &Value) -> RpcResult {
+        to_result(self.open_subscription(
+            crate::rpc::subscription::Source::Events,
+            Method::EventsSubscribe,
+            notification::EVENTS_EVENT,
+            params,
+        )?)
+    }
+
+    fn handle_subscription_cancel(&self, params: &Value) -> RpcResult {
+        let p: SubscriptionCancelParams = parse_params(params)?;
+        let token = self.subscriptions.lock().remove(&p.subscription_id);
+        if let Some(token) = &token {
+            token.cancel();
+        }
+        to_result(SubscriptionCancelResult {
+            cancelled: token.is_some(),
+        })
+    }
+
+    /// Open a subscription on `source` for this connection and start its
+    /// delivery task. Returns the id and the newest sequence number.
+    ///
+    /// The hub holds the frames; the task only moves a cursor. `since_seq`
+    /// replays what is still buffered, and any gap, whether evicted, lost on
+    /// the bus, or from before a restart, is reported as
+    /// `subscription/lagged` before delivery resumes. A subscription outlives
+    /// the call that opened it, so every delivery is held to the connection's
+    /// authority: the credential must still be live and, whenever the
+    /// accepted policy has moved, the principal is resolved again against
+    /// `method`. The first refusal ends the stream. An unbound dispatcher (the
+    /// direct unit-test handlers) has nothing to recheck.
+    /// Refuse the global streams to a scoped principal (neither an
+    /// administrator nor the shared operator), using its current grants
+    /// rather than the bind-time copy. An
+    /// unbound dispatcher (the direct unit-test handlers) is not checked.
+    fn require_global_stream_access(&self, method: Method) -> Result<(), JsonRpcError> {
+        let Some(auth) = self.auth.as_ref() else {
+            return Ok(());
+        };
+        let denied = match current_authority(&self.ctx.auth, auth, method) {
+            Ok(grants) if sees_every_principal(auth, &grants) => return Ok(()),
+            Ok(_) => crate::rpc::auth::AuthDenied::forbidden(GLOBAL_STREAM_SCOPED_DENIAL),
+            Err(denied) => denied,
+        };
+        audit_denial(Some(auth), method, &denied);
+        Err(rpc_err(denied.code, denied.message))
+    }
+
+    fn open_subscription(
+        &self,
+        source: crate::rpc::subscription::Source,
+        method: Method,
+        notification_method: &'static str,
+        params: &Value,
+    ) -> Result<LogsSubscribeResult, JsonRpcError> {
+        self.require_global_stream_access(method)?;
+        let p: SubscribeParams = if params.is_null() {
+            SubscribeParams::default()
+        } else {
+            parse_params(params)?
+        };
         let event_tx = self
             .ctx
             .event_tx
             .as_ref()
             .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Event streaming is not available"))?;
-        let mut rx = event_tx.subscribe();
-        let rpc = self.rpc.clone();
-        // A subscription outlives the call that opened it, so the gate alone
-        // cannot end it. Hold every delivery to the connection's authority:
-        // the credential must still be live, and whenever the accepted policy
-        // has moved, the principal is resolved again and must still hold
-        // `Logs:Read`. The first refusal ends the stream. An unbound
-        // dispatcher (the direct unit-test handlers) has nothing to recheck.
-        let inbound = Arc::clone(&self.ctx.auth);
-        let binding = self.auth.clone();
-        let mut checked_generation = binding.as_ref().map(|auth| auth.generation);
-        zeroclaw_spawn::spawn!(async move {
-            loop {
-                tokio::select! {
-                    biased;
-                    _ = rpc.closed() => break,
-                    event = rx.recv() => match event {
-                        Ok(mut event) => {
-                            if let Some(auth) = binding.as_ref() {
-                                let generation = inbound.generation();
-                                let authority = if checked_generation == Some(generation) {
-                                    credential_is_live(&inbound, auth)
-                                } else {
-                                    current_authority(&inbound, auth, Method::LogsSubscribe)
-                                        .map(|_| ())
-                                };
-                                if let Err(denied) = authority {
-                                    audit_denial(Some(auth), Method::LogsSubscribe, &denied);
-                                    break;
-                                }
-                                checked_generation = Some(generation);
-                            }
-                            // Pairing secrets (QR payloads, one-shot pair codes)
-                            // ride the shared broadcast bus stamped with the
-                            // ephemeral marker. `logs/subscribe` is NOT the
-                            // bearer-authenticated SSE surface those credentials
-                            // are scoped to — a fresh remote RPC client can
-                            // `initialize` and subscribe over WSS without the
-                            // gateway bearer check — so fail closed: withhold
-                            // marked frames entirely and strip the internal
-                            // marker from everything else (public shape
-                            // unchanged). See `zeroclaw_gateway::sse`.
-                            if zeroclaw_log::frame_carries_ephemeral_credentials(&event) {
-                                continue;
-                            }
-                            zeroclaw_log::strip_ephemeral_broadcast_marker(&mut event);
-                            let notification =
-                                JsonRpcNotification::new(notification::LOGS_EVENT, event);
-                            if let Ok(json) = serde_json::to_string(&notification)
-                                && !rpc.send_raw(json).await
-                            {
-                                break;
-                            }
-                        }
-                        Err(_) => break,
-                    },
+        let hub = Arc::clone(&self.ctx.subscriptions);
+        hub.attach_bus(event_tx);
+        let head = hub.head_seq(source);
+        // Sequence numbers are scoped to the hub's epoch; a new hub (daemon
+        // restart or reload) starts again at 1. `since_seq` resumes only
+        // against the epoch it came from. Any other epoch, or none, cannot be
+        // lined up with this hub's numbers: replay what this hub still holds
+        // and say that continuity broke.
+        let (cursor, epoch_changed) = match p.since_seq {
+            None => (head + 1, false),
+            Some(since) if p.epoch.as_deref() == Some(hub.epoch()) => {
+                if since > head {
+                    return Err(rpc_err(
+                        INVALID_PARAMS,
+                        format!("since_seq {since} is ahead of this stream (newest is {head})"),
+                    ));
                 }
+                (since + 1, false)
             }
-        });
-        to_result(LogsSubscribeResult { subscribed: true })
+            Some(_) => (hub.oldest_seq(source), true),
+        };
+        let epoch = hub.epoch().to_string();
+        let subscription_id = uuid::Uuid::new_v4().to_string();
+        let cancel = self.connection_cancel.child_token();
+        self.subscriptions
+            .lock()
+            .insert(subscription_id.clone(), cancel.clone());
+        let delivery = SubscriptionDelivery {
+            hub,
+            source,
+            subscription_id: subscription_id.clone(),
+            cursor,
+            epoch_changed,
+            rpc: self.rpc.clone(),
+            cancel,
+            notification_method,
+            method,
+            inbound: Arc::clone(&self.ctx.auth),
+            binding: self.auth.clone(),
+            registry: Arc::clone(&self.subscriptions),
+        };
+        zeroclaw_spawn::spawn!(deliver_subscription(delivery));
+        Ok(LogsSubscribeResult {
+            subscribed: true,
+            subscription_id,
+            seq: head,
+            epoch,
+        })
     }
 
     /// Recent observer frames (agent, tool, LLM, history-trim, error), oldest
@@ -9215,6 +9296,7 @@ impl RpcDispatcher {
     /// the daemon's bus so it works without the gateway. Pairing credentials
     /// are never replayed.
     fn handle_events_history(&self) -> RpcResult {
+        self.require_global_stream_access(Method::EventsHistory)?;
         let history = self
             .ctx
             .event_history
@@ -10428,6 +10510,201 @@ impl Drop for RpcDispatcher {
 }
 
 // ── Helpers ──────────────────────────────────────────────────────
+
+/// Everything one subscription's delivery task owns.
+struct SubscriptionDelivery {
+    hub: Arc<crate::rpc::subscription::SubscriptionHub>,
+    source: crate::rpc::subscription::Source,
+    subscription_id: String,
+    cursor: u64,
+    /// The client's `since_seq` came from another hub epoch; `cursor` is the
+    /// oldest frame still buffered here.
+    epoch_changed: bool,
+    rpc: Arc<RpcOutbound>,
+    cancel: CancellationToken,
+    notification_method: &'static str,
+    method: Method,
+    inbound: Arc<crate::rpc::auth::RpcInboundAuth>,
+    binding: Option<crate::rpc::auth::ConnectionAuth>,
+    registry: Arc<parking_lot::Mutex<std::collections::HashMap<String, CancellationToken>>>,
+}
+
+/// Move one subscription's cursor through the hub until it is cancelled, the
+/// connection closes, a write fails, or the caller loses its authority.
+async fn deliver_subscription(delivery: SubscriptionDelivery) {
+    use crate::rpc::subscription::{READ_BATCH, Read};
+    let SubscriptionDelivery {
+        hub,
+        source,
+        subscription_id,
+        mut cursor,
+        epoch_changed,
+        rpc,
+        cancel,
+        notification_method,
+        method,
+        inbound,
+        binding,
+        registry,
+    } = delivery;
+    let lagged = |from_seq: u64, resume_seq: u64, epoch_changed: bool| {
+        serde_json::to_string(&JsonRpcNotification::new(
+            notification::SUBSCRIPTION_LAGGED,
+            serde_json::json!(SubscriptionLagged {
+                subscription_id: subscription_id.clone(),
+                from_seq,
+                resume_seq,
+                epoch_changed,
+            }),
+        ))
+        .ok()
+    };
+    let mut checked_generation = binding.as_ref().map(|auth| auth.generation);
+
+    'deliver: {
+        // The client's numbers belong to another epoch: nothing it saw can be
+        // matched here. Everything before `cursor` in this epoch is gone; from
+        // `cursor` on, every buffered frame is replayed.
+        if epoch_changed {
+            if !still_authorized(&inbound, binding.as_ref(), method, &mut checked_generation) {
+                break 'deliver;
+            }
+            let Some(json) = lagged(1, cursor, true) else {
+                break 'deliver;
+            };
+            if !rpc.send_raw(json).await {
+                break 'deliver;
+            }
+        }
+
+        loop {
+            let notified = hub.notifier(source).notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            match hub.read(source, cursor, READ_BATCH) {
+                Read::Lagged {
+                    from_seq,
+                    resume_seq,
+                } => {
+                    if !still_authorized(
+                        &inbound,
+                        binding.as_ref(),
+                        method,
+                        &mut checked_generation,
+                    ) {
+                        break 'deliver;
+                    }
+                    let Some(json) = lagged(from_seq, resume_seq, false) else {
+                        break 'deliver;
+                    };
+                    if !rpc.send_raw(json).await {
+                        break 'deliver;
+                    }
+                    cursor = resume_seq;
+                    continue;
+                }
+                Read::Frames(frames) if !frames.is_empty() => {
+                    for (seq, frame) in frames {
+                        if cancel.is_cancelled()
+                            || !still_authorized(
+                                &inbound,
+                                binding.as_ref(),
+                                method,
+                                &mut checked_generation,
+                            )
+                        {
+                            break 'deliver;
+                        }
+                        let mut params = (*frame).clone();
+                        if let Some(object) = params.as_object_mut() {
+                            object.insert(
+                                "subscription_id".into(),
+                                serde_json::json!(subscription_id),
+                            );
+                            object.insert("seq".into(), serde_json::json!(seq));
+                        }
+                        let notification = JsonRpcNotification::new(notification_method, params);
+                        let Ok(json) = serde_json::to_string(&notification) else {
+                            break 'deliver;
+                        };
+                        if !rpc.send_raw(json).await {
+                            break 'deliver;
+                        }
+                        cursor = seq + 1;
+                    }
+                    tokio::task::yield_now().await;
+                    continue;
+                }
+                Read::Frames(_) => {}
+            }
+            tokio::select! {
+                biased;
+                () = cancel.cancelled() => break 'deliver,
+                () = rpc.closed() => break 'deliver,
+                () = &mut notified => {}
+            }
+        }
+    }
+    registry.lock().remove(&subscription_id);
+}
+
+/// The daemon-wide log and event streams, and the event history, carry
+/// frames from every principal's work: session messages, cron results, log
+/// lines. Many name no owner, so they cannot be filtered per principal. Until
+/// frames carry reliable ownership they are unscoped-only, with the same
+/// definition session ownership uses ([`RpcDispatcher::scoped_principal_id`]):
+/// an administrator, or the unauthenticated shared operator. Reaching every
+/// agent (the `*` agent selector) is not enough; it addresses every agent
+/// but owns only its own sessions.
+fn sees_every_principal(
+    auth: &crate::rpc::auth::ConnectionAuth,
+    grants: &zeroclaw_api::grants::ResolvedGrants,
+) -> bool {
+    grants.admin || !auth.principal.is_authenticated()
+}
+
+const GLOBAL_STREAM_SCOPED_DENIAL: &str = "Scoped principals cannot read the daemon-wide log \
+     and event streams: their frames are not attributed to an owning principal, so these \
+     streams and the event history are limited to administrators and the shared operator";
+
+/// Hold one delivery (a frame or a `lagged` notice) to the connection's
+/// authority. The credential must still be live, and whenever the accepted
+/// policy generation has moved, the principal is resolved again against
+/// `method`. A refusal is audited. An unbound dispatcher (the direct
+/// unit-test handlers) has nothing to recheck.
+fn still_authorized(
+    inbound: &crate::rpc::auth::RpcInboundAuth,
+    binding: Option<&crate::rpc::auth::ConnectionAuth>,
+    method: Method,
+    checked_generation: &mut Option<u64>,
+) -> bool {
+    let Some(auth) = binding else {
+        return true;
+    };
+    let generation = inbound.generation();
+    // A moved policy generation re-resolves the principal: it must still
+    // hold `method`'s grant and still see every principal, so narrowing or
+    // demoting a principal ends its stream.
+    let authority = if *checked_generation == Some(generation) {
+        credential_is_live(inbound, auth)
+    } else {
+        current_authority(inbound, auth, method).and_then(|grants| {
+            if sees_every_principal(auth, &grants) {
+                Ok(())
+            } else {
+                Err(crate::rpc::auth::AuthDenied::forbidden(
+                    GLOBAL_STREAM_SCOPED_DENIAL,
+                ))
+            }
+        })
+    };
+    if let Err(denied) = authority {
+        audit_denial(Some(auth), method, &denied);
+        return false;
+    }
+    *checked_generation = Some(generation);
+    true
+}
 
 fn parse_params<T: DeserializeOwned>(params: &Value) -> Result<T, JsonRpcError> {
     serde_json::from_value(params.clone()).map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))
@@ -15414,27 +15691,6 @@ mod tests {
         result.output.into_string()
     }
 
-    /// Poll the shell environment until `pred` holds or a bounded number of
-    /// yields elapse. The resume path applies its environment rebind in a
-    /// spawned task (so the reconnect never waits on an in-flight turn), so a
-    /// test observing the rebound value must let that task run first.
-    #[cfg(unix)]
-    async fn wait_for_shell_env(
-        ctx: &Arc<RpcContext>,
-        session_id: &str,
-        pred: impl Fn(&str) -> bool,
-    ) -> String {
-        let mut last = String::new();
-        for _ in 0..200 {
-            last = session_shell_env(ctx, session_id).await;
-            if pred(&last) {
-                return last;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
-        last
-    }
-
     #[cfg(unix)]
     #[tokio::test]
     async fn session_new_ignores_a_foreign_request_tui_id_for_environment() {
@@ -15572,18 +15828,12 @@ mod tests {
         );
     }
 
-    /// Reviewer regression (discussion_r4109687906): reusing a canonical live
-    /// session must re-derive the forwarded shell environment against the
-    /// RESUMING connection, not keep the environment cloned into the shell tool
-    /// at first construction. A local operator creates an environment-bearing
-    /// session; the SAME connection then resumes it after its retained
-    /// environment is gone (reconnect re-registers the id with no environment,
-    /// e.g. the entitlement that kept it was lost). The resumed session's own
-    /// shell tool must stop overlaying the stale sentinel. Environment-free
-    /// reuse stays clean, and an unchanged retained environment survives reuse.
+    /// The environment is immutable for a live session. A reconnect carrying
+    /// a different map must create a new session; it cannot mutate the shell
+    /// underneath the session's admission record.
     #[cfg(unix)]
     #[tokio::test]
-    async fn resuming_a_session_re_derives_the_forwarded_shell_environment() {
+    async fn resuming_a_session_requires_its_original_environment() {
         let tmp = tempfile::TempDir::new().unwrap();
         let ctx = enforcement_ctx(shell_env_config(&tmp));
         let (tx, mut rx) = tokio::sync::mpsc::channel(64);
@@ -15618,11 +15868,7 @@ mod tests {
         );
         let canonical = ctx.sessions.get_agent("s-reuse").await.unwrap();
 
-        // ── Same session RESUMED after the retained environment is gone ──
-        // The reconnect re-registers the same id under a new epoch carrying no
-        // environment (the value `retained_tui_env` produces once the operator
-        // entitlement that kept it is lost). Resuming must re-derive the shell
-        // tool's environment, not keep the sentinel cloned in at construction.
+        // ── A different registration cannot mutate the same incarnation ──
         let epoch = ctx
             .tui_registry
             .register(crate::rpc::tui_identity::TuiEntry {
@@ -15641,23 +15887,18 @@ mod tests {
             json!({"agent_alias": "test-agent", "session_id": "s-reuse"}),
         )
         .await;
-        assert_eq!(
-            response["result"]["session_id"],
-            json!("s-reuse"),
-            "{response}"
-        );
+        assert_eq!(response["error"]["code"], FORBIDDEN, "{response}");
         assert!(
             Arc::ptr_eq(
                 &canonical,
                 &ctx.sessions.get_agent("s-reuse").await.unwrap()
             ),
-            "the resume rebinds the SAME canonical incarnation, not a fresh build"
+            "the refused resume leaves the canonical incarnation in place"
         );
-        let after = wait_for_shell_env(&ctx, "s-reuse", |env| !env.contains("REUSE_SOCK")).await;
+        let after = session_shell_env(&ctx, "s-reuse").await;
         assert!(
-            !after.contains("REUSE_SOCK"),
-            "resuming under a connection with no retained environment must drop the \
-             environment the first incarnation carried:\n{after}"
+            after.contains("REUSE_SOCK=/tmp/reuse.sock"),
+            "a refused resume must not change the shell environment:\n{after}"
         );
 
         // ── Permitted continuity: re-registering the SAME environment keeps it ──
@@ -15681,10 +15922,7 @@ mod tests {
             json!("s-reuse"),
             "{response}"
         );
-        let restored = wait_for_shell_env(&ctx, "s-reuse", |env| {
-            env.contains("REUSE_SOCK=/tmp/reuse.sock")
-        })
-        .await;
+        let restored = session_shell_env(&ctx, "s-reuse").await;
         assert!(
             restored.contains("REUSE_SOCK=/tmp/reuse.sock"),
             "an unchanged retained environment survives reuse:\n{restored}"
@@ -15692,7 +15930,9 @@ mod tests {
     }
 
     /// A session built with NO forwarded environment stays environment-free
-    /// across reuse — the rebind never invents one.
+    /// across reuse; a matching empty registration is still compatible, and a
+    /// connection that now forwards a map is refused instead of grafting it
+    /// onto the live incarnation.
     #[cfg(unix)]
     #[tokio::test]
     async fn resuming_an_environment_free_session_stays_environment_free() {
@@ -15727,6 +15967,39 @@ mod tests {
                 "{response}"
             );
         }
+        let canonical = ctx.sessions.get_agent("s-empty").await.unwrap();
+
+        // ── An environment-bearing registration cannot resume it ──
+        register_tui_env(
+            &ctx,
+            &mut client,
+            "tui_empty0001",
+            "REUSE_SOCK",
+            "/tmp/reuse.sock",
+        );
+        let response = rpc(
+            &mut client,
+            &mut rx,
+            3,
+            "session/new",
+            json!({"agent_alias": "test-agent", "session_id": "s-empty"}),
+        )
+        .await;
+        assert_eq!(response["error"]["code"], FORBIDDEN, "{response}");
+        assert!(
+            response["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("environment differs"),
+            "{response}"
+        );
+        assert!(
+            Arc::ptr_eq(
+                &canonical,
+                &ctx.sessions.get_agent("s-empty").await.unwrap()
+            ),
+            "the refused resume leaves the canonical incarnation in place"
+        );
         let env = session_shell_env(&ctx, "s-empty").await;
         assert!(
             !env.contains("REUSE_SOCK") && !env.contains("SENTINEL"),
@@ -15906,6 +16179,10 @@ mod tests {
 
     async fn environment_principal_fixture(tmp: &tempfile::TempDir) -> RpcDispatcher {
         let mut config = principal_test_config(tmp, &["*"], &["*"]);
+        let risk = config.risk_profiles.get_mut("test-profile").unwrap();
+        risk.allowed_tools.push("shell".into());
+        risk.allowed_commands = vec!["env".into()];
+        std::fs::create_dir_all(config.agent_workspace_dir("test-agent")).unwrap();
         config
             .permission_profiles
             .get_mut("principal-test")
@@ -15946,6 +16223,141 @@ mod tests {
             .unwrap()
             .admin = false;
         dispatcher.ctx.auth.refresh_from_config(&config).unwrap();
+    }
+
+    #[cfg(unix)]
+    struct ShellEnvironmentProbe(Arc<std::sync::Mutex<Option<String>>>);
+
+    #[cfg(unix)]
+    #[async_trait]
+    impl zeroclaw_api::model_provider::ModelProvider for ShellEnvironmentProbe {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("unused".to_string())
+        }
+
+        async fn chat(
+            &self,
+            request: zeroclaw_providers::ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<zeroclaw_providers::ChatResponse> {
+            if let Some(result) = request
+                .messages
+                .iter()
+                .rev()
+                .find(|message| message.role == "tool")
+            {
+                *self.0.lock().unwrap() = Some(result.content.clone());
+                return Ok(zeroclaw_providers::ChatResponse {
+                    text: Some("environment checked".to_string()),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    reasoning_content: None,
+                });
+            }
+            Ok(zeroclaw_providers::ChatResponse {
+                text: None,
+                tool_calls: vec![zeroclaw_providers::ToolCall {
+                    id: "shell-env".to_string(),
+                    name: "shell".to_string(),
+                    arguments: json!({"command": "env", "approved": true}).to_string(),
+                    extra_content: None,
+                }],
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    #[cfg(unix)]
+    impl zeroclaw_api::attribution::Attributable for ShellEnvironmentProbe {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Provider(
+                zeroclaw_api::attribution::ProviderKind::Model(
+                    zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "shell-environment-probe"
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn demoted_principal_cannot_restore_environment_on_fresh_session_resume() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = environment_principal_fixture(&tmp).await;
+        let ctx = Arc::clone(&dispatcher.ctx);
+        demote_environment_principal(&dispatcher);
+        assert!(!registered_env(&ctx, &dispatcher).is_empty());
+        // This probe exercises the shell result, not the operator approval
+        // channel. Keep shell execution automatic after preserving its grant.
+        ctx.config
+            .write()
+            .risk_profiles
+            .get_mut("test-profile")
+            .unwrap()
+            .level = zeroclaw_config::autonomy::AutonomyLevel::Full;
+
+        let params = json!({"agent_alias": "test-agent", "session_id": "env-fresh"});
+        dispatcher
+            .handle_session_new_for_test(&params)
+            .await
+            .unwrap();
+        assert_eq!(
+            ctx.sessions.has_forwarded_environment("env-fresh").await,
+            Some(false)
+        );
+        let agent = ctx.sessions.get_agent("env-fresh").await.unwrap();
+        let observed = Arc::new(std::sync::Mutex::new(None));
+        agent
+            .lock()
+            .await
+            .set_model_provider(Box::new(ShellEnvironmentProbe(Arc::clone(&observed))));
+
+        dispatcher
+            .handle_session_new_for_test(&params)
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(
+            &agent,
+            &ctx.sessions.get_agent("env-fresh").await.unwrap()
+        ));
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            dispatcher.handle_session_prompt(&json!({
+                "session_id": "env-fresh", "prompt": "Inspect the environment"
+            })),
+        )
+        .await
+        .expect("the shell probe must settle")
+        .unwrap();
+        let tool_result = observed
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the prompt executed shell env");
+        assert!(
+            tool_result.contains("ZEROCLAW_SESSION_ID=env-fresh"),
+            "the probe must observe a real shell run: {tool_result}"
+        );
+        assert!(
+            !tool_result.contains("ZEROCLAW_ENV_SENTINEL"),
+            "demoted owner recovered forwarded values: {tool_result}"
+        );
+        assert!(
+            !session_shell_env(&ctx, "env-fresh")
+                .await
+                .contains("ZEROCLAW_ENV_SENTINEL")
+        );
     }
 
     #[tokio::test]
@@ -19405,7 +19817,7 @@ mod tests {
         let d = RpcDispatcher::new(ctx, writer_tx, "remote:wss=1,uid=anon".into());
 
         assert!(
-            d.handle_logs_subscribe().await.is_ok(),
+            d.handle_logs_subscribe(&json!({})).is_ok(),
             "a fresh client should be able to subscribe"
         );
 
@@ -19459,20 +19871,69 @@ mod tests {
         );
     }
 
-    /// G2a: the daemon owns the observer hook, so with no gateway running a
-    /// `logs/subscribe` client still receives the agent, tool, and LLM frames
-    /// recorded through any factory-built observer, each exactly once, and
+    /// The fixture's hook: forwards only its own turn to the real
+    /// `BroadcastObserver`, so observer events other tests record through the
+    /// process-wide hook never reach this bus's live ring or its history.
+    /// Counts what it turned away, so a flood can prove it went through here.
+    struct FixtureTurnObserver {
+        turn: &'static str,
+        inner: crate::observability::BroadcastObserver,
+        rejected: std::sync::atomic::AtomicUsize,
+    }
+
+    impl crate::observability::Observer for FixtureTurnObserver {
+        fn record_event(&self, event: &crate::observability::ObserverEvent) {
+            use crate::observability::ObserverEvent;
+            let turn_id = match event {
+                ObserverEvent::AgentStart { turn_id, .. }
+                | ObserverEvent::LlmRequest { turn_id, .. }
+                | ObserverEvent::ToolCall { turn_id, .. } => turn_id.as_deref(),
+                _ => None,
+            };
+            if turn_id == Some(self.turn) {
+                self.inner.record_event(event);
+            } else {
+                self.rejected
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+
+        fn record_metric(&self, _metric: &crate::observability::traits::ObserverMetric) {}
+
+        fn name(&self) -> &str {
+            "fixture-turn"
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// Shared body of the G2a fixture. Records the fixture turn's agent, LLM
+    /// and tool events through a factory-built observer, then `foreign` more
+    /// events for another turn from a separate thread, and asserts the
+    /// subscriber received the fixture's three frames once each and
     /// `events/history` replays them.
-    #[tokio::test]
-    async fn logs_subscribe_carries_observer_frames_without_a_gateway() {
-        use crate::observability::{EventBus, ObserverEvent};
+    ///
+    /// The bus is deliberately small (64 live, 16 history): isolation, not
+    /// capacity, is what keeps foreign events out. The fixture installs its
+    /// own hook and hands its bus to the RPC context by hand; it never starts
+    /// `daemon::run`, so it covers observer-to-RPC plumbing, not the daemon's
+    /// bootstrap wiring.
+    async fn assert_fixture_turn_reaches_subscriber_and_history(foreign: usize) {
+        use crate::observability::{BroadcastObserver, EventBus, ObserverEvent};
         use zeroclaw_infra::session_queue::SessionActorQueue;
+        const TURN: &str = "g2a-turn";
         let _hook = crate::observability::HOOK_TEST_LOCK.lock().await;
         crate::observability::clear_broadcast_hook();
 
-        // What `daemon::run` does, and nothing the gateway does.
         let bus = EventBus::with_capacities(64, 16);
-        let _daemon_hook = bus.install_hook();
+        let fixture = Arc::new(FixtureTurnObserver {
+            turn: TURN,
+            inner: BroadcastObserver::new(bus.sender().clone(), Arc::clone(bus.history())),
+            rejected: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let _fixture_hook = crate::observability::set_scoped_broadcast_hook(fixture.clone());
         let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
         let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
         let ctx = RpcContext::minimal_with_event_bus(
@@ -19482,14 +19943,16 @@ mod tests {
         );
         let (writer_tx, mut writer_rx) = tokio::sync::mpsc::channel::<String>(64);
         let d = RpcDispatcher::new(ctx, writer_tx, "local:uid=0".into());
-        assert!(d.handle_logs_subscribe().await.is_ok());
+        assert!(d.handle_logs_subscribe(&json!({})).is_ok());
 
-        let observer =
+        let factory_observer = || {
             crate::observability::create_observer(&zeroclaw_config::schema::ObservabilityConfig {
                 backend: zeroclaw_config::schema::ObservabilityBackend::None,
                 ..Default::default()
-            });
-        let turn = Some("g2a-turn".to_string());
+            })
+        };
+        let observer = factory_observer();
+        let turn = Some(TURN.to_string());
         observer.record_event(&ObserverEvent::AgentStart {
             model_provider: "p".into(),
             model: "m".into(),
@@ -19519,6 +19982,27 @@ mod tests {
             turn_id: turn.clone(),
         });
 
+        // Another test's producer: its own factory observer on its own thread,
+        // not holding HOOK_TEST_LOCK, recording before this fixture reads
+        // anything back.
+        let foreign_producer = std::thread::spawn(move || {
+            let observer = factory_observer();
+            for _ in 0..foreign {
+                observer.record_event(&ObserverEvent::AgentStart {
+                    model_provider: "p".into(),
+                    model: "m".into(),
+                    channel: None,
+                    agent_alias: None,
+                    turn_id: Some("foreign-turn".into()),
+                });
+            }
+        });
+        foreign_producer.join().expect("foreign producer finished");
+        assert!(
+            fixture.rejected.load(std::sync::atomic::Ordering::Relaxed) >= foreign,
+            "the foreign events must have reached the fixture's hook and been turned away"
+        );
+
         let mut kinds = Vec::new();
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
         while kinds.len() < 3 {
@@ -19528,7 +20012,7 @@ mod tests {
             };
             let frame: Value = serde_json::from_str(&frame).expect("notification is JSON");
             if frame["method"] == json!(notification::LOGS_EVENT)
-                && frame["params"]["turn_id"] == json!("g2a-turn")
+                && frame["params"]["turn_id"] == json!(TURN)
             {
                 kinds.push(
                     frame["params"]["type"]
@@ -19539,27 +20023,21 @@ mod tests {
             }
         }
         assert_eq!(kinds, ["agent_start", "llm_request", "tool_call"]);
-        // The observer hook is process-wide, so tests running in parallel can
-        // put their own frames on this bus. Only a second copy of this test's
-        // turn would be a duplicate.
         let quiet_until = tokio::time::Instant::now() + std::time::Duration::from_millis(150);
         while let Ok(Some(frame)) = tokio::time::timeout_at(quiet_until, writer_rx.recv()).await {
             let frame: Value = serde_json::from_str(&frame).expect("notification is JSON");
             assert_ne!(
                 frame["params"]["turn_id"],
-                json!("g2a-turn"),
+                json!(TURN),
                 "each observer event must be delivered once: {frame}"
             );
         }
 
         let history = d.handle_events_history().expect("history is available");
-        // Parallel tests can record into the same process-wide hook; only this
-        // test's turn is asserted on.
         let types: Vec<_> = history["events"]
             .as_array()
             .expect("events array")
             .iter()
-            .filter(|event| event["turn_id"] == json!("g2a-turn"))
             .map(|event| event["type"].clone())
             .collect();
         assert_eq!(
@@ -19568,10 +20046,30 @@ mod tests {
                 json!("agent_start"),
                 json!("llm_request"),
                 json!("tool_call")
-            ]
+            ],
+            "history holds exactly the fixture's turn"
         );
 
         crate::observability::clear_broadcast_hook();
+    }
+
+    /// G2a: the daemon owns the observer hook, so with no gateway running a
+    /// `logs/subscribe` client still receives the agent, tool, and LLM frames
+    /// recorded through any factory-built observer, each exactly once, and
+    /// `events/history` replays them.
+    #[tokio::test]
+    async fn logs_subscribe_carries_observer_frames_without_a_gateway() {
+        assert_fixture_turn_reaches_subscriber_and_history(0).await;
+    }
+
+    /// The G2a fixture survives other tests' observer traffic: 1000 foreign
+    /// events, more than both the live (64, daemon 256) and history (16,
+    /// daemon 500) capacities, recorded through the same process-wide hook
+    /// from another thread, neither lag the subscriber nor evict the
+    /// fixture's turn from history.
+    #[tokio::test]
+    async fn logs_subscribe_fixture_is_isolated_from_foreign_observer_traffic() {
+        assert_fixture_turn_reaches_subscriber_and_history(1000).await;
     }
 
     /// `events/history` is classified `Logs:Read`: a principal without that
@@ -19601,12 +20099,7 @@ mod tests {
         );
 
         let mut granted_config = roster_config(4242);
-        granted_config
-            .permission_profiles
-            .get_mut("reader")
-            .expect("the fixture profile exists")
-            .grants
-            .insert(Resource::Logs, vec![Verb::Read]);
+        grant_global_log_reads(&mut granted_config);
         let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
         let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
         let ctx = RpcContext::minimal_with_event_bus(granted_config, sessions, &bus);
@@ -19616,6 +20109,402 @@ mod tests {
             response["result"]["events"][0]["tool"],
             json!("SENTINEL"),
             "{response}"
+        );
+    }
+
+    /// A dispatcher on a context whose hub has `max_frames` per ring and no
+    /// byte limits, plus the writer receiving its frames.
+    fn subscription_dispatcher(
+        max_frames: usize,
+    ) -> (
+        RpcDispatcher,
+        tokio::sync::mpsc::Receiver<String>,
+        Arc<crate::rpc::subscription::SubscriptionHub>,
+    ) {
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+        let hub = Arc::new(crate::rpc::subscription::SubscriptionHub::with_limits(
+            crate::rpc::subscription::RingLimits {
+                max_frames,
+                max_bytes: usize::MAX,
+            },
+            usize::MAX,
+        ));
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let (event_tx, _rx) = tokio::sync::broadcast::channel(16);
+        let ctx = RpcContext::minimal_with_subscription_hub(
+            zeroclaw_config::schema::Config::default(),
+            sessions,
+            event_tx,
+            Arc::clone(&hub),
+        );
+        let (writer_tx, writer_rx) = tokio::sync::mpsc::channel::<String>(256);
+        (
+            RpcDispatcher::new(ctx, writer_tx, "local:uid=0".into()),
+            writer_rx,
+            hub,
+        )
+    }
+
+    /// Notifications until `count` arrive or two seconds pass.
+    async fn notifications(
+        rx: &mut tokio::sync::mpsc::Receiver<String>,
+        count: usize,
+    ) -> Vec<Value> {
+        let mut seen = Vec::new();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while seen.len() < count {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            match tokio::time::timeout(remaining, rx.recv()).await {
+                Ok(Some(frame)) => seen.push(serde_json::from_str(&frame).expect("JSON frame")),
+                _ => break,
+            }
+        }
+        seen
+    }
+
+    async fn assert_quiet(rx: &mut tokio::sync::mpsc::Receiver<String>) {
+        let extra = tokio::time::timeout(std::time::Duration::from_millis(150), rx.recv()).await;
+        assert!(extra.is_err(), "unexpected frame: {extra:?}");
+    }
+
+    fn seqs(frames: &[Value]) -> Vec<u64> {
+        frames
+            .iter()
+            .map(|frame| frame["params"]["seq"].as_u64().expect("seq on every frame"))
+            .collect()
+    }
+
+    /// F3a: resuming with `since_seq` replays exactly the missing range, then
+    /// continues live, and every notification carries its subscription id.
+    #[tokio::test]
+    async fn events_subscribe_resumes_exactly_the_missing_range() {
+        use crate::rpc::subscription::Source;
+        let (d, mut rx, hub) = subscription_dispatcher(64);
+        for n in 1..=10 {
+            hub.publish(Source::Events, json!({"source": "observability", "n": n}));
+        }
+
+        let opened = d
+            .handle_events_subscribe(&json!({"since_seq": 6, "epoch": hub.epoch()}))
+            .expect("subscribe");
+        assert_eq!(opened["seq"], json!(10));
+        assert_eq!(opened["epoch"], json!(hub.epoch()));
+        let id = opened["subscription_id"].as_str().expect("id").to_string();
+
+        let replay = notifications(&mut rx, 4).await;
+        assert_eq!(seqs(&replay), [7, 8, 9, 10]);
+        for frame in &replay {
+            assert_eq!(frame["method"], json!(notification::EVENTS_EVENT));
+            assert_eq!(frame["params"]["subscription_id"], json!(id));
+        }
+        assert_quiet(&mut rx).await;
+
+        hub.publish(Source::Events, json!({"source": "observability", "n": 11}));
+        assert_eq!(seqs(&notifications(&mut rx, 1).await), [11]);
+        assert_quiet(&mut rx).await;
+    }
+
+    /// F3a: a cursor that fell behind the ring gets `subscription/lagged` with
+    /// the resume point, then the stream continues. It never just ends.
+    #[tokio::test]
+    async fn overflow_is_reported_as_lagged_and_delivery_continues() {
+        use crate::rpc::subscription::Source;
+        let (d, mut rx, hub) = subscription_dispatcher(4);
+        for n in 1..=10 {
+            hub.publish(Source::Logs, json!({"n": n}));
+        }
+
+        let opened = d
+            .handle_logs_subscribe(&json!({"since_seq": 0, "epoch": hub.epoch()}))
+            .expect("subscribe");
+        let id = opened["subscription_id"].as_str().expect("id").to_string();
+
+        let frames = notifications(&mut rx, 5).await;
+        assert_eq!(
+            frames[0]["method"],
+            json!(notification::SUBSCRIPTION_LAGGED)
+        );
+        assert_eq!(
+            frames[0]["params"],
+            json!({
+                "subscription_id": id,
+                "from_seq": 1,
+                "resume_seq": 7,
+                "epoch_changed": false,
+            })
+        );
+        assert_eq!(seqs(&frames[1..]), [7, 8, 9, 10]);
+
+        hub.publish(Source::Logs, json!({"n": 11}));
+        assert_eq!(seqs(&notifications(&mut rx, 1).await), [11]);
+    }
+
+    /// Within one epoch, a `since_seq` ahead of the newest frame cannot come
+    /// from this stream: it is refused, not turned into a notice.
+    #[tokio::test]
+    async fn a_future_since_seq_in_the_same_epoch_is_refused() {
+        use crate::rpc::subscription::Source;
+        let (d, _rx, hub) = subscription_dispatcher(64);
+        hub.publish(Source::Logs, json!({"n": 1}));
+        let refused = d.handle_logs_subscribe(&json!({"since_seq": 40, "epoch": hub.epoch()}));
+        assert!(
+            matches!(&refused, Err(error) if error.code == INVALID_PARAMS),
+            "{refused:?}"
+        );
+    }
+
+    /// Sequence numbers restart in a new hub (daemon restart or reload). A
+    /// `since_seq` from another epoch is never lined up by number, whether the
+    /// new hub holds fewer frames than it or more: the client is told its
+    /// continuity broke (`epoch_changed`, a forward range) and gets every
+    /// frame the new hub still buffers.
+    #[tokio::test]
+    async fn a_since_seq_from_another_epoch_replays_the_new_hub() {
+        use crate::rpc::subscription::Source;
+        for (published, since_seq) in [(3_u64, 40_u64), (10, 6)] {
+            let (d, mut rx, hub) = subscription_dispatcher(64);
+            for n in 1..=published {
+                hub.publish(Source::Logs, json!({ "n": n }));
+            }
+            let opened = d
+                .handle_logs_subscribe(&json!({
+                    "since_seq": since_seq,
+                    "epoch": "an-epoch-from-before-the-restart",
+                }))
+                .expect("subscribe");
+            assert_ne!(opened["epoch"], json!("an-epoch-from-before-the-restart"));
+
+            let count = usize::try_from(published).expect("small") + 1;
+            let frames = notifications(&mut rx, count).await;
+            assert_eq!(
+                frames[0]["method"],
+                json!(notification::SUBSCRIPTION_LAGGED)
+            );
+            assert_eq!(frames[0]["params"]["from_seq"], json!(1));
+            assert_eq!(frames[0]["params"]["resume_seq"], json!(1));
+            assert_eq!(frames[0]["params"]["epoch_changed"], json!(true));
+            assert_eq!(
+                seqs(&frames[1..]),
+                (1..=published).collect::<Vec<_>>(),
+                "published {published}, since_seq {since_seq}"
+            );
+            assert_quiet(&mut rx).await;
+        }
+    }
+
+    /// A subscriber opens a subscription and ends it through the real
+    /// authorization gate. Cancel is classified like the subscribe methods
+    /// (`Logs:Read`), so whoever could open a subscription can end it.
+    #[tokio::test]
+    async fn a_logs_reader_can_cancel_its_own_subscription() {
+        use zeroclaw_api::grants::{Resource, Verb};
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+        assert_eq!(
+            Method::SubscriptionCancel.authz(),
+            MethodAuthz::Requires(Resource::Logs, Verb::Read)
+        );
+        let mut config = roster_config(4242);
+        let reader = config
+            .permission_profiles
+            .get_mut("reader")
+            .expect("the fixture profile exists");
+        reader.grants.clear();
+        reader.grants.insert(Resource::Logs, vec![Verb::Read]);
+        reader.admin = true;
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let (event_tx, _rx0) = tokio::sync::broadcast::channel(16);
+        let ctx = RpcContext::minimal_with_event_tx(config, sessions, event_tx);
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+
+        let opened = rpc(&mut alice, &mut rx, 1, "logs/subscribe", json!({})).await;
+        let id = opened["result"]["subscription_id"].clone();
+        assert!(id.is_string(), "{opened}");
+        let cancelled = rpc(
+            &mut alice,
+            &mut rx,
+            2,
+            "subscription/cancel",
+            json!({"subscription_id": id}),
+        )
+        .await;
+        assert_eq!(cancelled["result"]["cancelled"], json!(true), "{cancelled}");
+    }
+
+    #[tokio::test]
+    async fn subscription_cancel_ends_only_that_subscription() {
+        use crate::rpc::subscription::Source;
+        let (d, mut rx, hub) = subscription_dispatcher(64);
+        let logs = d.handle_logs_subscribe(&json!({})).expect("logs");
+        let events = d.handle_events_subscribe(&json!({})).expect("events");
+
+        let cancelled = d
+            .handle_subscription_cancel(&json!({"subscription_id": logs["subscription_id"]}))
+            .expect("cancel");
+        assert_eq!(cancelled["cancelled"], json!(true));
+        let again = d
+            .handle_subscription_cancel(&json!({"subscription_id": logs["subscription_id"]}))
+            .expect("cancel again");
+        assert_eq!(again["cancelled"], json!(false));
+
+        hub.publish(Source::Logs, json!({"n": 1}));
+        hub.publish(Source::Events, json!({"source": "observability", "n": 1}));
+        let frames = notifications(&mut rx, 1).await;
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0]["method"], json!(notification::EVENTS_EVENT));
+        assert_eq!(
+            frames[0]["params"]["subscription_id"],
+            events["subscription_id"]
+        );
+        assert_quiet(&mut rx).await;
+    }
+
+    #[tokio::test]
+    async fn events_subscribe_requires_logs_read() {
+        use zeroclaw_api::grants::{Resource, Verb};
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+        assert_eq!(
+            Method::EventsSubscribe.authz(),
+            MethodAuthz::Requires(Resource::Logs, Verb::Read)
+        );
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let (event_tx, _rx0) = tokio::sync::broadcast::channel(16);
+        let ctx = RpcContext::minimal_with_event_tx(roster_config(4242), sessions, event_tx);
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+        let response = rpc(&mut alice, &mut rx, 1, "events/subscribe", json!({})).await;
+        assert_eq!(response["error"]["code"], json!(FORBIDDEN), "{response}");
+    }
+
+    /// Make the fixture `reader` an administrator with `Logs:Read`: the
+    /// global streams are limited to administrators and the shared operator,
+    /// and the roster peer is an authenticated principal.
+    fn grant_global_log_reads(config: &mut zeroclaw_config::schema::Config) {
+        use zeroclaw_api::grants::{Resource, Verb};
+        let reader = config
+            .permission_profiles
+            .get_mut("reader")
+            .expect("the fixture profile exists");
+        reader.grants.insert(Resource::Logs, vec![Verb::Read]);
+        reader.admin = true;
+    }
+
+    /// Configure an `alpha` agent so a profile can be scoped to it (policy
+    /// rejects an `allowed_agents` entry naming an unconfigured agent).
+    fn configure_agent_alpha(config: &mut zeroclaw_config::schema::Config) {
+        use zeroclaw_config::schema::{AliasedAgentConfig, RiskProfileConfig};
+        config
+            .risk_profiles
+            .insert("scoped-profile".into(), RiskProfileConfig::default());
+        config.agents.insert(
+            "alpha".into(),
+            AliasedAgentConfig {
+                enabled: true,
+                risk_profile: "scoped-profile".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+    }
+
+    /// Frames on the global streams are not attributed to an owning agent,
+    /// so a principal scoped to some agents is refused all three, even with
+    /// `Logs:Read`.
+    #[tokio::test]
+    async fn global_streams_refuse_a_scoped_principal() {
+        use zeroclaw_api::grants::{Resource, Verb};
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+        // An authenticated, non-admin principal is scoped whether it may
+        // address one agent or every agent (`*`): addressing every agent is
+        // not owning every principal's sessions, and these frames carry them.
+        for agents in [vec!["alpha".to_string()], vec!["*".to_string()]] {
+            let mut config = roster_config(4242);
+            configure_agent_alpha(&mut config);
+            let reader = config
+                .permission_profiles
+                .get_mut("reader")
+                .expect("the fixture profile exists");
+            reader.grants.insert(Resource::Logs, vec![Verb::Read]);
+            reader.grants.insert(Resource::Sessions, vec![Verb::Read]);
+            reader.allowed_agents = agents.clone();
+            let bus = crate::observability::EventBus::with_capacities(16, 16);
+            bus.history()
+                .push(json!({"type": "tool_call", "source": "observability", "tool": "SENTINEL"}));
+            let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+            let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+            let ctx = RpcContext::minimal_with_event_bus(config, sessions, &bus);
+            let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+
+            for (id, method) in [
+                (1, "logs/subscribe"),
+                (2, "events/subscribe"),
+                (3, "events/history"),
+            ] {
+                let response = rpc(&mut alice, &mut rx, id, method, json!({})).await;
+                assert_eq!(
+                    response["error"]["code"],
+                    json!(FORBIDDEN),
+                    "{agents:?} {method}: {response}"
+                );
+                assert!(
+                    !response.to_string().contains("SENTINEL"),
+                    "{agents:?} {method} must not disclose frames: {response}"
+                );
+            }
+        }
+    }
+
+    /// Demoting a live subscriber from administrator ends its stream at the
+    /// next delivery, even though it keeps `Logs:Read` and every agent (`*`):
+    /// the principal is rechecked, not only the verb or the agent selector.
+    #[tokio::test]
+    async fn demoting_a_subscriber_from_admin_ends_its_stream() {
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+        let mut config = roster_config(4242);
+        configure_agent_alpha(&mut config);
+        grant_global_log_reads(&mut config);
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let (event_tx, _rx0) = tokio::sync::broadcast::channel(16);
+        let ctx = RpcContext::minimal_with_event_tx(config.clone(), sessions, event_tx.clone());
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+
+        let subscribed = rpc(&mut alice, &mut rx, 1, "logs/subscribe", json!({})).await;
+        assert_eq!(
+            subscribed["result"]["subscribed"],
+            json!(true),
+            "{subscribed}"
+        );
+        event_tx
+            .send(json!({"source": "observability", "tool": "SENTINEL-WIDE"}))
+            .expect("send the first frame");
+        assert!(
+            next_frame_containing(&mut rx, "SENTINEL-WIDE", std::time::Duration::from_secs(2))
+                .await,
+            "an unscoped subscriber receives frames"
+        );
+
+        let mut demoted = config;
+        let reader = demoted
+            .permission_profiles
+            .get_mut("reader")
+            .expect("the fixture profile exists");
+        reader.admin = false;
+        reader.allowed_agents = vec![zeroclaw_api::grants::WILDCARD.into()];
+        ctx.auth
+            .refresh_from_config(&demoted)
+            .expect("the demoted policy compiles");
+        event_tx
+            .send(json!({"source": "observability", "tool": "SENTINEL-DEMOTED"}))
+            .expect("send the second frame");
+        assert!(
+            !next_frame_containing(
+                &mut rx,
+                "SENTINEL-DEMOTED",
+                std::time::Duration::from_millis(500)
+            )
+            .await,
+            "a demoted subscriber with every agent must stop receiving global frames"
         );
     }
 
@@ -19637,15 +20526,10 @@ mod tests {
 
     #[tokio::test]
     async fn logs_subscription_stops_once_the_principal_loses_the_grant() {
-        use zeroclaw_api::grants::{Resource, Verb};
+        use zeroclaw_api::grants::Resource;
         use zeroclaw_infra::session_queue::SessionActorQueue;
         let mut config = roster_config(4242);
-        config
-            .permission_profiles
-            .get_mut("reader")
-            .expect("the fixture profile exists")
-            .grants
-            .insert(Resource::Logs, vec![Verb::Read]);
+        grant_global_log_reads(&mut config);
         let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
         let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
         let (event_tx, _rx0) = tokio::sync::broadcast::channel(16);
@@ -19671,13 +20555,15 @@ mod tests {
             "an entitled subscriber receives log frames"
         );
 
+        // The fixture reader is an administrator (the global streams require
+        // one), so revoking Logs:Read alone would change nothing; revoke both.
         let mut narrowed = config;
-        narrowed
+        let reader = narrowed
             .permission_profiles
             .get_mut("reader")
-            .expect("the fixture profile exists")
-            .grants
-            .remove(&Resource::Logs);
+            .expect("the fixture profile exists");
+        reader.grants.remove(&Resource::Logs);
+        reader.admin = false;
         ctx.auth
             .refresh_from_config(&narrowed)
             .expect("the narrowed policy compiles");
@@ -32583,6 +33469,7 @@ mod tests {
             cost_tracker: None,
             event_tx: None,
             event_history: None,
+            subscriptions: Arc::new(crate::rpc::subscription::SubscriptionHub::new()),
             reload_tx: None,
             gateway_shutdown_tx: None,
             approval_pending: Arc::new(crate::rpc::context::ApprovalPendingMap::default()),
@@ -32633,6 +33520,7 @@ mod tests {
             cost_tracker: None,
             event_tx: None,
             event_history: None,
+            subscriptions: Arc::new(crate::rpc::subscription::SubscriptionHub::new()),
             reload_tx: None,
             gateway_shutdown_tx: None,
             approval_pending: Arc::new(crate::rpc::context::ApprovalPendingMap::default()),
@@ -32742,6 +33630,7 @@ mod tests {
             cost_tracker: None,
             event_tx: None,
             event_history: None,
+            subscriptions: Arc::new(crate::rpc::subscription::SubscriptionHub::new()),
             reload_tx: None,
             gateway_shutdown_tx: None,
             approval_pending: Arc::new(crate::rpc::context::ApprovalPendingMap::default()),
