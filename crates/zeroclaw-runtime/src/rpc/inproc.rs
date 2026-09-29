@@ -111,7 +111,14 @@ pub struct InprocConnector {
 struct ConnectorInner {
     ctx: watch::Sender<Option<Arc<RpcContext>>>,
     cancel: CancellationToken,
+    /// Live in-process activity: one for each accepted connection task plus
+    /// every task it started, released only when that task has ended. This is
+    /// the connector's contribution to the daemon's generation-drain proof.
     connections: Arc<AtomicUsize>,
+    /// The accepted connection tasks, owned here so a retiring generation can
+    /// join them, and abort the ones that ignore cancellation, before it hands
+    /// over. A detached task would have no owner to establish that.
+    tasks: std::sync::Mutex<tokio::task::JoinSet<()>>,
 }
 
 impl std::fmt::Debug for InprocConnector {
@@ -133,6 +140,7 @@ impl InprocConnector {
                 ctx,
                 cancel,
                 connections: Arc::new(AtomicUsize::new(0)),
+                tasks: std::sync::Mutex::new(tokio::task::JoinSet::new()),
             }),
         }
     }
@@ -148,9 +156,38 @@ impl InprocConnector {
         self.inner.ctx.borrow().is_some()
     }
 
-    /// Live in-process connections served by this connector.
+    /// Live in-process activity: accepted connections plus the tasks they
+    /// started, each counted until it has ended. The daemon adds this to its
+    /// socket count when deciding whether the generation has drained; it is
+    /// deliberately kept out of the ephemeral external-client count.
     pub fn connection_count(&self) -> usize {
         self.inner.connections.load(Ordering::Relaxed)
+    }
+
+    /// Retire the accepted connections of this generation.
+    ///
+    /// Call after cancelling the generation's token, which ends every
+    /// connection's dispatcher. Waits up to [`super::CONNECTION_DRAIN_GRACE`]
+    /// for the connection tasks to finish unwinding on their own, then aborts
+    /// and joins whatever is left, the same sequence the local socket listener
+    /// applies to its accepted connections. Returns how many connection tasks
+    /// had to be aborted; a nonzero count means the retiring generation could
+    /// not prove those connections finished cooperatively.
+    pub async fn drain(&self) -> usize {
+        let mut tasks = {
+            let mut guard = self.inner.tasks.lock().unwrap_or_else(|e| e.into_inner());
+            std::mem::take(&mut *guard)
+        };
+        tokio::select! {
+            () = async {
+                while tasks.join_next().await.is_some() {}
+            } => 0,
+            () = tokio::time::sleep(super::CONNECTION_DRAIN_GRACE) => {
+                let aborted = tasks.len();
+                tasks.shutdown().await;
+                aborted
+            }
+        }
     }
 
     /// Open one in-process connection and return the client's half. `None`
@@ -179,7 +216,13 @@ impl InprocConnector {
         let (client_half, server_half) = tokio::io::duplex(DUPLEX_BUFFER_BYTES);
         let conn_cancel = self.inner.cancel.child_token();
         let activity = super::ConnectionActivity::new(Arc::clone(&self.inner.connections));
-        zeroclaw_spawn::spawn!(serve(ctx, server_half, conn_cancel, activity));
+        {
+            let mut tasks = self.inner.tasks.lock().unwrap_or_else(|e| e.into_inner());
+            // Reap the connections that already ended so the set only holds
+            // live tasks; `JoinSet` keeps finished entries until polled.
+            while tasks.try_join_next().is_some() {}
+            tasks.spawn(serve(ctx, server_half, conn_cancel, activity));
+        }
         Some(client_half)
     }
 }
@@ -220,6 +263,7 @@ mod tests {
     use super::*;
     use crate::rpc::session::SessionStore;
     use crate::rpc::types::{InitializeParams, InitializeResult, StatusResult};
+    use std::time::Duration;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
     use zeroclaw_api::grants::{Resource, Verb};
     use zeroclaw_api::jsonrpc::JsonRpcRequest;
@@ -411,6 +455,46 @@ mod tests {
             "the TUI registry derives the transport name from the label prefix"
         );
         cancel.cancel();
+    }
+
+    /// The generation owns its accepted in-process connections: cancelling it
+    /// and draining the connector ends every connection task, the client sees
+    /// EOF, and the activity count is zero, which is what the daemon's reload
+    /// decision reads.
+    #[tokio::test]
+    async fn generation_drain_joins_accepted_connections_and_zeroes_the_count() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ctx = ctx_for(base_config(tmp.path()));
+        let cancel = CancellationToken::new();
+        let connector = InprocConnector::new(cancel.clone());
+        connector.bind(ctx);
+        let client = connector.connect().await.expect("bound connector connects");
+        let (read_half, _write_half) = tokio::io::split(client);
+        let mut reader = tokio::io::BufReader::new(read_half);
+        // Let the connection task start so it is counted and owned.
+        tokio::task::yield_now().await;
+        assert_eq!(
+            connector.connection_count(),
+            1,
+            "accepted connection is counted"
+        );
+
+        cancel.cancel();
+        let aborted = tokio::time::timeout(Duration::from_secs(10), connector.drain())
+            .await
+            .expect("drain returns inside its budget");
+        assert_eq!(aborted, 0, "a cancelled connection unwinds cooperatively");
+        assert_eq!(
+            connector.connection_count(),
+            0,
+            "no in-process activity may outlive the drained generation"
+        );
+        let mut line = String::new();
+        let eof = tokio::time::timeout(Duration::from_secs(2), reader.read_line(&mut line))
+            .await
+            .expect("peer answers after drain")
+            .expect("read");
+        assert_eq!(eof, 0, "the client sees EOF once its connection is retired");
     }
 
     #[tokio::test]
