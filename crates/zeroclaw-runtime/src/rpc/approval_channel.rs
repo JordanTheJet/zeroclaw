@@ -731,10 +731,11 @@ mod tests {
         let _route = hub.route_session("sess-1", hub.session_source("sess-1"), None);
         hub.add_viewer(
             "sess-1",
+            hub.session_source("sess-1"),
             "viewer",
             1,
             tokio_util::sync::CancellationToken::new(),
-            false,
+            Arc::default(),
         );
         let source = hub.session_source("sess-1");
         let ch = ring_channel(rpc, Arc::clone(&pending), &hub);
@@ -780,10 +781,11 @@ mod tests {
         let _route = hub.route_session("sess-1", hub.session_source("sess-1"), None);
         hub.add_viewer(
             "sess-1",
+            hub.session_source("sess-1"),
             "viewer",
             1,
             tokio_util::sync::CancellationToken::new(),
-            false,
+            Arc::default(),
         );
         let ch = ring_channel(rpc, Arc::clone(&pending), &hub);
         let task = {
@@ -839,10 +841,11 @@ mod tests {
         let _route = hub.route_session("sess-1", hub.session_source("sess-1"), None);
         hub.add_viewer(
             "sess-1",
+            hub.session_source("sess-1"),
             "viewer",
             1,
             tokio_util::sync::CancellationToken::new(),
-            false,
+            Arc::default(),
         );
 
         let choices = vec!["a".to_string(), "b".to_string()];

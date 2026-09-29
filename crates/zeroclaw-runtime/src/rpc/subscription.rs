@@ -123,49 +123,60 @@ struct Viewer {
     /// The connection that attached it (see [`SubscriptionHub::add_viewer`]).
     connection: u64,
     cancel: CancellationToken,
-    /// Bounded to one turn: it ends with that turn, so it does not count as
-    /// the connection viewing the session for later turns.
-    turn_scoped: bool,
+    /// The turns of its own connection it carries (see [`OwnTurns`]).
+    own: Arc<OwnTurns>,
 }
 
 /// Per-session bookkeeping: the ring handle, its viewers, whether a turn is
-/// currently delivering through the ring, and which session the ring belongs
-/// to.
+/// currently delivering through it, and which session incarnation it holds
+/// frames for.
 struct SessionEntry {
     id: u64,
     viewers: HashMap<String, Viewer>,
     routed: usize,
-    /// The session incarnation the ring holds frames for, as given by the
-    /// caller that created it. `None` only for a ring created without one,
-    /// which the first identified caller adopts. A ring is never handed to
-    /// a different identity: that caller retires it and gets a fresh ring,
-    /// so a session recreated under a reused id cannot read the old frames.
-    identity: Option<String>,
+    /// The incarnation the ring holds frames for, as given by the caller
+    /// that created it. `None` only for a ring created without one, which
+    /// the first identified caller adopts. A ring is never handed to a
+    /// different identity: that caller retires it and gets a fresh ring, so
+    /// a session recreated under a reused id cannot read the old frames.
+    identity: Option<RingIdentity>,
 }
 
-/// The end of one turn's stream, for a viewer bounded to that turn. Open
-/// while the turn runs; closed at the ring's head when the turn ended, after
-/// which the viewer delivers nothing further.
+/// Which session incarnation a ring's frames belong to, and to whom.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RingIdentity {
+    /// Names the incarnation: its storage domain and durable row, or its
+    /// live generation, together with its owner.
+    pub incarnation: String,
+    /// The principal that owns the incarnation, and so every frame the ring
+    /// holds; `None` for an unowned session.
+    pub owner: Option<String>,
+}
+
+/// One turn's span of a session ring: from its first frame to the ring's
+/// head when the turn ended. Open while the turn runs.
 pub struct TurnScope {
+    first_seq: u64,
     /// The ring's head when the turn ended, or [`Self::OPEN`] while it runs.
     last_seq: AtomicU64,
     closed: Notify,
 }
 
-impl Default for TurnScope {
-    fn default() -> Self {
+impl TurnScope {
+    /// No sequence number reaches it, so it cannot be mistaken for a real
+    /// bound. A turn that ends on an empty ring closes at 0, which bounds
+    /// its span to nothing at all.
+    const OPEN: u64 = u64::MAX;
+
+    /// A turn starting on a ring whose newest frame is `head`.
+    #[must_use]
+    pub fn after(head: u64) -> Self {
         Self {
+            first_seq: head + 1,
             last_seq: AtomicU64::new(Self::OPEN),
             closed: Notify::new(),
         }
     }
-}
-
-impl TurnScope {
-    /// No sequence number reaches it, so it cannot be mistaken for a real
-    /// bound. A turn that ends on an empty ring closes at 0, which bounds
-    /// its viewer to nothing at all.
-    const OPEN: u64 = u64::MAX;
 
     /// The ring's head when the turn ended, once it has.
     #[must_use]
@@ -174,6 +185,12 @@ impl TurnScope {
             Self::OPEN => None,
             seq => Some(seq),
         }
+    }
+
+    /// Whether frame `seq` was published during this turn.
+    #[must_use]
+    pub fn covers(&self, seq: u64) -> bool {
+        seq >= self.first_seq && self.last_seq().is_none_or(|last| seq <= last)
     }
 
     /// End the scope at `seq`, the turn's last frame.
@@ -187,6 +204,81 @@ impl TurnScope {
     pub fn closed(&self) -> tokio::sync::futures::Notified<'_> {
         self.closed.notified()
     }
+}
+
+/// The turns of its own connection a session viewer carries. Their frames
+/// are that connection's own prompt output, which the prompt's authority
+/// (sessions:execute) entitles it to whether or not it may also read the
+/// whole session. A connection's turns ride its existing viewer of the ring
+/// when it has one (see [`SubscriptionHub::carry_turn`]), so each frame
+/// reaches the connection once and in order.
+#[derive(Default)]
+pub struct OwnTurns {
+    scopes: Mutex<Vec<Arc<TurnScope>>>,
+}
+
+impl OwnTurns {
+    /// Carrying one turn.
+    #[must_use]
+    pub fn of(scope: Arc<TurnScope>) -> Self {
+        Self {
+            scopes: Mutex::new(vec![scope]),
+        }
+    }
+
+    /// Whether frame `seq` belongs to one of the carried turns.
+    #[must_use]
+    pub fn covers(&self, seq: u64) -> bool {
+        self.scopes.lock().iter().any(|scope| scope.covers(seq))
+    }
+
+    /// The carried turn still running, if any. Turns of one session run one
+    /// at a time, so there is at most one.
+    #[must_use]
+    pub fn running(&self) -> Option<Arc<TurnScope>> {
+        self.scopes
+            .lock()
+            .iter()
+            .find(|scope| scope.last_seq().is_none())
+            .cloned()
+    }
+
+    /// Stop carrying the turn frame `seq` belongs to: the connection may no
+    /// longer see that turn.
+    pub fn drop_turn_of(&self, seq: u64) {
+        self.scopes.lock().retain(|scope| !scope.covers(seq));
+    }
+
+    /// Forget the carried turns that ended before `cursor`.
+    pub fn forget_before(&self, cursor: u64) {
+        self.scopes
+            .lock()
+            .retain(|scope| scope.last_seq().is_none_or(|last| last >= cursor));
+    }
+
+    fn push(&self, scope: Arc<TurnScope>) {
+        self.scopes.lock().push(scope);
+    }
+
+    /// Whether every carried turn has ended and `cursor` is past its last
+    /// frame.
+    fn delivered_before(&self, cursor: u64) -> bool {
+        self.scopes
+            .lock()
+            .iter()
+            .all(|scope| scope.last_seq().is_some_and(|last| cursor > last))
+    }
+}
+
+/// How a session viewer's frame fared at its commit.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Commit {
+    /// Handed to the connection's writer.
+    Sent,
+    /// Not the viewer's to see. The viewer is detached.
+    Refused,
+    /// The ring was retired, or the viewer detached, before the commit.
+    Gone,
 }
 
 #[derive(Default)]
@@ -488,13 +580,13 @@ impl SubscriptionHub {
     /// another owner, without its ring being released) is retired first: its
     /// viewers end and its frames are dropped, so they can never be replayed
     /// to the new session.
-    pub fn session_source_for(&self, session_id: &str, identity: &str) -> Source {
+    pub fn session_source_for(&self, session_id: &str, identity: &RingIdentity) -> Source {
         let mut sessions = self.sessions.lock();
         if let Some(entry) = sessions.by_id.get_mut(session_id) {
-            match entry.identity.as_deref() {
+            match entry.identity.as_ref() {
                 Some(current) if current == identity => return Source::Session(entry.id),
                 None => {
-                    entry.identity = Some(identity.to_string());
+                    entry.identity = Some(identity.clone());
                     return Source::Session(entry.id);
                 }
                 Some(_) => {}
@@ -512,7 +604,7 @@ impl SubscriptionHub {
     fn create_session_entry(
         sessions: &mut Sessions,
         session_id: &str,
-        identity: Option<&str>,
+        identity: Option<&RingIdentity>,
     ) -> Source {
         sessions.next_id += 1;
         let id = sessions.next_id;
@@ -522,41 +614,45 @@ impl SubscriptionHub {
                 id,
                 viewers: HashMap::new(),
                 routed: 0,
-                identity: identity.map(str::to_string),
+                identity: identity.cloned(),
             },
         );
         Source::Session(id)
     }
 
-    /// Record a viewer of `session_id` whose delivery ends when `cancel`
-    /// fires. `connection` identifies the attaching connection, so a
-    /// connection can tell whether it already views the session.
+    /// Record a viewer of `session_id`'s ring `source` whose delivery ends
+    /// when `cancel` fires. `connection` identifies the attaching
+    /// connection; `own` holds the turns of that connection it carries.
+    /// Returns `false`, recording nothing, when `source` is no longer the
+    /// session's ring.
     pub fn add_viewer(
         &self,
         session_id: &str,
+        source: Source,
         subscription_id: &str,
         connection: u64,
         cancel: CancellationToken,
-        turn_scoped: bool,
-    ) {
-        let source = self.session_source(session_id);
+        own: Arc<OwnTurns>,
+    ) -> bool {
         let mut sessions = self.sessions.lock();
-        if let Some(entry) = sessions
+        let Some(entry) = sessions
             .by_id
             .get_mut(session_id)
             .filter(|entry| Source::Session(entry.id) == source)
-        {
-            entry.viewers.insert(
-                subscription_id.to_string(),
-                Viewer {
-                    connection,
-                    cancel,
-                    turn_scoped,
-                },
-            );
-        }
+        else {
+            return false;
+        };
+        entry.viewers.insert(
+            subscription_id.to_string(),
+            Viewer {
+                connection,
+                cancel,
+                own,
+            },
+        );
         drop(sessions);
         self.viewers_changed.notify_waiters();
+        true
     }
 
     /// Forget a viewer when its delivery ends.
@@ -583,20 +679,96 @@ impl SubscriptionHub {
             .map_or(0, |entry| entry.viewers.len())
     }
 
-    /// Whether `connection` already views `session_id` beyond a single turn.
-    /// A turn-scoped viewer ends with its turn, so it does not count.
-    #[must_use]
-    pub fn viewed_by(&self, session_id: &str, connection: u64) -> bool {
-        self.sessions
-            .lock()
+    /// Hand `connection`'s new turn `scope` to every viewer that connection
+    /// already has on `source`, still `session_id`'s ring. Returns whether
+    /// there was one; if not, the caller gives the turn a viewer of its own.
+    ///
+    /// This and [`Self::retire_viewer_if_done`] run under the same lock, so a
+    /// viewer either takes the turn before it decides it is done, and then
+    /// is not done, or is gone before the turn looks for it.
+    pub fn carry_turn(
+        &self,
+        session_id: &str,
+        source: Source,
+        connection: u64,
+        scope: &Arc<TurnScope>,
+    ) -> bool {
+        let sessions = self.sessions.lock();
+        let Some(entry) = sessions
             .by_id
             .get(session_id)
-            .is_some_and(|entry| {
-                entry
-                    .viewers
-                    .values()
-                    .any(|viewer| viewer.connection == connection && !viewer.turn_scoped)
-            })
+            .filter(|entry| Source::Session(entry.id) == source)
+        else {
+            return false;
+        };
+        let mut carried = false;
+        for viewer in entry.viewers.values() {
+            if viewer.connection == connection && !viewer.cancel.is_cancelled() {
+                viewer.own.push(Arc::clone(scope));
+                carried = true;
+            }
+        }
+        carried
+    }
+
+    /// Detach a viewer that carries only its connection's own turns once it
+    /// has delivered all of them up to `cursor`. Returns `true` when the
+    /// viewer is gone (detached now, or already), so its delivery ends.
+    pub fn retire_viewer_if_done(
+        &self,
+        session_id: &str,
+        source: Source,
+        subscription_id: &str,
+        cursor: u64,
+    ) -> bool {
+        let mut sessions = self.sessions.lock();
+        let Some(entry) = sessions
+            .by_id
+            .get_mut(session_id)
+            .filter(|entry| Source::Session(entry.id) == source)
+        else {
+            return true;
+        };
+        match entry.viewers.get(subscription_id) {
+            None => return true,
+            Some(viewer) if !viewer.own.delivered_before(cursor) => return false,
+            Some(_) => {}
+        }
+        entry.viewers.remove(subscription_id);
+        drop(sessions);
+        self.viewers_changed.notify_waiters();
+        true
+    }
+
+    /// Commit one of a viewer's frames: `send` runs only while `source` is
+    /// still `session_id`'s ring and the viewer is attached to it, and only
+    /// if `permitted` accepts the ring's identity, the owner of every frame
+    /// it holds. Retiring a ring takes the same lock, so a frame is either
+    /// committed before its ring is retired, to a viewer permitted to see
+    /// that ring's frames, or not at all. A refusal detaches the viewer
+    /// under the same lock.
+    pub fn commit_viewer_frame(
+        &self,
+        session_id: &str,
+        source: Source,
+        subscription_id: &str,
+        permitted: impl FnOnce(Option<&RingIdentity>) -> bool,
+        send: impl FnOnce(),
+    ) -> Commit {
+        let mut sessions = self.sessions.lock();
+        let Some(entry) = sessions.by_id.get_mut(session_id).filter(|entry| {
+            Source::Session(entry.id) == source && entry.viewers.contains_key(subscription_id)
+        }) else {
+            return Commit::Gone;
+        };
+        if permitted(entry.identity.as_ref()) {
+            send();
+            return Commit::Sent;
+        }
+        entry.viewers.remove(subscription_id);
+        drop(sessions);
+        self.viewers_changed.notify_waiters();
+        Commit::Refused
     }
 
     /// Resolves once `session_id` has no viewers. Returns at once when it
@@ -924,10 +1096,8 @@ mod tests {
         assert!(hub.total_bytes() > 0);
 
         let viewer = CancellationToken::new();
-        hub.add_viewer("s1", "sub-1", 7, viewer.clone(), false);
+        assert!(hub.add_viewer("s1", source, "sub-1", 7, viewer.clone(), Arc::default()));
         assert_eq!(hub.viewer_count("s1"), 1);
-        assert!(hub.viewed_by("s1", 7));
-        assert!(!hub.viewed_by("s1", 8));
 
         hub.release_session("s1");
         assert!(viewer.is_cancelled(), "release ends the session's viewers");
@@ -950,20 +1120,28 @@ mod tests {
         assert_eq!(hub.routed_source("s1"), None);
     }
 
+    fn identity(incarnation: &str, owner: &str) -> RingIdentity {
+        RingIdentity {
+            incarnation: incarnation.to_string(),
+            owner: Some(owner.to_string()),
+        }
+    }
+
     #[test]
     fn a_ring_is_never_handed_to_a_different_session_incarnation() {
         let hub = Arc::new(small_hub(64));
-        let bob = hub.session_source_for("s1", "bob-incarnation");
+        let bobs = identity("bob-incarnation", "user:bob");
+        let bob = hub.session_source_for("s1", &bobs);
         hub.publish(bob, json!({"text": "bob's private frame"}));
         let viewer = CancellationToken::new();
-        hub.add_viewer("s1", "sub-bob", 7, viewer.clone(), false);
+        assert!(hub.add_viewer("s1", bob, "sub-bob", 7, viewer.clone(), Arc::default()));
         assert_eq!(
-            hub.session_source_for("s1", "bob-incarnation"),
+            hub.session_source_for("s1", &bobs),
             bob,
             "the same incarnation keeps its ring and its replay"
         );
 
-        let alice = hub.session_source_for("s1", "alice-incarnation");
+        let alice = hub.session_source_for("s1", &identity("alice-incarnation", "user:alice"));
         assert_ne!(alice, bob, "a reused id gets a fresh ring");
         assert!(
             frames(hub.read(alice, 1, 64)).is_empty(),
@@ -978,6 +1156,17 @@ mod tests {
             0,
             "the retired ring's bytes are returned"
         );
+        assert!(
+            !hub.add_viewer(
+                "s1",
+                bob,
+                "late",
+                7,
+                CancellationToken::new(),
+                Arc::default()
+            ),
+            "a viewer cannot attach to a retired ring"
+        );
     }
 
     #[test]
@@ -985,47 +1174,190 @@ mod tests {
         let hub = Arc::new(small_hub(64));
         let source = hub.session_source("s1");
         hub.publish(source, json!({"text": "published before identification"}));
-        assert_eq!(hub.session_source_for("s1", "the-incarnation"), source);
+        assert_eq!(
+            hub.session_source_for("s1", &identity("the-incarnation", "user:alice")),
+            source
+        );
         assert_eq!(frames(hub.read(source, 1, 64)), vec![1]);
+    }
+
+    // A frame a viewer has already read is committed under the lock that
+    // retires rings, and judged against the ring's own identity. These pin
+    // the order: whichever of commit and retirement takes the lock first
+    // decides, and no later owner of the id is ever consulted.
+
+    #[test]
+    fn a_frame_is_not_committed_once_its_ring_is_retired() {
+        let hub = Arc::new(small_hub(64));
+        let alices = identity("alice-incarnation", "user:alice");
+        let source = hub.session_source_for("s1", &alices);
+        assert!(hub.add_viewer(
+            "s1",
+            source,
+            "v",
+            7,
+            CancellationToken::new(),
+            Arc::default()
+        ));
+
+        hub.release_session("s1");
+        // The id is reused before the frame, read earlier, is committed.
+        let reused = hub.session_source_for("s1", &identity("bob-incarnation", "user:bob"));
+        assert!(hub.add_viewer(
+            "s1",
+            reused,
+            "v2",
+            7,
+            CancellationToken::new(),
+            Arc::default()
+        ));
+        let mut sent = false;
+        let outcome = hub.commit_viewer_frame("s1", source, "v", |_| true, || sent = true);
+        assert_eq!(outcome, Commit::Gone);
+        assert!(!sent, "a retired ring's frame is never handed to a writer");
+    }
+
+    #[test]
+    fn a_frame_is_judged_against_its_own_rings_owner() {
+        let hub = Arc::new(small_hub(64));
+        let alices = identity("alice-incarnation", "user:alice");
+        let source = hub.session_source_for("s1", &alices);
+        assert!(hub.add_viewer(
+            "s1",
+            source,
+            "v",
+            7,
+            CancellationToken::new(),
+            Arc::default()
+        ));
+
+        let mut judged = None;
+        let mut sent = false;
+        let outcome = hub.commit_viewer_frame(
+            "s1",
+            source,
+            "v",
+            |ring| {
+                judged = ring.cloned();
+                ring.is_some_and(|ring| ring.owner.as_deref() == Some("user:bob"))
+            },
+            || sent = true,
+        );
+        assert_eq!(judged, Some(alices), "the ring's identity, not the id's");
+        assert_eq!(outcome, Commit::Refused);
+        assert!(!sent);
+        assert_eq!(hub.viewer_count("s1"), 0, "a refusal detaches the viewer");
+
+        let mut sent = false;
+        assert_eq!(
+            hub.commit_viewer_frame("s1", source, "v", |_| true, || sent = true),
+            Commit::Gone,
+            "a detached viewer commits nothing more"
+        );
+        assert!(!sent);
+    }
+
+    #[test]
+    fn a_turn_is_carried_by_a_viewer_that_is_not_yet_done() {
+        let hub = Arc::new(small_hub(64));
+        let source = hub.session_source_for("s1", &identity("i", "user:alice"));
+        let first = Arc::new(TurnScope::after(0));
+        let own = Arc::new(OwnTurns::of(Arc::clone(&first)));
+        assert!(hub.add_viewer(
+            "s1",
+            source,
+            "t",
+            7,
+            CancellationToken::new(),
+            Arc::clone(&own)
+        ));
+        hub.publish(source, json!({"n": 1}));
+        first.close_at(1);
+
+        // The next turn is carried before the viewer checks whether it is
+        // done: it is not done, and it carries the new turn's frames.
+        let second = Arc::new(TurnScope::after(1));
+        assert!(hub.carry_turn("s1", source, 7, &second));
+        assert!(
+            !hub.carry_turn("s1", source, 8, &second),
+            "only its own connection's"
+        );
+        assert!(!hub.retire_viewer_if_done("s1", source, "t", 2));
+        hub.publish(source, json!({"n": 2}));
+        assert!(own.covers(2));
+
+        // Once it is done it is gone, and a later turn finds no viewer to
+        // ride: the caller gives that turn a viewer of its own.
+        second.close_at(2);
+        assert!(hub.retire_viewer_if_done("s1", source, "t", 3));
+        assert!(!hub.carry_turn("s1", source, 7, &Arc::new(TurnScope::after(2))));
+        assert_eq!(hub.viewer_count("s1"), 0);
+    }
+
+    #[test]
+    fn own_turns_cover_exactly_their_frames() {
+        let one = Arc::new(TurnScope::after(2));
+        let own = OwnTurns::of(Arc::clone(&one));
+        assert!(!own.covers(2), "before the turn");
+        assert!(own.covers(3) && own.covers(99), "open while the turn runs");
+        one.close_at(4);
+        assert!(own.covers(4) && !own.covers(5), "closed at its last frame");
+        assert!(own.running().is_none());
+        assert!(!own.delivered_before(4) && own.delivered_before(5));
+        own.drop_turn_of(3);
+        assert!(!own.covers(3), "a dropped turn is no longer carried");
+        assert!(own.delivered_before(0), "nothing left to deliver");
     }
 
     #[test]
     fn a_turn_scope_closes_at_the_last_frame_when_its_route_drops() {
         let hub = Arc::new(small_hub(64));
-        let source = hub.session_source_for("s1", "incarnation");
-        let scope = Arc::new(TurnScope::default());
-        hub.add_viewer("s1", "implicit", 7, CancellationToken::new(), true);
-        assert!(
-            !hub.viewed_by("s1", 7),
-            "a turn-scoped viewer does not count as viewing the session"
-        );
+        let source = hub.session_source_for("s1", &identity("i", "user:alice"));
+        let scope = Arc::new(TurnScope::after(hub.head_seq(source)));
         let route = hub.route_session("s1", source, Some(Arc::clone(&scope)));
         hub.publish(source, json!({"text": "one"}));
         hub.publish(source, json!({"text": "two"}));
         assert_eq!(scope.last_seq(), None, "open while the turn runs");
         drop(route);
         assert_eq!(scope.last_seq(), Some(2), "closed at the turn's last frame");
+        assert!(scope.covers(1) && scope.covers(2) && !scope.covers(3));
     }
 
     #[test]
     fn a_turn_that_published_nothing_on_an_empty_ring_bounds_its_viewer_to_nothing() {
         let hub = Arc::new(small_hub(64));
-        let source = hub.session_source_for("s1", "incarnation");
-        let scope = Arc::new(TurnScope::default());
+        let source = hub.session_source_for("s1", &identity("i", "user:alice"));
+        let scope = Arc::new(TurnScope::after(0));
         drop(hub.route_session("s1", source, Some(Arc::clone(&scope))));
         assert_eq!(
             scope.last_seq(),
             Some(0),
             "the bound is the empty head, not the next turn's first frame"
         );
+        assert!(!scope.covers(1));
     }
 
     #[tokio::test]
     async fn viewers_gone_resolves_when_the_last_viewer_leaves() {
         let hub = Arc::new(small_hub(64));
         hub.viewers_gone("s1").await; // none attached: immediate
-        hub.add_viewer("s1", "a", 1, CancellationToken::new(), false);
-        hub.add_viewer("s1", "b", 2, CancellationToken::new(), false);
+        let source = hub.session_source("s1");
+        hub.add_viewer(
+            "s1",
+            source,
+            "a",
+            1,
+            CancellationToken::new(),
+            Arc::default(),
+        );
+        hub.add_viewer(
+            "s1",
+            source,
+            "b",
+            2,
+            CancellationToken::new(),
+            Arc::default(),
+        );
         let waiter = {
             let hub = Arc::clone(&hub);
             zeroclaw_spawn::spawn!(async move { hub.viewers_gone("s1").await })

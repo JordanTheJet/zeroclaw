@@ -5688,22 +5688,27 @@ impl RpcDispatcher {
         // A session-lifetime turn delivers through the session's ring from
         // here on, the terminal frame included. The ring belongs to this
         // session incarnation: a ring kept under the same id for another one
-        // is retired, not reused. Unless the prompting connection already
-        // views the session (an explicit, sessions:read attach), it gets a
-        // viewer bounded to this turn: it carries this turn's frames, which
-        // sessions:execute entitles the caller to, and ends at the turn's
-        // last frame rather than reading later turns.
+        // is retired, not reused. The turn's frames are the prompting
+        // connection's own output, which sessions:execute entitles it to:
+        // they ride the viewer that connection already has on the ring (an
+        // explicit attach, or an earlier turn's), so each reaches it once and
+        // in order, or else a viewer that carries only this connection's own
+        // turns and detaches after them. Either way they do not depend on the
+        // connection also holding sessions:read.
         let session_lifetime = self.turn_lifetime == TurnLifetime::Session;
         let _session_route = session_lifetime.then(|| {
             let hub = &self.ctx.subscriptions;
             let identity = admitted.as_ref().map_or_else(
-                || format!("unresolved:{}", uuid::Uuid::new_v4()),
+                || crate::rpc::subscription::RingIdentity {
+                    incarnation: format!("unresolved:{}", uuid::Uuid::new_v4()),
+                    owner: None,
+                },
                 session_ring_identity,
             );
             let source = hub.session_source_for(sid, &identity);
-            let scope = (!hub.viewed_by(sid, self.connection_nonce)).then(|| {
-                let scope = Arc::new(crate::rpc::subscription::TurnScope::default());
-                let head = hub.head_seq(source);
+            let head = hub.head_seq(source);
+            let scope = Arc::new(crate::rpc::subscription::TurnScope::after(head));
+            if !hub.carry_turn(sid, source, self.connection_nonce, &scope) {
                 let _ = self.start_subscription(
                     source,
                     Method::SessionPrompt,
@@ -5714,12 +5719,12 @@ impl RpcDispatcher {
                         session_id: sid.to_string(),
                         sessions: Arc::clone(&self.ctx.sessions),
                         live_generation: admitted.as_ref().and_then(|rec| rec.live_generation),
-                        turn: Some(Arc::clone(&scope)),
+                        whole_session: false,
+                        own: Arc::new(crate::rpc::subscription::OwnTurns::of(Arc::clone(&scope))),
                     }),
                 );
-                scope
-            });
-            hub.route_session(sid, source, scope)
+            }
+            hub.route_session(sid, source, Some(scope))
         });
         let sink = match self.ctx.subscriptions.routed_source(sid) {
             Some(source) if session_lifetime => TurnSink::Ring {
@@ -6990,7 +6995,8 @@ impl RpcDispatcher {
                 session_id: req.session_id.clone(),
                 sessions: Arc::clone(&self.ctx.sessions),
                 live_generation: record.live_generation,
-                turn: None,
+                whole_session: true,
+                own: Arc::default(),
             }),
         )?;
         to_result(SessionAttachResult {
@@ -9982,14 +9988,24 @@ impl RpcDispatcher {
         self.subscriptions
             .lock()
             .insert(subscription_id.clone(), cancel.clone());
-        if let Some(viewer) = viewer.as_ref() {
-            hub.add_viewer(
+        // A viewer joins only the ring it was authorized against: if that
+        // ring was retired since (the session deleted or replaced), it reads
+        // nothing.
+        if let Some(viewer) = viewer.as_ref()
+            && !hub.add_viewer(
                 &viewer.session_id,
+                source,
                 &subscription_id,
                 self.connection_nonce,
                 cancel.clone(),
-                viewer.turn.is_some(),
-            );
+                Arc::clone(&viewer.own),
+            )
+        {
+            self.subscriptions.lock().remove(&subscription_id);
+            return Err(rpc_err(
+                SESSION_NOT_FOUND,
+                "Session changed while attaching",
+            ));
         }
         let delivery = SubscriptionDelivery {
             hub,
@@ -11257,6 +11273,14 @@ struct SubscriptionDelivery {
 
 /// Move one subscription's cursor through the hub until it is cancelled, the
 /// connection closes, a write fails, or the caller loses its authority.
+///
+/// A session viewer carries up to two kinds of frame. Frames of its own
+/// connection's turns ([`crate::rpc::subscription::OwnTurns`]) are that
+/// connection's prompt output, disclosed under the prompt's authority
+/// (sessions:execute). A viewer attached with `session/attach` also carries
+/// the rest of the session, under sessions:read. Losing read ends that part
+/// of the stream, not the connection's own turns; a viewer left with only its
+/// own turns detaches once it has delivered them.
 async fn deliver_subscription(delivery: SubscriptionDelivery) {
     use crate::rpc::subscription::{READ_BATCH, Read};
     let SubscriptionDelivery {
@@ -11292,15 +11316,18 @@ async fn deliver_subscription(delivery: SubscriptionDelivery) {
         ))
         .ok()
     };
-    let mut checked_generation = binding.as_ref().map(|auth| auth.generation);
-    let mut grants = binding.as_ref().map(|auth| auth.grants.clone());
-    // A viewer bounded to one turn delivers nothing past that turn's last
-    // frame, and ends once it has delivered it.
-    let turn = viewer.as_ref().and_then(|viewer| viewer.turn.clone());
-    let past_turn = |seq: u64| {
-        turn.as_ref()
-            .and_then(|scope| scope.last_seq())
-            .is_some_and(|last| seq > last)
+    let mut authority = StreamAuthority::new(binding.as_ref(), method);
+    let mut whole_session = viewer.as_ref().is_none_or(|viewer| viewer.whole_session);
+    let discloser = Discloser {
+        hub: &hub,
+        source,
+        subscription_id: &subscription_id,
+        rpc: &rpc,
+        cancel: &cancel,
+        inbound: &inbound,
+        binding: binding.as_ref(),
+        method,
+        viewer: viewer.as_ref(),
     };
 
     'deliver: {
@@ -11311,19 +11338,10 @@ async fn deliver_subscription(delivery: SubscriptionDelivery) {
             let Some(json) = lagged(1, cursor, true) else {
                 break 'deliver;
             };
-            if !disclose(
-                json,
-                &hub,
-                &rpc,
-                &cancel,
-                &inbound,
-                binding.as_ref(),
-                method,
-                &mut checked_generation,
-                &mut grants,
-                viewer.as_ref(),
-            )
-            .await
+            if discloser
+                .disclose(json, None, &mut authority, &mut whole_session)
+                .await
+                == Delivery::Stop
             {
                 break 'deliver;
             }
@@ -11334,14 +11352,31 @@ async fn deliver_subscription(delivery: SubscriptionDelivery) {
             let notified = notifier.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            // Armed before the bound is read, so a turn that ends in between
-            // still wakes this viewer.
-            let mut turn_closed = turn.as_ref().map(|scope| Box::pin(scope.closed()));
-            if let Some(closed) = turn_closed.as_mut() {
-                closed.as_mut().enable();
+            // A viewer left with only its own turns also wakes when the one
+            // running ends, to detach. Armed before the check below, so an
+            // end in between still wakes it.
+            let running = viewer
+                .as_ref()
+                .filter(|_| !whole_session)
+                .and_then(|viewer| viewer.own.running());
+            let mut turn_ended = running.as_ref().map(|scope| Box::pin(scope.closed()));
+            if let Some(ended) = turn_ended.as_mut() {
+                ended.as_mut().enable();
             }
-            if past_turn(cursor) {
-                break 'deliver;
+            if let Some(viewer) = viewer.as_ref() {
+                if whole_session {
+                    viewer.own.forget_before(cursor);
+                } else if hub.retire_viewer_if_done(
+                    &viewer.session_id,
+                    source,
+                    &subscription_id,
+                    cursor,
+                ) {
+                    // Decided under the lock a new turn takes to ride this
+                    // viewer: a turn is never handed to a viewer that has
+                    // already decided to leave.
+                    break 'deliver;
+                }
             }
             match hub.read(source, cursor, READ_BATCH) {
                 Read::Lagged {
@@ -11351,19 +11386,10 @@ async fn deliver_subscription(delivery: SubscriptionDelivery) {
                     let Some(json) = lagged(from_seq, resume_seq, false) else {
                         break 'deliver;
                     };
-                    if !disclose(
-                        json,
-                        &hub,
-                        &rpc,
-                        &cancel,
-                        &inbound,
-                        binding.as_ref(),
-                        method,
-                        &mut checked_generation,
-                        &mut grants,
-                        viewer.as_ref(),
-                    )
-                    .await
+                    if discloser
+                        .disclose(json, None, &mut authority, &mut whole_session)
+                        .await
+                        == Delivery::Stop
                     {
                         break 'deliver;
                     }
@@ -11372,36 +11398,34 @@ async fn deliver_subscription(delivery: SubscriptionDelivery) {
                 }
                 Read::Frames(frames) if !frames.is_empty() => {
                     for (seq, frame) in frames {
-                        if cancel.is_cancelled() || past_turn(seq) {
+                        if cancel.is_cancelled() {
                             break 'deliver;
                         }
-                        let mut params = (*frame).clone();
-                        if let Some(object) = params.as_object_mut() {
-                            object.insert(
-                                "subscription_id".into(),
-                                serde_json::json!(subscription_id),
-                            );
-                            object.insert("seq".into(), serde_json::json!(seq));
-                        }
-                        let notification = JsonRpcNotification::new(notification_method, params);
-                        let Ok(json) = serde_json::to_string(&notification) else {
-                            break 'deliver;
-                        };
-                        if !disclose(
-                            json,
-                            &hub,
-                            &rpc,
-                            &cancel,
-                            &inbound,
-                            binding.as_ref(),
-                            method,
-                            &mut checked_generation,
-                            &mut grants,
-                            viewer.as_ref(),
-                        )
-                        .await
-                        {
-                            break 'deliver;
+                        // A viewer carrying only its own turns passes over
+                        // every other frame without disclosing it.
+                        let carried = whole_session
+                            || viewer.as_ref().is_none_or(|viewer| viewer.own.covers(seq));
+                        if carried {
+                            let mut params = (*frame).clone();
+                            if let Some(object) = params.as_object_mut() {
+                                object.insert(
+                                    "subscription_id".into(),
+                                    serde_json::json!(subscription_id),
+                                );
+                                object.insert("seq".into(), serde_json::json!(seq));
+                            }
+                            let notification =
+                                JsonRpcNotification::new(notification_method, params);
+                            let Ok(json) = serde_json::to_string(&notification) else {
+                                break 'deliver;
+                            };
+                            if discloser
+                                .disclose(json, Some(seq), &mut authority, &mut whole_session)
+                                .await
+                                == Delivery::Stop
+                            {
+                                break 'deliver;
+                            }
                         }
                         cursor = seq + 1;
                     }
@@ -11415,8 +11439,8 @@ async fn deliver_subscription(delivery: SubscriptionDelivery) {
                 () = cancel.cancelled() => break 'deliver,
                 () = rpc.closed() => break 'deliver,
                 () = async {
-                    match turn_closed.as_mut() {
-                        Some(closed) => closed.as_mut().await,
+                    match turn_ended.as_mut() {
+                        Some(ended) => ended.as_mut().await,
                         None => std::future::pending().await,
                     }
                 } => {}
@@ -11427,87 +11451,252 @@ async fn deliver_subscription(delivery: SubscriptionDelivery) {
     finish();
 }
 
-/// Enqueue one subscription line only if the connection may still see it at
-/// the moment it is enqueued.
-///
-/// The order is the point. Every wait comes first: writer room is reserved
-/// (cancellably), then, for a session viewer, the session's current
-/// incarnation and owner are read from the session store. Only then is the
-/// disclosure decided, synchronously and with no await before the commit: the
-/// credential and, after a policy change, freshly re-resolved grants, then
-/// ownership from those fresh grants and the facts just read. A decision made
-/// before any of those waits would be judged on authority that could change
-/// while it waited (a viewer demoted while the writer was full, or while the
-/// session store was being read) and still commit. Returns `false` when the
-/// stream must end.
-#[allow(clippy::too_many_arguments)]
-async fn disclose(
-    json: String,
-    hub: &crate::rpc::subscription::SubscriptionHub,
-    rpc: &RpcOutbound,
-    cancel: &CancellationToken,
-    inbound: &crate::rpc::auth::RpcInboundAuth,
-    binding: Option<&crate::rpc::auth::ConnectionAuth>,
-    method: Method,
-    checked_generation: &mut Option<u64>,
-    grants: &mut Option<zeroclaw_api::grants::ResolvedGrants>,
-    viewer: Option<&SessionViewer>,
-) -> bool {
-    let permit = tokio::select! {
-        biased;
-        () = cancel.cancelled() => return false,
-        permit = rpc.reserve() => match permit {
-            Some(permit) => permit,
-            None => return false,
-        },
-    };
-    hub.wait_test_delivery_pause(true).await;
-    let facts = match viewer {
-        Some(viewer) => Some(ViewerFacts::read(viewer).await),
-        None => None,
-    };
-    hub.wait_test_delivery_facts_pause().await;
-
-    // From here to the commit nothing awaits. A publication racing the
-    // resolution on another thread is caught by re-resolving until the
-    // generation read after the decision is the one it was made under.
-    for _ in 0..3 {
-        if !still_authorized(
-            inbound,
-            binding,
-            method,
-            checked_generation,
-            grants,
-            viewer.is_none(),
-        ) {
-            return false;
-        }
-        if binding.is_some() && *checked_generation != Some(inbound.generation()) {
-            continue;
-        }
-        let permitted = match (viewer, facts.as_ref()) {
-            (Some(viewer), Some(facts)) => viewer_permits(viewer, facts, binding, grants.as_ref()),
-            _ => true,
-        };
-        if !permitted {
-            return false;
-        }
-        permit.send(json);
-        return true;
-    }
-    // The policy kept moving under the decision: fail closed.
-    false
+/// Whether a stream goes on after one disclosure attempt. A line that was
+/// not the connection's to see, when that does not end the stream, is
+/// withheld and the stream goes on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Delivery {
+    Continue,
+    Stop,
 }
 
-/// The identity of the session incarnation a replay ring holds frames for.
-/// It names the owner and the durable row (domain, key, and creation time),
-/// or, for a session with no durable row, its live generation. The same
-/// durable session keeps its identity across eviction and rehydration, so its
-/// ring still replays; a session deleted and recreated under the same id, by
-/// the same owner or another, does not, so it never inherits the old frames.
-fn session_ring_identity(record: &super::session::SessionRecord) -> String {
+/// Authority resolved for one method, re-resolved whenever the accepted
+/// policy generation moves.
+#[derive(Default)]
+struct ResolvedAuthority {
+    checked_generation: Option<u64>,
+    grants: Option<zeroclaw_api::grants::ResolvedGrants>,
+}
+
+impl ResolvedAuthority {
+    /// Seeded from the connection's binding: resolved under its generation.
+    fn bound(binding: Option<&crate::rpc::auth::ConnectionAuth>) -> Self {
+        Self {
+            checked_generation: binding.map(|auth| auth.generation),
+            grants: binding.map(|auth| auth.grants.clone()),
+        }
+    }
+
+    /// The credential must still be live, and whenever the policy
+    /// generation has moved, the principal is resolved again against
+    /// `method`. Not audited: the caller audits the decision it acts on.
+    fn refresh(
+        &mut self,
+        inbound: &crate::rpc::auth::RpcInboundAuth,
+        auth: &crate::rpc::auth::ConnectionAuth,
+        method: Method,
+    ) -> Result<(), crate::rpc::auth::AuthDenied> {
+        let generation = inbound.generation();
+        if self.checked_generation == Some(generation) {
+            credential_is_live(inbound, auth)?;
+        } else {
+            self.grants = Some(current_authority(inbound, auth, method)?);
+        }
+        self.checked_generation = Some(generation);
+        Ok(())
+    }
+
+    fn admin(&self, auth: &crate::rpc::auth::ConnectionAuth) -> bool {
+        self.grants
+            .as_ref()
+            .map_or(auth.grants.admin, |grants| grants.admin)
+    }
+}
+
+/// The authority a subscription's lines are disclosed under: `stream` for
+/// the method it was opened with (sessions:read for `session/attach`), and,
+/// for a session viewer, `own_turns` for its connection's own turns
+/// (sessions:execute, the prompt's authority).
+struct StreamAuthority {
+    stream: ResolvedAuthority,
+    own_turns: ResolvedAuthority,
+}
+
+impl StreamAuthority {
+    fn new(binding: Option<&crate::rpc::auth::ConnectionAuth>, method: Method) -> Self {
+        Self {
+            stream: ResolvedAuthority::bound(binding),
+            // A viewer a prompt opened was authorized as that prompt; any
+            // other resolves the prompt's authority at its first own frame.
+            own_turns: if method == Method::SessionPrompt {
+                ResolvedAuthority::bound(binding)
+            } else {
+                ResolvedAuthority::default()
+            },
+        }
+    }
+}
+
+/// One subscription's view of where its lines go and whose they are.
+struct Discloser<'a> {
+    hub: &'a crate::rpc::subscription::SubscriptionHub,
+    source: crate::rpc::subscription::Source,
+    subscription_id: &'a str,
+    rpc: &'a RpcOutbound,
+    cancel: &'a CancellationToken,
+    inbound: &'a crate::rpc::auth::RpcInboundAuth,
+    binding: Option<&'a crate::rpc::auth::ConnectionAuth>,
+    method: Method,
+    viewer: Option<&'a SessionViewer>,
+}
+
+impl Discloser<'_> {
+    /// Enqueue one subscription line (a frame numbered `seq`, or a notice)
+    /// only if the connection may still see it at the moment it is enqueued.
+    ///
+    /// The order is the point. Every wait comes first: writer room is
+    /// reserved (cancellably), then, for a session viewer, the session's
+    /// current incarnation and owner are read from the session store in one
+    /// read. Only then is the disclosure decided, synchronously and with no
+    /// await before the commit: the credential and, after a policy change,
+    /// freshly re-resolved grants, then ownership. A session viewer's line is
+    /// committed by the hub under the lock that retires rings, and judged
+    /// against the identity of the ring it came from, so a line read from a
+    /// ring that is retired, or whose id now names another session, while
+    /// this waited is never enqueued, and the owner consulted is always the
+    /// owner of that line's own session incarnation.
+    async fn disclose(
+        &self,
+        json: String,
+        seq: Option<u64>,
+        authority: &mut StreamAuthority,
+        whole_session: &mut bool,
+    ) -> Delivery {
+        let permit = tokio::select! {
+            biased;
+            () = self.cancel.cancelled() => return Delivery::Stop,
+            permit = self.rpc.reserve() => match permit {
+                Some(permit) => permit,
+                None => return Delivery::Stop,
+            },
+        };
+        self.hub.wait_test_delivery_pause(true).await;
+        let facts = match self.viewer {
+            Some(viewer) => Some(ViewerFacts::read(viewer).await),
+            None => None,
+        };
+        self.hub.wait_test_delivery_facts_pause().await;
+
+        // From here to the commit nothing awaits. A publication racing the
+        // resolution on another thread is caught by re-resolving until the
+        // generation read after the decision is the one it was made under.
+        let (Some(viewer), Some(facts)) = (self.viewer, facts) else {
+            for _ in 0..3 {
+                if !still_authorized(
+                    self.inbound,
+                    self.binding,
+                    self.method,
+                    &mut authority.stream.checked_generation,
+                    &mut authority.stream.grants,
+                    true,
+                ) {
+                    return Delivery::Stop;
+                }
+                if self.binding.is_some()
+                    && authority.stream.checked_generation != Some(self.inbound.generation())
+                {
+                    continue;
+                }
+                if self.cancel.is_cancelled() {
+                    return Delivery::Stop;
+                }
+                permit.send(json);
+                return Delivery::Continue;
+            }
+            // The policy kept moving under the decision: fail closed.
+            return Delivery::Stop;
+        };
+        for _ in 0..3 {
+            let generation = self.inbound.generation();
+            let Some(admin) = self.session_authority(viewer, seq, authority, whole_session) else {
+                return Delivery::Continue;
+            };
+            if self.binding.is_some() && self.inbound.generation() != generation {
+                continue;
+            }
+            let cancel = self.cancel;
+            let binding = self.binding;
+            let committed = self.hub.commit_viewer_frame(
+                &viewer.session_id,
+                self.source,
+                self.subscription_id,
+                |ring| {
+                    !cancel.is_cancelled() && viewer_permits(viewer, &facts, ring, binding, admin)
+                },
+                || permit.send(json),
+            );
+            return match committed {
+                crate::rpc::subscription::Commit::Sent => Delivery::Continue,
+                crate::rpc::subscription::Commit::Refused
+                | crate::rpc::subscription::Commit::Gone => Delivery::Stop,
+            };
+        }
+        Delivery::Stop
+    }
+
+    /// The authority a session viewer's line is disclosed under, as whether
+    /// it is an administrator's: `Some` to disclose it, `None` to withhold
+    /// it. A frame of the connection's own turn goes under the prompt's
+    /// authority (sessions:execute) and, failing that, a whole-session
+    /// viewer's sessions:read; any other line needs sessions:read. Losing
+    /// read leaves the viewer carrying only its own turns; losing the
+    /// prompt's authority drops the turn the frame belongs to.
+    fn session_authority(
+        &self,
+        viewer: &SessionViewer,
+        seq: Option<u64>,
+        authority: &mut StreamAuthority,
+        whole_session: &mut bool,
+    ) -> Option<bool> {
+        let Some(auth) = self.binding else {
+            return Some(false);
+        };
+        let own_turn = seq.is_some_and(|seq| viewer.own.covers(seq));
+        if own_turn || !*whole_session {
+            match authority
+                .own_turns
+                .refresh(self.inbound, auth, Method::SessionPrompt)
+            {
+                Ok(()) => return Some(authority.own_turns.admin(auth)),
+                Err(denied) if !*whole_session => {
+                    audit_denial(Some(auth), Method::SessionPrompt, &denied);
+                    if let Some(seq) = seq {
+                        viewer.own.drop_turn_of(seq);
+                    }
+                    return None;
+                }
+                // A whole-session viewer may still see it under read.
+                Err(_) => {}
+            }
+        }
+        match authority
+            .stream
+            .refresh(self.inbound, auth, Method::SessionAttach)
+        {
+            Ok(()) => Some(authority.stream.admin(auth)),
+            Err(denied) => {
+                audit_denial(Some(auth), Method::SessionAttach, &denied);
+                *whole_session = false;
+                if own_turn && let Some(seq) = seq {
+                    viewer.own.drop_turn_of(seq);
+                }
+                None
+            }
+        }
+    }
+}
+
+/// The identity of the session incarnation a replay ring holds frames for:
+/// its owner and durable row (domain, key, and creation time), or, for a
+/// session with no durable row, its live generation. The same durable
+/// session keeps its identity across eviction and rehydration, so its ring
+/// still replays; a session deleted and recreated under the same id, by the
+/// same owner or another, does not, so it never inherits the old frames.
+fn session_ring_identity(
+    record: &super::session::SessionRecord,
+) -> crate::rpc::subscription::RingIdentity {
     let owner = record.owner.as_deref().unwrap_or("");
-    match (&record.durable, &record.durable_created_at) {
+    let incarnation = match (&record.durable, &record.durable_created_at) {
         (Some(DurableSession::Chat { key }), created) => {
             format!("chat:{key}:{}:{owner}", created.as_deref().unwrap_or(""))
         }
@@ -11520,19 +11709,26 @@ fn session_ring_identity(record: &super::session::SessionRecord) -> String {
                 .live_generation
                 .map_or_else(String::new, |generation| generation.to_string())
         ),
+    };
+    crate::rpc::subscription::RingIdentity {
+        incarnation,
+        owner: record.owner.clone(),
     }
 }
 
 /// A viewer of one session's ring. Attach authorized it against the session
-/// as it was then; delivery holds every frame to the session as it is now.
+/// as it was then; delivery holds every frame to the session as it is now
+/// and to the incarnation the frame's ring belongs to.
 struct SessionViewer {
     session_id: String,
     sessions: Arc<crate::rpc::session::SessionStore>,
     /// The live incarnation attach authorized, when the session was live.
     live_generation: Option<u64>,
-    /// Set for the viewer a session-owned prompt gives its own connection:
-    /// it delivers that turn's frames and ends at the turn's last one.
-    turn: Option<Arc<crate::rpc::subscription::TurnScope>>,
+    /// Attached with `session/attach`: it carries the whole session under
+    /// sessions:read, not only its connection's own turns.
+    whole_session: bool,
+    /// The turns of its own connection it carries.
+    own: Arc<crate::rpc::subscription::OwnTurns>,
 }
 
 /// What the session store says about a viewed session right now: its live
@@ -11544,28 +11740,35 @@ struct ViewerFacts {
 }
 
 impl ViewerFacts {
+    /// One read under the store's lock, so the generation and the owner are
+    /// always those of a single incarnation, never a pair taken from two.
     async fn read(viewer: &SessionViewer) -> Self {
+        let live = viewer
+            .sessions
+            .owner_generation_and_mode(&viewer.session_id)
+            .await;
         Self {
-            live_generation: viewer.sessions.get_generation(&viewer.session_id).await,
-            owner: viewer
-                .sessions
-                .session_owner_principal(&viewer.session_id)
-                .await,
+            live_generation: live.as_ref().map(|(_, generation, _)| *generation),
+            owner: live.map(|(owner, _, _)| owner),
         }
     }
 }
 
-/// Whether a session viewer may see the session's next frame, decided
-/// synchronously from facts already read: the live incarnation it attached to
-/// has not been replaced, and a scoped principal (authenticated, and not admin
-/// under the grants resolved for this decision) owns the session. The same
-/// scope rule as `RpcDispatcher::scoped_principal_id`. An unbound dispatcher
-/// passes.
+/// Whether a session viewer may see a frame of the ring `ring` names,
+/// decided synchronously from facts already read: the live incarnation it
+/// attached to has not been replaced, and a scoped principal (authenticated,
+/// and not `admin` under the grants resolved for this decision) owns both
+/// the incarnation the frame belongs to and the session as it is live now.
+/// A frame's incarnation is its ring's, not whoever holds the id now: a
+/// frame kept from a deleted session is never judged against the session
+/// that reused its id. The same scope rule as
+/// `RpcDispatcher::scoped_principal_id`. An unbound dispatcher passes.
 fn viewer_permits(
     viewer: &SessionViewer,
     facts: &ViewerFacts,
+    ring: Option<&crate::rpc::subscription::RingIdentity>,
     binding: Option<&crate::rpc::auth::ConnectionAuth>,
-    grants: Option<&zeroclaw_api::grants::ResolvedGrants>,
+    admin: bool,
 ) -> bool {
     let Some(auth) = binding else {
         return true;
@@ -11575,14 +11778,13 @@ fn viewer_permits(
     {
         return false;
     }
-    let admin = grants.map_or(auth.grants.admin, |grants| grants.admin);
     if admin || !auth.principal.is_authenticated() {
         return true;
     }
-    matches!(
-        facts.owner.as_ref(),
-        Some(Some(owner)) if owner == auth.principal.id.as_str()
-    )
+    let me = auth.principal.id.as_str();
+    let owns_frames = ring.is_some_and(|ring| ring.owner.as_deref() == Some(me));
+    let owns_live = matches!(facts.owner.as_ref(), Some(Some(owner)) if owner == me);
+    owns_frames && owns_live
 }
 
 /// A process-unique id for each accepted connection. See
@@ -40740,6 +40942,431 @@ mod tests {
             done["params"]["outcome"],
             json!("completed"),
             "the successor's turn was not interrupted: {done}"
+        );
+    }
+
+    // ── A frame is judged against the incarnation it belongs to ───────
+    //
+    // Delivery reads a frame out of the ring, then waits: for writer room,
+    // then for the session facts. Everything after the second wait, the
+    // decision and the commit, is synchronous and runs under the hub lock
+    // that retires rings. So a change made at either park point is seen by
+    // the decision, and no later owner of the id is consulted for a frame
+    // that belongs to an earlier incarnation. These park at both points.
+
+    /// Where a parked delivery waits: right after it wins writer room, before
+    /// the session facts are read; or after they are read, at the last await
+    /// before the commit.
+    #[derive(Clone, Copy, Debug)]
+    enum DeliveryPark {
+        AfterReservation,
+        AfterFacts,
+    }
+
+    fn arm_delivery_park(
+        ctx: &Arc<RpcContext>,
+        park: DeliveryPark,
+    ) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+        match park {
+            DeliveryPark::AfterReservation => {
+                let pause = ctx.subscriptions.set_test_delivery_pause();
+                (pause.entered, pause.release)
+            }
+            DeliveryPark::AfterFacts => ctx.subscriptions.set_test_delivery_facts_pause(),
+        }
+    }
+
+    /// How the viewed session's id comes to name another session while the
+    /// frame waits.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum IdReuse {
+        /// `session/delete`, which retires the ring.
+        Deleted,
+        /// The durable row removed out of band: the ring stays, holding the
+        /// old incarnation's frames under the id.
+        RowRemoved,
+        /// Nothing, and the viewer keeps its authority: the positive control.
+        Unchanged,
+    }
+
+    const BOB_UID: u32 = 4243;
+
+    fn republish_profile(
+        ctx: &Arc<RpcContext>,
+        profile: &str,
+        edit: impl FnOnce(&mut PermissionProfileConfigForTests),
+    ) {
+        let mut next = ctx.config.read().clone();
+        edit(
+            next.permission_profiles
+                .get_mut(profile)
+                .expect("the fixture profile exists"),
+        );
+        ctx.auth
+            .refresh_from_config(&next)
+            .expect("the republished policy compiles");
+    }
+
+    /// Bob, an authenticated administrator on uid [`BOB_UID`], replays
+    /// Alice's session, evicted from memory as an idle sibling, from just
+    /// before its private frame. His delivery parks at `park` holding that
+    /// frame; the id is reused per `reuse`, by Bob, and Bob is demoted to a
+    /// scoped principal who still holds sessions:read (for the control he is
+    /// only widened); then the delivery resumes. Returns whether the private
+    /// frame reached Bob.
+    async fn replay_across_id_reuse(park: DeliveryPark, reuse: IdReuse) -> bool {
+        use zeroclaw_api::grants::{Resource, Verb};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sid = "s-reused-while-parked";
+        let mut config = session_cwd_config(&tmp, 4242, None);
+        config.permission_profiles.insert(
+            "bob-admin".into(),
+            zeroclaw_config::schema::PermissionProfileConfig {
+                admin: true,
+                allowed_agents: vec!["test-agent".into()],
+                allowed_tools: vec![zeroclaw_api::grants::WILDCARD.into()],
+                grants: std::collections::HashMap::from([
+                    (
+                        Resource::Sessions,
+                        vec![Verb::Create, Verb::Read, Verb::Execute, Verb::Update],
+                    ),
+                    (Resource::Tools, vec![Verb::Execute]),
+                ]),
+                ..zeroclaw_config::schema::PermissionProfileConfig::default()
+            },
+        );
+        config.users.insert(
+            "bob".into(),
+            zeroclaw_config::schema::UserConfig {
+                principal_id: None,
+                uid: Some(BOB_UID),
+                permission_profiles: vec!["bob-admin".into()],
+            },
+        );
+        let workspace = config
+            .agent_workspace_dir("test-agent")
+            .canonicalize()
+            .unwrap();
+        let (ctx, chat_backend, _acp_store) = persistence_enforcement_ctx(config);
+        let (provider, (mut started, release, _requests)) = scripted_turn_provider();
+        let key = install_state_test_session_owned_at(
+            &ctx.sessions,
+            &chat_backend,
+            sid,
+            provider,
+            Some("tui-alice"),
+            Some("user:alice"),
+            &workspace,
+        )
+        .await;
+
+        // Alice's session runs a session-owned turn; its private output stays
+        // in the ring. Her TUI then opens a sibling, evicting the idle session
+        // from memory while its durable row and ring remain.
+        let (mut operator, mut operator_rx, _) = session_lifetime_operator(&ctx).await;
+        operator.set_tui_id_for_test(Some("tui-alice".into()));
+        send_prompt(&mut operator, 1, sid, 1).await;
+        await_provider_start(&mut started).await;
+        release.send(()).unwrap();
+        let done = drain_to_turn_complete(&mut operator_rx, sid).await;
+        assert!(done.to_string().contains("reply-1"), "the sentinel: {done}");
+        let private_seq = done["params"]["seq"].as_u64().expect("a ring frame");
+        await_turn_end(&ctx, sid).await;
+        let opened = rpc(
+            &mut operator,
+            &mut operator_rx,
+            2,
+            "session/new",
+            json!({"agent_alias": "test-agent", "chat_mode": "chat", "session_id": "s-sibling"}),
+        )
+        .await;
+        assert!(opened.get("error").is_none(), "{opened}");
+        assert!(ctx.sessions.get_agent(sid).await.is_none(), "evicted");
+        await_viewer_detached(&ctx, sid).await;
+
+        // Bob attaches in the current epoch from just before the private
+        // frame, so the first line his delivery holds is that frame.
+        let (entered, resume) = arm_delivery_park(&ctx, park);
+        let (mut bob, mut bob_rx) = roster_peer(&ctx, BOB_UID).await;
+        let attached = rpc(
+            &mut bob,
+            &mut bob_rx,
+            1,
+            "session/attach",
+            json!({
+                "session_id": sid,
+                "since_seq": private_seq - 1,
+                "epoch": ctx.subscriptions.epoch(),
+            }),
+        )
+        .await;
+        assert!(attached.get("error").is_none(), "{attached}");
+        let subscription = attached["result"]["subscription_id"]
+            .as_str()
+            .expect("a subscription id")
+            .to_string();
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+            .await
+            .expect("Bob's delivery parks holding the private frame");
+
+        match reuse {
+            IdReuse::Deleted | IdReuse::RowRemoved => {
+                if reuse == IdReuse::Deleted {
+                    let deleted = rpc(
+                        &mut operator,
+                        &mut operator_rx,
+                        3,
+                        "session/delete",
+                        json!({"session_id": sid}),
+                    )
+                    .await;
+                    assert!(deleted.get("error").is_none(), "{deleted}");
+                } else {
+                    assert!(
+                        zeroclaw_infra::session_backend::SessionBackend::delete_session(
+                            chat_backend.as_ref(),
+                            &key,
+                        )
+                        .unwrap(),
+                        "the durable row is removed"
+                    );
+                }
+                let created = rpc(
+                    &mut bob,
+                    &mut bob_rx,
+                    2,
+                    "session/new",
+                    json!({
+                        "agent_alias": "test-agent",
+                        "session_id": sid,
+                        "cwd": workspace.to_string_lossy(),
+                    }),
+                )
+                .await;
+                assert!(created.get("error").is_none(), "{created}");
+                assert_eq!(
+                    ctx.sessions.session_owner_principal(sid).await,
+                    Some(Some("user:bob".to_string())),
+                    "the id now names Bob's own session"
+                );
+                republish_profile(&ctx, "bob-admin", |profile| profile.admin = false);
+            }
+            IdReuse::Unchanged => {
+                republish_profile(&ctx, "bob-admin", widen_with_an_unrelated_grant);
+            }
+        }
+        resume.notify_one();
+
+        let received = frame_arrives(&mut bob_rx, std::time::Duration::from_secs(2), |frame| {
+            frame.to_string().contains("reply-1")
+        })
+        .await;
+        if reuse != IdReuse::Unchanged {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while bob.subscriptions.lock().contains_key(&subscription) {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("the retired subscription ends");
+        }
+        received
+    }
+
+    #[tokio::test]
+    async fn a_frame_held_after_reservation_is_not_disclosed_once_its_session_is_deleted_and_the_id_reused()
+     {
+        assert!(!replay_across_id_reuse(DeliveryPark::AfterReservation, IdReuse::Deleted).await);
+    }
+
+    #[tokio::test]
+    async fn a_frame_held_after_the_facts_read_is_not_disclosed_once_its_session_is_deleted_and_the_id_reused()
+     {
+        assert!(!replay_across_id_reuse(DeliveryPark::AfterFacts, IdReuse::Deleted).await);
+    }
+
+    #[tokio::test]
+    async fn a_frame_held_after_reservation_is_judged_against_its_own_rings_owner_when_the_ring_survives()
+     {
+        assert!(!replay_across_id_reuse(DeliveryPark::AfterReservation, IdReuse::RowRemoved).await);
+    }
+
+    #[tokio::test]
+    async fn a_frame_held_after_the_facts_read_is_judged_against_its_own_rings_owner_when_the_ring_survives()
+     {
+        assert!(!replay_across_id_reuse(DeliveryPark::AfterFacts, IdReuse::RowRemoved).await);
+    }
+
+    #[tokio::test]
+    async fn a_parked_frame_of_the_same_session_is_still_replayed_to_a_viewer_that_keeps_its_authority()
+     {
+        assert!(replay_across_id_reuse(DeliveryPark::AfterReservation, IdReuse::Unchanged).await);
+        assert!(replay_across_id_reuse(DeliveryPark::AfterFacts, IdReuse::Unchanged).await);
+    }
+
+    // ── A connection's own turn does not depend on its read grant ─────
+
+    /// Alice's session, with Alice on a session-lifetime connection holding
+    /// every session verb, attached explicitly (sessions:read) to it.
+    async fn explicit_viewer_fixture(
+        tmp: &tempfile::TempDir,
+        sid: &str,
+    ) -> (
+        Arc<RpcContext>,
+        (RpcDispatcher, tokio::sync::mpsc::Receiver<String>),
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::mpsc::UnboundedReceiver<()>,
+    ) {
+        use zeroclaw_api::grants::Verb;
+        let mut config = session_cwd_config(tmp, 4242, None);
+        set_session_verbs(
+            config
+                .permission_profiles
+                .get_mut("session-scoped")
+                .expect("the fixture profile exists"),
+            vec![Verb::Create, Verb::Read, Verb::Execute, Verb::Update],
+        );
+        let workspace = config
+            .agent_workspace_dir("test-agent")
+            .canonicalize()
+            .unwrap();
+        let (ctx, chat_backend, _acp_store) = persistence_enforcement_ctx(config);
+        let (provider, (started, release, _requests)) = scripted_turn_provider();
+        install_state_test_session_owned_at(
+            &ctx.sessions,
+            &chat_backend,
+            sid,
+            provider,
+            None,
+            Some("user:alice"),
+            &workspace,
+        )
+        .await;
+        let (mut alice, mut alice_rx) = session_lifetime_roster_peer(&ctx, 4242).await;
+        let attached = rpc(
+            &mut alice,
+            &mut alice_rx,
+            1,
+            "session/attach",
+            json!({"session_id": sid}),
+        )
+        .await;
+        assert!(attached.get("error").is_none(), "{attached}");
+        (ctx, (alice, alice_rx), release, started)
+    }
+
+    /// Another client's session-owned turn in `sid`, watched by an explicit
+    /// viewer of its own; returns that turn's `TurnComplete`.
+    async fn someone_elses_turn(ctx: &Arc<RpcContext>, sid: &str) -> Value {
+        let (mut operator, mut operator_rx, _) = session_lifetime_operator(ctx).await;
+        let attached = rpc(
+            &mut operator,
+            &mut operator_rx,
+            1,
+            "session/attach",
+            json!({"session_id": sid}),
+        )
+        .await;
+        assert!(attached.get("error").is_none(), "{attached}");
+        send_prompt(&mut operator, 2, sid, 2).await;
+        let done = drain_to_turn_complete(&mut operator_rx, sid).await;
+        assert_eq!(done["params"]["client_turn_generation"], json!(2), "{done}");
+        await_turn_end(ctx, sid).await;
+        done
+    }
+
+    fn is_turn_complete_of(frame: &Value, sid: &str, generation: u64) -> bool {
+        is_turn_complete(frame, sid)
+            && frame["params"]["client_turn_generation"] == json!(generation)
+    }
+
+    #[tokio::test]
+    async fn an_explicit_viewer_carries_its_own_turn_once_after_losing_read_at_the_parked_frame() {
+        use zeroclaw_api::grants::Verb;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sid = "s-own-turn-explicit";
+        let (ctx, (mut alice, mut alice_rx), release, mut started) =
+            explicit_viewer_fixture(&tmp, sid).await;
+
+        // The explicit viewer carries Alice's turn. It parks on the turn's
+        // first frame after reading the session facts, the last wait before
+        // the commit, and Alice loses sessions:read there.
+        let (entered, resume) = arm_delivery_park(&ctx, DeliveryPark::AfterFacts);
+        send_prompt(&mut alice, 2, sid, 1).await;
+        await_provider_start(&mut started).await;
+        release.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+            .await
+            .expect("the viewer parks on a frame of Alice's own turn");
+        republish_alice(&ctx, |profile| {
+            set_session_verbs(profile, vec![Verb::Create, Verb::Execute, Verb::Update]);
+        });
+        resume.notify_one();
+
+        let own = drain_to_turn_complete(&mut alice_rx, sid).await;
+        assert_eq!(own["params"]["client_turn_generation"], json!(1), "{own}");
+        await_turn_end(&ctx, sid).await;
+        assert!(
+            !frame_arrives(
+                &mut alice_rx,
+                std::time::Duration::from_millis(300),
+                |frame| { is_turn_complete_of(frame, sid, 1) }
+            )
+            .await,
+            "her own completion arrives once"
+        );
+
+        let next = someone_elses_turn(&ctx, sid).await;
+        assert!(next.to_string().contains("reply-2"), "{next}");
+        assert!(
+            !frame_arrives(
+                &mut alice_rx,
+                std::time::Duration::from_millis(500),
+                |frame| { is_turn_complete(frame, sid) || frame.to_string().contains("reply-2") }
+            )
+            .await,
+            "without sessions:read, nothing of another client's turn reaches her"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !alice.subscriptions.lock().is_empty() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("having lost read, her viewer detaches once her own turn is delivered");
+    }
+
+    #[tokio::test]
+    async fn an_explicit_viewer_carries_its_own_turn_once_and_the_rest_of_the_session_with_read() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sid = "s-own-turn-explicit-read";
+        let (ctx, (mut alice, mut alice_rx), release, mut started) =
+            explicit_viewer_fixture(&tmp, sid).await;
+
+        send_prompt(&mut alice, 2, sid, 1).await;
+        await_provider_start(&mut started).await;
+        release.send(()).unwrap();
+        let own = drain_to_turn_complete(&mut alice_rx, sid).await;
+        assert_eq!(own["params"]["client_turn_generation"], json!(1), "{own}");
+        await_turn_end(&ctx, sid).await;
+        assert!(
+            !frame_arrives(
+                &mut alice_rx,
+                std::time::Duration::from_millis(300),
+                |frame| { is_turn_complete_of(frame, sid, 1) }
+            )
+            .await,
+            "one viewer carries her turn: no second copy"
+        );
+        assert_eq!(ctx.subscriptions.viewer_count(sid), 1, "no extra viewer");
+
+        someone_elses_turn(&ctx, sid).await;
+        assert!(
+            frame_arrives(&mut alice_rx, std::time::Duration::from_secs(5), |frame| {
+                is_turn_complete_of(frame, sid, 2)
+            })
+            .await,
+            "with sessions:read she still sees the rest of the session"
         );
     }
 }
