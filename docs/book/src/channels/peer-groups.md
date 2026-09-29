@@ -194,12 +194,15 @@ Resolution, per message:
 - A sender matching two groups of the same rank that name different profiles
   is refused with a message, and the turn does not run. Nothing is guessed.
 - No matching role group means the agent's own profile, exactly as before.
+  An admitted sender that no role group matches is not capped by any role:
+  add a `"*"` group to cap everyone the channel admits who is not named
+  elsewhere.
 
 A role only narrows the agent's profile, and only in the four fields a turn
 can change: `excluded_tools` and `always_ask` are added, `auto_approve` keeps
 only what both profiles allow, and `approval_route` is the role's own, or the
-agent's when the role sets none. The
-role's exclusions apply even when the agent runs at `full`. Every other field
+agent's when the role sets none. The role's exclusions apply even when the
+agent runs at `full`. Every other field
 of the role profile must equal the agent's; validation rejects one that
 differs, because sandbox, command, and autonomy settings are fixed when the
 agent's tools are built.
@@ -209,15 +212,28 @@ even under `inherit-originator`, so a guest cannot approve their own request.
 Only when neither the role nor the agent sets a route do prompts go to the
 room, as the agent's own turns do, where the channel decides who may answer
 (on Discord, anyone it admits). Give guest roles a route, or exclude the tools
-you would otherwise gate. A role turn also starts with an empty "Always" list, so an owner's
-"Always" answer never carries over to guests.
+you would otherwise gate. A role turn also starts with an empty "Always"
+list, so an owner's "Always" answer never carries over to guests. A skill
+wrapper counts as the tool it runs: a wrapper over a tool the role excludes
+is excluded too, and one over a tool the role always asks about asks too.
+
+A role turn cannot start work its restrictions would not follow. Its model is
+not offered, and cannot call, any tool that hands work to another run:
+`delegate`, `spawn_subagent`, `pipeline`, and any other tool that starts
+nested execution without carrying the caller's limits; `cron_add`,
+`cron_update`, `cron_run`, and `schedule`, whose jobs run later under the
+agent's profile; `sop_execute`, `sop_advance`, `sop_approve`, and
+`sop_workshop`, whose steps may run as another agent; and
+`send_message_to_peer`, which makes another agent run a turn under its own
+profile. A skill wrapper over any of these is excluded as well. Owners, and
+senders no role matches, keep these tools.
 
 Current limits:
 
 - A role cannot restrict to an allowlist (`allowed_tools`, `deny_all_tools`);
-  list what to remove in `excluded_tools`. Remember nested execution:
-  `delegate`, `spawn_subagent`, and SOP tools run other agents under their
-  own profiles.
+  list what to remove in `excluded_tools`.
+- A role cannot yet carry its limits into delegated, scheduled, SOP, or
+  peer-agent work, so its turns do not reach those tools at all.
 - Roles narrow tools and approvals only. They add no memory isolation: what
   a guest turn can recall is whatever the agent's memory scoping already
   allows. Exclude `memory_recall` for guests if that matters.

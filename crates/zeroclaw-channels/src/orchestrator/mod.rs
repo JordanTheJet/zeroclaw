@@ -3202,7 +3202,9 @@ struct SenderRoleTurn {
     risk_profile: String,
     /// Tools the role removes, applied on top of the agent's own per-turn
     /// exclusions at every autonomy level. A role is an explicit narrowing,
-    /// so an agent running at `full` must not quietly undo it.
+    /// so an agent running at `full` must not quietly undo it. Besides the
+    /// role's own `excluded_tools`, this holds every tool whose work the role
+    /// cannot follow (see [`sender_role_excluded_tools`]).
     excluded_tools: Vec<String>,
     /// Approval policy for the turn, derived from the narrowed profile. Its
     /// session allowlist starts empty, so an "Always" answered for one side
@@ -3274,14 +3276,93 @@ fn resolve_sender_role_turn(
             risk_profiles: vec![role.risk_profile],
         };
     };
-    let narrowed = agent_profile.narrowed_for_sender_role(role_profile);
+    let registry: &[Box<dyn Tool>] = &ctx.tools_registry[..];
+    let mut narrowed = agent_profile.narrowed_for_sender_role(role_profile);
+    let wrapped_always_ask = sender_role_wrapped_always_ask(registry, &narrowed.always_ask);
+    narrowed.always_ask.extend(wrapped_always_ask);
     SenderRoleOutcome::Role(Box::new(SenderRoleTurn {
         group: role.group,
         risk_profile: role.risk_profile,
-        excluded_tools: role_profile.excluded_tools.clone(),
+        excluded_tools: sender_role_excluded_tools(registry, &role_profile.excluded_tools),
         approval_manager: ctx.approval_manager.derive_for_risk_profile(&narrowed),
         approval_route: narrowed.approval_route,
     }))
+}
+
+/// Tools a sender-role turn may not call because the work they start runs
+/// where the role's restrictions do not follow it: jobs that run later
+/// (`cron_add`, `cron_update`, `cron_run`, `schedule`), SOP runs and step
+/// approvals, whose steps may run as another agent, and messages that make
+/// another agent run a turn under its own profile. Nested launchers that do
+/// not carry a caller's ceiling (delegate, spawn_subagent, pipeline) are
+/// found by `requires_unrestricted_principal` instead, the flag a
+/// constrained RPC principal is held to.
+const SENDER_ROLE_UNFOLLOWED_TOOLS: &[&str] = &[
+    "cron_add",
+    "cron_update",
+    "cron_run",
+    "schedule",
+    "sop_execute",
+    "sop_advance",
+    "sop_approve",
+    "sop_workshop",
+    "send_message_to_peer",
+];
+
+/// `tool` and every tool it wraps, outermost first.
+fn wrapper_chain(tool: &dyn Tool) -> Vec<&dyn Tool> {
+    let mut chain = vec![tool];
+    while let Some(inner) = chain.last().and_then(|link| link.wrapped_tool()) {
+        chain.push(inner);
+    }
+    chain
+}
+
+/// Every tool a sender-role turn may not call: the role's own exclusions and
+/// the tools whose work the role cannot follow, plus each registered tool
+/// (wrappers included) that reaches one of those, or launches nested
+/// execution without carrying the caller's ceiling. Until those paths carry
+/// the sender's restrictions, a role turn does not reach them at all.
+fn sender_role_excluded_tools(registry: &[Box<dyn Tool>], role_excluded: &[String]) -> Vec<String> {
+    let blocked_name = |name: &str| {
+        SENDER_ROLE_UNFOLLOWED_TOOLS.contains(&name)
+            || role_excluded.iter().any(|excluded| excluded == name)
+    };
+    let mut excluded: Vec<String> = role_excluded.to_vec();
+    for name in SENDER_ROLE_UNFOLLOWED_TOOLS {
+        if !excluded.iter().any(|tool| tool == name) {
+            excluded.push((*name).to_string());
+        }
+    }
+    for tool in registry {
+        let blocked = wrapper_chain(tool.as_ref())
+            .into_iter()
+            .any(|link| link.requires_unrestricted_principal() || blocked_name(link.name()));
+        if blocked && !excluded.iter().any(|name| name == tool.name()) {
+            excluded.push(tool.name().to_string());
+        }
+    }
+    excluded
+}
+
+/// Registered wrappers whose chain reaches a tool in `always_ask`. They ask
+/// too, so a renamed wrapper cannot run the tool without the approval the
+/// role requires for it.
+fn sender_role_wrapped_always_ask(
+    registry: &[Box<dyn Tool>],
+    always_ask: &[String],
+) -> Vec<String> {
+    registry
+        .iter()
+        .filter(|tool| !always_ask.iter().any(|name| name == tool.name()))
+        .filter(|tool| {
+            wrapper_chain(tool.as_ref())
+                .into_iter()
+                .skip(1)
+                .any(|link| always_ask.iter().any(|name| name == link.name()))
+        })
+        .map(|tool| tool.name().to_string())
+        .collect()
 }
 
 /// The tools a channel turn may not call: the agent's non-CLI exclusions
@@ -28000,6 +28081,20 @@ BTC is currently around $65,000 based on latest tool output."#
         channels: Vec<Arc<dyn Channel>>,
         executions: Arc<AtomicUsize>,
     ) -> Arc<ChannelRuntimeContext> {
+        sender_role_runtime_ctx_with(
+            prompt_config,
+            channels,
+            vec![Box::new(CountingPriceTool(executions))],
+            Arc::new(ToolCallingModelProvider),
+        )
+    }
+
+    fn sender_role_runtime_ctx_with(
+        prompt_config: zeroclaw_config::schema::Config,
+        channels: Vec<Arc<dyn Channel>>,
+        tools: Vec<Box<dyn Tool>>,
+        model_provider: Arc<dyn ModelProvider>,
+    ) -> Arc<ChannelRuntimeContext> {
         let channels_by_name: HashMap<String, Arc<dyn Channel>> = channels
             .into_iter()
             .map(|channel| (channel.name().to_string(), channel))
@@ -28010,7 +28105,7 @@ BTC is currently around $65,000 based on latest tool output."#
             .unwrap_or_default();
         Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
-            model_provider: Arc::new(ToolCallingModelProvider),
+            model_provider,
             model_provider_ref: Arc::new("test-provider".to_string()),
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
@@ -28023,9 +28118,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 ),
             ),
             tools_registry: Arc::new(
-                zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![
-                    Box::new(CountingPriceTool(executions)),
-                ]),
+                zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(tools),
             ),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
@@ -28253,6 +28346,299 @@ BTC is currently around $65,000 based on latest tool output."#
             "the guest's prompt goes to the agent's approver"
         );
         assert_eq!(executions.load(Ordering::SeqCst), 1);
+    }
+
+    /// A counting tool under any name. `launcher` marks it as starting nested
+    /// execution without carrying a caller's ceiling, the flag delegate,
+    /// spawn_subagent and pipeline declare.
+    struct CountingNamedTool {
+        name: String,
+        launcher: bool,
+        executions: Arc<AtomicUsize>,
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for CountingNamedTool {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Tool(::zeroclaw_api::attribution::ToolKind::Plugin)
+        }
+        fn alias(&self) -> &str {
+            &self.name
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for CountingNamedTool {
+        fn requires_unrestricted_principal(&self) -> bool {
+            self.launcher
+        }
+
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn description(&self) -> &str {
+            "counts its runs"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": { "symbol": { "type": "string" } }
+            })
+        }
+
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            self.executions.fetch_add(1, Ordering::SeqCst);
+            Ok(ToolResult {
+                success: true,
+                output: "ran".to_string().into(),
+                error: None,
+            })
+        }
+    }
+
+    /// Calls the tool it names until a tool result comes back.
+    struct NamedToolCallingProvider(String);
+
+    impl NamedToolCallingProvider {
+        fn payload(&self) -> String {
+            format!(
+                "<tool_call>\n{{\"name\":\"{}\",\"arguments\":{{\"symbol\":\"BTC\"}}}}\n</tool_call>",
+                self.0
+            )
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for NamedToolCallingProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok(self.payload())
+        }
+
+        async fn chat_with_history(
+            &self,
+            messages: &[ChatMessage],
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            let has_tool_results = messages
+                .iter()
+                .any(|msg| msg.role == "user" && msg.content.contains("[Tool results]"));
+            if has_tool_results {
+                Ok("done".to_string())
+            } else {
+                Ok(self.payload())
+            }
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for NamedToolCallingProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "NamedToolCallingProvider"
+        }
+    }
+
+    /// The fixture's roles with the owner auto-approving everything, so a
+    /// call stops only on an exclusion or on an approval the role adds.
+    fn open_sender_role_config(
+        guest: zeroclaw_config::schema::RiskProfileConfig,
+    ) -> zeroclaw_config::schema::Config {
+        let mut config = sender_role_prompt_config(guest);
+        config
+            .risk_profiles
+            .get_mut("owner")
+            .expect("the fixture's agent profile")
+            .auto_approve = vec!["*".into()];
+        config
+    }
+
+    fn open_guest() -> zeroclaw_config::schema::RiskProfileConfig {
+        zeroclaw_config::schema::RiskProfileConfig {
+            auto_approve: vec!["*".into()],
+            ..Default::default()
+        }
+    }
+
+    /// A skill's builtin wrapper `ops__<tool>` over `target`.
+    fn skill_wrapper(
+        tool: &str,
+        target: Arc<dyn Tool>,
+    ) -> zeroclaw_runtime::tools::SkillBuiltinTool {
+        let manifest = zeroclaw_runtime::skills::SkillTool {
+            name: tool.into(),
+            description: "a skill wrapper".into(),
+            kind: "builtin".into(),
+            command: String::new(),
+            args: HashMap::new(),
+            target: Some(target.name().to_string()),
+            locked_args: HashMap::new(),
+            timeout_secs: None,
+        };
+        zeroclaw_runtime::tools::SkillBuiltinTool::new("ops", &manifest, target, HashMap::new())
+    }
+
+    /// Run `sender`'s turn, in which the model calls `called`, with `tools`
+    /// registered and `channels` live.
+    async fn run_sender_turn(
+        config: zeroclaw_config::schema::Config,
+        sender: &str,
+        called: &str,
+        tools: Vec<Box<dyn Tool>>,
+        channels: Vec<Arc<dyn Channel>>,
+    ) {
+        let ctx = sender_role_runtime_ctx_with(
+            config,
+            channels,
+            tools,
+            Arc::new(NamedToolCallingProvider(called.to_string())),
+        );
+        process_channel_message(ctx, sender_role_msg(sender), CancellationToken::new()).await;
+    }
+
+    #[tokio::test]
+    async fn a_sender_role_turn_cannot_start_work_its_role_does_not_follow() {
+        // Launchers found by their flag, and entry points whose work runs
+        // later or as another agent. The owner's runs are the positive
+        // control: each tool works when no role applies.
+        let cases: &[(&str, bool)] = &[
+            ("delegate", true),
+            ("spawn_subagent", true),
+            ("pipeline", true),
+            ("cron_add", false),
+            ("cron_update", false),
+            ("cron_run", false),
+            ("schedule", false),
+            ("sop_execute", false),
+            ("sop_advance", false),
+            ("sop_approve", false),
+            ("sop_workshop", false),
+            ("send_message_to_peer", false),
+        ];
+        let mut failures = Vec::new();
+        for &(name, launcher) in cases {
+            for (sender, expected) in [("mallory", 0), ("alice", 1)] {
+                let executions = Arc::new(AtomicUsize::new(0));
+                let room = Arc::new(SenderRoleTestChannel::new("test-channel", None));
+                run_sender_turn(
+                    open_sender_role_config(open_guest()),
+                    sender,
+                    name,
+                    vec![Box::new(CountingNamedTool {
+                        name: name.to_string(),
+                        launcher,
+                        executions: Arc::clone(&executions),
+                    })],
+                    vec![room as Arc<dyn Channel>],
+                )
+                .await;
+                let runs = executions.load(Ordering::SeqCst);
+                if runs != expected {
+                    failures.push(format!(
+                        "{name} for {sender}: {runs} runs, expected {expected}"
+                    ));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[tokio::test]
+    async fn a_skill_wrapper_cannot_reach_a_tool_a_sender_role_excludes() {
+        let mut failures = Vec::new();
+        // A wrapper over a tool the role excludes, and over a launcher.
+        for (tool, target_name, launcher, guest_excludes) in [
+            ("price", "mock_price", false, vec!["mock_price".to_string()]),
+            ("hand_off", "delegate", true, Vec::new()),
+        ] {
+            for (sender, expected) in [("mallory", 0), ("alice", 1)] {
+                let executions = Arc::new(AtomicUsize::new(0));
+                let target: Arc<dyn Tool> = Arc::new(CountingNamedTool {
+                    name: target_name.to_string(),
+                    launcher,
+                    executions: Arc::clone(&executions),
+                });
+                let wrapper = skill_wrapper(tool, target);
+                let called = wrapper.name().to_string();
+                let guest = zeroclaw_config::schema::RiskProfileConfig {
+                    excluded_tools: guest_excludes.clone(),
+                    ..open_guest()
+                };
+                let room = Arc::new(SenderRoleTestChannel::new("test-channel", None));
+                run_sender_turn(
+                    open_sender_role_config(guest),
+                    sender,
+                    &called,
+                    vec![Box::new(wrapper)],
+                    vec![room as Arc<dyn Channel>],
+                )
+                .await;
+                let runs = executions.load(Ordering::SeqCst);
+                if runs != expected {
+                    failures.push(format!(
+                        "{called} over {target_name} for {sender}: {runs} runs, expected {expected}"
+                    ));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[tokio::test]
+    async fn a_skill_wrapper_asks_where_its_target_would_for_a_sender_role() {
+        for (answer, expected_runs) in [
+            (zeroclaw_api::channel::ChannelApprovalResponse::Approve, 1),
+            (zeroclaw_api::channel::ChannelApprovalResponse::Deny, 0),
+        ] {
+            let executions = Arc::new(AtomicUsize::new(0));
+            let wrapper = skill_wrapper(
+                "price",
+                Arc::new(CountingPriceTool(Arc::clone(&executions))),
+            );
+            let called = wrapper.name().to_string();
+            // The room would approve anything; only the role's approver may.
+            let room = Arc::new(SenderRoleTestChannel::new(
+                "test-channel",
+                Some(zeroclaw_api::channel::ChannelApprovalResponse::Approve),
+            ));
+            let label = format!("{answer:?}");
+            let ops = Arc::new(SenderRoleTestChannel::new("ops", Some(answer)));
+            let guest = zeroclaw_config::schema::RiskProfileConfig {
+                always_ask: vec!["mock_price".into()],
+                approval_route: Some(guest_route("ops")),
+                ..open_guest()
+            };
+            run_sender_turn(
+                open_sender_role_config(guest),
+                "mallory",
+                &called,
+                vec![Box::new(wrapper)],
+                vec![
+                    room.clone() as Arc<dyn Channel>,
+                    ops.clone() as Arc<dyn Channel>,
+                ],
+            )
+            .await;
+            assert!(room.approvals.lock().await.is_empty(), "{label}");
+            assert_eq!(
+                ops.approvals.lock().await.as_slice(),
+                &[("admins".to_string(), called.clone())],
+                "{label}: the wrapper asks the role's approver as its target would"
+            );
+            assert_eq!(executions.load(Ordering::SeqCst), expected_runs, "{label}");
+        }
     }
 
     #[tokio::test]
