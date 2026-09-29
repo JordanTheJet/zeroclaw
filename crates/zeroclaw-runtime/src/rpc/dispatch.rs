@@ -21215,20 +21215,69 @@ mod tests {
         );
     }
 
-    /// G2a: the daemon owns the observer hook, so with no gateway running a
-    /// `logs/subscribe` client still receives the agent, tool, and LLM frames
-    /// recorded through any factory-built observer, each exactly once, and
+    /// The fixture's hook: forwards only its own turn to the real
+    /// `BroadcastObserver`, so observer events other tests record through the
+    /// process-wide hook never reach this bus's live ring or its history.
+    /// Counts what it turned away, so a flood can prove it went through here.
+    struct FixtureTurnObserver {
+        turn: &'static str,
+        inner: crate::observability::BroadcastObserver,
+        rejected: std::sync::atomic::AtomicUsize,
+    }
+
+    impl crate::observability::Observer for FixtureTurnObserver {
+        fn record_event(&self, event: &crate::observability::ObserverEvent) {
+            use crate::observability::ObserverEvent;
+            let turn_id = match event {
+                ObserverEvent::AgentStart { turn_id, .. }
+                | ObserverEvent::LlmRequest { turn_id, .. }
+                | ObserverEvent::ToolCall { turn_id, .. } => turn_id.as_deref(),
+                _ => None,
+            };
+            if turn_id == Some(self.turn) {
+                self.inner.record_event(event);
+            } else {
+                self.rejected
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+
+        fn record_metric(&self, _metric: &crate::observability::traits::ObserverMetric) {}
+
+        fn name(&self) -> &str {
+            "fixture-turn"
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// Shared body of the G2a fixture. Records the fixture turn's agent, LLM
+    /// and tool events through a factory-built observer, then `foreign` more
+    /// events for another turn from a separate thread, and asserts the
+    /// subscriber received the fixture's three frames once each and
     /// `events/history` replays them.
-    #[tokio::test]
-    async fn logs_subscribe_carries_observer_frames_without_a_gateway() {
-        use crate::observability::{EventBus, ObserverEvent};
+    ///
+    /// The bus is deliberately small (64 live, 16 history): isolation, not
+    /// capacity, is what keeps foreign events out. The fixture installs its
+    /// own hook and hands its bus to the RPC context by hand; it never starts
+    /// `daemon::run`, so it covers observer-to-RPC plumbing, not the daemon's
+    /// bootstrap wiring.
+    async fn assert_fixture_turn_reaches_subscriber_and_history(foreign: usize) {
+        use crate::observability::{BroadcastObserver, EventBus, ObserverEvent};
         use zeroclaw_infra::session_queue::SessionActorQueue;
+        const TURN: &str = "g2a-turn";
         let _hook = crate::observability::HOOK_TEST_LOCK.lock().await;
         crate::observability::clear_broadcast_hook();
 
-        // What `daemon::run` does, and nothing the gateway does.
         let bus = EventBus::with_capacities(64, 16);
-        let _daemon_hook = bus.install_hook();
+        let fixture = Arc::new(FixtureTurnObserver {
+            turn: TURN,
+            inner: BroadcastObserver::new(bus.sender().clone(), Arc::clone(bus.history())),
+            rejected: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let _fixture_hook = crate::observability::set_scoped_broadcast_hook(fixture.clone());
         let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
         let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
         let ctx = RpcContext::minimal_with_event_bus(
@@ -21240,12 +21289,14 @@ mod tests {
         let d = RpcDispatcher::new(ctx, writer_tx, "local:uid=0".into());
         assert!(d.handle_logs_subscribe(&json!({})).is_ok());
 
-        let observer =
+        let factory_observer = || {
             crate::observability::create_observer(&zeroclaw_config::schema::ObservabilityConfig {
                 backend: zeroclaw_config::schema::ObservabilityBackend::None,
                 ..Default::default()
-            });
-        let turn = Some("g2a-turn".to_string());
+            })
+        };
+        let observer = factory_observer();
+        let turn = Some(TURN.to_string());
         observer.record_event(&ObserverEvent::AgentStart {
             model_provider: "p".into(),
             model: "m".into(),
@@ -21275,6 +21326,27 @@ mod tests {
             turn_id: turn.clone(),
         });
 
+        // Another test's producer: its own factory observer on its own thread,
+        // not holding HOOK_TEST_LOCK, recording before this fixture reads
+        // anything back.
+        let foreign_producer = std::thread::spawn(move || {
+            let observer = factory_observer();
+            for _ in 0..foreign {
+                observer.record_event(&ObserverEvent::AgentStart {
+                    model_provider: "p".into(),
+                    model: "m".into(),
+                    channel: None,
+                    agent_alias: None,
+                    turn_id: Some("foreign-turn".into()),
+                });
+            }
+        });
+        foreign_producer.join().expect("foreign producer finished");
+        assert!(
+            fixture.rejected.load(std::sync::atomic::Ordering::Relaxed) >= foreign,
+            "the foreign events must have reached the fixture's hook and been turned away"
+        );
+
         let mut kinds = Vec::new();
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
         while kinds.len() < 3 {
@@ -21284,7 +21356,7 @@ mod tests {
             };
             let frame: Value = serde_json::from_str(&frame).expect("notification is JSON");
             if frame["method"] == json!(notification::LOGS_EVENT)
-                && frame["params"]["turn_id"] == json!("g2a-turn")
+                && frame["params"]["turn_id"] == json!(TURN)
             {
                 kinds.push(
                     frame["params"]["type"]
@@ -21295,27 +21367,21 @@ mod tests {
             }
         }
         assert_eq!(kinds, ["agent_start", "llm_request", "tool_call"]);
-        // The observer hook is process-wide, so tests running in parallel can
-        // put their own frames on this bus. Only a second copy of this test's
-        // turn would be a duplicate.
         let quiet_until = tokio::time::Instant::now() + std::time::Duration::from_millis(150);
         while let Ok(Some(frame)) = tokio::time::timeout_at(quiet_until, writer_rx.recv()).await {
             let frame: Value = serde_json::from_str(&frame).expect("notification is JSON");
             assert_ne!(
                 frame["params"]["turn_id"],
-                json!("g2a-turn"),
+                json!(TURN),
                 "each observer event must be delivered once: {frame}"
             );
         }
 
         let history = d.handle_events_history().expect("history is available");
-        // Parallel tests can record into the same process-wide hook; only this
-        // test's turn is asserted on.
         let types: Vec<_> = history["events"]
             .as_array()
             .expect("events array")
             .iter()
-            .filter(|event| event["turn_id"] == json!("g2a-turn"))
             .map(|event| event["type"].clone())
             .collect();
         assert_eq!(
@@ -21324,10 +21390,30 @@ mod tests {
                 json!("agent_start"),
                 json!("llm_request"),
                 json!("tool_call")
-            ]
+            ],
+            "history holds exactly the fixture's turn"
         );
 
         crate::observability::clear_broadcast_hook();
+    }
+
+    /// G2a: the daemon owns the observer hook, so with no gateway running a
+    /// `logs/subscribe` client still receives the agent, tool, and LLM frames
+    /// recorded through any factory-built observer, each exactly once, and
+    /// `events/history` replays them.
+    #[tokio::test]
+    async fn logs_subscribe_carries_observer_frames_without_a_gateway() {
+        assert_fixture_turn_reaches_subscriber_and_history(0).await;
+    }
+
+    /// The G2a fixture survives other tests' observer traffic: 1000 foreign
+    /// events, more than both the live (64, daemon 256) and history (16,
+    /// daemon 500) capacities, recorded through the same process-wide hook
+    /// from another thread, neither lag the subscriber nor evict the
+    /// fixture's turn from history.
+    #[tokio::test]
+    async fn logs_subscribe_fixture_is_isolated_from_foreign_observer_traffic() {
+        assert_fixture_turn_reaches_subscriber_and_history(1000).await;
     }
 
     /// `events/history` is classified `Logs:Read`: a principal without that
