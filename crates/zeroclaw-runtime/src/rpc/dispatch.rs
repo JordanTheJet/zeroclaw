@@ -1442,10 +1442,22 @@ impl RpcDispatcher {
         let Some(auth) = self.auth.as_ref() else {
             return Err(rpc_err(AUTH_REQUIRED, "First call must be 'initialize'"));
         };
+        self.check_agent_selector_with_grants(method, &auth.grants, alias, require_configured)
+    }
+
+    /// [`Self::check_agent_selector`] evaluated against an explicit grant
+    /// set, for a handler that re-resolved its principal after a wait.
+    fn check_agent_selector_with_grants(
+        &self,
+        method: Method,
+        grants: &zeroclaw_api::grants::ResolvedGrants,
+        alias: &str,
+        require_configured: bool,
+    ) -> Result<(), JsonRpcError> {
         let configured = !require_configured
-            || auth.grants.admin
+            || grants.admin
             || self.ctx.config.read().agents.contains_key(alias);
-        if configured && auth.grants.may_use_agent(alias) {
+        if configured && grants.may_use_agent(alias) {
             return Ok(());
         }
         let denied = rpc_err(
@@ -9597,6 +9609,18 @@ impl RpcDispatcher {
         let Some(grants) = self.stamped_grants() else {
             return Ok(());
         };
+        self.authorize_sop_agents_with_grants(method, sop, executes, grants)
+    }
+
+    /// [`Self::authorize_sop_agents`] evaluated against `grants`: the stamped
+    /// grants at admission, freshly resolved ones at a recheck after a wait.
+    fn authorize_sop_agents_with_grants(
+        &self,
+        method: Method,
+        sop: &crate::sop::Sop,
+        executes: bool,
+        grants: &zeroclaw_api::grants::ResolvedGrants,
+    ) -> Result<(), JsonRpcError> {
         if executes {
             return self.authorize_sop_execution_with_grants(method, sop, grants);
         }
@@ -9605,7 +9629,7 @@ impl RpcDispatcher {
             Self::sop_executing_agents(sop, &config)
         };
         for alias in &agents {
-            self.selector_agent(method, alias)?;
+            self.check_agent_selector_with_grants(method, grants, alias, true)?;
         }
         Ok(())
     }
@@ -10356,17 +10380,28 @@ impl RpcDispatcher {
         let Some(grants) = self.stamped_grants() else {
             return Ok(());
         };
-        let run_sop = {
-            let guard = engine
-                .lock()
-                .map_err(|_| rpc_err(INTERNAL_ERROR, "SOP engine lock poisoned"))?;
-            guard
-                .get_run(run_id)
-                .and_then(|run| guard.get_sop(&run.sop_name))
-                .cloned()
-        };
+        let guard = engine
+            .lock()
+            .map_err(|_| rpc_err(INTERNAL_ERROR, "SOP engine lock poisoned"))?;
+        self.authorize_run_agents_with_grants(method, &guard, run_id, grants)
+    }
+
+    /// [`Self::authorize_run_agents`] evaluated against `grants`, reading the
+    /// run from `engine`, whose lock the caller holds. Admission passes the
+    /// stamped grants; the recheck under the lock that acts on the run passes
+    /// freshly resolved ones, so both sides test the same thing.
+    fn authorize_run_agents_with_grants(
+        &self,
+        method: Method,
+        engine: &crate::sop::SopEngine,
+        run_id: &str,
+        grants: &zeroclaw_api::grants::ResolvedGrants,
+    ) -> Result<(), JsonRpcError> {
+        let run_sop = engine
+            .get_run(run_id)
+            .and_then(|run| engine.get_sop(&run.sop_name));
         match run_sop {
-            Some(run_sop) => self.authorize_sop_agents(method, &run_sop, false),
+            Some(run_sop) => self.authorize_sop_agents_with_grants(method, run_sop, false, grants),
             None if grants.admin => Ok(()),
             None => Err(rpc_err(
                 AUTH_REQUIRED,
@@ -10401,6 +10436,18 @@ impl RpcDispatcher {
         let mut guard = engine
             .lock()
             .map_err(|_| rpc_err(INTERNAL_ERROR, "SOP engine lock poisoned"))?;
+        // The checks above ran on the grants stamped at the gate, and each
+        // lock acquisition since could have waited behind other engine work
+        // while a policy change was published. Re-resolve the caller now, with
+        // the lock that cancels held, and hold the run's procedure to it.
+        if let Some(grants) = self.recheck_authority_after_admission(Method::SopsCancel)? {
+            self.authorize_run_agents_with_grants(
+                Method::SopsCancel,
+                &guard,
+                &req.run_id,
+                &grants,
+            )?;
+        }
         let outcome = match guard.cancel_run_idempotent(&req.run_id, req.reason, Some(actor)) {
             Ok(Some(outcome)) => outcome,
             Ok(None) => {
@@ -22327,6 +22374,163 @@ mod tests {
             "{}",
             step.output
         );
+    }
+
+    /// Run `call` on its own thread while this test holds the SOP engine
+    /// lock, so the call waits on that lock after the gate admitted it;
+    /// publish `change` (a roster) while it waits; release the lock; and
+    /// return the call's result. The call must still be waiting when the
+    /// change lands, or the test is vacuous, and a call that never completes
+    /// fails the test instead of hanging it.
+    fn call_parked_on_the_engine_lock<T: Send + 'static>(
+        ctx: &Arc<RpcContext>,
+        engine: &Arc<std::sync::Mutex<crate::sop::SopEngine>>,
+        change: Option<zeroclaw_config::schema::Config>,
+        call: impl FnOnce() -> T + Send + 'static,
+    ) -> T {
+        let held = engine.lock().unwrap();
+        let caller = std::thread::spawn(call);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(
+            !caller.is_finished(),
+            "the call must be waiting on the engine lock when the change lands"
+        );
+        if let Some(config) = change {
+            ctx.auth
+                .refresh_from_config(&config)
+                .expect("the new policy publishes");
+        }
+        drop(held);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !caller.is_finished() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the call must complete once the engine lock is free"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        caller.join().expect("the call does not panic")
+    }
+
+    /// The context's configuration with alice's permission profile replaced:
+    /// entitled to `agents`, holding `verbs` on SOPs.
+    fn roster_republished(
+        ctx: &Arc<RpcContext>,
+        agents: &[&str],
+        verbs: &[zeroclaw_api::grants::Verb],
+    ) -> zeroclaw_config::schema::Config {
+        let mut config = ctx.config.read().clone();
+        config.permission_profiles = dispatch_event_roster_with(agents, verbs).permission_profiles;
+        config
+    }
+
+    /// Alice's roster (uid 4242, entitled to `alpha`, SOP read and execute)
+    /// applied to a checkpoint fixture's configuration.
+    fn alice_roster(config: &mut zeroclaw_config::schema::Config) {
+        let roster = dispatch_event_roster(&["alpha"]);
+        config.agents = roster.agents;
+        config.permission_profiles = roster.permission_profiles;
+        config.users = roster.users;
+    }
+
+    /// A run parked at a checkpoint in a procedure `alpha` executes.
+    fn alpha_checkpoint_fixture() -> (
+        Arc<RpcContext>,
+        Arc<std::sync::Mutex<crate::sop::SopEngine>>,
+        String,
+        tempfile::TempDir,
+    ) {
+        let (ctx, engine, run_id, temp) = make_checkpoint_rpc_fixture(1, &[], alice_roster);
+        {
+            let mut engine = engine.lock().unwrap();
+            let mut sop = engine
+                .get_sop("rpc-checkpoint")
+                .cloned()
+                .expect("the procedure is loaded");
+            sop.agent = Some("alpha".into());
+            engine.set_sops_for_test(vec![sop]);
+        }
+        (ctx, engine, run_id, temp)
+    }
+
+    /// Everything a cancellation or a decision would change about `run_id`:
+    /// the run itself (its status and cancellation record) and whether it is
+    /// still active, which is what keeps its execution claim.
+    fn run_state(
+        engine: &Arc<std::sync::Mutex<crate::sop::SopEngine>>,
+        run_id: &str,
+    ) -> (Value, bool) {
+        let engine = engine.lock().unwrap();
+        let run = engine.get_run(run_id).expect("the run is known");
+        (
+            serde_json::to_value(run).unwrap(),
+            engine.active_runs().contains_key(run_id),
+        )
+    }
+
+    fn cancel_parked_on_the_engine_lock(
+        ctx: &Arc<RpcContext>,
+        engine: &Arc<std::sync::Mutex<crate::sop::SopEngine>>,
+        alice: RpcDispatcher,
+        run_id: &str,
+        change: Option<zeroclaw_config::schema::Config>,
+    ) -> RpcResult {
+        let params = json!({ "run_id": run_id });
+        tokio::task::block_in_place(|| {
+            call_parked_on_the_engine_lock(ctx, engine, change, move || {
+                alice.handle_sops_cancel(&params)
+            })
+        })
+    }
+
+    /// Control: with nothing changed while the cancel waits for the engine,
+    /// the entitled caller cancels the run.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sops_cancel_unchanged_while_waiting_for_the_engine_cancels() {
+        let (ctx, engine, run_id, _temp) = alpha_checkpoint_fixture();
+        let alice = scoped_dispatcher(&ctx, 4242).await;
+        let result = cancel_parked_on_the_engine_lock(&ctx, &engine, alice, &run_id, None)
+            .expect("an entitled caller cancels");
+        assert_eq!(result["outcome"], "cancelled");
+        assert_eq!(
+            run_status(&engine, &run_id),
+            Some(crate::sop::types::SopRunStatus::Cancelled)
+        );
+    }
+
+    /// `sops:execute` is withdrawn while the cancel waits for the engine: the
+    /// run, its cancellation record and its claim are untouched.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sops_cancel_revoked_while_waiting_for_the_engine_has_no_effect() {
+        let (ctx, engine, run_id, _temp) = alpha_checkpoint_fixture();
+        let alice = scoped_dispatcher(&ctx, 4242).await;
+        let before = run_state(&engine, &run_id);
+        let revoked = roster_republished(&ctx, &["alpha"], &[zeroclaw_api::grants::Verb::Read]);
+        let error = cancel_parked_on_the_engine_lock(&ctx, &engine, alice, &run_id, Some(revoked))
+            .expect_err("a caller whose execute grant was withdrawn must not cancel");
+        assert_eq!(error.code, FORBIDDEN, "{}", error.message);
+        assert_eq!(run_state(&engine, &run_id), before);
+    }
+
+    /// Alice's agent selector is narrowed away from `alpha` while the cancel
+    /// waits for the engine: the run is untouched.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sops_cancel_narrowed_while_waiting_for_the_engine_has_no_effect() {
+        let (ctx, engine, run_id, _temp) = alpha_checkpoint_fixture();
+        let alice = scoped_dispatcher(&ctx, 4242).await;
+        let before = run_state(&engine, &run_id);
+        let narrowed = roster_republished(
+            &ctx,
+            &["beta"],
+            &[
+                zeroclaw_api::grants::Verb::Read,
+                zeroclaw_api::grants::Verb::Execute,
+            ],
+        );
+        let error = cancel_parked_on_the_engine_lock(&ctx, &engine, alice, &run_id, Some(narrowed))
+            .expect_err("a caller no longer entitled to the run's agent must not cancel");
+        assert_eq!(error.code, FORBIDDEN, "{}", error.message);
+        assert_eq!(run_state(&engine, &run_id), before);
     }
 
     #[test]
