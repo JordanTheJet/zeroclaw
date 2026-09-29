@@ -135,7 +135,10 @@ the next turn: the request is refused before execution. Create a new session to
 continue without the forwarded environment. Sessions without forwarded values
 remain eligible for normal resume, subject to the other authorization checks.
 The retained environment is immutable for the lifetime of its session; refusing
-a later request does not rewrite it underneath an already running turn.
+a later request does not rewrite it underneath an already running turn. A
+resume also requires the current connection's authorized environment to match
+the session's retained environment. If it differs, create a new session; an
+environment-free session can still be resumed after `admin` is removed.
 
 #### Recovery
 
