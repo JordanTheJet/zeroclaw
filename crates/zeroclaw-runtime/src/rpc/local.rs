@@ -2931,7 +2931,15 @@ mod tests {
         tmp: &tempfile::TempDir,
         limits: LocalListenerLimits,
     ) -> (std::path::PathBuf, Arc<AtomicUsize>, CancellationToken) {
-        let ctx = test_ctx(tmp.path());
+        listener_on(test_ctx(tmp.path()), limits).await
+    }
+
+    /// Start a listener with `limits` on `ctx`.
+    #[cfg(unix)]
+    async fn listener_on(
+        ctx: Arc<RpcContext>,
+        limits: LocalListenerLimits,
+    ) -> (std::path::PathBuf, Arc<AtomicUsize>, CancellationToken) {
         let sock_path = ctx.config.read().data_dir.join("daemon.sock");
         let cancel = CancellationToken::new();
         let count = Arc::new(AtomicUsize::new(0));
@@ -2991,6 +2999,49 @@ mod tests {
 
         let (_reader, _writer) = do_initialize(&sock_path).await;
         wait_for_client_count(&count, 1).await;
+        cancel.cancel();
+    }
+
+    /// An `initialize` that arrives in time but is still authenticating when
+    /// the deadline passes ends the connection, rather than completing late.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_initialize_still_authenticating_at_the_deadline_is_closed_and_its_slot_reused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(tmp.path());
+        // Never released: the authentication stays parked past the deadline.
+        let (arrived, _release) = ctx.auth.pause_next_authentication();
+        let (sock_path, count, cancel) = listener_on(
+            ctx,
+            LocalListenerLimits {
+                max_connections: 1,
+                write_timeout: LOCAL_PEER_WRITE_TIMEOUT,
+                initialize_timeout: Duration::from_millis(400),
+                frame_read_timeout: LOCAL_FRAME_READ_TIMEOUT,
+            },
+        )
+        .await;
+
+        let stream = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
+        wait_for_client_count(&count, 1).await;
+        let (read_half, mut write_half) = stream.into_split();
+        write_half
+            .write_all(
+                b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocol_version\":1}}\n",
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), arrived.notified())
+            .await
+            .expect("authentication starts before the deadline");
+        let mut reader = tokio::io::BufReader::new(read_half);
+        let lines = lines_until_eof(&mut reader, Duration::from_secs(5)).await;
+        assert!(lines.is_empty(), "no late initialize result: {lines:?}");
+        wait_for_client_count(&count, 0).await;
+
+        let (_reader, _writer) = do_initialize(&sock_path).await;
+        wait_for_client_count(&count, 1).await;
+        drop(write_half);
         cancel.cancel();
     }
 

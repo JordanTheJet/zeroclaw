@@ -2772,16 +2772,7 @@ impl RpcDispatcher {
                     match tokio::time::timeout_at(deadline, transport.next_frame()).await {
                         Ok(frame) => frame,
                         Err(_) => {
-                            ::zeroclaw_log::record!(
-                                WARN,
-                                ::zeroclaw_log::Event::new(
-                                    module_path!(),
-                                    ::zeroclaw_log::Action::Note
-                                )
-                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                                .with_attrs(::serde_json::json!({"peer": self.peer_label})),
-                                "local RPC client did not initialize in time; closing its connection"
-                            );
+                            self.log_initialize_timeout();
                             return;
                         }
                     }
@@ -2795,11 +2786,38 @@ impl RpcDispatcher {
             if trimmed.is_empty() {
                 continue;
             }
-            self.process_line(trimmed).await;
+            match self.initialize_deadline {
+                // Until `initialize` succeeds the deadline also bounds
+                // handling the frame, so an authentication that is still
+                // running when it passes ends the connection instead of
+                // completing late. Nothing is registered before the
+                // authentication await, and teardown unregisters anything
+                // registered after it.
+                Some(deadline) if self.auth.is_none() => {
+                    if tokio::time::timeout_at(deadline, self.process_line(trimmed))
+                        .await
+                        .is_err()
+                    {
+                        self.log_initialize_timeout();
+                        return;
+                    }
+                }
+                _ => self.process_line(trimmed).await,
+            }
             if self.auth.is_some() {
                 self.initialize_deadline = None;
             }
         }
+    }
+
+    fn log_initialize_timeout(&self) {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({"peer": self.peer_label})),
+            "local RPC client did not initialize in time; closing its connection"
+        );
     }
 
     /// Own a transport until EOF or generation cancellation, then drain all

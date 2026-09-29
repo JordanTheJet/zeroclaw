@@ -322,6 +322,12 @@ pub struct RpcInboundAuth {
     /// publication carrying an older revision is refused, so a slow writer
     /// cannot reinstall superseded policy.
     accepted_revision: AtomicU64,
+    /// Test-only pause inside [`Self::authenticate`], where provider
+    /// verification awaits. Taken by the first authentication that reaches
+    /// it.
+    #[cfg(test)]
+    authenticate_pause:
+        std::sync::Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
 }
 
 impl RpcInboundAuth {
@@ -343,7 +349,22 @@ impl RpcInboundAuth {
             state: RwLock::new(Arc::new(state)),
             pairing,
             accepted_revision: AtomicU64::new(0),
+            #[cfg(test)]
+            authenticate_pause: std::sync::Mutex::new(None),
         })
+    }
+
+    /// Test-only: park the next authentication where provider verification
+    /// awaits. Returns `(arrived, release)`.
+    #[cfg(test)]
+    pub(crate) fn pause_next_authentication(
+        &self,
+    ) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+        let arrived = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        *self.authenticate_pause.lock().unwrap() =
+            Some((Arc::clone(&arrived), Arc::clone(&release)));
+        (arrived, release)
     }
 
     /// Test-only permissive layer: empty auth config, fresh pairing guard.
@@ -642,6 +663,14 @@ impl RpcInboundAuth {
         auth_token: Option<&str>,
         auth_provider: Option<&str>,
     ) -> Result<ConnectionAuth, AuthDenied> {
+        #[cfg(test)]
+        {
+            let pause = self.authenticate_pause.lock().unwrap().take();
+            if let Some((arrived, release)) = pause {
+                arrived.notify_one();
+                release.notified().await;
+            }
+        }
         let state = self.state();
         // The generation the provider is about to verify against. Provider
         // verification below may await an IdP round trip; a trusted config
