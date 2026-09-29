@@ -1912,7 +1912,7 @@ impl RpcDispatcher {
         let Some(auth) = self.auth.as_ref() else {
             return Err(rpc_err(AUTH_REQUIRED, "First call must be 'initialize'"));
         };
-        if auth.grants.admin && !auth.principal.is_authenticated() {
+        if self.is_shared_operator(&auth.grants) {
             return Ok(());
         }
         let denied = rpc_err(
@@ -2018,8 +2018,8 @@ impl RpcDispatcher {
     }
 
     /// Apply a principal's posture to an agent: narrow its tool surface to the
-    /// selector, and, for a principal without operator reach, disable nested
-    /// tools that cannot carry the principal through. A handler that
+    /// selector, and, for any principal but the shared operator, disable the
+    /// nested and scheduling tools that cannot carry the principal through. A handler that
     /// re-resolved its principal after waiting for admission passes the fresh
     /// grants here: the stamped copy is only as current as the last gate, and
     /// a prompt that queued before its principal was narrowed must execute
@@ -2041,14 +2041,29 @@ impl RpcDispatcher {
         // rehydration, and subsequent prompts.
         let narrowing = principal_tool_ceiling(grants);
         agent.narrow_to_principal_tools(narrowing.as_deref());
-        if !grants.admin
-            && !grants
-                .allowed_agents
-                .iter()
-                .any(|alias| alias.as_str() == zeroclaw_api::grants::WILDCARD)
-        {
+        // Nested tools (delegate, spawn_subagent, pipeline) and scheduling
+        // tools (cron_add, cron_update, cron_run, schedule) start work that
+        // runs without this connection, so nothing re-checks the principal
+        // before its effect: a job outlives its submitter's session, and a
+        // nested run can rebuild the scheduling tools. The rule is the one
+        // `admit_headless_agent_work` applies to the RPC cron methods. Only the
+        // shared operator keeps them; a named administrator, or a principal
+        // with wildcard tools and agents, does not, because its grants can be
+        // withdrawn while the work it started still runs.
+        if !self.is_shared_operator(grants) {
             agent.disable_principal_unaware_nested_tools();
         }
+    }
+
+    /// Whether this connection's principal, holding `grants`, is the shared
+    /// operator: the install's own principal, whose authority no grant
+    /// publication narrows. A named administrator is not.
+    fn is_shared_operator(&self, grants: &zeroclaw_api::grants::ResolvedGrants) -> bool {
+        grants.admin
+            && self
+                .auth
+                .as_ref()
+                .is_some_and(|auth| !auth.principal.is_authenticated())
     }
 
     /// Queued prompts must not execute with the transport-time grants clone.
@@ -17286,6 +17301,25 @@ mod tests {
                     .unwrap()
                     .delegation_policy = toml::from_str("mode = 'allow'").unwrap();
                 let (dispatcher, sessions) = make_acp_test_dispatcher(config);
+                // Positive control: with no principal applied, the agent's own
+                // configuration does provide the delegate.
+                dispatcher
+                    .handle_session_new_for_test(
+                        &json!({"agent_alias":"test-agent","session_id":"unbound-control"}),
+                    )
+                    .await
+                    .unwrap();
+                assert!(
+                    sessions
+                        .get_agent("unbound-control")
+                        .await
+                        .unwrap()
+                        .lock()
+                        .await
+                        .tool_names()
+                        .contains(&"delegate"),
+                    "positive control must actually have a delegate"
+                );
                 let dispatcher = bind_test_principal(dispatcher).await;
                 dispatcher
                     .handle_session_new_for_test(
@@ -17294,9 +17328,12 @@ mod tests {
                     .await
                     .unwrap();
                 let handle = sessions.get_agent("principal-delegate").await.unwrap();
+                // A named principal is not the shared operator, so even with
+                // wildcard tools and agents its session starts without nested
+                // delegation, whose work would outlive a withdrawal of its grants.
                 assert!(
-                    handle.lock().await.tool_names().contains(&"delegate"),
-                    "positive control must actually have a delegate"
+                    !handle.lock().await.tool_names().contains(&"delegate"),
+                    "a named wildcard principal gets no delegate"
                 );
                 if agent_only {
                     refresh_test_principal(&dispatcher, &["*"], &["test-agent"]);
@@ -37563,112 +37600,115 @@ mod tests {
         );
     }
 
-    /// The model-facing twins of the RPC agent-job gate. `cron_add`,
-    /// `cron_update`, `cron_run` and `schedule` store or run work that later
-    /// executes headless without the RPC principal's ceiling, so a constrained
-    /// session does not get them, even when its selector names them or a skill
-    /// wraps one. The operator's session keeps them.
-    #[tokio::test]
-    async fn constrained_session_loses_the_model_facing_cron_scheduling_tools() {
-        use std::collections::HashMap;
-        use zeroclaw_api::grants::{Resource, Verb};
+    /// Every model-facing way to start work that runs without the RPC
+    /// connection: the four scheduling tools, a skill wrapping `cron_add`, and
+    /// the pipeline, a nested route that can call `cron_add` itself.
+    const SCHEDULING_ROUTES: [&str; 6] = [
+        "cron_add",
+        "ops__add",
+        crate::tools::PipelineTool::NAME,
+        "cron_update",
+        "cron_run",
+        "schedule",
+    ];
 
-        let tmp = tempfile::TempDir::new().unwrap();
-        let mut config = p4_config(&tmp);
-        let names = [
-            "cron_add",
-            "ops__add",
-            "cron_update",
-            "cron_run",
-            "schedule",
-        ];
-        {
-            let profile = config
-                .permission_profiles
-                .get_mut("cron-alpha")
-                .expect("the roster profile exists");
-            profile.grants.insert(Resource::Tools, vec![Verb::Execute]);
-            profile.allowed_tools = names.map(String::from).to_vec();
-        }
-        let seeded = seed_cron_job(&config, "alpha", "seeded");
-        let ctx = enforcement_ctx(config.clone());
-        let (operator, _operator_rx) = local_operator(&ctx).await;
-        let (alice, _alice_rx) = roster_peer(&ctx, 4242).await;
-        let grants_of = |d: &RpcDispatcher| d.auth.as_ref().expect("bound").grants.clone();
-
+    /// An agent for `alpha` holding the real scheduling tools, as a session
+    /// would, with every route in [`SCHEDULING_ROUTES`].
+    fn agent_with_scheduling_routes(
+        config: &zeroclaw_config::schema::Config,
+        workspace: &std::path::Path,
+    ) -> crate::agent::agent::Agent {
         let shared = Arc::new(config.clone());
         let security = Arc::new(
-            zeroclaw_config::policy::SecurityPolicy::for_agent(&config, "alpha")
+            zeroclaw_config::policy::SecurityPolicy::for_agent(config, "alpha")
                 .expect("alpha's policy"),
         );
-        let agent_with_cron_tools = || {
-            let cron_add: Arc<dyn zeroclaw_api::tool::Tool> = Arc::new(
-                crate::tools::CronAddTool::new(Arc::clone(&shared), Arc::clone(&security), "alpha"),
-            );
-            let skill_tool = crate::skills::SkillTool {
-                name: "add".into(),
-                description: "schedule a job".into(),
-                kind: "builtin".into(),
-                command: String::new(),
-                args: Default::default(),
-                target: Some("cron_add".into()),
-                locked_args: Default::default(),
-                timeout_secs: None,
-            };
-            let wrapper = crate::tools::SkillBuiltinTool::new(
-                "ops",
-                &skill_tool,
-                Arc::clone(&cron_add),
-                HashMap::new(),
-            );
-            crate::agent::agent::Agent::builder()
-                .model_provider(Box::new(DummyModelProvider))
-                .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
-                    vec![
-                        Box::new(crate::tools::ArcToolRef(cron_add)),
-                        Box::new(wrapper),
-                        Box::new(crate::tools::CronUpdateTool::new(
-                            Arc::clone(&shared),
-                            Arc::clone(&security),
-                            "alpha",
-                        )),
-                        Box::new(crate::tools::CronRunTool::new(
-                            Arc::clone(&shared),
-                            Arc::clone(&security),
-                            "alpha",
-                        )),
-                        Box::new(crate::tools::ScheduleTool::new(
-                            Arc::clone(&security),
-                            config.clone(),
-                            "alpha",
-                        )),
-                    ],
-                ))
-                .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
-                .observer(Arc::new(crate::observability::noop::NoopObserver))
-                .tool_dispatcher(Box::new(crate::agent::dispatcher::NativeToolDispatcher))
-                .workspace_dir(tmp.path().to_path_buf())
-                .build()
-                .unwrap()
+        let cron_add: Arc<dyn zeroclaw_api::tool::Tool> = Arc::new(crate::tools::CronAddTool::new(
+            Arc::clone(&shared),
+            Arc::clone(&security),
+            "alpha",
+        ));
+        let skill_tool = crate::skills::SkillTool {
+            name: "add".into(),
+            description: "schedule a job".into(),
+            kind: "builtin".into(),
+            command: String::new(),
+            args: Default::default(),
+            target: Some("cron_add".into()),
+            locked_args: Default::default(),
+            timeout_secs: None,
         };
-        let agent_job = json!({
+        let wrapper = crate::tools::SkillBuiltinTool::new(
+            "ops",
+            &skill_tool,
+            Arc::clone(&cron_add),
+            std::collections::HashMap::new(),
+        );
+        let pipeline = crate::tools::PipelineTool::with_access_policy(
+            zeroclaw_config::schema::PipelineConfig::default(),
+            vec![Arc::clone(&cron_add)],
+            None,
+        );
+        crate::agent::agent::Agent::builder()
+            .model_provider(Box::new(DummyModelProvider))
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![
+                    Box::new(crate::tools::ArcToolRef(cron_add)),
+                    Box::new(wrapper),
+                    Box::new(pipeline),
+                    Box::new(crate::tools::CronUpdateTool::new(
+                        Arc::clone(&shared),
+                        Arc::clone(&security),
+                        "alpha",
+                    )),
+                    Box::new(crate::tools::CronRunTool::new(
+                        Arc::clone(&shared),
+                        Arc::clone(&security),
+                        "alpha",
+                    )),
+                    Box::new(crate::tools::ScheduleTool::new(
+                        Arc::clone(&security),
+                        config.clone(),
+                        "alpha",
+                    )),
+                ],
+            ))
+            .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
+            .observer(Arc::new(crate::observability::noop::NoopObserver))
+            .tool_dispatcher(Box::new(crate::agent::dispatcher::NativeToolDispatcher))
+            .workspace_dir(workspace.to_path_buf())
+            .build()
+            .unwrap()
+    }
+
+    /// An agent job for later that asks for `file_write`, tagged `marker`.
+    fn file_write_agent_job(marker: &str) -> Value {
+        json!({
             "schedule": {"kind": "after", "after_seconds": 3600},
             "job_type": "agent",
-            "prompt": "Use file_write to write marker.txt",
+            "prompt": format!("{marker}: use file_write to write marker.txt"),
             "allowed_tools": ["file_write"],
-        });
+        })
+    }
 
-        // A constrained principal whose selector names every one of them gets
-        // none, and a model call to any of them schedules or runs nothing.
-        let mut agent = agent_with_cron_tools();
-        alice.apply_principal_grants_to_agent(&grants_of(&alice), &mut agent);
-        assert!(agent.tool_names().is_empty(), "{:?}", agent.tool_names());
+    /// Have the model call every scheduling route, and require each to fail.
+    async fn assert_no_scheduling_route_runs(
+        agent: &crate::agent::agent::Agent,
+        seeded: &crate::cron::CronJob,
+        marker: &str,
+        who: &str,
+    ) {
+        let job = file_write_agent_job(marker);
         for (name, args) in [
-            ("cron_add", agent_job.clone()),
-            ("ops__add", agent_job.clone()),
+            ("cron_add", job.clone()),
+            ("ops__add", job.clone()),
+            (
+                crate::tools::PipelineTool::NAME,
+                json!({"steps": [{"tool": "cron_add", "args": job}]}),
+            ),
             (
                 "cron_update",
-                json!({"job_id": seeded.id, "patch": {"prompt": "Use file_write", "allowed_tools": ["file_write"]}}),
+                json!({"job_id": seeded.id, "patch": {"prompt": marker, "allowed_tools": ["file_write"]}}),
             ),
             ("cron_run", json!({"job_id": seeded.id})),
             (
@@ -37678,9 +37718,42 @@ mod tests {
         ] {
             assert!(
                 !agent.dispatch_tool_for_test(name, args).await.success,
-                "{name} must not run for a constrained principal"
+                "{name} must not run for a {who}"
             );
         }
+    }
+
+    /// The model-facing twins of the RPC agent-job gate. The scheduling tools,
+    /// and the nested routes that can reach them, start work that later
+    /// executes headless without the RPC principal's ceiling, so a constrained
+    /// session does not get them, even when its selector names them or a skill
+    /// wraps one. The operator's session keeps them.
+    #[tokio::test]
+    async fn constrained_session_loses_the_model_facing_cron_scheduling_tools() {
+        use zeroclaw_api::grants::{Resource, Verb};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = p4_config(&tmp);
+        {
+            let profile = config
+                .permission_profiles
+                .get_mut("cron-alpha")
+                .expect("the roster profile exists");
+            profile.grants.insert(Resource::Tools, vec![Verb::Execute]);
+            profile.allowed_tools = SCHEDULING_ROUTES.map(String::from).to_vec();
+        }
+        let seeded = seed_cron_job(&config, "alpha", "seeded");
+        let ctx = enforcement_ctx(config.clone());
+        let (operator, _operator_rx) = local_operator(&ctx).await;
+        let (alice, _alice_rx) = roster_peer(&ctx, 4242).await;
+        let grants_of = |d: &RpcDispatcher| d.auth.as_ref().expect("bound").grants.clone();
+
+        // A constrained principal whose selector names every route gets none,
+        // and a model call to any of them schedules or runs nothing.
+        let mut agent = agent_with_scheduling_routes(&config, tmp.path());
+        alice.apply_principal_grants_to_agent(&grants_of(&alice), &mut agent);
+        assert!(agent.tool_names().is_empty(), "{:?}", agent.tool_names());
+        assert_no_scheduling_route_runs(&agent, &seeded, "alice", "constrained principal").await;
         let jobs = crate::cron::list_jobs(&config).expect("store readable");
         assert_eq!(jobs.len(), 1, "nothing was scheduled: {jobs:?}");
         assert_eq!(jobs[0].prompt, seeded.prompt);
@@ -37693,12 +37766,126 @@ mod tests {
         );
 
         // Control: the operator's session keeps them, and they work.
-        let mut agent = agent_with_cron_tools();
+        let mut agent = agent_with_scheduling_routes(&config, tmp.path());
         operator.apply_principal_grants_to_agent(&grants_of(&operator), &mut agent);
-        assert_eq!(agent.tool_names(), names);
-        let added = agent.dispatch_tool_for_test("cron_add", agent_job).await;
+        assert_eq!(agent.tool_names(), SCHEDULING_ROUTES);
+        let added = agent
+            .dispatch_tool_for_test("cron_add", file_write_agent_job("operator"))
+            .await;
         assert!(added.success, "{}", added.output);
         assert_eq!(crate::cron::list_jobs(&config).unwrap().len(), 2);
+    }
+
+    /// A named administrator, and a named principal with wildcard tools and
+    /// agents, are unrestricted when they act but not afterwards: their grants
+    /// can be withdrawn while a job they stored waits to run, and nothing at
+    /// the run re-checks them. So, like the RPC `cron/*` gate, their sessions
+    /// get neither the scheduling tools nor the nested routes that could
+    /// rebuild them. The test withdraws both principals' grants after their
+    /// attempts, then stops where the scheduler takes effect, at the jobs it
+    /// would claim once due: only the operator's are there.
+    #[tokio::test]
+    async fn named_unrestricted_principals_leave_no_work_to_outlive_their_grants() {
+        use std::collections::HashMap;
+        use zeroclaw_api::grants::{Resource, Verb, WILDCARD};
+        use zeroclaw_config::schema::{PermissionProfileConfig, UserConfig};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = p4_config(&tmp);
+        config
+            .permission_profiles
+            .get_mut("cron-alpha")
+            .expect("the roster profile exists")
+            .admin = true;
+        config.permission_profiles.insert(
+            "wildcard".into(),
+            PermissionProfileConfig {
+                allowed_agents: vec![WILDCARD.into()],
+                allowed_tools: vec![WILDCARD.into()],
+                grants: HashMap::from([(Resource::Tools, vec![Verb::Execute])]),
+                ..PermissionProfileConfig::default()
+            },
+        );
+        config.users.insert(
+            "bob".into(),
+            UserConfig {
+                principal_id: None,
+                uid: Some(4243),
+                permission_profiles: vec!["wildcard".into()],
+            },
+        );
+        let seeded = seed_cron_job(&config, "alpha", "seeded");
+        let ctx = enforcement_ctx(config.clone());
+        let (operator, _operator_rx) = local_operator(&ctx).await;
+        let (alice, _alice_rx) = roster_peer(&ctx, 4242).await;
+        let (bob, _bob_rx) = roster_peer(&ctx, 4243).await;
+        let grants_of = |d: &RpcDispatcher| d.auth.as_ref().expect("bound").grants.clone();
+        assert!(grants_of(&alice).admin, "alice is a named administrator");
+        assert!(
+            principal_tool_ceiling(&grants_of(&bob)).is_none(),
+            "bob's selector does not narrow"
+        );
+
+        for (peer, marker, who) in [
+            (&alice, "alice", "named administrator"),
+            (&bob, "bob", "wildcard principal"),
+        ] {
+            let mut agent = agent_with_scheduling_routes(&config, tmp.path());
+            peer.apply_principal_grants_to_agent(&grants_of(peer), &mut agent);
+            assert!(
+                agent.tool_names().is_empty(),
+                "a {who} keeps no scheduling route: {:?}",
+                agent.tool_names()
+            );
+            assert_no_scheduling_route_runs(&agent, &seeded, marker, who).await;
+        }
+
+        // The operator's job, which the scheduler should reach.
+        let mut agent = agent_with_scheduling_routes(&config, tmp.path());
+        operator.apply_principal_grants_to_agent(&grants_of(&operator), &mut agent);
+        assert_eq!(agent.tool_names(), SCHEDULING_ROUTES);
+        let added = agent
+            .dispatch_tool_for_test("cron_add", file_write_agent_job("operator"))
+            .await;
+        assert!(added.success, "{}", added.output);
+
+        // Withdraw both named principals' grants while the store waits.
+        let mut withdrawn = config.clone();
+        withdrawn
+            .users
+            .retain(|name, _| name != "alice" && name != "bob");
+        ctx.auth
+            .refresh_from_config(&withdrawn)
+            .expect("the withdrawn roster is a valid refresh");
+
+        // The effect boundary: what the scheduler claims and runs once due.
+        let due = crate::cron::due_jobs(&config, chrono::Utc::now() + chrono::Duration::days(2))
+            .expect("store readable");
+        let prompts: Vec<_> = due.iter().map(|job| job.prompt.clone()).collect();
+        assert_eq!(
+            due.len(),
+            2,
+            "the seeded job and the operator's: {prompts:?}"
+        );
+        let seeded_now = due
+            .iter()
+            .find(|job| job.id == seeded.id)
+            .expect("the seeded job is due");
+        assert_eq!(seeded_now.prompt, seeded.prompt, "no principal rewrote it");
+        assert_eq!(seeded_now.allowed_tools, seeded.allowed_tools);
+        assert!(
+            due.iter().any(|job| job
+                .prompt
+                .as_deref()
+                .is_some_and(|p| p.starts_with("operator:"))),
+            "{prompts:?}"
+        );
+        assert!(
+            crate::cron::list_runs(&config, &seeded.id, 10)
+                .expect("runs readable")
+                .is_empty(),
+            "no principal ran it early"
+        );
     }
 
     /// The operator may submit agent jobs, but only with tools the agent's
