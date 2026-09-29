@@ -1231,6 +1231,57 @@ fn credential_is_live(
 /// The authority `auth` holds for `method` under the accepted policy in force
 /// now: a live credential, a fresh resolution, a generation that did not move
 /// underneath that resolution, and the method's coarse grant.
+/// What a prompt's final authorization needs, captured so it can be judged
+/// again at each effect after the last wait before it: the ACP checkpoint
+/// write and the Agent guard the execution task runs the turn under.
+struct PromptAdmission {
+    /// A handle on the prompting connection, for its binding and policy.
+    dispatcher: RpcDispatcher,
+    /// The session record the prompt was admitted against.
+    admitted: Option<crate::rpc::session::SessionRecord>,
+    agent_alias: String,
+    workspace: Option<String>,
+    has_environment: bool,
+}
+
+impl PromptAdmission {
+    /// The same admission, for a second effect.
+    fn duplicate(&self) -> Self {
+        Self {
+            dispatcher: self.dispatcher.spawn_handle(),
+            admitted: self.admitted.clone(),
+            agent_alias: self.agent_alias.clone(),
+            workspace: self.workspace.clone(),
+            has_environment: self.has_environment,
+        }
+    }
+
+    /// Re-resolve the caller's grants and take every prompt decision from
+    /// them. Returns the grants the effect runs under.
+    fn check(&self) -> Result<Option<zeroclaw_api::grants::ResolvedGrants>, JsonRpcError> {
+        let grants = self
+            .dispatcher
+            .recheck_authority_after_admission(Method::SessionPrompt)?;
+        self.dispatcher.authorize_admitted_prompt(
+            grants.as_ref(),
+            self.admitted.as_ref(),
+            &self.agent_alias,
+            self.workspace.as_deref(),
+            self.has_environment,
+        )?;
+        Ok(grants)
+    }
+
+    /// [`Self::check`], then apply the caller's tool ceiling to `agent`.
+    fn admit(&self, agent: &mut crate::agent::agent::Agent) -> Result<(), JsonRpcError> {
+        if let Some(grants) = self.check()? {
+            self.dispatcher
+                .apply_principal_grants_to_agent(&grants, agent);
+        }
+        Ok(())
+    }
+}
+
 fn current_authority(
     inbound: &crate::rpc::auth::RpcInboundAuth,
     auth: &crate::rpc::auth::ConnectionAuth,
@@ -5887,17 +5938,22 @@ impl RpcDispatcher {
             .await
             .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
 
-        // Every wait before the turn is behind this prompt now: the session
-        // queue, provider reconciliation, the provider-update lock and the
-        // Agent lock. Re-resolve under the Agent lock and take every decision
-        // from that one view: ownership, the agent and workspace binding, the
-        // forwarded environment, and the tool ceiling applied to the Agent. A
-        // check passed under grants from before a wait does not carry over,
-        // so an administrator demoted during reconciliation is held to
-        // ownership, and a principal narrowed then runs under the narrowed
-        // ceiling. The ceiling is applied on the canonical handle, not the
-        // pre-reconciliation one, so a replaced incarnation cannot carry a
-        // stale ceiling.
+        // Session bookkeeping first, so no wait of its own separates the checks
+        // below from the effects they gate.
+        self.ctx.sessions.touch(sid).await;
+
+        // The prompt's authority is judged again at each effect after its
+        // last wait, never carried over from grants resolved before one:
+        // here, under the Agent lock and before the durable row is marked
+        // running; on the thread that writes an ACP turn checkpoint; and on
+        // the Agent guard the execution task runs the turn under. Each takes
+        // every decision from one fresh resolution: ownership, the agent and
+        // workspace binding, the forwarded environment, and the tool ceiling
+        // applied to the Agent. So an administrator demoted during any wait is
+        // held to ownership, and a principal narrowed during one runs under
+        // the narrowed ceiling. The ceiling is applied on the canonical
+        // handle, not the pre-reconciliation one, so a replaced incarnation
+        // cannot carry a stale ceiling.
         //
         // Owner isolation replaced the parent's blanket refusal of a
         // constrained principal here: the session is stamped with its owner
@@ -5905,33 +5961,27 @@ impl RpcDispatcher {
         // principal's grants can only ever re-narrow ITS OWN session's Agent,
         // never a shared victim's. Direct unit handlers bind no connection
         // and keep their fixture semantics.
-        {
+        let admission = PromptAdmission {
+            dispatcher: self.spawn_handle(),
+            admitted: admitted.clone(),
+            agent_alias: agent_alias.clone(),
+            workspace: workspace.clone(),
+            has_environment,
+        };
+        // Attribution is read under the same guard, so the turn's span needs
+        // no further Agent lock before execution.
+        let (model_provider, model) = {
             let mut agent_guard = self.ctx.sessions.lock_agent_for_prompt(&agent).await;
-            let grants = match self.recheck_authority_after_admission(Method::SessionPrompt) {
-                Ok(grants) => grants,
-                Err(denied) => {
-                    drop(agent_guard);
-                    return Err(self
-                        .refuse_admitted_prompt(sid, req.client_turn_generation, denied)
-                        .await);
-                }
-            };
-            if let Err(denied) = self.authorize_admitted_prompt(
-                grants.as_ref(),
-                admitted.as_ref(),
-                &agent_alias,
-                workspace.as_deref(),
-                has_environment,
-            ) {
+            if let Err(denied) = admission.admit(&mut agent_guard) {
                 drop(agent_guard);
                 return Err(self
                     .refuse_admitted_prompt(sid, req.client_turn_generation, denied)
                     .await);
             }
-            if let Some(grants) = grants.as_ref() {
-                self.apply_principal_grants_to_agent(grants, &mut agent_guard);
-            }
-        }
+            let (_, model_provider, model) = agent_guard.attribution_fields();
+            (model_provider, model)
+        };
+        self.ctx.sessions.wait_test_prompt_execution_pause().await;
 
         // Mark the durable row running only after every preflight wait has
         // passed. The generation waits and the canonical Agent lookup above
@@ -5963,7 +6013,6 @@ impl RpcDispatcher {
             let _ = backend.set_session_state(&session_key, "running", Some(&turn_id));
         }
 
-        self.ctx.sessions.touch(sid).await;
         ::zeroclaw_log::record!(
             INFO,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Invoke)
@@ -5977,13 +6026,28 @@ impl RpcDispatcher {
             let session_id = sid.to_string();
             let turn_id_for_store = turn_id.clone();
             let initial = vec![ConversationMessage::Chat(ChatMessage::user(&prompt))];
+            let checkpoint_admission = admission.duplicate();
             let persisted = if let Some(store) = self.ctx.acp_session_store.clone() {
                 match tokio::task::spawn_blocking(move || {
-                    store.begin_turn_checkpoint(&session_id, &turn_id_for_store, &initial)
+                    // Judged on the thread that writes the checkpoint, with no
+                    // await before the write: the prompt enters the session's
+                    // journal only if its caller may still run it.
+                    if let Err(denied) = checkpoint_admission.check() {
+                        return Ok(Err(denied));
+                    }
+                    store
+                        .begin_turn_checkpoint(&session_id, &turn_id_for_store, &initial)
+                        .map(Ok)
                 })
                 .await
                 {
-                    Ok(result) => result.map_err(|error| error.to_string()),
+                    Ok(Ok(Ok(()))) => Ok(()),
+                    Ok(Ok(Err(denied))) => {
+                        return Err(self
+                            .refuse_admitted_prompt(sid, req.client_turn_generation, denied)
+                            .await);
+                    }
+                    Ok(Err(error)) => Err(error.to_string()),
                     Err(join) => Err(join.to_string()),
                 }
             } else {
@@ -6017,21 +6081,7 @@ impl RpcDispatcher {
         // (Master's precomputed `max_context_tokens` injection is
         // deliberately NOT carried over: the route-aware contract resolves
         // capacity from the serving provider/model at call time.)
-        let (agent_alias, model_provider, model) = {
-            let alias = self
-                .ctx
-                .sessions
-                .get_agent_alias(sid)
-                .await
-                .unwrap_or_default();
-            let (mp, m) = if let Some(agent) = self.ctx.sessions.get_agent(sid).await {
-                let (_, model_provider, model) = agent.lock().await.attribution_fields();
-                (model_provider, model)
-            } else {
-                (String::new(), String::new())
-            };
-            (alias, mp, m)
-        };
+        let agent_alias = agent_alias.clone();
 
         let rpc = self.rpc.clone();
         let sid_owned = sid.to_string();
@@ -6081,6 +6131,14 @@ impl RpcDispatcher {
             cost_context,
             self.connection_activity.clone(),
             Some(steering_rx),
+            Some(Box::new(move |agent: &mut crate::agent::agent::Agent| {
+                admission
+                    .admit(agent)
+                    .map_err(|denied| crate::rpc::turn::TurnRefusal {
+                        code: denied.code,
+                        message: denied.message,
+                    })
+            })),
             move |event| {
                 let rpc = rpc.clone();
                 let sid = sid_owned.clone();
@@ -6308,7 +6366,10 @@ impl RpcDispatcher {
                 // journal frontier and resurrect trimmed data.
             }
             crate::rpc::types::ChatMode::Chat => {
-                if let Some(ref backend) = self.ctx.session_backend
+                // A refused turn never touched the Agent, so there is nothing
+                // of it to persist.
+                if !matches!(outcome, Err(crate::rpc::turn::TurnError::Refused(_)))
+                    && let Some(ref backend) = self.ctx.session_backend
                     && let Some(agent) = self.ctx.sessions.get_agent(sid).await
                 {
                     let key = format!("rpc_{sid}");
@@ -6446,6 +6507,21 @@ impl RpcDispatcher {
                     },
                     usage,
                 ))
+            }
+            Err(crate::rpc::turn::TurnError::Refused(refusal)) => {
+                // The execution task refused the caller on the Agent guard
+                // before the turn started: nothing ran, so the session is idle
+                // again and the caller receives the refusal, with no totals.
+                if persist_session_state && let Some(ref backend) = self.ctx.session_backend {
+                    let _ = backend.set_session_state(&session_key, "idle", None);
+                }
+                Err(self
+                    .refuse_admitted_prompt(
+                        &req.session_id,
+                        req.client_turn_generation,
+                        rpc_err(refusal.code, refusal.message),
+                    )
+                    .await)
             }
             Err(e) => {
                 if persist_session_state && let Some(ref backend) = self.ctx.session_backend {
@@ -39574,6 +39650,8 @@ mod tests {
     /// What a recording session is built with beyond its owner and tools.
     #[derive(Default)]
     struct SessionExtras {
+        /// Build an ACP session (recorded in the ACP store) instead of Chat.
+        acp: bool,
         /// Memory that auto-saves each user turn; `None` is no memory.
         auto_save_memory: Option<Arc<dyn zeroclaw_api::memory_traits::Memory>>,
         /// A provisional binding the session's prompts wait on.
@@ -39609,17 +39687,31 @@ mod tests {
             .agent_alias("test-agent".to_string())
             .build()
             .expect("test agent should build");
+        let mode = if extras.acp {
+            ChatMode::Acp
+        } else {
+            ChatMode::Chat
+        };
         let session = crate::rpc::session::RpcSession::new(
             agent,
             "test-agent",
             workspace.to_str().unwrap(),
-            ChatMode::Chat,
+            mode,
         )
         .with_owner_principal(Some(owner.to_string()));
         let session = match extras.pending_generation {
             Some(pending) => session.with_pending_generation(pending),
             None => session,
         };
+        if extras.acp {
+            ctx.acp_session_store
+                .as_ref()
+                .expect("the persistence context has an ACP store")
+                .create_session(sid, "test-agent", workspace.to_str().unwrap(), Some(owner))
+                .unwrap();
+            ctx.sessions.insert(sid.to_string(), session).await.unwrap();
+            return handles;
+        }
         ctx.sessions.insert(sid.to_string(), session).await.unwrap();
         let key = format!("rpc_{sid}");
         zeroclaw_infra::session_backend::SessionBackend::set_session_agent_alias(
@@ -40352,12 +40444,16 @@ mod tests {
         PendingGeneration,
         ProviderUpdate,
         AgentLock,
+        /// After the handler's final check under the Agent lock: the
+        /// hand-off to the execution task and its own wait for the Agent.
+        Execution,
     }
 
-    const PROMPT_WAITS: [PromptWait; 3] = [
+    const PROMPT_WAITS: [PromptWait; 4] = [
         PromptWait::PendingGeneration,
         PromptWait::ProviderUpdate,
         PromptWait::AgentLock,
+        PromptWait::Execution,
     ];
 
     struct PromptAfterWait {
@@ -40400,6 +40496,7 @@ mod tests {
 
         let mut held_update = None;
         let mut held_agent = None;
+        let mut release_execution = None;
         let waiting = match wait {
             PromptWait::PendingGeneration => ctx.sessions.pending_generation_waiting(),
             PromptWait::ProviderUpdate => {
@@ -40411,6 +40508,11 @@ mod tests {
                 held_agent = Some(agent.lock_owned().await);
                 ctx.sessions.agent_lock_waiting()
             }
+            PromptWait::Execution => {
+                let (entered, release) = ctx.sessions.set_test_prompt_execution_pause();
+                release_execution = Some(release);
+                entered
+            }
         };
         let params = json!({"session_id": sid, "prompt": QUEUED_PROMPT});
         let task =
@@ -40418,6 +40520,15 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(5), waiting.notified())
             .await
             .unwrap_or_else(|_| panic!("the prompt parks at {wait:?}"));
+        if let Some(release) = release_execution {
+            // Past the final check: hold the Agent the execution task needs
+            // and let the prompt hand its turn over, so the change below lands
+            // before the task can acquire the Agent.
+            let agent = ctx.sessions.get_agent(sid).await.unwrap();
+            held_agent = Some(agent.lock_owned().await);
+            release.notify_one();
+            tokio::task::yield_now().await;
+        }
         republish_session_scoped(&ctx, change);
         if matches!(wait, PromptWait::PendingGeneration) {
             let generation = ctx.sessions.get_generation(sid).await.unwrap();
@@ -40585,5 +40696,74 @@ mod tests {
             "the narrowing test's tool is offered when nothing changes: {:?}",
             outcome.calls
         );
+    }
+
+    /// Alice, an administrator, prompts `owner`'s ACP session and is demoted
+    /// right after the prompt's final check under the Agent lock, before its
+    /// turn checkpoint is written. Returns the prompt's result, the model
+    /// calls, and whether the session's ACP transcript holds the prompt.
+    async fn acp_prompt_demoted_before_its_checkpoint(owner: &str) -> (RpcResult, usize, bool) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sid = "s-acp-prompt";
+        let (ctx, backend, workspace) = steering_ctx(&tmp, |profile| profile.admin = true);
+        let handles = install_recording_session_with(
+            &ctx,
+            &backend,
+            sid,
+            owner,
+            &workspace,
+            Vec::new(),
+            false,
+            SessionExtras {
+                acp: true,
+                ..SessionExtras::default()
+            },
+        )
+        .await;
+        let (alice, _alice_rx) = roster_peer(&ctx, 4242).await;
+        let (entered, release) = ctx.sessions.set_test_prompt_execution_pause();
+        let params = json!({"session_id": sid, "prompt": QUEUED_PROMPT});
+        let task =
+            zeroclaw_spawn::spawn!(async move { alice.handle_session_prompt(&params).await });
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+            .await
+            .expect("the prompt passes its final check");
+        republish_session_scoped(&ctx, demote_admin);
+        release.notify_one();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), task)
+            .await
+            .expect("the prompt finishes")
+            .expect("the prompt task does not panic");
+        let journal = ctx
+            .acp_session_store
+            .as_ref()
+            .unwrap()
+            .load_session(sid)
+            .unwrap()
+            .expect("the ACP session exists");
+        let holds_prompt = journal.messages.iter().any(|message| match message {
+            ConversationMessage::Chat(chat) => chat.content.contains(QUEUED_PROMPT),
+            _ => false,
+        });
+        (result, handles.calls().await.len(), holds_prompt)
+    }
+
+    #[tokio::test]
+    async fn an_administrator_demoted_before_an_acp_checkpoint_writes_nothing_to_another_principals_journal()
+     {
+        let (result, calls, holds_prompt) =
+            acp_prompt_demoted_before_its_checkpoint("user:bob").await;
+        assert_eq!(result.expect_err("refused").code, FORBIDDEN);
+        assert_eq!(calls, 0, "no model call");
+        assert!(!holds_prompt, "the prompt never enters Bob's ACP journal");
+    }
+
+    #[tokio::test]
+    async fn an_administrator_demoted_before_an_acp_checkpoint_still_runs_on_its_own_session() {
+        let (result, calls, holds_prompt) =
+            acp_prompt_demoted_before_its_checkpoint("user:alice").await;
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(calls, 1);
+        assert!(holds_prompt, "the journal records a prompt that runs");
     }
 }

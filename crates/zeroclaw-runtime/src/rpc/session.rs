@@ -297,6 +297,8 @@ pub struct SessionStore {
     /// prompt owns admission but before any fallible setup or provider work.
     #[cfg(test)]
     test_prompt_registration_pause: std::sync::Mutex<Option<PromptRegistrationPause>>,
+    #[cfg(test)]
+    test_prompt_execution_pause: std::sync::Mutex<Option<PromptRegistrationPause>>,
     /// Test-only pause right after `session/steer` or `session/abort` has
     /// taken its identity snapshot and before it acts. Fires once.
     #[cfg(test)]
@@ -374,6 +376,8 @@ impl SessionStore {
             test_gated_op_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
             test_prompt_registration_pause: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            test_prompt_execution_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
             test_control_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
@@ -1565,6 +1569,31 @@ impl SessionStore {
     #[cfg(not(test))]
     #[inline(always)]
     pub(crate) async fn wait_test_prompt_registration_pause(&self) {}
+
+    /// Park a prompt once, right after its final authorization under the
+    /// Agent lock and before any effect it gates: the running state, an ACP
+    /// turn checkpoint, and the hand-off to the execution task.
+    #[cfg(test)]
+    pub(crate) async fn wait_test_prompt_execution_pause(&self) {
+        let pause = self.test_prompt_execution_pause.lock().unwrap().take();
+        if let Some((entered, release)) = pause {
+            entered.notify_one();
+            release.notified().await;
+        }
+    }
+
+    #[cfg(not(test))]
+    #[inline(always)]
+    pub(crate) async fn wait_test_prompt_execution_pause(&self) {}
+
+    #[cfg(test)]
+    pub(crate) fn set_test_prompt_execution_pause(&self) -> PromptRegistrationPause {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        *self.test_prompt_execution_pause.lock().unwrap() =
+            Some((Arc::clone(&entered), Arc::clone(&release)));
+        (entered, release)
+    }
 
     #[cfg(test)]
     pub(crate) fn set_test_prompt_registration_pause(&self) -> PromptRegistrationPause {

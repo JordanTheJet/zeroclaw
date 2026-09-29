@@ -32,7 +32,30 @@ pub enum TurnError {
         diagnostic: String,
         user_message: String,
     },
+    /// The turn's caller was refused on the Agent guard the turn would have
+    /// run under, so the turn never started.
+    Refused(TurnRefusal),
 }
+
+/// Why a turn's caller may not run it, as the JSON-RPC error it receives.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnRefusal {
+    pub code: i32,
+    pub message: String,
+}
+
+impl std::fmt::Display for TurnRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for TurnRefusal {}
+
+/// Judges a turn's caller on the Agent guard the turn runs under, after the
+/// last wait before the turn, and applies the caller's tool posture to that
+/// Agent. A refusal stops the turn before it touches the Agent.
+pub type TurnAdmission = Box<dyn FnOnce(&mut Agent) -> Result<(), TurnRefusal> + Send>;
 
 impl std::fmt::Display for TurnError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -42,6 +65,7 @@ impl std::fmt::Display for TurnError {
             Self::TerminalCompletion { diagnostic, .. } => {
                 write!(f, "Agent turn failed: {diagnostic}")
             }
+            Self::Refused(refusal) => write!(f, "Turn refused: {refusal}"),
         }
     }
 }
@@ -54,7 +78,7 @@ impl TurnError {
     pub fn user_message(&self) -> Option<&str> {
         match self {
             Self::TerminalCompletion { user_message, .. } => Some(user_message),
-            Self::Panicked(_) | Self::AgentError(_) => None,
+            Self::Panicked(_) | Self::AgentError(_) | Self::Refused(_) => None,
         }
     }
 }
@@ -78,6 +102,7 @@ pub async fn execute_turn<F, Fut>(
     cost_context: Option<ToolLoopCostTrackingContext>,
     connection_activity: Option<crate::rpc::ConnectionActivity>,
     steering_rx: Option<mpsc::Receiver<crate::agent::SteeringInput>>,
+    admission: Option<TurnAdmission>,
     on_event: F,
 ) -> Result<TurnOutcome, TurnError>
 where
@@ -96,6 +121,17 @@ where
         let _connection_activity = connection_activity;
         let mut steering_rx = steering_rx;
         let mut guard = agent.lock().await;
+        // Judged on this guard, with no await before the turn starts under
+        // it: every earlier check predates at least this lock wait.
+        if let Some(admit) = admission
+            && let Err(refusal) = admit(&mut guard)
+        {
+            return Err(StreamedTurnError {
+                error: anyhow::Error::new(refusal),
+                committed_response: String::new(),
+                new_messages: Vec::new(),
+            });
+        }
         let sk = attribution.session_key.clone();
         crate::agent::loop_::scope_session_key(attribution.session_key, async move {
             use ::zeroclaw_log::Instrument as _;
@@ -325,6 +361,10 @@ fn outcome_from_task_result(
             messages: new_messages,
         }),
         Err(StreamedTurnError { error, .. }) => {
+            let error = match error.downcast::<TurnRefusal>() {
+                Ok(refusal) => return Err(TurnError::Refused(refusal)),
+                Err(error) => error,
+            };
             if let Some(user_message) =
                 crate::agent::terminal_completion_error_message(&error, None)
             {
@@ -1244,6 +1284,7 @@ mod tests {
             Some(cost_context),
             None,
             None,
+            None,
             noop,
         )
         .await
@@ -1396,6 +1437,7 @@ mod tests {
                 model: "test-model".into(),
                 channel: "rpc",
             },
+            None,
             None,
             None,
             None,
@@ -1570,6 +1612,7 @@ mod tests {
                     model: "matrix-model".into(),
                     channel: "rpc",
                 },
+                None,
                 None,
                 None,
                 None,
@@ -1835,6 +1878,7 @@ mod tests {
                 model: "w1-model".into(),
                 channel: "rpc",
             },
+            None,
             None,
             None,
             None,
@@ -2115,6 +2159,7 @@ mod tests {
                 },
                 None,
                 Some(activity),
+                None,
                 None,
                 noop,
             )
