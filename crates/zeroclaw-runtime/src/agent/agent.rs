@@ -2030,6 +2030,45 @@ impl Agent {
         self.disable_principal_unaware_nested_tools();
     }
 
+    /// Admit drained steering messages: each one's sender is judged now. A
+    /// refused message is dropped and logged; an admitted one first applies
+    /// its sender's current tool posture, so the round it steers runs with no
+    /// more than that sender holds. Returns the admitted texts in order.
+    fn admit_steering(
+        &mut self,
+        inputs: Vec<crate::agent::SteeringInput>,
+        turn_id: &str,
+    ) -> Vec<String> {
+        let mut admitted = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            match input.admit() {
+                crate::agent::SteeringAdmission::Refused(reason) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_category(::zeroclaw_log::EventCategory::Agent)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "turn_id": turn_id,
+                                "reason": reason,
+                            })),
+                        "steering message dropped: its sender may no longer steer this turn"
+                    );
+                }
+                crate::agent::SteeringAdmission::Admitted(posture) => {
+                    if posture.tool_ceiling.is_some() {
+                        self.narrow_to_principal_tools(posture.tool_ceiling.as_deref());
+                    }
+                    if posture.disable_principal_unaware_nested_tools {
+                        self.disable_principal_unaware_nested_tools();
+                    }
+                    admitted.push(input.into_text());
+                }
+            }
+        }
+        admitted
+    }
+
     /// Nested builders do not yet carry the RPC principal's two selectors.
     /// Refuse only those entry points, not the correctly narrowed parent turn.
     pub(crate) fn disable_principal_unaware_nested_tools(&mut self) {
@@ -4017,7 +4056,7 @@ impl Agent {
         user_message: &str,
         event_tx: tokio::sync::mpsc::Sender<TurnEvent>,
         cancel_token: Option<tokio_util::sync::CancellationToken>,
-        mut steering_rx: Option<&mut tokio::sync::mpsc::Receiver<String>>,
+        mut steering_rx: Option<&mut tokio::sync::mpsc::Receiver<crate::agent::SteeringInput>>,
     ) -> std::result::Result<StreamedTurnSuccess, StreamedTurnError> {
         // See `Agent::turn` for the rationale. Same guard: blank input would
         // push a timestamp-only user message into history and the model would
@@ -4243,6 +4282,9 @@ impl Agent {
         // wins.
         let served_route_sink: crate::agent::loop_::ServedRouteSink =
             std::sync::Arc::new(std::sync::Mutex::new(None));
+        // Steering admitted at the end of a round, consumed at the top of the
+        // next.
+        let mut admitted_steering: Vec<String> = Vec::new();
         for round in 0..self.config.resolved.max_tool_iterations {
             // Early exit if the caller cancelled this turn (e.g. user abort)
             if cancel_token
@@ -4277,7 +4319,15 @@ impl Agent {
 
             // Steering drain: each accepted mid-turn message becomes its own
             // enriched user turn in both transcripts before the next round.
-            for steering_message in crate::agent::loop_::drain_steering_messages(&mut steering_rx) {
+            // Messages admitted at the end of the previous round (with no
+            // await since) come first; anything that arrived after that is
+            // admitted now, as it is consumed.
+            let mut steering_messages = std::mem::take(&mut admitted_steering);
+            steering_messages.extend(self.admit_steering(
+                crate::agent::loop_::drain_steering_messages(&mut steering_rx),
+                &turn_id,
+            ));
+            for steering_message in steering_messages {
                 // Mirror the enrichment logic from append_streamed_user_message_to_history
                 // but route through round_added instead of self.history/new_msgs.
                 if self.auto_save {
@@ -4534,8 +4584,16 @@ impl Agent {
                     let tree_budget_finalized = execution_tree_budget
                         .as_ref()
                         .is_some_and(|budget| budget.remaining() == 0);
-                    let has_more_steering =
-                        steering_rx.as_deref_mut().is_some_and(|rx| !rx.is_empty());
+                    // Pending steering is admitted here, where it decides
+                    // whether another round runs: a message whose sender may
+                    // no longer steer is dropped and cannot start one. The
+                    // admitted texts are consumed at the top of the next
+                    // round with no await in between.
+                    admitted_steering.extend(self.admit_steering(
+                        crate::agent::loop_::drain_steering_messages(&mut steering_rx),
+                        &turn_id,
+                    ));
+                    let has_more_steering = !admitted_steering.is_empty();
                     if has_more_steering && !tree_budget_finalized {
                         continue;
                     }
@@ -13401,7 +13459,8 @@ mod tests {
             .expect("agent builder should succeed with valid config");
 
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
-        let (steering_tx, mut steering_rx) = tokio::sync::mpsc::channel::<String>(4);
+        let (steering_tx, mut steering_rx) =
+            tokio::sync::mpsc::channel::<crate::agent::SteeringInput>(4);
         let handle = zeroclaw_spawn::spawn!(async move {
             agent
                 .turn_streamed_with_steering_state("first", event_tx, None, Some(&mut steering_rx))
@@ -13529,7 +13588,8 @@ mod tests {
             .expect("agent builder should succeed with valid config");
 
         let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
-        let (steering_tx, mut steering_rx) = tokio::sync::mpsc::channel::<String>(4);
+        let (steering_tx, mut steering_rx) =
+            tokio::sync::mpsc::channel::<crate::agent::SteeringInput>(4);
         let handle = zeroclaw_spawn::spawn!(async move {
             agent
                 .turn_streamed_with_steering_state("first", event_tx, None, Some(&mut steering_rx))
@@ -13591,7 +13651,8 @@ mod tests {
             .expect("agent builder should succeed with valid config");
 
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
-        let (steering_tx, mut steering_rx) = tokio::sync::mpsc::channel::<String>(4);
+        let (steering_tx, mut steering_rx) =
+            tokio::sync::mpsc::channel::<crate::agent::SteeringInput>(4);
         let handle = zeroclaw_spawn::spawn!(async move {
             agent
                 .turn_streamed_with_steering_state("first", event_tx, None, Some(&mut steering_rx))

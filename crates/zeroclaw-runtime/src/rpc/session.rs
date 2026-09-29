@@ -67,7 +67,7 @@ impl CancelCause {
     }
 }
 
-/// Result of [`SessionStore::steer_session`].
+/// Result of [`SessionStore::steer_session_for_generation`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SteerOutcome {
     Accepted,
@@ -273,7 +273,9 @@ pub struct SessionStore {
     /// Steering sender of each session's running turn, keyed by the same
     /// generation as its cancel token so the turn's exit removes exactly its
     /// own entry.
-    steering: std::sync::Mutex<HashMap<String, (u64, tokio::sync::mpsc::Sender<String>)>>,
+    steering: std::sync::Mutex<
+        HashMap<String, (u64, tokio::sync::mpsc::Sender<crate::agent::SteeringInput>)>,
+    >,
     max_sessions: usize,
     pub session_queue: Arc<SessionActorQueue>,
     /// Monotonic counter incremented on every `insert` that installs or
@@ -291,6 +293,10 @@ pub struct SessionStore {
     /// prompt owns admission but before any fallible setup or provider work.
     #[cfg(test)]
     test_prompt_registration_pause: std::sync::Mutex<Option<PromptRegistrationPause>>,
+    /// Test-only pause right after `session/steer` or `session/abort` has
+    /// taken its identity snapshot and before it acts. Fires once.
+    #[cfg(test)]
+    test_control_pause: std::sync::Mutex<Option<PromptRegistrationPause>>,
     #[cfg(test)]
     test_prompt_rehydration_pause: std::sync::Mutex<Option<PromptRehydrationPause>>,
     /// Test-only pause after a removal handler captures the target generation
@@ -360,6 +366,8 @@ impl SessionStore {
             test_gated_op_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
             test_prompt_registration_pause: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            test_control_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
             test_prompt_rehydration_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
@@ -1579,6 +1587,28 @@ impl SessionStore {
     #[inline(always)]
     pub(crate) fn notify_test_removal_signal_attempted(&self) {}
 
+    #[cfg(test)]
+    pub(crate) async fn wait_test_control_pause(&self) {
+        let Some((entered, release)) = self.test_control_pause.lock().unwrap().take() else {
+            return;
+        };
+        entered.notify_one();
+        release.notified().await;
+    }
+
+    #[cfg(not(test))]
+    #[inline(always)]
+    pub(crate) async fn wait_test_control_pause(&self) {}
+
+    #[cfg(test)]
+    pub(crate) fn set_test_control_pause(&self) -> PromptRegistrationPause {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        *self.test_control_pause.lock().unwrap() =
+            Some((Arc::clone(&entered), Arc::clone(&release)));
+        (entered, release)
+    }
+
     pub fn remove_cancel_token(&self, id: &str, generation: u64) {
         {
             let mut tokens = self.cancel_tokens.lock().unwrap_or_else(|e| e.into_inner());
@@ -1609,6 +1639,13 @@ impl SessionStore {
     /// [`Self::cancel_session`] it is not tied to the owning client.
     pub fn abort_session(&self, id: &str) -> bool {
         self.signal_cancellation(id, CancelCause::OperatorAbort)
+    }
+
+    /// [`Self::abort_session`] bound to the live session incarnation the
+    /// caller was authorized against: a turn belonging to any other
+    /// incarnation under the same id (a same-id successor) is left running.
+    pub fn abort_session_for_generation(&self, id: &str, session_generation: Option<u64>) -> bool {
+        self.signal_cancellation_for_generation(id, session_generation, CancelCause::OperatorAbort)
     }
 
     /// Signal an in-flight turn before a close/delete handler waits for the
@@ -1686,7 +1723,7 @@ impl SessionStore {
         &self,
         id: &str,
         generation: u64,
-        sender: tokio::sync::mpsc::Sender<String>,
+        sender: tokio::sync::mpsc::Sender<crate::agent::SteeringInput>,
     ) {
         self.steering
             .lock()
@@ -1694,18 +1731,37 @@ impl SessionStore {
             .insert(id.to_string(), (generation, sender));
     }
 
-    /// Queue a steering message for the session's running turn.
-    pub fn steer_session(&self, id: &str, content: String) -> SteerOutcome {
-        let sender = self
-            .steering
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(id)
-            .map(|(_, sender)| sender.clone());
-        let Some(sender) = sender else {
+    /// Queue a steering message for the session's running turn, but only if
+    /// that turn belongs to the live session incarnation the caller was
+    /// authorized against. The turn's registration (which records the
+    /// incarnation it runs in) and its steering sender are read and the
+    /// message is queued in one critical section, so a same-id successor that
+    /// replaced the authorized incarnation never receives it.
+    pub fn steer_session_for_generation(
+        &self,
+        id: &str,
+        session_generation: Option<u64>,
+        input: crate::agent::SteeringInput,
+    ) -> SteerOutcome {
+        let Some(session_generation) = session_generation else {
             return SteerOutcome::NoActiveTurn;
         };
-        match sender.try_send(content) {
+        // Lock order: cancel tokens, then steering (the only nesting).
+        let tokens = self.cancel_tokens.lock().unwrap_or_else(|e| e.into_inner());
+        let Some((turn_generation, _, _)) = tokens
+            .get(id)
+            .filter(|(_, registered, _)| *registered == Some(session_generation))
+        else {
+            return SteerOutcome::NoActiveTurn;
+        };
+        let steering = self.steering.lock().unwrap_or_else(|e| e.into_inner());
+        let Some((_, sender)) = steering
+            .get(id)
+            .filter(|(generation, _)| generation == turn_generation)
+        else {
+            return SteerOutcome::NoActiveTurn;
+        };
+        match sender.try_send(input) {
             Ok(()) => SteerOutcome::Accepted,
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => SteerOutcome::QueueFull,
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => SteerOutcome::NoActiveTurn,

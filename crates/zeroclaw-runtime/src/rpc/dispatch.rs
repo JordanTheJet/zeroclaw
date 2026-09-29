@@ -5591,7 +5591,8 @@ impl RpcDispatcher {
         // RAII handle removes this exact generation on every exit path.
         // Steering shares that generation, so the same exit that unregisters
         // the token closes this turn to steering.
-        let (steering_tx, steering_rx) = tokio::sync::mpsc::channel::<String>(32);
+        let (steering_tx, steering_rx) =
+            tokio::sync::mpsc::channel::<crate::agent::SteeringInput>(32);
         self.ctx
             .sessions
             .register_steering(sid, cancel_registration.generation(), steering_tx);
@@ -5692,7 +5693,8 @@ impl RpcDispatcher {
         // The queue wait was unbounded: the incarnation authorized before it
         // may have been replaced under the same id. Bind this prompt to the
         // exact record present now, under the permit, or refuse it.
-        self.revalidate_admitted_session(sid, authorized.as_ref())
+        let admitted = self
+            .revalidate_admitted_session(sid, authorized.as_ref())
             .await?;
         // Admission can wait behind an active turn for as long as that turn
         // runs, and the grants resolved before the lookup predate that wait.
@@ -5706,6 +5708,16 @@ impl RpcDispatcher {
                     .await);
             }
         };
+        // `revalidate_admitted_session` judged ownership by the scope stamped
+        // on this connection before the wait. An administrator demoted while
+        // queued would still pass it, so hold the prompt to the admitted
+        // record's owner under the grants just resolved, before the Agent,
+        // the transcript, or the turn's totals are touched.
+        if let Err(denied) = self.require_ownership_under(grants.as_ref(), admitted.as_ref()) {
+            return Err(self
+                .refuse_admitted_prompt(sid, req.client_turn_generation, denied)
+                .await);
+        }
 
         // Session/new authorizes a binding only when it creates or reattaches
         // a session. Reused and rehydrated sessions enter through
@@ -6846,13 +6858,33 @@ impl RpcDispatcher {
                 "session/steer requires a non-empty `content`",
             ));
         }
-        self.authorize_session_owner(&req.session_id, Method::SessionSteer)
+        let record = self
+            .authorize_session_owner(&req.session_id, Method::SessionSteer)
             .await?;
-        match self
-            .ctx
-            .sessions
-            .steer_session(&req.session_id, req.content)
+        self.ctx.sessions.wait_test_control_pause().await;
+        // The ownership lookup awaited, so decide again on what holds now,
+        // and bind the steer to the incarnation that was authorized: the
+        // store queues it only if the running turn belongs to that
+        // incarnation. The same check travels with the message and is run
+        // again when the agent consumes it.
+        let session_generation = record.as_ref().and_then(|rec| rec.live_generation);
+        let input = match self
+            .steering_admission(&req.session_id, record.as_ref())
+            .await
         {
+            Some(admit) => {
+                if let crate::agent::SteeringAdmission::Refused(reason) = admit() {
+                    return Err(rpc_err(FORBIDDEN, reason));
+                }
+                crate::agent::SteeringInput::with_admission(req.content, admit)
+            }
+            None => crate::agent::SteeringInput::new(req.content),
+        };
+        match self.ctx.sessions.steer_session_for_generation(
+            &req.session_id,
+            session_generation,
+            input,
+        ) {
             crate::rpc::session::SteerOutcome::Accepted => to_result(SessionSteerResult {
                 session_id: req.session_id,
                 accepted: true,
@@ -6875,9 +6907,21 @@ impl RpcDispatcher {
     /// only its own sessions.
     async fn handle_session_abort(&self, params: &Value) -> RpcResult {
         let req: SessionIdParams = parse_params(params)?;
-        self.authorize_session_owner(&req.session_id, Method::SessionAbort)
+        let record = self
+            .authorize_session_owner(&req.session_id, Method::SessionAbort)
             .await?;
-        if !self.ctx.sessions.abort_session(&req.session_id) {
+        self.ctx.sessions.wait_test_control_pause().await;
+        // The ownership lookup awaited: re-resolve the caller now, and cancel
+        // only a turn of the incarnation that was authorized, never a same-id
+        // successor.
+        let grants = self.recheck_authority_after_admission(Method::SessionAbort)?;
+        self.require_ownership_under(grants.as_ref(), record.as_ref())?;
+        let session_generation = record.as_ref().and_then(|rec| rec.live_generation);
+        if !self
+            .ctx
+            .sessions
+            .abort_session_for_generation(&req.session_id, session_generation)
+        {
             return Err(rpc_err(
                 SESSION_NOT_FOUND,
                 "No active turn for this session",
@@ -6902,6 +6946,88 @@ impl RpcDispatcher {
             session_id: req.session_id,
             cancelled: true,
         })
+    }
+
+    /// Hold a caller to a session's ownership under `grants`, freshly resolved
+    /// after a wait, rather than under the scope stamped on the connection: a
+    /// principal that lost administrator scope while it waited is held to the
+    /// owner of the exact record it was authorized against. The unauthenticated
+    /// shared operator and administrators pass, as `scoped_principal_id` has
+    /// them pass. `None` grants (an unbound dispatcher) pass.
+    fn require_ownership_under(
+        &self,
+        grants: Option<&zeroclaw_api::grants::ResolvedGrants>,
+        record: Option<&crate::rpc::session::SessionRecord>,
+    ) -> Result<(), JsonRpcError> {
+        if let Some(grants) = grants
+            && !grants.admin
+            && let Some(me) = self.owner_principal_id()
+            && record.and_then(|rec| rec.owner.as_deref()) != Some(me.as_str())
+        {
+            return Err(rpc_err(
+                FORBIDDEN,
+                "Session not found or not owned by this principal",
+            ));
+        }
+        Ok(())
+    }
+
+    /// The authority check a steering message carries into the running
+    /// turn, for a bound connection (`None` for an unbound dispatcher). It
+    /// re-resolves the sender each time it runs: credential and
+    /// `sessions:execute` (`current_authority`), ownership of the authorized
+    /// incarnation for a principal that is not admin, and entitlement to the
+    /// session's agent. An admitted sender's current tool ceiling is handed
+    /// back for the agent to apply before the steered round, as a new prompt
+    /// applies it.
+    async fn steering_admission(
+        &self,
+        session_id: &str,
+        record: Option<&crate::rpc::session::SessionRecord>,
+    ) -> Option<crate::agent::SteeringAdmit> {
+        let binding = self.auth.clone()?;
+        let inbound = Arc::clone(&self.ctx.auth);
+        let owner = record.and_then(|rec| rec.owner.clone());
+        let agent_alias = self
+            .ctx
+            .sessions
+            .get_agent_alias(session_id)
+            .await
+            .unwrap_or_default();
+        Some(Box::new(move || {
+            use crate::agent::{SteeringAdmission, SteeringPosture};
+            let refuse = |message: String| {
+                let denied = crate::rpc::auth::AuthDenied::forbidden(message.clone());
+                audit_denial(Some(&binding), Method::SessionSteer, &denied);
+                SteeringAdmission::Refused(message)
+            };
+            let grants = match current_authority(&inbound, &binding, Method::SessionSteer) {
+                Ok(grants) => grants,
+                Err(denied) => {
+                    audit_denial(Some(&binding), Method::SessionSteer, &denied);
+                    return SteeringAdmission::Refused(denied.message);
+                }
+            };
+            if !grants.admin
+                && binding.principal.is_authenticated()
+                && owner.as_deref() != Some(binding.principal.id.as_str())
+            {
+                return refuse("Session not found or not owned by this principal".into());
+            }
+            if !grants.may_use_agent(&agent_alias) {
+                return refuse(format!(
+                    "Principal is not entitled to agent {agent_alias:?}"
+                ));
+            }
+            SteeringAdmission::Admitted(SteeringPosture {
+                tool_ceiling: principal_tool_ceiling(&grants),
+                disable_principal_unaware_nested_tools: !grants.admin
+                    && !grants
+                        .allowed_agents
+                        .iter()
+                        .any(|alias| alias.as_str() == zeroclaw_api::grants::WILDCARD),
+            })
+        }))
     }
 
     /// The durable chat key a rename writes, from a resolved session record.
@@ -6994,16 +7120,7 @@ impl RpcDispatcher {
         // principal that lost administrator scope while it waited is held to
         // ownership again.
         let grants = self.recheck_authority_after_admission(Method::SessionAppend)?;
-        if let Some(grants) = grants.as_ref()
-            && !grants.admin
-            && let Some(me) = self.owner_principal_id()
-            && admitted.as_ref().and_then(|rec| rec.owner.as_deref()) != Some(me.as_str())
-        {
-            return Err(rpc_err(
-                FORBIDDEN,
-                "Session not found or not owned by this principal",
-            ));
-        }
+        self.require_ownership_under(grants.as_ref(), admitted.as_ref())?;
         let key = Self::rpc_chat_writer_key(sid, admitted)?;
         let message = zeroclaw_providers::ChatMessage::assistant(&req.content);
         backend.append(&key, &message).map_err(|e| {
@@ -39272,6 +39389,562 @@ mod tests {
         assert!(
             ctx.sessions.get_agent("s-bobs").await.is_some(),
             "run-once must not touch a session it did not create"
+        );
+    }
+
+    // ── Steering authority, control incarnation, queued prompt ownership ─
+
+    /// One model call as the provider saw it: the joined message text and
+    /// the names of the tools it was offered.
+    type RecordedCall = (String, Vec<String>);
+
+    /// Provider whose first call parks until released (when gated) and whose
+    /// every call records its messages and offered tools.
+    struct RecordingTurnProvider {
+        started: tokio::sync::mpsc::UnboundedSender<()>,
+        release: tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+        calls: Arc<tokio::sync::Mutex<Vec<RecordedCall>>>,
+    }
+
+    #[async_trait]
+    impl zeroclaw_api::model_provider::ModelProvider for RecordingTurnProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("ok".to_string())
+        }
+
+        fn supports_native_tools(&self) -> bool {
+            true
+        }
+
+        async fn chat(
+            &self,
+            request: zeroclaw_providers::ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<zeroclaw_providers::ChatResponse> {
+            let text = request
+                .messages
+                .iter()
+                .map(|m| m.content.clone())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let tools = request
+                .tools
+                .unwrap_or_default()
+                .iter()
+                .map(|spec| spec.name.clone())
+                .collect();
+            self.calls.lock().await.push((text, tools));
+            let _ = self.started.send(());
+            let gate = self.release.lock().await.take();
+            if let Some(gate) = gate {
+                let _ = gate.await;
+            }
+            Ok(zeroclaw_providers::ChatResponse {
+                text: Some("steered reply".to_string()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    impl zeroclaw_api::attribution::Attributable for RecordingTurnProvider {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Provider(
+                zeroclaw_api::attribution::ProviderKind::Model(
+                    zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "recording-provider"
+        }
+    }
+
+    /// A tool the steered round's posture can remove.
+    struct ProbeTool;
+
+    #[async_trait]
+    impl zeroclaw_api::tool::Tool for ProbeTool {
+        fn name(&self) -> &str {
+            "probe"
+        }
+        fn description(&self) -> &str {
+            "a tool the tests look for in a model request"
+        }
+        fn parameters_schema(&self) -> Value {
+            json!({"type": "object"})
+        }
+        async fn execute(&self, _args: Value) -> anyhow::Result<crate::tools::ToolResult> {
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: "probed".into(),
+                error: None,
+            })
+        }
+    }
+
+    zeroclaw_api::mock_tool_attribution!(ProbeTool);
+
+    struct RecordingHandles {
+        started: tokio::sync::mpsc::UnboundedReceiver<()>,
+        release: Option<tokio::sync::oneshot::Sender<()>>,
+        calls: Arc<tokio::sync::Mutex<Vec<RecordedCall>>>,
+    }
+
+    impl RecordingHandles {
+        async fn await_start(&mut self) {
+            tokio::time::timeout(std::time::Duration::from_secs(10), self.started.recv())
+                .await
+                .expect("the turn must reach the provider")
+                .expect("the provider stays alive");
+        }
+
+        fn release(&mut self) {
+            if let Some(release) = self.release.take() {
+                let _ = release.send(());
+            }
+        }
+
+        async fn calls(&self) -> Vec<RecordedCall> {
+            self.calls.lock().await.clone()
+        }
+    }
+
+    fn recording_provider(gated: bool) -> (RecordingTurnProvider, RecordingHandles) {
+        let (started_tx, started) = tokio::sync::mpsc::unbounded_channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let calls = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        (
+            RecordingTurnProvider {
+                started: started_tx,
+                release: tokio::sync::Mutex::new(gated.then_some(release_rx)),
+                calls: Arc::clone(&calls),
+            },
+            RecordingHandles {
+                started,
+                release: gated.then_some(release_tx),
+                calls,
+            },
+        )
+    }
+
+    /// Install a live chat session `sid` owned by `owner`, built with
+    /// `tools`, on the canonical `workspace` a scoped prompt requires.
+    async fn install_recording_session(
+        ctx: &Arc<RpcContext>,
+        backend: &Arc<zeroclaw_infra::session_sqlite::SqliteSessionBackend>,
+        sid: &str,
+        owner: &str,
+        workspace: &std::path::Path,
+        tools: Vec<Box<dyn zeroclaw_api::tool::Tool>>,
+        gated: bool,
+    ) -> RecordingHandles {
+        let (provider, handles) = recording_provider(gated);
+        let agent = crate::agent::agent::Agent::builder()
+            .model_provider(Box::new(provider))
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                tools,
+            ))
+            .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
+            .observer(Arc::new(crate::observability::noop::NoopObserver))
+            .tool_dispatcher(Box::new(crate::agent::dispatcher::NativeToolDispatcher))
+            .workspace_dir(workspace.to_path_buf())
+            .agent_alias("test-agent".to_string())
+            .build()
+            .expect("test agent should build");
+        let session = crate::rpc::session::RpcSession::new(
+            agent,
+            "test-agent",
+            workspace.to_str().unwrap(),
+            ChatMode::Chat,
+        )
+        .with_owner_principal(Some(owner.to_string()));
+        ctx.sessions.insert(sid.to_string(), session).await.unwrap();
+        let key = format!("rpc_{sid}");
+        zeroclaw_infra::session_backend::SessionBackend::set_session_agent_alias(
+            backend.as_ref(),
+            &key,
+            "test-agent",
+        )
+        .unwrap();
+        zeroclaw_infra::session_backend::SessionBackend::set_session_principal(
+            backend.as_ref(),
+            &key,
+            owner,
+        )
+        .unwrap();
+        handles
+    }
+
+    /// Alice (roster uid 4242) with session and tool grants as `edit` leaves
+    /// them, and the canonical agent workspace.
+    fn steering_ctx(
+        tmp: &tempfile::TempDir,
+        edit: impl FnOnce(&mut zeroclaw_config::schema::PermissionProfileConfig),
+    ) -> (
+        Arc<RpcContext>,
+        Arc<zeroclaw_infra::session_sqlite::SqliteSessionBackend>,
+        std::path::PathBuf,
+    ) {
+        let mut config = session_cwd_config(tmp, 4242, None);
+        edit(
+            config
+                .permission_profiles
+                .get_mut("session-scoped")
+                .expect("the fixture profile exists"),
+        );
+        let workspace = config
+            .agent_workspace_dir("test-agent")
+            .canonicalize()
+            .unwrap();
+        let (ctx, backend, _acp_store) = persistence_enforcement_ctx(config);
+        (ctx, backend, workspace)
+    }
+
+    const STEER_TEXT: &str = "please also check the second file";
+
+    /// Alice's turn on her own session is parked at its first model call; a
+    /// second Alice connection steers it after `before_steer`, then
+    /// `after_steer` runs, then the call is released. Returns the steer's
+    /// response and every model call the turn made.
+    async fn steer_alices_parked_turn(
+        tools: Vec<Box<dyn zeroclaw_api::tool::Tool>>,
+        allowed_tools: Vec<&str>,
+        before_steer: impl FnOnce(&Arc<RpcContext>),
+        after_steer: impl FnOnce(&Arc<RpcContext>),
+    ) -> (Value, Vec<RecordedCall>) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sid = "s-steered";
+        let (ctx, backend, workspace) = steering_ctx(&tmp, |profile| {
+            profile.allowed_tools = allowed_tools.iter().map(|t| (*t).to_string()).collect();
+        });
+        let mut handles =
+            install_recording_session(&ctx, &backend, sid, "user:alice", &workspace, tools, true)
+                .await;
+        let (mut prompter, mut prompter_rx) = roster_peer(&ctx, 4242).await;
+        let (mut steerer, mut steerer_rx) = roster_peer(&ctx, 4242).await;
+
+        send_prompt(&mut prompter, 1, sid, 1).await;
+        handles.await_start().await;
+        before_steer(&ctx);
+        let steered = rpc(
+            &mut steerer,
+            &mut steerer_rx,
+            2,
+            "session/steer",
+            json!({"session_id": sid, "content": STEER_TEXT}),
+        )
+        .await;
+        after_steer(&ctx);
+        handles.release();
+        let (response, _) = response_and_notifications(&mut prompter_rx, 1).await;
+        assert!(
+            response.get("error").is_none(),
+            "the turn itself completes: {response}"
+        );
+        (steered, handles.calls().await)
+    }
+
+    fn steered(calls: &[RecordedCall]) -> bool {
+        calls.iter().any(|(text, _)| text.contains(STEER_TEXT))
+    }
+
+    #[tokio::test]
+    async fn a_steer_from_a_second_connection_of_the_owner_reaches_the_next_round() {
+        let (response, calls) =
+            steer_alices_parked_turn(Vec::new(), vec!["*"], |_| {}, |_| {}).await;
+        assert_eq!(response["result"]["accepted"], json!(true), "{response}");
+        assert_eq!(calls.len(), 2, "the steer adds a round: {calls:?}");
+        assert!(steered(&calls[1..]), "the second round carries the steer");
+    }
+
+    #[tokio::test]
+    async fn a_queued_steer_survives_an_unrelated_grant_change() {
+        let (response, calls) = steer_alices_parked_turn(
+            Vec::new(),
+            vec!["*"],
+            |_| {},
+            |ctx| {
+                republish_session_scoped(ctx, |profile| {
+                    profile.grants.insert(
+                        zeroclaw_api::grants::Resource::Memory,
+                        vec![zeroclaw_api::grants::Verb::Read],
+                    );
+                });
+            },
+        )
+        .await;
+        assert_eq!(response["result"]["accepted"], json!(true), "{response}");
+        assert_eq!(calls.len(), 2, "re-resolution admits it: {calls:?}");
+        assert!(steered(&calls));
+    }
+
+    #[tokio::test]
+    async fn a_steer_is_refused_when_its_sender_lost_the_agent_before_enqueue() {
+        let (response, calls) = steer_alices_parked_turn(
+            Vec::new(),
+            vec!["*"],
+            |ctx| republish_session_scoped(ctx, |profile| profile.allowed_agents.clear()),
+            |_| {},
+        )
+        .await;
+        assert_eq!(response["error"]["code"], json!(FORBIDDEN), "{response}");
+        assert_eq!(calls.len(), 1, "no steered round: {calls:?}");
+        assert!(!steered(&calls));
+    }
+
+    #[tokio::test]
+    async fn a_queued_steer_is_dropped_when_its_senders_grant_is_revoked_before_consumption() {
+        let (response, calls) = steer_alices_parked_turn(
+            Vec::new(),
+            vec!["*"],
+            |_| {},
+            |ctx| {
+                republish_session_scoped(ctx, |profile| {
+                    profile.grants.insert(
+                        zeroclaw_api::grants::Resource::Sessions,
+                        vec![zeroclaw_api::grants::Verb::Read],
+                    );
+                });
+            },
+        )
+        .await;
+        assert_eq!(
+            response["result"]["accepted"],
+            json!(true),
+            "queued while still authorized: {response}"
+        );
+        assert_eq!(
+            calls.len(),
+            1,
+            "the revoked steer starts no round: {calls:?}"
+        );
+        assert!(!steered(&calls), "and never reaches the model");
+    }
+
+    #[tokio::test]
+    async fn a_queued_steer_is_dropped_when_its_sender_loses_the_agent_before_consumption() {
+        let (response, calls) = steer_alices_parked_turn(
+            Vec::new(),
+            vec!["*"],
+            |_| {},
+            |ctx| republish_session_scoped(ctx, |profile| profile.allowed_agents.clear()),
+        )
+        .await;
+        assert_eq!(response["result"]["accepted"], json!(true), "{response}");
+        assert_eq!(calls.len(), 1, "no steered round: {calls:?}");
+        assert!(!steered(&calls));
+    }
+
+    #[tokio::test]
+    async fn a_steered_round_runs_under_the_senders_current_tool_ceiling() {
+        let (response, calls) = steer_alices_parked_turn(
+            vec![Box::new(ProbeTool)],
+            vec!["probe"],
+            |_| {},
+            |ctx| republish_session_scoped(ctx, |profile| profile.allowed_tools.clear()),
+        )
+        .await;
+        assert_eq!(response["result"]["accepted"], json!(true), "{response}");
+        assert_eq!(calls.len(), 2, "still allowed to steer: {calls:?}");
+        assert!(
+            calls[0].1.iter().any(|tool| tool == "probe"),
+            "the first round was offered the tool: {calls:?}"
+        );
+        assert!(steered(&calls[1..]));
+        assert!(
+            !calls[1].1.iter().any(|tool| tool == "probe"),
+            "the steered round runs without the tool its sender no longer holds: {calls:?}"
+        );
+    }
+
+    /// Alice's steer or abort on her session `s` is paused right after its
+    /// identity snapshot; meanwhile `s` is removed and recreated for Bob, whose
+    /// turn starts and parks. Returns Alice's response, Bob's model calls, and
+    /// the outcome of Bob's turn.
+    async fn stale_control_against_a_successor(method: &str) -> (Value, Vec<RecordedCall>, Value) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sid = "s-reused";
+        // Abort is an operator verb (sessions:delete); grant it so the call
+        // reaches its snapshot instead of failing classification.
+        let (ctx, backend, workspace) = steering_ctx(&tmp, |profile| {
+            profile.grants.insert(
+                zeroclaw_api::grants::Resource::Sessions,
+                vec![
+                    zeroclaw_api::grants::Verb::Read,
+                    zeroclaw_api::grants::Verb::Execute,
+                    zeroclaw_api::grants::Verb::Delete,
+                ],
+            );
+        });
+        let _alices = install_recording_session(
+            &ctx,
+            &backend,
+            sid,
+            "user:alice",
+            &workspace,
+            Vec::new(),
+            true,
+        )
+        .await;
+        let (mut alice, mut alice_rx) = roster_peer(&ctx, 4242).await;
+        let (entered, release_control) = ctx.sessions.set_test_control_pause();
+        let params = if method == "session/steer" {
+            json!({"session_id": sid, "content": STEER_TEXT})
+        } else {
+            json!({"session_id": sid})
+        };
+        let method_owned = method.to_string();
+        let control = zeroclaw_spawn::spawn!(async move {
+            rpc(&mut alice, &mut alice_rx, 1, &method_owned, params).await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+            .await
+            .expect("the control reaches its pause after the identity snapshot");
+
+        // Same id, new incarnation, another principal, a live turn.
+        ctx.sessions.kill_session(sid).await;
+        let mut bobs = install_recording_session(
+            &ctx,
+            &backend,
+            sid,
+            "user:bob",
+            &workspace,
+            Vec::new(),
+            true,
+        )
+        .await;
+        let (mut operator, mut operator_rx) = local_operator(&ctx).await;
+        send_prompt(&mut operator, 5, sid, 1).await;
+        bobs.await_start().await;
+
+        release_control.notify_one();
+        let response = tokio::time::timeout(std::time::Duration::from_secs(10), control)
+            .await
+            .expect("the control finishes")
+            .expect("the control task does not panic");
+        bobs.release();
+        let done = drain_to_turn_complete(&mut operator_rx, sid).await;
+        (response, bobs.calls().await, done)
+    }
+
+    #[tokio::test]
+    async fn a_steer_authorized_against_a_replaced_incarnation_never_reaches_the_successor() {
+        let (response, calls, done) = stale_control_against_a_successor("session/steer").await;
+        assert_eq!(
+            response["error"]["code"],
+            json!(SESSION_NOT_FOUND),
+            "{response}"
+        );
+        assert_eq!(
+            calls.len(),
+            1,
+            "Bob's turn gets no steered round: {calls:?}"
+        );
+        assert!(!steered(&calls));
+        assert_eq!(done["params"]["outcome"], json!("completed"), "{done}");
+    }
+
+    #[tokio::test]
+    async fn an_abort_authorized_against_a_replaced_incarnation_leaves_the_successor_running() {
+        let (response, _calls, done) = stale_control_against_a_successor("session/abort").await;
+        assert_eq!(
+            response["error"]["code"],
+            json!(SESSION_NOT_FOUND),
+            "{response}"
+        );
+        assert_eq!(
+            done["params"]["outcome"],
+            json!("completed"),
+            "Bob's turn is not cancelled: {done}"
+        );
+    }
+
+    const QUEUED_PROMPT: &str = "summarize the incident";
+
+    /// Alice, an administrator, queues a prompt to `owner`'s session behind a
+    /// held permit and is demoted (keeping sessions:execute and the agent)
+    /// while it waits. Returns the prompt's result, the provider's calls, the
+    /// frames Alice received, and whether the session's durable and live
+    /// transcripts hold the prompt.
+    async fn queued_prompt_after_admin_demotion(
+        owner: &str,
+    ) -> (RpcResult, Vec<RecordedCall>, Vec<Value>, (bool, bool)) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sid = "s-queued-prompt";
+        let (ctx, backend, workspace) = steering_ctx(&tmp, |profile| profile.admin = true);
+        let handles =
+            install_recording_session(&ctx, &backend, sid, owner, &workspace, Vec::new(), false)
+                .await;
+        let (alice, mut alice_rx) = roster_peer(&ctx, 4242).await;
+        let params = json!({"session_id": sid, "prompt": QUEUED_PROMPT});
+        let result = rpc_result_after_midwait_session_admission(
+            Arc::clone(&ctx),
+            sid,
+            async move { alice.handle_session_prompt(&params).await },
+            |ctx| republish_session_scoped(ctx, |profile| profile.admin = false),
+        )
+        .await;
+        let mut frames = Vec::new();
+        while let Ok(frame) = alice_rx.try_recv() {
+            frames.push(serde_json::from_str(&frame).expect("valid JSON-RPC frame"));
+        }
+        let transcript = (
+            durable_holds(&backend, &format!("rpc_{sid}"), QUEUED_PROMPT),
+            live_holds(&ctx, sid, QUEUED_PROMPT).await,
+        );
+        (result, handles.calls().await, frames, transcript)
+    }
+
+    #[tokio::test]
+    async fn a_queued_prompt_by_a_demoted_administrator_does_not_run_on_another_principals_session()
+    {
+        let (result, calls, frames, transcript) =
+            queued_prompt_after_admin_demotion("user:bob").await;
+        assert_eq!(result.expect_err("demoted while queued").code, FORBIDDEN);
+        assert!(
+            calls.is_empty(),
+            "no model call on Bob's session: {calls:?}"
+        );
+        assert!(
+            frames
+                .iter()
+                .all(|frame| frame["params"].get("usage").is_none()
+                    && frame["params"]["type"] != "agent_message_chunk"),
+            "Alice receives no content or totals from Bob's session: {frames:?}"
+        );
+        assert!(
+            frames
+                .iter()
+                .any(|frame| frame["params"]["type"] == "turn_complete"
+                    && frame["params"]["outcome"] == "failed"),
+            "the refused prompt still ends Alice's turn: {frames:?}"
+        );
+        assert_eq!(
+            transcript,
+            (false, false),
+            "Bob's durable and live transcripts are untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_queued_prompt_by_a_demoted_administrator_still_runs_on_its_own_session() {
+        let (result, calls, _frames, transcript) =
+            queued_prompt_after_admin_demotion("user:alice").await;
+        result.expect("Alice keeps her own session under her remaining grants");
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert_eq!(
+            transcript,
+            (true, true),
+            "the prompt reaches both transcripts, so the refusal's (false, false) is meaningful"
         );
     }
 }

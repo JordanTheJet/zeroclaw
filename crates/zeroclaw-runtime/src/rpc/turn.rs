@@ -77,7 +77,7 @@ pub async fn execute_turn<F, Fut>(
     attribution: TurnAttribution,
     cost_context: Option<ToolLoopCostTrackingContext>,
     connection_activity: Option<crate::rpc::ConnectionActivity>,
-    steering_rx: Option<mpsc::Receiver<String>>,
+    steering_rx: Option<mpsc::Receiver<crate::agent::SteeringInput>>,
     on_event: F,
 ) -> Result<TurnOutcome, TurnError>
 where
