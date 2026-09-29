@@ -3593,6 +3593,20 @@ impl RpcDispatcher {
     }
 
     async fn handle_session_new(&self, params: &Value) -> RpcResult {
+        self.session_new_with_mode(params, None).await
+    }
+
+    /// `session/new`, or with `create_only` set, a create that never resumes:
+    /// a supplied id that already names a session under the admission permit
+    /// is refused, and the generation of the session it created is written
+    /// back. Creation always runs under the session's queue permit, so a
+    /// create-only call and any concurrent creator of the same id are
+    /// serialized; whichever comes second sees the other's session.
+    async fn session_new_with_mode(
+        &self,
+        params: &Value,
+        create_only: Option<&parking_lot::Mutex<Option<u64>>>,
+    ) -> RpcResult {
         let req: SessionNewParams = parse_params(params)?;
         self.selector_session_agent(Method::SessionNew, &req.agent_alias)?;
         let chat_mode = req.chat_mode.clone().unwrap_or(ChatMode::Chat);
@@ -3644,7 +3658,7 @@ impl RpcDispatcher {
         // above authorized whatever existed then, this authorizes what exists
         // now. A scoped mismatch surfaces as the uniform ownership denial.
         let resume_scope = self.scoped_principal_id();
-        if resuming {
+        if resuming && create_only.is_none() {
             match self
                 .ctx
                 .sessions
@@ -3714,6 +3728,20 @@ impl RpcDispatcher {
         } else {
             None
         };
+        if create_only.is_some()
+            && (admitted_record.is_some()
+                || self
+                    .ctx
+                    .sessions
+                    .get_generation(&session_id)
+                    .await
+                    .is_some())
+        {
+            return Err(rpc_err(
+                INVALID_PARAMS,
+                "session_id already names a session; a create-only session/new never resumes one",
+            ));
+        }
 
         // The wait for admission is unbounded, so the principal's profile,
         // credential, or pairing may have changed while this request was
@@ -4514,6 +4542,12 @@ impl RpcDispatcher {
             hooks.fire_session_start(&session_id, "rpc").await;
         }
 
+        if let Some(created) = create_only {
+            // Still under the admission permit: this is the incarnation this
+            // call created, not one a later caller installed.
+            *created.lock() = self.ctx.sessions.get_generation(&session_id).await;
+        }
+
         to_result(SessionNewResult {
             session_id,
             agent_alias: req.agent_alias,
@@ -4523,6 +4557,18 @@ impl RpcDispatcher {
     }
 
     async fn handle_session_close(&self, params: &Value) -> RpcResult {
+        self.handle_session_close_bound(params, None).await
+    }
+
+    /// `session/close`, optionally bound to one incarnation: with
+    /// `expected_generation` set, a session that is no longer that
+    /// incarnation is left alone (`session/run-once` closes only the session
+    /// it created).
+    async fn handle_session_close_bound(
+        &self,
+        params: &Value,
+        expected_generation: Option<u64>,
+    ) -> RpcResult {
         let req: SessionIdParams = parse_params(params)?;
         // Authorize the caller as the session owner before signalling
         // cancellation or waiting on the queue: an unauthorized close must not
@@ -4534,6 +4580,14 @@ impl RpcDispatcher {
         let requested_generation = requested_identity
             .as_ref()
             .map(|(generation, _)| *generation);
+        if let Some(expected) = expected_generation
+            && requested_generation != Some(expected)
+        {
+            return Err(rpc_err(
+                SESSION_NOT_FOUND,
+                "Session is no longer the incarnation this close was bound to",
+            ));
+        }
         if requested_generation
             != authorized
                 .as_ref()
@@ -5445,16 +5499,18 @@ impl RpcDispatcher {
 
     async fn handle_session_prompt(&self, params: &Value) -> RpcResult {
         let req: SessionPromptParams = parse_params(params)?;
-        let (result, _usage) = self.run_session_prompt(req).await?;
+        let (result, _usage) = self.run_session_prompt(req, None).await?;
         to_result(result)
     }
 
     /// The `session/prompt` turn, shared with `session/run-once`. Returns the
     /// prompt result together with the usage totals the terminal
-    /// `TurnComplete` carried.
+    /// `TurnComplete` carried. With `expected_generation` set, the turn runs
+    /// only in that incarnation of the session.
     async fn run_session_prompt(
         &self,
         req: SessionPromptParams,
+        expected_generation: Option<u64>,
     ) -> Result<
         (
             SessionPromptResult,
@@ -5475,6 +5531,14 @@ impl RpcDispatcher {
         }
 
         let live_generation_at_entry = self.ctx.sessions.get_generation(sid).await;
+        if let Some(expected) = expected_generation
+            && live_generation_at_entry != Some(expected)
+        {
+            return Err(rpc_err(
+                SESSION_NOT_FOUND,
+                "Session is no longer the incarnation this prompt was bound to",
+            ));
+        }
 
         // Admission fences the complete session incarnation: agent, mode,
         // attachments, durable writes, and terminal state are all resolved
@@ -6999,7 +7063,11 @@ impl RpcDispatcher {
             zeroclaw_api::grants::Verb::Create,
         )?;
         // The session is closed when the turn ends, so the call must not
-        // adopt one that already exists under a caller-chosen id.
+        // adopt one that already exists under a caller-chosen id. This early
+        // check gives a clear error; the create-only session/new below is what
+        // makes it hold against a concurrent creator. A scoped caller naming
+        // another principal's session gets the uniform ownership denial
+        // first, so run-once cannot probe which ids exist.
         let session_id = match req.session_id {
             Some(sid) => {
                 if self
@@ -7007,6 +7075,8 @@ impl RpcDispatcher {
                     .await?
                     .is_some()
                 {
+                    self.authorize_session_owner(&sid, Method::SessionRunOnce)
+                        .await?;
                     return Err(rpc_err(
                         INVALID_PARAMS,
                         "session/run-once requires a session_id that does not exist yet",
@@ -7028,19 +7098,27 @@ impl RpcDispatcher {
             keep_siblings: Some(true),
         })
         .map_err(|e| rpc_err(INTERNAL_ERROR, e.to_string()))?;
-        Box::pin(self.handle_session_new(&new_params)).await?;
+        let created = parking_lot::Mutex::new(None);
+        Box::pin(self.session_new_with_mode(&new_params, Some(&created))).await?;
+        let created_generation = *created.lock();
 
+        // The turn and the close are bound to the incarnation created above: if
+        // the id now names another incarnation, neither touches it.
         let turn = self
-            .run_session_prompt(SessionPromptParams {
-                session_id: session_id.clone(),
-                prompt: req.prompt,
-                client_turn_generation: None,
-                attachments: Vec::new(),
-            })
+            .run_session_prompt(
+                SessionPromptParams {
+                    session_id: session_id.clone(),
+                    prompt: req.prompt,
+                    client_turn_generation: None,
+                    attachments: Vec::new(),
+                },
+                created_generation,
+            )
             .await;
 
         let close = serde_json::json!({ "session_id": session_id });
-        if let Err(e) = Box::pin(self.handle_session_close(&close)).await {
+        if let Err(e) = Box::pin(self.handle_session_close_bound(&close, created_generation)).await
+        {
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -39038,5 +39116,66 @@ mod tests {
             durable_holds(&backend, &key, "reply-1"),
             "and the turn's own reply was persisted with it"
         );
+    }
+
+    #[tokio::test]
+    async fn run_once_does_not_adopt_a_session_created_while_it_waits_for_admission() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = session_cwd_config(&tmp, 4242, None);
+        let (ctx, _backend, _acp_store) = persistence_enforcement_ctx(config);
+        let (operator, _rx) = local_operator(&ctx).await;
+        let sid = "s-run-once-race";
+        let params = json!({"agent_alias": "test-agent", "prompt": "hi", "session_id": sid});
+
+        // Run-once's early check sees nothing; while it waits for the
+        // session's admission permit, another creator makes the session.
+        let result = rpc_result_after_midwait_session_admission(
+            Arc::clone(&ctx),
+            sid,
+            async move { Box::pin(operator.handle_session_run_once(&params)).await },
+            |ctx| {
+                let backend = ctx
+                    .session_backend
+                    .as_ref()
+                    .expect("the fixture has a chat backend");
+                backend
+                    .set_session_agent_alias("rpc_s-run-once-race", "test-agent")
+                    .expect("the concurrent creator's row exists");
+            },
+        )
+        .await;
+
+        let err = result.expect_err("run-once must refuse the session it did not create");
+        assert_eq!(err.code, INVALID_PARAMS, "{err:?}");
+        assert!(
+            ctx.sessions.get_agent(sid).await.is_none(),
+            "run-once must not have built or resumed a live session"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bound_close_leaves_another_incarnation_alone() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sid = "s-bound-close";
+        let (ctx, _backend, _handles) = turn_parity_fixture(&tmp, sid, None).await;
+        let (operator, _rx) = local_operator(&ctx).await;
+        let live = ctx
+            .sessions
+            .get_generation(sid)
+            .await
+            .expect("the session is live");
+
+        let err = operator
+            .handle_session_close_bound(&json!({"session_id": sid}), Some(live + 1))
+            .await
+            .expect_err("a close bound to another incarnation must not close this one");
+        assert_eq!(err.code, SESSION_NOT_FOUND, "{err:?}");
+        assert!(ctx.sessions.get_agent(sid).await.is_some(), "still live");
+
+        operator
+            .handle_session_close_bound(&json!({"session_id": sid}), Some(live))
+            .await
+            .expect("a close bound to this incarnation closes it");
+        assert!(ctx.sessions.get_agent(sid).await.is_none(), "closed");
     }
 }
