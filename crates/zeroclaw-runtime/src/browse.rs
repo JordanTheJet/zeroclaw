@@ -340,45 +340,44 @@ fn agent_root(config: &Config, agent_alias: &str) -> Result<PathBuf, BrowseError
     }
 }
 
-/// Whether `rel` names the reserved top-level entry `reserved` on whatever
-/// filesystem holds the workspace. A case-insensitive volume (the default on
-/// macOS and Windows) resolves `soul.md` to `SOUL.md`, and Windows drops a
-/// trailing dot or space, so an exact comparison would let either spelling
-/// through to the entry it was meant to refuse.
-fn names_reserved(rel: &str, reserved: &str) -> bool {
+/// Whether `rel` names one of the reserved top-level entries in `reserved`
+/// on whatever filesystem holds the workspace. A case-insensitive volume (the
+/// default on macOS and Windows) resolves `soul.md` to `SOUL.md`, and Windows
+/// drops a trailing dot or space, so an exact comparison would let either
+/// spelling through to the entry it was meant to refuse. `rel` is folded
+/// once, so the cost is linear in its length.
+fn names_reserved(rel: &str, reserved: &[&str]) -> bool {
     let fold = |name: &str| {
         name.trim_end_matches(['.', ' '])
             .to_uppercase()
             .to_lowercase()
     };
-    fold(rel) == fold(reserved)
+    let rel = fold(rel);
+    reserved.iter().any(|name| fold(name) == rel)
 }
 
 fn protected_file(rel: &str) -> bool {
-    AGENT_WORKSPACE_PROTECTED_FILES
-        .iter()
-        .any(|reserved| names_reserved(rel, reserved))
+    names_reserved(rel, AGENT_WORKSPACE_PROTECTED_FILES)
 }
 
 fn protected_dir(rel: &str) -> bool {
-    AGENT_WORKSPACE_PROTECTED_DIRS
-        .iter()
-        .any(|reserved| names_reserved(rel, reserved))
+    names_reserved(rel, AGENT_WORKSPACE_PROTECTED_DIRS)
 }
 
-/// The first leading run of `relative`'s components that is a protected
-/// file, if any.
+/// The protected file that creating `relative`, or moving an entry to or
+/// from it, would name or pass through, if any.
 ///
-/// Creating `SOUL.md/child` creates a `SOUL.md` directory on the way, which
-/// then stands where the bootstrap file belongs, although the whole path is
-/// not a protected name. Every operation that creates the directories along
-/// a path, or moves an entry out of one, checks each of them here.
-fn protected_file_along(relative: &str) -> Option<&str> {
-    relative
-        .match_indices('/')
-        .map(|(end, _)| &relative[..end])
-        .chain(std::iter::once(relative))
-        .find(|prefix| protected_file(prefix))
+/// Protected files are top-level entries whose names contain no `/`, so only
+/// the first component can be one: `SOUL.md/child` would create a `SOUL.md`
+/// directory where the bootstrap file belongs, while `notes/SOUL.md` is an
+/// ordinary entry. The path is the caller's to choose, so that one component
+/// is all that is checked; comparing every leading prefix would cost the
+/// square of the path's length.
+fn protected_top_level_file(relative: &str) -> Option<&str> {
+    let first = relative
+        .split_once('/')
+        .map_or(relative, |(first, _)| first);
+    protected_file(first).then_some(first)
 }
 
 /// One-level listing inside the agent's workspace. Top-level entries that
@@ -416,7 +415,7 @@ pub fn make_agent_workspace_directory(
     if relative.is_empty() {
         return Err(BrowseError::NotFound(raw.to_string()));
     }
-    if let Some(protected) = protected_file_along(&relative) {
+    if let Some(protected) = protected_top_level_file(&relative) {
         return Err(BrowseError::ProtectedFile(protected.to_string()));
     }
     make_directory_under(&root, raw)
@@ -584,9 +583,23 @@ pub fn move_agent_workspace_path(
     if from_trimmed.is_empty() || to_trimmed.is_empty() {
         return Err(BrowseError::NotFound(from.to_string()));
     }
-    // `to`'s parents are created below, so every directory along it is
-    // checked, not only the entry it names.
-    if let Some(protected) = protected_file_along(from_trimmed).or(protected_file_along(to_trimmed))
+    let dir = open_root(&root, from)?;
+    // The source is looked up first, so a request naming a missing entry
+    // costs that lookup and nothing more. Both sides are reached without
+    // following an intermediate link, so the protected-entry checks below
+    // judge the entries this moves, and they run before anything changes.
+    let (from_parent, from_name) = open_parent_nofollow(&dir, from_trimmed, from, &root)?;
+    match from_parent.symlink_metadata(&from_name) {
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Err(BrowseError::NotFound(from.to_string()));
+        }
+        Err(err) => return Err(confined(from, &root)(err)),
+    }
+    // `to`'s parents are created below, so a protected name at its top is
+    // refused even when `to` itself is deeper.
+    if let Some(protected) =
+        protected_top_level_file(from_trimmed).or(protected_top_level_file(to_trimmed))
     {
         return Err(BrowseError::ProtectedFile(protected.to_string()));
     }
@@ -599,17 +612,6 @@ pub fn move_agent_workspace_path(
                 to_trimmed
             }
         )));
-    }
-    let dir = open_root(&root, from)?;
-    // Both sides are reached without following an intermediate link, so the
-    // protected-entry checks above judged the entries this moves.
-    let (from_parent, from_name) = open_parent_nofollow(&dir, from_trimmed, from, &root)?;
-    match from_parent.symlink_metadata(&from_name) {
-        Ok(_) => {}
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            return Err(BrowseError::NotFound(from.to_string()));
-        }
-        Err(err) => return Err(confined(from, &root)(err)),
     }
     if let Some(parent) = std::path::Path::new(to_trimmed).parent()
         && !parent.as_os_str().is_empty()
@@ -1384,8 +1386,8 @@ mod tests {
     }
 
     /// A move creates its destination's parents, so a destination under a
-    /// protected file name would create that directory; a source under one is
-    /// refused the same way.
+    /// protected file name would create that directory; a source under one,
+    /// left by an earlier version or by hand, is refused the same way.
     #[test]
     fn move_agent_workspace_path_refuses_a_protected_file_along_either_path() {
         let (dir, cfg) = workspace_fixture();
@@ -1400,8 +1402,69 @@ mod tests {
             assert!(std::fs::symlink_metadata(ws.join("SOUL.md")).is_err());
             assert!(ws.join("notes/draft.md").is_file());
         }
+        std::fs::create_dir_all(ws.join("SOUL.md/x")).unwrap();
         let err = move_agent_workspace_path(&cfg, "alpha", "SOUL.md/x", "notes/x").unwrap_err();
-        assert!(matches!(err, BrowseError::ProtectedFile(_)));
+        assert!(matches!(err, BrowseError::ProtectedFile(_)), "{err:?}");
+        assert!(ws.join("SOUL.md/x").is_dir());
+    }
+
+    /// Nothing bounds a path's depth before these checks run, so judging it
+    /// must cost time linear in its length. Each operation here is handed a
+    /// path of a million components, 2 MB and well inside an RPC frame, and
+    /// must return within the bound: one with a protected first component,
+    /// one that stops at a file on the way, a move whose source is missing,
+    /// which is noticed before its destination is judged, and one whose
+    /// destination runs through a file. They take about a
+    /// second together; comparing every leading prefix against the protected
+    /// names takes minutes at this length.
+    #[test]
+    fn a_very_long_path_is_judged_in_linear_time() {
+        assert!(
+            AGENT_WORKSPACE_PROTECTED_FILES
+                .iter()
+                .all(|name| !name.contains('/')),
+            "only a path's first component is checked for a protected file"
+        );
+        let (dir, cfg) = workspace_fixture();
+        let deep = "a/".repeat(1_000_000);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send([
+                make_agent_workspace_directory(&cfg, "alpha", &format!("SOUL.md/{deep}")),
+                make_agent_workspace_directory(&cfg, "alpha", &format!("notes/draft.md/{deep}")),
+                move_agent_workspace_path(
+                    &cfg,
+                    "alpha",
+                    "missing.txt",
+                    &format!("SOUL.md/{deep}x"),
+                ),
+                move_agent_workspace_path(
+                    &cfg,
+                    "alpha",
+                    "notes/draft.md",
+                    &format!("notes/draft.md/{deep}x"),
+                ),
+            ]);
+        });
+        let [protected, through_file, missing, onto_file] = rx
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect("judging a long path took more than linear time");
+        assert!(
+            matches!(&protected, Err(BrowseError::ProtectedFile(name)) if name == "SOUL.md"),
+            "{protected:?}"
+        );
+        assert!(
+            matches!(through_file, Err(BrowseError::NotADirectory(_))),
+            "{through_file:?}"
+        );
+        assert!(
+            matches!(missing, Err(BrowseError::NotFound(_))),
+            "{missing:?}"
+        );
+        assert!(onto_file.is_err(), "{onto_file:?}");
+        let ws = dir.path().join("agents/alpha/workspace");
+        assert!(ws.join("notes/draft.md").is_file());
+        assert!(!ws.join("a").exists());
     }
 
     #[test]
