@@ -37,7 +37,6 @@
 //! concurrent persist can never reinstall the older policy over the
 //! newer one.
 
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use axum::{
@@ -275,20 +274,12 @@ impl ConfigWriteSet {
         after: &Config,
         paths: impl IntoIterator<Item = &'a str>,
     ) -> Self {
-        let before = declared_paths(before);
-        let after = declared_paths(after);
-        let writes = paths
-            .into_iter()
-            .map(|path| {
-                let verb = match (contains_path(&before, path), contains_path(&after, path)) {
-                    (false, true) => Verb::Create,
-                    (true, false) => Verb::Delete,
-                    _ => Verb::Update,
-                };
-                (path.to_owned(), verb)
-            })
-            .collect();
-        Self { writes }
+        // The same classification the RPC persistence boundary applies.
+        Self {
+            writes: zeroclaw_runtime::config_ops::write_set::classify_by_effect(
+                before, after, paths,
+            ),
+        }
     }
 
     /// Pin the verb for a path whose route semantics the effect diff does
@@ -309,22 +300,6 @@ impl ConfigWriteSet {
                     .is_some_and(|rest| rest.starts_with('.'))
         })
     }
-}
-
-fn declared_paths(config: &Config) -> HashSet<String> {
-    config
-        .prop_fields()
-        .into_iter()
-        .map(|info| info.name)
-        .collect()
-}
-
-fn contains_path(declared: &HashSet<String>, path: &str) -> bool {
-    declared.contains(path)
-        || declared.iter().any(|name| {
-            name.strip_prefix(path)
-                .is_some_and(|rest| rest.starts_with('.'))
-        })
 }
 
 fn verb_name(verb: Verb) -> &'static str {

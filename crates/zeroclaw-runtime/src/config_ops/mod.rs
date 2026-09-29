@@ -11,3 +11,4 @@ pub mod delete;
 pub mod document;
 pub mod drift;
 pub mod sections;
+pub mod write_set;
