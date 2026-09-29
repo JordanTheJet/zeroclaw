@@ -938,6 +938,19 @@
         ],
         "type": "object"
       },
+      "EventsHistoryResult": {
+        "description": "`events/history`: recent observer frames, oldest first.",
+        "properties": {
+          "events": {
+            "items": true,
+            "type": "array"
+          }
+        },
+        "required": [
+          "events"
+        ],
+        "type": "object"
+      },
       "FileAttachParams": {
         "properties": {
           "files": {
@@ -2994,6 +3007,13 @@
               "null"
             ]
           },
+          "cursor": {
+            "description": "Presence of this field opts into bounded ACP cursor pagination.\n`null` requests the newest page; a string continues a walk.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "limit": {
             "default": null,
             "format": "uint",
@@ -3014,11 +3034,23 @@
       },
       "SessionMessagesResult": {
         "properties": {
+          "has_older": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
           "messages": {
             "items": {
               "$ref": "#/components/schemas/MessageEntry"
             },
             "type": "array"
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "session_id": {
             "type": "string"
@@ -3854,12 +3886,74 @@
       "paramStructure": "by-name",
       "params": [
         {
-          "name": "params",
-          "required": true,
+          "name": "auth_provider",
+          "required": false,
           "schema": {
-            "$ref": "#/components/schemas/InitializeParams"
-          },
-          "x-zeroclaw-shape": "typed"
+            "description": "Which configured provider verifies `auth_token` (e.g. `native`,\n`oidc.corp`). Defaults to `native`. Selection is explicit and\nfinal: the selected provider's denial never falls through to\nanother provider.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "auth_token",
+          "required": false,
+          "schema": {
+            "description": "Explicit credential for authentication (a native pairing token\nor an OIDC access token). Wins over the transport-intrinsic\npeer credential when present.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "clientCapabilities",
+          "required": false,
+          "schema": true
+        },
+        {
+          "name": "env",
+          "required": false,
+          "schema": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Shell environment from the TUI process, used to forward the user's\nreal env (PATH, credentials, etc.) to subprocesses spawned by the\ndaemon on their behalf. Omitted by older clients; defaults to empty.",
+            "type": "object"
+          }
+        },
+        {
+          "name": "protocol_version",
+          "required": false,
+          "schema": {
+            "default": 1,
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        {
+          "name": "tui_id",
+          "required": false,
+          "schema": {
+            "description": "TUI ID from a previous connection (reconnection).",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "tui_sig",
+          "required": false,
+          "schema": {
+            "description": "HMAC signature proving ownership of the claimed TUI ID.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
         }
       ],
       "result": {
@@ -3871,6 +3965,10 @@
       },
       "x-zeroclaw-authorization": {
         "kind": "handshake"
+      },
+      "x-zeroclaw-params": {
+        "shape": "typed",
+        "type": "InitializeParams"
       }
     },
     {
@@ -3888,6 +3986,9 @@
         "kind": "grant",
         "resource": "system",
         "verb": "read"
+      },
+      "x-zeroclaw-params": {
+        "shape": "none"
       }
     },
     {
@@ -3905,6 +4006,9 @@
         "kind": "grant",
         "resource": "system",
         "verb": "read"
+      },
+      "x-zeroclaw-params": {
+        "shape": "none"
       }
     },
     {
@@ -3923,22 +4027,15 @@
         "kind": "grant",
         "resource": "system",
         "verb": "execute"
+      },
+      "x-zeroclaw-params": {
+        "shape": "none"
       }
     },
     {
       "name": "session/new",
       "paramStructure": "by-name",
-      "params": [
-        {
-          "name": "params",
-          "required": true,
-          "schema": {
-            "description": "`SessionNewParams`, defined in `zeroclaw-runtime`; no schema is exported yet."
-          },
-          "x-zeroclaw-owner": "zeroclaw-runtime",
-          "x-zeroclaw-shape": "external"
-        }
-      ],
+      "params": [],
       "result": {
         "name": "result",
         "schema": {
@@ -3950,6 +4047,12 @@
         "kind": "grant",
         "resource": "sessions",
         "verb": "create"
+      },
+      "x-zeroclaw-params": {
+        "description": "`SessionNewParams`, defined in `zeroclaw-runtime`; no schema is exported yet, so its keys are not enumerable here.",
+        "owner": "zeroclaw-runtime",
+        "shape": "external",
+        "type": "SessionNewParams"
       }
     },
     {
@@ -3957,12 +4060,11 @@
       "paramStructure": "by-name",
       "params": [
         {
-          "name": "params",
+          "name": "session_id",
           "required": true,
           "schema": {
-            "$ref": "#/components/schemas/SessionIdParams"
-          },
-          "x-zeroclaw-shape": "typed"
+            "type": "string"
+          }
         }
       ],
       "result": {
@@ -3976,6 +4078,10 @@
         "kind": "grant",
         "resource": "sessions",
         "verb": "update"
+      },
+      "x-zeroclaw-params": {
+        "shape": "typed",
+        "type": "SessionIdParams"
       }
     },
     {
@@ -3983,12 +4089,42 @@
       "paramStructure": "by-name",
       "params": [
         {
-          "name": "params",
+          "name": "attachments",
+          "required": false,
+          "schema": {
+            "description": "Inline file attachments. Processed identically to `file/attach`\nentries — markers are appended to the prompt before the turn runs.",
+            "items": {
+              "$ref": "#/components/schemas/FileEntry"
+            },
+            "type": "array"
+          }
+        },
+        {
+          "name": "client_turn_generation",
+          "required": false,
+          "schema": {
+            "description": "Optional client-local turn identity echoed by `TurnComplete`.\nOlder clients omit this field and retain session-scoped behavior.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "prompt",
           "required": true,
           "schema": {
-            "$ref": "#/components/schemas/SessionPromptParams"
-          },
-          "x-zeroclaw-shape": "typed"
+            "type": "string"
+          }
+        },
+        {
+          "name": "session_id",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
         }
       ],
       "result": {
@@ -4002,6 +4138,10 @@
         "kind": "grant",
         "resource": "sessions",
         "verb": "execute"
+      },
+      "x-zeroclaw-params": {
+        "shape": "typed",
+        "type": "SessionPromptParams"
       }
     },
     {
@@ -4009,12 +4149,19 @@
       "paramStructure": "by-name",
       "params": [
         {
-          "name": "params",
+          "name": "overrides",
+          "required": false,
+          "schema": {
+            "$ref": "#/components/schemas/SessionOverrides",
+            "default": {}
+          }
+        },
+        {
+          "name": "session_id",
           "required": true,
           "schema": {
-            "$ref": "#/components/schemas/SessionConfigureParams"
-          },
-          "x-zeroclaw-shape": "typed"
+            "type": "string"
+          }
         }
       ],
       "result": {
@@ -4028,6 +4175,10 @@
         "kind": "grant",
         "resource": "sessions",
         "verb": "update"
+      },
+      "x-zeroclaw-params": {
+        "shape": "typed",
+        "type": "SessionConfigureParams"
       }
     },
     {
@@ -4035,12 +4186,11 @@
       "paramStructure": "by-name",
       "params": [
         {
-          "name": "params",
+          "name": "session_id",
           "required": true,
           "schema": {
-            "$ref": "#/components/schemas/SessionIdParams"
-          },
-          "x-zeroclaw-shape": "typed"
+            "type": "string"
+          }
         }
       ],
       "result": {
@@ -4054,6 +4204,10 @@
         "kind": "grant",
         "resource": "sessions",
         "verb": "update"
+      },
+      "x-zeroclaw-params": {
+        "shape": "typed",
+        "type": "SessionIdParams"
       }
     },
     {
@@ -4061,12 +4215,11 @@
       "paramStructure": "by-name",
       "params": [
         {
-          "name": "params",
+          "name": "session_id",
           "required": true,
           "schema": {
-            "$ref": "#/components/schemas/SessionIdParams"
-          },
-          "x-zeroclaw-shape": "typed"
+            "type": "string"
+          }
         }
       ],
       "result": {
@@ -4080,6 +4233,10 @@
         "kind": "grant",
         "resource": "sessions",
         "verb": "read"
+      },
+      "x-zeroclaw-params": {
+        "shape": "typed",
+        "type": "SessionIdParams"
       }
     },
     {
@@ -4087,12 +4244,27 @@
       "paramStructure": "by-name",
       "params": [
         {
-          "name": "params",
-          "required": true,
+          "name": "limit",
+          "required": false,
           "schema": {
-            "$ref": "#/components/schemas/SessionListParams"
-          },
-          "x-zeroclaw-shape": "typed"
+            "format": "uint",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "query",
+          "required": false,
+          "schema": {
+            "description": "Full-text search query. When present, only sessions whose message\ncontent matches (via FTS5) are returned.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
         }
       ],
       "result": {
@@ -4106,6 +4278,10 @@
         "kind": "grant",
         "resource": "sessions",
         "verb": "read"
+      },
+      "x-zeroclaw-params": {
+        "shape": "typed",
+        "type": "SessionListParams"
       }
     },
     {
@@ -4123,6 +4299,9 @@
         "kind": "grant",
         "resource": "sessions",
         "verb": "read"
+      },
+      "x-zeroclaw-params": {
+        "shape": "none"
       }
     },
     {
@@ -4130,12 +4309,48 @@
       "paramStructure": "by-name",
       "params": [
         {
-          "name": "params",
+          "name": "before_index",
+          "required": false,
+          "schema": {
+            "default": null,
+            "format": "uint",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "cursor",
+          "required": false,
+          "schema": {
+            "description": "Presence of this field opts into bounded ACP cursor pagination.\n`null` requests the newest page; a string continues a walk.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "limit",
+          "required": false,
+          "schema": {
+            "default": null,
+            "format": "uint",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "session_id",
           "required": true,
           "schema": {
-            "$ref": "#/components/schemas/SessionMessagesParams"
-          },
-          "x-zeroclaw-shape": "typed"
+            "type": "string"
+          }
         }
       ],
       "result": {
@@ -4149,6 +4364,10 @@
         "kind": "grant",
         "resource": "sessions",
         "verb": "read"
+      },
+      "x-zeroclaw-params": {
+        "shape": "typed",
+        "type": "SessionMessagesParams"
       }
     },
     {
@@ -4156,12 +4375,11 @@
       "paramStructure": "by-name",
       "params": [
         {
-          "name": "params",
+          "name": "session_id",
           "required": true,
           "schema": {
-            "$ref": "#/components/schemas/SessionIdParams"
-          },
-          "x-zeroclaw-shape": "typed"
+            "type": "string"
+          }
         }
       ],
       "result": {
@@ -4175,6 +4393,10 @@
         "kind": "grant",
         "resource": "sessions",
         "verb": "read"
+      },
+      "x-zeroclaw-params": {
+        "shape": "typed",
+        "type": "SessionIdParams"
       }
     },
     {
@@ -4182,12 +4404,11 @@
       "paramStructure": "by-name",
       "params": [
         {
-          "name": "params",
+          "name": "session_id",
           "required": true,
           "schema": {
-            "$ref": "#/components/schemas/SessionIdParams"
-          },
-          "x-zeroclaw-shape": "typed"
+            "type": "string"
+          }
         }
       ],
       "result": {
@@ -4201,6 +4422,10 @@
         "kind": "grant",
         "resource": "sessions",
         "verb": "delete"
+      },
+      "x-zeroclaw-params": {
+        "shape": "typed",
+        "type": "SessionIdParams"
       }
     },
     {
@@ -4208,12 +4433,35 @@
       "paramStructure": "by-name",
       "params": [
         {
-          "name": "params",
+          "name": "decision",
           "required": true,
           "schema": {
-            "$ref": "#/components/schemas/SessionApproveParams"
-          },
-          "x-zeroclaw-shape": "typed"
+            "type": "string"
+          }
+        },
+        {
+          "name": "replacement",
+          "required": false,
+          "schema": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "request_id",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "session_id",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
         }
       ],
       "result": {
@@ -4227,6 +4475,10 @@
         "kind": "grant",
         "resource": "sessions",
         "verb": "update"
+      },
+      "x-zeroclaw-params": {
+        "shape": "typed",
+        "type": "SessionApproveParams"
       }
     },
     {
@@ -4234,12 +4486,11 @@
       "paramStructure": "by-name",
       "params": [
         {
-          "name": "params",
+          "name": "session_id",
           "required": true,
           "schema": {
-            "$ref": "#/components/schemas/SessionKillParams"
-          },
-          "x-zeroclaw-shape": "typed"
+            "type": "string"
+          }
         }
       ],
       "result": {
@@ -4253,6 +4504,10 @@
         "kind": "grant",
         "resource": "sessions",
         "verb": "delete"
+      },
+      "x-zeroclaw-params": {
+        "shape": "typed",
+        "type": "SessionKillParams"
       }
     },
     {
@@ -4260,12 +4515,45 @@
       "paramStructure": "by-name",
       "params": [
         {
-          "name": "params",
-          "required": true,
+          "name": "agent",
+          "required": false,
           "schema": {
-            "$ref": "#/components/schemas/MemoryListParams"
-          },
-          "x-zeroclaw-shape": "typed"
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "category",
+          "required": false,
+          "schema": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "plane",
+          "required": false,
+          "schema": {
+            "description": "Memory plane: `\"private\"` (the caller's own; the default for every\nauthenticated principal) or `\"shared\"` (honoured only for callers\nwith the admin bypass, audited).",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "session_id",
+          "required": false,
+          "schema": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
         }
       ],
       "result": {
@@ -4279,6 +4567,10 @@
         "kind": "grant",
         "resource": "memory",
         "verb": "read"
+      },
+      "x-zeroclaw-params": {
+        "shape": "typed",
+        "type": "MemoryListParams"
       }
     },
     {
@@ -4286,12 +4578,72 @@
       "paramStructure": "by-name",
       "params": [
         {
-          "name": "params",
+          "name": "agent",
+          "required": false,
+          "schema": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "limit",
+          "required": false,
+          "schema": {
+            "default": 10,
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        {
+          "name": "plane",
+          "required": false,
+          "schema": {
+            "description": "Memory plane; see `MemoryListParams::plane`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "query",
           "required": true,
           "schema": {
-            "$ref": "#/components/schemas/MemorySearchParams"
-          },
-          "x-zeroclaw-shape": "typed"
+            "type": "string"
+          }
+        },
+        {
+          "name": "session_id",
+          "required": false,
+          "schema": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "since",
+          "required": false,
+          "schema": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "until",
+          "required": false,
+          "schema": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
         }
       ],
       "result": {
@@ -4305,6 +4657,10 @@
         "kind": "grant",
         "resource": "memory",
         "verb": "read"
+      },
+      "x-zeroclaw-params": {
+        "shape": "typed",
+        "type": "MemorySearchParams"
       }
     },
     {
@@ -4312,12 +4668,32 @@
       "paramStructure": "by-name",
       "params": [
         {
-          "name": "params",
+          "name": "agent",
+          "required": false,
+          "schema": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "key",
           "required": true,
           "schema": {
-            "$ref": "#/components/schemas/MemoryGetParams"
-          },
-          "x-zeroclaw-shape": "typed"
+            "type": "string"
+          }
+        },
+        {
+          "name": "plane",
+          "required": false,
+          "schema": {
+            "description": "Memory plane; see `MemoryListParams::plane`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
         }
       ],
       "result": {
@@ -4331,6 +4707,10 @@
         "kind": "grant",
         "resource": "memory",
         "verb": "read"
+      },
+      "x-zeroclaw-params": {
+        "shape": "typed",
+        "type": "MemoryGetParams"
       }
     },
     {
@@ -4338,12 +4718,59 @@
       "paramStructure": "by-name",
       "params": [
         {
-          "name": "params",
+          "name": "agent",
+          "required": false,
+          "schema": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "category",
+          "required": false,
+          "schema": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "content",
           "required": true,
           "schema": {
-            "$ref": "#/components/schemas/MemoryStoreParams"
-          },
-          "x-zeroclaw-shape": "typed"
+            "type": "string"
+          }
+        },
+        {
+          "name": "key",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "plane",
+          "required": false,
+          "schema": {
+            "description": "Memory plane; see `MemoryListParams::plane`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "session_id",
+          "required": false,
+          "schema": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
         }
       ],
       "result": {
@@ -4357,6 +4784,10 @@
         "kind": "grant",
         "resource": "memory",
         "verb": "create"
+      },
+      "x-zeroclaw-params": {
+        "shape": "typed",
+        "type": "MemoryStoreParams"
       }
     },
     {
@@ -4364,12 +4795,32 @@
       "paramStructure": "by-name",
       "params": [
         {
-          "name": "params",
+          "name": "agent",
+          "required": false,
+          "schema": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "key",
           "required": true,
           "schema": {
-            "$ref": "#/components/schemas/MemoryDeleteParams"
-          },
-          "x-zeroclaw-shape": "typed"
+            "type": "string"
+          }
+        },
+        {
+          "name": "plane",
+          "required": false,
+          "schema": {
+            "description": "Memory plane; see `MemoryListParams::plane`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
         }
       ],
       "result": {
@@ -4383,6 +4834,10 @@
         "kind": "grant",
         "resource": "memory",
         "verb": "delete"
+      },
+      "x-zeroclaw-params": {
+        "shape": "typed",
+        "type": "MemoryDeleteParams"
       }
     },
     {
@@ -4401,6 +4856,9 @@
         "kind": "grant",
         "resource": "cron",
         "verb": "read"
+      },
+      "x-zeroclaw-params": {
+        "shape": "none"
       }
     },
     {
@@ -4408,12 +4866,11 @@
       "paramStructure": "by-name",
       "params": [
         {
-          "name": "params",
+          "name": "id",
           "required": true,
           "schema": {
-            "$ref": "#/components/schemas/CronIdParams"
-          },
-          "x-zeroclaw-shape": "typed"
+            "type": "string"
+          }
         }
       ],
       "result": {
@@ -4428,22 +4885,16 @@
         "kind": "grant",
         "resource": "cron",
         "verb": "read"
+      },
+      "x-zeroclaw-params": {
+        "shape": "typed",
+        "type": "CronIdParams"
       }
     },
     {
       "name": "cron/add",
       "paramStructure": "by-name",
-      "params": [
-        {
-          "name": "params",
-          "required": true,
-          "schema": {
-            "description": "`CronAddParams`, defined in `zeroclaw-runtime`; no schema is exported yet."
-          },
-          "x-zeroclaw-owner": "zeroclaw-runtime",
-          "x-zeroclaw-shape": "external"
-        }
-      ],
+      "params": [],
       "result": {
         "name": "result",
         "schema": {
@@ -4456,6 +4907,12 @@
         "kind": "grant",
         "resource": "cron",
         "verb": "create"
+      },
+      "x-zeroclaw-params": {
+        "description": "`CronAddParams`, defined in `zeroclaw-runtime`; no schema is exported yet, so its keys are not enumerable here.",
+        "owner": "zeroclaw-runtime",
+        "shape": "external",
+        "type": "CronAddParams"
       }
     },
     {
@@ -4463,12 +4920,78 @@
       "paramStructure": "by-name",
       "params": [
         {
-          "name": "params",
+          "name": "agent",
           "required": true,
           "schema": {
-            "$ref": "#/components/schemas/CronPatchParams"
-          },
-          "x-zeroclaw-shape": "typed"
+            "type": "string"
+          }
+        },
+        {
+          "name": "clear_tz",
+          "required": false,
+          "schema": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "command",
+          "required": false,
+          "schema": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "id",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "name",
+          "required": false,
+          "schema": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "prompt",
+          "required": false,
+          "schema": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "schedule",
+          "required": false,
+          "schema": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "tz",
+          "required": false,
+          "schema": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
         }
       ],
       "result": {
@@ -4483,6 +5006,10 @@
         "kind": "grant",
         "resource": "cron",
         "verb": "update"
+      },
+      "x-zeroclaw-params": {
+        "shape": "typed",
+        "type": "CronPatchParams"
       }
     },
     {
@@ -4490,12 +5017,11 @@
       "paramStructure": "by-name",
       "params": [
         {
-          "name": "params",
+          "name": "id",
           "required": true,
           "schema": {
-            "$ref": "#/components/schemas/CronIdParams"
-          },
-          "x-zeroclaw-shape": "typed"
+            "type": "string"
+          }
         }
       ],
       "result": {
@@ -4509,6 +5035,10 @@
         "kind": "grant",
         "resource": "cron",
         "verb": "delete"
+      },
+      "x-zeroclaw-params": {
+        "shape": "typed",
+        "type": "CronIdParams"
       }
     },
     {
@@ -4516,12 +5046,23 @@
       "paramStructure": "by-name",
       "params": [
         {
-          "name": "params",
+          "name": "id",
           "required": true,
           "schema": {
-            "$ref": "#/components/schemas/CronRunsParams"
-          },
-          "x-zeroclaw-shape": "typed"
+            "type": "string"
+          }
+        },
+        {
+          "name": "limit",
+          "required": false,
+          "schema": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
         }
       ],
       "result": {
@@ -4536,6 +5077,10 @@
         "kind": "grant",
         "resource": "cron",
         "verb": "read"
+      },
+      "x-zeroclaw-params": {
+        "shape": "typed",
+        "type": "CronRunsParams"
       }
     },
     {
@@ -4543,12 +5088,11 @@
       "paramStructure": "by-name",
       "params": [
         {
-          "name": "params",
+          "name": "id",
           "required": true,
           "schema": {
-            "$ref": "#/components/schemas/CronIdParams"
-          },
-          "x-zeroclaw-shape": "typed"
+            "type": "string"
+          }
         }
       ],
       "result": {
@@ -4562,21 +5106,16 @@
         "kind": "grant",
         "resource": "cron",
         "verb": "execute"
+      },
+      "x-zeroclaw-params": {
+        "shape": "typed",
+        "type": "CronIdParams"
       }
     },
     {
       "name": "cron/settings",
       "paramStructure": "by-name",
-      "params": [
-        {
-          "name": "params",
-          "required": true,
-          "schema": {
-            "description": "Free-form JSON shaped by the daemon at runtime."
-          },
-          "x-zeroclaw-shape": "untyped"
-        }
-      ],
+      "params": [],
       "result": {
         "name": "result",
         "schema": {
@@ -4588,6 +5127,10 @@
         "kind": "grant",
         "resource": "cron",
         "verb": "read"
+      },
+      "x-zeroclaw-params": {
+        "description": "Free-form JSON object shaped by the daemon at runtime; keys are not enumerable here.",
+        "shape": "untyped"
       }
     },
     {
@@ -4595,12 +5138,14 @@
       "paramStructure": "by-name",
       "params": [
         {
-          "name": "params",
-          "required": true,
+          "name": "prop",
+          "required": false,
           "schema": {
-            "$ref": "#/components/schemas/ConfigGetParams"
-          },
-          "x-zeroclaw-shape": "typed"
+            "type": [
+              "string",
+              "null"
+            ]
+          }
         }
       ],
       "result": {
@@ -4614,6 +5159,10 @@
         "kind": "grant",
         "resource": "config",
         "verb": "read"
+      },
+      "x-zeroclaw-params": {
+        "shape": "typed",
+        "type": "ConfigGetParams"
       }
     },
     {
@@ -4621,12 +5170,16 @@
       "paramStructure": "by-name",
       "params": [
         {
-          "name": "params",
+          "name": "prop",
           "required": true,
           "schema": {
-            "$ref": "#/components/schemas/ConfigSetParams"
-          },
-          "x-zeroclaw-shape": "typed"
+            "type": "string"
+          }
+        },
+        {
+          "name": "value",
+          "required": true,
+          "schema": true
         }
       ],
       "result": {
@@ -4640,6 +5193,10 @@
         "kind": "grant",
         "resource": "config",
         "verb": "update"
+      },
+      "x-zeroclaw-params": {
+        "shape": "typed",
+        "type": "ConfigSetParams"
       }
     },
     {
@@ -4647,12 +5204,14 @@
       "paramStructure": "by-name",
       "params": [
         {
-          "name": "params",
+          "name": "sets",
           "required": true,
           "schema": {
-            "$ref": "#/components/schemas/ConfigSetManyParams"
-          },
-          "x-zeroclaw-shape": "typed"
+            "items": {
+              "$ref": "#/components/schemas/ConfigSetParams"
+            },
+            "type": "array"
+          }
         }
       ],
       "result": {
@@ -4666,6 +5225,10 @@
         "kind": "grant",
         "resource": "config",
         "verb": "update"
+      },
+      "x-zeroclaw-params": {
+        "shape": "typed",
+        "type": "ConfigSetManyParams"
       }
     },
     {
@@ -4683,6 +5246,9 @@
         "kind": "grant",
         "resource": "config",
         "verb": "read"
+      },
+      "x-zeroclaw-params": {
+        "shape": "none"
       }
     },
     {
@@ -4700,6 +5266,9 @@
         "kind": "grant",
         "resource": "config",
         "verb": "update"
+      },
+      "x-zeroclaw-params": {
+        "shape": "none"
       }
     },
     {
@@ -4707,12 +5276,14 @@
       "paramStructure": "by-name",
       "params": [
         {
-          "name": "params",
-          "required": true,
+          "name": "prefix",
+          "required": false,
           "schema": {
-            "$ref": "#/components/schemas/ConfigListParams"
-          },
-          "x-zeroclaw-shape": "typed"
+            "type": [
+              "string",
+              "null"
+            ]
+          }
         }
       ],
       "result": {
@@ -4726,6 +5297,10 @@
         "kind": "grant",
         "resource": "config",
         "verb": "read"
+      },
+      "x-zeroclaw-params": {
+        "shape": "typed",
+        "type": "ConfigListParams"
       }
     },
     {
@@ -4733,12 +5308,11 @@
       "paramStructure": "by-name",
       "params": [
         {
-          "name": "params",
+          "name": "prop",
           "required": true,
           "schema": {
-            "$ref": "#/components/schemas/ConfigDeleteParams"
-          },
-          "x-zeroclaw-shape": "typed"
+            "type": "string"
+          }
         }
       ],
       "result": {
@@ -4752,6 +5326,10 @@
         "kind": "grant",
         "resource": "config",
         "verb": "delete"
+      },
+      "x-zeroclaw-params": {
+        "shape": "typed",
+        "type": "ConfigDeleteParams"
       }
     },
     {
@@ -4759,12 +5337,11 @@
       "paramStructure": "by-name",
       "params": [
         {
-          "name": "params",
+          "name": "path",
           "required": true,
           "schema": {
-            "$ref": "#/components/schemas/ConfigMapKeysParams"
-          },
-          "x-zeroclaw-shape": "typed"
+            "type": "string"
+          }
         }
       ],
       "result": {
@@ -4778,6 +5355,10 @@
         "kind": "grant",
         "resource": "config",
         "verb": "read"
+      },
+      "x-zeroclaw-params": {
+        "shape": "typed",
+        "type": "ConfigMapKeysParams"
       }
     },
     {
@@ -4785,12 +5366,11 @@
       "paramStructure": "by-name",
       "params": [
         {
-          "name": "params",
+          "name": "source",
           "required": true,
           "schema": {
-            "$ref": "#/components/schemas/ConfigResolveAliasSourceParams"
-          },
-          "x-zeroclaw-shape": "typed"
+            "$ref": "#/components/schemas/AliasSource"
+          }
         }
       ],
       "result": {
@@ -4804,6 +5384,10 @@
         "kind": "grant",
         "resource": "config",
         "verb": "read"
+      },
+      "x-zeroclaw-params": {
+        "shape": "typed",
+        "type": "ConfigResolveAliasSourceParams"
       }
     },
     {
@@ -4811,12 +5395,18 @@
       "paramStructure": "by-name",
       "params": [
         {
-          "name": "params",
+          "name": "key",
           "required": true,
           "schema": {
-            "$ref": "#/components/schemas/ConfigMapKeyCreateParams"
-          },
-          "x-zeroclaw-shape": "typed"
+            "type": "string"
+          }
+        },
+        {
+          "name": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
         }
       ],
       "result": {
@@ -4830,6 +5420,10 @@
         "kind": "grant",
         "resource": "config",
         "verb": "create"
+      },
+      "x-zeroclaw-params": {
+        "shape": "typed",
+        "type": "ConfigMapKeyCreateParams"
       }
     },
     {
@@ -4837,12 +5431,18 @@
       "paramStructure": "by-name",
       "params": [
         {
-          "name": "params",
+          "name": "key",
           "required": true,
           "schema": {
-            "$ref": "#/components/schemas/ConfigMapKeyDeleteParams"
-          },
-          "x-zeroclaw-shape": "typed"
+            "type": "string"
+          }
+        },
+        {
+          "name": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
         }
       ],
       "result": {
@@ -4856,6 +5456,10 @@
         "kind": "grant",
         "resource": "config",
         "verb": "delete"
+      },
+      "x-zeroclaw-params": {
+        "shape": "typed",
+        "type": "ConfigMapKeyDeleteParams"
       }
     },
     {
@@ -4863,12 +5467,25 @@
       "paramStructure": "by-name",
       "params": [
         {
-          "name": "params",
+          "name": "from",
           "required": true,
           "schema": {
-            "$ref": "#/components/schemas/ConfigMapKeyRenameParams"
-          },
-          "x-zeroclaw-shape": "typed"
+            "type": "string"
+          }
+        },
+        {
+          "name": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "to",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
         }
       ],
       "result": {
@@ -4882,6 +5499,10 @@
         "kind": "grant",
         "resource": "config",
         "verb": "update"
+      },
+      "x-zeroclaw-params": {
+        "shape": "typed",
+        "type": "ConfigMapKeyRenameParams"
       }
     },
     {
@@ -4899,6 +5520,9 @@
         "kind": "grant",
         "resource": "config",
         "verb": "read"
+      },
+      "x-zeroclaw-params": {
+        "shape": "none"
       }
     },
     {
@@ -4916,6 +5540,9 @@
         "kind": "grant",
         "resource": "agents",
         "verb": "read"
+      },
+      "x-zeroclaw-params": {
+        "shape": "none"
       }
     },
     {
@@ -4933,6 +5560,9 @@
         "kind": "grant",
         "resource": "agents",
         "verb": "read"
+      },
+      "x-zeroclaw-params": {
+        "shape": "none"
       }
     },
     {
@@ -4940,12 +5570,34 @@
       "paramStructure": "by-name",
       "params": [
         {
-          "name": "params",
-          "required": true,
+          "name": "agent",
+          "required": false,
           "schema": {
-            "$ref": "#/components/schemas/CostQueryParams"
-          },
-          "x-zeroclaw-shape": "typed"
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "from",
+          "required": false,
+          "schema": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "to",
+          "required": false,
+          "schema": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
         }
       ],
       "result": {
@@ -4960,6 +5612,10 @@
         "kind": "grant",
         "resource": "cost",
         "verb": "read"
+      },
+      "x-zeroclaw-params": {
+        "shape": "typed",
+        "type": "CostQueryParams"
       }
     },
     {
@@ -4977,6 +5633,9 @@
         "kind": "grant",
         "resource": "cost",
         "verb": "read"
+      },
+      "x-zeroclaw-params": {
+        "shape": "none"
       }
     },
     {
@@ -4994,6 +5653,9 @@
         "kind": "grant",
         "resource": "skills",
         "verb": "read"
+      },
+      "x-zeroclaw-params": {
+        "shape": "none"
       }
     },
     {
@@ -5001,12 +5663,14 @@
       "paramStructure": "by-name",
       "params": [
         {
-          "name": "params",
-          "required": true,
+          "name": "bundle",
+          "required": false,
           "schema": {
-            "$ref": "#/components/schemas/SkillsListParams"
-          },
-          "x-zeroclaw-shape": "typed"
+            "type": [
+              "string",
+              "null"
+            ]
+          }
         }
       ],
       "result": {
@@ -5021,6 +5685,10 @@
         "kind": "grant",
         "resource": "skills",
         "verb": "read"
+      },
+      "x-zeroclaw-params": {
+        "shape": "typed",
+        "type": "SkillsListParams"
       }
     },
     {
@@ -5028,12 +5696,18 @@
       "paramStructure": "by-name",
       "params": [
         {
-          "name": "params",
+          "name": "bundle",
           "required": true,
           "schema": {
-            "$ref": "#/components/schemas/SkillsReadParams"
-          },
-          "x-zeroclaw-shape": "typed"
+            "type": "string"
+          }
+        },
+        {
+          "name": "name",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
         }
       ],
       "result": {
@@ -5048,22 +5722,16 @@
         "kind": "grant",
         "resource": "skills",
         "verb": "read"
+      },
+      "x-zeroclaw-params": {
+        "shape": "typed",
+        "type": "SkillsReadParams"
       }
     },
     {
       "name": "skills/write",
       "paramStructure": "by-name",
-      "params": [
-        {
-          "name": "params",
-          "required": true,
-          "schema": {
-            "description": "`SkillsWriteParams`, defined in `zeroclaw-runtime`; no schema is exported yet."
-          },
-          "x-zeroclaw-owner": "zeroclaw-runtime",
-          "x-zeroclaw-shape": "external"
-        }
-      ],
+      "params": [],
       "result": {
         "name": "result",
         "schema": {
@@ -5075,6 +5743,12 @@
         "kind": "grant",
         "resource": "skills",
         "verb": "update"
+      },
+      "x-zeroclaw-params": {
+        "description": "`SkillsWriteParams`, defined in `zeroclaw-runtime`; no schema is exported yet, so its keys are not enumerable here.",
+        "owner": "zeroclaw-runtime",
+        "shape": "external",
+        "type": "SkillsWriteParams"
       }
     },
     {
@@ -5082,12 +5756,18 @@
       "paramStructure": "by-name",
       "params": [
         {
-          "name": "params",
+          "name": "bundle",
           "required": true,
           "schema": {
-            "$ref": "#/components/schemas/SkillsDeleteParams"
-          },
-          "x-zeroclaw-shape": "typed"
+            "type": "string"
+          }
+        },
+        {
+          "name": "name",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
         }
       ],
       "result": {
@@ -5101,6 +5781,10 @@
         "kind": "grant",
         "resource": "skills",
         "verb": "delete"
+      },
+      "x-zeroclaw-params": {
+        "shape": "typed",
+        "type": "SkillsDeleteParams"
       }
     },
     {
@@ -5108,12 +5792,14 @@
       "paramStructure": "by-name",
       "params": [
         {
-          "name": "params",
-          "required": true,
+          "name": "agent",
+          "required": false,
           "schema": {
-            "$ref": "#/components/schemas/PersonalityListParams"
-          },
-          "x-zeroclaw-shape": "typed"
+            "type": [
+              "string",
+              "null"
+            ]
+          }
         }
       ],
       "result": {
@@ -5127,6 +5813,10 @@
         "kind": "grant",
         "resource": "personality",
         "verb": "read"
+      },
+      "x-zeroclaw-params": {
+        "shape": "typed",
+        "type": "PersonalityListParams"
       }
     },
     {
@@ -5134,12 +5824,18 @@
       "paramStructure": "by-name",
       "params": [
         {
-          "name": "params",
+          "name": "agent",
           "required": true,
           "schema": {
-            "$ref": "#/components/schemas/PersonalityGetParams"
-          },
-          "x-zeroclaw-shape": "typed"
+            "type": "string"
+          }
+        },
+        {
+          "name": "filename",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
         }
       ],
       "result": {
@@ -5153,6 +5849,10 @@
         "kind": "grant",
         "resource": "personality",
         "verb": "read"
+      },
+      "x-zeroclaw-params": {
+        "shape": "typed",
+        "type": "PersonalityGetParams"
       }
     },
     {
@@ -5160,12 +5860,25 @@
       "paramStructure": "by-name",
       "params": [
         {
-          "name": "params",
+          "name": "agent",
           "required": true,
           "schema": {
-            "$ref": "#/components/schemas/PersonalityPutParams"
-          },
-          "x-zeroclaw-shape": "typed"
+            "type": "string"
+          }
+        },
+        {
+          "name": "content",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "filename",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
         }
       ],
       "result": {
@@ -5179,6 +5892,10 @@
         "kind": "grant",
         "resource": "personality",
         "verb": "update"
+      },
+      "x-zeroclaw-params": {
+        "shape": "typed",
+        "type": "PersonalityPutParams"
       }
     },
     {
@@ -5186,12 +5903,14 @@
       "paramStructure": "by-name",
       "params": [
         {
-          "name": "params",
-          "required": true,
+          "name": "agent",
+          "required": false,
           "schema": {
-            "$ref": "#/components/schemas/PersonalityTemplatesParams"
-          },
-          "x-zeroclaw-shape": "typed"
+            "type": [
+              "string",
+              "null"
+            ]
+          }
         }
       ],
       "result": {
@@ -5205,6 +5924,10 @@
         "kind": "grant",
         "resource": "personality",
         "verb": "read"
+      },
+      "x-zeroclaw-params": {
+        "shape": "typed",
+        "type": "PersonalityTemplatesParams"
       }
     },
     {
@@ -5222,6 +5945,9 @@
         "kind": "grant",
         "resource": "config",
         "verb": "read"
+      },
+      "x-zeroclaw-params": {
+        "shape": "none"
       }
     },
     {
@@ -5239,6 +5965,9 @@
         "kind": "grant",
         "resource": "config",
         "verb": "read"
+      },
+      "x-zeroclaw-params": {
+        "shape": "none"
       }
     },
     {
@@ -5256,6 +5985,9 @@
         "kind": "grant",
         "resource": "config",
         "verb": "read"
+      },
+      "x-zeroclaw-params": {
+        "shape": "none"
       }
     },
     {
@@ -5263,12 +5995,12 @@
       "paramStructure": "by-name",
       "params": [
         {
-          "name": "params",
+          "name": "model_provider",
           "required": true,
           "schema": {
-            "$ref": "#/components/schemas/CatalogModelsParams"
-          },
-          "x-zeroclaw-shape": "typed"
+            "description": "Accepts `model_provider` or aliased `provider` (gateway compat).",
+            "type": "string"
+          }
         }
       ],
       "result": {
@@ -5282,6 +6014,10 @@
         "kind": "grant",
         "resource": "config",
         "verb": "read"
+      },
+      "x-zeroclaw-params": {
+        "shape": "typed",
+        "type": "CatalogModelsParams"
       }
     },
     {
@@ -5299,6 +6035,9 @@
         "kind": "grant",
         "resource": "logs",
         "verb": "read"
+      },
+      "x-zeroclaw-params": {
+        "shape": "none"
       }
     },
     {
@@ -5306,12 +6045,165 @@
       "paramStructure": "by-name",
       "params": [
         {
-          "name": "params",
-          "required": true,
+          "name": "action",
+          "required": false,
           "schema": {
-            "$ref": "#/components/schemas/LogsQueryParams"
-          },
-          "x-zeroclaw-shape": "typed"
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "category",
+          "required": false,
+          "schema": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "hide_internal",
+          "required": false,
+          "schema": {
+            "default": false,
+            "type": "boolean"
+          }
+        },
+        {
+          "name": "limit",
+          "required": false,
+          "schema": {
+            "default": null,
+            "format": "uint",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "outcome",
+          "required": false,
+          "schema": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "q",
+          "required": false,
+          "schema": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "severity_min",
+          "required": false,
+          "schema": {
+            "default": null,
+            "format": "uint8",
+            "maximum": 255,
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "since_ts",
+          "required": false,
+          "schema": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "sop_run_id",
+          "required": false,
+          "schema": {
+            "default": null,
+            "description": "Exact SOP run correlation. Uses the canonical persisted-log\nattribution filter, including its compatibility bridge for older rows.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "trace_id",
+          "required": false,
+          "schema": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "until_id",
+          "required": false,
+          "schema": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "until_line_offset",
+          "required": false,
+          "schema": {
+            "default": null,
+            "description": "Byte offset to resume reading from. Set from the previous\n`LogsQueryResult::next_cursor_line_offset` for deterministic\npagination regardless of id ordering.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "until_segment_cursor",
+          "required": false,
+          "schema": {
+            "default": null,
+            "description": "Segment-aware cursor. Set from `LogsQueryResult::next_segment_cursor`\nto paginate across rotated archive files. Takes precedence over\n`until_line_offset` when both are supplied.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "until_ts",
+          "required": false,
+          "schema": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
         }
       ],
       "result": {
@@ -5325,6 +6217,10 @@
         "kind": "grant",
         "resource": "logs",
         "verb": "read"
+      },
+      "x-zeroclaw-params": {
+        "shape": "typed",
+        "type": "LogsQueryParams"
       }
     },
     {
@@ -5332,12 +6228,11 @@
       "paramStructure": "by-name",
       "params": [
         {
-          "name": "params",
+          "name": "id",
           "required": true,
           "schema": {
-            "$ref": "#/components/schemas/LogsGetParams"
-          },
-          "x-zeroclaw-shape": "typed"
+            "type": "string"
+          }
         }
       ],
       "result": {
@@ -5351,6 +6246,30 @@
         "kind": "grant",
         "resource": "logs",
         "verb": "read"
+      },
+      "x-zeroclaw-params": {
+        "shape": "typed",
+        "type": "LogsGetParams"
+      }
+    },
+    {
+      "name": "events/history",
+      "paramStructure": "by-name",
+      "params": [],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/EventsHistoryResult"
+        },
+        "x-zeroclaw-shape": "typed"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "logs",
+        "verb": "read"
+      },
+      "x-zeroclaw-params": {
+        "shape": "none"
       }
     },
     {
@@ -5368,6 +6287,9 @@
         "kind": "grant",
         "resource": "tui",
         "verb": "read"
+      },
+      "x-zeroclaw-params": {
+        "shape": "none"
       }
     },
     {
@@ -5375,12 +6297,21 @@
       "paramStructure": "by-name",
       "params": [
         {
-          "name": "params",
+          "name": "files",
           "required": true,
           "schema": {
-            "$ref": "#/components/schemas/FileAttachParams"
-          },
-          "x-zeroclaw-shape": "typed"
+            "items": {
+              "$ref": "#/components/schemas/FileEntry"
+            },
+            "type": "array"
+          }
+        },
+        {
+          "name": "session_id",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
         }
       ],
       "result": {
@@ -5394,22 +6325,16 @@
         "kind": "grant",
         "resource": "files",
         "verb": "create"
+      },
+      "x-zeroclaw-params": {
+        "shape": "typed",
+        "type": "FileAttachParams"
       }
     },
     {
       "name": "fs/list_dir",
       "paramStructure": "by-name",
-      "params": [
-        {
-          "name": "params",
-          "required": true,
-          "schema": {
-            "description": "`FsListDirRequest`, defined in `zeroclaw-api`; no schema is exported yet."
-          },
-          "x-zeroclaw-owner": "zeroclaw-api",
-          "x-zeroclaw-shape": "external"
-        }
-      ],
+      "params": [],
       "result": {
         "name": "result",
         "schema": {
@@ -5422,6 +6347,12 @@
         "kind": "grant",
         "resource": "files",
         "verb": "read"
+      },
+      "x-zeroclaw-params": {
+        "description": "`FsListDirRequest`, defined in `zeroclaw-api`; no schema is exported yet, so its keys are not enumerable here.",
+        "owner": "zeroclaw-api",
+        "shape": "external",
+        "type": "FsListDirRequest"
       }
     },
     {
@@ -5439,21 +6370,15 @@
         "kind": "grant",
         "resource": "locales",
         "verb": "read"
+      },
+      "x-zeroclaw-params": {
+        "shape": "none"
       }
     },
     {
       "name": "locales/fetch",
       "paramStructure": "by-name",
-      "params": [
-        {
-          "name": "params",
-          "required": true,
-          "schema": {
-            "description": "Free-form JSON shaped by the daemon at runtime."
-          },
-          "x-zeroclaw-shape": "untyped"
-        }
-      ],
+      "params": [],
       "result": {
         "name": "result",
         "schema": {
@@ -5465,6 +6390,10 @@
         "kind": "grant",
         "resource": "locales",
         "verb": "read"
+      },
+      "x-zeroclaw-params": {
+        "description": "Free-form JSON object shaped by the daemon at runtime; keys are not enumerable here.",
+        "shape": "untyped"
       }
     },
     {
@@ -5482,22 +6411,15 @@
         "kind": "grant",
         "resource": "quickstart",
         "verb": "read"
+      },
+      "x-zeroclaw-params": {
+        "shape": "none"
       }
     },
     {
       "name": "quickstart/fields",
       "paramStructure": "by-name",
-      "params": [
-        {
-          "name": "params",
-          "required": true,
-          "schema": {
-            "description": "`QuickstartFieldsParams`, defined in `zeroclaw-runtime`; no schema is exported yet."
-          },
-          "x-zeroclaw-owner": "zeroclaw-runtime",
-          "x-zeroclaw-shape": "external"
-        }
-      ],
+      "params": [],
       "result": {
         "name": "result",
         "schema": {
@@ -5510,6 +6432,12 @@
         "kind": "grant",
         "resource": "quickstart",
         "verb": "read"
+      },
+      "x-zeroclaw-params": {
+        "description": "`QuickstartFieldsParams`, defined in `zeroclaw-runtime`; no schema is exported yet, so its keys are not enumerable here.",
+        "owner": "zeroclaw-runtime",
+        "shape": "external",
+        "type": "QuickstartFieldsParams"
       }
     },
     {
@@ -5517,12 +6445,11 @@
       "paramStructure": "by-name",
       "params": [
         {
-          "name": "params",
+          "name": "submission",
           "required": true,
           "schema": {
-            "$ref": "#/components/schemas/QuickstartValidateParams"
-          },
-          "x-zeroclaw-shape": "typed"
+            "$ref": "#/components/schemas/BuilderSubmission"
+          }
         }
       ],
       "result": {
@@ -5537,6 +6464,10 @@
         "kind": "grant",
         "resource": "quickstart",
         "verb": "read"
+      },
+      "x-zeroclaw-params": {
+        "shape": "typed",
+        "type": "QuickstartValidateParams"
       }
     },
     {
@@ -5544,12 +6475,11 @@
       "paramStructure": "by-name",
       "params": [
         {
-          "name": "params",
+          "name": "submission",
           "required": true,
           "schema": {
-            "$ref": "#/components/schemas/QuickstartApplyParams"
-          },
-          "x-zeroclaw-shape": "typed"
+            "$ref": "#/components/schemas/BuilderSubmission"
+          }
         }
       ],
       "result": {
@@ -5564,22 +6494,16 @@
         "kind": "grant",
         "resource": "quickstart",
         "verb": "execute"
+      },
+      "x-zeroclaw-params": {
+        "shape": "typed",
+        "type": "QuickstartApplyParams"
       }
     },
     {
       "name": "quickstart/dismiss",
       "paramStructure": "by-name",
-      "params": [
-        {
-          "name": "params",
-          "required": true,
-          "schema": {
-            "description": "`QuickstartDismissParams`, defined in `zeroclaw-runtime`; no schema is exported yet."
-          },
-          "x-zeroclaw-owner": "zeroclaw-runtime",
-          "x-zeroclaw-shape": "external"
-        }
-      ],
+      "params": [],
       "result": {
         "name": "result",
         "schema": {
@@ -5591,21 +6515,18 @@
         "kind": "grant",
         "resource": "quickstart",
         "verb": "update"
+      },
+      "x-zeroclaw-params": {
+        "description": "`QuickstartDismissParams`, defined in `zeroclaw-runtime`; no schema is exported yet, so its keys are not enumerable here.",
+        "owner": "zeroclaw-runtime",
+        "shape": "external",
+        "type": "QuickstartDismissParams"
       }
     },
     {
       "name": "cert/renew",
       "paramStructure": "by-name",
-      "params": [
-        {
-          "name": "params",
-          "required": true,
-          "schema": {
-            "description": "Free-form JSON shaped by the daemon at runtime."
-          },
-          "x-zeroclaw-shape": "untyped"
-        }
-      ],
+      "params": [],
       "result": {
         "name": "result",
         "schema": {
@@ -5615,6 +6536,10 @@
       },
       "x-zeroclaw-authorization": {
         "kind": "handshake"
+      },
+      "x-zeroclaw-params": {
+        "description": "Free-form JSON object shaped by the daemon at runtime; keys are not enumerable here.",
+        "shape": "untyped"
       }
     },
     {
@@ -5632,22 +6557,15 @@
         "kind": "grant",
         "resource": "sops",
         "verb": "read"
+      },
+      "x-zeroclaw-params": {
+        "shape": "none"
       }
     },
     {
       "name": "sops/get",
       "paramStructure": "by-name",
-      "params": [
-        {
-          "name": "params",
-          "required": true,
-          "schema": {
-            "description": "`SopSelectRequest`, defined in `zeroclaw-api`; no schema is exported yet."
-          },
-          "x-zeroclaw-owner": "zeroclaw-api",
-          "x-zeroclaw-shape": "external"
-        }
-      ],
+      "params": [],
       "result": {
         "name": "result",
         "schema": {
@@ -5660,22 +6578,18 @@
         "kind": "grant",
         "resource": "sops",
         "verb": "read"
+      },
+      "x-zeroclaw-params": {
+        "description": "`SopSelectRequest`, defined in `zeroclaw-api`; no schema is exported yet, so its keys are not enumerable here.",
+        "owner": "zeroclaw-api",
+        "shape": "external",
+        "type": "SopSelectRequest"
       }
     },
     {
       "name": "sops/graph",
       "paramStructure": "by-name",
-      "params": [
-        {
-          "name": "params",
-          "required": true,
-          "schema": {
-            "description": "`SopSelectRequest`, defined in `zeroclaw-api`; no schema is exported yet."
-          },
-          "x-zeroclaw-owner": "zeroclaw-api",
-          "x-zeroclaw-shape": "external"
-        }
-      ],
+      "params": [],
       "result": {
         "name": "result",
         "schema": {
@@ -5687,22 +6601,18 @@
         "kind": "grant",
         "resource": "sops",
         "verb": "read"
+      },
+      "x-zeroclaw-params": {
+        "description": "`SopSelectRequest`, defined in `zeroclaw-api`; no schema is exported yet, so its keys are not enumerable here.",
+        "owner": "zeroclaw-api",
+        "shape": "external",
+        "type": "SopSelectRequest"
       }
     },
     {
       "name": "sops/run",
       "paramStructure": "by-name",
-      "params": [
-        {
-          "name": "params",
-          "required": true,
-          "schema": {
-            "description": "`SopRunRequest`, defined in `zeroclaw-api`; no schema is exported yet."
-          },
-          "x-zeroclaw-owner": "zeroclaw-api",
-          "x-zeroclaw-shape": "external"
-        }
-      ],
+      "params": [],
       "result": {
         "name": "result",
         "schema": {
@@ -5715,22 +6625,18 @@
         "kind": "grant",
         "resource": "sops",
         "verb": "execute"
+      },
+      "x-zeroclaw-params": {
+        "description": "`SopRunRequest`, defined in `zeroclaw-api`; no schema is exported yet, so its keys are not enumerable here.",
+        "owner": "zeroclaw-api",
+        "shape": "external",
+        "type": "SopRunRequest"
       }
     },
     {
       "name": "sops/runs",
       "paramStructure": "by-name",
-      "params": [
-        {
-          "name": "params",
-          "required": true,
-          "schema": {
-            "description": "`SopRunsRequest`, defined in `zeroclaw-api`; no schema is exported yet."
-          },
-          "x-zeroclaw-owner": "zeroclaw-api",
-          "x-zeroclaw-shape": "external"
-        }
-      ],
+      "params": [],
       "result": {
         "name": "result",
         "schema": {
@@ -5742,22 +6648,18 @@
         "kind": "grant",
         "resource": "sops",
         "verb": "read"
+      },
+      "x-zeroclaw-params": {
+        "description": "`SopRunsRequest`, defined in `zeroclaw-api`; no schema is exported yet, so its keys are not enumerable here.",
+        "owner": "zeroclaw-api",
+        "shape": "external",
+        "type": "SopRunsRequest"
       }
     },
     {
       "name": "sops/run-detail",
       "paramStructure": "by-name",
-      "params": [
-        {
-          "name": "params",
-          "required": true,
-          "schema": {
-            "description": "`SopRunDetailRequest`, defined in `zeroclaw-api`; no schema is exported yet."
-          },
-          "x-zeroclaw-owner": "zeroclaw-api",
-          "x-zeroclaw-shape": "external"
-        }
-      ],
+      "params": [],
       "result": {
         "name": "result",
         "schema": {
@@ -5769,22 +6671,18 @@
         "kind": "grant",
         "resource": "sops",
         "verb": "read"
+      },
+      "x-zeroclaw-params": {
+        "description": "`SopRunDetailRequest`, defined in `zeroclaw-api`; no schema is exported yet, so its keys are not enumerable here.",
+        "owner": "zeroclaw-api",
+        "shape": "external",
+        "type": "SopRunDetailRequest"
       }
     },
     {
       "name": "sops/run-overlay",
       "paramStructure": "by-name",
-      "params": [
-        {
-          "name": "params",
-          "required": true,
-          "schema": {
-            "description": "`SopRunOverlayRequest`, defined in `zeroclaw-api`; no schema is exported yet."
-          },
-          "x-zeroclaw-owner": "zeroclaw-api",
-          "x-zeroclaw-shape": "external"
-        }
-      ],
+      "params": [],
       "result": {
         "name": "result",
         "schema": {
@@ -5797,21 +6695,18 @@
         "kind": "grant",
         "resource": "sops",
         "verb": "read"
+      },
+      "x-zeroclaw-params": {
+        "description": "`SopRunOverlayRequest`, defined in `zeroclaw-api`; no schema is exported yet, so its keys are not enumerable here.",
+        "owner": "zeroclaw-api",
+        "shape": "external",
+        "type": "SopRunOverlayRequest"
       }
     },
     {
       "name": "sops/validate",
       "paramStructure": "by-name",
-      "params": [
-        {
-          "name": "params",
-          "required": true,
-          "schema": {
-            "description": "Free-form JSON shaped by the daemon at runtime."
-          },
-          "x-zeroclaw-shape": "untyped"
-        }
-      ],
+      "params": [],
       "result": {
         "name": "result",
         "schema": {
@@ -5823,22 +6718,16 @@
         "kind": "grant",
         "resource": "sops",
         "verb": "execute"
+      },
+      "x-zeroclaw-params": {
+        "description": "Free-form JSON object shaped by the daemon at runtime; keys are not enumerable here.",
+        "shape": "untyped"
       }
     },
     {
       "name": "sops/save",
       "paramStructure": "by-name",
-      "params": [
-        {
-          "name": "params",
-          "required": true,
-          "schema": {
-            "description": "`SopSaveRequest`, defined in `zeroclaw-api`; no schema is exported yet."
-          },
-          "x-zeroclaw-owner": "zeroclaw-api",
-          "x-zeroclaw-shape": "external"
-        }
-      ],
+      "params": [],
       "result": {
         "name": "result",
         "schema": {
@@ -5850,22 +6739,18 @@
         "kind": "grant",
         "resource": "sops",
         "verb": "update"
+      },
+      "x-zeroclaw-params": {
+        "description": "`SopSaveRequest`, defined in `zeroclaw-api`; no schema is exported yet, so its keys are not enumerable here.",
+        "owner": "zeroclaw-api",
+        "shape": "external",
+        "type": "SopSaveRequest"
       }
     },
     {
       "name": "sops/create",
       "paramStructure": "by-name",
-      "params": [
-        {
-          "name": "params",
-          "required": true,
-          "schema": {
-            "description": "`SopSaveRequest`, defined in `zeroclaw-api`; no schema is exported yet."
-          },
-          "x-zeroclaw-owner": "zeroclaw-api",
-          "x-zeroclaw-shape": "external"
-        }
-      ],
+      "params": [],
       "result": {
         "name": "result",
         "schema": {
@@ -5877,22 +6762,18 @@
         "kind": "grant",
         "resource": "sops",
         "verb": "create"
+      },
+      "x-zeroclaw-params": {
+        "description": "`SopSaveRequest`, defined in `zeroclaw-api`; no schema is exported yet, so its keys are not enumerable here.",
+        "owner": "zeroclaw-api",
+        "shape": "external",
+        "type": "SopSaveRequest"
       }
     },
     {
       "name": "sops/delete",
       "paramStructure": "by-name",
-      "params": [
-        {
-          "name": "params",
-          "required": true,
-          "schema": {
-            "description": "`SopSelectRequest`, defined in `zeroclaw-api`; no schema is exported yet."
-          },
-          "x-zeroclaw-owner": "zeroclaw-api",
-          "x-zeroclaw-shape": "external"
-        }
-      ],
+      "params": [],
       "result": {
         "name": "result",
         "schema": {
@@ -5904,22 +6785,18 @@
         "kind": "grant",
         "resource": "sops",
         "verb": "delete"
+      },
+      "x-zeroclaw-params": {
+        "description": "`SopSelectRequest`, defined in `zeroclaw-api`; no schema is exported yet, so its keys are not enumerable here.",
+        "owner": "zeroclaw-api",
+        "shape": "external",
+        "type": "SopSelectRequest"
       }
     },
     {
       "name": "sops/rename",
       "paramStructure": "by-name",
-      "params": [
-        {
-          "name": "params",
-          "required": true,
-          "schema": {
-            "description": "`SopRenameRequest`, defined in `zeroclaw-api`; no schema is exported yet."
-          },
-          "x-zeroclaw-owner": "zeroclaw-api",
-          "x-zeroclaw-shape": "external"
-        }
-      ],
+      "params": [],
       "result": {
         "name": "result",
         "schema": {
@@ -5931,22 +6808,18 @@
         "kind": "grant",
         "resource": "sops",
         "verb": "update"
+      },
+      "x-zeroclaw-params": {
+        "description": "`SopRenameRequest`, defined in `zeroclaw-api`; no schema is exported yet, so its keys are not enumerable here.",
+        "owner": "zeroclaw-api",
+        "shape": "external",
+        "type": "SopRenameRequest"
       }
     },
     {
       "name": "sops/decide",
       "paramStructure": "by-name",
-      "params": [
-        {
-          "name": "params",
-          "required": true,
-          "schema": {
-            "description": "`SopDecideRequest`, defined in `zeroclaw-api`; no schema is exported yet."
-          },
-          "x-zeroclaw-owner": "zeroclaw-api",
-          "x-zeroclaw-shape": "external"
-        }
-      ],
+      "params": [],
       "result": {
         "name": "result",
         "schema": {
@@ -5959,21 +6832,18 @@
         "kind": "grant",
         "resource": "sops",
         "verb": "execute"
+      },
+      "x-zeroclaw-params": {
+        "description": "`SopDecideRequest`, defined in `zeroclaw-api`; no schema is exported yet, so its keys are not enumerable here.",
+        "owner": "zeroclaw-api",
+        "shape": "external",
+        "type": "SopDecideRequest"
       }
     },
     {
       "name": "sops/wire-draft",
       "paramStructure": "by-name",
-      "params": [
-        {
-          "name": "params",
-          "required": true,
-          "schema": {
-            "description": "Free-form JSON shaped by the daemon at runtime."
-          },
-          "x-zeroclaw-shape": "untyped"
-        }
-      ],
+      "params": [],
       "result": {
         "name": "result",
         "schema": {
@@ -5985,21 +6855,16 @@
         "kind": "grant",
         "resource": "sops",
         "verb": "execute"
+      },
+      "x-zeroclaw-params": {
+        "description": "Free-form JSON object shaped by the daemon at runtime; keys are not enumerable here.",
+        "shape": "untyped"
       }
     },
     {
       "name": "sops/graph-draft",
       "paramStructure": "by-name",
-      "params": [
-        {
-          "name": "params",
-          "required": true,
-          "schema": {
-            "description": "Free-form JSON shaped by the daemon at runtime."
-          },
-          "x-zeroclaw-shape": "untyped"
-        }
-      ],
+      "params": [],
       "result": {
         "name": "result",
         "schema": {
@@ -6011,6 +6876,10 @@
         "kind": "grant",
         "resource": "sops",
         "verb": "execute"
+      },
+      "x-zeroclaw-params": {
+        "description": "Free-form JSON object shaped by the daemon at runtime; keys are not enumerable here.",
+        "shape": "untyped"
       }
     },
     {
@@ -6029,21 +6898,15 @@
         "kind": "grant",
         "resource": "sops",
         "verb": "read"
+      },
+      "x-zeroclaw-params": {
+        "shape": "none"
       }
     },
     {
       "name": "tools/param-options",
       "paramStructure": "by-name",
-      "params": [
-        {
-          "name": "params",
-          "required": true,
-          "schema": {
-            "description": "Free-form JSON shaped by the daemon at runtime."
-          },
-          "x-zeroclaw-shape": "untyped"
-        }
-      ],
+      "params": [],
       "result": {
         "name": "result",
         "schema": {
@@ -6055,6 +6918,10 @@
         "kind": "grant",
         "resource": "tools",
         "verb": "read"
+      },
+      "x-zeroclaw-params": {
+        "description": "Free-form JSON object shaped by the daemon at runtime; keys are not enumerable here.",
+        "shape": "untyped"
       }
     }
   ],

@@ -37,8 +37,89 @@ fn generator() -> SchemaGenerator {
     settings.into_generator()
 }
 
-/// Describe one params/result side: a schema reference, an external type
-/// marker, a free-form value, or nothing.
+/// The by-name parameter descriptors for a method's params shape.
+///
+/// OpenRPC names each content descriptor after the key the caller puts in
+/// `params`, so a typed params struct is expanded into one descriptor per
+/// property, with `required` taken from the schema. The struct's own schema
+/// is still registered, so its description and nested references stay in
+/// `components`. Shapes this document cannot describe field by field (a
+/// free-form object, or a type another crate owns without an exported
+/// schema) produce no descriptors and are marked in `x-zeroclaw-params`, so
+/// a consumer never sees an invented `params` wrapper as a real key.
+fn param_descriptors(generator: &mut SchemaGenerator, shape: Shape) -> (Vec<Value>, Value) {
+    match shape {
+        Shape::None => (Vec::new(), json!({ "shape": "none" })),
+        Shape::Untyped => (
+            Vec::new(),
+            json!({
+                "shape": "untyped",
+                "description": "Free-form JSON object shaped by the daemon at runtime; keys are not enumerable here.",
+            }),
+        ),
+        Shape::Typed(name) => match schema::subschema_for_named(generator, name) {
+            Some(_) => {
+                let definition = generator
+                    .definitions()
+                    .get(name)
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                let required: Vec<&str> = definition["required"]
+                    .as_array()
+                    .map(|r| r.iter().filter_map(Value::as_str).collect())
+                    .unwrap_or_default();
+                let descriptors: Vec<Value> = definition["properties"]
+                    .as_object()
+                    .map(|props| {
+                        props
+                            .iter()
+                            .map(|(prop, schema)| {
+                                json!({
+                                    "name": prop,
+                                    "required": required.contains(&prop.as_str()),
+                                    "schema": schema,
+                                })
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let marker = if descriptors.is_empty() {
+                    json!({
+                        "shape": "typed",
+                        "type": name,
+                        "description": format!("`{name}` is not a plain object; its schema is in components."),
+                    })
+                } else {
+                    json!({ "shape": "typed", "type": name })
+                };
+                (descriptors, marker)
+            }
+            None => {
+                let owner = external_owner(name);
+                (
+                    Vec::new(),
+                    json!({
+                        "shape": "external",
+                        "type": name,
+                        "owner": owner,
+                        "description": format!("`{name}`, defined in `{owner}`; no schema is exported yet, so its keys are not enumerable here."),
+                    }),
+                )
+            }
+        },
+    }
+}
+
+fn external_owner(name: &str) -> &'static str {
+    EXTERNAL_TYPES
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, owner)| *owner)
+        .unwrap_or("unknown")
+}
+
+/// Describe a result side: a schema reference, an external type marker, a
+/// free-form value, or nothing.
 fn shape_value(generator: &mut SchemaGenerator, shape: Shape) -> Option<Value> {
     match shape {
         Shape::None => None,
@@ -54,11 +135,7 @@ fn shape_value(generator: &mut SchemaGenerator, shape: Shape) -> Option<Value> {
                 "x-zeroclaw-shape": "typed",
             })),
             None => {
-                let owner = EXTERNAL_TYPES
-                    .iter()
-                    .find(|(n, _)| *n == name)
-                    .map(|(_, owner)| *owner)
-                    .unwrap_or("unknown");
+                let owner = external_owner(name);
                 Some(json!({
                     "name": name,
                     "schema": { "description": format!("`{name}`, defined in `{owner}`; no schema is exported yet.") },
@@ -92,17 +169,9 @@ pub fn render() -> anyhow::Result<String> {
             let mut entry = Map::new();
             entry.insert("name".into(), json!(wire));
             entry.insert("paramStructure".into(), json!("by-name"));
-            let params: Vec<Value> = shape_value(&mut generator, contract.params)
-                .map(|mut p| {
-                    if let Some(obj) = p.as_object_mut() {
-                        obj.insert("name".into(), json!("params"));
-                        obj.insert("required".into(), json!(true));
-                    }
-                    p
-                })
-                .into_iter()
-                .collect();
+            let (params, params_marker) = param_descriptors(&mut generator, contract.params);
             entry.insert("params".into(), Value::Array(params));
+            entry.insert("x-zeroclaw-params".into(), params_marker);
             let result = shape_value(&mut generator, contract.result).map_or_else(
                 || json!({ "name": "result", "schema": { "type": "null" } }),
                 |mut r| {
@@ -215,6 +284,76 @@ mod tests {
             doc["info"]["version"],
             json!(RPC_PROTOCOL_VERSION.to_string())
         );
+    }
+
+    /// A request built from the descriptors must be what the daemon parses:
+    /// the descriptor names are the params keys, not a wrapper around them.
+    #[test]
+    fn descriptors_name_the_real_params_keys() {
+        let doc: Value = serde_json::from_str(&render().expect("render")).expect("valid JSON");
+        let methods = doc["methods"].as_array().expect("methods");
+        let by_name = |wire: &str| {
+            methods
+                .iter()
+                .find(|m| m["name"] == json!(wire))
+                .unwrap_or_else(|| panic!("{wire} missing"))
+        };
+        // Every descriptor everywhere is a real property, never `params`.
+        for m in methods {
+            for p in m["params"].as_array().expect("params array") {
+                assert_ne!(
+                    p["name"],
+                    json!("params"),
+                    "{}: wrapper descriptor",
+                    m["name"]
+                );
+                // A JSON Schema is an object or a boolean (`true` for a free
+                // `serde_json::Value` property such as `clientCapabilities`).
+                assert!(
+                    p["schema"].is_object() || p["schema"].is_boolean(),
+                    "{}: descriptor without schema",
+                    m["name"]
+                );
+                assert!(
+                    p["required"].is_boolean(),
+                    "{}: descriptor without required",
+                    m["name"]
+                );
+            }
+            assert!(
+                m["x-zeroclaw-params"]["shape"].is_string(),
+                "{}: params shape marker missing",
+                m["name"]
+            );
+        }
+        // session/close: build the request the document describes and parse
+        // it with the daemon's own type.
+        let close = by_name("session/close");
+        let names: Vec<&str> = close["params"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["session_id"]);
+        assert_eq!(close["params"][0]["required"], json!(true));
+        let request = json!({ "session_id": "s1" });
+        let parsed: zeroclaw_rpc_proto::types::SessionIdParams =
+            serde_json::from_value(request).expect("descriptor-shaped request parses");
+        assert_eq!(parsed.session_id, "s1");
+        // initialize: optional fields are optional, the version is required by default.
+        let init = by_name("initialize");
+        let init_params = init["params"].as_array().unwrap();
+        let find = |n: &str| init_params.iter().find(|p| p["name"] == json!(n)).unwrap();
+        assert_eq!(find("auth_token")["required"], json!(false));
+        assert_eq!(find("protocol_version")["required"], json!(false));
+        // Shapes this document cannot enumerate say so instead of inventing a key.
+        for m in methods {
+            let shape = m["x-zeroclaw-params"]["shape"].as_str().unwrap();
+            if shape == "untyped" || shape == "external" || shape == "none" {
+                assert!(m["params"].as_array().unwrap().is_empty(), "{}", m["name"]);
+            }
+        }
     }
 
     #[test]
