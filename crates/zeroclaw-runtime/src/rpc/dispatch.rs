@@ -1519,10 +1519,23 @@ impl RpcDispatcher {
         let Some(auth) = self.auth.as_ref() else {
             return Err(rpc_err(AUTH_REQUIRED, "First call must be 'initialize'"));
         };
+        self.check_agent_selector_with_grants(method, &auth.grants, alias, require_configured)
+    }
+
+    /// [`Self::check_agent_selector`] evaluated against an explicit grant set,
+    /// for a handler that has re-resolved its principal after waiting for
+    /// admission.
+    fn check_agent_selector_with_grants(
+        &self,
+        method: Method,
+        grants: &zeroclaw_api::grants::ResolvedGrants,
+        alias: &str,
+        require_configured: bool,
+    ) -> Result<(), JsonRpcError> {
         let configured = !require_configured
-            || auth.grants.admin
+            || grants.admin
             || self.ctx.config.read().agents.contains_key(alias);
-        if configured && auth.grants.may_use_agent(alias) {
+        if configured && grants.may_use_agent(alias) {
             return Ok(());
         }
         let denied = rpc_err(
@@ -1912,7 +1925,17 @@ impl RpcDispatcher {
         let Some(auth) = self.auth.as_ref() else {
             return Err(rpc_err(AUTH_REQUIRED, "First call must be 'initialize'"));
         };
-        if self.is_shared_operator(&auth.grants) {
+        self.admit_headless_agent_work_with(method, &auth.grants)
+    }
+
+    /// [`Self::admit_headless_agent_work`] against grants re-resolved under the
+    /// config write lock by [`Self::recheck_cron_write_authority`].
+    fn admit_headless_agent_work_with(
+        &self,
+        method: Method,
+        grants: &zeroclaw_api::grants::ResolvedGrants,
+    ) -> Result<(), JsonRpcError> {
+        if self.is_shared_operator(grants) {
             return Ok(());
         }
         let denied = rpc_err(
@@ -2053,6 +2076,30 @@ impl RpcDispatcher {
         if !self.is_shared_operator(grants) {
             agent.disable_principal_unaware_nested_tools();
         }
+    }
+
+    /// Re-establish the caller's authority over `agent`'s cron rows once the
+    /// config write lock is held, and return the freshly resolved grants.
+    ///
+    /// The cron store writes synchronously and can wait out SQLite's busy
+    /// timeout, so the grants stamped at the gate may be stale by the time
+    /// the row is written. Every accepted-policy publication, from RPC or the
+    /// gateway, takes the config write lock, and the cron handlers hold it
+    /// from this check through their write: a revocation published while the
+    /// request queued is seen here, and none can land between this check and
+    /// the commit however long the store waits for the database.
+    fn recheck_cron_write_authority(
+        &self,
+        method: Method,
+        agent: &str,
+        require_configured: bool,
+        _guard: &ConfigWriteGuard,
+    ) -> Result<zeroclaw_api::grants::ResolvedGrants, JsonRpcError> {
+        let Some(grants) = self.recheck_authority_after_admission(method)? else {
+            return Err(rpc_err(AUTH_REQUIRED, "First call must be 'initialize'"));
+        };
+        self.check_agent_selector_with_grants(method, &grants, agent, require_configured)?;
+        Ok(grants)
     }
 
     /// Whether this connection's principal, holding `grants`, is the shared
@@ -7567,6 +7614,14 @@ impl RpcDispatcher {
     async fn handle_cron_add(&self, params: &Value) -> RpcResult {
         let req: CronAddParams = parse_params(params)?;
         self.selector_agent(Method::CronAdd, &req.agent)?;
+        // Held through the insert: see `recheck_cron_write_authority`.
+        let config_write_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
+        let grants = self.recheck_cron_write_authority(
+            Method::CronAdd,
+            &req.agent,
+            true,
+            &config_write_guard,
+        )?;
         let config = self.ctx.config.read().clone();
         let schedule = Schedule::Cron {
             expr: req.schedule,
@@ -7577,7 +7632,7 @@ impl RpcDispatcher {
         let is_agent = matches!(req.job_type.as_deref(), Some("agent"))
             || (req.job_type.is_none() && req.prompt.is_some());
         let job = if is_agent {
-            self.admit_headless_agent_work(Method::CronAdd)?;
+            self.admit_headless_agent_work_with(Method::CronAdd, &grants)?;
             if let Some(tools) = req.allowed_tools.as_deref() {
                 check_tools_admitted_by_agent_policy(&config, &req.agent, tools)?;
             }
@@ -7632,22 +7687,39 @@ impl RpcDispatcher {
             )
         }
         .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Cron add failed: {e}")))?;
+        drop(config_write_guard);
         to_result(job)
     }
 
     async fn handle_cron_patch(&self, params: &Value) -> RpcResult {
         let req: CronPatchParams = parse_params(params)?;
         self.selector_agent(Method::CronPatch, &req.agent)?;
-        let config = self.ctx.config.read().clone();
         // The ownership test rides in the `UPDATE` itself for a scoped
         // principal, so an agent rename landing between the check and the
         // write cannot open a window. An operator-level principal patches
-        // any row, including the ownerless legacy ones.
-        let owner = self.authorize_cron_job(Method::CronPatch, &config, &req.id)?;
+        // any row, including the ownerless legacy ones. The config snapshot
+        // is dropped before the lock is awaited: held across it, a whole
+        // `Config` would live in this future and in the dispatch future
+        // that embeds it.
+        let owner = {
+            let config = self.ctx.config.read().clone();
+            self.authorize_cron_job(Method::CronPatch, &config, &req.id)?
+        };
+        // Held through the update: see `recheck_cron_write_authority`. The
+        // config is read again under it, so the command is validated against
+        // the policy the write commits under.
+        let config_write_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
+        let grants = self.recheck_cron_write_authority(
+            Method::CronPatch,
+            &owner.agent_alias,
+            false,
+            &config_write_guard,
+        )?;
         let is_agent = matches!(owner.job_type, crate::cron::JobType::Agent);
         if is_agent {
-            self.admit_headless_agent_work(Method::CronPatch)?;
+            self.admit_headless_agent_work_with(Method::CronPatch, &grants)?;
         }
+        let config = self.ctx.config.read().clone();
         if req.shell_output_format.is_some() {
             if is_agent {
                 return Err(rpc_err(
@@ -7699,12 +7771,13 @@ impl RpcDispatcher {
             shell_output_format: req.shell_output_format,
             ..Default::default()
         };
-        let job = if self.has_admin_grants() {
+        let job = if grants.admin {
             crate::cron::update_job(&config, &req.id, patch)
         } else {
             crate::cron::update_job_for_agent(&config, &req.id, &owner.agent_alias, patch)
         }
         .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Cron patch failed: {e}")))?;
+        drop(config_write_guard);
         to_result(job)
     }
 
@@ -12857,6 +12930,28 @@ mod tests {
         .expect("the fixture job is created")
     }
 
+    /// Seed a low-risk shell job owned by `alias`, for the paths a scoped
+    /// principal may still change.
+    fn seed_shell_cron_job(
+        config: &zeroclaw_config::schema::Config,
+        alias: &str,
+        name: &str,
+    ) -> crate::cron::CronJob {
+        crate::cron::add_shell_job_with_approval(
+            config,
+            alias,
+            Some(name.to_string()),
+            crate::cron::Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "echo hi",
+            None,
+            false,
+        )
+        .expect("the fixture shell job is created")
+    }
+
     #[tokio::test]
     async fn cron_list_hides_jobs_owned_by_other_agents() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -13084,6 +13179,199 @@ mod tests {
             "a rejected patch must leave the stored command unchanged"
         );
         assert_eq!(reread.name.as_deref(), job.name.as_deref());
+    }
+
+    /// Republish the accepted policy with alice's entitlement to `alpha` gone.
+    fn revoke_alice_cron_agent(ctx: &Arc<RpcContext>) {
+        let mut narrowed = ctx.config.read().clone();
+        narrowed
+            .permission_profiles
+            .get_mut("cron-alpha")
+            .expect("the fixture profile exists")
+            .allowed_agents
+            .clear();
+        ctx.auth
+            .refresh_from_config(&narrowed)
+            .expect("the narrowed policy compiles");
+    }
+
+    /// Republish the accepted policy with alice's cron grant gone.
+    fn revoke_alice_cron_grant(ctx: &Arc<RpcContext>) {
+        let mut narrowed = ctx.config.read().clone();
+        narrowed
+            .permission_profiles
+            .get_mut("cron-alpha")
+            .expect("the fixture profile exists")
+            .grants
+            .clear();
+        ctx.auth
+            .refresh_from_config(&narrowed)
+            .expect("the narrowed policy compiles");
+    }
+
+    /// The selector passes and the call parks on the publication lock; alice's
+    /// entitlement to `alpha` is revoked while it waits. The insert must be
+    /// refused and nothing stored.
+    #[tokio::test]
+    async fn cron_add_revoked_while_queued_is_refused() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = cron_roster_config_in(&tmp, 4242);
+        let ctx = enforcement_ctx(config.clone());
+        let (alice, _rx) = roster_peer(&ctx, 4242).await;
+
+        let params = json!({"agent": "alpha", "schedule": "*/5 * * * *", "command": "echo hi"});
+        let result = rpc_result_after_midwait_policy_change(
+            Arc::clone(&ctx),
+            async move { alice.handle_cron_add(&params).await },
+            revoke_alice_cron_agent,
+        )
+        .await;
+
+        let err = result.expect_err("a principal revoked while queued must not add a job");
+        assert_eq!(err.code, FORBIDDEN, "{err:?}");
+        assert!(
+            crate::cron::list_jobs(&config)
+                .expect("the store is readable")
+                .is_empty(),
+            "the refused add must not store a job"
+        );
+    }
+
+    /// Control for the recheck: a republication that leaves alice's authority
+    /// as it was does not refuse the parked add.
+    #[tokio::test]
+    async fn cron_add_survives_an_unrelated_republication_while_queued() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = cron_roster_config_in(&tmp, 4242);
+        let ctx = enforcement_ctx(config.clone());
+        let (alice, _rx) = roster_peer(&ctx, 4242).await;
+
+        let republish_unchanged = |ctx: &Arc<RpcContext>| {
+            let same = ctx.config.read().clone();
+            ctx.auth
+                .refresh_from_config(&same)
+                .expect("republishing the same policy compiles");
+        };
+        let params = json!({"agent": "alpha", "schedule": "*/5 * * * *", "command": "echo hi"});
+        let result = rpc_result_after_midwait_policy_change(
+            Arc::clone(&ctx),
+            async move { alice.handle_cron_add(&params).await },
+            republish_unchanged,
+        )
+        .await;
+
+        let job = result.expect("unchanged authority must not be refused at the recheck");
+        assert_eq!(job["agent_alias"], json!("alpha"), "{job}");
+    }
+
+    /// The patch path rechecks too: alice's cron grant is revoked while the
+    /// call is parked, so the patch is refused and the row is unchanged.
+    #[tokio::test]
+    async fn cron_patch_revoked_while_queued_is_refused() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = cron_roster_config_in(&tmp, 4242);
+        let job = seed_shell_cron_job(&config, "alpha", "alpha-shell");
+        let ctx = enforcement_ctx(config.clone());
+        let (alice, _rx) = roster_peer(&ctx, 4242).await;
+
+        let params =
+            json!({"id": job.id, "agent": "alpha", "command": "echo changed", "name": "changed"});
+        let result = rpc_result_after_midwait_policy_change(
+            Arc::clone(&ctx),
+            async move { alice.handle_cron_patch(&params).await },
+            revoke_alice_cron_grant,
+        )
+        .await;
+
+        let err = result.expect_err("a principal revoked while queued must not patch a job");
+        assert_eq!(err.code, FORBIDDEN, "{err:?}");
+        let stored = crate::cron::get_job(&config, &job.id).expect("the job still exists");
+        assert_eq!(stored.command, "echo hi");
+        assert_eq!(stored.name.as_deref(), Some("alpha-shell"));
+    }
+
+    /// The store's write is synchronous and can wait out SQLite's busy
+    /// timeout. While a competing writer holds `jobs.db`, the cron write must
+    /// already hold the publication lock, so a revocation published meanwhile
+    /// queues behind it: the add admitted before the revocation commits, and
+    /// the revocation binds alice's next add.
+    #[test]
+    fn cron_add_holds_the_publication_lock_while_the_store_is_busy() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("the test runtime builds");
+        runtime.block_on(async {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config = cron_roster_config_in(&tmp, 4242);
+            // Creates jobs.db, so the competing writer has a database to hold.
+            seed_shell_cron_job(&config, "alpha", "alpha-shell");
+            let ctx = enforcement_ctx(config.clone());
+            let (alice, _rx) = roster_peer(&ctx, 4242).await;
+
+            let writer = rusqlite::Connection::open(config.data_dir.join("cron").join("jobs.db"))
+                .expect("the competing writer opens jobs.db");
+            writer
+                .execute_batch("BEGIN IMMEDIATE")
+                .expect("the competing writer takes the write lock");
+
+            let params = json!({"agent": "alpha", "schedule": "*/5 * * * *", "command": "echo hi"});
+            let add = zeroclaw_spawn::spawn!(async move {
+                let result = alice.handle_cron_add(&params).await;
+                (alice, result)
+            });
+
+            // The handler takes the lock only once its selector has passed.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            while ctx.config_write_lock.try_lock().is_ok() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the cron write must hold the publication lock while the store is busy"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+
+            let publisher_ctx = Arc::clone(&ctx);
+            let mut publish = Box::pin(async move {
+                let _publication = Arc::clone(&publisher_ctx.config_write_lock)
+                    .lock_owned()
+                    .await;
+                revoke_alice_cron_agent(&publisher_ctx);
+            });
+            // One poll queues the publication on the lock; it cannot pass it
+            // while the cron write holds it.
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(
+                std::future::Future::poll(publish.as_mut(), &mut cx).is_pending(),
+                "a publication must queue behind the cron write"
+            );
+
+            writer
+                .execute_batch("ROLLBACK")
+                .expect("the competing writer releases jobs.db");
+            let (alice, result) = add.await.expect("the add task must not panic");
+            let added = result.expect("the add admitted before the revocation commits");
+            assert_eq!(added["agent_alias"], json!("alpha"), "{added}");
+            publish.await;
+
+            let refused = alice
+                .handle_cron_add(&json!({
+                    "agent": "alpha",
+                    "schedule": "*/5 * * * *",
+                    "command": "echo again",
+                }))
+                .await
+                .expect_err("the revocation binds the next add");
+            assert_eq!(refused.code, FORBIDDEN, "{refused:?}");
+            assert_eq!(
+                crate::cron::list_jobs(&config)
+                    .expect("the store is readable")
+                    .len(),
+                2,
+                "only the seeded job and the add admitted before the revocation"
+            );
+        });
     }
 
     #[tokio::test]
