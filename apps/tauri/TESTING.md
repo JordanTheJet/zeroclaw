@@ -129,10 +129,17 @@ cargo tauri build          # native build on each platform
 #   cargo build --release --target x86_64-pc-windows-msvc
 ```
 
-## CI matrix to add (separate issue)
+## CI coverage
 
-```yaml
-# Suggested when #6501 lands — run all three at minimum on cargo check
-matrix:
-  os: [macos-14, ubuntu-22.04, windows-2022]
+- `.github/workflows/desktop-check.yml` runs clippy and `cargo test -p zeroclaw-desktop`
+  on macOS, Linux, and Windows for PRs that touch `apps/tauri/**`.
+- `.github/workflows/desktop-bundle-check.yml` builds the self-contained installer on all
+  three platforms (real dashboard, `embedded-web` kernel sidecar, unsigned `cargo tauri build`)
+  and runs `scripts/desktop/smoke-dashboard.sh` against the staged kernel. It runs for PRs that
+  change desktop packaging inputs and on manual dispatch.
+
+To run the dashboard smoke locally against a staged kernel:
+
+```sh
+scripts/desktop/smoke-dashboard.sh apps/tauri/binaries/zeroclaw-<target-triple>
 ```
