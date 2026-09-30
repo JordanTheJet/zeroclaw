@@ -16098,7 +16098,9 @@ mod tests {
         // A request that omits `params` reaches the handler as `null`; the
         // settings read must still answer it.
         operator
-            .process_line(&json!({"jsonrpc": "2.0", "id": 7, "method": "cron/settings"}).to_string())
+            .process_line(
+                &json!({"jsonrpc": "2.0", "id": 7, "method": "cron/settings"}).to_string(),
+            )
             .await;
         let settings = loop {
             let frame = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
