@@ -290,6 +290,7 @@ pub enum OptionDomain {
 
 /// One resolved choice for a domain-typed parameter.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct OptionEntry {
     /// The literal value to store in the argument.
     pub value: String,

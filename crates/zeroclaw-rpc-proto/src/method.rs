@@ -292,12 +292,12 @@ impl Method {
     /// otherwise to the crate named in [`Shape::Typed`]'s documentation.
     pub const fn contract(self) -> MethodContract {
         use Method as M;
-        use Shape::{None, Typed, Untyped};
+        use Shape::{None, Typed};
         let (params, result) = match self {
             // Core
             M::Initialize => (Typed("InitializeParams"), Typed("InitializeResult")),
             M::Status => (None, Typed("StatusResult")),
-            M::Health => (None, Untyped),
+            M::Health => (None, Typed("HealthResult")),
             M::DoctorRun => (None, Typed("DoctorRunResult")),
 
             // Sessions
@@ -339,7 +339,7 @@ impl Method {
             M::CronSettings => (Typed("CronSettingsParams"), Typed("SchedulerConfig")),
 
             // Config
-            M::ConfigGet => (Typed("ConfigGetParams"), Untyped),
+            M::ConfigGet => (Typed("ConfigGetParams"), Typed("ConfigGetResult")),
             M::ConfigSet => (Typed("ConfigSetParams"), Typed("ConfigSetResult")),
             M::ConfigSetMany => (Typed("ConfigSetManyParams"), Typed("ConfigSetManyResult")),
             M::ConfigValidate => (None, Typed("ConfigValidateResult")),
@@ -373,7 +373,7 @@ impl Method {
             M::AgentsList => (None, Typed("AgentsListResult")),
             M::AgentsStatus => (None, Typed("AgentsStatusResult")),
             M::CostQuery => (Typed("CostQueryParams"), Typed("CostSummary")),
-            M::CostOrg => (None, Untyped),
+            M::CostOrg => (None, Typed("CostOrgResult")),
 
             // Skills and personality
             M::SkillsBundles => (None, Typed("SkillsBundlesResult")),
@@ -437,26 +437,29 @@ impl Method {
             ),
 
             // Transport-authenticated certificate renewal
-            M::CertRenew => (Typed("CertRenewParams"), Untyped),
+            M::CertRenew => (Typed("CertRenewParams"), Typed("CertRenewResult")),
 
             // SOPs
-            M::SopsList => (None, Untyped),
+            M::SopsList => (None, Typed("SopsListResult")),
             M::SopsGet => (Typed("SopSelectRequest"), Typed("Sop")),
             M::SopsGraph => (Typed("SopSelectRequest"), Typed("SopGraph")),
             M::SopsRun => (Typed("SopRunRequest"), Typed("SopRunResponse")),
-            M::SopsRuns => (Typed("SopRunsRequest"), Untyped),
-            M::SopsRunDetail => (Typed("SopRunDetailRequest"), Untyped),
+            M::SopsRuns => (Typed("SopRunsRequest"), Typed("SopRunsResult")),
+            M::SopsRunDetail => (Typed("SopRunDetailRequest"), Typed("SopRunDetailResult")),
             M::SopsRunOverlay => (Typed("SopRunOverlayRequest"), Typed("RunOverlay")),
-            M::SopsValidate => (Typed("SopValidateParams"), Untyped),
-            M::SopsSave => (Typed("SopSaveRequest"), Untyped),
-            M::SopsCreate => (Typed("SopSaveRequest"), Untyped),
-            M::SopsDelete => (Typed("SopSelectRequest"), Untyped),
-            M::SopsRename => (Typed("SopRenameRequest"), Untyped),
+            M::SopsValidate => (Typed("SopValidateParams"), Typed("SopValidateResult")),
+            M::SopsSave => (Typed("SopSaveRequest"), Typed("SopSaveResult")),
+            M::SopsCreate => (Typed("SopSaveRequest"), Typed("SopCreateResult")),
+            M::SopsDelete => (Typed("SopSelectRequest"), Typed("SopDeleteResult")),
+            M::SopsRename => (Typed("SopRenameRequest"), Typed("SopRenameResult")),
             M::SopsDecide => (Typed("SopDecideRequest"), Typed("RunOverlay")),
-            M::SopsWireDraft => (Typed("SopWireDraftParams"), Untyped),
+            M::SopsWireDraft => (Typed("SopWireDraftParams"), Typed("SopWireDraftResult")),
             M::SopsGraphDraft => (Typed("SopDraftParams"), Typed("SopGraph")),
             M::SopsTriggerSources => (None, Typed("TriggerSourceRegistry")),
-            M::ToolsParamOptions => (Typed("ToolsParamOptionsParams"), Untyped),
+            M::ToolsParamOptions => (
+                Typed("ToolsParamOptionsParams"),
+                Typed("ToolsParamOptionsResult"),
+            ),
         };
         MethodContract { params, result }
     }
@@ -487,8 +490,9 @@ pub struct MethodContract {
 /// crate's own catalog (`zeroclaw_runtime::rpc::schema`), and the contract
 /// document records the owner so a client knows where the type lives.
 pub const EXTERNAL_TYPES: &[(&str, &str)] = &[
-    // Fields are runtime-owned types: diagnostics, cron jobs, skill
-    // frontmatter, quickstart descriptors, SOP definitions and wire edits.
+    // Fields are runtime-owned types: diagnostics, health, cron jobs, skill
+    // frontmatter, quickstart descriptors, enrollment, SOP definitions, runs
+    // and wire edits.
     ("DoctorRunResult", "zeroclaw-runtime"),
     ("SessionNewParams", "zeroclaw-runtime"),
     ("CronListResult", "zeroclaw-runtime"),
@@ -507,6 +511,12 @@ pub const EXTERNAL_TYPES: &[(&str, &str)] = &[
     ("RunOverlay", "zeroclaw-runtime"),
     ("TriggerSourceRegistry", "zeroclaw-runtime"),
     ("SopWireDraftParams", "zeroclaw-runtime"),
+    ("HealthResult", "zeroclaw-runtime"),
+    ("CertRenewResult", "zeroclaw-runtime"),
+    ("SopsListResult", "zeroclaw-runtime"),
+    ("SopRunsResult", "zeroclaw-runtime"),
+    ("SopRunDetailResult", "zeroclaw-runtime"),
+    ("SopWireDraftResult", "zeroclaw-runtime"),
 ];
 
 #[cfg(test)]

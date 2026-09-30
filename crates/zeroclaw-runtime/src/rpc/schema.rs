@@ -9,6 +9,10 @@
 use schemars::{Schema, SchemaGenerator};
 
 use super::types::{
+    CertRenewResult, HealthResult, SopRunDetailResult, SopRunsResult, SopWireDraftResult,
+    SopsListResult,
+};
+use super::types::{
     CronAddParams, CronJob, CronListResult, CronRunsResult, DoctorRunResult, QuickstartApplyResult,
     QuickstartDismissParams, QuickstartFieldsParams, QuickstartFieldsResult,
     QuickstartValidateResult, SessionNewParams, SkillsListResult, SkillsReadResult,
@@ -40,6 +44,8 @@ catalog! {
     SkillsListResult, SkillsReadResult, SkillsWriteParams, QuickstartFieldsParams,
     QuickstartFieldsResult, QuickstartValidateResult, QuickstartApplyResult,
     QuickstartDismissParams, Sop, RunOverlay, TriggerSourceRegistry, SopWireDraftParams,
+    HealthResult, CertRenewResult, SopsListResult, SopRunsResult, SopRunDetailResult,
+    SopWireDraftResult,
 }
 
 #[cfg(test)]

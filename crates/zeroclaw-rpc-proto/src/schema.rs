@@ -98,6 +98,9 @@ catalog! {
     FsListDirResponse, ToolsParamOptionsParams, CertRenewParams,
     // Cost and cron settings
     CostSummary, CronSettingsParams, SchedulerConfig,
+    // Results that were free-form
+    ConfigGetResult, CostOrgResult, SopValidateResult, SopSaveResult, SopCreateResult,
+    SopDeleteResult, SopRenameResult, ToolsParamOptionsResult,
 }
 
 use crate::sop::{GraphLegend, SopGraph};

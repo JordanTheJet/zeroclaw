@@ -417,6 +417,36 @@
         ],
         "type": "object"
       },
+      "CertRenewResult": {
+        "description": "Result of `cert/renew`: the replacement client certificate, the CA\nchain to trust, and the current relay profile.",
+        "properties": {
+          "ca_chain_pem": {
+            "type": "string"
+          },
+          "cert_pem": {
+            "type": "string"
+          },
+          "device_id": {
+            "type": "string"
+          },
+          "not_after": {
+            "description": "Expiry as Unix seconds.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "relay_profile": {
+            "$ref": "#/components/schemas/RelayProfile"
+          }
+        },
+        "required": [
+          "ca_chain_pem",
+          "cert_pem",
+          "device_id",
+          "not_after",
+          "relay_profile"
+        ],
+        "type": "object"
+      },
       "ChannelAlias": {
         "description": "One configured channel instance an SOP channel trigger can bind to.",
         "properties": {
@@ -531,6 +561,39 @@
         ],
         "type": "object"
       },
+      "ComponentHealth": {
+        "properties": {
+          "last_error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_ok": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "restart_count": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "status": {
+            "type": "string"
+          },
+          "updated_at": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "status",
+          "updated_at",
+          "restart_count"
+        ],
+        "type": "object"
+      },
       "ConditionField": {
         "description": "One field of a trigger payload a condition can reference. `path` is the\nJSON path suffix after `$.` (empty for a scalar payload compared directly),\n`label` is the human name, `value_type` drives the value control, and\n`options` carries the choices when `value_type` is `Enum`.",
         "properties": {
@@ -636,6 +699,33 @@
           }
         },
         "type": "object"
+      },
+      "ConfigGetPropResult": {
+        "description": "Returned when `config/get` is called with a specific `prop`.",
+        "properties": {
+          "prop": {
+            "type": "string"
+          },
+          "value": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "prop",
+          "value"
+        ],
+        "type": "object"
+      },
+      "ConfigGetResult": {
+        "anyOf": [
+          {
+            "$ref": "#/components/schemas/ConfigGetPropResult"
+          },
+          {
+            "$ref": "#/components/schemas/MaskedConfigDocument"
+          }
+        ],
+        "description": "Result of `config/get`: one property when `prop` is given, otherwise the\nwhole configuration with secrets masked."
       },
       "ConfigListParams": {
         "properties": {
@@ -1067,6 +1157,9 @@
           "valid"
         ],
         "type": "object"
+      },
+      "CostOrgResult": {
+        "description": "The contents of `org_cost.json` in the data directory, served as-is, or null when the file does not exist."
       },
       "CostQueryParams": {
         "description": "Params for `cost/query`. Consolidates gateway `CostQuery`.",
@@ -2384,6 +2477,41 @@
         ],
         "type": "object"
       },
+      "HealthResult": {
+        "description": "Result of `health`: the component health snapshot with the daemon's\nprocess statistics merged in under `process`.",
+        "properties": {
+          "components": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/ComponentHealth"
+            },
+            "type": "object"
+          },
+          "pid": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "process": {
+            "$ref": "#/components/schemas/ProcessStats"
+          },
+          "updated_at": {
+            "type": "string"
+          },
+          "uptime_seconds": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "pid",
+          "updated_at",
+          "uptime_seconds",
+          "components",
+          "process"
+        ],
+        "type": "object"
+      },
       "InitializeParams": {
         "properties": {
           "auth_provider": {
@@ -2931,6 +3059,10 @@
             "type": "string"
           }
         ]
+      },
+      "MaskedConfigDocument": {
+        "description": "The whole configuration with secrets masked. Its keys follow the configuration schema printed by `zeroclaw config schema`.",
+        "type": "object"
       },
       "MemoryBackendKind": {
         "description": "Selects the memory backend used by an agent.",
@@ -3522,6 +3654,27 @@
           }
         ]
       },
+      "OptionEntry": {
+        "description": "One resolved choice for a domain-typed parameter.",
+        "properties": {
+          "hint": {
+            "description": "Short qualifier shown next to the label (e.g. `peer agent`,\n`group: 3 members`, `disabled`).",
+            "type": "string"
+          },
+          "label": {
+            "description": "Human-facing label; falls back to `value` when empty.",
+            "type": "string"
+          },
+          "value": {
+            "description": "The literal value to store in the argument.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "value"
+        ],
+        "type": "object"
+      },
       "PayloadContract": {
         "description": "The set of payload fields a condition may reference for a given source.\n`open` marks sources whose payload is arbitrary user JSON (MQTT, AMQP,\nwebhook body, channel message): the surface offers a guided path/op/value\nbuilder plus a sample-payload probe rather than a fixed field list. `direct`\nmarks a scalar payload (peripheral signal) compared with the bare `op value`\nform and no path.",
         "properties": {
@@ -3805,6 +3958,42 @@
         },
         "required": [
           "tool"
+        ],
+        "type": "object"
+      },
+      "ProcessStats": {
+        "properties": {
+          "cpu_percent": {
+            "description": "CPU usage as a percentage summed across logical cores (0..100*ncpu).\n`None` on the first sample (no baseline) or unsupported platforms.",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "num_cpus": {
+            "description": "Number of logical CPUs the OS reports. Useful for clamping the CPU%\nbar on the dashboard. `0` when unknown.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "rss_bytes": {
+            "description": "Resident set size in bytes. `0` when unsupported.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "system_ram_total_bytes": {
+            "description": "Total system RAM in bytes. `0` when unsupported. The dashboard\nrenders `rss / system_ram_total` as a percentage so the RAM tile is\nmeaningful at a glance regardless of host size.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "rss_bytes",
+          "system_ram_total_bytes",
+          "num_cpus"
         ],
         "type": "object"
       },
@@ -4214,6 +4403,29 @@
             "type": "object"
           }
         ]
+      },
+      "RelayProfile": {
+        "description": "Routing target a freshly enrolled client should use to reach this daemon\nthrough a relay. Delivered in the enrollment response so the client is\nzero-config on its next run.",
+        "properties": {
+          "node_id": {
+            "description": "Opaque node-id naming this daemon on the relay.",
+            "type": "string"
+          },
+          "relay_cert_pin": {
+            "description": "SHA-256 of the relay's OUTER leaf certificate to pin (empty if unknown\nyet; the client may then TOFU-pin or be given `--relay-pin`).",
+            "type": "string"
+          },
+          "relay_url": {
+            "description": "Relay address (`host:port`) to dial.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "relay_url",
+          "node_id",
+          "relay_cert_pin"
+        ],
+        "type": "object"
       },
       "RunOverlay": {
         "description": "Live run state layered over a `SopGraph`, letting a canvas animate an\nexecution without re-fetching the graph. Served by `sops/run-overlay`.",
@@ -5961,6 +6173,18 @@
           }
         ]
       },
+      "SopCreateResult": {
+        "description": "Result of `sops/create`: the name of the new SOP.",
+        "properties": {
+          "created": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "created"
+        ],
+        "type": "object"
+      },
       "SopDecideRequest": {
         "description": "Request payload for `sops/decide`: resolve a paused checkpoint. `name` and\n`run_id` select the run; `decision` is the raw `ApprovalDecision` wire value\n(`\"approve\"` or `{\"deny\": {\"reason\": \"...\"}}`), deserialized into the\ncanonical runtime enum by the handler so no parallel decision enum exists\nhere to drift from it.",
         "properties": {
@@ -6037,6 +6261,18 @@
         },
         "required": [
           "model"
+        ],
+        "type": "object"
+      },
+      "SopDeleteResult": {
+        "description": "Result of `sops/delete`: the name of the removed SOP.",
+        "properties": {
+          "deleted": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "deleted"
         ],
         "type": "object"
       },
@@ -6154,6 +6390,101 @@
         ],
         "type": "object"
       },
+      "SopRenameResult": {
+        "description": "Result of `sops/rename`: the SOP's new name and the one it replaced.",
+        "properties": {
+          "from": {
+            "type": "string"
+          },
+          "renamed": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "from",
+          "renamed"
+        ],
+        "type": "object"
+      },
+      "SopRunDetail": {
+        "description": "Full detail for one run as exposed over RPC (`sops/run-detail`) — an\nexplicit projection, not the persisted [`SopRun`].\n\nPolicy at this response boundary, applied independently of what any\nstorage path did earlier:\n- free-text fields that can carry model or tool content (step output,\n  tool arguments/output/error, the trigger topic) pass through the\n  credential scrubber on the way out;\n- fields no consuming view reads are excluded rather than redacted — the\n  raw trigger payload, the untrusted-framing marker, gate revision\n  bookkeeping, structured tool output payloads, and savings counters are\n  not on this struct, so a future serializer change cannot leak them.",
+        "properties": {
+          "active": {
+            "description": "True while the run is live rather than a retained terminal record.",
+            "type": "boolean"
+          },
+          "completed_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "current_step": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "failure_reason": {
+            "description": "Why the run failed, scrubbed. This is the run-level cause the engine\nretains, not a step's output: a run can fail before any step result\nexists — an input-schema rejection finishes the run straight from\nvalidation — and then this is the only explanation the response carries.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "run_id": {
+            "type": "string"
+          },
+          "sop_name": {
+            "type": "string"
+          },
+          "started_at": {
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/SopRunStatus"
+          },
+          "steps": {
+            "items": {
+              "$ref": "#/components/schemas/SopStepDetail"
+            },
+            "type": "array"
+          },
+          "total_steps": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "trigger_source": {
+            "description": "Where the run's trigger came from (manual, a channel, cron, ...).",
+            "type": "string"
+          },
+          "trigger_topic": {
+            "description": "The trigger's routing topic, scrubbed; the raw payload is excluded.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "waiting_since": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "run_id",
+          "sop_name",
+          "status",
+          "current_step",
+          "total_steps",
+          "started_at",
+          "trigger_source",
+          "active",
+          "steps"
+        ],
+        "type": "object"
+      },
       "SopRunDetailRequest": {
         "description": "Parameters for `sops/run-detail`.",
         "properties": {
@@ -6163,6 +6494,18 @@
         },
         "required": [
           "run_id"
+        ],
+        "type": "object"
+      },
+      "SopRunDetailResult": {
+        "description": "Result of `sops/run-detail`.",
+        "properties": {
+          "run": {
+            "$ref": "#/components/schemas/SopRunDetail"
+          }
+        },
+        "required": [
+          "run"
         ],
         "type": "object"
       },
@@ -6245,6 +6588,58 @@
           }
         ]
       },
+      "SopRunSummary": {
+        "description": "Lightweight projection of a run for list surfaces (Runs page). Carries\njust enough to render a row and open the per-run overlay, without the\nfull step-result payload.",
+        "properties": {
+          "active": {
+            "description": "True while the run is live (in the engine's active set) rather than\na retained terminal record.",
+            "type": "boolean"
+          },
+          "completed_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "current_step": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "run_id": {
+            "type": "string"
+          },
+          "sop_name": {
+            "type": "string"
+          },
+          "started_at": {
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/SopRunStatus"
+          },
+          "total_steps": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "trigger_source": {
+            "description": "Where the run's trigger came from (manual, a channel, cron, ...).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "run_id",
+          "sop_name",
+          "status",
+          "current_step",
+          "total_steps",
+          "started_at",
+          "trigger_source",
+          "active"
+        ],
+        "type": "object"
+      },
       "SopRunsRequest": {
         "description": "Request payload for `sops/runs`: enumerate runs the engine currently holds\n(active plus retained terminal), newest first. `sop` optionally scopes the\nlisting to a single SOP by name; omitting it lists every SOP's runs.",
         "properties": {
@@ -6255,6 +6650,21 @@
             ]
           }
         },
+        "type": "object"
+      },
+      "SopRunsResult": {
+        "description": "Result of `sops/runs`: run summaries, newest first.",
+        "properties": {
+          "runs": {
+            "items": {
+              "$ref": "#/components/schemas/SopRunSummary"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "runs"
+        ],
         "type": "object"
       },
       "SopSaveRequest": {
@@ -6270,6 +6680,18 @@
         },
         "required": [
           "sop"
+        ],
+        "type": "object"
+      },
+      "SopSaveResult": {
+        "description": "Result of `sops/save`: the name the SOP is stored under.",
+        "properties": {
+          "saved": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "saved"
         ],
         "type": "object"
       },
@@ -6451,6 +6873,51 @@
         },
         "type": "object"
       },
+      "SopStepDetail": {
+        "description": "One executed step inside [`SopRunDetail`].",
+        "properties": {
+          "completed_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "effective_agent": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "output": {
+            "description": "Scrubbed display output (or failure text) recorded for the step.",
+            "type": "string"
+          },
+          "started_at": {
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/SopStepStatus"
+          },
+          "step_number": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "tool_calls": {
+            "items": {
+              "$ref": "#/components/schemas/SopToolCallDetail"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "step_number",
+          "status",
+          "output",
+          "started_at"
+        ],
+        "type": "object"
+      },
       "SopStepKind": {
         "description": "The kind of a workflow step.",
         "oneOf": [
@@ -6470,6 +6937,58 @@
             "type": "string"
           }
         ]
+      },
+      "SopStepStatus": {
+        "description": "Result status of a single step execution.",
+        "enum": [
+          "completed",
+          "failed",
+          "skipped"
+        ],
+        "type": "string"
+      },
+      "SopToolCallDetail": {
+        "description": "One tool invocation inside [`SopStepDetail`].",
+        "properties": {
+          "args": {
+            "description": "Scrubbed arguments the tool actually received."
+          },
+          "duration_ms": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "index": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "output": {
+            "description": "Scrubbed display output.",
+            "type": "string"
+          },
+          "success": {
+            "type": "boolean"
+          },
+          "tool": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "index",
+          "tool",
+          "args",
+          "success",
+          "output",
+          "duration_ms"
+        ],
+        "type": "object"
       },
       "SopTrigger": {
         "description": "What event can activate an SOP.",
@@ -6721,6 +7240,32 @@
         ],
         "description": "Params for `sops/validate`: an unsaved draft in the `sops/save` form, or\na stored SOP selected by name. A request carrying a `sop` key is always\nvalidated as a draft."
       },
+      "SopValidateResult": {
+        "description": "Result of `sops/validate`. `ok` is true when nothing blocks the SOP;\nwarnings never block it.",
+        "properties": {
+          "blocking": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "ok": {
+            "type": "boolean"
+          },
+          "warnings": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "blocking",
+          "ok",
+          "warnings"
+        ],
+        "type": "object"
+      },
       "SopWireDraftParams": {
         "description": "Params for `sops/wire-draft`: apply one wire edit to an unsaved SOP\n(the `sops/save` wire form) and return the edited SOP and its graph.\nThe handler reads the two keys itself so each can report its own\nerror; this type is their declared contract.",
         "properties": {
@@ -6732,6 +7277,22 @@
         "required": [
           "sop",
           "edit"
+        ],
+        "type": "object"
+      },
+      "SopWireDraftResult": {
+        "description": "Result of `sops/wire-draft`: the edited SOP and its graph.",
+        "properties": {
+          "graph": {
+            "$ref": "#/components/schemas/SopGraph"
+          },
+          "sop": {
+            "$ref": "#/components/schemas/Sop"
+          }
+        },
+        "required": [
+          "graph",
+          "sop"
         ],
         "type": "object"
       },
@@ -7176,6 +7737,21 @@
         ],
         "type": "object"
       },
+      "ToolsParamOptionsResult": {
+        "description": "Result of `tools/param-options`.",
+        "properties": {
+          "options": {
+            "items": {
+              "$ref": "#/components/schemas/OptionEntry"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "options"
+        ],
+        "type": "object"
+      },
       "TriggerField": {
         "description": "One editable field of a trigger source (e.g. `topic` for MQTT).",
         "properties": {
@@ -7494,9 +8070,10 @@
       "result": {
         "name": "result",
         "schema": {
-          "description": "Free-form JSON shaped by the daemon at runtime."
+          "$ref": "#/components/schemas/HealthResult"
         },
-        "x-zeroclaw-shape": "untyped"
+        "x-zeroclaw-owner": "zeroclaw-runtime",
+        "x-zeroclaw-shape": "typed"
       },
       "x-zeroclaw-authorization": {
         "kind": "grant",
@@ -8866,9 +9443,9 @@
       "result": {
         "name": "result",
         "schema": {
-          "description": "Free-form JSON shaped by the daemon at runtime."
+          "$ref": "#/components/schemas/ConfigGetResult"
         },
-        "x-zeroclaw-shape": "untyped"
+        "x-zeroclaw-shape": "typed"
       },
       "x-zeroclaw-authorization": {
         "kind": "grant",
@@ -9339,9 +9916,9 @@
       "result": {
         "name": "result",
         "schema": {
-          "description": "Free-form JSON shaped by the daemon at runtime."
+          "$ref": "#/components/schemas/CostOrgResult"
         },
-        "x-zeroclaw-shape": "untyped"
+        "x-zeroclaw-shape": "typed"
       },
       "x-zeroclaw-authorization": {
         "kind": "grant",
@@ -10603,9 +11180,10 @@
       "result": {
         "name": "result",
         "schema": {
-          "description": "Free-form JSON shaped by the daemon at runtime."
+          "$ref": "#/components/schemas/CertRenewResult"
         },
-        "x-zeroclaw-shape": "untyped"
+        "x-zeroclaw-owner": "zeroclaw-runtime",
+        "x-zeroclaw-shape": "typed"
       },
       "x-zeroclaw-authorization": {
         "kind": "handshake"
@@ -10622,9 +11200,13 @@
       "result": {
         "name": "result",
         "schema": {
-          "description": "Free-form JSON shaped by the daemon at runtime."
+          "items": {
+            "$ref": "#/components/schemas/Sop"
+          },
+          "type": "array"
         },
-        "x-zeroclaw-shape": "untyped"
+        "x-zeroclaw-owner": "zeroclaw-runtime",
+        "x-zeroclaw-shape": "typed"
       },
       "x-zeroclaw-authorization": {
         "kind": "grant",
@@ -10762,9 +11344,10 @@
       "result": {
         "name": "result",
         "schema": {
-          "description": "Free-form JSON shaped by the daemon at runtime."
+          "$ref": "#/components/schemas/SopRunsResult"
         },
-        "x-zeroclaw-shape": "untyped"
+        "x-zeroclaw-owner": "zeroclaw-runtime",
+        "x-zeroclaw-shape": "typed"
       },
       "x-zeroclaw-authorization": {
         "kind": "grant",
@@ -10791,9 +11374,10 @@
       "result": {
         "name": "result",
         "schema": {
-          "description": "Free-form JSON shaped by the daemon at runtime."
+          "$ref": "#/components/schemas/SopRunDetailResult"
         },
-        "x-zeroclaw-shape": "untyped"
+        "x-zeroclaw-owner": "zeroclaw-runtime",
+        "x-zeroclaw-shape": "typed"
       },
       "x-zeroclaw-authorization": {
         "kind": "grant",
@@ -10849,9 +11433,9 @@
       "result": {
         "name": "result",
         "schema": {
-          "description": "Free-form JSON shaped by the daemon at runtime."
+          "$ref": "#/components/schemas/SopValidateResult"
         },
-        "x-zeroclaw-shape": "untyped"
+        "x-zeroclaw-shape": "typed"
       },
       "x-zeroclaw-authorization": {
         "kind": "grant",
@@ -10887,9 +11471,9 @@
       "result": {
         "name": "result",
         "schema": {
-          "description": "Free-form JSON shaped by the daemon at runtime."
+          "$ref": "#/components/schemas/SopSaveResult"
         },
-        "x-zeroclaw-shape": "untyped"
+        "x-zeroclaw-shape": "typed"
       },
       "x-zeroclaw-authorization": {
         "kind": "grant",
@@ -10924,9 +11508,9 @@
       "result": {
         "name": "result",
         "schema": {
-          "description": "Free-form JSON shaped by the daemon at runtime."
+          "$ref": "#/components/schemas/SopCreateResult"
         },
-        "x-zeroclaw-shape": "untyped"
+        "x-zeroclaw-shape": "typed"
       },
       "x-zeroclaw-authorization": {
         "kind": "grant",
@@ -10953,9 +11537,9 @@
       "result": {
         "name": "result",
         "schema": {
-          "description": "Free-form JSON shaped by the daemon at runtime."
+          "$ref": "#/components/schemas/SopDeleteResult"
         },
-        "x-zeroclaw-shape": "untyped"
+        "x-zeroclaw-shape": "typed"
       },
       "x-zeroclaw-authorization": {
         "kind": "grant",
@@ -10991,9 +11575,9 @@
       "result": {
         "name": "result",
         "schema": {
-          "description": "Free-form JSON shaped by the daemon at runtime."
+          "$ref": "#/components/schemas/SopRenameResult"
         },
-        "x-zeroclaw-shape": "untyped"
+        "x-zeroclaw-shape": "typed"
       },
       "x-zeroclaw-authorization": {
         "kind": "grant",
@@ -11067,9 +11651,10 @@
       "result": {
         "name": "result",
         "schema": {
-          "description": "Free-form JSON shaped by the daemon at runtime."
+          "$ref": "#/components/schemas/SopWireDraftResult"
         },
-        "x-zeroclaw-shape": "untyped"
+        "x-zeroclaw-owner": "zeroclaw-runtime",
+        "x-zeroclaw-shape": "typed"
       },
       "x-zeroclaw-authorization": {
         "kind": "grant",
@@ -11165,9 +11750,9 @@
       "result": {
         "name": "result",
         "schema": {
-          "description": "Free-form JSON shaped by the daemon at runtime."
+          "$ref": "#/components/schemas/ToolsParamOptionsResult"
         },
-        "x-zeroclaw-shape": "untyped"
+        "x-zeroclaw-shape": "typed"
       },
       "x-zeroclaw-authorization": {
         "kind": "grant",

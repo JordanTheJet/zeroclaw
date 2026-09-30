@@ -10,7 +10,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use zeroclaw_api::jsonrpc::{SopSaveRequest, SopSelectRequest};
-use zeroclaw_api::tool::OptionDomain;
+use zeroclaw_api::tool::{OptionDomain, OptionEntry};
 
 // ── Re-exports: foundation-crate types that appear on the wire ────────
 
@@ -617,7 +617,36 @@ rpc_type! {
     }
 }
 
-// Full config read returns `Value` (masked) — inherently untyped.
+/// Result of `config/get`: one property when `prop` is given, otherwise the
+/// whole configuration with secrets masked.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(untagged)]
+pub enum ConfigGetResult {
+    Prop(ConfigGetPropResult),
+    Document(MaskedConfigDocument),
+}
+
+/// The whole configuration as `config/get` returns it, secrets masked. Its
+/// keys follow the configuration schema (`zeroclaw config schema`), which the
+/// RPC contract points to rather than repeats.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct MaskedConfigDocument(pub Value);
+
+#[cfg(feature = "schema-export")]
+impl schemars::JsonSchema for MaskedConfigDocument {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "MaskedConfigDocument".into()
+    }
+
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "type": "object",
+            "description": "The whole configuration with secrets masked. Its keys follow the configuration schema printed by `zeroclaw config schema`.",
+        })
+    }
+}
 
 rpc_type! {
     /// Value is polymorphic: a JSON string passes through as-is (backward
@@ -853,6 +882,26 @@ rpc_type! {
 }
 
 // Result is `CostSummary` directly (already Serialize).
+
+/// Result of `cost/org`: the operator's `org_cost.json` from the data
+/// directory, served as-is, or `null` when there is no such file. The daemon
+/// does not interpret it, so the contract does not constrain its shape.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct CostOrgResult(pub Option<Value>);
+
+#[cfg(feature = "schema-export")]
+impl schemars::JsonSchema for CostOrgResult {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "CostOrgResult".into()
+    }
+
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "description": "The contents of `org_cost.json` in the data directory, served as-is, or null when the file does not exist.",
+        })
+    }
+}
 
 // ══════════════════════════════════════════════════════════════════════
 // ── Skills ───────────────────────────────────────────────────────────
@@ -1728,6 +1777,45 @@ rpc_type! {
     }
 }
 
+rpc_type! {
+    /// Result of `sops/validate`. `ok` is true when nothing blocks the SOP;
+    /// warnings never block it.
+    pub struct SopValidateResult {
+        pub blocking: Vec<String>,
+        pub ok: bool,
+        pub warnings: Vec<String>,
+    }
+}
+
+rpc_type! {
+    /// Result of `sops/save`: the name the SOP is stored under.
+    pub struct SopSaveResult {
+        pub saved: String,
+    }
+}
+
+rpc_type! {
+    /// Result of `sops/create`: the name of the new SOP.
+    pub struct SopCreateResult {
+        pub created: String,
+    }
+}
+
+rpc_type! {
+    /// Result of `sops/delete`: the name of the removed SOP.
+    pub struct SopDeleteResult {
+        pub deleted: String,
+    }
+}
+
+rpc_type! {
+    /// Result of `sops/rename`: the SOP's new name and the one it replaced.
+    pub struct SopRenameResult {
+        pub from: String,
+        pub renamed: String,
+    }
+}
+
 // ══════════════════════════════════════════════════════════════════════
 // ── Tools ────────────────────────────────────────────────────────────
 // ══════════════════════════════════════════════════════════════════════
@@ -1744,6 +1832,13 @@ rpc_type! {
         /// Domain-specific arguments, handed to the option resolver as-is.
         #[serde(default)]
         pub args: Value,
+    }
+}
+
+rpc_type! {
+    /// Result of `tools/param-options`.
+    pub struct ToolsParamOptionsResult {
+        pub options: Vec<OptionEntry>,
     }
 }
 
@@ -2149,5 +2244,35 @@ mod tests {
         let draft = json!({ "name": "deploy", "steps": [] });
         let params: SopDraftParams = serde_json::from_value(json!({ "sop": draft })).unwrap();
         assert_eq!(params.sop, draft);
+    }
+
+    #[test]
+    fn config_get_result_serializes_either_branch_bare() {
+        let prop = ConfigGetResult::Prop(ConfigGetPropResult {
+            prop: "a.b".into(),
+            value: "1".into(),
+        });
+        assert_eq!(
+            serde_json::to_value(prop).unwrap(),
+            json!({"prop": "a.b", "value": "1"})
+        );
+        let document = ConfigGetResult::Document(MaskedConfigDocument(json!({"agents": {}})));
+        assert_eq!(
+            serde_json::to_value(document).unwrap(),
+            json!({"agents": {}})
+        );
+    }
+
+    #[test]
+    fn cost_org_result_is_the_file_or_null() {
+        assert_eq!(
+            serde_json::to_value(CostOrgResult(None)).unwrap(),
+            Value::Null
+        );
+        let file = json!({"teams": []});
+        assert_eq!(
+            serde_json::to_value(CostOrgResult(Some(file.clone()))).unwrap(),
+            file
+        );
     }
 }

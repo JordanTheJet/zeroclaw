@@ -3150,13 +3150,13 @@ impl RpcDispatcher {
         // reaches the client without a second bootstrap (rotation push consumer).
         let relay_profile = crate::enroll::relay_profile(&data_dir, &relay_cfg);
 
-        let response = serde_json::json!({
-            "cert_pem": issued.cert_pem,
-            "ca_chain_pem": ca_cert_pem,
-            "device_id": device_id,
-            "not_after": issued.not_after,
-            "relay_profile": relay_profile,
-        });
+        let response = to_result(CertRenewResult {
+            ca_chain_pem: ca_cert_pem.clone(),
+            cert_pem: issued.cert_pem.clone(),
+            device_id: device_id.clone(),
+            not_after: issued.not_after,
+            relay_profile,
+        })?;
 
         // Delivery boundary for renewal - and an honest one about its limits.
         // This layer returns a value to the JSON-RPC framing; it never sees the
@@ -7414,12 +7414,17 @@ impl RpcDispatcher {
             let val = config
                 .get_prop(&prop)
                 .map_err(|e| rpc_err(INVALID_PARAMS, format!("Unknown prop: {e}")))?;
-            to_result(ConfigGetPropResult { prop, value: val })
+            to_result(ConfigGetResult::Prop(ConfigGetPropResult {
+                prop,
+                value: val,
+            }))
         } else {
             // Return full config, masked.
             let mut masked = config;
             masked.mask_secrets();
-            Ok(serde_json::to_value(&masked).unwrap_or(Value::Null))
+            to_result(ConfigGetResult::Document(MaskedConfigDocument(
+                serde_json::to_value(&masked).unwrap_or(Value::Null),
+            )))
         }
     }
 
@@ -8570,9 +8575,9 @@ impl RpcDispatcher {
                         format!("org_cost.json is not valid JSON: {e}"),
                     )
                 })?;
-                Ok(value)
+                to_result(CostOrgResult(Some(value)))
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Value::Null),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => to_result(CostOrgResult(None)),
             Err(e) => Err(rpc_err(
                 INTERNAL_ERROR,
                 format!("failed to read org_cost.json: {e}"),
@@ -9751,7 +9756,7 @@ impl RpcDispatcher {
 
     fn handle_sops_list(&self) -> RpcResult {
         let (dir, mode) = self.sops_dir_and_mode();
-        let sops = crate::sop::load_sops_from_directory(&dir, mode);
+        let sops: SopsListResult = crate::sop::load_sops_from_directory(&dir, mode);
         to_result(sops)
     }
 
@@ -9931,7 +9936,7 @@ impl RpcDispatcher {
             .ok_or_else(|| rpc_err(INTERNAL_ERROR, "SOP subsystem not enabled"))?;
         let runs = crate::sop::run_summaries_for(engine, req.sop.as_deref())
             .map_err(|e| rpc_err(INTERNAL_ERROR, e.to_string()))?;
-        to_result(serde_json::json!({ "runs": runs }))
+        to_result(SopRunsResult { runs })
     }
 
     /// Full detail for one run: step results with status, timings, failure
@@ -9970,7 +9975,7 @@ impl RpcDispatcher {
             rpc_err(code, msg)
         })?;
         let detail = crate::sop::types::SopRunDetail::from_run(&run, active);
-        to_result(serde_json::json!({ "run": detail }))
+        to_result(SopRunDetailResult { run: detail })
     }
 
     fn handle_sops_run_overlay(&self, params: &Value) -> RpcResult {
@@ -10159,11 +10164,11 @@ impl RpcDispatcher {
             }
         };
         let v = crate::sop::validate_sop_strict(&sop);
-        to_result(serde_json::json!({
-            "blocking": v.blocking,
-            "warnings": v.warnings,
-            "ok": v.is_ok(),
-        }))
+        to_result(SopValidateResult {
+            ok: v.is_ok(),
+            blocking: v.blocking,
+            warnings: v.warnings,
+        })
     }
 
     fn handle_sops_save(&self, params: &Value) -> RpcResult {
@@ -10199,7 +10204,7 @@ impl RpcDispatcher {
             };
             rpc_err(code, e.to_string())
         })?;
-        to_result(serde_json::json!({ "saved": sop.name }))
+        to_result(SopSaveResult { saved: sop.name })
     }
 
     fn handle_sops_create(&self, params: &Value) -> RpcResult {
@@ -10214,7 +10219,7 @@ impl RpcDispatcher {
             };
             rpc_err(code, e.to_string())
         })?;
-        to_result(serde_json::json!({ "created": sop.name }))
+        to_result(SopCreateResult { created: sop.name })
     }
 
     fn handle_sops_delete(&self, params: &Value) -> RpcResult {
@@ -10228,7 +10233,7 @@ impl RpcDispatcher {
             };
             rpc_err(code, e.to_string())
         })?;
-        to_result(serde_json::json!({ "deleted": req.name }))
+        to_result(SopDeleteResult { deleted: req.name })
     }
 
     /// Move a SOP to a new name. Separate from `sops/save` on purpose: save
@@ -10261,7 +10266,10 @@ impl RpcDispatcher {
             };
             rpc_err(code, e.to_string())
         })?;
-        to_result(serde_json::json!({ "renamed": req.to, "from": req.from }))
+        to_result(SopRenameResult {
+            from: req.from,
+            renamed: req.to,
+        })
     }
 
     fn handle_sops_wire_draft(&self, params: &Value) -> RpcResult {
@@ -10276,10 +10284,10 @@ impl RpcDispatcher {
             .map_err(|e| rpc_err(INVALID_PARAMS, format!("invalid wire edit: {e}")))?;
         crate::sop::apply_wire(&mut sop, &edit)
             .map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))?;
-        to_result(serde_json::json!({
-            "sop": sop,
-            "graph": crate::sop::SopGraph::from_sop_with_specs(&sop, &self.sop_tool_specs()),
-        }))
+        to_result(SopWireDraftResult {
+            graph: crate::sop::SopGraph::from_sop_with_specs(&sop, &self.sop_tool_specs()),
+            sop,
+        })
     }
 
     fn handle_sops_graph_draft(&self, params: &Value) -> RpcResult {
@@ -10347,7 +10355,7 @@ impl RpcDispatcher {
                 &[],
             )
         };
-        to_result(serde_json::json!({ "options": entries }))
+        to_result(ToolsParamOptionsResult { options: entries })
     }
 
     async fn handle_quickstart_apply(&self, params: &Value) -> RpcResult {
@@ -16120,6 +16128,165 @@ mod tests {
             json!("certificate renewal requires the mutually authenticated WSS plane"),
             "{renew}"
         );
+    }
+
+    /// The results these handlers now build from declared types must be the
+    /// payloads they returned before.
+    #[tokio::test]
+    async fn typed_contract_results_keep_the_handlers_payloads() {
+        use std::collections::BTreeSet;
+        let keys = |v: &Value| -> BTreeSet<String> {
+            v.as_object()
+                .map(|o| o.keys().cloned().collect())
+                .unwrap_or_default()
+        };
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (ctx, engine, _sops_dir) = sop_scoped_ctx(&tmp, 4242);
+        let (mut operator, mut rx) = local_operator(&ctx).await;
+
+        let listed = rpc(&mut operator, &mut rx, 1, "sops/list", json!({})).await;
+        assert!(
+            listed["result"]
+                .as_array()
+                .is_some_and(|sops| sops.iter().any(|sop| sop["name"] == json!("alpha-sop"))),
+            "{listed}"
+        );
+
+        let draft = gated_sop("gamma-sop", "alpha");
+        let created = rpc(
+            &mut operator,
+            &mut rx,
+            2,
+            "sops/create",
+            json!({"sop": draft}),
+        )
+        .await;
+        assert_eq!(
+            created["result"],
+            json!({"created": "gamma-sop"}),
+            "{created}"
+        );
+        let saved = rpc(
+            &mut operator,
+            &mut rx,
+            3,
+            "sops/save",
+            json!({"sop": draft}),
+        )
+        .await;
+        assert_eq!(saved["result"], json!({"saved": "gamma-sop"}), "{saved}");
+        let renamed = rpc(
+            &mut operator,
+            &mut rx,
+            4,
+            "sops/rename",
+            json!({"from": "gamma-sop", "to": "delta-sop"}),
+        )
+        .await;
+        assert_eq!(
+            renamed["result"],
+            json!({"renamed": "delta-sop", "from": "gamma-sop"}),
+            "{renamed}"
+        );
+        let deleted = rpc(
+            &mut operator,
+            &mut rx,
+            5,
+            "sops/delete",
+            json!({"name": "delta-sop"}),
+        )
+        .await;
+        assert_eq!(
+            deleted["result"],
+            json!({"deleted": "delta-sop"}),
+            "{deleted}"
+        );
+
+        let validated = rpc(
+            &mut operator,
+            &mut rx,
+            6,
+            "sops/validate",
+            json!({"name": "alpha-sop"}),
+        )
+        .await;
+        assert_eq!(
+            keys(&validated["result"]),
+            BTreeSet::from(["blocking".into(), "ok".into(), "warnings".into()]),
+            "{validated}"
+        );
+
+        let run_id = park_sop_run(&engine, "alpha-sop");
+        let runs = rpc(&mut operator, &mut rx, 7, "sops/runs", json!({})).await;
+        assert_eq!(
+            keys(&runs["result"]),
+            BTreeSet::from(["runs".into()]),
+            "{runs}"
+        );
+        assert_eq!(runs["result"]["runs"][0]["run_id"], json!(run_id), "{runs}");
+        let detail = rpc(
+            &mut operator,
+            &mut rx,
+            8,
+            "sops/run-detail",
+            json!({"run_id": run_id}),
+        )
+        .await;
+        assert_eq!(
+            keys(&detail["result"]),
+            BTreeSet::from(["run".into()]),
+            "{detail}"
+        );
+        assert_eq!(detail["result"]["run"]["run_id"], json!(run_id), "{detail}");
+
+        let options = rpc(
+            &mut operator,
+            &mut rx,
+            9,
+            "tools/param-options",
+            json!({"domain": "agent_aliases"}),
+        )
+        .await;
+        assert_eq!(
+            keys(&options["result"]),
+            BTreeSet::from(["options".into()]),
+            "{options}"
+        );
+
+        let prop = rpc(
+            &mut operator,
+            &mut rx,
+            10,
+            "config/get",
+            json!({"prop": "users.alice.uid"}),
+        )
+        .await;
+        assert_eq!(
+            prop["result"],
+            json!({"prop": "users.alice.uid", "value": "4242"}),
+            "{prop}"
+        );
+        let whole = rpc(&mut operator, &mut rx, 11, "config/get", json!({})).await;
+        assert!(whole["result"]["agents"].is_object(), "{whole}");
+        assert!(whole["result"].get("prop").is_none(), "{whole}");
+
+        let absent = rpc(&mut operator, &mut rx, 12, "cost/org", json!({})).await;
+        assert_eq!(absent["result"], Value::Null, "{absent}");
+        let org_cost = json!({"teams": [{"name": "core", "usd": 12.5}]});
+        let data_dir = ctx.config.read().data_dir.clone();
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::write(data_dir.join("org_cost.json"), org_cost.to_string()).unwrap();
+        let present = rpc(&mut operator, &mut rx, 13, "cost/org", json!({})).await;
+        assert_eq!(present["result"], org_cost, "{present}");
+
+        let health = rpc(&mut operator, &mut rx, 14, "health", json!({})).await;
+        let declared = serde_json::to_value(HealthResult {
+            snapshot: crate::health::snapshot(),
+            process: crate::process_stats::sample(),
+        })
+        .unwrap();
+        assert_eq!(keys(&health["result"]), keys(&declared), "{health}");
     }
 
     #[tokio::test]

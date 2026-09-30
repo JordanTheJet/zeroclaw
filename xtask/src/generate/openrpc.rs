@@ -440,6 +440,22 @@ mod tests {
         assert_eq!(fetch["result"]["x-zeroclaw-shape"], json!("typed"));
     }
 
+    /// Every method's result is described. A method whose result is truly
+    /// free-form must say so with a documented result type rather than
+    /// `Shape::Untyped`, so the contract never hides a shape.
+    #[test]
+    fn every_result_is_described() {
+        let doc: Value = serde_json::from_str(&render().expect("render")).expect("valid JSON");
+        for m in doc["methods"].as_array().expect("methods") {
+            assert_ne!(
+                m["result"]["x-zeroclaw-shape"],
+                json!("untyped"),
+                "{}: declare a result type instead of an untyped result",
+                m["name"]
+            );
+        }
+    }
+
     #[test]
     fn every_schema_in_the_document_is_draft_7() {
         const LATER_DIALECT_KEYWORDS: &[&str] = &[

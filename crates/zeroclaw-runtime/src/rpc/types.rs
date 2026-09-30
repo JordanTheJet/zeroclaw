@@ -256,10 +256,88 @@ rpc_type! {
     }
 }
 
+rpc_type! {
+    /// Result of `sops/wire-draft`: the edited SOP and its graph.
+    #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+    pub struct SopWireDraftResult {
+        pub graph: crate::sop::SopGraph,
+        pub sop: crate::sop::Sop,
+    }
+}
+
+/// Result of `sops/list`: every SOP in the configured directory.
+pub type SopsListResult = Vec<crate::sop::Sop>;
+
+rpc_type! {
+    /// Result of `sops/runs`: run summaries, newest first.
+    #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+    pub struct SopRunsResult {
+        pub runs: Vec<crate::sop::types::SopRunSummary>,
+    }
+}
+
+rpc_type! {
+    /// Result of `sops/run-detail`.
+    #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+    pub struct SopRunDetailResult {
+        pub run: crate::sop::types::SopRunDetail,
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// ── Health and enrollment ────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════
+
+/// Result of `health`: the component health snapshot with the daemon's
+/// process statistics merged in under `process`.
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct HealthResult {
+    #[serde(flatten)]
+    pub snapshot: crate::health::HealthSnapshot,
+    pub process: crate::process_stats::ProcessStats,
+}
+
+rpc_type! {
+    /// Result of `cert/renew`: the replacement client certificate, the CA
+    /// chain to trust, and the current relay profile.
+    #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+    pub struct CertRenewResult {
+        pub ca_chain_pem: String,
+        pub cert_pem: String,
+        pub device_id: String,
+        /// Expiry as Unix seconds.
+        pub not_after: i64,
+        pub relay_profile: crate::enroll::RelayProfile,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn cert_renew_result_is_the_shape_clients_read() {
+        let result = CertRenewResult {
+            ca_chain_pem: "ca".into(),
+            cert_pem: "cert".into(),
+            device_id: "device".into(),
+            not_after: 1_700_000_000,
+            relay_profile: crate::enroll::RelayProfile::default(),
+        };
+        let wire = serde_json::to_value(&result).unwrap();
+        assert_eq!(
+            wire,
+            json!({
+                "ca_chain_pem": "ca",
+                "cert_pem": "cert",
+                "device_id": "device",
+                "not_after": 1_700_000_000,
+                "relay_profile": {"relay_url": "", "node_id": "", "relay_cert_pin": ""},
+            })
+        );
+    }
 
     #[test]
     fn sop_wire_draft_params_accept_the_body_the_handler_reads() {

@@ -761,6 +761,7 @@ impl fmt::Display for SopRunStatus {
 
 /// Result status of a single step execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum SopStepStatus {
     Completed,
@@ -900,6 +901,7 @@ impl ::zeroclaw_api::attribution::Attributable for SopRun {
 /// just enough to render a row and open the per-run overlay, without the
 /// full step-result payload.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct SopRunSummary {
     pub run_id: String,
     pub sop_name: String,
@@ -944,6 +946,7 @@ impl SopRunSummary {
 ///   bookkeeping, structured tool output payloads, and savings counters are
 ///   not on this struct, so a future serializer change cannot leak them.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct SopRunDetail {
     pub run_id: String,
     pub sop_name: String,
@@ -971,6 +974,7 @@ pub struct SopRunDetail {
 
 /// One executed step inside [`SopRunDetail`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct SopStepDetail {
     pub step_number: u32,
     pub status: SopStepStatus,
@@ -986,6 +990,7 @@ pub struct SopStepDetail {
 
 /// One tool invocation inside [`SopStepDetail`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct SopToolCallDetail {
     pub index: u32,
     pub tool: String,
