@@ -1041,6 +1041,36 @@ impl Dial for HangingDial {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_waiter_takes_the_capacity_a_request_lets_go_of() {
+    let fake = FakeCore::accepting(&["zc_a", "zc_b"]);
+    let limits = PoolLimits {
+        max_credentials: 1,
+        capacity_wait: Duration::from_millis(200),
+        ..PoolLimits::default()
+    };
+    let core = core_over(&fake, true, limits);
+    let a = call_for(&core, "zc_a").await;
+    connection_of(&a).await;
+
+    let waiter = {
+        let core = core.clone();
+        zeroclaw_spawn::spawn!(async move {
+            core.access(&headers(Some("zc_b"), None)).await.map(|_| ())
+        })
+    };
+    // b is now waiting for capacity that a holds. a's request ends well
+    // before b's deadline; its idle connection must make room for b.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    drop(a);
+    assert!(
+        matches!(waiter.await.expect("join"), Ok(())),
+        "the waiter was not admitted when a's connection went idle"
+    );
+    assert_eq!(fake.dials(), 2);
+    assert_eq!(pool_of(&core).open_connections(), 1);
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_dial_in_progress_holds_capacity() {
     let limits = PoolLimits {
         max_credentials: 1,
