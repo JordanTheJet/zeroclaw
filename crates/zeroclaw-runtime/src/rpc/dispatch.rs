@@ -25278,7 +25278,7 @@ mod tests {
 
         // (runtime_profile.max_context_tokens, provider.context_window, expected)
         let cases: &[(Option<usize>, Option<usize>, u64)] = &[
-            (Some(128_000), None, 32_000), // unknown capacity caps the profile budget
+            (Some(128_000), None, 128_000), // unknown capacity never caps an explicit budget
             (Some(128_000), Some(200_000), 128_000),
             (None, Some(200_000), 32_000), // meter reads profile budget (32k), not provider window
             (None, None, 32_000),          // hard stub
@@ -25502,8 +25502,8 @@ mod tests {
 
         assert_eq!(v["params"]["type"], "context_usage");
         assert_eq!(
-            v["params"]["max_context_tokens"], 32_000,
-            "effective budget must respect the unknown-capacity fallback"
+            v["params"]["max_context_tokens"], 128_000,
+            "an explicit profile budget is not clamped to the unknown-capacity stub (#10068)"
         );
         assert!(
             v["params"].get("model_context_window").is_none(),
@@ -25763,7 +25763,10 @@ mod tests {
         let json = notification_for_turn_event("s1", &event).unwrap();
         let v = parse(&json);
         assert_eq!(v["params"]["type"], "context_usage");
-        assert_eq!(v["params"]["max_context_tokens"], 32_000);
+        assert_eq!(
+            v["params"]["max_context_tokens"], 800_000,
+            "the explicit profile budget survives the same-profile fallback (#10068)"
+        );
         assert!(
             v["params"].get("model_context_window").is_none(),
             "RPC wire must omit model_context_window on same-profile fallback"
