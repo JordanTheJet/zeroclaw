@@ -39,7 +39,12 @@ native_path() {
   fi
 }
 
-smoke_root="$(mktemp -d)"
+if command -v cygpath >/dev/null 2>&1; then
+  smoke_root="$(mktemp -d)"
+else
+  # Keep the root short: the daemon's Unix socket path is length-limited.
+  smoke_root="$(mktemp -d /tmp/zc-smoke.XXXXXX)"
+fi
 smoke_cwd="$smoke_root/cwd"
 smoke_home="$smoke_root/home"
 xdg_data_home="$smoke_root/xdg-data"
