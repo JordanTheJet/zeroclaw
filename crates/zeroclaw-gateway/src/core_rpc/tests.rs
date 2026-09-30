@@ -1,0 +1,794 @@
+use super::*;
+
+use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+use axum::Router;
+use axum::body::Body;
+use axum::http::{HeaderValue, Request, header};
+use axum::routing::get;
+use http_body_util::BodyExt as _;
+use serde_json::json;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tower::ServiceExt as _;
+
+/// A core stand-in that speaks just enough of the protocol. It records the
+/// params of every `initialize` it receives, serves each connection as the
+/// credential that opened it, and answers every call with the connection's
+/// number, so a test can tell which connection carried a request.
+#[derive(Default)]
+struct FakeCore {
+    accepted: Mutex<HashSet<String>>,
+    handshakes: Mutex<Vec<Value>>,
+    dials: AtomicUsize,
+    open: Mutex<HashSet<usize>>,
+    down: AtomicBool,
+    drop_connections: tokio::sync::Notify,
+}
+
+impl FakeCore {
+    fn accepting(tokens: &[&str]) -> Arc<Self> {
+        let core = Self::default();
+        lock(&core.accepted).extend(tokens.iter().map(|t| (*t).to_owned()));
+        Arc::new(core)
+    }
+
+    fn accepts(&self, token: &str) -> bool {
+        lock(&self.accepted).contains(token)
+    }
+
+    fn revoke(&self, token: &str) {
+        lock(&self.accepted).remove(token);
+    }
+
+    fn dials(&self) -> usize {
+        self.dials.load(Ordering::SeqCst)
+    }
+
+    fn is_open(&self, connection: usize) -> bool {
+        lock(&self.open).contains(&connection)
+    }
+
+    /// The invariant under test: every handshake the core ever saw carried a
+    /// non-empty bearer and the provider that must verify it.
+    fn assert_no_credential_less_handshake(&self) {
+        for params in lock(&self.handshakes).iter() {
+            let token = params["auth_token"].as_str().unwrap_or_default();
+            let provider = params["auth_provider"].as_str().unwrap_or_default();
+            assert!(
+                !token.is_empty() && !provider.is_empty(),
+                "a handshake reached the core without a credential: {params}"
+            );
+        }
+    }
+
+    fn handshake_tokens(&self) -> Vec<String> {
+        lock(&self.handshakes)
+            .iter()
+            .map(|params| params["auth_token"].as_str().unwrap_or_default().to_owned())
+            .collect()
+    }
+}
+
+struct FakeDialer(Arc<FakeCore>);
+
+impl Dial for FakeDialer {
+    fn dial(&self) -> DialFuture<'_> {
+        let core = Arc::clone(&self.0);
+        Box::pin(async move {
+            if core.down.load(Ordering::SeqCst) {
+                return None;
+            }
+            let connection = core.dials.fetch_add(1, Ordering::SeqCst) + 1;
+            let (client, server) = tokio::io::duplex(64 * 1024);
+            lock(&core.open).insert(connection);
+            zeroclaw_spawn::spawn!(serve(core, server, connection));
+            Some(client)
+        })
+    }
+}
+
+fn reply(id: &Value, result: Value) -> String {
+    format!(
+        "{}\n",
+        json!({ "jsonrpc": "2.0", "id": id, "result": result })
+    )
+}
+
+fn refuse(id: &Value, code: i32, message: &str) -> String {
+    format!(
+        "{}\n",
+        json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
+    )
+}
+
+async fn serve(core: Arc<FakeCore>, stream: DuplexStream, connection: usize) {
+    let (read, mut write) = tokio::io::split(stream);
+    let mut lines = BufReader::new(read).lines();
+    let mut bound: Option<String> = None;
+    loop {
+        let line = tokio::select! {
+            line = lines.next_line() => line,
+            () = core.drop_connections.notified() => break,
+        };
+        let Ok(Some(line)) = line else { break };
+        let frame: Value = serde_json::from_str(&line).expect("client frames are JSON");
+        let id = frame["id"].clone();
+        let answer = match (frame["method"].as_str(), &bound) {
+            (Some("initialize"), None) => {
+                lock(&core.handshakes).push(frame["params"].clone());
+                let token = frame["params"]["auth_token"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned();
+                if core.accepts(&token) {
+                    let answer = reply(
+                        &id,
+                        json!({
+                            "protocol_version": 1,
+                            "server_version": "fake",
+                            "server_pid": 1,
+                            "principal_id": format!("principal-of-{token}"),
+                        }),
+                    );
+                    bound = Some(token);
+                    answer
+                } else {
+                    refuse(&id, AUTH_REQUIRED, "credential rejected")
+                }
+            }
+            (Some(method), Some(token)) => {
+                if !core.accepts(token) {
+                    refuse(&id, AUTH_REQUIRED, "credential revoked")
+                } else if method == Method::ConfigGet.wire_name() {
+                    refuse(&id, FORBIDDEN, "no config grant")
+                } else {
+                    reply(&id, json!({ "connection": connection }))
+                }
+            }
+            _ => refuse(&id, AUTH_REQUIRED, "initialize first"),
+        };
+        if write.write_all(answer.as_bytes()).await.is_err() {
+            break;
+        }
+    }
+    lock(&core.open).remove(&connection);
+}
+
+fn core_over(fake: &Arc<FakeCore>, pairing_required: bool, limits: PoolLimits) -> CoreRpc {
+    CoreRpc::with_dialer(
+        FakeDialer(Arc::clone(fake)),
+        move || pairing_required,
+        limits,
+    )
+}
+
+fn pool_of(core: &CoreRpc) -> Arc<Pool> {
+    Arc::clone(&core.seam.as_ref().expect("attached").pool)
+}
+
+fn headers(token: Option<&str>, provider: Option<&str>) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    if let Some(token) = token {
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}")).expect("header"),
+        );
+    }
+    if let Some(provider) = provider {
+        headers.insert(
+            AUTH_PROVIDER_HEADER,
+            HeaderValue::from_str(provider).expect("header"),
+        );
+    }
+    headers
+}
+
+async fn call_for(core: &CoreRpc, token: &str) -> CoreCall {
+    match core.access(&headers(Some(token), None)).await {
+        Ok(CoreAccess::Core(call)) => call,
+        Ok(CoreAccess::InProcess) => panic!("{token}: served in-process"),
+        Err(error) => panic!("{token}: {error:?}"),
+    }
+}
+
+async fn connection_of(call: &CoreCall) -> u64 {
+    call.request(Method::Status, json!({}))
+        .await
+        .expect("status")["connection"]
+        .as_u64()
+        .expect("connection number")
+}
+
+async fn wait_until(what: &str, condition: impl Fn() -> bool) {
+    let reached = tokio::time::timeout(Duration::from_secs(5), async {
+        while !condition() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(reached.is_ok(), "never observed: {what}");
+}
+
+fn status_of(error: &CoreError) -> (StatusCode, &'static str) {
+    error.status()
+}
+
+// ── Credential binding ───────────────────────────────────────────
+
+#[tokio::test]
+async fn each_credential_gets_its_own_connection_and_never_uses_another() {
+    let fake = FakeCore::accepting(&["zc_alice", "zc_bob"]);
+    let core = core_over(&fake, true, PoolLimits::default());
+
+    let alice = call_for(&core, "zc_alice").await;
+    let bob = call_for(&core, "zc_bob").await;
+    assert_eq!(alice.principal_id(), Some("principal-of-zc_alice"));
+    assert_eq!(bob.principal_id(), Some("principal-of-zc_bob"));
+    let alice_connection = connection_of(&alice).await;
+    let bob_connection = connection_of(&bob).await;
+    assert_ne!(alice_connection, bob_connection);
+
+    // A later request with the same credential reuses its connection.
+    let alice_again = call_for(&core, "zc_alice").await;
+    assert_eq!(connection_of(&alice_again).await, alice_connection);
+    assert_eq!(fake.dials(), 2);
+    assert_eq!(fake.handshake_tokens(), ["zc_alice", "zc_bob"]);
+    fake.assert_no_credential_less_handshake();
+}
+
+#[tokio::test]
+async fn one_credential_under_two_providers_is_two_connections() {
+    let fake = FakeCore::accepting(&["zc_shared"]);
+    let core = core_over(&fake, true, PoolLimits::default());
+
+    let native = match core
+        .access(&headers(Some("zc_shared"), Some("native")))
+        .await
+    {
+        Ok(CoreAccess::Core(call)) => call,
+        _ => panic!("native selection is served by the core"),
+    };
+    let oidc = match core
+        .access(&headers(Some("zc_shared"), Some("oidc.corp")))
+        .await
+    {
+        Ok(CoreAccess::Core(call)) => call,
+        _ => panic!("oidc selection is served by the core"),
+    };
+    assert_ne!(connection_of(&native).await, connection_of(&oidc).await);
+    let providers: Vec<String> = lock(&fake.handshakes)
+        .iter()
+        .map(|p| p["auth_provider"].as_str().unwrap_or_default().to_owned())
+        .collect();
+    assert_eq!(providers, ["native", "oidc.corp"]);
+}
+
+#[tokio::test]
+async fn concurrent_first_requests_with_one_credential_share_one_dial() {
+    let fake = FakeCore::accepting(&["zc_alice"]);
+    let core = core_over(&fake, true, PoolLimits::default());
+
+    let (first, second) = tokio::join!(call_for(&core, "zc_alice"), call_for(&core, "zc_alice"));
+    assert_eq!(connection_of(&first).await, connection_of(&second).await);
+    assert_eq!(fake.dials(), 1);
+}
+
+// ── The no-tokenless invariant ───────────────────────────────────
+
+#[tokio::test]
+async fn an_unusable_credential_is_refused_before_any_connection() {
+    let long = "a".repeat(MAX_BEARER_BYTES + 1);
+    let cases: Vec<(&str, HeaderMap)> = vec![
+        ("no Authorization header", HeaderMap::new()),
+        ("empty bearer", headers(Some(""), None)),
+        ("blank bearer", headers(Some("   "), None)),
+        (
+            "bearer with inner whitespace",
+            headers(Some("two words"), None),
+        ),
+        ("over-long bearer", headers(Some(&long), None)),
+        ("blank provider", headers(Some("zc_alice"), Some(""))),
+        (
+            "whitespace provider",
+            headers(Some("zc_alice"), Some("   ")),
+        ),
+        (
+            "transport provider",
+            headers(Some("zc_alice"), Some("peercred")),
+        ),
+        (
+            "unknown provider",
+            headers(Some("zc_alice"), Some("service")),
+        ),
+        (
+            "case-changed provider",
+            headers(Some("zc_alice"), Some("NATIVE")),
+        ),
+        (
+            "oidc with no alias",
+            headers(Some("zc_alice"), Some("oidc.")),
+        ),
+        ("provider without a bearer", headers(None, Some("native"))),
+    ];
+    let mut basic = HeaderMap::new();
+    basic.insert(
+        header::AUTHORIZATION,
+        HeaderValue::from_static("Basic emM6"),
+    );
+    let mut undecodable = headers(Some("zc_alice"), None);
+    undecodable.insert(
+        AUTH_PROVIDER_HEADER,
+        HeaderValue::from_bytes(b"oidc.\xff").expect("obs-text header"),
+    );
+
+    let fake = FakeCore::accepting(&["zc_alice"]);
+    let core = core_over(&fake, true, PoolLimits::default());
+    for (case, headers) in cases.iter().map(|(case, h)| (*case, h)).chain([
+        ("basic scheme", &basic),
+        ("undecodable provider", &undecodable),
+    ]) {
+        match core.access(headers).await {
+            Err(error) => assert_eq!(
+                status_of(&error),
+                (StatusCode::UNAUTHORIZED, "auth_required"),
+                "{case}"
+            ),
+            Ok(_) => panic!("{case}: must be refused"),
+        }
+    }
+    assert_eq!(fake.dials(), 0, "no connection was opened for any of them");
+}
+
+#[tokio::test]
+async fn with_pairing_disabled_only_an_unselected_request_stays_in_process() {
+    let fake = FakeCore::accepting(&["zc_alice"]);
+    let core = core_over(&fake, false, PoolLimits::default());
+
+    for headers in [
+        HeaderMap::new(),
+        headers(Some("zc_alice"), None),
+        headers(Some("not a token"), None),
+    ] {
+        assert!(matches!(
+            core.access(&headers).await,
+            Ok(CoreAccess::InProcess)
+        ));
+    }
+    // A provider selection is a request to authenticate: it is never waved
+    // through, and a bad one is refused.
+    assert!(matches!(
+        core.access(&headers(Some("zc_alice"), Some("peercred")))
+            .await,
+        Err(CoreError::AuthRequired(_))
+    ));
+    assert!(matches!(
+        core.access(&headers(None, Some("native"))).await,
+        Err(CoreError::AuthRequired(_))
+    ));
+    assert_eq!(fake.dials(), 0);
+
+    let selected = core
+        .access(&headers(Some("zc_alice"), Some("native")))
+        .await;
+    assert!(matches!(selected, Ok(CoreAccess::Core(_))));
+    fake.assert_no_credential_less_handshake();
+}
+
+#[tokio::test]
+async fn a_credential_the_core_refuses_is_401_and_never_pooled() {
+    let fake = FakeCore::accepting(&["zc_alice"]);
+    let core = core_over(&fake, true, PoolLimits::default());
+
+    for _ in 0..2 {
+        match core.access(&headers(Some("zc_forged"), None)).await {
+            Err(error) => {
+                assert_eq!(
+                    status_of(&error),
+                    (StatusCode::UNAUTHORIZED, "auth_required")
+                )
+            }
+            Ok(_) => panic!("a refused credential must not be served"),
+        }
+    }
+    assert_eq!(pool_of(&core).pooled(), 0);
+    // Each attempt presented the same credential; none fell back to
+    // presenting nothing.
+    assert_eq!(fake.handshake_tokens(), ["zc_forged", "zc_forged"]);
+    fake.assert_no_credential_less_handshake();
+    wait_until("the refused connections close", || {
+        lock(&fake.open).is_empty()
+    })
+    .await;
+}
+
+// ── Revocation, grants and failure ───────────────────────────────
+
+#[tokio::test]
+async fn a_revoked_credential_ends_its_connection_at_next_use() {
+    let fake = FakeCore::accepting(&["zc_alice", "zc_bob"]);
+    let core = core_over(&fake, true, PoolLimits::default());
+    let alice = call_for(&core, "zc_alice").await;
+    let bob = call_for(&core, "zc_bob").await;
+    let alice_connection = connection_of(&alice).await as usize;
+    let bob_connection = connection_of(&bob).await;
+
+    fake.revoke("zc_alice");
+    let refused = alice
+        .request(Method::Status, json!({}))
+        .await
+        .expect_err("the revoked credential is refused");
+    assert_eq!(
+        status_of(&refused),
+        (StatusCode::UNAUTHORIZED, "auth_required")
+    );
+    wait_until("the revoked connection closes", || {
+        !fake.is_open(alice_connection)
+    })
+    .await;
+    assert_eq!(pool_of(&core).pooled(), 1, "only bob's connection remains");
+    assert_eq!(connection_of(&bob).await, bob_connection);
+
+    // The next request with the revoked credential dials again with it and
+    // is refused at the handshake.
+    assert!(matches!(
+        core.access(&headers(Some("zc_alice"), None)).await,
+        Err(CoreError::AuthRequired(_))
+    ));
+    assert_eq!(fake.handshake_tokens(), ["zc_alice", "zc_bob", "zc_alice"]);
+    fake.assert_no_credential_less_handshake();
+}
+
+#[tokio::test]
+async fn a_missing_grant_is_403_and_the_next_request_dials_again() {
+    let fake = FakeCore::accepting(&["zc_alice"]);
+    let core = core_over(&fake, true, PoolLimits::default());
+    let alice = call_for(&core, "zc_alice").await;
+
+    let denied = alice
+        .request(Method::ConfigGet, json!({}))
+        .await
+        .expect_err("the fake core denies config/get");
+    assert_eq!(status_of(&denied), (StatusCode::FORBIDDEN, "forbidden"));
+    assert_eq!(pool_of(&core).pooled(), 0);
+
+    let again = call_for(&core, "zc_alice").await;
+    connection_of(&again).await;
+    assert_eq!(fake.handshake_tokens(), ["zc_alice", "zc_alice"]);
+}
+
+#[tokio::test]
+async fn an_unreachable_core_is_503_never_401() {
+    let fake = FakeCore::accepting(&["zc_alice"]);
+    fake.down.store(true, Ordering::SeqCst);
+    let core = core_over(&fake, true, PoolLimits::default());
+
+    let error = match core.access(&headers(Some("zc_alice"), None)).await {
+        Err(error) => error,
+        Ok(_) => panic!("no core to serve the request"),
+    };
+    assert_eq!(
+        status_of(&error),
+        (StatusCode::SERVICE_UNAVAILABLE, "core_unavailable")
+    );
+    // A bad credential is still a 401 while the core is down: the shape
+    // checks run first, and nothing is dialed for them.
+    let error = match core.access(&HeaderMap::new()).await {
+        Err(error) => error,
+        Ok(_) => panic!("refused"),
+    };
+    assert_eq!(
+        status_of(&error),
+        (StatusCode::UNAUTHORIZED, "auth_required")
+    );
+    assert_eq!(fake.dials(), 0);
+}
+
+#[tokio::test]
+async fn a_lost_connection_is_503_and_the_next_request_redials_with_its_credential() {
+    let fake = FakeCore::accepting(&["zc_alice"]);
+    let core = core_over(&fake, true, PoolLimits::default());
+    let alice = call_for(&core, "zc_alice").await;
+    connection_of(&alice).await;
+
+    fake.drop_connections.notify_waiters();
+    wait_until("the core drops the connection", || {
+        lock(&fake.open).is_empty()
+    })
+    .await;
+    let lost = alice
+        .request(Method::Status, json!({}))
+        .await
+        .expect_err("the connection is gone");
+    assert_eq!(
+        status_of(&lost),
+        (StatusCode::SERVICE_UNAVAILABLE, "core_unavailable")
+    );
+
+    let again = call_for(&core, "zc_alice").await;
+    connection_of(&again).await;
+    assert_eq!(fake.handshake_tokens(), ["zc_alice", "zc_alice"]);
+    fake.assert_no_credential_less_handshake();
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_pool_never_dials_on_its_own() {
+    // No probe, heartbeat or reconnect loop exists that could open a
+    // connection without a caller's credential: the only dial is a
+    // request's, carrying that request's bearer.
+    let fake = FakeCore::accepting(&["zc_alice"]);
+    let limits = PoolLimits {
+        sweep_interval: Duration::from_secs(1),
+        ..PoolLimits::default()
+    };
+    let core = core_over(&fake, true, limits);
+    tokio::time::advance(Duration::from_secs(3600)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(fake.dials(), 0, "an idle pool opened a connection");
+
+    // A connection the core drops is not dialed again until a request
+    // presents its credential.
+    let alice = call_for(&core, "zc_alice").await;
+    connection_of(&alice).await;
+    drop(alice);
+    fake.drop_connections.notify_waiters();
+    wait_until("the core drops the connection", || {
+        lock(&fake.open).is_empty()
+    })
+    .await;
+    tokio::time::advance(Duration::from_secs(3600)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(
+        fake.dials(),
+        1,
+        "a dropped connection was dialed again unasked"
+    );
+    assert_eq!(pool_of(&core).pooled(), 0);
+    fake.assert_no_credential_less_handshake();
+}
+
+#[tokio::test]
+async fn a_gateway_without_a_core_serves_in_process() {
+    let core = CoreRpc::default();
+    assert!(matches!(
+        core.access(&HeaderMap::new()).await,
+        Ok(CoreAccess::InProcess)
+    ));
+}
+
+// ── Bounds ───────────────────────────────────────────────────────
+
+#[tokio::test(start_paused = true)]
+async fn idle_connections_leave_the_pool() {
+    let fake = FakeCore::accepting(&["zc_alice", "zc_bob"]);
+    let limits = PoolLimits {
+        max_credentials: 8,
+        idle_timeout: Duration::from_secs(600),
+        sweep_interval: Duration::from_secs(60),
+    };
+    let core = core_over(&fake, true, limits);
+    let pool = pool_of(&core);
+
+    let alice_connection = {
+        let alice = call_for(&core, "zc_alice").await;
+        connection_of(&alice).await as usize
+    };
+    tokio::time::advance(Duration::from_secs(360)).await;
+    {
+        let bob = call_for(&core, "zc_bob").await;
+        connection_of(&bob).await;
+    }
+    tokio::time::advance(Duration::from_secs(300)).await;
+    pool.sweep_idle();
+
+    assert_eq!(pool.pooled(), 1, "alice was idle for 11 minutes, bob for 5");
+    wait_until("alice's idle connection closes", || {
+        !fake.is_open(alice_connection)
+    })
+    .await;
+
+    // The background sweep does the same without being called.
+    tokio::time::advance(Duration::from_secs(700)).await;
+    wait_until("the sweep drops bob's connection", || pool.pooled() == 0).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_cap_drops_the_least_recently_used_credential() {
+    let fake = FakeCore::accepting(&["zc_alice", "zc_bob", "zc_carol"]);
+    let limits = PoolLimits {
+        max_credentials: 2,
+        ..PoolLimits::default()
+    };
+    let core = core_over(&fake, true, limits);
+
+    let mut connections = HashMap::new();
+    for token in ["zc_alice", "zc_bob", "zc_alice", "zc_carol"] {
+        let call = call_for(&core, token).await;
+        connections.insert(token, connection_of(&call).await as usize);
+        tokio::time::advance(Duration::from_secs(1)).await;
+    }
+
+    assert_eq!(pool_of(&core).pooled(), 2);
+    wait_until("bob's connection, used least recently, closes", || {
+        !fake.is_open(connections["zc_bob"])
+    })
+    .await;
+    assert!(fake.is_open(connections["zc_alice"]));
+    assert!(fake.is_open(connections["zc_carol"]));
+}
+
+// ── The extractor ────────────────────────────────────────────────
+
+async fn probe(access: CoreAccess) -> Response {
+    match access {
+        CoreAccess::InProcess => "in-process".into_response(),
+        CoreAccess::Core(call) => match call.request(Method::Status, json!({})).await {
+            Ok(result) => Json(result).into_response(),
+            Err(error) => error.into_response(),
+        },
+    }
+}
+
+async fn get_probe(router: Router, headers: HeaderMap) -> (StatusCode, Value) {
+    let mut request = Request::builder().uri("/probe");
+    for (name, value) in &headers {
+        request = request.header(name, value);
+    }
+    let response = router
+        .oneshot(request.body(Body::empty()).expect("request"))
+        .await
+        .expect("infallible");
+    let status = response.status();
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .expect("body")
+        .to_bytes();
+    let body = serde_json::from_slice(&bytes)
+        .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).into_owned()));
+    (status, body)
+}
+
+#[tokio::test]
+async fn the_extractor_answers_401_and_503_distinctly() {
+    let fake = FakeCore::accepting(&["zc_alice"]);
+    let core = core_over(&fake, true, PoolLimits::default());
+    let router = Router::new()
+        .route("/probe", get(probe))
+        .layer(axum::Extension(core));
+
+    let (status, body) = get_probe(router.clone(), HeaderMap::new()).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(body["code"], "auth_required");
+    assert_eq!(fake.dials(), 0);
+
+    let (status, body) = get_probe(router.clone(), headers(Some("zc_alice"), None)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["connection"], 1);
+
+    fake.down.store(true, Ordering::SeqCst);
+    let (status, body) = get_probe(router.clone(), headers(Some("zc_newcomer"), None)).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["code"], "core_unavailable");
+
+    // A route the core handle was never installed on fails closed.
+    let unwired = Router::new().route("/probe", get(probe));
+    let (status, body) = get_probe(unwired, headers(Some("zc_alice"), None)).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["code"], "core_unavailable");
+    fake.assert_no_credential_less_handshake();
+}
+
+#[test]
+fn core_error_codes_map_to_their_http_statuses() {
+    use zeroclaw_api::jsonrpc::error_codes::INTERNAL_ERROR;
+    let cases = [
+        (AUTH_REQUIRED, StatusCode::UNAUTHORIZED),
+        (FORBIDDEN, StatusCode::FORBIDDEN),
+        (SESSION_NOT_OWNED, StatusCode::FORBIDDEN),
+        (INVALID_PARAMS, StatusCode::BAD_REQUEST),
+        (SESSION_NOT_FOUND, StatusCode::NOT_FOUND),
+        (SESSION_LIMIT_REACHED, StatusCode::TOO_MANY_REQUESTS),
+        (SESSION_BUSY, StatusCode::CONFLICT),
+        (METHOD_NOT_FOUND, StatusCode::SERVICE_UNAVAILABLE),
+        (VERSION_MISMATCH, StatusCode::SERVICE_UNAVAILABLE),
+        (CONNECTION_LIMIT_REACHED, StatusCode::SERVICE_UNAVAILABLE),
+        (INTERNAL_ERROR, StatusCode::INTERNAL_SERVER_ERROR),
+    ];
+    for (code, status) in cases {
+        let error = CoreError::from_rpc(JsonRpcError {
+            code,
+            message: "m".into(),
+            data: None,
+        });
+        assert_eq!(error.status().0, status, "code {code}");
+    }
+}
+
+// ── Against the daemon's real in-process connector ───────────────
+
+struct CountingDial {
+    connector: InprocConnector,
+    dials: Arc<AtomicUsize>,
+}
+
+impl Dial for CountingDial {
+    fn dial(&self) -> DialFuture<'_> {
+        self.dials.fetch_add(1, Ordering::SeqCst);
+        self.connector.dial()
+    }
+}
+
+#[tokio::test]
+async fn the_real_core_binds_each_bearer_and_revocation_ends_its_connection() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let mut config = zeroclaw_config::schema::Config {
+        data_dir: tmp.path().to_path_buf(),
+        config_path: tmp.path().join("config.toml"),
+        ..Default::default()
+    };
+    config.gateway.require_pairing = true;
+    config.gateway.paired_tokens = vec!["zc_gw_alice".into(), "zc_gw_bob".into()];
+    let sessions = Arc::new(zeroclaw_runtime::rpc::session::SessionStore::new(
+        16,
+        Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
+            4, 10, 60,
+        )),
+    ));
+    let ctx = zeroclaw_runtime::rpc::context::RpcContext::for_live_test(config, sessions);
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let connector = InprocConnector::new(cancel.clone());
+    connector.bind(Arc::clone(&ctx));
+    let dials = Arc::new(AtomicUsize::new(0));
+    let core = CoreRpc::with_dialer(
+        CountingDial {
+            connector,
+            dials: Arc::clone(&dials),
+        },
+        || true,
+        PoolLimits::default(),
+    );
+
+    // Refused before the core: nothing dialed.
+    assert!(matches!(
+        core.access(&HeaderMap::new()).await,
+        Err(CoreError::AuthRequired(_))
+    ));
+    assert_eq!(dials.load(Ordering::SeqCst), 0);
+
+    // A forged bearer is refused by the core and never pooled.
+    assert!(matches!(
+        core.access(&headers(Some("zc_gw_forged"), None)).await,
+        Err(CoreError::AuthRequired(_))
+    ));
+    assert_eq!(pool_of(&core).pooled(), 0);
+
+    let alice = call_for(&core, "zc_gw_alice").await;
+    let bob = call_for(&core, "zc_gw_bob").await;
+    assert_eq!(alice.principal_id(), Some("shared-operator"));
+    alice
+        .request(Method::Status, json!({}))
+        .await
+        .expect("alice's status");
+    bob.request(Method::Status, json!({}))
+        .await
+        .expect("bob's status");
+    assert_eq!(pool_of(&core).pooled(), 2);
+
+    assert!(ctx.auth.pairing().revoke_token("zc_gw_alice"));
+    let refused = alice
+        .request(Method::Status, json!({}))
+        .await
+        .expect_err("the revoked bearer is refused on its next use");
+    assert_eq!(
+        status_of(&refused),
+        (StatusCode::UNAUTHORIZED, "auth_required")
+    );
+    assert_eq!(pool_of(&core).pooled(), 1);
+    bob.request(Method::Status, json!({}))
+        .await
+        .expect("bob is unaffected");
+
+    cancel.cancel();
+}

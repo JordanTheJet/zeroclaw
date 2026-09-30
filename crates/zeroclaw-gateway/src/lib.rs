@@ -1012,19 +1012,6 @@ pub async fn run_gateway_with_plugin_webhooks(
         None => (None, None, None),
     };
 
-    // The in-process RPC seam: dial the daemon's dispatcher when a
-    // supervised run provides its connector, and hand the handle to every
-    // request as an extension so routes can migrate onto RPC one at a time.
-    // The gateway has no credential of its own yet, so the dial is refused
-    // and the seam stays idle until that credential exists; it never rides
-    // the daemon's anonymous compatibility path.
-    let core_rpc = core_rpc::CoreRpc::default();
-    if let Some(connector) = reload_controls
-        .as_ref()
-        .and_then(|controls| controls.inproc.clone())
-    {
-        core_rpc.attach_inproc(connector, zeroclaw_rpc_client::ConnectOptions::default());
-    }
     // ── Security: warn on public bind without tunnel or explicit opt-in ──
     if is_public_bind(host)
         && config.tunnel.tunnel_provider == "none"
@@ -1680,6 +1667,20 @@ pub async fn run_gateway_with_plugin_webhooks(
             config.gateway.pairing_code,
         )
     }));
+    // The in-process RPC seam: when a supervised run provides the daemon's
+    // connector, routes that migrate onto RPC reach the core through it, each
+    // request on a connection bound to its caller's own credential. Nothing
+    // is dialed until such a request arrives, and never without a credential.
+    let core_rpc = match reload_controls
+        .as_ref()
+        .and_then(|controls| controls.inproc.clone())
+    {
+        Some(connector) => {
+            let pairing = Arc::clone(&pairing);
+            core_rpc::CoreRpc::inproc(connector, move || pairing.require_pairing())
+        }
+        None => core_rpc::CoreRpc::default(),
+    };
     let rate_limit_max_keys = normalize_max_keys(
         config.gateway.rate_limit_max_keys,
         RATE_LIMIT_MAX_KEYS_DEFAULT,

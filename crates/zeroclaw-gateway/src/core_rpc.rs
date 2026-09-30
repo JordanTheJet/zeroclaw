@@ -1,139 +1,642 @@
-//! The gateway's RPC connection to the core.
+//! The gateway's RPC connections to the core.
 //!
 //! This is the strangler seam for the gateway split. While the gateway still
 //! runs inside the daemon, it dials the dispatcher through the daemon's
-//! in-process connector and holds the resulting [`RpcClient`] here; routes
-//! that migrate onto RPC reach it through the `CoreRpc` request extension.
-//! The cut-over later replaces the in-process dial with the real socket
-//! without changing any route.
+//! in-process connector; routes that migrate onto RPC reach it through the
+//! [`CoreAccess`] extractor. The cut-over later replaces the in-process dial
+//! with the real socket without changing any route.
 //!
-//! The in-process transport never takes the daemon's local compatibility
-//! path: an `initialize` without an explicit credential is refused with
-//! `AUTH_REQUIRED`. Until the gateway has a credential of its own to present
-//! (its service key, or a forwarded user bearer, both later work), the seam
-//! therefore stays idle by design; that outcome is logged once at INFO and
-//! not retried, because the daemon's policy does not change until a reload
-//! restarts this generation. Other handshake refusals are logged at WARN and
-//! not retried either; transport failures retry with backoff.
+//! Every core connection is bound to one HTTP caller's credential. The pool
+//! is keyed by the selected auth provider and a SHA-256 of the bearer, and a
+//! request is only ever sent on the connection its own credential opened:
+//! there is no gateway-wide connection and no credential-less one. The pool
+//! keeps no bearer, only its hash; a connection that ended is dialed again
+//! on the caller's next request, which presents the bearer again.
+//!
+//! No credential-less connection, ever. A request whose credential is absent,
+//! blank, malformed, or selects a provider that cannot verify a bearer is
+//! answered `401` before any connection is opened or reused. A credential the
+//! core refuses, at the handshake or on a later call, is answered `401` (`403`
+//! when the principal lacks a grant) and its connection leaves the pool; the
+//! request is never retried without the credential or with another one. This
+//! matters beyond the in-process transport, which already refuses an
+//! anonymous `initialize`: on a Unix socket the core admits a same-uid peer
+//! that presents nothing as the shared operator, and with no user roster it
+//! admits any local peer through local compatibility.
+//!
+//! Two cases stay in-process. With pairing disabled and no provider selected
+//! the caller presents no credential by design, so the request is served by
+//! the route's in-process body exactly as before. A gateway with no core
+//! attached (a standalone run) serves every request in-process.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::Duration;
 
-use tokio::sync::RwLock;
-use zeroclaw_rpc_client::{Backoff, ClientError, ConnectOptions, RpcClient};
+use axum::Json;
+use axum::extract::FromRequestParts;
+use axum::http::request::Parts;
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
+use serde_json::Value;
+use sha2::{Digest, Sha256};
+use tokio::io::DuplexStream;
+use tokio::time::Instant;
+use zeroclaw_api::jsonrpc::JsonRpcError;
+use zeroclaw_api::jsonrpc::error_codes::{
+    AUTH_REQUIRED, CONNECTION_LIMIT_REACHED, FORBIDDEN, FS_INVALID_PATH, FS_NOT_FOUND,
+    FS_PERMISSION_DENIED, INVALID_PARAMS, METHOD_NOT_FOUND, SESSION_BUSY, SESSION_LIMIT_REACHED,
+    SESSION_NOT_FOUND, SESSION_NOT_OWNED, SOP_ALREADY_EXISTS, SOP_NOT_FOUND, VERSION_MISMATCH,
+};
+use zeroclaw_rpc_client::{ClientError, ConnectOptions, ConnectionState, Method, RpcClient};
 use zeroclaw_runtime::rpc::inproc::InprocConnector;
 
-/// Handle to the core connection, shared with every request as an axum
-/// extension. Cheap to clone.
+use crate::principal_gate::AUTH_PROVIDER_HEADER;
+
+/// Distinct credentials holding a core connection at once.
+const MAX_CREDENTIALS: usize = 64;
+/// A credential's connection leaves the pool after this long unused.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+/// How often the idle sweep runs.
+const SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+/// Ceiling for obtaining a transport from the dialer.
+const DIAL_TIMEOUT: Duration = Duration::from_secs(5);
+/// Longest bearer forwarded to the core. An OIDC access token is well
+/// below this; anything longer is refused as malformed.
+const MAX_BEARER_BYTES: usize = 8 * 1024;
+
+/// The provider a bare bearer selects, as in the RPC handshake.
+const NATIVE_PROVIDER: &str = "native";
+/// Prefix of every OIDC provider selection (`oidc.<alias>`).
+const OIDC_PROVIDER_PREFIX: &str = "oidc.";
+
+/// The 401 message for a missing or unusable bearer, unchanged from the
+/// gateway's existing denial.
+const PAIR_FIRST_MESSAGE: &str =
+    "Unauthorized — pair first via POST /pair, then send Authorization: Bearer <token>";
+/// The 401 message for a provider header naming no bearer provider,
+/// unchanged from the config route layer's.
+const INVALID_PROVIDER_MESSAGE: &str = "Invalid auth_provider selection";
+
+type DialFuture<'a> = Pin<Box<dyn Future<Output = Option<DuplexStream>> + Send + 'a>>;
+
+/// Opens a transport to the core. The in-process connector implements it;
+/// tests substitute their own.
+pub(crate) trait Dial: Send + Sync + 'static {
+    /// A fresh connection, or `None` when the core is not accepting any.
+    fn dial(&self) -> DialFuture<'_>;
+}
+
+impl Dial for InprocConnector {
+    fn dial(&self) -> DialFuture<'_> {
+        Box::pin(self.connect())
+    }
+}
+
+/// Handle to the gateway's core connections, shared with every request as
+/// an axum extension. Cheap to clone. The default handle has no core
+/// attached: every request is served in-process.
 #[derive(Clone, Default)]
 pub struct CoreRpc {
-    client: Arc<RwLock<Option<Arc<RpcClient>>>>,
+    seam: Option<Arc<Seam>>,
+}
+
+struct Seam {
+    pool: Arc<Pool>,
+    /// Whether pairing is required, read from the live pairing authority on
+    /// every request rather than captured at startup.
+    pairing_required: Box<dyn Fn() -> bool + Send + Sync>,
 }
 
 impl CoreRpc {
-    /// The live client, or `None` while disconnected or unattached.
-    pub async fn client(&self) -> Option<Arc<RpcClient>> {
-        self.client.read().await.clone()
+    /// Serve RPC-backed routes through the daemon's in-process connector.
+    /// `pairing_required` reads the live pairing authority.
+    pub fn inproc(
+        connector: InprocConnector,
+        pairing_required: impl Fn() -> bool + Send + Sync + 'static,
+    ) -> Self {
+        Self::with_dialer(connector, pairing_required, PoolLimits::default())
     }
 
-    /// Whether a connection is currently established.
-    pub async fn is_connected(&self) -> bool {
-        self.client.read().await.is_some()
+    fn with_dialer(
+        dialer: impl Dial,
+        pairing_required: impl Fn() -> bool + Send + Sync + 'static,
+        limits: PoolLimits,
+    ) -> Self {
+        let pool = Arc::new(Pool::new(Box::new(dialer), limits));
+        spawn_idle_sweep(Arc::downgrade(&pool), limits.sweep_interval);
+        Self {
+            seam: Some(Arc::new(Seam {
+                pool,
+                pairing_required: Box::new(pairing_required),
+            })),
+        }
     }
 
-    /// Dial the core through `connector`, presenting `options` in every
-    /// handshake, and keep the handle current across reconnects until the
-    /// generation is cancelled.
-    pub fn attach_inproc(&self, connector: InprocConnector, options: ConnectOptions) {
-        let slot = Arc::clone(&self.client);
-        zeroclaw_spawn::spawn!(maintain(connector, options, slot));
+    /// Decide how the request carrying `headers` reaches the core.
+    ///
+    /// Every refusal here happens before a connection is opened or reused.
+    pub async fn access(&self, headers: &HeaderMap) -> Result<CoreAccess, CoreError> {
+        let Some(seam) = &self.seam else {
+            return Ok(CoreAccess::InProcess);
+        };
+        let provider = provider_selection(headers)?;
+        if provider.is_none() && !(seam.pairing_required)() {
+            return Ok(CoreAccess::InProcess);
+        }
+        let credential = HttpCredential {
+            provider: provider.unwrap_or(NATIVE_PROVIDER),
+            token: bearer(headers)?,
+        };
+        Arc::clone(&seam.pool)
+            .acquire(&credential)
+            .await
+            .map(CoreAccess::Core)
     }
 }
 
-async fn maintain(
-    connector: InprocConnector,
-    options: ConnectOptions,
-    slot: Arc<RwLock<Option<Arc<RpcClient>>>>,
-) {
-    let mut backoff = Backoff::new(Duration::from_millis(100), Duration::from_secs(5));
-    loop {
-        let Some(stream) = connector.connect().await else {
-            // The generation is over; nothing to reconnect to.
-            return;
+/// How one HTTP request reaches the core.
+pub enum CoreAccess {
+    /// Through the core, on a connection bound to the caller's credential.
+    Core(CoreCall),
+    /// Through the route's in-process body: pairing is disabled and the
+    /// caller selected no provider, or this gateway has no core attached.
+    InProcess,
+}
+
+impl<S: Send + Sync> FromRequestParts<S> for CoreAccess {
+    type Rejection = CoreError;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        // The router always installs the handle; a route without it is a
+        // wiring fault, refused rather than served in-process.
+        let Some(core) = parts.extensions.get::<CoreRpc>().cloned() else {
+            return Err(CoreError::Unavailable(
+                "the core connection is not configured for this route".into(),
+            ));
         };
-        match RpcClient::connect_over(stream, options.clone()).await {
+        core.access(&parts.headers).await
+    }
+}
+
+/// Why a request could not be served through the core. Each case answers
+/// with its own status, so a refused credential (`401`) is never reported
+/// as an unreachable core (`503`) or the reverse.
+#[derive(Debug)]
+pub enum CoreError {
+    /// The caller presented no usable credential, or the core refused it.
+    AuthRequired(String),
+    /// The core refused this principal the operation.
+    Forbidden(String),
+    /// The core could not be reached.
+    Unavailable(String),
+    /// The core did not answer in time.
+    Timeout,
+    /// Any other refusal from the core, mapped by its code.
+    Rpc(JsonRpcError),
+}
+
+impl CoreError {
+    fn from_rpc(error: JsonRpcError) -> Self {
+        match error.code {
+            AUTH_REQUIRED => Self::AuthRequired(error.message),
+            FORBIDDEN => Self::Forbidden(error.message),
+            _ => Self::Rpc(error),
+        }
+    }
+
+    /// The HTTP status and stable machine code this error answers with.
+    pub fn status(&self) -> (StatusCode, &'static str) {
+        match self {
+            Self::AuthRequired(_) => (StatusCode::UNAUTHORIZED, "auth_required"),
+            Self::Forbidden(_) => (StatusCode::FORBIDDEN, "forbidden"),
+            Self::Unavailable(_) => (StatusCode::SERVICE_UNAVAILABLE, "core_unavailable"),
+            Self::Timeout => (StatusCode::GATEWAY_TIMEOUT, "core_timeout"),
+            Self::Rpc(error) => rpc_status(error.code),
+        }
+    }
+}
+
+/// The HTTP mapping of a core error code.
+fn rpc_status(code: i32) -> (StatusCode, &'static str) {
+    match code {
+        AUTH_REQUIRED => (StatusCode::UNAUTHORIZED, "auth_required"),
+        FORBIDDEN | SESSION_NOT_OWNED | FS_PERMISSION_DENIED => {
+            (StatusCode::FORBIDDEN, "forbidden")
+        }
+        INVALID_PARAMS | FS_INVALID_PATH => (StatusCode::BAD_REQUEST, "invalid_params"),
+        SESSION_NOT_FOUND | SOP_NOT_FOUND | FS_NOT_FOUND => (StatusCode::NOT_FOUND, "not_found"),
+        SESSION_LIMIT_REACHED => (StatusCode::TOO_MANY_REQUESTS, "session_limit_reached"),
+        SESSION_BUSY | SOP_ALREADY_EXISTS => (StatusCode::CONFLICT, "conflict"),
+        METHOD_NOT_FOUND => (StatusCode::SERVICE_UNAVAILABLE, "core_capability_missing"),
+        VERSION_MISMATCH => (StatusCode::SERVICE_UNAVAILABLE, "core_incompatible"),
+        CONNECTION_LIMIT_REACHED => (StatusCode::SERVICE_UNAVAILABLE, "core_unavailable"),
+        _ => (StatusCode::INTERNAL_SERVER_ERROR, "core_error"),
+    }
+}
+
+impl IntoResponse for CoreError {
+    fn into_response(self) -> Response {
+        let (status, code) = self.status();
+        let message = match self {
+            Self::AuthRequired(message) | Self::Forbidden(message) | Self::Unavailable(message) => {
+                message
+            }
+            Self::Timeout => "the core did not answer in time".to_owned(),
+            Self::Rpc(error) => error.message,
+        };
+        (
+            status,
+            Json(serde_json::json!({ "error": message, "code": code })),
+        )
+            .into_response()
+    }
+}
+
+/// The provider the caller selected, `None` when the header is absent.
+///
+/// A header that is present must name a provider that verifies a bearer:
+/// `native`, or an `oidc.<alias>` selection. Anything else, including a
+/// blank value or a provider that authenticates the transport rather than a
+/// bearer, is refused; it never falls back to the native provider or to the
+/// in-process path. Whether an OIDC alias is configured is the core's call.
+fn provider_selection(headers: &HeaderMap) -> Result<Option<&str>, CoreError> {
+    let Some(value) = headers.get(AUTH_PROVIDER_HEADER) else {
+        return Ok(None);
+    };
+    let name = value.to_str().map(str::trim).unwrap_or_default();
+    let verifies_a_bearer = name == NATIVE_PROVIDER
+        || name
+            .strip_prefix(OIDC_PROVIDER_PREFIX)
+            .is_some_and(|alias| !alias.is_empty() && alias.bytes().all(|b| b.is_ascii_graphic()));
+    if verifies_a_bearer {
+        Ok(Some(name))
+    } else {
+        Err(CoreError::AuthRequired(INVALID_PROVIDER_MESSAGE.into()))
+    }
+}
+
+/// The caller's bearer: non-empty, printable ASCII with no whitespace, and
+/// bounded in length. Anything else is refused before the core sees it.
+fn bearer(headers: &HeaderMap) -> Result<&str, CoreError> {
+    let refused = || CoreError::AuthRequired(PAIR_FIRST_MESSAGE.into());
+    let token = crate::api::extract_bearer_token(headers).ok_or_else(refused)?;
+    if token.is_empty()
+        || token.len() > MAX_BEARER_BYTES
+        || !token.bytes().all(|b| b.is_ascii_graphic())
+    {
+        return Err(refused());
+    }
+    Ok(token)
+}
+
+/// A credential that passed the gateway's shape checks. Borrowed from the
+/// request; the pool never stores it.
+struct HttpCredential<'a> {
+    provider: &'a str,
+    token: &'a str,
+}
+
+impl HttpCredential<'_> {
+    fn key(&self) -> PoolKey {
+        PoolKey {
+            provider: self.provider.to_owned(),
+            credential_sha256: Sha256::digest(self.token.as_bytes()).into(),
+        }
+    }
+
+    /// The handshake options for this credential. Always carries the
+    /// bearer and the provider that must verify it.
+    fn connect_options(&self) -> ConnectOptions {
+        ConnectOptions {
+            auth_token: Some(self.token.to_owned()),
+            auth_provider: Some(self.provider.to_owned()),
+            ..ConnectOptions::default()
+        }
+    }
+}
+
+/// Pool key: the provider selection and the credential's SHA-256, never
+/// the principal (two bearers of one principal expire and are revoked
+/// independently).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct PoolKey {
+    provider: String,
+    credential_sha256: [u8; 32],
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PoolLimits {
+    max_credentials: usize,
+    idle_timeout: Duration,
+    sweep_interval: Duration,
+}
+
+impl Default for PoolLimits {
+    fn default() -> Self {
+        Self {
+            max_credentials: MAX_CREDENTIALS,
+            idle_timeout: IDLE_TIMEOUT,
+            sweep_interval: SWEEP_INTERVAL,
+        }
+    }
+}
+
+struct Pool {
+    dialer: Box<dyn Dial>,
+    limits: PoolLimits,
+    slots: Mutex<HashMap<PoolKey, Arc<Slot>>>,
+}
+
+/// One credential's place in the pool. Its connection closes when the slot
+/// leaves the pool and no request still holds it.
+struct Slot {
+    /// Serializes dials for this credential, so concurrent first requests
+    /// share one connection.
+    dial_lock: tokio::sync::Mutex<()>,
+    client: Mutex<Option<Arc<RpcClient>>>,
+    last_used: Mutex<Instant>,
+}
+
+impl Slot {
+    fn new() -> Self {
+        Self {
+            dial_lock: tokio::sync::Mutex::new(()),
+            client: Mutex::new(None),
+            last_used: Mutex::new(Instant::now()),
+        }
+    }
+
+    fn touch(&self) {
+        *lock(&self.last_used) = Instant::now();
+    }
+
+    fn idle_for(&self) -> Duration {
+        lock(&self.last_used).elapsed()
+    }
+
+    fn live_client(&self) -> Option<Arc<RpcClient>> {
+        lock(&self.client)
+            .as_ref()
+            .filter(|client| client.state() == ConnectionState::Connected)
+            .cloned()
+    }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+impl Pool {
+    fn new(dialer: Box<dyn Dial>, limits: PoolLimits) -> Self {
+        Self {
+            dialer,
+            limits,
+            slots: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// The connection for `credential`, dialing one if it has none.
+    async fn acquire(
+        self: Arc<Self>,
+        credential: &HttpCredential<'_>,
+    ) -> Result<CoreCall, CoreError> {
+        let key = credential.key();
+        let slot = {
+            let mut slots = lock(&self.slots);
+            self.sweep_idle_locked(&mut slots);
+            Arc::clone(
+                slots
+                    .entry(key.clone())
+                    .or_insert_with(|| Arc::new(Slot::new())),
+            )
+        };
+        slot.touch();
+        if let Some(client) = slot.live_client() {
+            return Ok(self.call(key, slot, client));
+        }
+
+        let dialing_slot = Arc::clone(&slot);
+        let _dialing = dialing_slot.dial_lock.lock().await;
+        if let Some(client) = slot.live_client() {
+            return Ok(self.call(key, slot, client));
+        }
+        match self.dial(credential).await {
             Ok(client) => {
-                backoff.reset();
-                let client = Arc::new(client);
-                ::zeroclaw_log::record!(
-                    INFO,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_attrs(::serde_json::json!({
-                            "principal_id": client.handshake().principal_id,
-                            "capabilities": client.handshake().capabilities.len(),
-                        })),
-                    "gateway connected to the core over the in-process RPC seam"
-                );
-                *slot.write().await = Some(Arc::clone(&client));
-                client.closed().await;
-                *slot.write().await = None;
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                    "gateway lost its in-process RPC connection; reconnecting"
-                );
+                *lock(&slot.client) = Some(Arc::clone(&client));
+                self.enforce_cap(&key);
+                Ok(self.call(key, slot, client))
             }
-            Err(ClientError::Rpc(error))
-                if error.code == zeroclaw_api::jsonrpc::error_codes::AUTH_REQUIRED =>
-            {
-                ::zeroclaw_log::record!(
-                    INFO,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_attrs(::serde_json::json!({ "code": error.code })),
-                    "in-process RPC seam idle: the gateway has no credential to present yet"
-                );
-                return;
+            Err(error) => {
+                self.forget(&key, &slot);
+                Err(error)
             }
+        }
+    }
+
+    fn call(self: &Arc<Self>, key: PoolKey, slot: Arc<Slot>, client: Arc<RpcClient>) -> CoreCall {
+        CoreCall {
+            pool: Arc::clone(self),
+            key,
+            slot,
+            client,
+        }
+    }
+
+    /// Open a connection and present `credential` in its handshake.
+    async fn dial(&self, credential: &HttpCredential<'_>) -> Result<Arc<RpcClient>, CoreError> {
+        let stream = match tokio::time::timeout(DIAL_TIMEOUT, self.dialer.dial()).await {
+            Ok(Some(stream)) => stream,
+            Ok(None) | Err(_) => {
+                return Err(CoreError::Unavailable(
+                    "the core is not accepting connections".into(),
+                ));
+            }
+        };
+        match RpcClient::connect_over(stream, credential.connect_options()).await {
+            Ok(client) => Ok(Arc::new(client)),
             Err(ClientError::Rpc(error)) => {
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "provider": credential.provider,
+                            "code": error.code,
+                        })),
+                    "core refused a gateway caller's handshake"
+                );
+                Err(match error.code {
+                    AUTH_REQUIRED | FORBIDDEN | VERSION_MISMATCH => CoreError::from_rpc(error),
+                    _ => CoreError::Unavailable(error.message),
+                })
+            }
+            Err(error) => {
                 ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                         .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({
-                            "code": error.code,
-                            "message": error.message,
-                        })),
-                    "core refused the gateway's in-process RPC handshake; routes stay on the in-process path"
+                        .with_attrs(::serde_json::json!({ "error": error.to_string() })),
+                    "gateway could not open a core connection"
                 );
+                Err(CoreError::Unavailable(
+                    "the core connection could not be established".into(),
+                ))
+            }
+        }
+    }
+
+    /// Drop the least recently used connections beyond the credential cap,
+    /// never the one `keep` just opened.
+    fn enforce_cap(&self, keep: &PoolKey) {
+        let mut slots = lock(&self.slots);
+        loop {
+            let live: Vec<(PoolKey, Duration)> = slots
+                .iter()
+                .filter(|(_, slot)| slot.live_client().is_some())
+                .map(|(key, slot)| (key.clone(), slot.idle_for()))
+                .collect();
+            if live.len() <= self.limits.max_credentials {
                 return;
             }
+            let Some((oldest, _)) = live
+                .into_iter()
+                .filter(|(key, _)| key != keep)
+                .max_by_key(|(_, idle)| *idle)
+            else {
+                return;
+            };
+            slots.remove(&oldest);
+        }
+    }
+
+    /// Remove `slot` after a failed dial, if it is still the one registered
+    /// for `key` and no other dial gave it a connection.
+    fn forget(&self, key: &PoolKey, slot: &Arc<Slot>) {
+        let mut slots = lock(&self.slots);
+        if slots
+            .get(key)
+            .is_some_and(|current| Arc::ptr_eq(current, slot))
+            && slot.live_client().is_none()
+        {
+            slots.remove(key);
+        }
+    }
+
+    /// Remove `key`'s slot if it still holds `client`.
+    fn discard(&self, key: &PoolKey, slot: &Arc<Slot>, client: &Arc<RpcClient>) {
+        let mut slots = lock(&self.slots);
+        let registered = slots
+            .get(key)
+            .is_some_and(|current| Arc::ptr_eq(current, slot));
+        let holds = lock(&slot.client)
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, client));
+        if registered && holds {
+            slots.remove(key);
+        }
+    }
+
+    fn sweep_idle(&self) {
+        let mut slots = lock(&self.slots);
+        self.sweep_idle_locked(&mut slots);
+    }
+
+    /// Drop connections unused past the idle timeout and slots whose
+    /// connection ended. A slot that is dialing is left alone.
+    fn sweep_idle_locked(&self, slots: &mut HashMap<PoolKey, Arc<Slot>>) {
+        slots.retain(|_, slot| {
+            if slot.dial_lock.try_lock().is_err() {
+                return true;
+            }
+            let expired = slot.idle_for() >= self.limits.idle_timeout;
+            let has_connection = lock(&slot.client).is_some();
+            let ended = has_connection && slot.live_client().is_none();
+            !(expired || ended)
+        });
+    }
+
+    /// Credentials currently holding a live connection.
+    #[cfg(test)]
+    fn pooled(&self) -> usize {
+        lock(&self.slots)
+            .values()
+            .filter(|slot| slot.live_client().is_some())
+            .count()
+    }
+}
+
+fn spawn_idle_sweep(pool: Weak<Pool>, interval: Duration) {
+    zeroclaw_spawn::spawn!(async move {
+        let mut ticks = tokio::time::interval(interval);
+        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticks.tick().await;
+            let Some(pool) = pool.upgrade() else {
+                return;
+            };
+            pool.sweep_idle();
+        }
+    });
+}
+
+/// A request's core connection, bound to the credential it presented.
+pub struct CoreCall {
+    pool: Arc<Pool>,
+    key: PoolKey,
+    slot: Arc<Slot>,
+    client: Arc<RpcClient>,
+}
+
+impl CoreCall {
+    /// The principal the core bound this connection to.
+    pub fn principal_id(&self) -> Option<&str> {
+        self.client.handshake().principal_id.as_deref()
+    }
+
+    /// Send `method` on this caller's connection.
+    ///
+    /// A credential the core now refuses (`AUTH_REQUIRED`: revoked, expired
+    /// or due for re-verification) ends the connection at once. A missing
+    /// grant (`FORBIDDEN`) or a lost connection takes it out of the pool.
+    /// Either way the next request dials again with the credential it
+    /// presents. Nothing is retried here.
+    pub async fn request(&self, method: Method, params: Value) -> Result<Value, CoreError> {
+        match self.client.request(method, params).await {
+            Ok(value) => {
+                self.slot.touch();
+                Ok(value)
+            }
+            // A transport that has gone away can surface as an RPC error
+            // from the client's own outbound queue; the connection state
+            // tells the two apart.
+            Err(error) if self.client.state() != ConnectionState::Connected => {
+                self.pool.discard(&self.key, &self.slot, &self.client);
+                Err(CoreError::Unavailable(format!(
+                    "the core connection was lost: {error}"
+                )))
+            }
+            Err(ClientError::Rpc(error)) => {
+                if error.code == AUTH_REQUIRED {
+                    self.pool.discard(&self.key, &self.slot, &self.client);
+                    self.client.shutdown();
+                } else if error.code == FORBIDDEN {
+                    self.pool.discard(&self.key, &self.slot, &self.client);
+                }
+                Err(CoreError::from_rpc(error))
+            }
+            Err(ClientError::Timeout { .. }) => Err(CoreError::Timeout),
             Err(error) => {
-                let delay = backoff.next_delay();
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({
-                            "error": error.to_string(),
-                            "retry_in_ms": delay.as_millis(),
-                        })),
-                    "in-process RPC handshake failed; retrying"
-                );
-                tokio::time::sleep(delay).await;
+                self.pool.discard(&self.key, &self.slot, &self.client);
+                Err(CoreError::Unavailable(format!(
+                    "the core connection was lost: {error}"
+                )))
             }
         }
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn an_unattached_seam_reports_no_client() {
-        let core = CoreRpc::default();
-        assert!(!core.is_connected().await);
-        assert!(core.client().await.is_none());
-    }
-}
+mod tests;
