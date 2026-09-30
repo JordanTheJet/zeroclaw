@@ -336,7 +336,7 @@ impl Method {
             M::CronDelete => (Typed("CronIdParams"), Typed("CronDeleteResult")),
             M::CronRuns => (Typed("CronRunsParams"), Typed("CronRunsResult")),
             M::CronTrigger => (Typed("CronIdParams"), Typed("CronTriggerResult")),
-            M::CronSettings => (Untyped, Untyped),
+            M::CronSettings => (Typed("CronSettingsParams"), Typed("SchedulerConfig")),
 
             // Config
             M::ConfigGet => (Typed("ConfigGetParams"), Untyped),
@@ -414,8 +414,8 @@ impl Method {
             ),
             M::FileUploadCommit => (Typed("FileUploadCommitParams"), Typed("FileEntryResult")),
             M::FsListDir => (Typed("FsListDirRequest"), Typed("FsListDirResponse")),
-            M::LocalesList => (None, Untyped),
-            M::LocalesFetch => (Untyped, Untyped),
+            M::LocalesList => (None, Typed("LocalesListResponse")),
+            M::LocalesFetch => (Typed("LocalesFetchRequest"), Typed("LocalesFetchResponse")),
 
             // Quickstart
             M::QuickstartState => (None, Typed("QuickstartStateResult")),
@@ -437,7 +437,7 @@ impl Method {
             ),
 
             // Transport-authenticated certificate renewal
-            M::CertRenew => (Untyped, Untyped),
+            M::CertRenew => (Typed("CertRenewParams"), Untyped),
 
             // SOPs
             M::SopsList => (None, Untyped),
@@ -447,16 +447,16 @@ impl Method {
             M::SopsRuns => (Typed("SopRunsRequest"), Untyped),
             M::SopsRunDetail => (Typed("SopRunDetailRequest"), Untyped),
             M::SopsRunOverlay => (Typed("SopRunOverlayRequest"), Typed("RunOverlay")),
-            M::SopsValidate => (Untyped, Untyped),
+            M::SopsValidate => (Typed("SopValidateParams"), Untyped),
             M::SopsSave => (Typed("SopSaveRequest"), Untyped),
             M::SopsCreate => (Typed("SopSaveRequest"), Untyped),
             M::SopsDelete => (Typed("SopSelectRequest"), Untyped),
             M::SopsRename => (Typed("SopRenameRequest"), Untyped),
             M::SopsDecide => (Typed("SopDecideRequest"), Typed("RunOverlay")),
-            M::SopsWireDraft => (Untyped, Untyped),
-            M::SopsGraphDraft => (Untyped, Typed("SopGraph")),
+            M::SopsWireDraft => (Typed("SopWireDraftParams"), Untyped),
+            M::SopsGraphDraft => (Typed("SopDraftParams"), Typed("SopGraph")),
             M::SopsTriggerSources => (None, Typed("TriggerSourceRegistry")),
-            M::ToolsParamOptions => (Untyped, Untyped),
+            M::ToolsParamOptions => (Typed("ToolsParamOptionsParams"), Untyped),
         };
         MethodContract { params, result }
     }
@@ -467,9 +467,9 @@ impl Method {
 pub enum Shape {
     /// The method takes no params, or returns no structured result.
     None,
-    /// A named wire type. Defined in [`crate::types`] when the schema
-    /// catalog knows it; otherwise owned by another crate and listed in
-    /// [`EXTERNAL_TYPES`].
+    /// A named wire type: in this crate's schema catalog (defined in
+    /// [`crate::types`] or a foundation crate it depends on), or owned by
+    /// the runtime and listed in [`EXTERNAL_TYPES`].
     Typed(&'static str),
     /// A free-form JSON value the daemon shapes at runtime.
     Untyped,
@@ -482,12 +482,13 @@ pub struct MethodContract {
     pub result: Shape,
 }
 
-/// Wire types named by a [`MethodContract`] that are owned by another crate
-/// and therefore carry no schema in this crate's catalog. Each entry names
-/// the owning crate so the contract document can say where to look.
+/// Wire types named by a [`MethodContract`] that are owned by the runtime,
+/// which this crate must not depend on. Their schemas come from the owning
+/// crate's own catalog (`zeroclaw_runtime::rpc::schema`), and the contract
+/// document records the owner so a client knows where the type lives.
 pub const EXTERNAL_TYPES: &[(&str, &str)] = &[
-    // zeroclaw-runtime: fields are runtime-owned types (diagnostics, cron
-    // jobs, skill frontmatter, quickstart descriptors, SOP definitions).
+    // Fields are runtime-owned types: diagnostics, cron jobs, skill
+    // frontmatter, quickstart descriptors, SOP definitions and wire edits.
     ("DoctorRunResult", "zeroclaw-runtime"),
     ("SessionNewParams", "zeroclaw-runtime"),
     ("CronListResult", "zeroclaw-runtime"),
@@ -505,21 +506,7 @@ pub const EXTERNAL_TYPES: &[(&str, &str)] = &[
     ("Sop", "zeroclaw-runtime"),
     ("RunOverlay", "zeroclaw-runtime"),
     ("TriggerSourceRegistry", "zeroclaw-runtime"),
-    // zeroclaw-api: JSON-RPC envelope-adjacent request types without schema
-    // derives.
-    ("FsListDirRequest", "zeroclaw-api"),
-    ("FsListDirResponse", "zeroclaw-api"),
-    ("SopSelectRequest", "zeroclaw-api"),
-    ("SopRunRequest", "zeroclaw-api"),
-    ("SopRunResponse", "zeroclaw-api"),
-    ("SopRunsRequest", "zeroclaw-api"),
-    ("SopRunDetailRequest", "zeroclaw-api"),
-    ("SopRunOverlayRequest", "zeroclaw-api"),
-    ("SopSaveRequest", "zeroclaw-api"),
-    ("SopRenameRequest", "zeroclaw-api"),
-    ("SopDecideRequest", "zeroclaw-api"),
-    // zeroclaw-config: no schema derive on the cost summary.
-    ("CostSummary", "zeroclaw-config"),
+    ("SopWireDraftParams", "zeroclaw-runtime"),
 ];
 
 #[cfg(test)]

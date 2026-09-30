@@ -428,6 +428,7 @@ impl RpcOutbound {
 
 /// One selectable locale from the build's embedded `locales.toml` registry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct LocaleOption {
     pub code: String,
     pub label: String,
@@ -435,6 +436,7 @@ pub struct LocaleOption {
 
 /// Response for `locales/list` — the in-memory locale registry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct LocalesListResponse {
     pub locales: Vec<LocaleOption>,
 }
@@ -443,6 +445,7 @@ pub struct LocalesListResponse {
 /// are downloaded; `None`/empty means all. The daemon validates `locale`
 /// against the embedded registry and `catalog` against the fixed catalog set.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct LocalesFetchRequest {
     pub locale: String,
     #[serde(default)]
@@ -453,6 +456,7 @@ pub struct LocalesFetchRequest {
 /// them into its own config dir (keeping the write in the caller's permission
 /// scope).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct FetchedCatalog {
     pub name: String,
     /// Output filename (e.g. `cli.ftl`).
@@ -463,6 +467,7 @@ pub struct FetchedCatalog {
 
 /// Response for `locales/fetch`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct LocalesFetchResponse {
     pub locale: String,
     pub catalogs: Vec<FetchedCatalog>,
@@ -475,6 +480,7 @@ pub struct LocalesFetchResponse {
 /// Request payload for SOP read/delete methods that select one SOP by name:
 /// `sops/get`, `sops/graph`, `sops/validate` (by name), `sops/delete`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct SopSelectRequest {
     pub name: String,
 }
@@ -482,6 +488,7 @@ pub struct SopSelectRequest {
 /// Request payload for `sops/run-overlay`: project a run's state onto a SOP's
 /// graph. Selects the SOP by `name` and the run by `run_id`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct SopRunOverlayRequest {
     pub name: String,
     pub run_id: String,
@@ -493,6 +500,7 @@ pub struct SopRunOverlayRequest {
 /// canonical runtime enum by the handler so no parallel decision enum exists
 /// here to drift from it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct SopDecideRequest {
     pub name: String,
     pub run_id: String,
@@ -504,6 +512,7 @@ pub struct SopDecideRequest {
 /// omitting it starts the run with no payload. The daemon builds the Manual
 /// `SopEvent` and dispatches it on the same path as the `sop_execute` tool.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct SopRunRequest {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -517,6 +526,7 @@ pub struct SopRunRequest {
 /// Response payload for `sops/run`: the id of the run that was started, which
 /// feeds straight into `sops/run-overlay` to animate the run on the canvas.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct SopRunResponse {
     pub run_id: String,
 }
@@ -525,6 +535,7 @@ pub struct SopRunResponse {
 /// (active plus retained terminal), newest first. `sop` optionally scopes the
 /// listing to a single SOP by name; omitting it lists every SOP's runs.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct SopRunsRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sop: Option<String>,
@@ -532,6 +543,7 @@ pub struct SopRunsRequest {
 
 /// Parameters for `sops/run-detail`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct SopRunDetailRequest {
     pub run_id: String,
 }
@@ -540,6 +552,7 @@ pub struct SopRunDetailRequest {
 /// wire form of the runtime `Sop`; the daemon deserializes and validates it.
 /// `sops/validate` also accepts this form to validate an unsaved draft.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct SopSaveRequest {
     pub sop: serde_json::Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -551,6 +564,7 @@ pub struct SopSaveRequest {
 /// because saving persists under the submitted SOP's name, so a name change
 /// smuggled through a save would fork the SOP or overwrite a different one.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct SopRenameRequest {
     /// Name the SOP is stored under today.
     pub from: String,
@@ -560,6 +574,7 @@ pub struct SopRenameRequest {
 
 /// Request payload for `fs.list_dir`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct FsListDirRequest {
     /// Relative or absolute path within the agent workspace.
     pub path: String,
@@ -569,6 +584,7 @@ pub struct FsListDirRequest {
 
 /// Response for `fs.list_dir`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct FsListDirResponse {
     pub entries: Vec<FsEntry>,
     pub cwd: String,
@@ -576,6 +592,7 @@ pub struct FsListDirResponse {
 
 /// A single directory entry returned by `fs.list_dir`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct FsEntry {
     pub name: String,
     pub full_path: String,

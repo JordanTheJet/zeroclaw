@@ -22,8 +22,9 @@ pub use crate::skills::frontmatter::SkillFrontmatter;
 
 // ── Derive helper ────────────────────────────────────────────────────
 //
-// Same shape as the proto crate's helper, minus the schema derive: the types
-// below embed runtime-owned field types that carry no `JsonSchema`.
+// Same shape as the proto crate's helper, minus the schema derive. A type
+// named by a method contract opts in with its own `cfg_attr`, so adding a
+// type here does not force every runtime field type to derive `JsonSchema`.
 
 macro_rules! rpc_type {
     (
@@ -42,6 +43,7 @@ macro_rules! rpc_type {
 // ══════════════════════════════════════════════════════════════════════
 
 rpc_type! {
+    #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
     pub struct DoctorRunResult {
         pub results: Vec<DiagResult>,
         pub summary: DoctorSummary,
@@ -58,6 +60,7 @@ rpc_type! {
 // ══════════════════════════════════════════════════════════════════════
 
 rpc_type! {
+    #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
     pub struct SessionNewParams {
         pub agent_alias: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -92,6 +95,7 @@ rpc_type! {
 // ══════════════════════════════════════════════════════════════════════
 
 rpc_type! {
+    #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
     pub struct CronListResult {
         pub jobs: Vec<CronJob>,
     }
@@ -99,6 +103,7 @@ rpc_type! {
 
 rpc_type! {
     /// Params for `cron/add`. Consolidates gateway `CronAddBody`.
+    #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
     pub struct CronAddParams {
         pub agent: String,
         pub schedule: String,
@@ -126,6 +131,7 @@ rpc_type! {
 }
 
 rpc_type! {
+    #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
     pub struct CronRunsResult {
         pub runs: Vec<CronRun>,
     }
@@ -137,6 +143,7 @@ rpc_type! {
 
 rpc_type! {
     /// Wire representation of a skill in a list. Consolidates gateway `SkillEntry`.
+    #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
     pub struct SkillListEntry {
         pub bundle: String,
         pub name: String,
@@ -146,6 +153,7 @@ rpc_type! {
 }
 
 rpc_type! {
+    #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
     pub struct SkillsListResult {
         pub skills: Vec<SkillListEntry>,
     }
@@ -153,6 +161,7 @@ rpc_type! {
 
 rpc_type! {
     /// Consolidates gateway `SkillReadResponse`.
+    #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
     pub struct SkillsReadResult {
         pub bundle: String,
         pub name: String,
@@ -162,6 +171,7 @@ rpc_type! {
 }
 
 rpc_type! {
+    #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
     pub struct SkillsWriteParams {
         pub bundle: String,
         pub name: String,
@@ -176,6 +186,7 @@ rpc_type! {
 // ══════════════════════════════════════════════════════════════════════
 
 rpc_type! {
+    #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
     pub struct QuickstartFieldsParams {
         pub section: FieldSection,
         pub type_key: String,
@@ -183,6 +194,7 @@ rpc_type! {
 }
 
 rpc_type! {
+    #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
     pub struct QuickstartFieldsResult {
         pub fields: Vec<FieldDescriptor>,
     }
@@ -191,6 +203,7 @@ rpc_type! {
 /// Tagged enum — matches the HTTP route's `ValidateResult` shape so
 /// the drift test can compare bytes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum QuickstartValidateResult {
     Ok,
@@ -199,6 +212,7 @@ pub enum QuickstartValidateResult {
 
 /// Tagged enum — matches the HTTP route's `ApplyResult` shape.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum QuickstartApplyResult {
     Applied {
@@ -215,6 +229,7 @@ pub enum QuickstartApplyResult {
 }
 
 rpc_type! {
+    #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
     pub struct QuickstartDismissParams {
         pub run_id: String,
         /// Surface that emitted the dismissal. Deserialised straight
@@ -225,10 +240,40 @@ rpc_type! {
     }
 }
 
+// ══════════════════════════════════════════════════════════════════════
+// ── SOP authoring ────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════
+
+rpc_type! {
+    /// Params for `sops/wire-draft`: apply one wire edit to an unsaved SOP
+    /// (the `sops/save` wire form) and return the edited SOP and its graph.
+    /// The handler reads the two keys itself so each can report its own
+    /// error; this type is their declared contract.
+    #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+    pub struct SopWireDraftParams {
+        pub sop: serde_json::Value,
+        pub edit: crate::sop::WireEdit,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn sop_wire_draft_params_accept_the_body_the_handler_reads() {
+        let body = json!({
+            "sop": {"name": "deploy", "steps": []},
+            "edit": {"op": "connect", "from": 1, "to": 2, "role": "sequence"},
+        });
+        let params: SopWireDraftParams = serde_json::from_value(body.clone()).unwrap();
+        assert_eq!(params.sop, body["sop"]);
+        assert_eq!(
+            params.edit,
+            serde_json::from_value::<crate::sop::WireEdit>(body["edit"].clone()).unwrap()
+        );
+    }
 
     #[test]
     fn interaction_surface_is_closed_and_snake_case() {

@@ -4,17 +4,19 @@
 //! method's declared params/result shape, the notification names, the error
 //! codes and the JSON Schema of every wire type it defines. The runtime
 //! contributes one fact per method that only it knows, the authorization
-//! classification. Types the proto crate does not own are recorded by name
-//! with their owning crate instead of a schema, so the document never claims
-//! more than the code guarantees.
+//! classification. Runtime-owned types, which the proto crate lists in
+//! `EXTERNAL_TYPES` because it cannot depend on the runtime, take their
+//! schema from the runtime's own catalog and are tagged with their owning
+//! crate. A contract type that neither catalog knows fails generation, so the
+//! document never names a type it cannot describe.
 //!
 //! Framing is not a schema-language concern. The NDJSON envelope, the
 //! handshake and the transport rules are documented in prose in
 //! `docs/book/src/architecture/rpc-socket.md`; this document describes what
 //! travels inside the envelope.
 
-use anyhow::{Context, ensure};
-use schemars::{SchemaGenerator, generate::SchemaSettings};
+use anyhow::{Context, bail, ensure};
+use schemars::{Schema, SchemaGenerator, generate::SchemaSettings};
 use serde_json::{Map, Value, json};
 use std::path::PathBuf;
 use zeroclaw_rpc_proto::method::EXTERNAL_TYPES;
@@ -54,8 +56,11 @@ fn generator() -> SchemaGenerator {
 /// free-form object, or a type another crate owns without an exported
 /// schema) produce no descriptors and are marked in `x-zeroclaw-params`, so
 /// a consumer never sees an invented `params` wrapper as a real key.
-fn param_descriptors(schemas: &Map<String, Value>, shape: Shape) -> (Vec<Value>, Value) {
-    match shape {
+fn param_descriptors(
+    schemas: &Map<String, Value>,
+    shape: Shape,
+) -> anyhow::Result<(Vec<Value>, Value)> {
+    Ok(match shape {
         Shape::None => (Vec::new(), json!({ "shape": "none" })),
         Shape::Untyped => (
             Vec::new(),
@@ -89,68 +94,63 @@ fn param_descriptors(schemas: &Map<String, Value>, shape: Shape) -> (Vec<Value>,
                         })
                     })
                     .collect();
-                let marker = if descriptors.is_empty() {
-                    json!({
-                        "shape": "typed",
-                        "type": name,
-                        "description": format!("`{name}` is not a plain object; its schema is in components."),
-                    })
-                } else {
-                    json!({ "shape": "typed", "type": name })
-                };
+                let mut marker = json!({ "shape": "typed", "type": name });
+                if descriptors.is_empty() {
+                    marker["description"] = json!(format!(
+                        "`{name}` is not a plain object; its schema is in components."
+                    ));
+                }
+                if let Some(owner) = external_owner(name) {
+                    marker["owner"] = json!(owner);
+                }
                 (descriptors, marker)
             }
-            None => {
-                let owner = external_owner(name);
-                (
-                    Vec::new(),
-                    json!({
-                        "shape": "external",
-                        "type": name,
-                        "owner": owner,
-                        "description": format!("`{name}`, defined in `{owner}`; no schema is exported yet, so its keys are not enumerable here."),
-                    }),
-                )
-            }
+            None => bail!("params type `{name}` has no schema in either catalog"),
         },
-    }
+    })
 }
 
-fn external_owner(name: &str) -> &'static str {
+/// The owning crate of a runtime-owned contract type, `None` for a type in
+/// the proto catalog.
+fn external_owner(name: &str) -> Option<&'static str> {
     EXTERNAL_TYPES
         .iter()
         .find(|(n, _)| *n == name)
         .map(|(_, owner)| *owner)
-        .unwrap_or("unknown")
 }
 
-/// Describe a result side: a schema reference, an external type marker, a
-/// free-form value, or nothing.
-fn shape_value(generator: &mut SchemaGenerator, shape: Shape) -> Option<Value> {
-    match shape {
+/// Schema for a contract type: the proto catalog first, then the runtime's
+/// catalog for the names `EXTERNAL_TYPES` assigns to it.
+fn subschema_for_contract(generator: &mut SchemaGenerator, name: &str) -> Option<Schema> {
+    schema::subschema_for_named(generator, name)
+        .or_else(|| zeroclaw_runtime::rpc::schema::subschema_for_named(generator, name))
+}
+
+/// Describe a result side: a schema reference, a free-form value, or
+/// nothing.
+fn shape_value(generator: &mut SchemaGenerator, shape: Shape) -> anyhow::Result<Option<Value>> {
+    Ok(match shape {
         Shape::None => None,
         Shape::Untyped => Some(json!({
             "name": "value",
             "schema": { "description": "Free-form JSON shaped by the daemon at runtime." },
             "x-zeroclaw-shape": "untyped",
         })),
-        Shape::Typed(name) => match schema::subschema_for_named(generator, name) {
-            Some(schema) => Some(json!({
-                "name": name,
-                "schema": schema,
-                "x-zeroclaw-shape": "typed",
-            })),
-            None => {
-                let owner = external_owner(name);
-                Some(json!({
+        Shape::Typed(name) => match subschema_for_contract(generator, name) {
+            Some(schema) => {
+                let mut value = json!({
                     "name": name,
-                    "schema": { "description": format!("`{name}`, defined in `{owner}`; no schema is exported yet.") },
-                    "x-zeroclaw-shape": "external",
-                    "x-zeroclaw-owner": owner,
-                }))
+                    "schema": schema,
+                    "x-zeroclaw-shape": "typed",
+                });
+                if let Some(owner) = external_owner(name) {
+                    value["x-zeroclaw-owner"] = json!(owner);
+                }
+                Some(value)
             }
+            None => bail!("result type `{name}` has no schema in either catalog"),
         },
-    }
+    })
 }
 
 fn authorization(method: Method) -> Value {
@@ -173,14 +173,18 @@ pub fn render() -> anyhow::Result<String> {
     // been taken with the Draft 7 transforms applied, expands the params from
     // those transformed definitions so copied property schemas are Draft 7
     // too.
-    let registered: Vec<(Method, &str, Shape, Value)> = Method::ALL
-        .iter()
-        .map(|(method, wire)| {
-            let contract = method.contract();
-            if let Shape::Typed(name) = contract.params {
-                let _ = schema::subschema_for_named(&mut generator, name);
-            }
-            let result = shape_value(&mut generator, contract.result).map_or_else(
+    let mut registered: Vec<(Method, &str, Shape, Value)> = Vec::with_capacity(Method::ALL.len());
+    for (method, wire) in Method::ALL {
+        let contract = method.contract();
+        if let Shape::Typed(name) = contract.params {
+            ensure!(
+                subschema_for_contract(&mut generator, name).is_some(),
+                "{wire}: params type `{name}` has no schema in either catalog"
+            );
+        }
+        let result = shape_value(&mut generator, contract.result)
+            .with_context(|| format!("{wire}: result"))?
+            .map_or_else(
                 || json!({ "name": "result", "schema": { "type": "null" } }),
                 |mut r| {
                     if let Some(obj) = r.as_object_mut() {
@@ -189,9 +193,8 @@ pub fn render() -> anyhow::Result<String> {
                     r
                 },
             );
-            (*method, *wire, contract.params, result)
-        })
-        .collect();
+        registered.push((*method, *wire, contract.params, result));
+    }
 
     let notifications: Vec<Value> = notification::ALL
         .iter()
@@ -223,14 +226,15 @@ pub fn render() -> anyhow::Result<String> {
             let mut entry = Map::new();
             entry.insert("name".into(), json!(wire));
             entry.insert("paramStructure".into(), json!("by-name"));
-            let (params, params_marker) = param_descriptors(&schemas, params_shape);
+            let (params, params_marker) = param_descriptors(&schemas, params_shape)
+                .with_context(|| format!("{wire}: params"))?;
             entry.insert("params".into(), Value::Array(params));
             entry.insert("x-zeroclaw-params".into(), params_marker);
             entry.insert("result".into(), result);
             entry.insert("x-zeroclaw-authorization".into(), authorization(method));
-            Value::Object(entry)
+            Ok(Value::Object(entry))
         })
-        .collect();
+        .collect::<anyhow::Result<_>>()?;
 
     let document = json!({
         "openrpc": "1.3.2",
@@ -381,6 +385,61 @@ mod tests {
     /// OpenRPC 1.3.2 schema objects are Draft 7: no keyword from a later
     /// dialect may appear anywhere in the document, or a Draft 7 consumer
     /// silently ignores it and accepts values the wire type rejects.
+    /// Runtime-owned contract types are described, not stubbed: their
+    /// params expand to real keys, their results carry a schema, and both
+    /// name the owning crate.
+    #[test]
+    fn runtime_owned_types_carry_schemas_and_their_owner() {
+        let doc: Value = serde_json::from_str(&render().expect("render")).expect("valid JSON");
+        let methods = doc["methods"].as_array().expect("methods");
+        for m in methods {
+            assert_ne!(
+                m["x-zeroclaw-params"]["shape"],
+                json!("external"),
+                "{}",
+                m["name"]
+            );
+            assert_ne!(
+                m["result"]["x-zeroclaw-shape"],
+                json!("external"),
+                "{}",
+                m["name"]
+            );
+        }
+        let by_name = |wire: &str| {
+            methods
+                .iter()
+                .find(|m| m["name"] == json!(wire))
+                .unwrap_or_else(|| panic!("{wire} missing"))
+        };
+
+        let add = by_name("cron/add");
+        assert_eq!(add["x-zeroclaw-params"]["owner"], json!("zeroclaw-runtime"));
+        assert_eq!(add["result"]["x-zeroclaw-owner"], json!("zeroclaw-runtime"));
+        let mut request = Map::new();
+        for p in add["params"].as_array().expect("cron/add params") {
+            if p["required"] == json!(true) {
+                request.insert(p["name"].as_str().unwrap().to_string(), json!("x"));
+            }
+        }
+        assert!(request.contains_key("agent") && request.contains_key("schedule"));
+        let parsed: zeroclaw_runtime::rpc::types::CronAddParams =
+            serde_json::from_value(Value::Object(request))
+                .expect("a request built from the required descriptors parses");
+        assert_eq!(parsed.agent, "x");
+
+        // Proto-owned types carry no owner tag.
+        let close = by_name("session/close");
+        assert!(close["x-zeroclaw-params"].get("owner").is_none());
+
+        // The former free-form params now name their keys.
+        let renew = by_name("cert/renew");
+        assert_eq!(renew["params"][0]["name"], json!("csr_pem"));
+        assert_eq!(renew["params"][0]["required"], json!(true));
+        let fetch = by_name("locales/fetch");
+        assert_eq!(fetch["result"]["x-zeroclaw-shape"], json!("typed"));
+    }
+
     #[test]
     fn every_schema_in_the_document_is_draft_7() {
         const LATER_DIALECT_KEYWORDS: &[&str] = &[

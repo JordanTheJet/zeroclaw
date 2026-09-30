@@ -9,6 +9,8 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use zeroclaw_api::jsonrpc::{SopSaveRequest, SopSelectRequest};
+use zeroclaw_api::tool::OptionDomain;
 
 // ── Re-exports: foundation-crate types that appear on the wire ────────
 
@@ -583,6 +585,16 @@ rpc_type! {
         pub duration_ms: i64,
         pub started_at: String,
         pub finished_at: String,
+    }
+}
+
+rpc_type! {
+    /// Params for `cron/settings`. Without a `patch` key, or with no params
+    /// at all, the call reads the scheduler settings. The daemon treats any
+    /// `patch` key as a write request, which it does not implement yet.
+    pub struct CronSettingsParams {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub patch: Option<Value>,
     }
 }
 
@@ -1693,6 +1705,61 @@ rpc_type! {
     }
 }
 
+// ══════════════════════════════════════════════════════════════════════
+// ── SOP authoring ────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════
+
+/// Params for `sops/validate`: an unsaved draft in the `sops/save` form, or
+/// a stored SOP selected by name. A request carrying a `sop` key is always
+/// validated as a draft.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(untagged)]
+pub enum SopValidateParams {
+    Draft(SopSaveRequest),
+    Stored(SopSelectRequest),
+}
+
+rpc_type! {
+    /// Params for `sops/graph-draft`: project an unsaved SOP (the `sops/save`
+    /// wire form) onto its graph without persisting it.
+    pub struct SopDraftParams {
+        pub sop: Value,
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// ── Tools ────────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════
+
+rpc_type! {
+    /// Params for `tools/param-options`: the option list for one tool
+    /// parameter domain.
+    pub struct ToolsParamOptionsParams {
+        pub domain: OptionDomain,
+        /// Agent whose configuration scopes the options. Blank or absent
+        /// selects the first configured agent.
+        #[serde(default)]
+        pub agent: Option<String>,
+        /// Domain-specific arguments, handed to the option resolver as-is.
+        #[serde(default)]
+        pub args: Value,
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// ── Certificates ─────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════
+
+rpc_type! {
+    /// Params for `cert/renew`, served only on the mutually authenticated WSS
+    /// plane. The certificate renewed is the calling connection's own.
+    pub struct CertRenewParams {
+        /// PEM-encoded certificate signing request for the replacement.
+        pub csr_pem: String,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2039,5 +2106,48 @@ mod tests {
         };
         let wire = serde_json::to_value(params).unwrap();
         assert!(wire.get("cursor").is_none());
+    }
+
+    #[test]
+    fn cron_settings_params_read_without_a_patch() {
+        let read: CronSettingsParams = serde_json::from_value(json!({})).unwrap();
+        assert!(read.patch.is_none());
+        let write: CronSettingsParams =
+            serde_json::from_value(json!({ "patch": { "enabled": false } })).unwrap();
+        assert_eq!(write.patch, Some(json!({ "enabled": false })));
+    }
+
+    #[test]
+    fn sop_validate_params_tell_a_draft_from_a_stored_sop() {
+        let draft: SopValidateParams =
+            serde_json::from_value(json!({ "sop": { "name": "deploy" } })).unwrap();
+        assert!(matches!(draft, SopValidateParams::Draft(ref d) if d.sop["name"] == "deploy"));
+        let stored: SopValidateParams =
+            serde_json::from_value(json!({ "name": "deploy" })).unwrap();
+        assert!(matches!(stored, SopValidateParams::Stored(ref s) if s.name == "deploy"));
+    }
+
+    #[test]
+    fn tools_param_options_params_default_the_agent_and_args() {
+        let params: ToolsParamOptionsParams =
+            serde_json::from_value(json!({ "domain": "agent_aliases" })).unwrap();
+        assert_eq!(params.domain, OptionDomain::AgentAliases);
+        assert!(params.agent.is_none());
+        assert!(params.args.is_null());
+    }
+
+    #[test]
+    fn cert_renew_params_require_the_csr() {
+        assert!(serde_json::from_value::<CertRenewParams>(json!({})).is_err());
+        assert!(serde_json::from_value::<CertRenewParams>(json!({ "csr_pem": 7 })).is_err());
+        let params: CertRenewParams = serde_json::from_value(json!({ "csr_pem": "csr" })).unwrap();
+        assert_eq!(params.csr_pem, "csr");
+    }
+
+    #[test]
+    fn sop_draft_params_carry_the_draft_verbatim() {
+        let draft = json!({ "name": "deploy", "steps": [] });
+        let params: SopDraftParams = serde_json::from_value(json!({ "sop": draft })).unwrap();
+        assert_eq!(params.sop, draft);
     }
 }

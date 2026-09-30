@@ -1,6 +1,60 @@
 {
   "components": {
     "schemas": {
+      "AgentCostStats": {
+        "description": "Statistics for a specific agent alias.",
+        "properties": {
+          "agent_alias": {
+            "description": "Agent alias (HashMap key in `config.agents`).",
+            "type": "string"
+          },
+          "cached_input_tokens": {
+            "default": 0,
+            "description": "Cached input tokens (subset of `input_tokens` served from the\nprovider's prompt cache).",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "cost_usd": {
+            "description": "Total cost attributed to this agent for the period.",
+            "format": "double",
+            "type": "number"
+          },
+          "input_tokens": {
+            "default": 0,
+            "description": "Input tokens (uncached + cached). Matches each record's\n`input_tokens` field.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "output_tokens": {
+            "default": 0,
+            "description": "Output tokens.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "request_count": {
+            "description": "Number of LLM responses attributed to this agent for the period.",
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total_tokens": {
+            "description": "Total tokens attributed to this agent for the period (input + output).",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "agent_alias",
+          "cost_usd",
+          "total_tokens",
+          "request_count"
+        ],
+        "type": "object"
+      },
       "AgentEntry": {
         "properties": {
           "alias": {
@@ -132,6 +186,70 @@
           "mcp_bundles"
         ],
         "type": "string"
+      },
+      "AppliedAgent": {
+        "properties": {
+          "alias": {
+            "type": "string"
+          },
+          "channels": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "memory_backend": {
+            "type": "string"
+          },
+          "model_provider": {
+            "type": "string"
+          },
+          "risk_profile": {
+            "type": "string"
+          },
+          "runtime_profile": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "alias",
+          "model_provider",
+          "risk_profile",
+          "runtime_profile",
+          "channels",
+          "memory_backend"
+        ],
+        "type": "object"
+      },
+      "BoundTriggerSource": {
+        "description": "A non-channel trigger source and the fields needed to configure it.",
+        "properties": {
+          "condition": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PayloadContract"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The payload contract a `condition` on this source may reference. Absent\nfor sources whose triggers carry no condition (`cron`, `manual`,\n`webhook`)."
+          },
+          "fields": {
+            "items": {
+              "$ref": "#/components/schemas/TriggerField"
+            },
+            "type": "array"
+          },
+          "source": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "source",
+          "fields"
+        ],
+        "type": "object"
       },
       "BuilderSubmission": {
         "description": "Complete builder submission consumed by the shared Quickstart apply path.",
@@ -286,6 +404,41 @@
         ],
         "type": "object"
       },
+      "CertRenewParams": {
+        "description": "Params for `cert/renew`, served only on the mutually authenticated WSS\nplane. The certificate renewed is the calling connection's own.",
+        "properties": {
+          "csr_pem": {
+            "description": "PEM-encoded certificate signing request for the replacement.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "csr_pem"
+        ],
+        "type": "object"
+      },
+      "ChannelAlias": {
+        "description": "One configured channel instance an SOP channel trigger can bind to.",
+        "properties": {
+          "alias": {
+            "type": "string"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "owning_agent": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "alias",
+          "enabled"
+        ],
+        "type": "object"
+      },
       "ChannelQuickStart": {
         "description": "One channel selection submitted by the Quickstart builder.",
         "properties": {
@@ -311,6 +464,51 @@
         ],
         "type": "object"
       },
+      "ChannelTriggerKind": {
+        "description": "One channel type row: every inbound-capable `ChannelKind` appears,\nconfigured or not, so editors can offer setup for missing ones.",
+        "properties": {
+          "aliases": {
+            "items": {
+              "$ref": "#/components/schemas/ChannelAlias"
+            },
+            "type": "array"
+          },
+          "channel": {
+            "type": "string"
+          },
+          "condition": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PayloadContract"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Condition payload contract for a channel-message trigger. Channel\npayloads are arbitrary, so this is the `open` contract; carried per row\nso the builder reads one shape whether the source is bound or a channel."
+          },
+          "configured": {
+            "type": "boolean"
+          },
+          "setup_path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "channel",
+          "aliases",
+          "configured",
+          "setup_path"
+        ],
+        "type": "object"
+      },
+      "ChatMode": {
+        "enum": [
+          "chat",
+          "acp"
+        ],
+        "type": "string"
+      },
       "CommandDescriptor": {
         "description": "Command identity and accepted tokens advertised to an RPC client.",
         "properties": {
@@ -332,6 +530,75 @@
           "name"
         ],
         "type": "object"
+      },
+      "ConditionField": {
+        "description": "One field of a trigger payload a condition can reference. `path` is the\nJSON path suffix after `$.` (empty for a scalar payload compared directly),\n`label` is the human name, `value_type` drives the value control, and\n`options` carries the choices when `value_type` is `Enum`.",
+        "properties": {
+          "label": {
+            "type": "string"
+          },
+          "options": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "path": {
+            "type": "string"
+          },
+          "value_type": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ConditionValueType"
+              }
+            ],
+            "default": "string"
+          }
+        },
+        "required": [
+          "path",
+          "label"
+        ],
+        "type": "object"
+      },
+      "ConditionOpSpec": {
+        "description": "Wire shape of one operator for authoring surfaces: the literal `token` to\nsplice into a condition string, and a human `label` to show in a picker.",
+        "properties": {
+          "label": {
+            "type": "string"
+          },
+          "token": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "token",
+          "label"
+        ],
+        "type": "object"
+      },
+      "ConditionValueType": {
+        "description": "Value-input widget hint for one condition field, so the authoring surface\nrenders the right control (text box, number, checkbox, enum select) and\nquotes string comparands correctly.",
+        "oneOf": [
+          {
+            "enum": [
+              "string",
+              "number",
+              "bool"
+            ],
+            "type": "string"
+          },
+          {
+            "const": "enum",
+            "description": "One of a finite set carried in `ConditionField::options`.",
+            "type": "string"
+          },
+          {
+            "const": "date_time",
+            "description": "ISO-8601 instant; rendered as a datetime control, compared as a string.",
+            "type": "string"
+          }
+        ]
       },
       "ConfigDeleteParams": {
         "properties": {
@@ -825,6 +1092,145 @@
         },
         "type": "object"
       },
+      "CostSummary": {
+        "description": "Cost summary for reporting.",
+        "properties": {
+          "by_agent": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/AgentCostStats"
+            },
+            "default": {},
+            "description": "Breakdown by agent alias. Empty when `[cost].track_per_agent =\nfalse` or when no records carry an agent_alias.",
+            "type": "object"
+          },
+          "by_model": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/ModelStats"
+            },
+            "description": "Breakdown by model",
+            "type": "object"
+          },
+          "daily_cost_usd": {
+            "description": "Total cost for the day",
+            "format": "double",
+            "type": "number"
+          },
+          "monthly_cost_usd": {
+            "description": "Total cost for the month",
+            "format": "double",
+            "type": "number"
+          },
+          "request_count": {
+            "description": "Number of requests",
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "session_cost_usd": {
+            "description": "Total cost for the session",
+            "format": "double",
+            "type": "number"
+          },
+          "total_tokens": {
+            "description": "Total tokens used",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "session_cost_usd",
+          "daily_cost_usd",
+          "monthly_cost_usd",
+          "total_tokens",
+          "request_count",
+          "by_model"
+        ],
+        "type": "object"
+      },
+      "CronAddParams": {
+        "description": "Params for `cron/add`. Consolidates gateway `CronAddBody`.",
+        "properties": {
+          "agent": {
+            "type": "string"
+          },
+          "allowed_tools": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "command": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "delete_after_run": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "delivery": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DeliveryConfig"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "job_type": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "prompt": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "schedule": {
+            "type": "string"
+          },
+          "session_target": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tz": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "agent",
+          "schedule"
+        ],
+        "type": "object"
+      },
       "CronDeleteResult": {
         "properties": {
           "deleted": {
@@ -848,6 +1254,140 @@
         },
         "required": [
           "id"
+        ],
+        "type": "object"
+      },
+      "CronJob": {
+        "properties": {
+          "agent_alias": {
+            "default": "",
+            "description": "Agent alias this job runs under. Empty when the row was written\nbefore the column existed and no agent has claimed it; the\nscheduler skips such rows with a warning rather than coercing\nthem to a magic alias.",
+            "type": "string"
+          },
+          "allowed_tools": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "command": {
+            "type": "string"
+          },
+          "created_at": {
+            "type": "string"
+          },
+          "delete_after_run": {
+            "type": "boolean"
+          },
+          "delivery": {
+            "$ref": "#/components/schemas/DeliveryConfig"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "expression": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "job_type": {
+            "$ref": "#/components/schemas/JobType"
+          },
+          "last_output": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_run": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_status": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "next_run": {
+            "type": "string"
+          },
+          "prompt": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "schedule": {
+            "$ref": "#/components/schemas/Schedule"
+          },
+          "session_target": {
+            "$ref": "#/components/schemas/SessionTarget"
+          },
+          "shell_output_format": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/CronShellOutputFormat"
+              }
+            ],
+            "default": "wrapped",
+            "description": "Output format for shell jobs. `\"wrapped\"` (default) or `\"raw\"`.\nDeclarative jobs read this from `CronJobDecl.shell_output_format` in\nthe config; imperative jobs read it from the stored field in the DB."
+          },
+          "source": {
+            "default": "imperative",
+            "description": "How the job was created: `\"imperative\"` (CLI/API) or `\"declarative\"` (config).",
+            "type": "string"
+          },
+          "uses_memory": {
+            "default": true,
+            "description": "Whether to recall and inject memory context before this agent job runs.\nDefaults to `true`; set to `false` for stateless digest jobs that should\nnot accumulate or consume memory entries.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "id",
+          "expression",
+          "schedule",
+          "command",
+          "job_type",
+          "session_target",
+          "enabled",
+          "delivery",
+          "delete_after_run",
+          "created_at",
+          "next_run"
+        ],
+        "type": "object"
+      },
+      "CronListResult": {
+        "properties": {
+          "jobs": {
+            "items": {
+              "$ref": "#/components/schemas/CronJob"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "jobs"
         ],
         "type": "object"
       },
@@ -903,6 +1443,107 @@
         ],
         "type": "object"
       },
+      "CronRun": {
+        "properties": {
+          "delivery": {
+            "default": null,
+            "description": "Delivery axis (`not_required | delivered | failed | skipped`).\n`None` on rows recorded before the triple existed.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "duration_ms": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "executing_agent": {
+            "default": null,
+            "description": "The executing agent's canonical alias at time of action. `None` on\nrows recorded before provenance existed.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "execution": {
+            "default": null,
+            "description": "Execution axis of the separated run-outcome triple (`ok | error`).\n`None` on rows recorded before the triple existed.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "finished_at": {
+            "type": "string"
+          },
+          "id": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "job_id": {
+            "type": "string"
+          },
+          "job_source": {
+            "default": null,
+            "description": "The job's `source` (`imperative` / `declarative`) at time of action;\nkeeps a run row retained past its job's deletion reachable by the\ncleanup that owns that id space. `None` on rows recorded before\nprovenance existed.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "output": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "owner_agent": {
+            "default": null,
+            "description": "Durable CURRENT cleanup owner: stamped as the executing agent at\ninsert and re-pointed by agent renames, unlike the immutable\n`executing_agent` historical fact. Owner-scoped deletion and\nauthorized retained-row reads key on this. How a `None` (pre-column\nrow) resolves — live-job fallback or quarantine — is owned by the\nstore's read/upgrade paths; see `list_runs_for_agent` and\n`initialize_schema` in `cron::store`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "persistence": {
+            "default": null,
+            "description": "Persistence axis (`not_bound | persisted | failed`). `None` on rows\nrecorded before the triple existed.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "principal": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/InternalPrincipal"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "The initiating principal stamped at dispatch, verbatim — immune to\nlater job renames or owner changes. `None` on rows recorded before\nprovenance existed."
+          },
+          "started_at": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "job_id",
+          "started_at",
+          "finished_at",
+          "status"
+        ],
+        "type": "object"
+      },
       "CronRunsParams": {
         "properties": {
           "id": {
@@ -921,6 +1562,42 @@
           "id"
         ],
         "type": "object"
+      },
+      "CronRunsResult": {
+        "properties": {
+          "runs": {
+            "items": {
+              "$ref": "#/components/schemas/CronRun"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "runs"
+        ],
+        "type": "object"
+      },
+      "CronSettingsParams": {
+        "description": "Params for `cron/settings`. Without a `patch` key, or with no params\nat all, the call reads the scheduler settings. The daemon treats any\n`patch` key as a write request, which it does not implement yet.",
+        "properties": {
+          "patch": true
+        },
+        "type": "object"
+      },
+      "CronShellOutputFormat": {
+        "description": "Output format for shell cron job stdout.",
+        "oneOf": [
+          {
+            "const": "wrapped",
+            "description": "Wrapped format: `status=...\\nstdout:\\n...\\nstderr:\\n...` (default).",
+            "type": "string"
+          },
+          {
+            "const": "raw",
+            "description": "Raw stdout on a zero process exit; wrapped status/stdout/stderr on a\nnon-zero exit; a plain error string for failures that never reach a\nprocess exit (security denial, spawn/setup failure, timeout).",
+            "type": "string"
+          }
+        ]
       },
       "CronTriggerResult": {
         "properties": {
@@ -958,6 +1635,115 @@
         ],
         "type": "object"
       },
+      "DeliveryConfig": {
+        "properties": {
+          "best_effort": {
+            "default": true,
+            "type": "boolean"
+          },
+          "channel": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "mode": {
+            "default": "",
+            "type": "string"
+          },
+          "thread_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "to": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "DiagResult": {
+        "description": "Structured diagnostic result for programmatic consumption (web dashboard, API).",
+        "properties": {
+          "category": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "severity": {
+            "$ref": "#/components/schemas/Severity"
+          }
+        },
+        "required": [
+          "severity",
+          "category",
+          "message"
+        ],
+        "type": "object"
+      },
+      "DoctorRunResult": {
+        "properties": {
+          "log_path": {
+            "description": "Resolved active log persistence path, if available.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "results": {
+            "items": {
+              "$ref": "#/components/schemas/DiagResult"
+            },
+            "type": "array"
+          },
+          "summary": {
+            "$ref": "#/components/schemas/DoctorSummary"
+          },
+          "timed_out_phase": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "results",
+          "summary"
+        ],
+        "type": "object"
+      },
+      "DoctorSummary": {
+        "properties": {
+          "errors": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "ok": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "warnings": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "ok",
+          "warnings",
+          "errors"
+        ],
+        "type": "object"
+      },
       "EventsHistoryResult": {
         "description": "`events/history`: recent observer frames, oldest first.",
         "properties": {
@@ -970,6 +1756,95 @@
           "events"
         ],
         "type": "object"
+      },
+      "FetchedCatalog": {
+        "description": "One fetched catalogue's bytes, returned over the wire so the client writes\nthem into its own config dir (keeping the write in the caller's permission\nscope).",
+        "properties": {
+          "content": {
+            "description": "The FTL file contents.",
+            "type": "string"
+          },
+          "filename": {
+            "description": "Output filename (e.g. `cli.ftl`).",
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "filename",
+          "content"
+        ],
+        "type": "object"
+      },
+      "FieldDescriptor": {
+        "properties": {
+          "default": {
+            "description": "Pre-filled default the modal should show as ghost text /\ninitial input value. `None` when the schema has no meaningful\ndefault for this field (e.g. API keys, bot tokens).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "enum_variants": {
+            "description": "Closed-set choices for `Enum` kind. `None` for everything else.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "help": {
+            "description": "One-line help blurb. Empty when the schema field has no doc.",
+            "type": "string"
+          },
+          "is_secret": {
+            "description": "`true` for `#[secret]` fields — the modal masks input.",
+            "type": "boolean"
+          },
+          "key": {
+            "description": "Schema-side field key (kebab-case terminal segment). The\ncaller submits this back through [`BuilderSubmission`].",
+            "type": "string"
+          },
+          "kind": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/PropKind"
+              }
+            ],
+            "description": "Wire-tag for the input control to render. Mirrors\n`PropKind::wire_name`."
+          },
+          "label": {
+            "description": "Human label shown next to the input.",
+            "type": "string"
+          },
+          "required": {
+            "description": "`true` when Quickstart treats this field as required. Currently\nevery field returned by [`field_shape`] is required, but the\nflag is exposed so future additions can include optional rows.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "key",
+          "label",
+          "help",
+          "kind",
+          "is_secret",
+          "required"
+        ],
+        "type": "object"
+      },
+      "FieldSection": {
+        "description": "Selector kinds that the Quickstart \"field shape\" descriptor\ncovers. The TUI / web ask the runtime for the shape, then render\ninputs dumbly off the response.",
+        "enum": [
+          "model_provider",
+          "channel",
+          "peer_group"
+        ],
+        "type": "string"
       },
       "FileAttachParams": {
         "properties": {
@@ -1186,6 +2061,16 @@
         ],
         "type": "object"
       },
+      "FilesystemEventKind": {
+        "description": "A normalized filesystem change kind reported by the watcher.",
+        "enum": [
+          "created",
+          "modified",
+          "deleted",
+          "renamed"
+        ],
+        "type": "string"
+      },
       "FlowRole": {
         "description": "Why a flow wire exists. Mirrors the `StepRouting`/`StepFailure` field it\nwas derived from, so an editor can write edits back to the right place.",
         "oneOf": [
@@ -1212,6 +2097,95 @@
           {
             "const": "trigger",
             "description": "Derived from the SOP's triggers; read-only, never hand-wired.",
+            "type": "string"
+          }
+        ]
+      },
+      "FsEntry": {
+        "description": "A single directory entry returned by `fs.list_dir`.",
+        "properties": {
+          "full_path": {
+            "type": "string"
+          },
+          "is_dir": {
+            "type": "boolean"
+          },
+          "is_hidden": {
+            "type": "boolean"
+          },
+          "mtime": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "size": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "name",
+          "full_path",
+          "is_dir",
+          "is_hidden",
+          "size"
+        ],
+        "type": "object"
+      },
+      "FsListDirRequest": {
+        "description": "Request payload for `fs.list_dir`.",
+        "properties": {
+          "path": {
+            "description": "Relative or absolute path within the agent workspace.",
+            "type": "string"
+          },
+          "show_hidden": {
+            "default": false,
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "type": "object"
+      },
+      "FsListDirResponse": {
+        "description": "Response for `fs.list_dir`.",
+        "properties": {
+          "cwd": {
+            "type": "string"
+          },
+          "entries": {
+            "items": {
+              "$ref": "#/components/schemas/FsEntry"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "entries",
+          "cwd"
+        ],
+        "type": "object"
+      },
+      "GateOnError": {
+        "description": "What the gate does when the model cannot answer (network, HTTP, malformed).",
+        "oneOf": [
+          {
+            "const": "run_strict",
+            "description": "Start the run anyway, in the strictest listed mode, so a human sees it.",
+            "type": "string"
+          },
+          {
+            "const": "skip",
+            "description": "Do not start the run. The event is recorded as skipped.",
             "type": "string"
           }
         ]
@@ -1524,6 +2498,94 @@
         ],
         "type": "object"
       },
+      "InteractionSurface": {
+        "description": "Closed identifier supplied by a trusted interaction client. The identifier\nselects host-owned descriptive semantics; it never carries prompt prose or\ncapability claims from the client.",
+        "enum": [
+          "zerocode_code"
+        ],
+        "type": "string"
+      },
+      "InternalPrincipal": {
+        "description": "The runtime-owned principal that initiated an internally driven turn —\nwho caused the turn to exist, distinct from the executing agent identity\nthe turn runs under. Stamped once at dispatch from the runtime's own\nresolved state (job config, canonical agent alias, runtime task id),\nnever from message content or tool arguments, and immutable for the\nturn's lifetime. Persisted records carry it verbatim as at-time-of-action\nfact. Internal principals never appear in `peer_groups` and are never\nconsulted by peer-membership checks — identity and delivery permission\nare separate axes.",
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "description": "A scheduled cron job. `job_id` is the stable store id; `job_name`\nthe operator-facing name, if the job has one.",
+            "properties": {
+              "cron": {
+                "properties": {
+                  "job_id": {
+                    "type": "string"
+                  },
+                  "job_name": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  }
+                },
+                "required": [
+                  "job_id"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "cron"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "A peer-agent dispatch. `sender_alias` is the sending agent's\ncanonical alias — the initiator only; the recipient turn executes\nunder the recipient's own alias.",
+            "properties": {
+              "peer_agent": {
+                "properties": {
+                  "sender_alias": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "sender_alias"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "peer_agent"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "A daemon-driven task (heartbeat pipeline, SOP step driver). `task`\nis a runtime-owned identifier, never model-authored text.",
+            "properties": {
+              "daemon": {
+                "properties": {
+                  "task": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "task"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "daemon"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "JobType": {
+        "enum": [
+          "shell",
+          "agent"
+        ],
+        "type": "string"
+      },
       "LayoutGeometry": {
         "description": "Canvas geometry carried on every serialized graph so the web canvas reads\nplacement pitch from the wire instead of a local literal. The values are\nfixed by [`LayoutGeometry::CANONICAL`]; the struct rides on `GraphLayout`\nonly to expose them to non-Rust surfaces.",
         "properties": {
@@ -1554,6 +2616,83 @@
           "col_gap",
           "row_gap",
           "origin"
+        ],
+        "type": "object"
+      },
+      "LocaleOption": {
+        "description": "One selectable locale from the build's embedded `locales.toml` registry.",
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "label": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "code",
+          "label"
+        ],
+        "type": "object"
+      },
+      "LocalesFetchRequest": {
+        "description": "Request payload for `locales/fetch`. `catalog` restricts which catalogues\nare downloaded; `None`/empty means all. The daemon validates `locale`\nagainst the embedded registry and `catalog` against the fixed catalog set.",
+        "properties": {
+          "catalog": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "locale": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "locale"
+        ],
+        "type": "object"
+      },
+      "LocalesFetchResponse": {
+        "description": "Response for `locales/fetch`.",
+        "properties": {
+          "catalogs": {
+            "items": {
+              "$ref": "#/components/schemas/FetchedCatalog"
+            },
+            "type": "array"
+          },
+          "locale": {
+            "type": "string"
+          },
+          "skipped": {
+            "description": "Catalogue names that had no file on upstream and were skipped.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "locale",
+          "catalogs",
+          "skipped"
+        ],
+        "type": "object"
+      },
+      "LocalesListResponse": {
+        "description": "Response for `locales/list` — the in-memory locale registry.",
+        "properties": {
+          "locales": {
+            "items": {
+              "$ref": "#/components/schemas/LocaleOption"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "locales"
         ],
         "type": "object"
       },
@@ -2185,6 +3324,67 @@
         ],
         "type": "object"
       },
+      "ModelStats": {
+        "description": "Statistics for a specific model.",
+        "properties": {
+          "cached_input_tokens": {
+            "default": 0,
+            "description": "Total cached input tokens for this model",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "cost_usd": {
+            "description": "Total cost for this model.",
+            "format": "double",
+            "type": "number"
+          },
+          "input_tokens": {
+            "default": 0,
+            "description": "Total input tokens for this model",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "model": {
+            "description": "Model name (upstream resource id from usage telemetry).",
+            "type": "string"
+          },
+          "output_tokens": {
+            "default": 0,
+            "description": "Total output tokens for this model",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "request_count": {
+            "description": "Number of LLM responses for this model.",
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total_tokens": {
+            "description": "Total tokens for this model",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "unpriced_tokens": {
+            "default": 0,
+            "description": "Tokens from records that explicitly report unavailable pricing.\n\nLegacy ledger rows omit `pricing_available` and deserialize as priced,\nso they do not contribute to this total.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "model",
+          "cost_usd",
+          "total_tokens",
+          "request_count"
+        ],
+        "type": "object"
+      },
       "NodeKind": {
         "oneOf": [
           {
@@ -2236,6 +3436,110 @@
           "step",
           "col",
           "row"
+        ],
+        "type": "object"
+      },
+      "NodeRunOverlay": {
+        "description": "Run state for one step node. Trigger nodes carry no run state and are\nomitted from overlays.",
+        "properties": {
+          "state": {
+            "$ref": "#/components/schemas/NodeRunState"
+          },
+          "step": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "tool_calls": {
+            "description": "Tool invocations captured while the step executed. Empty for\nunreached steps and runs recorded before capture landed.",
+            "items": {
+              "$ref": "#/components/schemas/StepToolCall"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "step",
+          "state"
+        ],
+        "type": "object"
+      },
+      "NodeRunState": {
+        "description": "Per-node execution state projected from a run's step results.",
+        "oneOf": [
+          {
+            "enum": [
+              "completed",
+              "failed",
+              "skipped"
+            ],
+            "type": "string"
+          },
+          {
+            "const": "pending",
+            "description": "Not reached yet (or run ended before reaching it).",
+            "type": "string"
+          },
+          {
+            "const": "active",
+            "description": "The run's current step while the run is live.",
+            "type": "string"
+          }
+        ]
+      },
+      "OptionDomain": {
+        "description": "Closed set of runtime-resolvable option domains a tool parameter can\ndraw its values from. Tools *declare* the domain; resolution happens\nwhere live config is visible (the runtime), so surfaces render real\nselectable choices instead of free-text guessing.",
+        "oneOf": [
+          {
+            "const": "channel_refs",
+            "description": "Configured channel refs the agent listens on (e.g. `telegram.prod`).",
+            "type": "string"
+          },
+          {
+            "const": "peer_targets",
+            "description": "Peers reachable by this agent: peer agents, external peers, and\npeer groups. Cascades on a sibling `channel` argument when present.",
+            "type": "string"
+          },
+          {
+            "const": "peer_groups",
+            "description": "Configured peer group names.",
+            "type": "string"
+          },
+          {
+            "const": "agent_aliases",
+            "description": "Configured agent aliases.",
+            "type": "string"
+          },
+          {
+            "const": "tool_names",
+            "description": "Names of tools registered in the active tool set.",
+            "type": "string"
+          },
+          {
+            "const": "memory_categories",
+            "description": "Memory categories present in the configured backend.",
+            "type": "string"
+          }
+        ]
+      },
+      "PayloadContract": {
+        "description": "The set of payload fields a condition may reference for a given source.\n`open` marks sources whose payload is arbitrary user JSON (MQTT, AMQP,\nwebhook body, channel message): the surface offers a guided path/op/value\nbuilder plus a sample-payload probe rather than a fixed field list. `direct`\nmarks a scalar payload (peripheral signal) compared with the bare `op value`\nform and no path.",
+        "properties": {
+          "direct": {
+            "type": "boolean"
+          },
+          "fields": {
+            "items": {
+              "$ref": "#/components/schemas/ConditionField"
+            },
+            "type": "array"
+          },
+          "open": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "open"
         ],
         "type": "object"
       },
@@ -2485,6 +3789,56 @@
         ],
         "type": "string"
       },
+      "PlannedToolCall": {
+        "description": "An authored tool invocation planned for a step. Args may embed\n`{{steps.N.path}}` / `{{calls.K.path}}` bindings (see `sop::binding`)\nthat resolve against captured run data before dispatch. `pinned`\ncarries a sample output (typically lifted from a real run's\n`StepToolCall.output_data`) so downstream bindings can be authored\nand previewed without re-executing the tool.",
+        "properties": {
+          "args": {
+            "default": null,
+            "description": "Argument template; string leaves may contain bindings."
+          },
+          "pinned": {
+            "description": "Pinned sample output for authoring/preview."
+          },
+          "tool": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "tool"
+        ],
+        "type": "object"
+      },
+      "PropKind": {
+        "description": "Runtime type classification for config property values.",
+        "oneOf": [
+          {
+            "enum": [
+              "string",
+              "bool",
+              "integer",
+              "float",
+              "object_array",
+              "object"
+            ],
+            "type": "string"
+          },
+          {
+            "const": "enum",
+            "description": "An enum or other serde-serializable type (parsed as TOML string).",
+            "type": "string"
+          },
+          {
+            "const": "alias_ref",
+            "description": "A reference to a configured alias; `alias_source` names the namespace.",
+            "type": "string"
+          },
+          {
+            "const": "string_array",
+            "description": "A `Vec<String>` field; set via comma-separated input.",
+            "type": "string"
+          }
+        ]
+      },
       "QuickstartApplyParams": {
         "properties": {
           "submission": {
@@ -2496,6 +3850,82 @@
         ],
         "type": "object"
       },
+      "QuickstartApplyResult": {
+        "description": "Tagged enum — matches the HTTP route's `ApplyResult` shape.",
+        "oneOf": [
+          {
+            "properties": {
+              "agent": {
+                "$ref": "#/components/schemas/AppliedAgent"
+              },
+              "daemon_restarted": {
+                "description": "`true` when the in-place daemon reload was signalled.\n`false` when no reload tx was attached (e.g. test harness)\n— caller must restart the daemon manually to pick up the\nchange.",
+                "type": "boolean"
+              },
+              "kind": {
+                "const": "applied",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "agent",
+              "daemon_restarted"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "errors": {
+                "items": {
+                  "$ref": "#/components/schemas/QuickstartError"
+                },
+                "type": "array"
+              },
+              "kind": {
+                "const": "errors",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "errors"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "QuickstartDismissParams": {
+        "properties": {
+          "last_step": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/QuickstartStep"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "run_id": {
+            "type": "string"
+          },
+          "surface": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/Surface"
+              }
+            ],
+            "description": "Surface that emitted the dismissal. Deserialised straight\ninto the typed enum — no string-match at the boundary."
+          }
+        },
+        "required": [
+          "run_id",
+          "surface"
+        ],
+        "type": "object"
+      },
       "QuickstartDismissResult": {
         "properties": {
           "recorded": {
@@ -2504,6 +3934,54 @@
         },
         "required": [
           "recorded"
+        ],
+        "type": "object"
+      },
+      "QuickstartError": {
+        "properties": {
+          "field": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "step": {
+            "$ref": "#/components/schemas/QuickstartStep"
+          }
+        },
+        "required": [
+          "step",
+          "field",
+          "message"
+        ],
+        "type": "object"
+      },
+      "QuickstartFieldsParams": {
+        "properties": {
+          "section": {
+            "$ref": "#/components/schemas/FieldSection"
+          },
+          "type_key": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "section",
+          "type_key"
+        ],
+        "type": "object"
+      },
+      "QuickstartFieldsResult": {
+        "properties": {
+          "fields": {
+            "items": {
+              "$ref": "#/components/schemas/FieldDescriptor"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "fields"
         ],
         "type": "object"
       },
@@ -2648,6 +4126,18 @@
         ],
         "type": "object"
       },
+      "QuickstartStep": {
+        "enum": [
+          "model_provider",
+          "risk_profile",
+          "runtime_profile",
+          "memory",
+          "channels",
+          "peer_groups",
+          "agent"
+        ],
+        "type": "string"
+      },
       "QuickstartTypeOption": {
         "description": "One row in the Quickstart \"Create new …\" picker. The TUI and\nweb surfaces both render this list as-is — no hardcoded\noption lists on either side.",
         "properties": {
@@ -2689,6 +4179,89 @@
         ],
         "type": "object"
       },
+      "QuickstartValidateResult": {
+        "description": "Tagged enum — matches the HTTP route's `ValidateResult` shape so\nthe drift test can compare bytes.",
+        "oneOf": [
+          {
+            "properties": {
+              "kind": {
+                "const": "ok",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "errors": {
+                "items": {
+                  "$ref": "#/components/schemas/QuickstartError"
+                },
+                "type": "array"
+              },
+              "kind": {
+                "const": "errors",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "errors"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "RunOverlay": {
+        "description": "Live run state layered over a `SopGraph`, letting a canvas animate an\nexecution without re-fetching the graph. Served by `sops/run-overlay`.",
+        "properties": {
+          "current_step": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "nodes": {
+            "items": {
+              "$ref": "#/components/schemas/NodeRunOverlay"
+            },
+            "type": "array"
+          },
+          "paused": {
+            "type": "boolean"
+          },
+          "run_id": {
+            "type": "string"
+          },
+          "sop_name": {
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/SopRunStatus"
+          },
+          "total_steps": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "waiting": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "run_id",
+          "sop_name",
+          "status",
+          "current_step",
+          "total_steps",
+          "waiting",
+          "paused",
+          "nodes"
+        ],
+        "type": "object"
+      },
       "RuntimeConfigKind": {
         "enum": [
           "default",
@@ -2718,6 +4291,104 @@
           "name",
           "family"
         ],
+        "type": "object"
+      },
+      "Schedule": {
+        "oneOf": [
+          {
+            "properties": {
+              "expr": {
+                "type": "string"
+              },
+              "kind": {
+                "const": "cron",
+                "type": "string"
+              },
+              "tz": {
+                "default": null,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "kind",
+              "expr"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "at": {
+                "type": "string"
+              },
+              "kind": {
+                "const": "at",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "at"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "every_ms": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "kind": {
+                "const": "every",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "every_ms"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "SchedulerConfig": {
+        "description": "Scheduler configuration for periodic task execution (`[scheduler]` section).\n\nOwns the cron-runtime knobs: per-job declarations live on\n`Config.cron: HashMap<String, CronJobDecl>` (alias-keyed), while the\nscheduler loop's runtime behavior (`enabled`, polling cap, catch-up) lives here.",
+        "properties": {
+          "catch_up_on_startup": {
+            "default": true,
+            "description": "Run all overdue jobs at scheduler startup. Default: `true`.\n\nWhen the daemon restarts late, jobs whose `next_run` is in the past\nfire once before normal polling resumes. Disable to wait for the\nnext scheduled occurrence instead.",
+            "type": "boolean"
+          },
+          "enabled": {
+            "default": true,
+            "description": "Enable the built-in scheduler loop. When false, no cron jobs run.",
+            "type": "boolean"
+          },
+          "max_concurrent": {
+            "default": 4,
+            "description": "Maximum tasks executed in parallel within a single polling cycle.",
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "max_run_history": {
+            "default": 50,
+            "description": "Maximum number of historical cron run records to retain. Default: `50`.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "max_tasks": {
+            "default": 64,
+            "description": "Maximum number of persisted scheduled tasks per polling cycle.",
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
         "type": "object"
       },
       "SectionShape": {
@@ -3246,6 +4917,70 @@
         ],
         "type": "object"
       },
+      "SessionNewParams": {
+        "properties": {
+          "agent_alias": {
+            "type": "string"
+          },
+          "chat_mode": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ChatMode"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "cwd": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "exclude_memory": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "interaction_surface": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/InteractionSurface"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Closed user-facing harness identifier. The daemon validates this\nvalue and resolves all descriptive claims from host-owned state."
+          },
+          "keep_siblings": {
+            "description": "When true, skip the same-mode idle-sibling eviction normally\nperformed on `session/new` for the calling TUI. Sent by\nmulti-session-aware clients that manage sibling session lifecycle\nthemselves. Absent or false preserves the eviction sweep.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "session_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tui_id": {
+            "description": "Accepted for wire compatibility and ignored. The session's shell\nenvironment is resolved from the calling connection's own TUI\nregistration, so naming another connection's id here has no\neffect.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "agent_alias"
+        ],
+        "type": "object"
+      },
       "SessionNewResult": {
         "properties": {
           "agent_alias": {
@@ -3382,6 +5117,13 @@
           "state"
         ],
         "type": "object"
+      },
+      "SessionTarget": {
+        "enum": [
+          "isolated",
+          "main"
+        ],
+        "type": "string"
       },
       "SessionUpdateEvent": {
         "description": "Typed session update events pushed via `session/update` notifications.\nReplaces the hand-built `notification_for_turn_event` function.",
@@ -3720,6 +5462,14 @@
           }
         ]
       },
+      "Severity": {
+        "enum": [
+          "ok",
+          "warn",
+          "error"
+        ],
+        "type": "string"
+      },
       "SkillBundleEntry": {
         "description": "Wire representation of a skill bundle. Consolidates gateway `BundleEntry`.",
         "properties": {
@@ -3747,6 +5497,178 @@
           "directory",
           "include",
           "exclude"
+        ],
+        "type": "object"
+      },
+      "SkillFrontmatter": {
+        "properties": {
+          "always": {
+            "description": "When `true`, keeps this skill's instructions inlined in the system\nprompt even in compact skill-prompt mode. See `Skill::always`.",
+            "type": "boolean"
+          },
+          "author": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "category": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "description": {
+            "type": "string"
+          },
+          "license": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "slash_options": {
+            "items": {
+              "$ref": "#/components/schemas/SkillSlashOption"
+            },
+            "type": "array"
+          },
+          "tags": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "version": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "name",
+          "description"
+        ],
+        "type": "object"
+      },
+      "SkillListEntry": {
+        "description": "Wire representation of a skill in a list. Consolidates gateway `SkillEntry`.",
+        "properties": {
+          "bundle": {
+            "type": "string"
+          },
+          "directory": {
+            "type": "string"
+          },
+          "frontmatter": {
+            "$ref": "#/components/schemas/SkillFrontmatter"
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "bundle",
+          "name",
+          "directory",
+          "frontmatter"
+        ],
+        "type": "object"
+      },
+      "SkillSlashChoice": {
+        "description": "A predefined choice for a typed slash option.",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "value": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "value"
+        ],
+        "type": "object"
+      },
+      "SkillSlashOption": {
+        "description": "A typed option a `slash`-tagged skill exposes on its slash command. Shaped\nafter the Discord Application Command Option model but channel-agnostic; a\nslash-capable channel maps `kind` to its wire option type. Declared in\nSKILL.toml under `[[skill.slash_options]]`.",
+        "properties": {
+          "choices": {
+            "default": [],
+            "description": "Predefined choices (string/integer/number options only). The `value` is\nkept as text and coerced to the option's type by the channel.",
+            "items": {
+              "$ref": "#/components/schemas/SkillSlashChoice"
+            },
+            "type": "array"
+          },
+          "description": {
+            "type": "string"
+          },
+          "description_localizations": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "default": {},
+            "description": "Per-locale translations of `description`, keyed by Discord locale code.\nEmpty for unlocalized options. Declared under\n`[[skill.slash_options]]` as `description_localizations`.",
+            "type": "object"
+          },
+          "max": {
+            "default": null,
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "max_length": {
+            "default": null,
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "min": {
+            "default": null,
+            "description": "Inclusive bounds for integer/number options.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "min_length": {
+            "default": null,
+            "description": "Length bounds for string options.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "required": {
+            "default": false,
+            "type": "boolean"
+          },
+          "type": {
+            "description": "`string` | `integer` | `number` | `boolean` | `user` | `channel` |\n`role` | `mentionable`. Unknown values are dropped by the channel.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "description",
+          "type"
         ],
         "type": "object"
       },
@@ -3809,6 +5731,20 @@
         },
         "type": "object"
       },
+      "SkillsListResult": {
+        "properties": {
+          "skills": {
+            "items": {
+              "$ref": "#/components/schemas/SkillListEntry"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "skills"
+        ],
+        "type": "object"
+      },
       "SkillsReadParams": {
         "properties": {
           "bundle": {
@@ -3821,6 +5757,53 @@
         "required": [
           "bundle",
           "name"
+        ],
+        "type": "object"
+      },
+      "SkillsReadResult": {
+        "description": "Consolidates gateway `SkillReadResponse`.",
+        "properties": {
+          "body": {
+            "type": "string"
+          },
+          "bundle": {
+            "type": "string"
+          },
+          "frontmatter": {
+            "$ref": "#/components/schemas/SkillFrontmatter"
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "bundle",
+          "name",
+          "frontmatter",
+          "body"
+        ],
+        "type": "object"
+      },
+      "SkillsWriteParams": {
+        "properties": {
+          "body": {
+            "default": "",
+            "type": "string"
+          },
+          "bundle": {
+            "type": "string"
+          },
+          "frontmatter": {
+            "$ref": "#/components/schemas/SkillFrontmatter"
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "bundle",
+          "name",
+          "frontmatter"
         ],
         "type": "object"
       },
@@ -3842,6 +5825,260 @@
           "written"
         ],
         "type": "object"
+      },
+      "Sop": {
+        "description": "A complete Standard Operating Procedure definition.",
+        "properties": {
+          "admission_policy": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/SopAdmissionPolicy"
+              }
+            ],
+            "default": "parallel",
+            "description": "How to handle a trigger that cannot be admitted immediately because this\nSOP's execution slots are full (A2). Default `parallel`."
+          },
+          "agent": {
+            "description": "Parent agent alias that owns this procedure. Every `execute` step runs\nas this agent unless the step names its own `agent` override. Required\nfor headless triggers (mqtt, webhook, cron, amqp), which have no\nambient agent loop to borrow.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "cooldown_secs": {
+            "default": 0,
+            "description": "Minimum seconds between successive runs of this procedure. `0`\n(default) disables the cooldown and back-to-back runs are allowed.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "decision": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SopDecisionSpec"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Optional decision-model gate and execution-mode choice, from the\n`[decision]` table of `SOP.toml`. See [`super::decision`]."
+          },
+          "description": {
+            "description": "Free-text summary of what the procedure does and when it fires. Shown\nin the SOP list and header; purely descriptive, never executed.",
+            "type": "string"
+          },
+          "deterministic": {
+            "default": false,
+            "description": "When true, sets execution_mode to Deterministic.\nSteps execute sequentially without LLM round-trips.",
+            "type": "boolean"
+          },
+          "execution_mode": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/SopExecutionMode"
+              }
+            ],
+            "description": "How steps are driven: `auto`, `supervised` (default), `step_by_step`,\n`priority_based`, or `deterministic`. `deterministic = true` forces\nthe last regardless of this field."
+          },
+          "max_concurrent": {
+            "default": 1,
+            "description": "Maximum simultaneous runs of this one procedure. Excess trigger\nfirings queue or drop per the engine's concurrency policy. Default 1.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "max_pending_approvals": {
+            "default": 0,
+            "description": "Upper bound on runs of this SOP parked at a HITL approval at once\n(`0` = unlimited). Once reached, further triggers are deferred (surfaced for\nbackpressure/redelivery) rather than silently dropped. Default `0`.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "name": {
+            "description": "Unique procedure name. Doubles as the on-disk directory key, so a\nrename in the editor moves the SOP's folder. Must be non-empty.",
+            "type": "string"
+          },
+          "priority": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/SopPriority"
+              }
+            ],
+            "description": "Scheduling priority when concurrency limits force a choice between\nrunnable procedures: `critical`, `high`, `normal` (default), `low`."
+          },
+          "steps": {
+            "description": "Ordered step definitions. This is the body of the procedure; the\ndaemon renumbers and remaps routing refs on save.",
+            "items": {
+              "$ref": "#/components/schemas/SopStep"
+            },
+            "type": "array"
+          },
+          "triggers": {
+            "description": "Signals that start a run. A procedure may bind several triggers; any\none firing (subject to its own condition) launches the SOP.",
+            "items": {
+              "$ref": "#/components/schemas/SopTrigger"
+            },
+            "type": "array"
+          },
+          "version": {
+            "description": "Semantic version string for the procedure definition (e.g. `1.0.0`).\nBump it when you change step behavior so runs are traceable.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "description",
+          "version",
+          "priority",
+          "execution_mode",
+          "triggers",
+          "steps"
+        ],
+        "type": "object"
+      },
+      "SopAdmissionPolicy": {
+        "description": "How concurrent triggers are handled when a SOP's execution slots are full. A\nrun parked at a HITL approval releases its slot (A1), so this governs the\nremaining case: too many runs actively *executing* at once. No variant ever\nsilently drops a trigger except `Drop`, which is explicit opt-in.",
+        "oneOf": [
+          {
+            "const": "parallel",
+            "description": "Admit up to `max_concurrent` concurrent runs; a trigger that cannot admit\nnow is DEFERRED (surfaced for backpressure/redelivery), never silently\ndropped. Best fit for independent work like PR-request approvals.",
+            "type": "string"
+          },
+          {
+            "const": "hold",
+            "description": "Serialize: admit only when no run of this SOP is active or parked; other\ntriggers are deferred. For pipelines whose pre-approval steps must not overlap.",
+            "type": "string"
+          },
+          {
+            "const": "coalesce",
+            "description": "Collapse concurrent triggers: when a run is already in flight for this SOP a\nnew trigger is coalesced (dropped as redundant - the in-flight run already\ncovers the latest state). For \"only current state matters\" SOPs.",
+            "type": "string"
+          },
+          {
+            "const": "drop",
+            "description": "Legacy fire-and-forget: a trigger that cannot admit now is dropped. Explicit\nopt-in only; never the default.",
+            "type": "string"
+          }
+        ]
+      },
+      "SopDecideRequest": {
+        "description": "Request payload for `sops/decide`: resolve a paused checkpoint. `name` and\n`run_id` select the run; `decision` is the raw `ApprovalDecision` wire value\n(`\"approve\"` or `{\"deny\": {\"reason\": \"...\"}}`), deserialized into the\ncanonical runtime enum by the handler so no parallel decision enum exists\nhere to drift from it.",
+        "properties": {
+          "decision": true,
+          "name": {
+            "type": "string"
+          },
+          "run_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "run_id",
+          "decision"
+        ],
+        "type": "object"
+      },
+      "SopDecisionSpec": {
+        "description": "The `[decision]` table of an `SOP.toml`.",
+        "properties": {
+          "gate": {
+            "description": "Yes/no question asked about each matching event. The run starts only\nwhen the model's \"yes\" probability reaches `gate_threshold`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "gate_on_error": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/GateOnError"
+              }
+            ],
+            "default": "run_strict",
+            "description": "When the model cannot answer: `run_strict` starts the run under the\nfail-closed mode, `skip` does not start it."
+          },
+          "gate_threshold": {
+            "default": 0.7,
+            "description": "Minimum \"yes\" probability (0 to 1) for the gate to start a run.",
+            "format": "double",
+            "type": "number"
+          },
+          "min_confidence": {
+            "default": 0.7,
+            "description": "A mode choice below this confidence falls back to the strictest mode.",
+            "format": "double",
+            "type": "number"
+          },
+          "mode_instructions": {
+            "description": "Guidance for the mode choice (what makes a run routine vs. risky).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "model": {
+            "description": "Alias of the decision model to ask, from `[decision_models.<alias>]`.",
+            "type": "string"
+          },
+          "modes": {
+            "description": "Execution modes the model may choose between for this run. Empty keeps\nthe SOP's authored `execution_mode`. Only `auto`, `supervised`, and\n`step_by_step` are selectable.",
+            "items": {
+              "$ref": "#/components/schemas/SopExecutionMode"
+            },
+            "type": "array"
+          },
+          "part_threshold": {
+            "default": 0.5,
+            "description": "Minimum \"yes\" probability for a step's `decide` question to include\nthat step (a conditional part).",
+            "format": "double",
+            "type": "number"
+          }
+        },
+        "required": [
+          "model"
+        ],
+        "type": "object"
+      },
+      "SopDraftParams": {
+        "description": "Params for `sops/graph-draft`: project an unsaved SOP (the `sops/save`\nwire form) onto its graph without persisting it.",
+        "properties": {
+          "sop": true
+        },
+        "required": [
+          "sop"
+        ],
+        "type": "object"
+      },
+      "SopExecutionMode": {
+        "description": "How much autonomy the agent has when executing an SOP.",
+        "oneOf": [
+          {
+            "const": "auto",
+            "description": "Execute all steps without human approval.",
+            "type": "string"
+          },
+          {
+            "const": "supervised",
+            "description": "Request approval before starting, then execute all steps.",
+            "type": "string"
+          },
+          {
+            "const": "step_by_step",
+            "description": "Request approval before each step.",
+            "type": "string"
+          },
+          {
+            "const": "priority_based",
+            "description": "Critical/High → Auto, Normal/Low → Supervised.",
+            "type": "string"
+          },
+          {
+            "const": "deterministic",
+            "description": "Execute steps sequentially without LLM round-trips.\nStep outputs are piped as inputs to the next step.\nCheckpoint steps pause for human approval.",
+            "type": "string"
+          }
+        ]
       },
       "SopGraph": {
         "description": "The full projected graph: nodes, wires, validation diagnostics, and a\nprecomputed layout. Serialized as-is over RPC (`sops/graph`) and HTTP.",
@@ -3887,6 +6124,615 @@
             "type": "array"
           }
         },
+        "type": "object"
+      },
+      "SopPriority": {
+        "description": "SOP priority level, used for execution mode resolution and scheduling.",
+        "enum": [
+          "low",
+          "normal",
+          "high",
+          "critical"
+        ],
+        "type": "string"
+      },
+      "SopRenameRequest": {
+        "description": "Request payload for `sops/rename`: move the SOP stored under `from` to\n`to`. Rename is its own operation rather than a side effect of `sops/save`\nbecause saving persists under the submitted SOP's name, so a name change\nsmuggled through a save would fork the SOP or overwrite a different one.",
+        "properties": {
+          "from": {
+            "description": "Name the SOP is stored under today.",
+            "type": "string"
+          },
+          "to": {
+            "description": "Name to move it to. Must not already be taken.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "from",
+          "to"
+        ],
+        "type": "object"
+      },
+      "SopRunDetailRequest": {
+        "description": "Parameters for `sops/run-detail`.",
+        "properties": {
+          "run_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "run_id"
+        ],
+        "type": "object"
+      },
+      "SopRunOverlayRequest": {
+        "description": "Request payload for `sops/run-overlay`: project a run's state onto a SOP's\ngraph. Selects the SOP by `name` and the run by `run_id`.",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "run_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "run_id"
+        ],
+        "type": "object"
+      },
+      "SopRunRequest": {
+        "description": "Request payload for `sops/run`: fire a Manual trigger for the named SOP.\n`payload` is an optional JSON string handed to the run as the step-1 input;\nomitting it starts the run with no payload. The daemon builds the Manual\n`SopEvent` and dispatches it on the same path as the `sop_execute` tool.",
+        "properties": {
+          "dedup_key": {
+            "description": "Optional semantic work-item key shared with another trigger producer.\nDispatch coalesces matching keys only while the first run remains active.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "payload": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "type": "object"
+      },
+      "SopRunResponse": {
+        "description": "Response payload for `sops/run`: the id of the run that was started, which\nfeeds straight into `sops/run-overlay` to animate the run on the canvas.",
+        "properties": {
+          "run_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "run_id"
+        ],
+        "type": "object"
+      },
+      "SopRunStatus": {
+        "description": "Status of an SOP execution run.",
+        "oneOf": [
+          {
+            "enum": [
+              "pending",
+              "running",
+              "waiting_approval",
+              "completed",
+              "failed",
+              "cancelled"
+            ],
+            "type": "string"
+          },
+          {
+            "const": "cancel_requested",
+            "description": "An operator requested cancellation while work was in flight. The run\nremains active and keeps its admission claim until the driver reaches\nthe next supported step boundary.",
+            "type": "string"
+          },
+          {
+            "const": "paused_checkpoint",
+            "description": "Paused at a checkpoint in a deterministic workflow.",
+            "type": "string"
+          }
+        ]
+      },
+      "SopRunsRequest": {
+        "description": "Request payload for `sops/runs`: enumerate runs the engine currently holds\n(active plus retained terminal), newest first. `sop` optionally scopes the\nlisting to a single SOP by name; omitting it lists every SOP's runs.",
+        "properties": {
+          "sop": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "SopSaveRequest": {
+        "description": "Request payload for `sops/save` and `sops/create`. The `sop` field is the\nwire form of the runtime `Sop`; the daemon deserializes and validates it.\n`sops/validate` also accepts this form to validate an unsaved draft.",
+        "properties": {
+          "original_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "sop": true
+        },
+        "required": [
+          "sop"
+        ],
+        "type": "object"
+      },
+      "SopSelectRequest": {
+        "description": "Request payload for SOP read/delete methods that select one SOP by name:\n`sops/get`, `sops/graph`, `sops/validate` (by name), `sops/delete`.",
+        "properties": {
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "type": "object"
+      },
+      "SopStep": {
+        "description": "A single step in an SOP procedure, parsed from SOP.md.",
+        "properties": {
+          "agent": {
+            "description": "Agent alias that runs this step. Overrides the SOP's parent agent when\nset; unset inherits the parent. Authored, persisted, and resolved into\nthe executing action via `effective_agent` (step override then parent).\nSpawning a distinct per-step agent's own session at execution time is\nstaged follow-on work; today the resolved alias is stamped on the action\nand the active agent loop executes the step body.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "body": {
+            "default": "",
+            "description": "The step's instruction body in Markdown. This is the prompt the\nrunning agent executes for the step; bindings like `{{steps.N}}`\nresolve against prior step outputs at run time.",
+            "type": "string"
+          },
+          "calls": {
+            "description": "Ordered tool calls planned for this step. Args may carry\n`{{steps.N}}` / `{{calls.K}}` bindings validated at save time.",
+            "items": {
+              "$ref": "#/components/schemas/PlannedToolCall"
+            },
+            "type": "array"
+          },
+          "capability": {
+            "description": "Capability identifier used when `kind = \"capability\"`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "decide": {
+            "description": "Conditional part (`- decide:` bullet): a yes/no question the SOP's\ndecision model answers about the triggering event when the run starts,\nin the same call as the SOP's gate. The step runs only on \"yes\"\n(p(yes) at or above `[decision] part_threshold`); on \"no\" it is recorded\nas skipped and the run moves on. If the model cannot answer, it runs.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "edit": {
+            "description": "Editable-field opt-in for a checkpoint step (`- edit: body` bullet): the\nnamed field of the piped value an approver may amend before the run\nresumes (the gate prompt gains an \"Edit\" choice). Absent = no editing.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "gate_prompt": {
+            "description": "Authored gate-notice template for a HITL step (`- prompt:` bullet).\n`{{path.to.field}}` placeholders resolve against the step's piped input\n(the trigger payload at step 1, the previous step's output later) — pure\nlookups, no logic. Rendered into the out-of-band approval notice so the\napprover sees WHAT they are approving; absent = an automatic summary.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "kind": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/SopStepKind"
+              }
+            ],
+            "default": "execute",
+            "description": "Step kind: `execute` (default) or `checkpoint`."
+          },
+          "mode": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SopExecutionMode"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Optional per-step execution mode override."
+          },
+          "number": {
+            "default": 0,
+            "description": "Ordinal position of this step within the procedure. Steps run in\nnumber order unless routing overrides the sequence; the daemon\nrenumbers on save so gaps and reorders normalize to 1..N.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "on_failure": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/StepFailure"
+              }
+            ],
+            "description": "Failure handling metadata. Default preserves fail-the-run behavior."
+          },
+          "policy": {
+            "description": "Approval policy name (a key in `[sop.approval].policies`) the approval broker\nenforces for this step's gate: required approver group + quorum. `None` keeps\ntoday's behavior (`approval_mode` alone governs, no membership/quorum).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "pos": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/StepPos"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Persisted canvas coordinate, set by dragging the node in the Blueprint\neditor. Absent until the node is moved; not surfaced in the step form."
+          },
+          "requires_confirmation": {
+            "default": false,
+            "description": "Pause for human confirmation before this step runs. Independent of\n`checkpoint` kind and the SOP-level approval gate; both still apply.",
+            "type": "boolean"
+          },
+          "routing": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/StepRouting"
+              }
+            ],
+            "description": "Conditional routing metadata. Default preserves linear execution."
+          },
+          "schema": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/StepSchema"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Typed input/output schemas for deterministic data flow validation."
+          },
+          "scope": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/StepToolScope"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Tool scope for this step. `suggested_tools` remains the legacy alias."
+          },
+          "suggested_tools": {
+            "default": [],
+            "description": "Advisory tool names surfaced to the agent for this step. Legacy alias\nfor `scope.allow`; when `step_scope_enforce` is off these are hints,\nnot a hard restriction.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "title": {
+            "default": "",
+            "description": "Short human label for the step, shown on the canvas node and in the\nstep list. Leave blank and the surface falls back to \"untitled\".",
+            "type": "string"
+          },
+          "unless_decided": {
+            "description": "Skip this step when step N's `decide` question was answered \"yes\"\n(`- unless_decided: N` bullet). Lets one decision select between\nalternative sets of steps, e.g. a scope hold instead of a full review.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "with": {
+            "description": "Capability arguments, serialized as `with` in TOML/JSON definitions."
+          }
+        },
+        "type": "object"
+      },
+      "SopStepKind": {
+        "description": "The kind of a workflow step.",
+        "oneOf": [
+          {
+            "const": "execute",
+            "description": "Normal step — executed by the agent (or deterministic handler).",
+            "type": "string"
+          },
+          {
+            "const": "checkpoint",
+            "description": "Checkpoint step — pauses execution and waits for human approval.",
+            "type": "string"
+          },
+          {
+            "const": "capability",
+            "description": "Deterministic capability step - executed by the SOP capability registry.",
+            "type": "string"
+          }
+        ]
+      },
+      "SopTrigger": {
+        "description": "What event can activate an SOP.",
+        "oneOf": [
+          {
+            "description": "MQTT message arrival. Live: delivered by the MQTT listener.",
+            "properties": {
+              "condition": {
+                "default": null,
+                "description": "Optional expression evaluated against the message payload; the run\nstarts only when it holds.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "topic": {
+                "description": "Topic filter. `+` matches one level, `#` matches the remaining levels.",
+                "type": "string"
+              },
+              "type": {
+                "const": "mqtt",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "topic"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Inbound HTTP request. Live: gateway `/sop/*` and SOP-first `/webhook` routes.",
+            "properties": {
+              "path": {
+                "description": "Request path matched exactly against the event path.",
+                "type": "string"
+              },
+              "type": {
+                "const": "webhook",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "path"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Time-based firing. Live: dispatched by the SOP maintenance tick (daemon / channel-start paths).",
+            "properties": {
+              "expression": {
+                "description": "Cron expression evaluated over the run window.",
+                "type": "string"
+              },
+              "type": {
+                "const": "cron",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "expression"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Hardware signal. Defined and matched, but no peripheral listener feeds it.",
+            "properties": {
+              "board": {
+                "description": "Board identifier the signal originates from.",
+                "type": "string"
+              },
+              "condition": {
+                "default": null,
+                "description": "Optional expression evaluated against the signal payload.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "signal": {
+                "description": "Signal name on the board; matched as `board/signal`.",
+                "type": "string"
+              },
+              "type": {
+                "const": "peripheral",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "board",
+              "signal"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Filesystem change. Live: delivered by the filesystem watcher.",
+            "properties": {
+              "condition": {
+                "default": null,
+                "description": "Optional expression evaluated against the change payload.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "events": {
+                "default": [],
+                "description": "Change kinds to match; empty matches every kind.",
+                "items": {
+                  "$ref": "#/components/schemas/FilesystemEventKind"
+                },
+                "type": "array"
+              },
+              "path": {
+                "description": "Path glob (`*`, `**`, `?`); a bare directory matches anything under it.",
+                "type": "string"
+              },
+              "type": {
+                "const": "filesystem",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "path"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Calendar event state. Defined and matched, but no poller feeds it live.",
+            "properties": {
+              "calendar_ids": {
+                "default": [],
+                "description": "Calendar IDs to scope to; empty matches all of the source's calendars.",
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "calendar_source": {
+                "description": "Calendar source identifier the event originates from.",
+                "type": "string"
+              },
+              "condition": {
+                "default": null,
+                "description": "Optional expression evaluated against the calendar event payload.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "type": {
+                "const": "calendar",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "calendar_source"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Inbound message or forge/platform event on a configured channel\n(telegram, discord, slack, git, ...). Live: delivered by the channel\norchestrator when the channel's SOP dispatch is enabled. The Git forge\nproducer sets an event topic of the form `<channel>.<alias>:<event_type>`\nand puts `event_type` in the payload, so an authored `condition` filters\nforge events by type without a second trigger shape.",
+            "properties": {
+              "alias": {
+                "default": null,
+                "description": "Optional configured-instance alias; unset matches every instance.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "channel": {
+                "description": "`ChannelKind` snake_case value naming the channel type.",
+                "type": "string"
+              },
+              "condition": {
+                "default": null,
+                "description": "Optional expression evaluated against the message payload.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "type": {
+                "const": "channel",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "channel"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Agent-initiated run via the `sop_execute` tool. Not an external fan-in.",
+            "properties": {
+              "type": {
+                "const": "manual",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "AMQP delivery. Live: delivered by the AMQP consumer in a SOP dispatch mode.",
+            "properties": {
+              "condition": {
+                "default": null,
+                "description": "Optional expression evaluated against the delivery body.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "routing_key": {
+                "description": "Routing-key filter (topic-exchange semantics): `.`-delimited words,\n`*` matches one word, `#` matches zero or more words.",
+                "type": "string"
+              },
+              "type": {
+                "const": "amqp",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "routing_key"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "SopValidateParams": {
+        "anyOf": [
+          {
+            "$ref": "#/components/schemas/SopSaveRequest"
+          },
+          {
+            "$ref": "#/components/schemas/SopSelectRequest"
+          }
+        ],
+        "description": "Params for `sops/validate`: an unsaved draft in the `sops/save` form, or\na stored SOP selected by name. A request carrying a `sop` key is always\nvalidated as a draft."
+      },
+      "SopWireDraftParams": {
+        "description": "Params for `sops/wire-draft`: apply one wire edit to an unsaved SOP\n(the `sops/save` wire form) and return the edited SOP and its graph.\nThe handler reads the two keys itself so each can report its own\nerror; this type is their declared contract.",
+        "properties": {
+          "edit": {
+            "$ref": "#/components/schemas/WireEdit"
+          },
+          "sop": true
+        },
+        "required": [
+          "sop",
+          "edit"
+        ],
         "type": "object"
       },
       "StatusResult": {
@@ -3955,6 +6801,204 @@
           "active_sessions",
           "session_ids"
         ],
+        "type": "object"
+      },
+      "StepFailure": {
+        "description": "Failure handling policy for a single SOP step.",
+        "oneOf": [
+          {
+            "enum": [
+              "fail"
+            ],
+            "type": "string"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "retry": {
+                "properties": {
+                  "max": {
+                    "format": "uint32",
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "max"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "retry"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "goto": {
+                "properties": {
+                  "step": {
+                    "format": "uint32",
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "step"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "goto"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "StepPos": {
+        "description": "Persisted canvas coordinate for a step node. Written by the Blueprint\neditor when a node is dragged; never edited in the step-definition form.",
+        "properties": {
+          "x": {
+            "format": "double",
+            "type": "number"
+          },
+          "y": {
+            "format": "double",
+            "type": "number"
+          }
+        },
+        "required": [
+          "x",
+          "y"
+        ],
+        "type": "object"
+      },
+      "StepRouting": {
+        "description": "Conditional routing metadata for a single SOP step.",
+        "properties": {
+          "depends_on": {
+            "description": "Step numbers that must have completed before this step can run.",
+            "items": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": "array"
+          },
+          "next": {
+            "description": "Explicit successor step number.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "switch": {
+            "description": "Ordered switch ports. Non-empty makes this a multi-branch switch node:\neach port is a named conditional out-edge, matched top to bottom.",
+            "items": {
+              "$ref": "#/components/schemas/SwitchRule"
+            },
+            "type": "array"
+          },
+          "terminal": {
+            "description": "When true, this step ends its branch: no implicit fallthrough to the\nfollowing step is derived. Lets an authoring surface delete the default\nsequence edge and leave a node free-floating between saves.",
+            "type": "boolean"
+          },
+          "when": {
+            "description": "Guard evaluated against accumulated run data.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "StepSchema": {
+        "description": "JSON Schema fragment for validating step input/output data.\nStored as a raw `serde_json::Value` so callers can validate without\npulling in a full JSON Schema library.",
+        "properties": {
+          "input": {
+            "description": "JSON Schema object describing expected input shape."
+          },
+          "output": {
+            "description": "JSON Schema object describing expected output shape."
+          }
+        },
+        "type": "object"
+      },
+      "StepToolCall": {
+        "description": "One tool invocation captured during a step's execution. A step may\nmake any number of calls (including the same tool repeatedly);\n`index` preserves invocation order so authoring surfaces can replay\nthe sequence and map data between calls.",
+        "properties": {
+          "args": {
+            "description": "Arguments the tool actually received."
+          },
+          "duration_ms": {
+            "default": 0,
+            "description": "Wall-clock duration in milliseconds.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "index": {
+            "description": "Zero-based invocation order within the step.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "output": {
+            "description": "Display text of the tool output.",
+            "type": "string"
+          },
+          "output_data": {
+            "description": "Structured output when the tool declared one (`ToolOutput::data`)."
+          },
+          "success": {
+            "type": "boolean"
+          },
+          "tool": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "index",
+          "tool",
+          "args",
+          "success",
+          "output"
+        ],
+        "type": "object"
+      },
+      "StepToolScope": {
+        "description": "Per-step allow/deny tool scope. Enforcement is opt-in through SOP config.",
+        "properties": {
+          "allow": {
+            "description": "Only these names or groups are allowed when present.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "deny": {
+            "description": "These names or groups are always subtracted.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
         "type": "object"
       },
       "SubscribeParams": {
@@ -4033,6 +7077,45 @@
         ],
         "type": "object"
       },
+      "Surface": {
+        "description": "Which surface invoked the Quickstart. Stamped on every event in\nthe apply path so SSE/dashboard consumers can filter by origin\nwithout parsing message strings.",
+        "enum": [
+          "web",
+          "tui",
+          "cli",
+          "test"
+        ],
+        "type": "string"
+      },
+      "SwitchRule": {
+        "description": "A single named output port on a switch step. Rules are evaluated top to\nbottom; the first whose `when` guard passes routes the run to `goto`. A\nrule with `when` unset is the catch-all (n8n's \"unknown\"/default port) and\nshould be ordered last.",
+        "properties": {
+          "goto": {
+            "description": "Target step this port routes to.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "name": {
+            "description": "Port label shown on the node's output pin (e.g. `pull_request`).",
+            "type": "string"
+          },
+          "when": {
+            "description": "Guard evaluated against accumulated run data. `None` = catch-all.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "type": "object"
+      },
       "TemplateFileEntry": {
         "description": "Consolidates gateway `TemplateFile`.",
         "properties": {
@@ -4068,6 +7151,116 @@
             "type": "string"
           }
         ]
+      },
+      "ToolsParamOptionsParams": {
+        "description": "Params for `tools/param-options`: the option list for one tool\nparameter domain.",
+        "properties": {
+          "agent": {
+            "default": null,
+            "description": "Agent whose configuration scopes the options. Blank or absent\nselects the first configured agent.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "args": {
+            "default": null,
+            "description": "Domain-specific arguments, handed to the option resolver as-is."
+          },
+          "domain": {
+            "$ref": "#/components/schemas/OptionDomain"
+          }
+        },
+        "required": [
+          "domain"
+        ],
+        "type": "object"
+      },
+      "TriggerField": {
+        "description": "One editable field of a trigger source (e.g. `topic` for MQTT).",
+        "properties": {
+          "kind": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/TriggerFieldKind"
+              }
+            ],
+            "default": "text"
+          },
+          "multi": {
+            "type": "boolean"
+          },
+          "name": {
+            "type": "string"
+          },
+          "options": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "type": "object"
+      },
+      "TriggerFieldKind": {
+        "description": "Input widget hint for a trigger field.",
+        "oneOf": [
+          {
+            "const": "text",
+            "description": "Free-form single value (topic, path, cron expression, ...).",
+            "type": "string"
+          },
+          {
+            "const": "list",
+            "description": "Multi-value selection; `options` carries the choices when finite.",
+            "type": "string"
+          },
+          {
+            "const": "expression",
+            "description": "Condition expression evaluated against the trigger payload.",
+            "type": "string"
+          }
+        ]
+      },
+      "TriggerSourceRegistry": {
+        "description": "Everything an authoring surface needs to offer trigger configuration:\nthe full ordered source list, the bound (non-channel) sources with their\nfield shapes, and per-channel availability. `Channel` is special-cased\ninto `channels` because its options depend on live config, not just the\nenum; `sources` still names it so surfaces render the picker from one\nbackend-walked list instead of reconstructing it.",
+        "properties": {
+          "bound": {
+            "items": {
+              "$ref": "#/components/schemas/BoundTriggerSource"
+            },
+            "type": "array"
+          },
+          "channels": {
+            "items": {
+              "$ref": "#/components/schemas/ChannelTriggerKind"
+            },
+            "type": "array"
+          },
+          "operators": {
+            "default": [],
+            "description": "The comparison operators every condition builder renders. Read from\n[`crate::sop::condition::ConditionOp`], never hand-listed by a surface.",
+            "items": {
+              "$ref": "#/components/schemas/ConditionOpSpec"
+            },
+            "type": "array"
+          },
+          "sources": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "sources",
+          "bound",
+          "channels"
+        ],
+        "type": "object"
       },
       "TuiListEntry": {
         "properties": {
@@ -4122,6 +7315,59 @@
           "failed"
         ],
         "type": "string"
+      },
+      "WireEdit": {
+        "description": "One editor gesture. `role` picks which routing field is mutated; `port`\nis required for `Switch` (index into `routing.switch`) and ignored\notherwise. Accepted over RPC (`sops/wire-draft`) and HTTP.",
+        "properties": {
+          "from": {
+            "description": "Source step number (the node the wire leaves).",
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "op": {
+            "$ref": "#/components/schemas/WireOp"
+          },
+          "port": {
+            "description": "Switch port index; grows the port list on connect if needed.",
+            "format": "uint",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "role": {
+            "$ref": "#/components/schemas/FlowRole"
+          },
+          "to": {
+            "description": "Target step number (the node the wire enters).",
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "op",
+          "from",
+          "to",
+          "role"
+        ],
+        "type": "object"
+      },
+      "WireOp": {
+        "oneOf": [
+          {
+            "const": "connect",
+            "description": "Create the edge, overwriting any previous target of the same role.",
+            "type": "string"
+          },
+          {
+            "const": "disconnect",
+            "description": "Remove the edge only if it currently points at the given target.",
+            "type": "string"
+          }
+        ]
       }
     }
   },
@@ -4268,10 +7514,10 @@
       "result": {
         "name": "result",
         "schema": {
-          "description": "`DoctorRunResult`, defined in `zeroclaw-runtime`; no schema is exported yet."
+          "$ref": "#/components/schemas/DoctorRunResult"
         },
         "x-zeroclaw-owner": "zeroclaw-runtime",
-        "x-zeroclaw-shape": "external"
+        "x-zeroclaw-shape": "typed"
       },
       "x-zeroclaw-authorization": {
         "kind": "grant",
@@ -4285,7 +7531,96 @@
     {
       "name": "session/new",
       "paramStructure": "by-name",
-      "params": [],
+      "params": [
+        {
+          "name": "agent_alias",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "chat_mode",
+          "required": false,
+          "schema": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ChatMode"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        {
+          "name": "cwd",
+          "required": false,
+          "schema": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "exclude_memory",
+          "required": false,
+          "schema": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "interaction_surface",
+          "required": false,
+          "schema": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/InteractionSurface"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Closed user-facing harness identifier. The daemon validates this\nvalue and resolves all descriptive claims from host-owned state."
+          }
+        },
+        {
+          "name": "keep_siblings",
+          "required": false,
+          "schema": {
+            "description": "When true, skip the same-mode idle-sibling eviction normally\nperformed on `session/new` for the calling TUI. Sent by\nmulti-session-aware clients that manage sibling session lifecycle\nthemselves. Absent or false preserves the eviction sweep.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "session_id",
+          "required": false,
+          "schema": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "tui_id",
+          "required": false,
+          "schema": {
+            "description": "Accepted for wire compatibility and ignored. The session's shell\nenvironment is resolved from the calling connection's own TUI\nregistration, so naming another connection's id here has no\neffect.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      ],
       "result": {
         "name": "result",
         "schema": {
@@ -4299,9 +7634,8 @@
         "verb": "create"
       },
       "x-zeroclaw-params": {
-        "description": "`SessionNewParams`, defined in `zeroclaw-runtime`; no schema is exported yet, so its keys are not enumerable here.",
         "owner": "zeroclaw-runtime",
-        "shape": "external",
+        "shape": "typed",
         "type": "SessionNewParams"
       }
     },
@@ -5101,10 +8435,10 @@
       "result": {
         "name": "result",
         "schema": {
-          "description": "`CronListResult`, defined in `zeroclaw-runtime`; no schema is exported yet."
+          "$ref": "#/components/schemas/CronListResult"
         },
         "x-zeroclaw-owner": "zeroclaw-runtime",
-        "x-zeroclaw-shape": "external"
+        "x-zeroclaw-shape": "typed"
       },
       "x-zeroclaw-authorization": {
         "kind": "grant",
@@ -5130,10 +8464,10 @@
       "result": {
         "name": "result",
         "schema": {
-          "description": "`CronJob`, defined in `zeroclaw-runtime`; no schema is exported yet."
+          "$ref": "#/components/schemas/CronJob"
         },
         "x-zeroclaw-owner": "zeroclaw-runtime",
-        "x-zeroclaw-shape": "external"
+        "x-zeroclaw-shape": "typed"
       },
       "x-zeroclaw-authorization": {
         "kind": "grant",
@@ -5148,14 +8482,136 @@
     {
       "name": "cron/add",
       "paramStructure": "by-name",
-      "params": [],
+      "params": [
+        {
+          "name": "agent",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "schedule",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "allowed_tools",
+          "required": false,
+          "schema": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "command",
+          "required": false,
+          "schema": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "delete_after_run",
+          "required": false,
+          "schema": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "delivery",
+          "required": false,
+          "schema": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DeliveryConfig"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        {
+          "name": "job_type",
+          "required": false,
+          "schema": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "model",
+          "required": false,
+          "schema": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "name",
+          "required": false,
+          "schema": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "prompt",
+          "required": false,
+          "schema": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "session_target",
+          "required": false,
+          "schema": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "tz",
+          "required": false,
+          "schema": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      ],
       "result": {
         "name": "result",
         "schema": {
-          "description": "`CronJob`, defined in `zeroclaw-runtime`; no schema is exported yet."
+          "$ref": "#/components/schemas/CronJob"
         },
         "x-zeroclaw-owner": "zeroclaw-runtime",
-        "x-zeroclaw-shape": "external"
+        "x-zeroclaw-shape": "typed"
       },
       "x-zeroclaw-authorization": {
         "kind": "grant",
@@ -5163,9 +8619,8 @@
         "verb": "create"
       },
       "x-zeroclaw-params": {
-        "description": "`CronAddParams`, defined in `zeroclaw-runtime`; no schema is exported yet, so its keys are not enumerable here.",
         "owner": "zeroclaw-runtime",
-        "shape": "external",
+        "shape": "typed",
         "type": "CronAddParams"
       }
     },
@@ -5251,10 +8706,10 @@
       "result": {
         "name": "result",
         "schema": {
-          "description": "`CronJob`, defined in `zeroclaw-runtime`; no schema is exported yet."
+          "$ref": "#/components/schemas/CronJob"
         },
         "x-zeroclaw-owner": "zeroclaw-runtime",
-        "x-zeroclaw-shape": "external"
+        "x-zeroclaw-shape": "typed"
       },
       "x-zeroclaw-authorization": {
         "kind": "grant",
@@ -5322,10 +8777,10 @@
       "result": {
         "name": "result",
         "schema": {
-          "description": "`CronRunsResult`, defined in `zeroclaw-runtime`; no schema is exported yet."
+          "$ref": "#/components/schemas/CronRunsResult"
         },
         "x-zeroclaw-owner": "zeroclaw-runtime",
-        "x-zeroclaw-shape": "external"
+        "x-zeroclaw-shape": "typed"
       },
       "x-zeroclaw-authorization": {
         "kind": "grant",
@@ -5369,13 +8824,19 @@
     {
       "name": "cron/settings",
       "paramStructure": "by-name",
-      "params": [],
+      "params": [
+        {
+          "name": "patch",
+          "required": false,
+          "schema": true
+        }
+      ],
       "result": {
         "name": "result",
         "schema": {
-          "description": "Free-form JSON shaped by the daemon at runtime."
+          "$ref": "#/components/schemas/SchedulerConfig"
         },
-        "x-zeroclaw-shape": "untyped"
+        "x-zeroclaw-shape": "typed"
       },
       "x-zeroclaw-authorization": {
         "kind": "grant",
@@ -5383,8 +8844,8 @@
         "verb": "read"
       },
       "x-zeroclaw-params": {
-        "description": "Free-form JSON object shaped by the daemon at runtime; keys are not enumerable here.",
-        "shape": "untyped"
+        "shape": "typed",
+        "type": "CronSettingsParams"
       }
     },
     {
@@ -5857,10 +9318,9 @@
       "result": {
         "name": "result",
         "schema": {
-          "description": "`CostSummary`, defined in `zeroclaw-config`; no schema is exported yet."
+          "$ref": "#/components/schemas/CostSummary"
         },
-        "x-zeroclaw-owner": "zeroclaw-config",
-        "x-zeroclaw-shape": "external"
+        "x-zeroclaw-shape": "typed"
       },
       "x-zeroclaw-authorization": {
         "kind": "grant",
@@ -5930,10 +9390,10 @@
       "result": {
         "name": "result",
         "schema": {
-          "description": "`SkillsListResult`, defined in `zeroclaw-runtime`; no schema is exported yet."
+          "$ref": "#/components/schemas/SkillsListResult"
         },
         "x-zeroclaw-owner": "zeroclaw-runtime",
-        "x-zeroclaw-shape": "external"
+        "x-zeroclaw-shape": "typed"
       },
       "x-zeroclaw-authorization": {
         "kind": "grant",
@@ -5967,10 +9427,10 @@
       "result": {
         "name": "result",
         "schema": {
-          "description": "`SkillsReadResult`, defined in `zeroclaw-runtime`; no schema is exported yet."
+          "$ref": "#/components/schemas/SkillsReadResult"
         },
         "x-zeroclaw-owner": "zeroclaw-runtime",
-        "x-zeroclaw-shape": "external"
+        "x-zeroclaw-shape": "typed"
       },
       "x-zeroclaw-authorization": {
         "kind": "grant",
@@ -5985,7 +9445,37 @@
     {
       "name": "skills/write",
       "paramStructure": "by-name",
-      "params": [],
+      "params": [
+        {
+          "name": "bundle",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "frontmatter",
+          "required": true,
+          "schema": {
+            "$ref": "#/components/schemas/SkillFrontmatter"
+          }
+        },
+        {
+          "name": "name",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "body",
+          "required": false,
+          "schema": {
+            "default": "",
+            "type": "string"
+          }
+        }
+      ],
       "result": {
         "name": "result",
         "schema": {
@@ -5999,9 +9489,8 @@
         "verb": "update"
       },
       "x-zeroclaw-params": {
-        "description": "`SkillsWriteParams`, defined in `zeroclaw-runtime`; no schema is exported yet, so its keys are not enumerable here.",
         "owner": "zeroclaw-runtime",
-        "shape": "external",
+        "shape": "typed",
         "type": "SkillsWriteParams"
       }
     },
@@ -6828,14 +10317,30 @@
     {
       "name": "fs/list_dir",
       "paramStructure": "by-name",
-      "params": [],
+      "params": [
+        {
+          "name": "path",
+          "required": true,
+          "schema": {
+            "description": "Relative or absolute path within the agent workspace.",
+            "type": "string"
+          }
+        },
+        {
+          "name": "show_hidden",
+          "required": false,
+          "schema": {
+            "default": false,
+            "type": "boolean"
+          }
+        }
+      ],
       "result": {
         "name": "result",
         "schema": {
-          "description": "`FsListDirResponse`, defined in `zeroclaw-api`; no schema is exported yet."
+          "$ref": "#/components/schemas/FsListDirResponse"
         },
-        "x-zeroclaw-owner": "zeroclaw-api",
-        "x-zeroclaw-shape": "external"
+        "x-zeroclaw-shape": "typed"
       },
       "x-zeroclaw-authorization": {
         "kind": "grant",
@@ -6843,9 +10348,7 @@
         "verb": "read"
       },
       "x-zeroclaw-params": {
-        "description": "`FsListDirRequest`, defined in `zeroclaw-api`; no schema is exported yet, so its keys are not enumerable here.",
-        "owner": "zeroclaw-api",
-        "shape": "external",
+        "shape": "typed",
         "type": "FsListDirRequest"
       }
     },
@@ -6856,9 +10359,9 @@
       "result": {
         "name": "result",
         "schema": {
-          "description": "Free-form JSON shaped by the daemon at runtime."
+          "$ref": "#/components/schemas/LocalesListResponse"
         },
-        "x-zeroclaw-shape": "untyped"
+        "x-zeroclaw-shape": "typed"
       },
       "x-zeroclaw-authorization": {
         "kind": "grant",
@@ -6872,13 +10375,32 @@
     {
       "name": "locales/fetch",
       "paramStructure": "by-name",
-      "params": [],
+      "params": [
+        {
+          "name": "locale",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "catalog",
+          "required": false,
+          "schema": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        }
+      ],
       "result": {
         "name": "result",
         "schema": {
-          "description": "Free-form JSON shaped by the daemon at runtime."
+          "$ref": "#/components/schemas/LocalesFetchResponse"
         },
-        "x-zeroclaw-shape": "untyped"
+        "x-zeroclaw-shape": "typed"
       },
       "x-zeroclaw-authorization": {
         "kind": "grant",
@@ -6886,8 +10408,8 @@
         "verb": "read"
       },
       "x-zeroclaw-params": {
-        "description": "Free-form JSON object shaped by the daemon at runtime; keys are not enumerable here.",
-        "shape": "untyped"
+        "shape": "typed",
+        "type": "LocalesFetchRequest"
       }
     },
     {
@@ -6913,14 +10435,29 @@
     {
       "name": "quickstart/fields",
       "paramStructure": "by-name",
-      "params": [],
+      "params": [
+        {
+          "name": "section",
+          "required": true,
+          "schema": {
+            "$ref": "#/components/schemas/FieldSection"
+          }
+        },
+        {
+          "name": "type_key",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
       "result": {
         "name": "result",
         "schema": {
-          "description": "`QuickstartFieldsResult`, defined in `zeroclaw-runtime`; no schema is exported yet."
+          "$ref": "#/components/schemas/QuickstartFieldsResult"
         },
         "x-zeroclaw-owner": "zeroclaw-runtime",
-        "x-zeroclaw-shape": "external"
+        "x-zeroclaw-shape": "typed"
       },
       "x-zeroclaw-authorization": {
         "kind": "grant",
@@ -6928,9 +10465,8 @@
         "verb": "read"
       },
       "x-zeroclaw-params": {
-        "description": "`QuickstartFieldsParams`, defined in `zeroclaw-runtime`; no schema is exported yet, so its keys are not enumerable here.",
         "owner": "zeroclaw-runtime",
-        "shape": "external",
+        "shape": "typed",
         "type": "QuickstartFieldsParams"
       }
     },
@@ -6949,10 +10485,10 @@
       "result": {
         "name": "result",
         "schema": {
-          "description": "`QuickstartValidateResult`, defined in `zeroclaw-runtime`; no schema is exported yet."
+          "$ref": "#/components/schemas/QuickstartValidateResult"
         },
         "x-zeroclaw-owner": "zeroclaw-runtime",
-        "x-zeroclaw-shape": "external"
+        "x-zeroclaw-shape": "typed"
       },
       "x-zeroclaw-authorization": {
         "kind": "grant",
@@ -6979,10 +10515,10 @@
       "result": {
         "name": "result",
         "schema": {
-          "description": "`QuickstartApplyResult`, defined in `zeroclaw-runtime`; no schema is exported yet."
+          "$ref": "#/components/schemas/QuickstartApplyResult"
         },
         "x-zeroclaw-owner": "zeroclaw-runtime",
-        "x-zeroclaw-shape": "external"
+        "x-zeroclaw-shape": "typed"
       },
       "x-zeroclaw-authorization": {
         "kind": "grant",
@@ -6997,7 +10533,42 @@
     {
       "name": "quickstart/dismiss",
       "paramStructure": "by-name",
-      "params": [],
+      "params": [
+        {
+          "name": "run_id",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "surface",
+          "required": true,
+          "schema": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/Surface"
+              }
+            ],
+            "description": "Surface that emitted the dismissal. Deserialised straight\ninto the typed enum — no string-match at the boundary."
+          }
+        },
+        {
+          "name": "last_step",
+          "required": false,
+          "schema": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/QuickstartStep"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          }
+        }
+      ],
       "result": {
         "name": "result",
         "schema": {
@@ -7011,16 +10582,24 @@
         "verb": "update"
       },
       "x-zeroclaw-params": {
-        "description": "`QuickstartDismissParams`, defined in `zeroclaw-runtime`; no schema is exported yet, so its keys are not enumerable here.",
         "owner": "zeroclaw-runtime",
-        "shape": "external",
+        "shape": "typed",
         "type": "QuickstartDismissParams"
       }
     },
     {
       "name": "cert/renew",
       "paramStructure": "by-name",
-      "params": [],
+      "params": [
+        {
+          "name": "csr_pem",
+          "required": true,
+          "schema": {
+            "description": "PEM-encoded certificate signing request for the replacement.",
+            "type": "string"
+          }
+        }
+      ],
       "result": {
         "name": "result",
         "schema": {
@@ -7032,8 +10611,8 @@
         "kind": "handshake"
       },
       "x-zeroclaw-params": {
-        "description": "Free-form JSON object shaped by the daemon at runtime; keys are not enumerable here.",
-        "shape": "untyped"
+        "shape": "typed",
+        "type": "CertRenewParams"
       }
     },
     {
@@ -7059,14 +10638,22 @@
     {
       "name": "sops/get",
       "paramStructure": "by-name",
-      "params": [],
+      "params": [
+        {
+          "name": "name",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
       "result": {
         "name": "result",
         "schema": {
-          "description": "`Sop`, defined in `zeroclaw-runtime`; no schema is exported yet."
+          "$ref": "#/components/schemas/Sop"
         },
         "x-zeroclaw-owner": "zeroclaw-runtime",
-        "x-zeroclaw-shape": "external"
+        "x-zeroclaw-shape": "typed"
       },
       "x-zeroclaw-authorization": {
         "kind": "grant",
@@ -7074,16 +10661,22 @@
         "verb": "read"
       },
       "x-zeroclaw-params": {
-        "description": "`SopSelectRequest`, defined in `zeroclaw-api`; no schema is exported yet, so its keys are not enumerable here.",
-        "owner": "zeroclaw-api",
-        "shape": "external",
+        "shape": "typed",
         "type": "SopSelectRequest"
       }
     },
     {
       "name": "sops/graph",
       "paramStructure": "by-name",
-      "params": [],
+      "params": [
+        {
+          "name": "name",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
       "result": {
         "name": "result",
         "schema": {
@@ -7097,23 +10690,49 @@
         "verb": "read"
       },
       "x-zeroclaw-params": {
-        "description": "`SopSelectRequest`, defined in `zeroclaw-api`; no schema is exported yet, so its keys are not enumerable here.",
-        "owner": "zeroclaw-api",
-        "shape": "external",
+        "shape": "typed",
         "type": "SopSelectRequest"
       }
     },
     {
       "name": "sops/run",
       "paramStructure": "by-name",
-      "params": [],
+      "params": [
+        {
+          "name": "name",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "dedup_key",
+          "required": false,
+          "schema": {
+            "description": "Optional semantic work-item key shared with another trigger producer.\nDispatch coalesces matching keys only while the first run remains active.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "payload",
+          "required": false,
+          "schema": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      ],
       "result": {
         "name": "result",
         "schema": {
-          "description": "`SopRunResponse`, defined in `zeroclaw-api`; no schema is exported yet."
+          "$ref": "#/components/schemas/SopRunResponse"
         },
-        "x-zeroclaw-owner": "zeroclaw-api",
-        "x-zeroclaw-shape": "external"
+        "x-zeroclaw-shape": "typed"
       },
       "x-zeroclaw-authorization": {
         "kind": "grant",
@@ -7121,16 +10740,25 @@
         "verb": "execute"
       },
       "x-zeroclaw-params": {
-        "description": "`SopRunRequest`, defined in `zeroclaw-api`; no schema is exported yet, so its keys are not enumerable here.",
-        "owner": "zeroclaw-api",
-        "shape": "external",
+        "shape": "typed",
         "type": "SopRunRequest"
       }
     },
     {
       "name": "sops/runs",
       "paramStructure": "by-name",
-      "params": [],
+      "params": [
+        {
+          "name": "sop",
+          "required": false,
+          "schema": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      ],
       "result": {
         "name": "result",
         "schema": {
@@ -7144,16 +10772,22 @@
         "verb": "read"
       },
       "x-zeroclaw-params": {
-        "description": "`SopRunsRequest`, defined in `zeroclaw-api`; no schema is exported yet, so its keys are not enumerable here.",
-        "owner": "zeroclaw-api",
-        "shape": "external",
+        "shape": "typed",
         "type": "SopRunsRequest"
       }
     },
     {
       "name": "sops/run-detail",
       "paramStructure": "by-name",
-      "params": [],
+      "params": [
+        {
+          "name": "run_id",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
       "result": {
         "name": "result",
         "schema": {
@@ -7167,23 +10801,36 @@
         "verb": "read"
       },
       "x-zeroclaw-params": {
-        "description": "`SopRunDetailRequest`, defined in `zeroclaw-api`; no schema is exported yet, so its keys are not enumerable here.",
-        "owner": "zeroclaw-api",
-        "shape": "external",
+        "shape": "typed",
         "type": "SopRunDetailRequest"
       }
     },
     {
       "name": "sops/run-overlay",
       "paramStructure": "by-name",
-      "params": [],
+      "params": [
+        {
+          "name": "name",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "run_id",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
       "result": {
         "name": "result",
         "schema": {
-          "description": "`RunOverlay`, defined in `zeroclaw-runtime`; no schema is exported yet."
+          "$ref": "#/components/schemas/RunOverlay"
         },
         "x-zeroclaw-owner": "zeroclaw-runtime",
-        "x-zeroclaw-shape": "external"
+        "x-zeroclaw-shape": "typed"
       },
       "x-zeroclaw-authorization": {
         "kind": "grant",
@@ -7191,9 +10838,7 @@
         "verb": "read"
       },
       "x-zeroclaw-params": {
-        "description": "`SopRunOverlayRequest`, defined in `zeroclaw-api`; no schema is exported yet, so its keys are not enumerable here.",
-        "owner": "zeroclaw-api",
-        "shape": "external",
+        "shape": "typed",
         "type": "SopRunOverlayRequest"
       }
     },
@@ -7214,14 +10859,31 @@
         "verb": "execute"
       },
       "x-zeroclaw-params": {
-        "description": "Free-form JSON object shaped by the daemon at runtime; keys are not enumerable here.",
-        "shape": "untyped"
+        "description": "`SopValidateParams` is not a plain object; its schema is in components.",
+        "shape": "typed",
+        "type": "SopValidateParams"
       }
     },
     {
       "name": "sops/save",
       "paramStructure": "by-name",
-      "params": [],
+      "params": [
+        {
+          "name": "sop",
+          "required": true,
+          "schema": true
+        },
+        {
+          "name": "original_name",
+          "required": false,
+          "schema": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      ],
       "result": {
         "name": "result",
         "schema": {
@@ -7235,16 +10897,30 @@
         "verb": "update"
       },
       "x-zeroclaw-params": {
-        "description": "`SopSaveRequest`, defined in `zeroclaw-api`; no schema is exported yet, so its keys are not enumerable here.",
-        "owner": "zeroclaw-api",
-        "shape": "external",
+        "shape": "typed",
         "type": "SopSaveRequest"
       }
     },
     {
       "name": "sops/create",
       "paramStructure": "by-name",
-      "params": [],
+      "params": [
+        {
+          "name": "sop",
+          "required": true,
+          "schema": true
+        },
+        {
+          "name": "original_name",
+          "required": false,
+          "schema": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      ],
       "result": {
         "name": "result",
         "schema": {
@@ -7258,16 +10934,22 @@
         "verb": "create"
       },
       "x-zeroclaw-params": {
-        "description": "`SopSaveRequest`, defined in `zeroclaw-api`; no schema is exported yet, so its keys are not enumerable here.",
-        "owner": "zeroclaw-api",
-        "shape": "external",
+        "shape": "typed",
         "type": "SopSaveRequest"
       }
     },
     {
       "name": "sops/delete",
       "paramStructure": "by-name",
-      "params": [],
+      "params": [
+        {
+          "name": "name",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
       "result": {
         "name": "result",
         "schema": {
@@ -7281,16 +10963,31 @@
         "verb": "delete"
       },
       "x-zeroclaw-params": {
-        "description": "`SopSelectRequest`, defined in `zeroclaw-api`; no schema is exported yet, so its keys are not enumerable here.",
-        "owner": "zeroclaw-api",
-        "shape": "external",
+        "shape": "typed",
         "type": "SopSelectRequest"
       }
     },
     {
       "name": "sops/rename",
       "paramStructure": "by-name",
-      "params": [],
+      "params": [
+        {
+          "name": "from",
+          "required": true,
+          "schema": {
+            "description": "Name the SOP is stored under today.",
+            "type": "string"
+          }
+        },
+        {
+          "name": "to",
+          "required": true,
+          "schema": {
+            "description": "Name to move it to. Must not already be taken.",
+            "type": "string"
+          }
+        }
+      ],
       "result": {
         "name": "result",
         "schema": {
@@ -7304,23 +11001,41 @@
         "verb": "update"
       },
       "x-zeroclaw-params": {
-        "description": "`SopRenameRequest`, defined in `zeroclaw-api`; no schema is exported yet, so its keys are not enumerable here.",
-        "owner": "zeroclaw-api",
-        "shape": "external",
+        "shape": "typed",
         "type": "SopRenameRequest"
       }
     },
     {
       "name": "sops/decide",
       "paramStructure": "by-name",
-      "params": [],
+      "params": [
+        {
+          "name": "decision",
+          "required": true,
+          "schema": true
+        },
+        {
+          "name": "name",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "run_id",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
       "result": {
         "name": "result",
         "schema": {
-          "description": "`RunOverlay`, defined in `zeroclaw-runtime`; no schema is exported yet."
+          "$ref": "#/components/schemas/RunOverlay"
         },
         "x-zeroclaw-owner": "zeroclaw-runtime",
-        "x-zeroclaw-shape": "external"
+        "x-zeroclaw-shape": "typed"
       },
       "x-zeroclaw-authorization": {
         "kind": "grant",
@@ -7328,16 +11043,27 @@
         "verb": "execute"
       },
       "x-zeroclaw-params": {
-        "description": "`SopDecideRequest`, defined in `zeroclaw-api`; no schema is exported yet, so its keys are not enumerable here.",
-        "owner": "zeroclaw-api",
-        "shape": "external",
+        "shape": "typed",
         "type": "SopDecideRequest"
       }
     },
     {
       "name": "sops/wire-draft",
       "paramStructure": "by-name",
-      "params": [],
+      "params": [
+        {
+          "name": "edit",
+          "required": true,
+          "schema": {
+            "$ref": "#/components/schemas/WireEdit"
+          }
+        },
+        {
+          "name": "sop",
+          "required": true,
+          "schema": true
+        }
+      ],
       "result": {
         "name": "result",
         "schema": {
@@ -7351,14 +11077,21 @@
         "verb": "execute"
       },
       "x-zeroclaw-params": {
-        "description": "Free-form JSON object shaped by the daemon at runtime; keys are not enumerable here.",
-        "shape": "untyped"
+        "owner": "zeroclaw-runtime",
+        "shape": "typed",
+        "type": "SopWireDraftParams"
       }
     },
     {
       "name": "sops/graph-draft",
       "paramStructure": "by-name",
-      "params": [],
+      "params": [
+        {
+          "name": "sop",
+          "required": true,
+          "schema": true
+        }
+      ],
       "result": {
         "name": "result",
         "schema": {
@@ -7372,8 +11105,8 @@
         "verb": "execute"
       },
       "x-zeroclaw-params": {
-        "description": "Free-form JSON object shaped by the daemon at runtime; keys are not enumerable here.",
-        "shape": "untyped"
+        "shape": "typed",
+        "type": "SopDraftParams"
       }
     },
     {
@@ -7383,10 +11116,10 @@
       "result": {
         "name": "result",
         "schema": {
-          "description": "`TriggerSourceRegistry`, defined in `zeroclaw-runtime`; no schema is exported yet."
+          "$ref": "#/components/schemas/TriggerSourceRegistry"
         },
         "x-zeroclaw-owner": "zeroclaw-runtime",
-        "x-zeroclaw-shape": "external"
+        "x-zeroclaw-shape": "typed"
       },
       "x-zeroclaw-authorization": {
         "kind": "grant",
@@ -7400,7 +11133,35 @@
     {
       "name": "tools/param-options",
       "paramStructure": "by-name",
-      "params": [],
+      "params": [
+        {
+          "name": "domain",
+          "required": true,
+          "schema": {
+            "$ref": "#/components/schemas/OptionDomain"
+          }
+        },
+        {
+          "name": "agent",
+          "required": false,
+          "schema": {
+            "default": null,
+            "description": "Agent whose configuration scopes the options. Blank or absent\nselects the first configured agent.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "args",
+          "required": false,
+          "schema": {
+            "default": null,
+            "description": "Domain-specific arguments, handed to the option resolver as-is."
+          }
+        }
+      ],
       "result": {
         "name": "result",
         "schema": {
@@ -7414,8 +11175,8 @@
         "verb": "read"
       },
       "x-zeroclaw-params": {
-        "description": "Free-form JSON object shaped by the daemon at runtime; keys are not enumerable here.",
-        "shape": "untyped"
+        "shape": "typed",
+        "type": "ToolsParamOptionsParams"
       }
     }
   ],

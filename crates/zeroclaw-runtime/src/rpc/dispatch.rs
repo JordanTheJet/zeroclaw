@@ -3010,10 +3010,9 @@ impl RpcDispatcher {
                 "certificate renewal requires the mutually authenticated WSS plane",
             )
         })?;
-        let csr_pem = params
-            .get("csr_pem")
-            .and_then(Value::as_str)
-            .ok_or_else(|| rpc_err(INVALID_PARAMS, "missing csr_pem"))?;
+        let req: CertRenewParams =
+            parse_params(params).map_err(|_| rpc_err(INVALID_PARAMS, "missing csr_pem"))?;
+        let csr_pem = req.csr_pem.as_str();
 
         let (data_dir, relay_cfg, static_client_pins_configured, crl_path) = {
             let cfg = self.ctx.config.read();
@@ -10144,14 +10143,20 @@ impl RpcDispatcher {
     }
 
     fn handle_sops_validate(&self, params: &Value) -> RpcResult {
-        let sop = if params.get("sop").is_some() {
-            let req: SopSaveRequest = parse_params(params)?;
-            Self::parse_sop(&req.sop)?
+        // Choose the variant by the `sop` key rather than by untagged
+        // deserialization, so a malformed draft reports its own field error.
+        let req = if params.get("sop").is_some() {
+            SopValidateParams::Draft(parse_params(params)?)
         } else {
-            let req: SopSelectRequest = parse_params(params)?;
-            let (dir, mode) = self.sops_dir_and_mode();
-            crate::sop::load_sop_by_name(&dir, &req.name, mode)
-                .map_err(|e| rpc_err(INVALID_PARAMS, format!("SOP '{}': {e}", req.name)))?
+            SopValidateParams::Stored(parse_params(params)?)
+        };
+        let sop = match req {
+            SopValidateParams::Draft(draft) => Self::parse_sop(&draft.sop)?,
+            SopValidateParams::Stored(stored) => {
+                let (dir, mode) = self.sops_dir_and_mode();
+                crate::sop::load_sop_by_name(&dir, &stored.name, mode)
+                    .map_err(|e| rpc_err(INVALID_PARAMS, format!("SOP '{}': {e}", stored.name)))?
+            }
         };
         let v = crate::sop::validate_sop_strict(&sop);
         to_result(serde_json::json!({
@@ -10278,10 +10283,9 @@ impl RpcDispatcher {
     }
 
     fn handle_sops_graph_draft(&self, params: &Value) -> RpcResult {
-        let sop_val = params
-            .get("sop")
-            .ok_or_else(|| rpc_err(INVALID_PARAMS, "missing 'sop'"))?;
-        let sop = Self::parse_sop(sop_val)?;
+        let req: SopDraftParams =
+            parse_params(params).map_err(|_| rpc_err(INVALID_PARAMS, "missing 'sop'"))?;
+        let sop = Self::parse_sop(&req.sop)?;
         to_result(crate::sop::SopGraph::from_sop_with_specs(
             &sop,
             &self.sop_tool_specs(),
@@ -10308,15 +10312,7 @@ impl RpcDispatcher {
     /// agent-relative domains; `args` carries sibling arguments already
     /// chosen so cascading domains can narrow.
     fn handle_tools_param_options(&self, params: &Value) -> RpcResult {
-        #[derive(serde::Deserialize)]
-        struct ParamOptionsParams {
-            domain: zeroclaw_api::tool::OptionDomain,
-            #[serde(default)]
-            agent: Option<String>,
-            #[serde(default)]
-            args: Value,
-        }
-        let req: ParamOptionsParams = parse_params(params)?;
+        let req: ToolsParamOptionsParams = parse_params(params)?;
         let config = self.ctx.config.read();
         let agent_alias = req
             .agent
@@ -16036,6 +16032,92 @@ mod tests {
         )
         .await;
         assert_eq!(run["error"]["code"], json!(FORBIDDEN), "{run}");
+    }
+
+    /// The params these handlers now declare as typed contracts must not
+    /// change what a caller gets back: the same errors for missing keys, the
+    /// transport check before params, and a null-params settings read.
+    #[tokio::test]
+    async fn typed_contract_params_keep_the_handlers_answers() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (ctx, _engine, _sops_dir) = sop_scoped_ctx(&tmp, 4242);
+        let (mut operator, mut rx) = local_operator(&ctx).await;
+
+        let graph = rpc(&mut operator, &mut rx, 1, "sops/graph-draft", json!({})).await;
+        assert_eq!(graph["error"]["code"], json!(INVALID_PARAMS), "{graph}");
+        assert_eq!(graph["error"]["message"], json!("missing 'sop'"), "{graph}");
+
+        let wire = rpc(
+            &mut operator,
+            &mut rx,
+            2,
+            "sops/wire-draft",
+            json!({"sop": {}}),
+        )
+        .await;
+        assert_eq!(wire["error"]["message"], json!("missing 'edit'"), "{wire}");
+
+        let stored = rpc(
+            &mut operator,
+            &mut rx,
+            3,
+            "sops/validate",
+            json!({"name": "alpha-sop"}),
+        )
+        .await;
+        assert!(stored["result"]["ok"].is_boolean(), "{stored}");
+        let unknown = rpc(
+            &mut operator,
+            &mut rx,
+            4,
+            "sops/validate",
+            json!({"name": "no-such-sop"}),
+        )
+        .await;
+        assert_eq!(unknown["error"]["code"], json!(INVALID_PARAMS), "{unknown}");
+        let draft = rpc(
+            &mut operator,
+            &mut rx,
+            5,
+            "sops/validate",
+            json!({"sop": 7}),
+        )
+        .await;
+        assert_eq!(draft["error"]["code"], json!(INVALID_PARAMS), "{draft}");
+
+        let options = rpc(
+            &mut operator,
+            &mut rx,
+            6,
+            "tools/param-options",
+            json!({"domain": "agent_aliases"}),
+        )
+        .await;
+        assert!(options["result"]["options"].is_array(), "{options}");
+
+        // A request that omits `params` reaches the handler as `null`; the
+        // settings read must still answer it.
+        operator
+            .process_line(&json!({"jsonrpc": "2.0", "id": 7, "method": "cron/settings"}).to_string())
+            .await;
+        let settings = loop {
+            let frame = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+                .await
+                .expect("a response within 10s")
+                .expect("writer channel open");
+            let value: Value = serde_json::from_str(&frame).expect("valid JSON-RPC frame");
+            if value.get("id") == Some(&json!(7)) {
+                break value;
+            }
+        };
+        assert!(settings["result"].is_object(), "{settings}");
+
+        let renew = rpc(&mut operator, &mut rx, 8, "cert/renew", json!({})).await;
+        assert_eq!(
+            renew["error"]["message"],
+            json!("certificate renewal requires the mutually authenticated WSS plane"),
+            "{renew}"
+        );
     }
 
     #[tokio::test]

@@ -1,9 +1,11 @@
 //! JSON Schema catalog for the wire types, behind `schema-export`.
 //!
 //! `cargo generate openrpc` asks this module for the schema of each type a
-//! [`crate::Method::contract`] names. A type this crate does not define is
-//! not here; the generator then records it as external, with its owning
-//! crate from [`crate::method::EXTERNAL_TYPES`].
+//! [`crate::Method::contract`] names. The catalog covers the types defined
+//! here and the foundation-crate wire types this crate already depends on
+//! (`zeroclaw-api`, `zeroclaw-config`). A runtime-owned type is not here: it
+//! is listed in [`crate::method::EXTERNAL_TYPES`], and the generator takes its
+//! schema from the owning crate's catalog.
 
 use crate::types::*;
 use schemars::{Schema, SchemaGenerator};
@@ -87,9 +89,25 @@ catalog! {
     QuickstartDismissResult,
     // SOP graph projection
     SopGraph, GraphLegend,
+    // SOP authoring
+    SopSelectRequest, SopRunOverlayRequest, SopDecideRequest, SopRunRequest, SopRunResponse,
+    SopRunsRequest, SopRunDetailRequest, SopSaveRequest, SopRenameRequest, SopValidateParams,
+    SopDraftParams,
+    // Locales, files, tools, certificates
+    LocalesListResponse, LocalesFetchRequest, LocalesFetchResponse, FsListDirRequest,
+    FsListDirResponse, ToolsParamOptionsParams, CertRenewParams,
+    // Cost and cron settings
+    CostSummary, CronSettingsParams, SchedulerConfig,
 }
 
 use crate::sop::{GraphLegend, SopGraph};
+use zeroclaw_api::jsonrpc::{
+    FsListDirRequest, FsListDirResponse, LocalesFetchRequest, LocalesFetchResponse,
+    LocalesListResponse, SopDecideRequest, SopRenameRequest, SopRunDetailRequest,
+    SopRunOverlayRequest, SopRunRequest, SopRunResponse, SopRunsRequest, SopSaveRequest,
+    SopSelectRequest,
+};
+use zeroclaw_config::schema::SchedulerConfig;
 
 #[cfg(test)]
 mod tests {
