@@ -1014,16 +1014,12 @@ async fn agent_turn_with_sop_reassembly(
         },
         |config| config.resolved_model_context_window_for_route(provider_name, model),
     );
-    let context_token_budget = if context_token_budget == 0 {
-        0
-    } else {
-        context_token_budget.min(resolved_capacity.tokens)
-    };
-    let context_limits = zeroclaw_config::schema::ResolvedContextLimits {
-        model_context_window: resolved_capacity.tokens,
+    // A configured capacity caps the budget; the compatibility stub does not
+    // (see `ResolvedContextLimits::bind_budget`).
+    let context_limits = zeroclaw_config::schema::ResolvedContextLimits::bind_budget(
+        resolved_capacity,
         context_token_budget,
-        model_context_window_source: resolved_capacity.source,
-    };
+    );
     let result = Box::pin(run_tool_call_loop(ToolLoop {
         sop_reassembly,
         history_has_trim_breadcrumb,
