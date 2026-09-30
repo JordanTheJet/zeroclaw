@@ -109,6 +109,9 @@ pub enum Method {
 
     // Files
     FileAttach,
+    FileUploadBegin,
+    FileUploadChunk,
+    FileUploadCommit,
     FsListDir,
 
     // Locales
@@ -230,6 +233,9 @@ impl Method {
         (Method::TuiList, "tui/list"),
         // Files
         (Method::FileAttach, "file/attach"),
+        (Method::FileUploadBegin, "file/upload/begin"),
+        (Method::FileUploadChunk, "file/upload/chunk"),
+        (Method::FileUploadCommit, "file/upload/commit"),
         (Method::FsListDir, "fs/list_dir"),
         // Locales
         (Method::LocalesList, "locales/list"),
@@ -398,6 +404,15 @@ impl Method {
             ),
             M::TuiList => (None, Typed("TuiListResult")),
             M::FileAttach => (Typed("FileAttachParams"), Typed("FileAttachResult")),
+            M::FileUploadBegin => (
+                Typed("FileUploadBeginParams"),
+                Typed("FileUploadBeginResult"),
+            ),
+            M::FileUploadChunk => (
+                Typed("FileUploadChunkParams"),
+                Typed("FileUploadChunkResult"),
+            ),
+            M::FileUploadCommit => (Typed("FileUploadCommitParams"), Typed("FileEntryResult")),
             M::FsListDir => (Typed("FsListDirRequest"), Typed("FsListDirResponse")),
             M::LocalesList => (None, Untyped),
             M::LocalesFetch => (Untyped, Untyped),

@@ -72,6 +72,8 @@ catalog! {
     SectionSelectParams, SelectItemResponse,
     // Files
     FileSource, FileEntry, FileAttachParams, FileEntryResult, FileAttachResult,
+    FileUploadBeginParams, FileUploadBeginResult, FileUploadChunkParams, FileUploadChunkResult,
+    FileUploadCommitParams,
     // Approval
     SessionApproveParams, SessionApproveResult,
     // Logs
