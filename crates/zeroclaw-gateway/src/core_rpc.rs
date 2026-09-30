@@ -45,6 +45,7 @@
 
 use std::collections::HashMap;
 use std::future::Future;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::Duration;
@@ -66,7 +67,9 @@ use zeroclaw_api::jsonrpc::error_codes::{
     SESSION_BUSY, SESSION_LIMIT_REACHED, SESSION_NOT_FOUND, SESSION_NOT_OWNED, SOP_ALREADY_EXISTS,
     SOP_NOT_FOUND, VERSION_MISMATCH,
 };
-use zeroclaw_rpc_client::{ClientError, ConnectOptions, ConnectionState, Method, RpcClient};
+use zeroclaw_rpc_client::{
+    ClientError, ConnectOptions, ConnectionState, EndpointOwner, Method, RpcClient,
+};
 use zeroclaw_runtime::rpc::inproc::InprocConnector;
 
 use crate::principal_gate::AUTH_PROVIDER_HEADER;
@@ -144,13 +147,27 @@ impl CoreRpc {
         Self::with_dialer(connector, pairing_required, PoolLimits::default())
     }
 
+    /// Serve RPC-backed routes through the daemon's local socket at
+    /// `endpoint`, which `owner` must serve: every dial verifies that
+    /// through the kernel before the caller's credential is written. A
+    /// gateway in its own process has no in-process path, so every request
+    /// needs a credential.
+    pub fn local(endpoint: PathBuf, owner: EndpointOwner) -> Self {
+        let limits = PoolLimits::default();
+        Self::with_pool(Pool::local(endpoint, owner, limits), || true)
+    }
+
     fn with_dialer(
         dialer: impl Dial,
         pairing_required: impl Fn() -> bool + Send + Sync + 'static,
         limits: PoolLimits,
     ) -> Self {
-        let pool = Arc::new(Pool::new(Box::new(dialer), limits));
-        spawn_idle_sweep(Arc::downgrade(&pool), limits.sweep_interval);
+        Self::with_pool(Pool::new(Box::new(dialer), limits), pairing_required)
+    }
+
+    fn with_pool(pool: Pool, pairing_required: impl Fn() -> bool + Send + Sync + 'static) -> Self {
+        let pool = Arc::new(pool);
+        spawn_idle_sweep(Arc::downgrade(&pool), pool.limits.sweep_interval);
         Self {
             seam: Some(Arc::new(Seam {
                 pool,
@@ -381,8 +398,20 @@ impl Default for PoolLimits {
     }
 }
 
+/// Where the pool opens its connections.
+enum Connector {
+    /// The daemon's in-process duplex, or a test's stand-in.
+    Duplex(Box<dyn Dial>),
+    /// The daemon's local socket. The client verifies through the kernel
+    /// that `owner` serves `endpoint` before it writes the credential.
+    Local {
+        endpoint: PathBuf,
+        owner: EndpointOwner,
+    },
+}
+
 struct Pool {
-    dialer: Box<dyn Dial>,
+    connector: Connector,
     limits: PoolLimits,
     /// One permit per open core connection. A connection takes its permit
     /// before it is dialed and returns it when it closes.
@@ -446,8 +475,16 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 impl Pool {
     fn new(dialer: Box<dyn Dial>, limits: PoolLimits) -> Self {
+        Self::with_connector(Connector::Duplex(dialer), limits)
+    }
+
+    fn local(endpoint: PathBuf, owner: EndpointOwner, limits: PoolLimits) -> Self {
+        Self::with_connector(Connector::Local { endpoint, owner }, limits)
+    }
+
+    fn with_connector(connector: Connector, limits: PoolLimits) -> Self {
         Self {
-            dialer,
+            connector,
             limits,
             capacity: Arc::new(Semaphore::new(limits.max_credentials)),
             slots: Mutex::new(HashMap::new()),
@@ -560,15 +597,27 @@ impl Pool {
 
     /// Open a connection and present `credential` in its handshake.
     async fn dial(&self, credential: &HttpCredential<'_>) -> Result<RpcClient, CoreError> {
-        let stream = match tokio::time::timeout(DIAL_TIMEOUT, self.dialer.dial()).await {
-            Ok(Some(stream)) => stream,
-            Ok(None) | Err(_) => {
-                return Err(CoreError::Unavailable(
-                    "the core is not accepting connections".into(),
-                ));
+        let connected = match &self.connector {
+            Connector::Duplex(dialer) => {
+                let stream = match tokio::time::timeout(DIAL_TIMEOUT, dialer.dial()).await {
+                    Ok(Some(stream)) => stream,
+                    Ok(None) | Err(_) => {
+                        return Err(CoreError::Unavailable(
+                            "the core is not accepting connections".into(),
+                        ));
+                    }
+                };
+                RpcClient::connect_over(stream, credential.connect_options()).await
+            }
+            Connector::Local { endpoint, owner } => {
+                let options = ConnectOptions {
+                    endpoint_owner: *owner,
+                    ..credential.connect_options()
+                };
+                RpcClient::connect_local(endpoint, options).await
             }
         };
-        match RpcClient::connect_over(stream, credential.connect_options()).await {
+        match connected {
             Ok(client) => Ok(client),
             Err(ClientError::Rpc(error)) => {
                 ::zeroclaw_log::record!(
@@ -594,9 +643,21 @@ impl Pool {
                         .with_attrs(::serde_json::json!({ "error": error.to_string() })),
                     "gateway could not open a core connection"
                 );
-                Err(CoreError::Unavailable(
-                    "the core connection could not be established".into(),
-                ))
+                Err(CoreError::Unavailable(match (&self.connector, &error) {
+                    // Nothing was sent: the endpoint is not served by the
+                    // account the gateway runs as.
+                    (_, ClientError::UntrustedEndpoint { .. }) => format!(
+                        "refusing to send the credential: {error}; run the gateway as the same \
+                         OS account as the core"
+                    ),
+                    (Connector::Local { endpoint, .. }, _) => format!(
+                        "the core is not reachable at {}: {error}",
+                        endpoint.display()
+                    ),
+                    (Connector::Duplex(_), _) => {
+                        "the core connection could not be established".into()
+                    }
+                }))
             }
         }
     }

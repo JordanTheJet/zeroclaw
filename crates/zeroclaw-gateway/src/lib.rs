@@ -39,6 +39,7 @@ pub mod nodes;
 pub mod openapi;
 #[cfg(feature = "plugins-wasm")]
 mod plugin_webhook;
+pub mod preview;
 pub mod principal_gate;
 pub mod security_headers;
 pub mod session_queue;
