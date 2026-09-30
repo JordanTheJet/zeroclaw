@@ -113,15 +113,25 @@ open /Applications/ZeroClaw.app
 ### Process ownership
 
 The app stops only processes it launched in this run. It keeps the handle
-returned when it spawns the desktop supervisor (the supervisor's Unix process
-group, or its Windows process handle) and, on Quit, stops those trees newest
-first: SIGTERM, up to 15 seconds for the supervisor to stop its daemon, then
-SIGKILL for anything left in the group. On Unix the supervisor is not reaped
-until those signals are sent, so its PID and group ID cannot be reused by
-another process in the meantime. Nothing is recorded across app runs: a daemon
-the app reused, or one left behind by an earlier run or a crash, is external
-and is never stopped by Quit, whatever its PID or executable. Closing windows
-keeps everything running.
+returned when it spawns the desktop supervisor and, on Quit, stops those trees
+newest first:
+
+- **Unix:** the supervisor leads its own process group. Quit sends SIGTERM to
+  the group, allows up to 15 seconds for the supervisor to stop its daemon, then
+  sends SIGKILL to anything left in the group. The supervisor is not reaped until
+  those signals are sent, so its PID and group ID cannot be reused by another
+  process in the meantime.
+- **Windows:** the supervisor is created suspended inside a Job Object the app
+  holds, before it can start anything. Quit terminates that job, which reaches
+  exactly the processes created in it; no process ID or parent relationship is
+  consulted. The job does not kill on close, so an app crash leaves the daemon
+  running, as on Unix.
+
+Quit first seals the registry: a daemon launch that has not started is refused,
+and one still waiting for readiness is waited for and stopped with the rest.
+Nothing is recorded across app runs: a daemon the app reused, or one left behind
+by an earlier run or a crash, is external and is never stopped by Quit, whatever
+its PID or executable. Closing windows keeps everything running.
 
 ### Native command boundary
 

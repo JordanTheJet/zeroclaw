@@ -4,7 +4,9 @@
 use process_wrap::tokio::{ChildWrapper, CommandWrap, CommandWrapper, JobObject, KillOnDrop};
 use std::io::{BufRead, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+#[cfg(not(windows))]
+use std::process::Child;
+use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
 #[cfg(any(unix, windows))]
@@ -16,6 +18,9 @@ const READINESS_FRAME_MAX_BYTES: usize = 4096;
 const CAPABILITY_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 /// How long a supervisor that failed startup gets to exit before it is forced.
 const STARTUP_CLEANUP_GRACE: Duration = Duration::from_millis(250);
+/// How long to wait for a terminated job's supervisor to report its exit.
+#[cfg(windows)]
+const WINDOWS_JOB_EXIT_WAIT: Duration = Duration::from_secs(5);
 
 #[cfg(unix)]
 const SIGTERM: i32 = 15;
@@ -30,6 +35,16 @@ const EPERM: i32 = 1;
 unsafe extern "C" {
     fn kill(pid: i32, signal: i32) -> i32;
 }
+
+/// The handle of a launched desktop supervisor, and the only thing that makes
+/// the tree under it owned. On Unix it is the supervisor's `Child`, which
+/// leads its own process group. On Windows it also holds the Job Object the
+/// supervisor was created in, suspended, before it could start a descendant;
+/// the tree is stopped through that job, never by process ID.
+#[cfg(not(windows))]
+pub type Supervisor = Child;
+#[cfg(windows)]
+pub type Supervisor = Box<dyn process_wrap::std::ChildWrapper>;
 
 /// Filename of the kernel binary on the current platform.
 fn zeroclaw_exe_name() -> &'static str {
@@ -87,7 +102,7 @@ pub fn find_zeroclaw_binary() -> Option<PathBuf> {
 /// reports readiness. The handle is the only proof that this app instance
 /// launched the tree: keep it (see [`crate::ownership`]) to be able to stop the
 /// tree on Quit. The supervisor owns the daemon's lifecycle and log capture.
-pub fn spawn_daemon(binary: &Path, port: u16) -> std::io::Result<Child> {
+pub fn spawn_daemon(binary: &Path, port: u16) -> std::io::Result<Supervisor> {
     ensure_desktop_supervisor_capability(binary)?;
     let mut cmd = desktop_daemon_command(binary, port);
     cmd.stdin(Stdio::null())
@@ -103,15 +118,30 @@ pub fn spawn_daemon(binary: &Path, port: u16) -> std::io::Result<Child> {
         use std::os::unix::process::CommandExt;
         cmd.process_group(0);
     }
+    #[cfg(not(windows))]
+    let mut child: Supervisor = cmd.spawn()?;
+    // Created suspended and assigned to a job this handle owns before it
+    // runs, so every descendant starts inside the job. The job does not kill
+    // on close: an app crash leaves the tree running, as on Unix.
     #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        // DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
-        cmd.creation_flags(0x0000_0008 | 0x0000_0200 | 0x0800_0000);
-    }
-
-    let mut child = cmd.spawn()?;
-    let stdout = match child.stdout.take() {
+    let mut child: Supervisor = {
+        use process_wrap::std::{CommandWrap as StdCommandWrap, CreationFlags, JobObject};
+        use windows::Win32::System::Threading::{
+            CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, DETACHED_PROCESS,
+        };
+        let mut wrapped = StdCommandWrap::from(cmd);
+        wrapped
+            .wrap(CreationFlags(
+                DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW,
+            ))
+            .wrap(JobObject);
+        wrapped.spawn()?
+    };
+    #[cfg(not(windows))]
+    let stdout = child.stdout.take();
+    #[cfg(windows)]
+    let stdout = child.stdout().take();
+    let stdout = match stdout {
         Some(stdout) => stdout,
         None => {
             let startup_error = std::io::Error::new(
@@ -430,7 +460,10 @@ fn attach_cleanup_error(
 /// ID, cannot be reused, so the signals reach only the tree this handle
 /// launched. On Windows the open process handle keeps the PID from being
 /// reused while it is signalled.
-pub(crate) fn terminate_supervisor_tree(child: &mut Child, grace: Duration) -> std::io::Result<()> {
+pub(crate) fn terminate_supervisor_tree(
+    child: &mut Supervisor,
+    grace: Duration,
+) -> std::io::Result<()> {
     let mut utility_errors = Vec::new();
 
     #[cfg(unix)]
@@ -472,55 +505,30 @@ pub(crate) fn terminate_supervisor_tree(child: &mut Child, grace: Duration) -> s
     }
     #[cfg(windows)]
     {
-        let mut forceful_termination_initiated = false;
-        let pid = child.id().to_string();
-        for force in [false, true] {
-            let mut command = Command::new("taskkill");
-            command.args(["/PID", &pid, "/T"]);
-            if force {
-                command.arg("/F");
-            }
-            match command.status() {
-                Ok(status) if status.success() => {
-                    if force {
-                        forceful_termination_initiated = true;
-                    }
-                    if !force {
-                        let deadline = Instant::now() + grace;
-                        while Instant::now() < deadline {
-                            match child.try_wait() {
-                                Ok(Some(_)) => break,
-                                Ok(None) => std::thread::sleep(Duration::from_millis(10)),
-                                Err(error) => {
-                                    utility_errors
-                                        .push(format!("failed to inspect supervisor: {error}"));
-                                    break;
-                                }
-                            }
-                        }
-                    }
+        // Terminating the job reaches exactly the processes created in it; no
+        // process ID or parent relationship is consulted. There is no graceful
+        // phase on Windows: the windowless supervisor has no console to signal.
+        if let Err(error) = child.start_kill() {
+            utility_errors.push(format!("failed to terminate the supervisor's job: {error}"));
+        }
+        let deadline = Instant::now() + grace.max(WINDOWS_JOB_EXIT_WAIT);
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
                 }
-                Ok(status) => utility_errors.push(format!("taskkill exited with status {status}")),
-                Err(error) => utility_errors.push(format!("taskkill failed: {error}")),
+                Ok(None) => {
+                    utility_errors.push(
+                        "supervisor remained running after its job was terminated".to_string(),
+                    );
+                    break;
+                }
+                Err(error) => {
+                    utility_errors.push(format!("failed to inspect supervisor: {error}"));
+                    break;
+                }
             }
-            if !child_still_running(child) {
-                break;
-            }
-        }
-        if child_still_running(child) {
-            match child.kill() {
-                Ok(()) => forceful_termination_initiated = true,
-                Err(error) => utility_errors.push(format!("fallback child kill failed: {error}")),
-            }
-        }
-        let child_running = child_still_running(child);
-        if (!child_running || forceful_termination_initiated)
-            && let Err(error) = child.wait()
-        {
-            utility_errors.push(format!("failed to reap supervisor: {error}"));
-        }
-        if child_still_running(child) {
-            utility_errors.push("supervisor remained running after cleanup".to_string());
         }
     }
 
@@ -572,11 +580,6 @@ fn terminate_reserved_group(
     if let Err(error) = child.wait() {
         utility_errors.push(format!("failed to reap supervisor: {error}"));
     }
-}
-
-#[cfg(windows)]
-fn child_still_running(child: &mut Child) -> bool {
-    !matches!(child.try_wait(), Ok(Some(_)))
 }
 
 #[cfg(unix)]
@@ -669,7 +672,9 @@ pub(crate) fn supervisor_exited(pid: u32) -> std::io::Result<bool> {
 /// The supervisor's exit status once it has exited. On Unix it is left
 /// unreaped so cleanup can still signal its process group safely; on Windows
 /// the open process handle already keeps its PID from being reused.
-fn peek_supervisor_exit(child: &mut Child) -> std::io::Result<Option<std::process::ExitStatus>> {
+fn peek_supervisor_exit(
+    child: &mut Supervisor,
+) -> std::io::Result<Option<std::process::ExitStatus>> {
     #[cfg(unix)]
     {
         supervisor_exit_status(child.id())

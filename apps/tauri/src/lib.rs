@@ -13,7 +13,6 @@ pub mod tray;
 use gateway_client::GatewayClient;
 use ownership::SharedOwnedProcesses;
 use state::shared_state;
-use std::sync::PoisonError;
 use tauri::{Emitter, Manager, RunEvent, WebviewUrl, WebviewWindowBuilder};
 
 /// Loopback port the desktop app expects the gateway/daemon on. Matches the
@@ -67,7 +66,7 @@ async fn ensure_daemon(
                     message: "Starting the ZeroClaw daemon…".to_string(),
                 },
             );
-            if let Err(e) = ownership::launch_owned_daemon(&bin, GATEWAY_PORT, &owned) {
+            if let Err(e) = owned.launch(&bin, GATEWAY_PORT) {
                 let _ = app.emit(
                     "zeroclaw://splash-status",
                     SplashStatus {
@@ -275,8 +274,7 @@ pub fn run() {
             // reused, or one left by an earlier run, keeps running.
             RunEvent::Exit => {
                 let owned = app.state::<SharedOwnedProcesses>();
-                let mut owned = owned.lock().unwrap_or_else(PoisonError::into_inner);
-                for error in owned.terminate_all(ownership::QUIT_GRACE) {
+                for error in owned.quit(ownership::QUIT_GRACE, ownership::LAUNCH_SETTLE_WAIT) {
                     eprintln!("ZeroClaw Desktop: stopping the daemon it launched failed: {error}");
                 }
             }
