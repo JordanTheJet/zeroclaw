@@ -1347,6 +1347,76 @@ fn current_authority_under(
     Ok(grants)
 }
 
+/// Whether `grants` reach a `workspace/list` or `fs/*` operation on `agent`
+/// under `config`; see [`RpcDispatcher::authorize_workspace_scope`] for the
+/// rule.
+fn workspace_scope_permits(
+    grants: &zeroclaw_api::grants::ResolvedGrants,
+    config: &Config,
+    agent: Option<&str>,
+) -> bool {
+    match agent {
+        Some(alias) => {
+            grants.may_use_agent(alias) && (grants.admin || config.agents.contains_key(alias))
+        }
+        None => grants.may_use_agent(zeroclaw_api::grants::WILDCARD),
+    }
+}
+
+fn workspace_scope_refusal(method: Method, agent: Option<&str>) -> crate::rpc::auth::AuthDenied {
+    crate::rpc::auth::AuthDenied::forbidden(match agent {
+        Some(agent) => format!(
+            "{} is not permitted for agent {agent:?}",
+            method.wire_name()
+        ),
+        None => format!(
+            "{} on the shared area requires access to every agent",
+            method.wire_name()
+        ),
+    })
+}
+
+/// Run a workspace operation where it takes effect, on its blocking worker.
+///
+/// The operation was admitted before it waited for a worker, and a grant,
+/// agent entitlement, configured agent or credential withdrawn during that
+/// wait must stop it. So the authority lease is taken here (see
+/// [`crate::rpc::auth::RpcInboundAuth::hold_authority`]), the caller's
+/// authority is re-resolved from it, including the method's coarse grant,
+/// the agent scope is judged again with those grants against the config in
+/// force now, and the operation runs on that config before the lease is
+/// dropped. A publication or unpairing that arrives after the check waits
+/// for the lease, so it lands after the operation, never between the check
+/// and the effect. The hold lasts one bounded path walk, rename, read or
+/// listing, or one recursive delete. Lock order, as for an upload: the
+/// authority state, the paired-token set, then the config.
+fn run_workspace_operation(
+    ctx: &RpcContext,
+    auth: Option<&crate::rpc::auth::ConnectionAuth>,
+    method: Method,
+    agent: Option<&str>,
+    operation: impl FnOnce(&Config) -> Result<Value, JsonRpcError>,
+) -> Result<Value, JsonRpcError> {
+    ctx.sessions.wait_test_workspace_worker_pause();
+    let Some(auth) = auth else {
+        return Err(rpc_err(AUTH_REQUIRED, "First call must be 'initialize'"));
+    };
+    let refuse = |denied: crate::rpc::auth::AuthDenied| {
+        audit_denial(Some(auth), method, &denied);
+        rpc_err(denied.code, denied.message)
+    };
+    let lease = ctx.auth.hold_authority();
+    let grants = current_authority_under(&lease, auth, method).map_err(refuse)?;
+    let config = ctx.config.read().clone();
+    if !workspace_scope_permits(&grants, &config, agent) {
+        return Err(refuse(workspace_scope_refusal(method, agent)));
+    }
+    ctx.sessions.run_test_workspace_effect_hook();
+    let result = operation(&config);
+    drop(lease);
+    result
+}
+
 impl RpcDispatcher {
     /// Fine-grained config-path selector. Composes with the coarse
     /// `Config` grant the gate already enforced: both are required.
@@ -1804,42 +1874,58 @@ impl RpcDispatcher {
 
     /// `workspace/list` and `fs/*`: parse, hold to the agent selector, then
     /// run the shared browse operation. See [`super::workspace`].
+    ///
+    /// The selector check here refuses early, before the operation waits for
+    /// a worker; the worker checks the caller's authority again where the
+    /// operation takes effect ([`run_workspace_operation`]).
     async fn handle_workspace_method(&self, method: Method, params: &Value) -> RpcResult {
         use zeroclaw_api::jsonrpc::{
             FsDeleteRequest, FsMkdirRequest, FsMoveRequest, FsReadRequest, FsRmdirRequest,
             WorkspaceListRequest,
         };
         type Operation = Box<dyn FnOnce(&Config) -> RpcResult + Send>;
-        let operation: Operation = match method {
+        let (agent, operation): (Option<String>, Operation) = match method {
             Method::WorkspaceList => {
                 let req: WorkspaceListRequest = parse_params(params)?;
-                self.authorize_workspace_scope(method, req.agent.as_deref())?;
-                Box::new(move |config| super::workspace::handle_workspace_list(config, &req))
+                (
+                    req.agent.clone(),
+                    Box::new(move |config| super::workspace::handle_workspace_list(config, &req)),
+                )
             }
             Method::FsMkdir => {
                 let req: FsMkdirRequest = parse_params(params)?;
-                self.authorize_workspace_scope(method, req.agent.as_deref())?;
-                Box::new(move |config| super::workspace::handle_fs_mkdir(config, &req))
+                (
+                    req.agent.clone(),
+                    Box::new(move |config| super::workspace::handle_fs_mkdir(config, &req)),
+                )
             }
             Method::FsRmdir => {
                 let req: FsRmdirRequest = parse_params(params)?;
-                self.authorize_workspace_scope(method, None)?;
-                Box::new(move |config| super::workspace::handle_fs_rmdir(config, &req))
+                (
+                    None,
+                    Box::new(move |config| super::workspace::handle_fs_rmdir(config, &req)),
+                )
             }
             Method::FsRead => {
                 let req: FsReadRequest = parse_params(params)?;
-                self.authorize_workspace_scope(method, Some(&req.agent))?;
-                Box::new(move |config| super::workspace::handle_fs_read(config, &req))
+                (
+                    Some(req.agent.clone()),
+                    Box::new(move |config| super::workspace::handle_fs_read(config, &req)),
+                )
             }
             Method::FsDelete => {
                 let req: FsDeleteRequest = parse_params(params)?;
-                self.authorize_workspace_scope(method, Some(&req.agent))?;
-                Box::new(move |config| super::workspace::handle_fs_delete(config, &req))
+                (
+                    Some(req.agent.clone()),
+                    Box::new(move |config| super::workspace::handle_fs_delete(config, &req)),
+                )
             }
             Method::FsMove => {
                 let req: FsMoveRequest = parse_params(params)?;
-                self.authorize_workspace_scope(method, Some(&req.agent))?;
-                Box::new(move |config| super::workspace::handle_fs_move(config, &req))
+                (
+                    Some(req.agent.clone()),
+                    Box::new(move |config| super::workspace::handle_fs_move(config, &req)),
+                )
             }
             _ => {
                 return Err(rpc_err(
@@ -1848,20 +1934,23 @@ impl RpcDispatcher {
                 ));
             }
         };
-        // A snapshot of the config rather than the read lock held across
-        // filesystem work, as the HTTP adapter does. The work runs on a
-        // blocking worker: creating a directory walks its path one component
-        // at a time, and a recursive delete visits everything beneath it, so
-        // neither belongs on a runtime worker that other connections share.
-        let config = self.ctx.config.read().clone();
-        tokio::task::spawn_blocking(move || operation(&config))
-            .await
-            .map_err(|join| {
-                rpc_err(
-                    INTERNAL_ERROR,
-                    format!("{} task failed: {join}", method.wire_name()),
-                )
-            })?
+        self.authorize_workspace_scope(method, agent.as_deref())?;
+        // The work runs on a blocking worker: creating a directory walks its
+        // path one component at a time, and a recursive delete visits
+        // everything beneath it, so neither belongs on a runtime worker that
+        // other connections share.
+        let ctx = Arc::clone(&self.ctx);
+        let auth = self.auth.clone();
+        tokio::task::spawn_blocking(move || {
+            run_workspace_operation(&ctx, auth.as_ref(), method, agent.as_deref(), operation)
+        })
+        .await
+        .map_err(|join| {
+            rpc_err(
+                INTERNAL_ERROR,
+                format!("{} task failed: {join}", method.wire_name()),
+            )
+        })?
     }
 
     /// `integrations/list`, `tools/cli-discover`, `plugins/list` and
@@ -2483,37 +2572,12 @@ impl RpcDispatcher {
         let Some(grants) = self.stamped_grants() else {
             return Err(rpc_err(AUTH_REQUIRED, "First call must be 'initialize'"));
         };
-        let entitled = match agent {
-            Some(alias) => {
-                grants.may_use_agent(alias)
-                    && (grants.admin || self.ctx.config.read().agents.contains_key(alias))
-            }
-            None => grants.may_use_agent(zeroclaw_api::grants::WILDCARD),
-        };
-        if entitled {
+        if workspace_scope_permits(grants, &self.ctx.config.read(), agent) {
             return Ok(());
         }
-        let denied = rpc_err(
-            FORBIDDEN,
-            match agent {
-                Some(agent) => format!(
-                    "{} is not permitted for agent {agent:?}",
-                    method.wire_name()
-                ),
-                None => format!(
-                    "{} on the shared area requires access to every agent",
-                    method.wire_name()
-                ),
-            },
-        );
-        self.audit_auth_denial(
-            method,
-            &crate::rpc::auth::AuthDenied {
-                code: denied.code,
-                message: denied.message.clone(),
-            },
-        );
-        Err(denied)
+        let denied = workspace_scope_refusal(method, agent);
+        self.audit_auth_denial(method, &denied);
+        Err(rpc_err(denied.code, denied.message))
     }
 
     /// Confine `fs/list_dir` to what the bound principal may read, before the

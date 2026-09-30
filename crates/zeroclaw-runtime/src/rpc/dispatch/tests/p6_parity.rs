@@ -332,6 +332,222 @@ async fn a_wildcard_principal_reaches_only_configured_agents() {
     assert_eq!(read["result"]["content"], json!("beta only"), "{read}");
 }
 
+/// Send one workspace request from `peer`, park its blocking worker after
+/// admission and before it acts, run `change` there, then release the worker
+/// and return the response. Reaching the pause proves the request was
+/// admitted ahead of `change`.
+async fn workspace_request_parked_on_its_worker(
+    peer: &mut RpcDispatcher,
+    rx: &mut tokio::sync::mpsc::Receiver<String>,
+    ctx: &Arc<RpcContext>,
+    id: u64,
+    method: &str,
+    params: Value,
+    change: impl FnOnce(),
+) -> Value {
+    let (arrived, release) = ctx.sessions.set_test_workspace_worker_pause();
+    let parked = std::sync::atomic::AtomicBool::new(false);
+    let line = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}).to_string();
+    let change_while_parked = async {
+        arrived.notified().await;
+        parked.store(true, std::sync::atomic::Ordering::SeqCst);
+        change();
+        release
+            .send(())
+            .expect("the parked worker waits for its release");
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        tokio::join!(peer.process_line(&line), change_while_parked)
+    })
+    .await
+    .expect("the request reaches its worker and completes");
+    assert!(
+        parked.load(std::sync::atomic::Ordering::SeqCst),
+        "the change must land while the operation waits, or the test is vacuous"
+    );
+    response_for(rx, id).await
+}
+
+/// `files_config` with the `files-alpha` profile narrowed by `narrow`.
+fn files_alpha_narrowed(
+    ctx: &Arc<RpcContext>,
+    narrow: impl FnOnce(&mut zeroclaw_config::schema::PermissionProfileConfig),
+) -> zeroclaw_config::schema::Config {
+    let mut config = ctx.config.read().clone();
+    narrow(
+        config
+            .permission_profiles
+            .get_mut("files-alpha")
+            .expect("files_config defines files-alpha"),
+    );
+    config
+}
+
+/// A workspace operation's authority is judged again on its blocking worker,
+/// where it takes effect, not only when it is admitted. An operation admitted
+/// and then waiting for its worker while its `files` grant, its agent
+/// selector or its agent's configuration is withdrawn is refused there and
+/// touches nothing. With nothing withdrawn, the same wait changes nothing.
+#[tokio::test]
+async fn a_workspace_operation_withdrawn_while_it_waits_does_not_take_effect() {
+    type Withdraw = fn(&Arc<RpcContext>);
+    let cases: [(&str, &str, Value, Withdraw); 3] = [
+        (
+            "the files grant",
+            "fs/delete",
+            json!({"agent": "alpha", "path": "notes/todo.md"}),
+            |ctx| {
+                let narrowed = files_alpha_narrowed(ctx, |profile| {
+                    profile
+                        .grants
+                        .remove(&zeroclaw_api::grants::Resource::Files);
+                });
+                ctx.auth.refresh_from_config(&narrowed).unwrap();
+            },
+        ),
+        (
+            "the agent selector",
+            "fs/mkdir",
+            json!({"agent": "alpha", "path": "made"}),
+            |ctx| {
+                let narrowed = files_alpha_narrowed(ctx, |profile| {
+                    profile.allowed_agents = vec!["beta".into()];
+                });
+                ctx.auth.refresh_from_config(&narrowed).unwrap();
+            },
+        ),
+        (
+            "the configured agent",
+            "fs/move",
+            json!({"agent": "alpha", "from": "notes", "to": "moved"}),
+            |ctx| {
+                ctx.config.write().agents.remove("alpha");
+            },
+        ),
+    ];
+    for (what, method, params, withdraw) in cases {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ctx = enforcement_ctx(files_config(&tmp));
+        let (mut peer, mut rx) = roster_peer(&ctx, SCOPED).await;
+        let refused = workspace_request_parked_on_its_worker(
+            &mut peer,
+            &mut rx,
+            &ctx,
+            1,
+            method,
+            params,
+            || withdraw(&ctx),
+        )
+        .await;
+        assert_forbidden(&refused, &format!("{method} after {what} was withdrawn"));
+        let alpha = tmp.path().join("agents/alpha/workspace");
+        assert_eq!(std::fs::read(alpha.join("notes/todo.md")).unwrap(), b"todo");
+        assert!(!alpha.join("made").exists(), "{what}");
+        assert!(!alpha.join("moved").exists(), "{what}");
+    }
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let ctx = enforcement_ctx(files_config(&tmp));
+    let (mut peer, mut rx) = roster_peer(&ctx, SCOPED).await;
+    let deleted = workspace_request_parked_on_its_worker(
+        &mut peer,
+        &mut rx,
+        &ctx,
+        1,
+        "fs/delete",
+        json!({"agent": "alpha", "path": "notes/todo.md"}),
+        || {},
+    )
+    .await;
+    assert_eq!(
+        deleted["result"],
+        json!({"removed": "notes/todo.md"}),
+        "{deleted}"
+    );
+    assert!(
+        !tmp.path()
+            .join("agents/alpha/workspace/notes/todo.md")
+            .exists()
+    );
+}
+
+/// The worker holds the authority lease from its check through the effect,
+/// so a policy change that arrives after the check waits for the operation:
+/// the withdrawal lands after the file is gone, never between the check and
+/// the delete, and the next request is refused under it.
+#[tokio::test]
+async fn a_policy_change_after_the_workers_check_lands_after_the_effect() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let ctx = enforcement_ctx(files_config(&tmp));
+    let (mut peer, mut rx) = roster_peer(&ctx, SCOPED).await;
+    let target = tmp.path().join("agents/alpha/workspace/notes/todo.md");
+    let narrowed = files_alpha_narrowed(&ctx, |profile| {
+        profile
+            .grants
+            .remove(&zeroclaw_api::grants::Resource::Files);
+    });
+
+    let publisher = Arc::new(std::sync::Mutex::new(None));
+    {
+        let (ctx, publisher, target) = (Arc::clone(&ctx), Arc::clone(&publisher), target.clone());
+        let hook_ctx = Arc::clone(&ctx);
+        hook_ctx.sessions.set_test_workspace_effect_hook(move || {
+            let handle = {
+                let ctx = Arc::clone(&ctx);
+                std::thread::spawn(move || {
+                    ctx.auth.refresh_from_config(&narrowed).unwrap();
+                    // Whether the delete had already happened when the
+                    // publication completed.
+                    !target.exists()
+                })
+            };
+            let started = std::time::Instant::now();
+            while !ctx.auth.publication_queued_behind_a_lease() {
+                assert!(!handle.is_finished(), "the publication did not wait");
+                assert!(
+                    started.elapsed() < std::time::Duration::from_secs(10),
+                    "the publication never reached the lease"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            *publisher.lock().unwrap() = Some(handle);
+        });
+    }
+
+    let deleted = rpc(
+        &mut peer,
+        &mut rx,
+        1,
+        "fs/delete",
+        json!({"agent": "alpha", "path": "notes/todo.md"}),
+    )
+    .await;
+    assert_eq!(
+        deleted["result"],
+        json!({"removed": "notes/todo.md"}),
+        "{deleted}"
+    );
+    let handle = publisher
+        .lock()
+        .unwrap()
+        .take()
+        .expect("the effect hook ran and queued the publication");
+    assert!(
+        handle.join().unwrap(),
+        "the publication completed only after the delete"
+    );
+
+    let refused = rpc(
+        &mut peer,
+        &mut rx,
+        2,
+        "fs/read",
+        json!({"agent": "alpha", "path": "notes"}),
+    )
+    .await;
+    assert_forbidden(&refused, "a read after the files grant was withdrawn");
+}
+
 /// A path past the browse bound is an invalid path on the RPC surface, and
 /// nothing is made for it.
 #[tokio::test]
