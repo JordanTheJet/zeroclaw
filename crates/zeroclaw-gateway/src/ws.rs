@@ -5035,7 +5035,10 @@ data: {{\"type\":\"message_stop\"}}\n\n"
             v.get("model_context_window").is_none(),
             "done-frame must omit model_context_window on same-profile fallback"
         );
-        assert_eq!(v["max_context_tokens"], 32_000);
+        assert_eq!(
+            v["max_context_tokens"], 800_000,
+            "the explicit profile budget survives the same-profile fallback (#10068)"
+        );
         assert_eq!(v["last_serving_model"], "model-b");
     }
 

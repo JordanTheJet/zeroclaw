@@ -38,6 +38,8 @@ pub const RPC_PROTOCOL_VERSION: u64 = 1;
 mod notification {
     pub const SESSION_UPDATE: &str = "session/update";
     pub const LOGS_EVENT: &str = "logs/event";
+    pub const EVENTS_EVENT: &str = "events/event";
+    pub const SUBSCRIPTION_LAGGED: &str = "subscription/lagged";
 }
 
 #[derive(Debug)]
@@ -168,12 +170,17 @@ pub enum Method {
     LogsQuery,
     LogsGet,
     EventsHistory,
+    EventsSubscribe,
+    SubscriptionCancel,
 
     // TUI
     TuiList,
 
     // Files
     FileAttach,
+    FileUploadBegin,
+    FileUploadChunk,
+    FileUploadCommit,
     FsListDir,
 
     // Locales
@@ -288,11 +295,16 @@ impl Method {
         (Method::LogsSubscribe, "logs/subscribe"),
         (Method::LogsQuery, "logs/query"),
         (Method::EventsHistory, "events/history"),
+        (Method::EventsSubscribe, "events/subscribe"),
+        (Method::SubscriptionCancel, "subscription/cancel"),
         (Method::LogsGet, "logs/get"),
         // TUI
         (Method::TuiList, "tui/list"),
         // Files
         (Method::FileAttach, "file/attach"),
+        (Method::FileUploadBegin, "file/upload/begin"),
+        (Method::FileUploadChunk, "file/upload/chunk"),
+        (Method::FileUploadCommit, "file/upload/commit"),
         (Method::FsListDir, "fs/list_dir"),
         // Locales
         (Method::LocalesList, "locales/list"),
@@ -416,13 +428,23 @@ impl Method {
             }
             M::PersonalityPut => (Resource::Personality, Verb::Update),
 
-            M::LogsSubscribe | M::LogsQuery | M::LogsGet | M::EventsHistory => {
-                (Resource::Logs, Verb::Read)
-            }
+            // `subscription/cancel` ends only a subscription this connection
+            // opened (the id is looked up in the connection's own registry).
+            // It takes the same grant as the subscribe methods that create
+            // subscriptions, so whoever could open one can end it. A future
+            // source under a different grant must revisit this arm.
+            M::LogsSubscribe
+            | M::LogsQuery
+            | M::LogsGet
+            | M::EventsHistory
+            | M::EventsSubscribe
+            | M::SubscriptionCancel => (Resource::Logs, Verb::Read),
 
             M::TuiList => (Resource::Tui, Verb::Read),
 
-            M::FileAttach => (Resource::Files, Verb::Create),
+            M::FileAttach | M::FileUploadBegin | M::FileUploadChunk | M::FileUploadCommit => {
+                (Resource::Files, Verb::Create)
+            }
             M::FsListDir => (Resource::Files, Verb::Read),
 
             M::LocalesList | M::LocalesFetch => (Resource::Locales, Verb::Read),
@@ -896,6 +918,18 @@ pub struct RpcDispatcher {
     /// one (direct dispatcher construction outside an accepted connection).
     connection_activity: Option<crate::rpc::ConnectionActivity>,
     prompt_tasks: Vec<JoinHandle<()>>,
+    /// Open subscriptions on this connection, by id. Shared with every
+    /// [`Self::spawn_handle`] clone; each token is a child of
+    /// `connection_cancel`, so teardown ends them all.
+    subscriptions: Arc<parking_lot::Mutex<std::collections::HashMap<String, CancellationToken>>>,
+    /// Chunked uploads this connection has begun and not yet committed.
+    /// Owned by the connection: dropped, with their staged bytes, when it
+    /// closes.
+    uploads: std::sync::Mutex<super::upload::UploadStaging>,
+    /// When a connection that has not completed `initialize` is closed.
+    /// Set by the local listener, cleared once `initialize` succeeds; `None`
+    /// leaves the wait unbounded.
+    initialize_deadline: Option<tokio::time::Instant>,
     /// SHA-256 fingerprint of the client certificate presented on the mTLS
     /// handshake (remote WSS plane only; `None` on the local socket). This is the
     /// transport identity: it keys the issued-cert ledger, so the renew RPC gates
@@ -991,6 +1025,9 @@ impl RpcDispatcher {
             owns_connection: true,
             connection_activity: None,
             prompt_tasks: Vec::new(),
+            subscriptions: Arc::default(),
+            uploads: std::sync::Mutex::default(),
+            initialize_deadline: None,
             peer_cert_fingerprint: None,
         }
     }
@@ -1004,6 +1041,15 @@ impl RpcDispatcher {
         activity: crate::rpc::ConnectionActivity,
     ) -> Self {
         self.connection_activity = Some(activity);
+        self
+    }
+
+    /// Close this connection if it has not completed `initialize` by
+    /// `deadline`, so a client that connects and never initializes cannot
+    /// hold a listener slot for as long as it stays open.
+    #[must_use]
+    pub(crate) fn with_initialize_deadline(mut self, deadline: tokio::time::Instant) -> Self {
+        self.initialize_deadline = Some(deadline);
         self
     }
 
@@ -1193,6 +1239,27 @@ fn current_authority(
         && !grants.permits(resource, verb)
     {
         return Err(AuthDenied::forbidden(format!(
+            "Principal is not granted {resource}:{verb} (required by {})",
+            method.wire_name()
+        )));
+    }
+    Ok(grants)
+}
+
+/// [`current_authority`] answered from a held [`AuthorityLease`], so the
+/// decision stays in force until the lease is dropped.
+///
+/// [`AuthorityLease`]: crate::rpc::auth::AuthorityLease
+fn current_authority_under(
+    lease: &crate::rpc::auth::AuthorityLease<'_>,
+    auth: &crate::rpc::auth::ConnectionAuth,
+    method: Method,
+) -> Result<zeroclaw_api::grants::ResolvedGrants, crate::rpc::auth::AuthDenied> {
+    let grants = lease.current_grants(auth)?;
+    if let MethodAuthz::Requires(resource, verb) = method.authz()
+        && !grants.permits(resource, verb)
+    {
+        return Err(crate::rpc::auth::AuthDenied::forbidden(format!(
             "Principal is not granted {resource}:{verb} (required by {})",
             method.wire_name()
         )));
@@ -1413,8 +1480,7 @@ impl RpcDispatcher {
     }
 
     /// [`Self::check_agent_selector`] evaluated against an explicit grant set,
-    /// for a handler that has re-resolved its principal after waiting for
-    /// admission.
+    /// for a handler that re-resolved its principal after a wait.
     fn check_agent_selector_with_grants(
         &self,
         method: Method,
@@ -1938,6 +2004,41 @@ impl RpcDispatcher {
             );
             self.audit_auth_denial(
                 method,
+                &crate::rpc::auth::AuthDenied {
+                    code: denied.code,
+                    message: denied.message.clone(),
+                },
+            );
+            return Err(denied);
+        }
+        Ok(())
+    }
+
+    /// A live session and its shell share one immutable forwarded map. A
+    /// reconnect may reuse it only if its *current* grants select the same
+    /// environment; otherwise the caller must create a new incarnation.
+    fn authorize_resumed_environment(
+        &self,
+        grants: Option<&zeroclaw_api::grants::ResolvedGrants>,
+        retained: Option<&crate::tools::ForwardedEnvironment>,
+    ) -> Result<(), JsonRpcError> {
+        self.authorize_session_environment(
+            Method::SessionNew,
+            grants,
+            retained.is_some_and(|env| !env.is_empty()),
+        )?;
+        let current = self.session_tui_env(grants);
+        let retained = retained
+            .map(|env| env.as_ref())
+            .filter(|env| !env.is_empty());
+        let current = current.as_ref().filter(|env| !env.is_empty());
+        if retained != current {
+            let denied = rpc_err(
+                FORBIDDEN,
+                "Session environment differs from this connection; create a new session",
+            );
+            self.audit_auth_denial(
+                Method::SessionNew,
                 &crate::rpc::auth::AuthDenied {
                     code: denied.code,
                     message: denied.message.clone(),
@@ -2497,6 +2598,12 @@ impl RpcDispatcher {
             // until that task's future is dropped.
             connection_activity: self.connection_activity.clone(),
             prompt_tasks: Vec::new(),
+            subscriptions: Arc::clone(&self.subscriptions),
+            // Prompt handles never serve upload methods; staging stays with
+            // the connection's own dispatcher.
+            uploads: std::sync::Mutex::default(),
+            // Prompt handles do not read frames.
+            initialize_deadline: None,
             peer_cert_fingerprint: self.peer_cert_fingerprint.clone(),
         }
     }
@@ -2734,13 +2841,58 @@ impl RpcDispatcher {
 
     /// Read frames from transport, dispatch, repeat.
     pub async fn run(&mut self, transport: &mut (dyn RpcTransport + Send)) {
-        while let Some(line) = transport.next_frame().await {
+        loop {
+            let frame = match self.initialize_deadline {
+                Some(deadline) if self.auth.is_none() => {
+                    match tokio::time::timeout_at(deadline, transport.next_frame()).await {
+                        Ok(frame) => frame,
+                        Err(_) => {
+                            self.log_initialize_timeout();
+                            return;
+                        }
+                    }
+                }
+                _ => transport.next_frame().await,
+            };
+            let Some(line) = frame else {
+                return;
+            };
             let trimmed = line.trim();
             if trimmed.is_empty() {
                 continue;
             }
-            self.process_line(trimmed).await;
+            match self.initialize_deadline {
+                // Until `initialize` succeeds the deadline also bounds
+                // handling the frame, so an authentication that is still
+                // running when it passes ends the connection instead of
+                // completing late. Nothing is registered before the
+                // authentication await, and teardown unregisters anything
+                // registered after it.
+                Some(deadline) if self.auth.is_none() => {
+                    if tokio::time::timeout_at(deadline, self.process_line(trimmed))
+                        .await
+                        .is_err()
+                    {
+                        self.log_initialize_timeout();
+                        return;
+                    }
+                }
+                _ => self.process_line(trimmed).await,
+            }
+            if self.auth.is_some() {
+                self.initialize_deadline = None;
+            }
         }
+    }
+
+    fn log_initialize_timeout(&self) {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({"peer": self.peer_label})),
+            "local RPC client did not initialize in time; closing its connection"
+        );
     }
 
     /// Own a transport until EOF or generation cancellation, then drain all
@@ -2979,7 +3131,9 @@ impl RpcDispatcher {
             }
 
             // Logs
-            Method::LogsSubscribe => self.handle_logs_subscribe().await,
+            Method::LogsSubscribe => self.handle_logs_subscribe(&req.params),
+            Method::EventsSubscribe => self.handle_events_subscribe(&req.params),
+            Method::SubscriptionCancel => self.handle_subscription_cancel(&req.params),
             Method::LogsQuery => self.handle_logs_query(&req.params).await,
             Method::EventsHistory => self.handle_events_history(),
             Method::LogsGet => self.handle_logs_get(&req.params).await,
@@ -2989,6 +3143,9 @@ impl RpcDispatcher {
 
             // Files
             Method::FileAttach => self.handle_file_attach(&req.params).await,
+            Method::FileUploadBegin => self.handle_file_upload_begin(&req.params).await,
+            Method::FileUploadChunk => self.handle_file_upload_chunk(&req.params),
+            Method::FileUploadCommit => self.handle_file_upload_commit(&req.params).await,
             Method::FsListDir => match self.authorize_fs_listing(&req.params) {
                 Ok(auth) => super::fs::handle_fs_list_dir(&req.params, &auth).await,
                 Err(denied) => Err(denied),
@@ -3550,34 +3707,6 @@ impl RpcDispatcher {
         chat_mode: &crate::rpc::types::ChatMode,
         existing: crate::rpc::session::ResumedRpcSession,
     ) -> RpcResult {
-        // The canonical live agent keeps the shell tool it was built with,
-        // whose forwarded environment was filtered for the connection that
-        // FIRST constructed it. This resume may be a different connection —
-        // the same principal after losing `admin`, a WSS reconnect describing
-        // another host — so re-derive the forwarded shell environment against
-        // THIS connection's own registration before the resumed session runs a
-        // command. The registration env was already filtered for this
-        // connection's entitlement at `initialize` (an environment is retained
-        // only for a local operator, dropped and audited otherwise), so
-        // re-installing it neither widens a scoped principal's environment nor
-        // strands a permitted local operator's. A connection with no retained
-        // environment installs `None`, dropping any environment the prior
-        // incarnation carried.
-        //
-        // Like the approval-channel rebind below, this must NOT make the
-        // reconnect wait on an active turn that owns the Agent mutex: install
-        // the re-derived environment as soon as the predecessor releases the
-        // canonical Agent. The rebind is idempotent and the next turn cannot
-        // start a command before its own `session/prompt` acquires the lock, so
-        // applying it after the in-flight turn drains is correct — an in-flight
-        // command keeps the environment it began with.
-        let resumed_env = self
-            .tui_registration()
-            .and_then(|(id, epoch)| self.ctx.tui_registry.env_for_registration(id, epoch));
-        let env_agent = Arc::clone(&existing.agent);
-        zeroclaw_spawn::spawn!(async move {
-            env_agent.lock().await.rebind_shell_env(resumed_env);
-        });
         self.rebind_rpc_approval_channel(Arc::clone(&existing.agent), session_id.clone());
         if matches!(chat_mode, crate::rpc::types::ChatMode::Acp)
             && let Some(plan) = self.ctx.sessions.get_plan(&session_id).await
@@ -3659,14 +3788,10 @@ impl RpcDispatcher {
                     resolved_interaction_surface,
                     self.tui_id.clone(),
                     resume_scope.as_deref(),
-                    |alias, workspace, has_environment| {
+                    |alias, workspace, retained_environment| {
                         let grants = self.recheck_authority_after_admission(Method::SessionNew)?;
                         self.authorize_resumed_session(grants.as_ref(), alias, workspace)?;
-                        self.authorize_session_environment(
-                            Method::SessionNew,
-                            grants.as_ref(),
-                            has_environment,
-                        )
+                        self.authorize_resumed_environment(grants.as_ref(), retained_environment)
                     },
                 )
                 .await
@@ -3754,14 +3879,10 @@ impl RpcDispatcher {
                     resolved_interaction_surface,
                     self.tui_id.clone(),
                     resume_scope.as_deref(),
-                    |alias, workspace, has_environment| {
+                    |alias, workspace, retained_environment| {
                         let grants = self.recheck_authority_after_admission(Method::SessionNew)?;
                         self.authorize_resumed_session(grants.as_ref(), alias, workspace)?;
-                        self.authorize_session_environment(
-                            Method::SessionNew,
-                            grants.as_ref(),
-                            has_environment,
-                        )
+                        self.authorize_resumed_environment(grants.as_ref(), retained_environment)
                     },
                 )
                 .await
@@ -9266,72 +9387,132 @@ impl RpcDispatcher {
 
     // ── Logs handler ─────────────────────────────────────────────
 
-    async fn handle_logs_subscribe(&self) -> RpcResult {
+    fn handle_logs_subscribe(&self, params: &Value) -> RpcResult {
+        to_result(self.open_subscription(
+            crate::rpc::subscription::Source::Logs,
+            Method::LogsSubscribe,
+            notification::LOGS_EVENT,
+            params,
+        )?)
+    }
+
+    /// Observer frames only (agent, tool, LLM, history-trim, error): the
+    /// live twin of `events/history`, from the daemon's bus.
+    fn handle_events_subscribe(&self, params: &Value) -> RpcResult {
+        to_result(self.open_subscription(
+            crate::rpc::subscription::Source::Events,
+            Method::EventsSubscribe,
+            notification::EVENTS_EVENT,
+            params,
+        )?)
+    }
+
+    fn handle_subscription_cancel(&self, params: &Value) -> RpcResult {
+        let p: SubscriptionCancelParams = parse_params(params)?;
+        let token = self.subscriptions.lock().remove(&p.subscription_id);
+        if let Some(token) = &token {
+            token.cancel();
+        }
+        to_result(SubscriptionCancelResult {
+            cancelled: token.is_some(),
+        })
+    }
+
+    /// Open a subscription on `source` for this connection and start its
+    /// delivery task. Returns the id and the newest sequence number.
+    ///
+    /// The hub holds the frames; the task only moves a cursor. `since_seq`
+    /// replays what is still buffered, and any gap, whether evicted, lost on
+    /// the bus, or from before a restart, is reported as
+    /// `subscription/lagged` before delivery resumes. A subscription outlives
+    /// the call that opened it, so every delivery is held to the connection's
+    /// authority: the credential must still be live and, whenever the
+    /// accepted policy has moved, the principal is resolved again against
+    /// `method`. The first refusal ends the stream. An unbound dispatcher (the
+    /// direct unit-test handlers) has nothing to recheck.
+    /// Refuse the global streams to a scoped principal (neither an
+    /// administrator nor the shared operator), using its current grants
+    /// rather than the bind-time copy. An
+    /// unbound dispatcher (the direct unit-test handlers) is not checked.
+    fn require_global_stream_access(&self, method: Method) -> Result<(), JsonRpcError> {
+        let Some(auth) = self.auth.as_ref() else {
+            return Ok(());
+        };
+        let denied = match current_authority(&self.ctx.auth, auth, method) {
+            Ok(grants) if sees_every_principal(auth, &grants) => return Ok(()),
+            Ok(_) => crate::rpc::auth::AuthDenied::forbidden(GLOBAL_STREAM_SCOPED_DENIAL),
+            Err(denied) => denied,
+        };
+        audit_denial(Some(auth), method, &denied);
+        Err(rpc_err(denied.code, denied.message))
+    }
+
+    fn open_subscription(
+        &self,
+        source: crate::rpc::subscription::Source,
+        method: Method,
+        notification_method: &'static str,
+        params: &Value,
+    ) -> Result<LogsSubscribeResult, JsonRpcError> {
+        self.require_global_stream_access(method)?;
+        let p: SubscribeParams = if params.is_null() {
+            SubscribeParams::default()
+        } else {
+            parse_params(params)?
+        };
         let event_tx = self
             .ctx
             .event_tx
             .as_ref()
             .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Event streaming is not available"))?;
-        let mut rx = event_tx.subscribe();
-        let rpc = self.rpc.clone();
-        // A subscription outlives the call that opened it, so the gate alone
-        // cannot end it. Hold every delivery to the connection's authority:
-        // the credential must still be live, and whenever the accepted policy
-        // has moved, the principal is resolved again and must still hold
-        // `Logs:Read`. The first refusal ends the stream. An unbound
-        // dispatcher (the direct unit-test handlers) has nothing to recheck.
-        let inbound = Arc::clone(&self.ctx.auth);
-        let binding = self.auth.clone();
-        let mut checked_generation = binding.as_ref().map(|auth| auth.generation);
-        zeroclaw_spawn::spawn!(async move {
-            loop {
-                tokio::select! {
-                    biased;
-                    _ = rpc.closed() => break,
-                    event = rx.recv() => match event {
-                        Ok(mut event) => {
-                            if let Some(auth) = binding.as_ref() {
-                                let generation = inbound.generation();
-                                let authority = if checked_generation == Some(generation) {
-                                    credential_is_live(&inbound, auth)
-                                } else {
-                                    current_authority(&inbound, auth, Method::LogsSubscribe)
-                                        .map(|_| ())
-                                };
-                                if let Err(denied) = authority {
-                                    audit_denial(Some(auth), Method::LogsSubscribe, &denied);
-                                    break;
-                                }
-                                checked_generation = Some(generation);
-                            }
-                            // Pairing secrets (QR payloads, one-shot pair codes)
-                            // ride the shared broadcast bus stamped with the
-                            // ephemeral marker. `logs/subscribe` is NOT the
-                            // bearer-authenticated SSE surface those credentials
-                            // are scoped to — a fresh remote RPC client can
-                            // `initialize` and subscribe over WSS without the
-                            // gateway bearer check — so fail closed: withhold
-                            // marked frames entirely and strip the internal
-                            // marker from everything else (public shape
-                            // unchanged). See `zeroclaw_gateway::sse`.
-                            if zeroclaw_log::frame_carries_ephemeral_credentials(&event) {
-                                continue;
-                            }
-                            zeroclaw_log::strip_ephemeral_broadcast_marker(&mut event);
-                            let notification =
-                                JsonRpcNotification::new(notification::LOGS_EVENT, event);
-                            if let Ok(json) = serde_json::to_string(&notification)
-                                && !rpc.send_raw(json).await
-                            {
-                                break;
-                            }
-                        }
-                        Err(_) => break,
-                    },
+        let hub = Arc::clone(&self.ctx.subscriptions);
+        hub.attach_bus(event_tx);
+        let head = hub.head_seq(source);
+        // Sequence numbers are scoped to the hub's epoch; a new hub (daemon
+        // restart or reload) starts again at 1. `since_seq` resumes only
+        // against the epoch it came from. Any other epoch, or none, cannot be
+        // lined up with this hub's numbers: replay what this hub still holds
+        // and say that continuity broke.
+        let (cursor, epoch_changed) = match p.since_seq {
+            None => (head + 1, false),
+            Some(since) if p.epoch.as_deref() == Some(hub.epoch()) => {
+                if since > head {
+                    return Err(rpc_err(
+                        INVALID_PARAMS,
+                        format!("since_seq {since} is ahead of this stream (newest is {head})"),
+                    ));
                 }
+                (since + 1, false)
             }
-        });
-        to_result(LogsSubscribeResult { subscribed: true })
+            Some(_) => (hub.oldest_seq(source), true),
+        };
+        let epoch = hub.epoch().to_string();
+        let subscription_id = uuid::Uuid::new_v4().to_string();
+        let cancel = self.connection_cancel.child_token();
+        self.subscriptions
+            .lock()
+            .insert(subscription_id.clone(), cancel.clone());
+        let delivery = SubscriptionDelivery {
+            hub,
+            source,
+            subscription_id: subscription_id.clone(),
+            cursor,
+            epoch_changed,
+            rpc: self.rpc.clone(),
+            cancel,
+            notification_method,
+            method,
+            inbound: Arc::clone(&self.ctx.auth),
+            binding: self.auth.clone(),
+            registry: Arc::clone(&self.subscriptions),
+        };
+        zeroclaw_spawn::spawn!(deliver_subscription(delivery));
+        Ok(LogsSubscribeResult {
+            subscribed: true,
+            subscription_id,
+            seq: head,
+            epoch,
+        })
     }
 
     /// Recent observer frames (agent, tool, LLM, history-trim, error), oldest
@@ -9339,6 +9520,7 @@ impl RpcDispatcher {
     /// the daemon's bus so it works without the gateway. Pairing credentials
     /// are never replayed.
     fn handle_events_history(&self) -> RpcResult {
+        self.require_global_stream_access(Method::EventsHistory)?;
         let history = self
             .ctx
             .event_history
@@ -9461,41 +9643,24 @@ impl RpcDispatcher {
     // ── File attachment handler ────────────────────────────────
 
     async fn handle_file_attach(&self, params: &Value) -> RpcResult {
-        use super::attachments::{MAX_REQUEST_BYTES, process_file_entry};
+        use super::attachments::{MAX_REQUEST_BYTES, load_file_entry};
 
         let req: FileAttachParams = parse_params(params)?;
-        let sid = &req.session_id;
-
-        // Uploads land in the per-agent workspace, not the session cwd, the
-        // same way `session/prompt` lands its inline attachments. The session
-        // id is caller-selected, so the session's agent must be one the
-        // principal may use before anything is written into its workspace.
-        let agent_alias = self
-            .ctx
-            .sessions
-            .get_agent_alias(sid)
-            .await
-            .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
-        self.selector_agent(Method::FileAttach, &agent_alias)?;
-        let upload_root = self
-            .ctx
-            .config
-            .read()
-            .agent_workspace_dir(&agent_alias)
-            .to_string_lossy()
-            .to_string();
+        let target = self
+            .upload_target(Method::FileAttach, &req.session_id)
+            .await?;
 
         let is_wss = self.peer_label.starts_with("wss:");
         // Resolve + authorize once; the returned slots are index-aligned with
         // req.files and carry the exact canonical target each read binds to. On
-        // WSS, path sources are rejected in process_file_entry.
+        // WSS, path sources are rejected in load_file_entry.
         let attachment_sources = if is_wss {
             Vec::new()
         } else {
             self.authorize_attachment_sources(
                 Method::FileAttach,
                 self.stamped_grants(),
-                &agent_alias,
+                &target.agent_alias,
                 &req.files,
             )?
         };
@@ -9505,10 +9670,8 @@ impl RpcDispatcher {
 
         for (idx, entry) in req.files.iter().enumerate() {
             let source = attachment_sources.get(idx).and_then(|s| s.as_ref());
-            let result =
-                process_file_entry(entry, sid, &upload_root, is_wss, source, &self.ctx.sessions)
-                    .await?;
-            total_bytes += result.size_bytes;
+            let (bytes, filename) = load_file_entry(entry, is_wss, source).await?;
+            total_bytes += bytes.len() as u64;
             if total_bytes > MAX_REQUEST_BYTES {
                 return Err(rpc_err(
                     INVALID_PARAMS,
@@ -9518,10 +9681,231 @@ impl RpcDispatcher {
                     ),
                 ));
             }
-            results.push(result);
+            results.push(
+                self.commit_upload(Method::FileAttach, &target, &bytes, &filename)
+                    .await?,
+            );
         }
 
         to_result(FileAttachResult { files: results })
+    }
+
+    /// The session incarnation an upload for `sid` writes into, authorized
+    /// for this caller: a scoped principal must own the session, and the
+    /// caller must be entitled to the session's agent. Uploads land in that
+    /// agent's workspace, not the session cwd, the same way `session/prompt`
+    /// lands its inline attachments.
+    ///
+    /// The owner check and the incarnation read are separate waits, so the
+    /// incarnation must be the one the owner check resolved; a session
+    /// replaced in between is refused as not found. This is admission only:
+    /// [`Self::commit_upload`] checks again where the upload takes effect.
+    async fn upload_target(
+        &self,
+        method: Method,
+        sid: &str,
+    ) -> Result<super::upload::UploadTarget, JsonRpcError> {
+        let record = self.authorize_session_owner(sid, method).await?;
+        let (generation, owner, agent_alias) = self
+            .ctx
+            .sessions
+            .live_incarnation(sid)
+            .await
+            .filter(|(generation, owner, _)| {
+                record.as_ref().is_some_and(|record| {
+                    record.live_generation == Some(*generation) && record.owner == *owner
+                })
+            })
+            .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
+        self.selector_agent(method, &agent_alias)?;
+        Ok(super::upload::UploadTarget {
+            session_id: sid.to_owned(),
+            generation,
+            owner,
+            agent_alias,
+        })
+    }
+
+    /// Persist and index one upload into `target`'s exact session
+    /// incarnation: the point where an upload takes effect.
+    ///
+    /// Everything that can wait happens before this: the owner check, the
+    /// session reads, the chunk transfer, a path read. Here the session map
+    /// lock is taken once, and under it, with no await in between, the
+    /// incarnation is confirmed unchanged. Then the authority lease is taken
+    /// (see [`RpcInboundAuth::hold_authority`]), the caller's authority is
+    /// re-resolved from it, and the file is written and indexed before the
+    /// lease is dropped. A credential, grant, or agent entitlement revoked
+    /// while the request waited, or a session closed, replaced, or re-owned,
+    /// stops the commit before any byte reaches disk. A policy publication or
+    /// unpairing that arrives after the check waits for the lease, so it
+    /// completes after the upload is stored, never between the check and the
+    /// write.
+    ///
+    /// The session map and the lease are held across one file write of at
+    /// most `MAX_FILE_BYTES`. Lock order: session map, then the authority
+    /// state, then the paired-token set; nothing takes them the other way.
+    ///
+    /// [`RpcInboundAuth::hold_authority`]: crate::rpc::auth::RpcInboundAuth::hold_authority
+    async fn commit_upload(
+        &self,
+        method: Method,
+        target: &super::upload::UploadTarget,
+        bytes: &[u8],
+        filename: &str,
+    ) -> Result<FileEntryResult, JsonRpcError> {
+        self.ctx
+            .sessions
+            .with_incarnation_uploads(
+                &target.session_id,
+                target.generation,
+                target.owner.as_deref(),
+                |uploads| {
+                    let lease = self.ctx.auth.hold_authority();
+                    self.recheck_upload_authority(method, target, &lease)?;
+                    self.ctx.sessions.run_test_upload_effect_hook();
+                    let upload_root = self
+                        .ctx
+                        .config
+                        .read()
+                        .agent_workspace_dir(&target.agent_alias)
+                        .to_string_lossy()
+                        .to_string();
+                    let stored = super::attachments::persist_into_index(
+                        uploads,
+                        bytes,
+                        filename,
+                        &upload_root,
+                    );
+                    self.ctx.sessions.run_test_upload_written_hook();
+                    drop(lease);
+                    stored
+                },
+            )
+            .await
+            .unwrap_or_else(|| {
+                Err(rpc_err(
+                    SESSION_NOT_FOUND,
+                    "The session was closed or replaced before the upload was stored",
+                ))
+            })
+    }
+
+    /// The final authority check for an upload, made where it takes effect
+    /// (see [`Self::commit_upload`]): the caller's authority re-resolved
+    /// from the held `lease`, including the method's `files:create`, then
+    /// the session owner and the agent entitlement judged with those fresh
+    /// grants rather than the ones stamped on the connection before the wait.
+    fn recheck_upload_authority(
+        &self,
+        method: Method,
+        target: &super::upload::UploadTarget,
+        lease: &crate::rpc::auth::AuthorityLease<'_>,
+    ) -> Result<(), JsonRpcError> {
+        // Only the direct unit-test handlers run unbound.
+        let Some(auth) = self.auth.as_ref() else {
+            return Ok(());
+        };
+        let grants = current_authority_under(lease, auth, method).map_err(|denied| {
+            self.audit_auth_denial(method, &denied);
+            rpc_err(denied.code, denied.message)
+        })?;
+        if !grants.admin
+            && auth.principal.is_authenticated()
+            && target.owner.as_deref() != Some(auth.principal.id.as_str())
+        {
+            let denied = crate::rpc::auth::AuthDenied::forbidden(
+                "Session not found or not owned by this principal",
+            );
+            self.audit_auth_denial(method, &denied);
+            return Err(rpc_err(denied.code, denied.message));
+        }
+        self.check_agent_selector_with_grants(method, &grants, &target.agent_alias, true)
+    }
+
+    /// Chunked uploads are served on local connections only. The staging
+    /// budget is shared process-wide, so a remote principal must not be able
+    /// to occupy it, and remote clients already have `file/attach`, which
+    /// carries a whole file in one frame under WSS's larger envelope.
+    fn require_local_upload(&self, method: Method) -> Result<(), JsonRpcError> {
+        if self.transport_kind == crate::rpc::transport::TransportKind::Local {
+            return Ok(());
+        }
+        Err(rpc_err(
+            FORBIDDEN,
+            format!(
+                "`{}` is available on local connections only",
+                method.wire_name()
+            ),
+        ))
+    }
+
+    fn upload_staging(&self) -> std::sync::MutexGuard<'_, super::upload::UploadStaging> {
+        self.uploads
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    // ── Chunked upload handlers ────────────────────────────────
+
+    async fn handle_file_upload_begin(&self, params: &Value) -> RpcResult {
+        use super::upload::{BeginRequest, UPLOAD_CHUNK_BYTES};
+
+        self.require_local_upload(Method::FileUploadBegin)?;
+        let req: FileUploadBeginParams = parse_params(params)?;
+        let target = self
+            .upload_target(Method::FileUploadBegin, &req.session_id)
+            .await?;
+        let upload_id = self.upload_staging().begin(
+            std::time::Instant::now(),
+            BeginRequest {
+                target,
+                filename: req.filename,
+                size_bytes: req.size_bytes,
+                sha256: req.sha256,
+            },
+        )?;
+        to_result(FileUploadBeginResult {
+            upload_id,
+            chunk_bytes: UPLOAD_CHUNK_BYTES,
+            max_bytes: super::attachments::MAX_FILE_BYTES,
+        })
+    }
+
+    fn handle_file_upload_chunk(&self, params: &Value) -> RpcResult {
+        use base64::{Engine, engine::general_purpose::STANDARD};
+
+        self.require_local_upload(Method::FileUploadChunk)?;
+        let req: FileUploadChunkParams = parse_params(params)?;
+        let chunk = STANDARD
+            .decode(&req.data_b64)
+            .map_err(|e| rpc_err(INVALID_PARAMS, format!("Invalid base64: {e}")))?;
+        let received_bytes = self.upload_staging().chunk(
+            std::time::Instant::now(),
+            &req.upload_id,
+            req.offset,
+            &chunk,
+        )?;
+        to_result(FileUploadChunkResult { received_bytes })
+    }
+
+    async fn handle_file_upload_commit(&self, params: &Value) -> RpcResult {
+        self.require_local_upload(Method::FileUploadCommit)?;
+        let req: FileUploadCommitParams = parse_params(params)?;
+        // Taking the upload consumes it: a commit that is refused below, or
+        // fails to store, needs a new `begin`.
+        let upload = self
+            .upload_staging()
+            .take_complete(std::time::Instant::now(), &req.upload_id)?;
+        let result = self
+            .commit_upload(
+                Method::FileUploadCommit,
+                &upload.target,
+                &upload.bytes,
+                &upload.filename,
+            )
+            .await?;
+        to_result(result)
     }
 
     // ── Wire helpers ─────────────────────────────────────────────
@@ -10552,6 +10936,201 @@ impl Drop for RpcDispatcher {
 }
 
 // ── Helpers ──────────────────────────────────────────────────────
+
+/// Everything one subscription's delivery task owns.
+struct SubscriptionDelivery {
+    hub: Arc<crate::rpc::subscription::SubscriptionHub>,
+    source: crate::rpc::subscription::Source,
+    subscription_id: String,
+    cursor: u64,
+    /// The client's `since_seq` came from another hub epoch; `cursor` is the
+    /// oldest frame still buffered here.
+    epoch_changed: bool,
+    rpc: Arc<RpcOutbound>,
+    cancel: CancellationToken,
+    notification_method: &'static str,
+    method: Method,
+    inbound: Arc<crate::rpc::auth::RpcInboundAuth>,
+    binding: Option<crate::rpc::auth::ConnectionAuth>,
+    registry: Arc<parking_lot::Mutex<std::collections::HashMap<String, CancellationToken>>>,
+}
+
+/// Move one subscription's cursor through the hub until it is cancelled, the
+/// connection closes, a write fails, or the caller loses its authority.
+async fn deliver_subscription(delivery: SubscriptionDelivery) {
+    use crate::rpc::subscription::{READ_BATCH, Read};
+    let SubscriptionDelivery {
+        hub,
+        source,
+        subscription_id,
+        mut cursor,
+        epoch_changed,
+        rpc,
+        cancel,
+        notification_method,
+        method,
+        inbound,
+        binding,
+        registry,
+    } = delivery;
+    let lagged = |from_seq: u64, resume_seq: u64, epoch_changed: bool| {
+        serde_json::to_string(&JsonRpcNotification::new(
+            notification::SUBSCRIPTION_LAGGED,
+            serde_json::json!(SubscriptionLagged {
+                subscription_id: subscription_id.clone(),
+                from_seq,
+                resume_seq,
+                epoch_changed,
+            }),
+        ))
+        .ok()
+    };
+    let mut checked_generation = binding.as_ref().map(|auth| auth.generation);
+
+    'deliver: {
+        // The client's numbers belong to another epoch: nothing it saw can be
+        // matched here. Everything before `cursor` in this epoch is gone; from
+        // `cursor` on, every buffered frame is replayed.
+        if epoch_changed {
+            if !still_authorized(&inbound, binding.as_ref(), method, &mut checked_generation) {
+                break 'deliver;
+            }
+            let Some(json) = lagged(1, cursor, true) else {
+                break 'deliver;
+            };
+            if !rpc.send_raw(json).await {
+                break 'deliver;
+            }
+        }
+
+        loop {
+            let notified = hub.notifier(source).notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            match hub.read(source, cursor, READ_BATCH) {
+                Read::Lagged {
+                    from_seq,
+                    resume_seq,
+                } => {
+                    if !still_authorized(
+                        &inbound,
+                        binding.as_ref(),
+                        method,
+                        &mut checked_generation,
+                    ) {
+                        break 'deliver;
+                    }
+                    let Some(json) = lagged(from_seq, resume_seq, false) else {
+                        break 'deliver;
+                    };
+                    if !rpc.send_raw(json).await {
+                        break 'deliver;
+                    }
+                    cursor = resume_seq;
+                    continue;
+                }
+                Read::Frames(frames) if !frames.is_empty() => {
+                    for (seq, frame) in frames {
+                        if cancel.is_cancelled()
+                            || !still_authorized(
+                                &inbound,
+                                binding.as_ref(),
+                                method,
+                                &mut checked_generation,
+                            )
+                        {
+                            break 'deliver;
+                        }
+                        let mut params = (*frame).clone();
+                        if let Some(object) = params.as_object_mut() {
+                            object.insert(
+                                "subscription_id".into(),
+                                serde_json::json!(subscription_id),
+                            );
+                            object.insert("seq".into(), serde_json::json!(seq));
+                        }
+                        let notification = JsonRpcNotification::new(notification_method, params);
+                        let Ok(json) = serde_json::to_string(&notification) else {
+                            break 'deliver;
+                        };
+                        if !rpc.send_raw(json).await {
+                            break 'deliver;
+                        }
+                        cursor = seq + 1;
+                    }
+                    tokio::task::yield_now().await;
+                    continue;
+                }
+                Read::Frames(_) => {}
+            }
+            tokio::select! {
+                biased;
+                () = cancel.cancelled() => break 'deliver,
+                () = rpc.closed() => break 'deliver,
+                () = &mut notified => {}
+            }
+        }
+    }
+    registry.lock().remove(&subscription_id);
+}
+
+/// The daemon-wide log and event streams, and the event history, carry
+/// frames from every principal's work: session messages, cron results, log
+/// lines. Many name no owner, so they cannot be filtered per principal. Until
+/// frames carry reliable ownership they are unscoped-only, with the same
+/// definition session ownership uses ([`RpcDispatcher::scoped_principal_id`]):
+/// an administrator, or the unauthenticated shared operator. Reaching every
+/// agent (the `*` agent selector) is not enough; it addresses every agent
+/// but owns only its own sessions.
+fn sees_every_principal(
+    auth: &crate::rpc::auth::ConnectionAuth,
+    grants: &zeroclaw_api::grants::ResolvedGrants,
+) -> bool {
+    grants.admin || !auth.principal.is_authenticated()
+}
+
+const GLOBAL_STREAM_SCOPED_DENIAL: &str = "Scoped principals cannot read the daemon-wide log \
+     and event streams: their frames are not attributed to an owning principal, so these \
+     streams and the event history are limited to administrators and the shared operator";
+
+/// Hold one delivery (a frame or a `lagged` notice) to the connection's
+/// authority. The credential must still be live, and whenever the accepted
+/// policy generation has moved, the principal is resolved again against
+/// `method`. A refusal is audited. An unbound dispatcher (the direct
+/// unit-test handlers) has nothing to recheck.
+fn still_authorized(
+    inbound: &crate::rpc::auth::RpcInboundAuth,
+    binding: Option<&crate::rpc::auth::ConnectionAuth>,
+    method: Method,
+    checked_generation: &mut Option<u64>,
+) -> bool {
+    let Some(auth) = binding else {
+        return true;
+    };
+    let generation = inbound.generation();
+    // A moved policy generation re-resolves the principal: it must still
+    // hold `method`'s grant and still see every principal, so narrowing or
+    // demoting a principal ends its stream.
+    let authority = if *checked_generation == Some(generation) {
+        credential_is_live(inbound, auth)
+    } else {
+        current_authority(inbound, auth, method).and_then(|grants| {
+            if sees_every_principal(auth, &grants) {
+                Ok(())
+            } else {
+                Err(crate::rpc::auth::AuthDenied::forbidden(
+                    GLOBAL_STREAM_SCOPED_DENIAL,
+                ))
+            }
+        })
+    };
+    if let Err(denied) = authority {
+        audit_denial(Some(auth), method, &denied);
+        return false;
+    }
+    *checked_generation = Some(generation);
+    true
+}
 
 fn parse_params<T: DeserializeOwned>(params: &Value) -> Result<T, JsonRpcError> {
     serde_json::from_value(params.clone()).map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))
@@ -15007,12 +15586,13 @@ mod tests {
         let (ctx, chat_backend, _acp_store) = persistence_enforcement_ctx(config);
         let (provider, _started_rx, _release_tx) = gated_provider();
         let sid = "s-attach";
-        install_state_test_session_at(
+        install_state_test_session_owned_at(
             &ctx.sessions,
             &chat_backend,
             sid,
             provider,
             None,
+            Some("user:alice"),
             &agent_workspace,
         )
         .await;
@@ -15043,6 +15623,1034 @@ mod tests {
             files_under(&agent_workspace),
             files_before,
             "a refused upload must not write into the agent's workspace"
+        );
+    }
+
+    /// `session_cwd_config` with alice granted `Files:Create` and a live
+    /// session `sid` for `test-agent` that alice owns; returns the context
+    /// and that agent's workspace.
+    async fn upload_fixture(
+        tmp: &tempfile::TempDir,
+        sid: &str,
+    ) -> (Arc<RpcContext>, std::path::PathBuf) {
+        let (ctx, agent_workspace, _backend) =
+            upload_fixture_owned_by(tmp, sid, "user:alice", |_| {}).await;
+        (ctx, agent_workspace)
+    }
+
+    /// [`upload_fixture`] with the session owned by `owner` and `adjust`
+    /// applied to the config first; also returns the chat backend, so a test
+    /// can replace the session.
+    async fn upload_fixture_owned_by(
+        tmp: &tempfile::TempDir,
+        sid: &str,
+        owner: &str,
+        adjust: impl FnOnce(&mut zeroclaw_config::schema::Config),
+    ) -> (
+        Arc<RpcContext>,
+        std::path::PathBuf,
+        Arc<zeroclaw_infra::session_sqlite::SqliteSessionBackend>,
+    ) {
+        let mut config = session_cwd_config(tmp, 4242, None);
+        config
+            .permission_profiles
+            .get_mut("session-scoped")
+            .expect("the fixture profile exists")
+            .grants
+            .insert(
+                zeroclaw_api::grants::Resource::Files,
+                vec![zeroclaw_api::grants::Verb::Create],
+            );
+        adjust(&mut config);
+        let agent_workspace = config.agent_workspace_dir("test-agent");
+        let (ctx, chat_backend, _acp_store) = persistence_enforcement_ctx(config);
+        install_upload_session(&ctx, &chat_backend, sid, Some(owner), &agent_workspace).await;
+        (ctx, agent_workspace, chat_backend)
+    }
+
+    /// Install (or replace) the live session `sid` for `test-agent`.
+    /// Replacing an id installs a new incarnation with a new generation.
+    async fn install_upload_session(
+        ctx: &Arc<RpcContext>,
+        chat_backend: &Arc<zeroclaw_infra::session_sqlite::SqliteSessionBackend>,
+        sid: &str,
+        owner: Option<&str>,
+        agent_workspace: &std::path::Path,
+    ) {
+        let (provider, _started_rx, _release_tx) = gated_provider();
+        install_state_test_session_owned_at(
+            &ctx.sessions,
+            chat_backend,
+            sid,
+            provider,
+            None,
+            owner,
+            agent_workspace,
+        )
+        .await;
+    }
+
+    /// The response frame for request `id`, skipping interleaved frames.
+    async fn response_for(rx: &mut tokio::sync::mpsc::Receiver<String>, id: u64) -> Value {
+        loop {
+            let frame = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+                .await
+                .expect("a response within 10s")
+                .expect("writer channel open");
+            let value: Value = serde_json::from_str(&frame).expect("valid JSON-RPC frame");
+            if value.get("id") == Some(&json!(id)) {
+                return value;
+            }
+        }
+    }
+
+    /// Begin an upload of `payload` to `sid`, declaring its SHA-256, and send
+    /// every byte, using request ids from `first_id`. Returns the upload id.
+    async fn stage_upload(
+        dispatcher: &mut RpcDispatcher,
+        rx: &mut tokio::sync::mpsc::Receiver<String>,
+        sid: &str,
+        payload: &[u8],
+        first_id: u64,
+    ) -> String {
+        use base64::{Engine, engine::general_purpose::STANDARD};
+        use sha2::{Digest, Sha256};
+
+        let begun = rpc(
+            dispatcher,
+            rx,
+            first_id,
+            "file/upload/begin",
+            json!({
+                "session_id": sid,
+                "filename": "staged.bin",
+                "size_bytes": payload.len(),
+                "sha256": format!("{:x}", Sha256::digest(payload)),
+            }),
+        )
+        .await;
+        let upload_id = begun["result"]["upload_id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("an upload id: {begun}"))
+            .to_string();
+        let chunk = usize::try_from(crate::rpc::upload::UPLOAD_CHUNK_BYTES).unwrap();
+        for (index, part) in payload.chunks(chunk).enumerate() {
+            let sent = rpc(
+                dispatcher,
+                rx,
+                first_id + 1 + index as u64,
+                "file/upload/chunk",
+                json!({
+                    "upload_id": upload_id,
+                    "offset": index * chunk,
+                    "data_b64": STANDARD.encode(part),
+                }),
+            )
+            .await;
+            assert!(sent["result"]["received_bytes"].is_u64(), "{sent}");
+        }
+        upload_id
+    }
+
+    /// Entries in the live session's upload index, `None` if it is not live.
+    async fn upload_index_len(ctx: &Arc<RpcContext>, sid: &str) -> Option<usize> {
+        ctx.sessions
+            .with_session_uploads(sid, |uploads| uploads.len())
+            .await
+    }
+
+    /// Send one request through `dispatcher`'s request gate, park it at the
+    /// session wait its upload commit makes, apply `change` there, then
+    /// release it and return its response.
+    ///
+    /// The pause sits inside the commit, so reaching it proves the request
+    /// passed the gate and every check before the commit ahead of `change`;
+    /// a request that is refused earlier never parks and fails the timeout.
+    async fn request_parked_at_the_commit(
+        dispatcher: &mut RpcDispatcher,
+        rx: &mut tokio::sync::mpsc::Receiver<String>,
+        ctx: &Arc<RpcContext>,
+        id: u64,
+        method: &str,
+        params: Value,
+        change: impl std::future::Future<Output = ()>,
+    ) -> Value {
+        let (arrived, release) = ctx.sessions.set_test_upload_commit_pause();
+        let parked = std::sync::atomic::AtomicBool::new(false);
+        let line =
+            json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}).to_string();
+        let change_while_parked = async {
+            arrived.notified().await;
+            parked.store(true, std::sync::atomic::Ordering::SeqCst);
+            change.await;
+            release.notify_one();
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            tokio::join!(dispatcher.process_line(&line), change_while_parked)
+        })
+        .await
+        .expect("the request reaches the commit and completes");
+        assert!(
+            parked.load(std::sync::atomic::Ordering::SeqCst),
+            "the change must land while the commit is parked, or the test is vacuous"
+        );
+        response_for(rx, id).await
+    }
+
+    fn revoke_alice_files_create(ctx: &Arc<RpcContext>) {
+        let mut narrowed = ctx.config.read().clone();
+        narrowed
+            .permission_profiles
+            .get_mut("session-scoped")
+            .expect("the fixture profile exists")
+            .grants
+            .remove(&zeroclaw_api::grants::Resource::Files);
+        ctx.auth
+            .refresh_from_config(&narrowed)
+            .expect("the narrowed policy compiles");
+    }
+
+    #[tokio::test]
+    async fn chunked_upload_lands_a_multi_chunk_payload_like_file_attach() {
+        use base64::{Engine, engine::general_purpose::STANDARD};
+        use sha2::{Digest, Sha256};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sid = "s-upload";
+        let (ctx, agent_workspace) = upload_fixture(&tmp, sid).await;
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+
+        // Larger than one chunk and than one base64 frame of `file/attach`
+        // could comfortably carry, so it must arrive in several chunks.
+        let chunk = usize::try_from(crate::rpc::upload::UPLOAD_CHUNK_BYTES).unwrap();
+        let payload: Vec<u8> = (0..(2 * chunk + 3)).map(|i| (i % 251) as u8).collect();
+        let begun = rpc(
+            &mut alice,
+            &mut rx,
+            1,
+            "file/upload/begin",
+            json!({
+                "session_id": sid,
+                "filename": "report.bin",
+                "size_bytes": payload.len(),
+                "sha256": format!("{:x}", Sha256::digest(&payload)),
+            }),
+        )
+        .await;
+        let upload_id = begun["result"]["upload_id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("an upload id: {begun}"))
+            .to_string();
+        assert_eq!(begun["result"]["chunk_bytes"], json!(chunk), "{begun}");
+
+        let mut id = 2;
+        for (index, part) in payload.chunks(chunk).enumerate() {
+            let response = rpc(
+                &mut alice,
+                &mut rx,
+                id,
+                "file/upload/chunk",
+                json!({
+                    "upload_id": upload_id,
+                    "offset": index * chunk,
+                    "data_b64": STANDARD.encode(part),
+                }),
+            )
+            .await;
+            assert_eq!(
+                response["result"]["received_bytes"],
+                json!(index * chunk + part.len()),
+                "{response}"
+            );
+            id += 1;
+        }
+
+        let committed = rpc(
+            &mut alice,
+            &mut rx,
+            id,
+            "file/upload/commit",
+            json!({"upload_id": upload_id}),
+        )
+        .await;
+        let result = &committed["result"];
+        assert_eq!(result["size_bytes"], json!(payload.len()), "{committed}");
+        assert_eq!(result["deduplicated"], json!(false), "{committed}");
+        let stored = std::path::PathBuf::from(result["workspace_path"].as_str().unwrap());
+        assert!(
+            stored.starts_with(std::fs::canonicalize(&agent_workspace).unwrap())
+                || stored.starts_with(&agent_workspace),
+            "the upload lands in the agent workspace: {committed}"
+        );
+        assert_eq!(std::fs::read(&stored).unwrap(), payload);
+
+        // The same bytes through `file/attach` resolve to the same entry, so
+        // both paths share one naming, storage, and dedup owner.
+        let attached = rpc(
+            &mut alice,
+            &mut rx,
+            id + 1,
+            "file/attach",
+            json!({"session_id": sid, "files": [{"data_b64": STANDARD.encode(&payload)}]}),
+        )
+        .await;
+        let file = &attached["result"]["files"][0];
+        assert_eq!(file["deduplicated"], json!(true), "{attached}");
+        assert_eq!(file["ref_id"], result["ref_id"], "{attached}");
+
+        let again = rpc(
+            &mut alice,
+            &mut rx,
+            id + 2,
+            "file/upload/commit",
+            json!({"upload_id": upload_id}),
+        )
+        .await;
+        assert_eq!(again["error"]["code"], json!(INVALID_PARAMS), "{again}");
+    }
+
+    #[tokio::test]
+    async fn chunked_upload_commit_rechecks_the_agent_grant() {
+        use base64::{Engine, engine::general_purpose::STANDARD};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sid = "s-upload-regrant";
+        let (ctx, agent_workspace) = upload_fixture(&tmp, sid).await;
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+
+        let begun = rpc(
+            &mut alice,
+            &mut rx,
+            1,
+            "file/upload/begin",
+            json!({"session_id": sid, "filename": "late.txt", "size_bytes": 5}),
+        )
+        .await;
+        let upload_id = begun["result"]["upload_id"].as_str().unwrap().to_string();
+        let chunked = rpc(
+            &mut alice,
+            &mut rx,
+            2,
+            "file/upload/chunk",
+            json!({"upload_id": upload_id, "offset": 0, "data_b64": STANDARD.encode(b"hello")}),
+        )
+        .await;
+        assert_eq!(chunked["result"]["received_bytes"], json!(5), "{chunked}");
+        let files_before = files_under(&agent_workspace);
+
+        narrow_alice_to_no_agents(&ctx);
+        let refused = rpc(
+            &mut alice,
+            &mut rx,
+            3,
+            "file/upload/commit",
+            json!({"upload_id": upload_id}),
+        )
+        .await;
+        assert_eq!(refused["error"]["code"], json!(FORBIDDEN), "{refused}");
+        assert_eq!(
+            files_under(&agent_workspace),
+            files_before,
+            "a refused commit must not write into the agent's workspace"
+        );
+    }
+
+    #[tokio::test]
+    async fn chunked_upload_ids_belong_to_the_connection_that_began_them() {
+        use base64::{Engine, engine::general_purpose::STANDARD};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sid = "s-upload-scope";
+        let (ctx, _agent_workspace) = upload_fixture(&tmp, sid).await;
+        let (mut owner, mut owner_rx) = roster_peer(&ctx, 4242).await;
+        let (mut other, mut other_rx) = roster_peer(&ctx, 4242).await;
+
+        let begun = rpc(
+            &mut owner,
+            &mut owner_rx,
+            1,
+            "file/upload/begin",
+            json!({"session_id": sid, "size_bytes": 1}),
+        )
+        .await;
+        let upload_id = begun["result"]["upload_id"].as_str().unwrap().to_string();
+
+        let chunk = rpc(
+            &mut other,
+            &mut other_rx,
+            1,
+            "file/upload/chunk",
+            json!({"upload_id": upload_id, "offset": 0, "data_b64": STANDARD.encode(b"x")}),
+        )
+        .await;
+        assert_eq!(chunk["error"]["code"], json!(INVALID_PARAMS), "{chunk}");
+        let commit = rpc(
+            &mut other,
+            &mut other_rx,
+            2,
+            "file/upload/commit",
+            json!({"upload_id": upload_id}),
+        )
+        .await;
+        assert_eq!(commit["error"]["code"], json!(INVALID_PARAMS), "{commit}");
+    }
+
+    #[tokio::test]
+    async fn chunked_upload_methods_are_refused_on_remote_connections() {
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().to_path_buf(),
+            config_path: tmp.path().join("config.toml"),
+            ..Default::default()
+        };
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let ctx = RpcContext::minimal(config, sessions);
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let remote = RpcDispatcher::new(ctx, tx, "wss:192.0.2.1:9781".to_string()).with_transport(
+            crate::rpc::transport::TransportKind::Wss,
+            crate::security::auth_provider::Credential::None,
+        );
+
+        // The transport gate runs before any session lookup or staging, so a
+        // remote peer learns nothing about sessions and stages nothing.
+        let begin = remote
+            .handle_file_upload_begin(&json!({"session_id": "s", "size_bytes": 1}))
+            .await
+            .unwrap_err();
+        assert_eq!(begin.code, FORBIDDEN, "{}", begin.message);
+        assert!(
+            begin.message.contains("local connections only"),
+            "{}",
+            begin.message
+        );
+        let chunk = remote
+            .handle_file_upload_chunk(&json!({"upload_id": "u", "offset": 0, "data_b64": "eA=="}))
+            .unwrap_err();
+        assert_eq!(chunk.code, FORBIDDEN, "{}", chunk.message);
+        let commit = remote
+            .handle_file_upload_commit(&json!({"upload_id": "u"}))
+            .await
+            .unwrap_err();
+        assert_eq!(commit.code, FORBIDDEN, "{}", commit.message);
+    }
+
+    /// Control for the parked-commit tests: with nothing changed while the
+    /// commit waits, it lands, and the index records it.
+    #[tokio::test]
+    async fn chunked_commit_parked_with_nothing_changed_lands() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sid = "s-park-control";
+        let (ctx, _agent_workspace) = upload_fixture(&tmp, sid).await;
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+        let upload_id = stage_upload(&mut alice, &mut rx, sid, b"parked bytes", 1).await;
+
+        let committed = request_parked_at_the_commit(
+            &mut alice,
+            &mut rx,
+            &ctx,
+            10,
+            "file/upload/commit",
+            json!({"upload_id": upload_id}),
+            async {},
+        )
+        .await;
+        let path = committed["result"]["workspace_path"]
+            .as_str()
+            .unwrap_or_else(|| panic!("committed: {committed}"));
+        assert_eq!(std::fs::read(path).unwrap(), b"parked bytes");
+        assert_eq!(upload_index_len(&ctx, sid).await, Some(1));
+    }
+
+    /// The agent entitlement is withdrawn by a published policy after the
+    /// commit passed its gate and while it waits for the session: nothing is
+    /// written and nothing is indexed.
+    #[tokio::test]
+    async fn chunked_commit_parked_when_the_agent_grant_is_revoked_writes_nothing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sid = "s-park-agent";
+        let (ctx, agent_workspace) = upload_fixture(&tmp, sid).await;
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+        let upload_id = stage_upload(&mut alice, &mut rx, sid, b"never stored", 1).await;
+        let files_before = files_under(&agent_workspace);
+
+        let change_ctx = Arc::clone(&ctx);
+        let refused = request_parked_at_the_commit(
+            &mut alice,
+            &mut rx,
+            &ctx,
+            10,
+            "file/upload/commit",
+            json!({"upload_id": upload_id}),
+            async move { narrow_alice_to_no_agents_via_publication(&change_ctx) },
+        )
+        .await;
+        assert_eq!(refused["error"]["code"], json!(FORBIDDEN), "{refused}");
+        assert_eq!(
+            files_under(&agent_workspace),
+            files_before,
+            "no file is written"
+        );
+        assert_eq!(
+            upload_index_len(&ctx, sid).await,
+            Some(0),
+            "nothing is indexed"
+        );
+    }
+
+    /// The coarse `files:create` grant is withdrawn while the commit waits.
+    #[tokio::test]
+    async fn chunked_commit_parked_when_files_create_is_revoked_writes_nothing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sid = "s-park-files";
+        let (ctx, agent_workspace) = upload_fixture(&tmp, sid).await;
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+        let upload_id = stage_upload(&mut alice, &mut rx, sid, b"never stored", 1).await;
+        let files_before = files_under(&agent_workspace);
+
+        let change_ctx = Arc::clone(&ctx);
+        let refused = request_parked_at_the_commit(
+            &mut alice,
+            &mut rx,
+            &ctx,
+            10,
+            "file/upload/commit",
+            json!({"upload_id": upload_id}),
+            async move { revoke_alice_files_create(&change_ctx) },
+        )
+        .await;
+        assert_eq!(refused["error"]["code"], json!(FORBIDDEN), "{refused}");
+        assert_eq!(
+            files_under(&agent_workspace),
+            files_before,
+            "no file is written"
+        );
+        assert_eq!(
+            upload_index_len(&ctx, sid).await,
+            Some(0),
+            "nothing is indexed"
+        );
+    }
+
+    /// `file/attach` takes effect at the same boundary, so a revocation while
+    /// it waits stops it the same way.
+    #[tokio::test]
+    async fn file_attach_parked_when_the_agent_grant_is_revoked_writes_nothing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sid = "s-park-attach";
+        let (ctx, agent_workspace) = upload_fixture(&tmp, sid).await;
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+        let files_before = files_under(&agent_workspace);
+
+        let change_ctx = Arc::clone(&ctx);
+        let refused = request_parked_at_the_commit(
+            &mut alice,
+            &mut rx,
+            &ctx,
+            1,
+            "file/attach",
+            json!({"session_id": sid, "files": [{"data_b64": "aGVsbG8=", "filename": "hello.txt"}]}),
+            async move { narrow_alice_to_no_agents_via_publication(&change_ctx) },
+        )
+        .await;
+        assert_eq!(refused["error"]["code"], json!(FORBIDDEN), "{refused}");
+        assert_eq!(
+            files_under(&agent_workspace),
+            files_before,
+            "no file is written"
+        );
+        assert_eq!(
+            upload_index_len(&ctx, sid).await,
+            Some(0),
+            "nothing is indexed"
+        );
+    }
+
+    /// Bob owns the session. Alice is entitled to its agent and holds
+    /// `files:create`, but may not add uploads to a session she does not own.
+    #[tokio::test]
+    async fn uploads_into_another_principals_session_are_refused_without_mutation() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sid = "s-bobs";
+        let (ctx, agent_workspace, _backend) =
+            upload_fixture_owned_by(&tmp, sid, "user:bob", |config| {
+                config.users.insert(
+                    "bob".into(),
+                    zeroclaw_config::schema::UserConfig {
+                        principal_id: None,
+                        uid: Some(4343),
+                        permission_profiles: vec!["session-scoped".into()],
+                    },
+                );
+            })
+            .await;
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+        let files_before = files_under(&agent_workspace);
+
+        let begun = rpc(
+            &mut alice,
+            &mut rx,
+            1,
+            "file/upload/begin",
+            json!({"session_id": sid, "size_bytes": 1}),
+        )
+        .await;
+        assert_eq!(begun["error"]["code"], json!(FORBIDDEN), "{begun}");
+        let attached = rpc(
+            &mut alice,
+            &mut rx,
+            2,
+            "file/attach",
+            json!({"session_id": sid, "files": [{"data_b64": "aGVsbG8=", "filename": "hello.txt"}]}),
+        )
+        .await;
+        assert_eq!(attached["error"]["code"], json!(FORBIDDEN), "{attached}");
+        assert_eq!(
+            files_under(&agent_workspace),
+            files_before,
+            "no file is written"
+        );
+        assert_eq!(
+            upload_index_len(&ctx, sid).await,
+            Some(0),
+            "bob's index is untouched"
+        );
+
+        // Bob, the owner, may.
+        let (mut bob, mut bob_rx) = roster_peer(&ctx, 4343).await;
+        let upload_id = stage_upload(&mut bob, &mut bob_rx, sid, b"bob's", 1).await;
+        let committed = rpc(
+            &mut bob,
+            &mut bob_rx,
+            10,
+            "file/upload/commit",
+            json!({"upload_id": upload_id}),
+        )
+        .await;
+        assert!(committed["result"]["ref_id"].is_string(), "{committed}");
+        assert_eq!(upload_index_len(&ctx, sid).await, Some(1));
+    }
+
+    /// The session an upload was begun for is closed and a new one is created
+    /// under the same id, for the same agent and owner. The upload belongs to
+    /// the old incarnation and is not committed into the new one.
+    #[tokio::test]
+    async fn chunked_commit_into_a_session_replaced_under_the_same_id_is_refused() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sid = "s-replaced";
+        let (ctx, agent_workspace, backend) =
+            upload_fixture_owned_by(&tmp, sid, "user:alice", |_| {}).await;
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+        let upload_id = stage_upload(&mut alice, &mut rx, sid, b"for the old one", 1).await;
+        let files_before = files_under(&agent_workspace);
+
+        install_upload_session(&ctx, &backend, sid, Some("user:alice"), &agent_workspace).await;
+        let refused = rpc(
+            &mut alice,
+            &mut rx,
+            10,
+            "file/upload/commit",
+            json!({"upload_id": upload_id}),
+        )
+        .await;
+        assert_eq!(
+            refused["error"]["code"],
+            json!(SESSION_NOT_FOUND),
+            "{refused}"
+        );
+        assert_eq!(
+            files_under(&agent_workspace),
+            files_before,
+            "no file is written"
+        );
+        assert_eq!(
+            upload_index_len(&ctx, sid).await,
+            Some(0),
+            "the new incarnation's index is untouched"
+        );
+    }
+
+    /// The session is removed while the commit waits for it: the commit fails
+    /// instead of reporting success for a file no session indexes.
+    #[tokio::test]
+    async fn chunked_commit_parked_while_the_session_is_removed_is_refused() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sid = "s-removed";
+        let (ctx, agent_workspace) = upload_fixture(&tmp, sid).await;
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+        let upload_id = stage_upload(&mut alice, &mut rx, sid, b"orphan?", 1).await;
+        let files_before = files_under(&agent_workspace);
+
+        let change_ctx = Arc::clone(&ctx);
+        let refused = request_parked_at_the_commit(
+            &mut alice,
+            &mut rx,
+            &ctx,
+            10,
+            "file/upload/commit",
+            json!({"upload_id": upload_id}),
+            async move {
+                assert!(change_ctx.sessions.remove("s-removed").await);
+            },
+        )
+        .await;
+        assert_eq!(
+            refused["error"]["code"],
+            json!(SESSION_NOT_FOUND),
+            "{refused}"
+        );
+        assert_eq!(
+            files_under(&agent_workspace),
+            files_before,
+            "no orphaned file"
+        );
+    }
+
+    /// The session is replaced while the commit waits for it.
+    #[tokio::test]
+    async fn chunked_commit_parked_while_the_session_is_replaced_is_refused() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sid = "s-swapped";
+        let (ctx, agent_workspace, backend) =
+            upload_fixture_owned_by(&tmp, sid, "user:alice", |_| {}).await;
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+        let upload_id = stage_upload(&mut alice, &mut rx, sid, b"for the old one", 1).await;
+        let files_before = files_under(&agent_workspace);
+
+        let (change_ctx, change_ws) = (Arc::clone(&ctx), agent_workspace.clone());
+        let refused = request_parked_at_the_commit(
+            &mut alice,
+            &mut rx,
+            &ctx,
+            10,
+            "file/upload/commit",
+            json!({"upload_id": upload_id}),
+            async move {
+                install_upload_session(
+                    &change_ctx,
+                    &backend,
+                    "s-swapped",
+                    Some("user:alice"),
+                    &change_ws,
+                )
+                .await;
+            },
+        )
+        .await;
+        assert_eq!(
+            refused["error"]["code"],
+            json!(SESSION_NOT_FOUND),
+            "{refused}"
+        );
+        assert_eq!(
+            files_under(&agent_workspace),
+            files_before,
+            "no file is written"
+        );
+        assert_eq!(upload_index_len(&ctx, sid).await, Some(0));
+    }
+
+    /// What an upload commit and a revocation racing it did, in the order
+    /// they did it.
+    type RaceTimeline = Arc<std::sync::Mutex<Vec<&'static str>>>;
+
+    /// Race `revoke` against the next upload commit and record the order of
+    /// events at the commit's effect boundary.
+    ///
+    /// Between the commit's final authority check and its write, `revoke`
+    /// starts on another OS thread and the commit waits until `queued()`
+    /// reports that writer has claimed the lock the revocation mutates and
+    /// is blocked behind a reader that still holds it: an acknowledgement
+    /// read from the lock, not a timeout. Right after the write and index
+    /// insert, before the commit's lease is released, it records whether the
+    /// writer is still queued behind it and unfinished. The revoking thread
+    /// records when it finishes. A lease released anywhere between the check
+    /// and the end of the write lets the queued writer through first, and the
+    /// timeline shows it.
+    fn race_a_revocation_through_the_commit(
+        ctx: &Arc<RpcContext>,
+        revoke: impl FnOnce() + Send + 'static,
+        queued: impl Fn() -> bool + Send + Sync + 'static,
+    ) -> (
+        RaceTimeline,
+        Arc<std::sync::Mutex<Option<std::thread::JoinHandle<()>>>>,
+    ) {
+        let timeline: RaceTimeline = Arc::default();
+        let revoked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let thread = Arc::new(std::sync::Mutex::new(None));
+        let queued = Arc::new(queued);
+        {
+            let (timeline, revoked, thread, queued) = (
+                Arc::clone(&timeline),
+                Arc::clone(&revoked),
+                Arc::clone(&thread),
+                Arc::clone(&queued),
+            );
+            ctx.sessions.set_test_upload_effect_hook(move || {
+                let handle = {
+                    let (timeline, revoked) = (Arc::clone(&timeline), Arc::clone(&revoked));
+                    std::thread::spawn(move || {
+                        revoke();
+                        revoked.store(true, std::sync::atomic::Ordering::SeqCst);
+                        timeline.lock().unwrap().push("revocation finished");
+                    })
+                };
+                let started = std::time::Instant::now();
+                while !queued() {
+                    assert!(
+                        !revoked.load(std::sync::atomic::Ordering::SeqCst),
+                        "the revocation finished between the final check and the write"
+                    );
+                    assert!(
+                        started.elapsed() < std::time::Duration::from_secs(10),
+                        "the revocation never reached its lock"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                timeline
+                    .lock()
+                    .unwrap()
+                    .push("revocation queued behind the commit");
+                *thread.lock().unwrap() = Some(handle);
+            });
+        }
+        {
+            let (timeline, revoked) = (Arc::clone(&timeline), Arc::clone(&revoked));
+            ctx.sessions.set_test_upload_written_hook(move || {
+                let held = queued() && !revoked.load(std::sync::atomic::Ordering::SeqCst);
+                timeline.lock().unwrap().push(if held {
+                    "upload written while the revocation was still queued"
+                } else {
+                    "upload written after the revocation got through"
+                });
+            });
+        }
+        (timeline, thread)
+    }
+
+    /// The order a race recorded, once the revoking thread has finished.
+    fn race_order(
+        timeline: RaceTimeline,
+        thread: Arc<std::sync::Mutex<Option<std::thread::JoinHandle<()>>>>,
+    ) -> Vec<&'static str> {
+        let handle = thread.lock().unwrap().take();
+        handle
+            .expect("the commit reached the point between its check and its write")
+            .join()
+            .expect("the revocation completes");
+        timeline.lock().unwrap().clone()
+    }
+
+    const UPLOAD_ORDERED_BEFORE_THE_REVOCATION: [&str; 3] = [
+        "revocation queued behind the commit",
+        "upload written while the revocation was still queued",
+        "revocation finished",
+    ];
+
+    /// A policy publication that revokes alice's agent entitlement arrives
+    /// between the commit's final check and its write, through the real
+    /// publication path. It queues at the accepted-state lock, the upload is
+    /// written and indexed while it waits, it finishes only afterwards, and
+    /// it binds the next request.
+    #[tokio::test]
+    async fn a_publication_racing_the_final_check_finishes_only_after_the_upload_is_stored() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sid = "s-race-publication";
+        let (ctx, _agent_workspace) = upload_fixture(&tmp, sid).await;
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+        let upload_id = stage_upload(&mut alice, &mut rx, sid, b"ordered first", 1).await;
+
+        let (revoking_ctx, probing_ctx) = (Arc::clone(&ctx), Arc::clone(&ctx));
+        let (timeline, thread) = race_a_revocation_through_the_commit(
+            &ctx,
+            move || narrow_alice_to_no_agents_via_publication(&revoking_ctx),
+            move || probing_ctx.auth.publication_queued_behind_a_lease(),
+        );
+        let committed = rpc(
+            &mut alice,
+            &mut rx,
+            10,
+            "file/upload/commit",
+            json!({"upload_id": upload_id}),
+        )
+        .await;
+        let path = committed["result"]["workspace_path"]
+            .as_str()
+            .unwrap_or_else(|| {
+                panic!("the upload checked before the publication lands: {committed}")
+            })
+            .to_string();
+        assert_eq!(
+            race_order(timeline, thread),
+            UPLOAD_ORDERED_BEFORE_THE_REVOCATION
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"ordered first");
+        assert_eq!(upload_index_len(&ctx, sid).await, Some(1));
+
+        let after = rpc(
+            &mut alice,
+            &mut rx,
+            11,
+            "file/upload/begin",
+            json!({"session_id": sid, "size_bytes": 1}),
+        )
+        .await;
+        assert_eq!(after["error"]["code"], json!(FORBIDDEN), "{after}");
+    }
+
+    /// The same order for credential revocation: the pairing token behind the
+    /// connection is unpaired between the final check and the write, and
+    /// queues at the paired-token lock until the upload is stored.
+    #[tokio::test]
+    async fn an_unpairing_racing_the_final_check_finishes_only_after_the_upload_is_stored() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sid = "s-race-unpair";
+        let (ctx, _agent_workspace, _backend) =
+            upload_fixture_owned_by(&tmp, sid, "user:alice", |config| {
+                config.gateway.paired_tokens = vec!["zc_tok".to_string()];
+            })
+            .await;
+        let (mut operator, mut rx) = local_peer(&ctx, 7777);
+        operator
+            .handle_initialize(&json!({"auth_token": "zc_tok"}))
+            .await
+            .expect("the paired token authenticates");
+        let upload_id = stage_upload(&mut operator, &mut rx, sid, b"paired when checked", 1).await;
+
+        let (revoking_ctx, probing_ctx) = (Arc::clone(&ctx), Arc::clone(&ctx));
+        let (timeline, thread) = race_a_revocation_through_the_commit(
+            &ctx,
+            move || assert!(revoking_ctx.auth.pairing().revoke_token("zc_tok")),
+            move || {
+                probing_ctx
+                    .auth
+                    .pairing()
+                    .token_write_queued_behind_a_hold()
+            },
+        );
+        let committed = rpc(
+            &mut operator,
+            &mut rx,
+            10,
+            "file/upload/commit",
+            json!({"upload_id": upload_id}),
+        )
+        .await;
+        let path = committed["result"]["workspace_path"]
+            .as_str()
+            .unwrap_or_else(|| panic!("the upload checked before the unpairing lands: {committed}"))
+            .to_string();
+        assert_eq!(
+            race_order(timeline, thread),
+            UPLOAD_ORDERED_BEFORE_THE_REVOCATION
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"paired when checked");
+
+        let after = rpc(
+            &mut operator,
+            &mut rx,
+            11,
+            "file/upload/begin",
+            json!({"session_id": sid, "size_bytes": 1}),
+        )
+        .await;
+        assert_eq!(after["error"]["code"], json!(AUTH_REQUIRED), "{after}");
+    }
+
+    /// A credential revoked while a commit waits for the session is refused
+    /// at the final check, with nothing written.
+    #[tokio::test]
+    async fn chunked_commit_parked_when_the_pairing_is_revoked_writes_nothing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sid = "s-park-unpair";
+        let (ctx, agent_workspace, _backend) =
+            upload_fixture_owned_by(&tmp, sid, "user:alice", |config| {
+                config.gateway.paired_tokens = vec!["zc_tok".to_string()];
+            })
+            .await;
+        let (mut operator, mut rx) = local_peer(&ctx, 7777);
+        operator
+            .handle_initialize(&json!({"auth_token": "zc_tok"}))
+            .await
+            .expect("the paired token authenticates");
+        let upload_id = stage_upload(&mut operator, &mut rx, sid, b"never stored", 1).await;
+        let files_before = files_under(&agent_workspace);
+
+        let change_ctx = Arc::clone(&ctx);
+        let refused = request_parked_at_the_commit(
+            &mut operator,
+            &mut rx,
+            &ctx,
+            10,
+            "file/upload/commit",
+            json!({"upload_id": upload_id}),
+            async move {
+                assert!(change_ctx.auth.pairing().revoke_token("zc_tok"));
+            },
+        )
+        .await;
+        assert_eq!(refused["error"]["code"], json!(AUTH_REQUIRED), "{refused}");
+        assert_eq!(
+            files_under(&agent_workspace),
+            files_before,
+            "no file is written"
+        );
+        assert_eq!(
+            upload_index_len(&ctx, sid).await,
+            Some(0),
+            "nothing is indexed"
+        );
+    }
+
+    /// A repeat of an indexed upload is not answered from the index alone:
+    /// the indexed file was edited to other bytes of the same length, and the
+    /// repeat commit (with the right SHA-256) reinstates the uploaded bytes
+    /// at the returned path.
+    #[tokio::test]
+    async fn a_repeat_commit_reinstates_an_indexed_file_that_was_modified() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sid = "s-repeat";
+        let (ctx, _agent_workspace) = upload_fixture(&tmp, sid).await;
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+        let payload = b"the uploaded bytes".to_vec();
+
+        let first = stage_upload(&mut alice, &mut rx, sid, &payload, 1).await;
+        let committed = rpc(
+            &mut alice,
+            &mut rx,
+            10,
+            "file/upload/commit",
+            json!({"upload_id": first}),
+        )
+        .await;
+        let path = committed["result"]["workspace_path"]
+            .as_str()
+            .unwrap_or_else(|| panic!("committed: {committed}"))
+            .to_string();
+        std::fs::write(&path, b"EDITED edited byte").unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            payload.len() as u64
+        );
+
+        let second = stage_upload(&mut alice, &mut rx, sid, &payload, 20).await;
+        let again = rpc(
+            &mut alice,
+            &mut rx,
+            30,
+            "file/upload/commit",
+            json!({"upload_id": second}),
+        )
+        .await;
+        assert_eq!(again["result"]["deduplicated"], json!(true), "{again}");
+        assert_eq!(again["result"]["ref_id"], committed["result"]["ref_id"]);
+        assert_eq!(again["result"]["workspace_path"], json!(path));
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            payload,
+            "the returned path holds the uploaded bytes"
         );
     }
 
@@ -16137,27 +17745,6 @@ mod tests {
         result.output.into_string()
     }
 
-    /// Poll the shell environment until `pred` holds or a bounded number of
-    /// yields elapse. The resume path applies its environment rebind in a
-    /// spawned task (so the reconnect never waits on an in-flight turn), so a
-    /// test observing the rebound value must let that task run first.
-    #[cfg(unix)]
-    async fn wait_for_shell_env(
-        ctx: &Arc<RpcContext>,
-        session_id: &str,
-        pred: impl Fn(&str) -> bool,
-    ) -> String {
-        let mut last = String::new();
-        for _ in 0..200 {
-            last = session_shell_env(ctx, session_id).await;
-            if pred(&last) {
-                return last;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
-        last
-    }
-
     #[cfg(unix)]
     #[tokio::test]
     async fn session_new_ignores_a_foreign_request_tui_id_for_environment() {
@@ -16295,18 +17882,12 @@ mod tests {
         );
     }
 
-    /// Reviewer regression (discussion_r4109687906): reusing a canonical live
-    /// session must re-derive the forwarded shell environment against the
-    /// RESUMING connection, not keep the environment cloned into the shell tool
-    /// at first construction. A local operator creates an environment-bearing
-    /// session; the SAME connection then resumes it after its retained
-    /// environment is gone (reconnect re-registers the id with no environment,
-    /// e.g. the entitlement that kept it was lost). The resumed session's own
-    /// shell tool must stop overlaying the stale sentinel. Environment-free
-    /// reuse stays clean, and an unchanged retained environment survives reuse.
+    /// The environment is immutable for a live session. A reconnect carrying
+    /// a different map must create a new session; it cannot mutate the shell
+    /// underneath the session's admission record.
     #[cfg(unix)]
     #[tokio::test]
-    async fn resuming_a_session_re_derives_the_forwarded_shell_environment() {
+    async fn resuming_a_session_requires_its_original_environment() {
         let tmp = tempfile::TempDir::new().unwrap();
         let ctx = enforcement_ctx(shell_env_config(&tmp));
         let (tx, mut rx) = tokio::sync::mpsc::channel(64);
@@ -16341,11 +17922,7 @@ mod tests {
         );
         let canonical = ctx.sessions.get_agent("s-reuse").await.unwrap();
 
-        // ── Same session RESUMED after the retained environment is gone ──
-        // The reconnect re-registers the same id under a new epoch carrying no
-        // environment (the value `retained_tui_env` produces once the operator
-        // entitlement that kept it is lost). Resuming must re-derive the shell
-        // tool's environment, not keep the sentinel cloned in at construction.
+        // ── A different registration cannot mutate the same incarnation ──
         let epoch = ctx
             .tui_registry
             .register(crate::rpc::tui_identity::TuiEntry {
@@ -16364,23 +17941,18 @@ mod tests {
             json!({"agent_alias": "test-agent", "session_id": "s-reuse"}),
         )
         .await;
-        assert_eq!(
-            response["result"]["session_id"],
-            json!("s-reuse"),
-            "{response}"
-        );
+        assert_eq!(response["error"]["code"], FORBIDDEN, "{response}");
         assert!(
             Arc::ptr_eq(
                 &canonical,
                 &ctx.sessions.get_agent("s-reuse").await.unwrap()
             ),
-            "the resume rebinds the SAME canonical incarnation, not a fresh build"
+            "the refused resume leaves the canonical incarnation in place"
         );
-        let after = wait_for_shell_env(&ctx, "s-reuse", |env| !env.contains("REUSE_SOCK")).await;
+        let after = session_shell_env(&ctx, "s-reuse").await;
         assert!(
-            !after.contains("REUSE_SOCK"),
-            "resuming under a connection with no retained environment must drop the \
-             environment the first incarnation carried:\n{after}"
+            after.contains("REUSE_SOCK=/tmp/reuse.sock"),
+            "a refused resume must not change the shell environment:\n{after}"
         );
 
         // ── Permitted continuity: re-registering the SAME environment keeps it ──
@@ -16404,10 +17976,7 @@ mod tests {
             json!("s-reuse"),
             "{response}"
         );
-        let restored = wait_for_shell_env(&ctx, "s-reuse", |env| {
-            env.contains("REUSE_SOCK=/tmp/reuse.sock")
-        })
-        .await;
+        let restored = session_shell_env(&ctx, "s-reuse").await;
         assert!(
             restored.contains("REUSE_SOCK=/tmp/reuse.sock"),
             "an unchanged retained environment survives reuse:\n{restored}"
@@ -16415,7 +17984,9 @@ mod tests {
     }
 
     /// A session built with NO forwarded environment stays environment-free
-    /// across reuse — the rebind never invents one.
+    /// across reuse; a matching empty registration is still compatible, and a
+    /// connection that now forwards a map is refused instead of grafting it
+    /// onto the live incarnation.
     #[cfg(unix)]
     #[tokio::test]
     async fn resuming_an_environment_free_session_stays_environment_free() {
@@ -16450,6 +18021,39 @@ mod tests {
                 "{response}"
             );
         }
+        let canonical = ctx.sessions.get_agent("s-empty").await.unwrap();
+
+        // ── An environment-bearing registration cannot resume it ──
+        register_tui_env(
+            &ctx,
+            &mut client,
+            "tui_empty0001",
+            "REUSE_SOCK",
+            "/tmp/reuse.sock",
+        );
+        let response = rpc(
+            &mut client,
+            &mut rx,
+            3,
+            "session/new",
+            json!({"agent_alias": "test-agent", "session_id": "s-empty"}),
+        )
+        .await;
+        assert_eq!(response["error"]["code"], FORBIDDEN, "{response}");
+        assert!(
+            response["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("environment differs"),
+            "{response}"
+        );
+        assert!(
+            Arc::ptr_eq(
+                &canonical,
+                &ctx.sessions.get_agent("s-empty").await.unwrap()
+            ),
+            "the refused resume leaves the canonical incarnation in place"
+        );
         let env = session_shell_env(&ctx, "s-empty").await;
         assert!(
             !env.contains("REUSE_SOCK") && !env.contains("SENTINEL"),
@@ -16629,6 +18233,10 @@ mod tests {
 
     async fn environment_principal_fixture(tmp: &tempfile::TempDir) -> RpcDispatcher {
         let mut config = principal_test_config(tmp, &["*"], &["*"]);
+        let risk = config.risk_profiles.get_mut("test-profile").unwrap();
+        risk.allowed_tools.push("shell".into());
+        risk.allowed_commands = vec!["env".into()];
+        std::fs::create_dir_all(config.agent_workspace_dir("test-agent")).unwrap();
         config
             .permission_profiles
             .get_mut("principal-test")
@@ -16669,6 +18277,141 @@ mod tests {
             .unwrap()
             .admin = false;
         dispatcher.ctx.auth.refresh_from_config(&config).unwrap();
+    }
+
+    #[cfg(unix)]
+    struct ShellEnvironmentProbe(Arc<std::sync::Mutex<Option<String>>>);
+
+    #[cfg(unix)]
+    #[async_trait]
+    impl zeroclaw_api::model_provider::ModelProvider for ShellEnvironmentProbe {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("unused".to_string())
+        }
+
+        async fn chat(
+            &self,
+            request: zeroclaw_providers::ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<zeroclaw_providers::ChatResponse> {
+            if let Some(result) = request
+                .messages
+                .iter()
+                .rev()
+                .find(|message| message.role == "tool")
+            {
+                *self.0.lock().unwrap() = Some(result.content.clone());
+                return Ok(zeroclaw_providers::ChatResponse {
+                    text: Some("environment checked".to_string()),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    reasoning_content: None,
+                });
+            }
+            Ok(zeroclaw_providers::ChatResponse {
+                text: None,
+                tool_calls: vec![zeroclaw_providers::ToolCall {
+                    id: "shell-env".to_string(),
+                    name: "shell".to_string(),
+                    arguments: json!({"command": "env", "approved": true}).to_string(),
+                    extra_content: None,
+                }],
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    #[cfg(unix)]
+    impl zeroclaw_api::attribution::Attributable for ShellEnvironmentProbe {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Provider(
+                zeroclaw_api::attribution::ProviderKind::Model(
+                    zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "shell-environment-probe"
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn demoted_principal_cannot_restore_environment_on_fresh_session_resume() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = environment_principal_fixture(&tmp).await;
+        let ctx = Arc::clone(&dispatcher.ctx);
+        demote_environment_principal(&dispatcher);
+        assert!(!registered_env(&ctx, &dispatcher).is_empty());
+        // This probe exercises the shell result, not the operator approval
+        // channel. Keep shell execution automatic after preserving its grant.
+        ctx.config
+            .write()
+            .risk_profiles
+            .get_mut("test-profile")
+            .unwrap()
+            .level = zeroclaw_config::autonomy::AutonomyLevel::Full;
+
+        let params = json!({"agent_alias": "test-agent", "session_id": "env-fresh"});
+        dispatcher
+            .handle_session_new_for_test(&params)
+            .await
+            .unwrap();
+        assert_eq!(
+            ctx.sessions.has_forwarded_environment("env-fresh").await,
+            Some(false)
+        );
+        let agent = ctx.sessions.get_agent("env-fresh").await.unwrap();
+        let observed = Arc::new(std::sync::Mutex::new(None));
+        agent
+            .lock()
+            .await
+            .set_model_provider(Box::new(ShellEnvironmentProbe(Arc::clone(&observed))));
+
+        dispatcher
+            .handle_session_new_for_test(&params)
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(
+            &agent,
+            &ctx.sessions.get_agent("env-fresh").await.unwrap()
+        ));
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            dispatcher.handle_session_prompt(&json!({
+                "session_id": "env-fresh", "prompt": "Inspect the environment"
+            })),
+        )
+        .await
+        .expect("the shell probe must settle")
+        .unwrap();
+        let tool_result = observed
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the prompt executed shell env");
+        assert!(
+            tool_result.contains("ZEROCLAW_SESSION_ID=env-fresh"),
+            "the probe must observe a real shell run: {tool_result}"
+        );
+        assert!(
+            !tool_result.contains("ZEROCLAW_ENV_SENTINEL"),
+            "demoted owner recovered forwarded values: {tool_result}"
+        );
+        assert!(
+            !session_shell_env(&ctx, "env-fresh")
+                .await
+                .contains("ZEROCLAW_ENV_SENTINEL")
+        );
     }
 
     #[tokio::test]
@@ -20254,7 +21997,7 @@ mod tests {
         let d = RpcDispatcher::new(ctx, writer_tx, "remote:wss=1,uid=anon".into());
 
         assert!(
-            d.handle_logs_subscribe().await.is_ok(),
+            d.handle_logs_subscribe(&json!({})).is_ok(),
             "a fresh client should be able to subscribe"
         );
 
@@ -20308,20 +22051,69 @@ mod tests {
         );
     }
 
-    /// G2a: the daemon owns the observer hook, so with no gateway running a
-    /// `logs/subscribe` client still receives the agent, tool, and LLM frames
-    /// recorded through any factory-built observer, each exactly once, and
+    /// The fixture's hook: forwards only its own turn to the real
+    /// `BroadcastObserver`, so observer events other tests record through the
+    /// process-wide hook never reach this bus's live ring or its history.
+    /// Counts what it turned away, so a flood can prove it went through here.
+    struct FixtureTurnObserver {
+        turn: &'static str,
+        inner: crate::observability::BroadcastObserver,
+        rejected: std::sync::atomic::AtomicUsize,
+    }
+
+    impl crate::observability::Observer for FixtureTurnObserver {
+        fn record_event(&self, event: &crate::observability::ObserverEvent) {
+            use crate::observability::ObserverEvent;
+            let turn_id = match event {
+                ObserverEvent::AgentStart { turn_id, .. }
+                | ObserverEvent::LlmRequest { turn_id, .. }
+                | ObserverEvent::ToolCall { turn_id, .. } => turn_id.as_deref(),
+                _ => None,
+            };
+            if turn_id == Some(self.turn) {
+                self.inner.record_event(event);
+            } else {
+                self.rejected
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+
+        fn record_metric(&self, _metric: &crate::observability::traits::ObserverMetric) {}
+
+        fn name(&self) -> &str {
+            "fixture-turn"
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// Shared body of the G2a fixture. Records the fixture turn's agent, LLM
+    /// and tool events through a factory-built observer, then `foreign` more
+    /// events for another turn from a separate thread, and asserts the
+    /// subscriber received the fixture's three frames once each and
     /// `events/history` replays them.
-    #[tokio::test]
-    async fn logs_subscribe_carries_observer_frames_without_a_gateway() {
-        use crate::observability::{EventBus, ObserverEvent};
+    ///
+    /// The bus is deliberately small (64 live, 16 history): isolation, not
+    /// capacity, is what keeps foreign events out. The fixture installs its
+    /// own hook and hands its bus to the RPC context by hand; it never starts
+    /// `daemon::run`, so it covers observer-to-RPC plumbing, not the daemon's
+    /// bootstrap wiring.
+    async fn assert_fixture_turn_reaches_subscriber_and_history(foreign: usize) {
+        use crate::observability::{BroadcastObserver, EventBus, ObserverEvent};
         use zeroclaw_infra::session_queue::SessionActorQueue;
+        const TURN: &str = "g2a-turn";
         let _hook = crate::observability::HOOK_TEST_LOCK.lock().await;
         crate::observability::clear_broadcast_hook();
 
-        // What `daemon::run` does, and nothing the gateway does.
         let bus = EventBus::with_capacities(64, 16);
-        let _daemon_hook = bus.install_hook();
+        let fixture = Arc::new(FixtureTurnObserver {
+            turn: TURN,
+            inner: BroadcastObserver::new(bus.sender().clone(), Arc::clone(bus.history())),
+            rejected: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let _fixture_hook = crate::observability::set_scoped_broadcast_hook(fixture.clone());
         let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
         let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
         let ctx = RpcContext::minimal_with_event_bus(
@@ -20331,14 +22123,16 @@ mod tests {
         );
         let (writer_tx, mut writer_rx) = tokio::sync::mpsc::channel::<String>(64);
         let d = RpcDispatcher::new(ctx, writer_tx, "local:uid=0".into());
-        assert!(d.handle_logs_subscribe().await.is_ok());
+        assert!(d.handle_logs_subscribe(&json!({})).is_ok());
 
-        let observer =
+        let factory_observer = || {
             crate::observability::create_observer(&zeroclaw_config::schema::ObservabilityConfig {
                 backend: zeroclaw_config::schema::ObservabilityBackend::None,
                 ..Default::default()
-            });
-        let turn = Some("g2a-turn".to_string());
+            })
+        };
+        let observer = factory_observer();
+        let turn = Some(TURN.to_string());
         observer.record_event(&ObserverEvent::AgentStart {
             model_provider: "p".into(),
             model: "m".into(),
@@ -20368,6 +22162,27 @@ mod tests {
             turn_id: turn.clone(),
         });
 
+        // Another test's producer: its own factory observer on its own thread,
+        // not holding HOOK_TEST_LOCK, recording before this fixture reads
+        // anything back.
+        let foreign_producer = std::thread::spawn(move || {
+            let observer = factory_observer();
+            for _ in 0..foreign {
+                observer.record_event(&ObserverEvent::AgentStart {
+                    model_provider: "p".into(),
+                    model: "m".into(),
+                    channel: None,
+                    agent_alias: None,
+                    turn_id: Some("foreign-turn".into()),
+                });
+            }
+        });
+        foreign_producer.join().expect("foreign producer finished");
+        assert!(
+            fixture.rejected.load(std::sync::atomic::Ordering::Relaxed) >= foreign,
+            "the foreign events must have reached the fixture's hook and been turned away"
+        );
+
         let mut kinds = Vec::new();
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
         while kinds.len() < 3 {
@@ -20377,7 +22192,7 @@ mod tests {
             };
             let frame: Value = serde_json::from_str(&frame).expect("notification is JSON");
             if frame["method"] == json!(notification::LOGS_EVENT)
-                && frame["params"]["turn_id"] == json!("g2a-turn")
+                && frame["params"]["turn_id"] == json!(TURN)
             {
                 kinds.push(
                     frame["params"]["type"]
@@ -20388,27 +22203,21 @@ mod tests {
             }
         }
         assert_eq!(kinds, ["agent_start", "llm_request", "tool_call"]);
-        // The observer hook is process-wide, so tests running in parallel can
-        // put their own frames on this bus. Only a second copy of this test's
-        // turn would be a duplicate.
         let quiet_until = tokio::time::Instant::now() + std::time::Duration::from_millis(150);
         while let Ok(Some(frame)) = tokio::time::timeout_at(quiet_until, writer_rx.recv()).await {
             let frame: Value = serde_json::from_str(&frame).expect("notification is JSON");
             assert_ne!(
                 frame["params"]["turn_id"],
-                json!("g2a-turn"),
+                json!(TURN),
                 "each observer event must be delivered once: {frame}"
             );
         }
 
         let history = d.handle_events_history().expect("history is available");
-        // Parallel tests can record into the same process-wide hook; only this
-        // test's turn is asserted on.
         let types: Vec<_> = history["events"]
             .as_array()
             .expect("events array")
             .iter()
-            .filter(|event| event["turn_id"] == json!("g2a-turn"))
             .map(|event| event["type"].clone())
             .collect();
         assert_eq!(
@@ -20417,10 +22226,30 @@ mod tests {
                 json!("agent_start"),
                 json!("llm_request"),
                 json!("tool_call")
-            ]
+            ],
+            "history holds exactly the fixture's turn"
         );
 
         crate::observability::clear_broadcast_hook();
+    }
+
+    /// G2a: the daemon owns the observer hook, so with no gateway running a
+    /// `logs/subscribe` client still receives the agent, tool, and LLM frames
+    /// recorded through any factory-built observer, each exactly once, and
+    /// `events/history` replays them.
+    #[tokio::test]
+    async fn logs_subscribe_carries_observer_frames_without_a_gateway() {
+        assert_fixture_turn_reaches_subscriber_and_history(0).await;
+    }
+
+    /// The G2a fixture survives other tests' observer traffic: 1000 foreign
+    /// events, more than both the live (64, daemon 256) and history (16,
+    /// daemon 500) capacities, recorded through the same process-wide hook
+    /// from another thread, neither lag the subscriber nor evict the
+    /// fixture's turn from history.
+    #[tokio::test]
+    async fn logs_subscribe_fixture_is_isolated_from_foreign_observer_traffic() {
+        assert_fixture_turn_reaches_subscriber_and_history(1000).await;
     }
 
     /// `events/history` is classified `Logs:Read`: a principal without that
@@ -20450,12 +22279,7 @@ mod tests {
         );
 
         let mut granted_config = roster_config(4242);
-        granted_config
-            .permission_profiles
-            .get_mut("reader")
-            .expect("the fixture profile exists")
-            .grants
-            .insert(Resource::Logs, vec![Verb::Read]);
+        grant_global_log_reads(&mut granted_config);
         let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
         let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
         let ctx = RpcContext::minimal_with_event_bus(granted_config, sessions, &bus);
@@ -20465,6 +22289,402 @@ mod tests {
             response["result"]["events"][0]["tool"],
             json!("SENTINEL"),
             "{response}"
+        );
+    }
+
+    /// A dispatcher on a context whose hub has `max_frames` per ring and no
+    /// byte limits, plus the writer receiving its frames.
+    fn subscription_dispatcher(
+        max_frames: usize,
+    ) -> (
+        RpcDispatcher,
+        tokio::sync::mpsc::Receiver<String>,
+        Arc<crate::rpc::subscription::SubscriptionHub>,
+    ) {
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+        let hub = Arc::new(crate::rpc::subscription::SubscriptionHub::with_limits(
+            crate::rpc::subscription::RingLimits {
+                max_frames,
+                max_bytes: usize::MAX,
+            },
+            usize::MAX,
+        ));
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let (event_tx, _rx) = tokio::sync::broadcast::channel(16);
+        let ctx = RpcContext::minimal_with_subscription_hub(
+            zeroclaw_config::schema::Config::default(),
+            sessions,
+            event_tx,
+            Arc::clone(&hub),
+        );
+        let (writer_tx, writer_rx) = tokio::sync::mpsc::channel::<String>(256);
+        (
+            RpcDispatcher::new(ctx, writer_tx, "local:uid=0".into()),
+            writer_rx,
+            hub,
+        )
+    }
+
+    /// Notifications until `count` arrive or two seconds pass.
+    async fn notifications(
+        rx: &mut tokio::sync::mpsc::Receiver<String>,
+        count: usize,
+    ) -> Vec<Value> {
+        let mut seen = Vec::new();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while seen.len() < count {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            match tokio::time::timeout(remaining, rx.recv()).await {
+                Ok(Some(frame)) => seen.push(serde_json::from_str(&frame).expect("JSON frame")),
+                _ => break,
+            }
+        }
+        seen
+    }
+
+    async fn assert_quiet(rx: &mut tokio::sync::mpsc::Receiver<String>) {
+        let extra = tokio::time::timeout(std::time::Duration::from_millis(150), rx.recv()).await;
+        assert!(extra.is_err(), "unexpected frame: {extra:?}");
+    }
+
+    fn seqs(frames: &[Value]) -> Vec<u64> {
+        frames
+            .iter()
+            .map(|frame| frame["params"]["seq"].as_u64().expect("seq on every frame"))
+            .collect()
+    }
+
+    /// F3a: resuming with `since_seq` replays exactly the missing range, then
+    /// continues live, and every notification carries its subscription id.
+    #[tokio::test]
+    async fn events_subscribe_resumes_exactly_the_missing_range() {
+        use crate::rpc::subscription::Source;
+        let (d, mut rx, hub) = subscription_dispatcher(64);
+        for n in 1..=10 {
+            hub.publish(Source::Events, json!({"source": "observability", "n": n}));
+        }
+
+        let opened = d
+            .handle_events_subscribe(&json!({"since_seq": 6, "epoch": hub.epoch()}))
+            .expect("subscribe");
+        assert_eq!(opened["seq"], json!(10));
+        assert_eq!(opened["epoch"], json!(hub.epoch()));
+        let id = opened["subscription_id"].as_str().expect("id").to_string();
+
+        let replay = notifications(&mut rx, 4).await;
+        assert_eq!(seqs(&replay), [7, 8, 9, 10]);
+        for frame in &replay {
+            assert_eq!(frame["method"], json!(notification::EVENTS_EVENT));
+            assert_eq!(frame["params"]["subscription_id"], json!(id));
+        }
+        assert_quiet(&mut rx).await;
+
+        hub.publish(Source::Events, json!({"source": "observability", "n": 11}));
+        assert_eq!(seqs(&notifications(&mut rx, 1).await), [11]);
+        assert_quiet(&mut rx).await;
+    }
+
+    /// F3a: a cursor that fell behind the ring gets `subscription/lagged` with
+    /// the resume point, then the stream continues. It never just ends.
+    #[tokio::test]
+    async fn overflow_is_reported_as_lagged_and_delivery_continues() {
+        use crate::rpc::subscription::Source;
+        let (d, mut rx, hub) = subscription_dispatcher(4);
+        for n in 1..=10 {
+            hub.publish(Source::Logs, json!({"n": n}));
+        }
+
+        let opened = d
+            .handle_logs_subscribe(&json!({"since_seq": 0, "epoch": hub.epoch()}))
+            .expect("subscribe");
+        let id = opened["subscription_id"].as_str().expect("id").to_string();
+
+        let frames = notifications(&mut rx, 5).await;
+        assert_eq!(
+            frames[0]["method"],
+            json!(notification::SUBSCRIPTION_LAGGED)
+        );
+        assert_eq!(
+            frames[0]["params"],
+            json!({
+                "subscription_id": id,
+                "from_seq": 1,
+                "resume_seq": 7,
+                "epoch_changed": false,
+            })
+        );
+        assert_eq!(seqs(&frames[1..]), [7, 8, 9, 10]);
+
+        hub.publish(Source::Logs, json!({"n": 11}));
+        assert_eq!(seqs(&notifications(&mut rx, 1).await), [11]);
+    }
+
+    /// Within one epoch, a `since_seq` ahead of the newest frame cannot come
+    /// from this stream: it is refused, not turned into a notice.
+    #[tokio::test]
+    async fn a_future_since_seq_in_the_same_epoch_is_refused() {
+        use crate::rpc::subscription::Source;
+        let (d, _rx, hub) = subscription_dispatcher(64);
+        hub.publish(Source::Logs, json!({"n": 1}));
+        let refused = d.handle_logs_subscribe(&json!({"since_seq": 40, "epoch": hub.epoch()}));
+        assert!(
+            matches!(&refused, Err(error) if error.code == INVALID_PARAMS),
+            "{refused:?}"
+        );
+    }
+
+    /// Sequence numbers restart in a new hub (daemon restart or reload). A
+    /// `since_seq` from another epoch is never lined up by number, whether the
+    /// new hub holds fewer frames than it or more: the client is told its
+    /// continuity broke (`epoch_changed`, a forward range) and gets every
+    /// frame the new hub still buffers.
+    #[tokio::test]
+    async fn a_since_seq_from_another_epoch_replays_the_new_hub() {
+        use crate::rpc::subscription::Source;
+        for (published, since_seq) in [(3_u64, 40_u64), (10, 6)] {
+            let (d, mut rx, hub) = subscription_dispatcher(64);
+            for n in 1..=published {
+                hub.publish(Source::Logs, json!({ "n": n }));
+            }
+            let opened = d
+                .handle_logs_subscribe(&json!({
+                    "since_seq": since_seq,
+                    "epoch": "an-epoch-from-before-the-restart",
+                }))
+                .expect("subscribe");
+            assert_ne!(opened["epoch"], json!("an-epoch-from-before-the-restart"));
+
+            let count = usize::try_from(published).expect("small") + 1;
+            let frames = notifications(&mut rx, count).await;
+            assert_eq!(
+                frames[0]["method"],
+                json!(notification::SUBSCRIPTION_LAGGED)
+            );
+            assert_eq!(frames[0]["params"]["from_seq"], json!(1));
+            assert_eq!(frames[0]["params"]["resume_seq"], json!(1));
+            assert_eq!(frames[0]["params"]["epoch_changed"], json!(true));
+            assert_eq!(
+                seqs(&frames[1..]),
+                (1..=published).collect::<Vec<_>>(),
+                "published {published}, since_seq {since_seq}"
+            );
+            assert_quiet(&mut rx).await;
+        }
+    }
+
+    /// A subscriber opens a subscription and ends it through the real
+    /// authorization gate. Cancel is classified like the subscribe methods
+    /// (`Logs:Read`), so whoever could open a subscription can end it.
+    #[tokio::test]
+    async fn a_logs_reader_can_cancel_its_own_subscription() {
+        use zeroclaw_api::grants::{Resource, Verb};
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+        assert_eq!(
+            Method::SubscriptionCancel.authz(),
+            MethodAuthz::Requires(Resource::Logs, Verb::Read)
+        );
+        let mut config = roster_config(4242);
+        let reader = config
+            .permission_profiles
+            .get_mut("reader")
+            .expect("the fixture profile exists");
+        reader.grants.clear();
+        reader.grants.insert(Resource::Logs, vec![Verb::Read]);
+        reader.admin = true;
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let (event_tx, _rx0) = tokio::sync::broadcast::channel(16);
+        let ctx = RpcContext::minimal_with_event_tx(config, sessions, event_tx);
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+
+        let opened = rpc(&mut alice, &mut rx, 1, "logs/subscribe", json!({})).await;
+        let id = opened["result"]["subscription_id"].clone();
+        assert!(id.is_string(), "{opened}");
+        let cancelled = rpc(
+            &mut alice,
+            &mut rx,
+            2,
+            "subscription/cancel",
+            json!({"subscription_id": id}),
+        )
+        .await;
+        assert_eq!(cancelled["result"]["cancelled"], json!(true), "{cancelled}");
+    }
+
+    #[tokio::test]
+    async fn subscription_cancel_ends_only_that_subscription() {
+        use crate::rpc::subscription::Source;
+        let (d, mut rx, hub) = subscription_dispatcher(64);
+        let logs = d.handle_logs_subscribe(&json!({})).expect("logs");
+        let events = d.handle_events_subscribe(&json!({})).expect("events");
+
+        let cancelled = d
+            .handle_subscription_cancel(&json!({"subscription_id": logs["subscription_id"]}))
+            .expect("cancel");
+        assert_eq!(cancelled["cancelled"], json!(true));
+        let again = d
+            .handle_subscription_cancel(&json!({"subscription_id": logs["subscription_id"]}))
+            .expect("cancel again");
+        assert_eq!(again["cancelled"], json!(false));
+
+        hub.publish(Source::Logs, json!({"n": 1}));
+        hub.publish(Source::Events, json!({"source": "observability", "n": 1}));
+        let frames = notifications(&mut rx, 1).await;
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0]["method"], json!(notification::EVENTS_EVENT));
+        assert_eq!(
+            frames[0]["params"]["subscription_id"],
+            events["subscription_id"]
+        );
+        assert_quiet(&mut rx).await;
+    }
+
+    #[tokio::test]
+    async fn events_subscribe_requires_logs_read() {
+        use zeroclaw_api::grants::{Resource, Verb};
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+        assert_eq!(
+            Method::EventsSubscribe.authz(),
+            MethodAuthz::Requires(Resource::Logs, Verb::Read)
+        );
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let (event_tx, _rx0) = tokio::sync::broadcast::channel(16);
+        let ctx = RpcContext::minimal_with_event_tx(roster_config(4242), sessions, event_tx);
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+        let response = rpc(&mut alice, &mut rx, 1, "events/subscribe", json!({})).await;
+        assert_eq!(response["error"]["code"], json!(FORBIDDEN), "{response}");
+    }
+
+    /// Make the fixture `reader` an administrator with `Logs:Read`: the
+    /// global streams are limited to administrators and the shared operator,
+    /// and the roster peer is an authenticated principal.
+    fn grant_global_log_reads(config: &mut zeroclaw_config::schema::Config) {
+        use zeroclaw_api::grants::{Resource, Verb};
+        let reader = config
+            .permission_profiles
+            .get_mut("reader")
+            .expect("the fixture profile exists");
+        reader.grants.insert(Resource::Logs, vec![Verb::Read]);
+        reader.admin = true;
+    }
+
+    /// Configure an `alpha` agent so a profile can be scoped to it (policy
+    /// rejects an `allowed_agents` entry naming an unconfigured agent).
+    fn configure_agent_alpha(config: &mut zeroclaw_config::schema::Config) {
+        use zeroclaw_config::schema::{AliasedAgentConfig, RiskProfileConfig};
+        config
+            .risk_profiles
+            .insert("scoped-profile".into(), RiskProfileConfig::default());
+        config.agents.insert(
+            "alpha".into(),
+            AliasedAgentConfig {
+                enabled: true,
+                risk_profile: "scoped-profile".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+    }
+
+    /// Frames on the global streams are not attributed to an owning agent,
+    /// so a principal scoped to some agents is refused all three, even with
+    /// `Logs:Read`.
+    #[tokio::test]
+    async fn global_streams_refuse_a_scoped_principal() {
+        use zeroclaw_api::grants::{Resource, Verb};
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+        // An authenticated, non-admin principal is scoped whether it may
+        // address one agent or every agent (`*`): addressing every agent is
+        // not owning every principal's sessions, and these frames carry them.
+        for agents in [vec!["alpha".to_string()], vec!["*".to_string()]] {
+            let mut config = roster_config(4242);
+            configure_agent_alpha(&mut config);
+            let reader = config
+                .permission_profiles
+                .get_mut("reader")
+                .expect("the fixture profile exists");
+            reader.grants.insert(Resource::Logs, vec![Verb::Read]);
+            reader.grants.insert(Resource::Sessions, vec![Verb::Read]);
+            reader.allowed_agents = agents.clone();
+            let bus = crate::observability::EventBus::with_capacities(16, 16);
+            bus.history()
+                .push(json!({"type": "tool_call", "source": "observability", "tool": "SENTINEL"}));
+            let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+            let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+            let ctx = RpcContext::minimal_with_event_bus(config, sessions, &bus);
+            let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+
+            for (id, method) in [
+                (1, "logs/subscribe"),
+                (2, "events/subscribe"),
+                (3, "events/history"),
+            ] {
+                let response = rpc(&mut alice, &mut rx, id, method, json!({})).await;
+                assert_eq!(
+                    response["error"]["code"],
+                    json!(FORBIDDEN),
+                    "{agents:?} {method}: {response}"
+                );
+                assert!(
+                    !response.to_string().contains("SENTINEL"),
+                    "{agents:?} {method} must not disclose frames: {response}"
+                );
+            }
+        }
+    }
+
+    /// Demoting a live subscriber from administrator ends its stream at the
+    /// next delivery, even though it keeps `Logs:Read` and every agent (`*`):
+    /// the principal is rechecked, not only the verb or the agent selector.
+    #[tokio::test]
+    async fn demoting_a_subscriber_from_admin_ends_its_stream() {
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+        let mut config = roster_config(4242);
+        configure_agent_alpha(&mut config);
+        grant_global_log_reads(&mut config);
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let (event_tx, _rx0) = tokio::sync::broadcast::channel(16);
+        let ctx = RpcContext::minimal_with_event_tx(config.clone(), sessions, event_tx.clone());
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+
+        let subscribed = rpc(&mut alice, &mut rx, 1, "logs/subscribe", json!({})).await;
+        assert_eq!(
+            subscribed["result"]["subscribed"],
+            json!(true),
+            "{subscribed}"
+        );
+        event_tx
+            .send(json!({"source": "observability", "tool": "SENTINEL-WIDE"}))
+            .expect("send the first frame");
+        assert!(
+            next_frame_containing(&mut rx, "SENTINEL-WIDE", std::time::Duration::from_secs(2))
+                .await,
+            "an unscoped subscriber receives frames"
+        );
+
+        let mut demoted = config;
+        let reader = demoted
+            .permission_profiles
+            .get_mut("reader")
+            .expect("the fixture profile exists");
+        reader.admin = false;
+        reader.allowed_agents = vec![zeroclaw_api::grants::WILDCARD.into()];
+        ctx.auth
+            .refresh_from_config(&demoted)
+            .expect("the demoted policy compiles");
+        event_tx
+            .send(json!({"source": "observability", "tool": "SENTINEL-DEMOTED"}))
+            .expect("send the second frame");
+        assert!(
+            !next_frame_containing(
+                &mut rx,
+                "SENTINEL-DEMOTED",
+                std::time::Duration::from_millis(500)
+            )
+            .await,
+            "a demoted subscriber with every agent must stop receiving global frames"
         );
     }
 
@@ -20486,15 +22706,10 @@ mod tests {
 
     #[tokio::test]
     async fn logs_subscription_stops_once_the_principal_loses_the_grant() {
-        use zeroclaw_api::grants::{Resource, Verb};
+        use zeroclaw_api::grants::Resource;
         use zeroclaw_infra::session_queue::SessionActorQueue;
         let mut config = roster_config(4242);
-        config
-            .permission_profiles
-            .get_mut("reader")
-            .expect("the fixture profile exists")
-            .grants
-            .insert(Resource::Logs, vec![Verb::Read]);
+        grant_global_log_reads(&mut config);
         let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
         let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
         let (event_tx, _rx0) = tokio::sync::broadcast::channel(16);
@@ -20520,13 +22735,15 @@ mod tests {
             "an entitled subscriber receives log frames"
         );
 
+        // The fixture reader is an administrator (the global streams require
+        // one), so revoking Logs:Read alone would change nothing; revoke both.
         let mut narrowed = config;
-        narrowed
+        let reader = narrowed
             .permission_profiles
             .get_mut("reader")
-            .expect("the fixture profile exists")
-            .grants
-            .remove(&Resource::Logs);
+            .expect("the fixture profile exists");
+        reader.grants.remove(&Resource::Logs);
+        reader.admin = false;
         ctx.auth
             .refresh_from_config(&narrowed)
             .expect("the narrowed policy compiles");
@@ -23016,7 +25233,7 @@ mod tests {
 
         // (runtime_profile.max_context_tokens, provider.context_window, expected)
         let cases: &[(Option<usize>, Option<usize>, u64)] = &[
-            (Some(128_000), None, 32_000), // unknown capacity caps the profile budget
+            (Some(128_000), None, 128_000), // unknown capacity never caps an explicit budget
             (Some(128_000), Some(200_000), 128_000),
             (None, Some(200_000), 32_000), // meter reads profile budget (32k), not provider window
             (None, None, 32_000),          // hard stub
@@ -23240,8 +25457,8 @@ mod tests {
 
         assert_eq!(v["params"]["type"], "context_usage");
         assert_eq!(
-            v["params"]["max_context_tokens"], 32_000,
-            "effective budget must respect the unknown-capacity fallback"
+            v["params"]["max_context_tokens"], 128_000,
+            "an explicit profile budget is not clamped to the unknown-capacity stub (#10068)"
         );
         assert!(
             v["params"].get("model_context_window").is_none(),
@@ -23501,7 +25718,10 @@ mod tests {
         let json = notification_for_turn_event("s1", &event).unwrap();
         let v = parse(&json);
         assert_eq!(v["params"]["type"], "context_usage");
-        assert_eq!(v["params"]["max_context_tokens"], 32_000);
+        assert_eq!(
+            v["params"]["max_context_tokens"], 800_000,
+            "the explicit profile budget survives the same-profile fallback (#10068)"
+        );
         assert!(
             v["params"].get("model_context_window").is_none(),
             "RPC wire must omit model_context_window on same-profile fallback"
@@ -33432,6 +35652,7 @@ mod tests {
             cost_tracker: None,
             event_tx: None,
             event_history: None,
+            subscriptions: Arc::new(crate::rpc::subscription::SubscriptionHub::new()),
             reload_tx: None,
             gateway_shutdown_tx: None,
             approval_pending: Arc::new(crate::rpc::context::ApprovalPendingMap::default()),
@@ -33482,6 +35703,7 @@ mod tests {
             cost_tracker: None,
             event_tx: None,
             event_history: None,
+            subscriptions: Arc::new(crate::rpc::subscription::SubscriptionHub::new()),
             reload_tx: None,
             gateway_shutdown_tx: None,
             approval_pending: Arc::new(crate::rpc::context::ApprovalPendingMap::default()),
@@ -33591,6 +35813,7 @@ mod tests {
             cost_tracker: None,
             event_tx: None,
             event_history: None,
+            subscriptions: Arc::new(crate::rpc::subscription::SubscriptionHub::new()),
             reload_tx: None,
             gateway_shutdown_tx: None,
             approval_pending: Arc::new(crate::rpc::context::ApprovalPendingMap::default()),
