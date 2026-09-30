@@ -3295,8 +3295,11 @@ fn resolve_sender_role_turn(
 /// Tools a sender-role turn may not call because the work they start runs
 /// where the role's restrictions do not follow it: jobs that run later
 /// (`cron_add`, `cron_update`, `cron_run`, `schedule`), SOP runs and step
-/// approvals, whose steps may run as another agent, and messages that make
-/// another agent run a turn under its own profile. Nested launchers that do
+/// approvals, whose steps may run as another agent, messages that make
+/// another agent run a turn under its own profile (`send_message_to_peer`,
+/// and `a2a_send` to an A2A peer, with `a2a_cancel` over its tasks), and
+/// messages planted in another session for its next turn (`sessions_send`).
+/// Nested launchers that do
 /// not carry a caller's ceiling (delegate, spawn_subagent, pipeline) are
 /// found by `requires_unrestricted_principal` instead, the flag a
 /// constrained RPC principal is held to.
@@ -3310,6 +3313,9 @@ const SENDER_ROLE_UNFOLLOWED_TOOLS: &[&str] = &[
     "sop_approve",
     "sop_workshop",
     "send_message_to_peer",
+    "a2a_send",
+    "a2a_cancel",
+    "sessions_send",
 ];
 
 /// `tool` and every tool it wraps, outermost first.
@@ -3349,6 +3355,10 @@ fn sender_role_excluded_tools(registry: &[Box<dyn Tool>], role_excluded: &[Strin
 }
 
 /// Registered wrappers whose chain reaches a tool `gate` always asks about.
+/// This matches as the approval gate does (entries trimmed, names exact),
+/// while [`sender_role_excluded_tools`] matches as the execution gate does
+/// (trimmed, ASCII case ignored). Each mirrors the gate it feeds; do not
+/// align one with the other.
 /// They ask too, so a renamed wrapper cannot run the tool without the
 /// approval the role requires for it. `gate` is the role's own approval
 /// manager, so the match is the one it applies to a direct call.
@@ -3385,7 +3395,7 @@ fn channel_turn_excluded_tools(
         };
     if let Some(role) = sender_role {
         for tool in &role.excluded_tools {
-            if !excluded.contains(tool) {
+            if !zeroclaw_runtime::agent::tool_execution::is_excluded_tool(tool, &excluded) {
                 excluded.push(tool.clone());
             }
         }
@@ -28530,6 +28540,9 @@ BTC is currently around $65,000 based on latest tool output."#
             ("sop_approve", false),
             ("sop_workshop", false),
             ("send_message_to_peer", false),
+            ("a2a_send", false),
+            ("a2a_cancel", false),
+            ("sessions_send", false),
         ];
         let mut failures = Vec::new();
         for &(name, launcher) in cases {
