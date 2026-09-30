@@ -37,6 +37,23 @@ pub enum MigrationNotice {
         reference: String,
         reason: &'static str,
     },
+    /// An entry naming a retired channel was left in place, because removing
+    /// it would change more than the reference: the entry at `path` is either
+    /// a peer group bound to the channel (a hard reference that is never
+    /// deleted for the operator) or the last channel binding any agent has,
+    /// whose removal would route every channel to the fallback agent. The
+    /// operator must fix it; `Config::validate` reports it until then.
+    ReferenceKept {
+        path: String,
+        reference: String,
+        reason: &'static str,
+    },
+    /// A `ZEROCLAW_*` environment variable names a retired key, so it was
+    /// ignored instead of failing startup.
+    IgnoredEnvOverride {
+        variable: String,
+        reason: &'static str,
+    },
     /// A retired key was moved to its replacement.
     Renamed {
         from: String,
@@ -53,6 +70,18 @@ pub enum MigrationNotice {
 }
 
 impl MigrationNotice {
+    /// Whether the notice reports a change to the config file, as opposed to
+    /// something left as it is for the operator to fix: a kept reference, or
+    /// an ignored environment variable. Only changing notices make a
+    /// migration write the file.
+    #[must_use]
+    pub fn changes_file(&self) -> bool {
+        !matches!(
+            self,
+            Self::ReferenceKept { .. } | Self::IgnoredEnvOverride { .. }
+        )
+    }
+
     /// One-line English description, for logs and as the fallback for
     /// localized CLI output.
     pub fn message(&self) -> String {
@@ -77,6 +106,16 @@ impl MigrationNotice {
                 reference,
                 reason,
             } => format!("removed `{reference}` from `{path}`: {reason}"),
+            Self::ReferenceKept {
+                path,
+                reference,
+                reason,
+            } => {
+                format!("kept `{reference}` in `{path}` although its channel is retired: {reason}")
+            }
+            Self::IgnoredEnvOverride { variable, reason } => {
+                format!("ignored `{variable}`, which sets a retired config key: {reason}")
+            }
             Self::Renamed { from, to, reason } => {
                 format!("moved retired config key `{from}` to `{to}`: {reason}")
             }
@@ -313,6 +352,22 @@ pub const RETIRED_KEYS: &[RetiredKey] = &[
     },
 ];
 
+/// The retired key a config path lies at or under, matching [`ANY_KEY`]
+/// segments against any key. Used where a path arrives from outside the
+/// file, such as an environment override, to recognize a retired key rather
+/// than fail on it as unknown.
+#[must_use]
+pub fn retired_key_covering(path: &[&str]) -> Option<&'static RetiredKey> {
+    RETIRED_KEYS.iter().find(|key| {
+        key.path.len() <= path.len()
+            && key
+                .path
+                .iter()
+                .zip(path)
+                .all(|(pattern, segment)| *pattern == ANY_KEY || pattern == segment)
+    })
+}
+
 const RETIRED_GLOBAL_FALLBACK: &str = "the global fallback lists were removed in V3; set \
      `fallback` on each `[providers.models.<type>.<alias>]` instead";
 
@@ -375,19 +430,17 @@ pub fn detect_version(value: &toml::Value) -> Result<u32> {
         None => match unversioned_shape(table) {
             UnversionedShape::V3 => Ok(INFERRED_SCHEMA_VERSION),
             UnversionedShape::NotV3 => Ok(1),
-            UnversionedShape::Ambiguous { section, key } => {
+            UnversionedShape::Ambiguous { detail } => {
                 ::zeroclaw_log::record!(
                     ERROR,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
                         .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({ "section": section, "key": key })),
+                        .with_attrs(::serde_json::json!({ "detail": detail })),
                     "config has no schema_version and its shape is ambiguous"
                 );
                 anyhow::bail!(
-                    "config has no `schema_version`, and `[{section}.{key}]` reads either as the \
-                     `{key}` field of a V2 `{section}` entry or as a V3 alias named `{key}`. \
-                     Add `schema_version = 2` or `schema_version = 3` as the first line of the \
-                     file so it is not guessed"
+                    "config has no `schema_version`, and {detail}. Add `schema_version = 2` or \
+                     `schema_version = 3` as the first line of the file so it is not guessed"
                 )
             }
         },
@@ -422,10 +475,11 @@ enum UnversionedShape {
     V3,
     /// Not the V3 shape: keep the historical V1 reading.
     NotV3,
-    /// The V3 shape, but `[<section>.<key>]` also reads as the `<key>` field
-    /// of a V2 entry. Either reading can lose configuration, so neither is
-    /// chosen and the operator must state the version.
-    Ambiguous { section: String, key: String },
+    /// The V3 shape, but something in it also reads as V2: a child table
+    /// that is a field of a V2 entry, or a key only V2 has. Either reading
+    /// can lose configuration, so neither is chosen and the operator must
+    /// state the version. `detail` says what reads both ways.
+    Ambiguous { detail: String },
 }
 
 /// Whether a config with no `schema_version` key is unmistakably written in
@@ -509,14 +563,67 @@ fn unversioned_shape(table: &toml::Table) -> UnversionedShape {
                 .into_iter()
                 .next()
         {
-            ambiguous = Some((format!("{}.{name}", entry_kind.path()), key));
+            let section = format!("{}.{name}", entry_kind.path());
+            ambiguous = Some(format!(
+                "`[{section}.{key}]` reads either as the `{key}` field of a V2 `{section}` \
+                 entry or as a V3 alias named `{key}`"
+            ));
         }
     }
-    match (alias_keyed, ambiguous) {
-        (true, Some((section, key))) => UnversionedShape::Ambiguous { section, key },
-        (true, None) => UnversionedShape::V3,
-        (false, _) => UnversionedShape::NotV3,
+    if !alias_keyed {
+        return UnversionedShape::NotV3;
     }
+    if let Some(detail) = ambiguous.or_else(|| v2_only_marker(table)) {
+        return UnversionedShape::Ambiguous { detail };
+    }
+    UnversionedShape::V3
+}
+
+/// Keys the V2 -> V3 step moves off `[agents.<alias>]` (see
+/// `schema::v2::synthesize_agent_brains`) that no V3 agent has. The inert
+/// tunables a V3 file may still carry, such as `max_tool_iterations`, are
+/// not listed: they say nothing about the version. Kept honest by
+/// `v2_only_agent_keys_are_not_v3_agent_fields`.
+const V2_ONLY_AGENT_KEYS: &[&str] = &[
+    "provider",
+    "model",
+    "api_key",
+    "temperature",
+    "max_iterations",
+    "allowed_tools",
+    "agentic",
+    "max_depth",
+    "skills_directory",
+    "memory_namespace",
+    "agentic_timeout_secs",
+    "timeout_secs",
+];
+
+/// A setting only V2 reads, found in a file whose other sections are in the
+/// V3 shape: a value held directly on `[providers]` (V3 keeps only the
+/// `models`, `tts` and `transcription` tables there) or a V2-only agent key.
+/// Read as V3 it would be ignored; read as V1 the V3 sections would be
+/// reshaped. `None` when there is no such key.
+fn v2_only_marker(table: &toml::Table) -> Option<String> {
+    if let Some(providers) = table.get("providers").and_then(toml::Value::as_table)
+        && let Some((key, _)) = providers.iter().find(|(_, value)| !value.is_table())
+    {
+        return Some(format!(
+            "`providers.{key}` is a V2 setting the V3 layout does not read, while other \
+             sections are in the V3 layout"
+        ));
+    }
+    let agents = table.get("agents").and_then(toml::Value::as_table)?;
+    agents.iter().find_map(|(alias, agent)| {
+        let agent = agent.as_table()?;
+        let key = V2_ONLY_AGENT_KEYS
+            .iter()
+            .find(|key| agent.contains_key(**key))?;
+        Some(format!(
+            "`agents.{alias}.{key}` is a V2 setting the V3 layout does not read, while other \
+             sections are in the V3 layout"
+        ))
+    })
 }
 
 /// The kind of entry an alias-keyed section holds.
@@ -549,6 +656,47 @@ fn keys_read_as_v2_entry_fields(
     name: &str,
     section: &toml::Table,
 ) -> Vec<String> {
+    let survivors = round_trip_as_v2_entry(kind, name, section).unwrap_or_default();
+    section
+        .keys()
+        .filter(|key| {
+            survivors.contains_key(key.as_str()) || survives_with_a_filler(kind, name, section, key)
+        })
+        .cloned()
+        .collect()
+}
+
+/// Whether `key` is a map-valued field whose own content was dropped from the
+/// round trip: an empty map, or one whose values all equal their defaults, is
+/// skipped on serialization, so `[providers.models.openai.extra_headers]` with
+/// no headers would not survive as itself. The child is replaced by a
+/// one-entry map of each value shape a field map can hold; if any of them
+/// survives, the key is a field.
+fn survives_with_a_filler(kind: V2EntryKind, name: &str, section: &toml::Table, key: &str) -> bool {
+    const FILLER_KEY: &str = "__unversioned_shape_filler__";
+    let fillers = [
+        toml::Value::String("filler".to_string()),
+        toml::Value::Float(1.5),
+        toml::Value::Integer(1),
+        toml::Value::Boolean(true),
+        toml::Value::Table(toml::Table::new()),
+    ];
+    fillers.into_iter().any(|filler| {
+        let mut probe = section.clone();
+        let mut child = toml::Table::new();
+        child.insert(FILLER_KEY.to_string(), filler);
+        probe.insert(key.to_string(), toml::Value::Table(child));
+        round_trip_as_v2_entry(kind, name, &probe).is_some_and(|entry| entry.contains_key(key))
+    })
+}
+
+/// `section` deserialized as one entry of its real type and serialized back,
+/// or `None` when it does not read as a single entry at all.
+fn round_trip_as_v2_entry(
+    kind: V2EntryKind,
+    name: &str,
+    section: &toml::Table,
+) -> Option<toml::Table> {
     const PROBE: &str = "__unversioned_shape_probe__";
     let mut slot = toml::Table::new();
     slot.insert(PROBE.to_string(), toml::Value::Table(section.clone()));
@@ -565,19 +713,12 @@ fn keys_read_as_v2_entry_fields(
             .ok()
             .and_then(|parsed| toml::Value::try_from(parsed).ok()),
     };
-    let Some(entry) = round_tripped
+    round_tripped
         .as_ref()
         .and_then(|value| value.get(name))
         .and_then(|slot| slot.get(PROBE))
         .and_then(toml::Value::as_table)
-    else {
-        return Vec::new();
-    };
-    section
-        .keys()
-        .filter(|key| entry.contains_key(key.as_str()))
         .cloned()
-        .collect()
 }
 
 /// The notice for a config with no `schema_version` key, by the version it
@@ -615,7 +756,10 @@ fn migrate_toml(value: toml::Value) -> Result<Option<Migrated>> {
         for version in 2..=CURRENT_SCHEMA_VERSION {
             apply_retired_keys(&mut value, version, RETIRED_KEYS, &mut notices);
         }
-        if notices.is_empty() {
+        if !notices.iter().any(MigrationNotice::changes_file) {
+            // Nothing to write. Notices about what was left for the operator
+            // are reported by `Config::validate`, which flags each dangling
+            // reference on every load.
             return Ok(None);
         }
         log_notices(&notices);
@@ -665,7 +809,7 @@ pub fn migrate_file(input: &str) -> Result<Option<String>> {
 /// number spelling, comments. Older files need the structural steps and are
 /// rebuilt from the migrated value. Raise this if a later version adds a
 /// structural migration step.
-const FIRST_RETIREMENT_ONLY_VERSION: u32 = 3;
+pub(crate) const FIRST_RETIREMENT_ONLY_VERSION: u32 = 3;
 
 /// [`migrate_file`], also returning what the migration changed or assumed.
 pub fn migrate_file_with_notices(input: &str) -> Result<Option<(String, Vec<MigrationNotice>)>> {
@@ -677,7 +821,7 @@ pub fn migrate_file_with_notices(input: &str) -> Result<Option<(String, Vec<Migr
         let mut notices: Vec<MigrationNotice> =
             unversioned_notice(&value, from).into_iter().collect();
         notices.extend(apply_retired_keys_to_doc(doc.as_table_mut()));
-        if from == CURRENT_SCHEMA_VERSION && notices.is_empty() {
+        if from == CURRENT_SCHEMA_VERSION && !notices.iter().any(MigrationNotice::changes_file) {
             return Ok(None);
         }
         stamp_doc_schema_version(doc.as_table_mut());
@@ -1227,6 +1371,13 @@ pub fn migrate_file_in_place(path: &Path) -> Result<Option<MigrateReport>> {
         Some(migrated) => migrated,
         None => return Ok(None),
     };
+    // The `.backup` slot below is replaced by every migration, including a
+    // later retirement-only one of a current file. Keep the pre-upgrade
+    // original as well, once per version, where nothing replaces it.
+    let from = detect_version(&toml::from_str(&raw).context("failed to parse config TOML")?)?;
+    if from < CURRENT_SCHEMA_VERSION {
+        keep_version_backup(path, from)?;
+    }
     let parent = path.parent().with_context(|| {
         format!(
             "config path {} has no parent directory",
@@ -1316,6 +1467,35 @@ pub fn migrate_file_in_place(path: &Path) -> Result<Option<MigrateReport>> {
         to_version: CURRENT_SCHEMA_VERSION,
         notices,
     }))
+}
+
+/// Where the copy of a config file at schema `version` is kept before this
+/// binary first rewrites it: `<name>.v<version>.backup` beside it.
+pub fn version_backup_path(config_path: &Path, version: u32) -> Result<std::path::PathBuf> {
+    let file_name = config_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .with_context(|| format!("config path {} has no file name", config_path.display()))?;
+    Ok(config_path.with_file_name(format!("{file_name}.v{version}.backup")))
+}
+
+/// Copy `config_path` to [`version_backup_path`] unless that copy already
+/// exists. It is written once and never replaced, so the original of each
+/// version survives every later migration and save. The copy keeps the
+/// file's permissions, since it holds the same secrets.
+pub fn keep_version_backup(config_path: &Path, version: u32) -> Result<()> {
+    let backup = version_backup_path(config_path, version)?;
+    if backup.exists() {
+        return Ok(());
+    }
+    std::fs::copy(config_path, &backup).with_context(|| {
+        format!(
+            "failed to keep a copy of {} as {} before rewriting it",
+            config_path.display(),
+            backup.display()
+        )
+    })?;
+    Ok(())
 }
 
 /// Fsync the directory entry so a subsequent rename inside it is durable.
@@ -1561,58 +1741,105 @@ fn retired_channel_type(key: &RetiredKey) -> Option<&'static str> {
 }
 
 /// The channel type a channel reference names: `"telegram"` names the type
-/// itself, `"telegram.work"` one alias of it.
+/// itself, `"telegram.work"` one alias of it. The reference is trimmed first,
+/// as `Config::validate` and the `alias_refs` cascade trim it.
 fn channel_reference_type(reference: &str) -> &str {
+    let reference = reference.trim();
     reference.split('.').next().unwrap_or(reference)
 }
 
-/// Remove every reference to the retired `channel_type` from a parsed config:
-/// its entries in each `[agents.<alias>] channels` list, and each
-/// `[peer_groups.<name>]` bound to it. Each removal gets its own notice.
+/// Lists a channel reference can be dropped from: every `[agents.<alias>]
+/// channels` and `[escalation] alert_channels`. With
+/// [`CHANNEL_REFERENCE_BINDINGS`] these mirror the reference sites of the
+/// canonical cascade in `alias_refs` (`collect_channel_refs`), which the test
+/// `channel_reference_sites_match_the_alias_cascade` keeps in step.
+const CHANNEL_REFERENCE_LISTS: &[&[&str]] = &[
+    &["agents", ANY_KEY, "channels"],
+    &["escalation", "alert_channels"],
+];
+
+/// Tables bound to a channel by one reference: `[peer_groups.<name>]
+/// channel`. The cascade treats this as a hard reference and refuses to
+/// delete the group, so a retirement leaves it in place too.
+const CHANNEL_REFERENCE_BINDINGS: &[&[&str]] = &[&["peer_groups", ANY_KEY, "channel"]];
+
+/// The list whose entries bind agents to channels. Emptying the last of them
+/// changes routing, not just references: with no binding anywhere, the
+/// runtime hands every configured channel to the fallback agent.
+const AGENT_CHANNEL_BINDINGS: &[&str] = &["agents", ANY_KEY, "channels"];
+
+const KEPT_PEER_GROUP: &str = "a peer group is not deleted when its channel is retired, because \
+     its members and settings are the operator's; rebind it to a live channel or remove it";
+
+const KEPT_LAST_BINDING: &str = "removing it would leave no agent bound to any channel, which \
+     routes every configured channel to the fallback agent; bind an agent to a live channel, \
+     then remove this entry";
+
+/// What a retirement does with the references to a retired channel type.
+struct ChannelReferencePlan {
+    /// Whether the agent channel bindings may be pruned: false when doing so
+    /// would leave no binding anywhere (see [`AGENT_CHANNEL_BINDINGS`]).
+    prune_agent_bindings: bool,
+}
+
+impl ChannelReferencePlan {
+    /// Decide from the counts of agent channel entries before and after the
+    /// retired type's entries are dropped.
+    fn new(bindings_before: usize, bindings_after: usize) -> Self {
+        Self {
+            prune_agent_bindings: bindings_before == 0 || bindings_after > 0,
+        }
+    }
+}
+
+/// Handle every reference to the retired `channel_type` in a parsed config:
+/// drop it from the lists in [`CHANNEL_REFERENCE_LISTS`], except that agent
+/// bindings are kept when pruning them would leave none; keep each peer group
+/// bound to it. Every removal and every kept reference gets a notice.
 fn prune_channel_references(
     root: &mut toml::Table,
     channel_type: &str,
     reason: &'static str,
     notices: &mut Vec<MigrationNotice>,
 ) {
-    if let Some(toml::Value::Table(agents)) = root.get_mut("agents") {
-        for (alias, agent) in agents.iter_mut() {
-            let Some(toml::Value::Array(channels)) = agent
-                .as_table_mut()
-                .and_then(|agent| agent.get_mut("channels"))
-            else {
+    let retired = |reference: &str| channel_reference_type(reference) == channel_type;
+    let entries = |root: &toml::Table, keep_retired: bool| -> usize {
+        expand_path(root, AGENT_CHANNEL_BINDINGS)
+            .iter()
+            .filter_map(|path| value_at(root, path).and_then(toml::Value::as_array))
+            .flatten()
+            .filter(|entry| keep_retired || !entry.as_str().is_some_and(retired))
+            .count()
+    };
+    let plan = ChannelReferencePlan::new(entries(root, true), entries(root, false));
+
+    for pattern in CHANNEL_REFERENCE_LISTS {
+        let prune = *pattern != AGENT_CHANNEL_BINDINGS || plan.prune_agent_bindings;
+        for path in expand_path(root, pattern) {
+            let joined = path.join(".");
+            let Some(toml::Value::Array(list)) = value_at_mut(root, &path) else {
                 continue;
             };
-            channels.retain(|entry| match entry.as_str() {
-                Some(reference) if channel_reference_type(reference) == channel_type => {
-                    notices.push(MigrationNotice::ReferenceRemoved {
-                        path: format!("agents.{alias}.channels"),
-                        reference: reference.to_string(),
-                        reason,
-                    });
-                    false
+            list.retain(|entry| match entry.as_str() {
+                Some(reference) if retired(reference) => {
+                    notices.push(channel_reference_notice(prune, &joined, reference, reason));
+                    !prune
                 }
                 _ => true,
             });
         }
     }
-    if let Some(toml::Value::Table(groups)) = root.get_mut("peer_groups") {
-        let bound: Vec<String> = groups
-            .iter()
-            .filter(|(_, group)| {
-                group
-                    .get("channel")
-                    .and_then(toml::Value::as_str)
-                    .is_some_and(|reference| channel_reference_type(reference) == channel_type)
-            })
-            .map(|(name, _)| name.clone())
-            .collect();
-        for name in bound {
-            groups.remove(&name);
-            notices.push(MigrationNotice::Removed {
-                path: format!("peer_groups.{name}"),
-                reason,
-            });
+    for pattern in CHANNEL_REFERENCE_BINDINGS {
+        for path in expand_path(root, pattern) {
+            if let Some(reference) = value_at(root, &path).and_then(toml::Value::as_str)
+                && retired(reference)
+            {
+                notices.push(MigrationNotice::ReferenceKept {
+                    path: path.join("."),
+                    reference: reference.to_string(),
+                    reason: KEPT_PEER_GROUP,
+                });
+            }
         }
     }
 }
@@ -1625,63 +1852,121 @@ fn prune_doc_channel_references(
     reason: &'static str,
     notices: &mut Vec<MigrationNotice>,
 ) {
-    if let Some(agents) = root
-        .get_mut("agents")
-        .and_then(toml_edit::Item::as_table_like_mut)
-    {
-        for (alias, agent) in agents.iter_mut() {
-            let alias = alias.get().to_string();
-            let Some(channels) = agent
-                .as_table_like_mut()
-                .and_then(|agent| agent.get_mut("channels"))
-                .and_then(toml_edit::Item::as_array_mut)
+    let retired = |reference: &str| channel_reference_type(reference) == channel_type;
+    let entries = |root: &toml_edit::Table, keep_retired: bool| -> usize {
+        expand_doc_path(root, AGENT_CHANNEL_BINDINGS)
+            .iter()
+            .filter_map(|path| doc_item_at(root, path).and_then(toml_edit::Item::as_array))
+            .flat_map(toml_edit::Array::iter)
+            .filter(|entry| keep_retired || !entry.as_str().is_some_and(retired))
+            .count()
+    };
+    let plan = ChannelReferencePlan::new(entries(root, true), entries(root, false));
+
+    for pattern in CHANNEL_REFERENCE_LISTS {
+        let prune = *pattern != AGENT_CHANNEL_BINDINGS || plan.prune_agent_bindings;
+        for path in expand_doc_path(root, pattern) {
+            let joined = path.join(".");
+            let Some(list) = doc_item_at_mut(root, &path).and_then(toml_edit::Item::as_array_mut)
             else {
                 continue;
             };
-            let before = channels.len();
-            channels.retain(|entry| match entry.as_str() {
-                Some(reference) if channel_reference_type(reference) == channel_type => {
-                    notices.push(MigrationNotice::ReferenceRemoved {
-                        path: format!("agents.{alias}.channels"),
-                        reference: reference.to_string(),
-                        reason,
-                    });
-                    false
+            let before = list.len();
+            list.retain(|entry| match entry.as_str() {
+                Some(reference) if retired(reference) => {
+                    notices.push(channel_reference_notice(prune, &joined, reference, reason));
+                    !prune
                 }
                 _ => true,
             });
             // The removed first entry's successor keeps the space that
             // separated it from the comma; drop it so `[ "a"]` reads `["a"]`.
-            if channels.len() != before
-                && let Some(first) = channels.get_mut(0)
+            if list.len() != before
+                && let Some(first) = list.get_mut(0)
             {
                 first.decor_mut().set_prefix("");
             }
         }
     }
-    if let Some(groups) = root
-        .get_mut("peer_groups")
-        .and_then(toml_edit::Item::as_table_like_mut)
-    {
-        let bound: Vec<String> = groups
-            .iter()
-            .filter(|(_, group)| {
-                group
-                    .as_table_like()
-                    .and_then(|group| group.get("channel"))
-                    .and_then(toml_edit::Item::as_str)
-                    .is_some_and(|reference| channel_reference_type(reference) == channel_type)
-            })
-            .map(|(name, _)| name.to_string())
-            .collect();
-        for name in bound {
-            groups.remove(&name);
-            notices.push(MigrationNotice::Removed {
-                path: format!("peer_groups.{name}"),
-                reason,
-            });
+    for pattern in CHANNEL_REFERENCE_BINDINGS {
+        for path in expand_doc_path(root, pattern) {
+            if let Some(reference) = doc_item_at(root, &path).and_then(toml_edit::Item::as_str)
+                && retired(reference)
+            {
+                notices.push(MigrationNotice::ReferenceKept {
+                    path: path.join("."),
+                    reference: reference.to_string(),
+                    reason: KEPT_PEER_GROUP,
+                });
+            }
         }
     }
+}
+
+/// The notice for one retired channel reference found in a list: removed, or
+/// kept because it is one of the last agent bindings.
+fn channel_reference_notice(
+    removed: bool,
+    path: &str,
+    reference: &str,
+    reason: &'static str,
+) -> MigrationNotice {
+    if removed {
+        MigrationNotice::ReferenceRemoved {
+            path: path.to_string(),
+            reference: reference.to_string(),
+            reason,
+        }
+    } else {
+        MigrationNotice::ReferenceKept {
+            path: path.to_string(),
+            reference: reference.to_string(),
+            reason: KEPT_LAST_BINDING,
+        }
+    }
+}
+
+/// The value at a concrete path in a parsed config.
+fn value_at<'a>(root: &'a toml::Table, path: &[String]) -> Option<&'a toml::Value> {
+    let (last, parents) = path.split_last()?;
+    let mut table = root;
+    for segment in parents {
+        table = table.get(segment)?.as_table()?;
+    }
+    table.get(last)
+}
+
+/// [`value_at`], mutably.
+fn value_at_mut<'a>(root: &'a mut toml::Table, path: &[String]) -> Option<&'a mut toml::Value> {
+    let (last, parents) = path.split_last()?;
+    let mut table = root;
+    for segment in parents {
+        table = table.get_mut(segment)?.as_table_mut()?;
+    }
+    table.get_mut(last)
+}
+
+/// [`value_at`] over a document, through every table spelling.
+fn doc_item_at<'a>(root: &'a toml_edit::Table, path: &[String]) -> Option<&'a toml_edit::Item> {
+    let (last, parents) = path.split_last()?;
+    let mut table: &dyn toml_edit::TableLike = root;
+    for segment in parents {
+        table = table.get(segment)?.as_table_like()?;
+    }
+    table.get(last)
+}
+
+/// [`doc_item_at`], mutably.
+fn doc_item_at_mut<'a>(
+    root: &'a mut toml_edit::Table,
+    path: &[String],
+) -> Option<&'a mut toml_edit::Item> {
+    let (last, parents) = path.split_last()?;
+    let mut table: &mut dyn toml_edit::TableLike = root;
+    for segment in parents {
+        table = table.get_mut(segment)?.as_table_like_mut()?;
+    }
+    table.get_mut(last)
 }
 
 /// [`expand_path`] over a document: every concrete path `pattern` matches,
@@ -1816,7 +2101,9 @@ fn keep_emptied_tables_visible(root: &mut toml_edit::Table, notices: &[Migration
             | MigrationNotice::RenameConflict { from, .. } => from,
             MigrationNotice::AssumedV1
             | MigrationNotice::InferredV3
-            | MigrationNotice::ReferenceRemoved { .. } => continue,
+            | MigrationNotice::ReferenceRemoved { .. }
+            | MigrationNotice::ReferenceKept { .. }
+            | MigrationNotice::IgnoredEnvOverride { .. } => continue,
         };
         let segments: Vec<&str> = from.split('.').collect();
         let parents = &segments[..segments.len().saturating_sub(1)];
@@ -4759,26 +5046,105 @@ mention_only = false
         assert_eq!(detect_version(&toml::from_str(raw).unwrap()).unwrap(), 1);
     }
 
-    /// A V3 alias named like a field is ambiguous only when its contents also
-    /// fit that field. `extra_headers` takes string values, so an alias of
-    /// that name holding `model = "..."` reads both ways and needs the
-    /// version. `pricing` takes numbers, so an alias named `pricing` holding
-    /// the same entry is no V2 field and is read as V3.
+    /// A V3 alias named like a map-valued field of a V2 entry reads both ways
+    /// whatever it holds, so the version is required: whether its content
+    /// happens to fit the field is not evidence of which version was meant.
+    /// Stated, it is the operator's alias. A table named like a scalar field
+    /// cannot be that field, so it stays an alias.
     #[test]
-    fn a_v3_alias_named_like_a_field_is_ambiguous_only_if_it_fits_the_field() {
-        let headers = "[providers.models.openai.extra_headers]\nmodel = \"gpt-4o\"\n";
-        assert!(detect_version(&toml::from_str(headers).unwrap()).is_err());
-        let stated = format!("schema_version = 3\n{headers}");
+    fn a_v3_alias_named_like_a_map_field_requires_an_explicit_version() {
+        for raw in [
+            "[providers.models.openai.extra_headers]\nmodel = \"gpt-4o\"\n",
+            "[providers.models.openai.pricing]\nmodel = \"gpt-4o\"\n",
+        ] {
+            assert!(
+                detect_version(&toml::from_str(raw).unwrap()).is_err(),
+                "{raw}"
+            );
+            let stated = format!("schema_version = 3\n{raw}");
+            assert_eq!(
+                detect_version(&toml::from_str(&stated).unwrap()).unwrap(),
+                3
+            );
+        }
+        let scalar_named = "[providers.models.openai.model]\nmodel = \"gpt-4o\"\n";
         assert_eq!(
-            detect_version(&toml::from_str(&stated).unwrap()).unwrap(),
-            3
-        );
-
-        let pricing = "[providers.models.openai.pricing]\nmodel = \"gpt-4o\"\n";
-        assert_eq!(
-            detect_version(&toml::from_str(pricing).unwrap()).unwrap(),
+            detect_version(&toml::from_str(scalar_named).unwrap()).unwrap(),
             INFERRED_SCHEMA_VERSION
         );
+    }
+
+    /// An empty map-valued field serializes to nothing, so it cannot be told
+    /// from its own round trip; the probe fills it in and still sees a field.
+    #[test]
+    fn an_empty_map_field_still_makes_the_shape_ambiguous() {
+        for raw in [
+            "[providers.models.openai.extra_headers]\n",
+            "[providers.models.openai.pricing]\n",
+        ] {
+            let err = detect_version(&toml::from_str(raw).unwrap())
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("schema_version = 2"), "{raw}: {err}");
+        }
+    }
+
+    /// V2-only settings in an otherwise V3-shaped file: read as V3 they would
+    /// be ignored, read as V1 the V3 sections would be reshaped, so the
+    /// version is required.
+    #[test]
+    fn a_v2_only_setting_beside_v3_sections_requires_an_explicit_version() {
+        for (raw, named) in [
+            (
+                "[providers]\napi_key = \"sk-global\"\n\n[providers.models.openai.default]\nmodel = \"gpt-4o\"\n",
+                "providers.api_key",
+            ),
+            (
+                "[providers.models.openai.default]\nmodel = \"gpt-4o\"\n\n[agents.coder]\nallowed_tools = [\"shell\"]\n",
+                "agents.coder.allowed_tools",
+            ),
+        ] {
+            let err = detect_version(&toml::from_str(raw).unwrap())
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(named), "{err}");
+        }
+        // An inert V3 tunable is not a V2 marker.
+        let raw = format!(
+            "{HAND_WRITTEN_V3_WITHOUT_VERSION}\n[agents.default]\nmax_tool_iterations = 7\n"
+        );
+        assert_eq!(
+            detect_version(&toml::from_str(&raw).unwrap()).unwrap(),
+            INFERRED_SCHEMA_VERSION
+        );
+    }
+
+    /// Every V2-only agent marker must be a key no V3 agent reads, or a V3
+    /// file using it would be refused as ambiguous.
+    #[test]
+    fn v2_only_agent_keys_are_not_v3_agent_fields() {
+        for key in V2_ONLY_AGENT_KEYS {
+            for value in [
+                toml::Value::String("x".into()),
+                toml::Value::Integer(2),
+                toml::Value::Float(0.5),
+                toml::Value::Boolean(true),
+                toml::Value::Array(vec![toml::Value::String("x".into())]),
+            ] {
+                let mut agent = toml::Table::new();
+                agent.insert((*key).to_string(), value);
+                let Ok(parsed) =
+                    toml::Value::Table(agent).try_into::<crate::schema::AliasedAgentConfig>()
+                else {
+                    continue;
+                };
+                let round_tripped = toml::Value::try_from(parsed).unwrap();
+                assert!(
+                    round_tripped.get(*key).is_none(),
+                    "`{key}` is a V3 agent field and cannot mark a file as V2"
+                );
+            }
+        }
     }
 
     /// A `schema_version` past `u32` is refused as newer than the binary, not
@@ -4911,6 +5277,9 @@ channels = ["notion.main", "telegram.main", "notion"]
 [agents.other]
 channels = ["telegram.main"]
 
+[escalation]
+alert_channels = [" notion.main", "telegram.main"]
+
 [peer_groups.notion_team]
 channel = "notion.main"
 agents = ["default"]
@@ -4929,7 +5298,10 @@ agents = ["default"]
                 MigrationNotice::Removed { path, .. } => format!("removed {path}"),
                 MigrationNotice::ReferenceRemoved {
                     path, reference, ..
-                } => format!("pruned {reference} from {path}"),
+                } => format!("pruned {} from {path}", reference.trim()),
+                MigrationNotice::ReferenceKept {
+                    path, reference, ..
+                } => format!("kept {} in {path}", reference.trim()),
                 other => panic!("unexpected notice {other:?}"),
             })
             .collect();
@@ -4937,11 +5309,15 @@ agents = ["default"]
         report
     }
 
+    /// The agent bindings and the padded escalation entry are dropped; the
+    /// peer group is a hard reference, so it is kept and reported, as the
+    /// `alias_refs` cascade refuses to delete it.
     const NOTION_RETIREMENT_REPORT: &[&str] = &[
+        "kept notion.main in peer_groups.notion_team.channel",
         "pruned notion from agents.default.channels",
         "pruned notion.main from agents.default.channels",
+        "pruned notion.main from escalation.alert_channels",
         "removed channels.notion",
-        "removed peer_groups.notion_team",
     ];
 
     #[test]
@@ -4962,7 +5338,16 @@ agents = ["default"]
             toml::Value::Array(vec!["telegram.main".into()]),
             "an agent with no notion reference is untouched"
         );
-        assert!(root["peer_groups"].get("notion_team").is_none());
+        assert_eq!(
+            root["escalation"]["alert_channels"],
+            toml::Value::Array(vec!["telegram.main".into()]),
+            "a padded reference is matched after trimming"
+        );
+        assert_eq!(
+            root["peer_groups"]["notion_team"]["channel"].as_str(),
+            Some("notion.main"),
+            "a peer group bound to the retired channel is kept for the operator"
+        );
         assert!(root["peer_groups"].get("telegram_team").is_some());
 
         // The in-place document path (`config migrate` on a V3+ file).
@@ -4970,7 +5355,7 @@ agents = ["default"]
             .unwrap()
             .unwrap();
         assert_eq!(notion_retirement_report(&notices), NOTION_RETIREMENT_REPORT);
-        assert!(!migrated.contains("notion"), "{migrated}");
+        assert!(!migrated.contains("NOTION-SENTINEL"), "{migrated}");
         assert!(migrated.contains("telegram_team"), "{migrated}");
         assert!(
             migrated.contains("channels = [\"telegram.main\"]"),
@@ -5002,8 +5387,8 @@ peer_groups = { notion_team = { channel = "notion" }, keep = { channel = "telegr
         assert_eq!(
             notion_retirement_report(&notices),
             vec![
+                "kept notion in peer_groups.notion_team.channel",
                 "pruned notion.work from agents.default.channels",
-                "removed peer_groups.notion_team",
             ]
         );
         let reparsed: toml::Value = toml::from_str(&out).unwrap();
@@ -5011,7 +5396,7 @@ peer_groups = { notion_team = { channel = "notion" }, keep = { channel = "telegr
             reparsed["agents"]["default"]["channels"],
             toml::Value::Array(vec!["telegram.main".into()])
         );
-        assert!(reparsed["peer_groups"].get("notion_team").is_none());
+        assert!(reparsed["peer_groups"].get("notion_team").is_some());
         assert!(reparsed["peer_groups"].get("keep").is_some());
 
         let value: toml::Value = toml::from_str(raw).unwrap();
@@ -5019,6 +5404,150 @@ peer_groups = { notion_team = { channel = "notion" }, keep = { channel = "telegr
             .unwrap()
             .expect("a current file holding retired references is cleaned on load");
         assert_eq!(notion_retirement_report(&notices).len(), 2);
+    }
+
+    /// Retiring a channel must not empty the last binding any agent has: with
+    /// no binding anywhere, the runtime hands every configured channel to the
+    /// fallback agent. The entry is kept and reported instead, and a current
+    /// file holding only such kept references is not rewritten.
+    #[test]
+    fn retiring_a_channel_keeps_the_last_agent_binding() {
+        let raw = r#"schema_version = 3
+
+[channels.telegram.ops]
+bot_token = "telegram-token"
+
+[agents.social]
+channels = ["notion.main"]
+"#;
+        let value: toml::Value = toml::from_str(raw).unwrap();
+        let Migrated { value, notices } = migrate_toml(value).unwrap().unwrap();
+        assert_eq!(
+            value["agents"]["social"]["channels"],
+            toml::Value::Array(vec!["notion.main".into()])
+        );
+        assert!(notices.iter().any(|n| matches!(
+            n,
+            MigrationNotice::ReferenceKept { reason, .. } if *reason == KEPT_LAST_BINDING
+        )));
+
+        let (migrated, _) = migrate_file_with_notices(raw).unwrap().unwrap();
+        assert!(
+            migrated.contains("channels = [\"notion.main\"]"),
+            "{migrated}"
+        );
+
+        let current = raw.replace("schema_version = 3", "schema_version = 4");
+        assert_eq!(
+            migrate_file_with_notices(&current).unwrap(),
+            None,
+            "a kept reference alone is not a change to write"
+        );
+    }
+
+    /// The reference sites pruned here are the ones the canonical
+    /// `alias_refs` cascade knows for a channel, with the same strength: the
+    /// lists are soft (entries dropped), the peer-group binding is hard
+    /// (never deleted). The fixture references a channel alias at every site.
+    #[test]
+    fn channel_reference_sites_match_the_alias_cascade() {
+        let cfg: Config = toml::from_str(
+            r#"
+[channels.telegram.probe]
+bot_token = "t"
+
+[agents.a]
+channels = ["telegram.probe"]
+
+[escalation]
+alert_channels = ["telegram.probe"]
+
+[peer_groups.g]
+channel = "telegram.probe"
+"#,
+        )
+        .unwrap();
+        let sites = crate::alias_refs::find_all_references(
+            &cfg,
+            &crate::alias_refs::AliasKind::Channel {
+                channel_type: "telegram".into(),
+            },
+            "probe",
+        );
+        let mut from_cascade: Vec<(String, bool)> = sites
+            .iter()
+            .map(|site| {
+                let path = site.path.split('[').next().unwrap_or(&site.path);
+                let mut segments: Vec<&str> = path.split('.').collect();
+                if matches!(segments.first(), Some(&"agents" | &"peer_groups")) {
+                    segments[1] = ANY_KEY;
+                }
+                (
+                    segments.join("."),
+                    matches!(site.strength, crate::alias_refs::RefStrength::Hard),
+                )
+            })
+            .collect();
+        from_cascade.sort();
+        from_cascade.dedup();
+        let mut ours: Vec<(String, bool)> = CHANNEL_REFERENCE_LISTS
+            .iter()
+            .map(|path| (path.join("."), false))
+            .chain(
+                CHANNEL_REFERENCE_BINDINGS
+                    .iter()
+                    .map(|path| (path.join("."), true)),
+            )
+            .collect();
+        ours.sort();
+        assert_eq!(from_cascade, ours);
+    }
+
+    /// `config migrate` keeps the pre-upgrade original once per version: a
+    /// later retirement-only migration replaces the `.backup` slot but not
+    /// the versioned copy.
+    #[test]
+    fn config_migrate_keeps_the_pre_upgrade_original() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        let original = "schema_version = 3\n\n[security.nevis]\nenabled = true\n";
+        std::fs::write(&path, original).unwrap();
+        migrate_file_in_place(&path)
+            .unwrap()
+            .expect("a V3 file migrates");
+        let versioned = dir.path().join("config.toml.v3.backup");
+        assert_eq!(std::fs::read_to_string(&versioned).unwrap(), original);
+
+        // A retired key pasted back into the V4 file: the next migration is
+        // retirement-only and replaces `.backup`, not the versioned copy.
+        let mut current = std::fs::read_to_string(&path).unwrap();
+        current.push_str("\n[security.nevis]\nenabled = true\n");
+        std::fs::write(&path, &current).unwrap();
+        migrate_file_in_place(&path)
+            .unwrap()
+            .expect("the retired key is removed");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("config.toml.backup")).unwrap(),
+            current
+        );
+        assert_eq!(std::fs::read_to_string(&versioned).unwrap(), original);
+    }
+
+    #[test]
+    fn a_retired_key_is_recognized_at_and_under_its_path() {
+        let summary = [
+            "runtime_profiles",
+            "fast",
+            "context_compression",
+            "summary_model",
+        ];
+        assert!(retired_key_covering(&summary).is_some());
+        assert!(retired_key_covering(&["security", "nevis", "client_secret"]).is_some());
+        assert!(retired_key_covering(&["channels", "notion", "main", "token"]).is_some());
+        assert!(
+            retired_key_covering(&["runtime_profiles", "fast", "max_tool_iterations"]).is_none()
+        );
+        assert!(retired_key_covering(&["security"]).is_none());
     }
 
     #[test]

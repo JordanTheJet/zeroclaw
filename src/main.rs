@@ -121,10 +121,6 @@ use std::sync::Arc;
 #[cfg(feature = "agent-runtime")]
 use zeroclaw_config::api_error::{ConfigApiCode, ConfigApiError};
 
-/// Resolve a `cli-*` Fluent key for CLI output. Routes through the runtime
-/// i18n catalogue under `agent-runtime` (default + CI/release); without that
-/// feature the runtime crate is absent, so the English `fallback` is used.
-#[allow(unused_variables)]
 /// Localized, operator-facing text for one config migration notice about the
 /// config file at `path`. Printed on stderr: the matching WARN record is
 /// hidden without `-v`, and these report config the operator wrote being
@@ -165,6 +161,27 @@ fn migration_notice_text(notice: &crate::config::migration::MigrationNotice, pat
             ],
             format!("warning: removed `{reference}` from `{key}` in {path}: {reason}"),
         ),
+        MigrationNotice::ReferenceKept {
+            path: key,
+            reference,
+            reason,
+        } => ta(
+            "cli-config-retired-reference-kept",
+            &[
+                ("reference", reference),
+                ("key", key),
+                ("path", path),
+                ("reason", reason),
+            ],
+            format!(
+                "warning: kept `{reference}` in `{key}` in {path} although its channel is retired: {reason}"
+            ),
+        ),
+        MigrationNotice::IgnoredEnvOverride { variable, reason } => ta(
+            "cli-config-env-override-retired",
+            &[("variable", variable), ("reason", reason)],
+            format!("warning: ignored `{variable}`, which sets a retired config key: {reason}"),
+        ),
         MigrationNotice::Renamed { from, to, reason } => ta(
             "cli-config-retired-key-renamed",
             &[
@@ -190,6 +207,10 @@ fn migration_notice_text(notice: &crate::config::migration::MigrationNotice, pat
     }
 }
 
+/// Resolve a `cli-*` Fluent key for CLI output. Routes through the runtime
+/// i18n catalogue under `agent-runtime` (default + CI/release); without that
+/// feature the runtime crate is absent, so the English `fallback` is used.
+#[allow(unused_variables)]
 fn t(key: &str, fallback: &str) -> String {
     #[cfg(feature = "agent-runtime")]
     {
@@ -6442,16 +6463,24 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
         for notice in &config.migration_notices {
             eprintln!("{}", migration_notice_text(notice, &path));
         }
-        eprintln!(
-            "{}",
-            ta(
-                "cli-config-migration-pending",
-                &[("path", &path)],
-                format!(
-                    "warning: these changes apply to this run only. Run `zeroclaw config migrate` to write them to {path}."
-                ),
-            )
-        );
+        // Only a change to the file can be written; an ignored environment
+        // variable or a kept reference is for the operator to fix.
+        if config
+            .migration_notices
+            .iter()
+            .any(crate::config::migration::MigrationNotice::changes_file)
+        {
+            eprintln!(
+                "{}",
+                ta(
+                    "cli-config-migration-pending",
+                    &[("path", &path)],
+                    format!(
+                        "warning: these changes apply to this run only. Run `zeroclaw config migrate` to write them to {path}."
+                    ),
+                )
+            );
+        }
     }
     #[cfg(feature = "agent-runtime")]
     observability::runtime_trace::init_from_config(&config.observability, &config.data_dir);

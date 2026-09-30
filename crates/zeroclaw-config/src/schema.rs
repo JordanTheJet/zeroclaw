@@ -25467,6 +25467,12 @@ impl Config {
         // emit a body-newer-than-label file. See `save_dirty` and.
         config_to_save.schema_version = crate::migration::CURRENT_SCHEMA_VERSION;
         let config_path = self.resolve_config_path_for_save().await?;
+        let existing = if config_path.exists() {
+            fs::read_to_string(&config_path).await.unwrap_or_default()
+        } else {
+            String::new()
+        };
+        prepare_on_disk_config_for_save(&config_path, &existing).await?;
         let zeroclaw_dir = config_path
             .parent()
             .context("Config path must have a parent directory")?;
@@ -25514,11 +25520,6 @@ impl Config {
 
         // If an existing config file is present, sync the new values onto it
         // to preserve comments and formatting. Otherwise, use the fresh serialization.
-        let existing = if config_path.exists() {
-            fs::read_to_string(&config_path).await.unwrap_or_default()
-        } else {
-            String::new()
-        };
         let mut doc: toml_edit::DocumentMut = if existing.is_empty() {
             new_toml
                 .parse()
@@ -25569,6 +25570,27 @@ impl Config {
             return result;
         }
 
+        let existing = fs::read_to_string(&config_path).await.with_context(|| {
+            format!(
+                "Failed to read existing config for incremental save: {}",
+                config_path.display()
+            )
+        })?;
+        if prepare_on_disk_config_for_save(&config_path, &existing).await?
+            == OnDiskConfig::NeedsStructuralMigration
+        {
+            // An incremental save edits the file in place and can only retire
+            // keys. A V1 or V2 file needs the structural migration first, and
+            // some keys it would retire are still live inputs to that step
+            // (`[identity]`, an agent's `max_tool_iterations`). The running
+            // config was migrated when it was loaded, so write all of it.
+            let result = self.save().await;
+            if result.is_ok() {
+                self.clear_dirty();
+            }
+            return result;
+        }
+
         let mut config_to_save = self.clone();
         let zeroclaw_dir = config_path
             .parent()
@@ -25597,12 +25619,6 @@ impl Config {
             .and_then(|v| v.try_into().ok())
             .unwrap_or_default();
 
-        let existing = fs::read_to_string(&config_path).await.with_context(|| {
-            format!(
-                "Failed to read existing config for incremental save: {}",
-                config_path.display()
-            )
-        })?;
         let mut doc: toml_edit::DocumentMut = existing
             .parse()
             .context("Failed to parse existing config for incremental save")?;
@@ -25643,6 +25659,98 @@ impl Config {
     }
 }
 
+/// What a save may do with the config file already on disk.
+#[derive(Debug, PartialEq, Eq)]
+enum OnDiskConfig {
+    /// Missing, empty, current, or old enough that reaching the current
+    /// schema only retires keys: the save can edit it in place.
+    Editable,
+    /// V1 or V2: only the typed migration reads it correctly, so it must be
+    /// rewritten whole from the (already migrated) running config.
+    NeedsStructuralMigration,
+}
+
+/// Check the config file on disk before a save rewrites it, and keep a copy
+/// of it if this is the first time the current binary rewrites a file of its
+/// version.
+///
+/// A file whose version cannot be determined (an unversioned file of
+/// ambiguous shape) or is newer than this binary is refused: the running
+/// config was not read from it, so a save would relabel it and overwrite what
+/// this binary could not read. A file below the current version is copied to
+/// `<name>.v<version>.backup` before anything touches it. That copy is written
+/// once and never replaced, so later saves and migrations cannot overwrite the
+/// original the way they replace the single `.backup` slot.
+async fn prepare_on_disk_config_for_save(
+    config_path: &Path,
+    existing: &str,
+) -> Result<OnDiskConfig> {
+    if existing.trim().is_empty() {
+        return Ok(OnDiskConfig::Editable);
+    }
+    // A file that does not parse is left to the save's own parse, which
+    // reports it.
+    let Ok(value) = toml::from_str::<toml::Value>(existing) else {
+        return Ok(OnDiskConfig::Editable);
+    };
+    let version = crate::migration::detect_version(&value).with_context(|| {
+        format!(
+            "refusing to save over {}: its schema version could not be determined",
+            config_path.display()
+        )
+    })?;
+    let current = crate::migration::CURRENT_SCHEMA_VERSION;
+    if version > current {
+        anyhow::bail!(
+            "refusing to save over {}: it is schema_version {version}, newer than this binary \
+             supports ({current}), so saving would drop the settings this binary cannot read",
+            config_path.display()
+        );
+    }
+    if version < current {
+        keep_pre_upgrade_backup(config_path, version).await?;
+    }
+    Ok(
+        if version < crate::migration::FIRST_RETIREMENT_ONLY_VERSION {
+            OnDiskConfig::NeedsStructuralMigration
+        } else {
+            OnDiskConfig::Editable
+        },
+    )
+}
+
+/// [`crate::migration::keep_version_backup`] for async callers: copy
+/// `config_path` to `<name>.v<version>.backup` unless that copy already
+/// exists. The copy keeps the file's permissions, since it holds the same
+/// secrets.
+pub async fn keep_pre_upgrade_backup(config_path: &Path, version: u32) -> Result<()> {
+    let backup = crate::migration::version_backup_path(config_path, version)?;
+    if fs::try_exists(&backup).await.unwrap_or(false) {
+        return Ok(());
+    }
+    fs::copy(config_path, &backup).await.with_context(|| {
+        format!(
+            "failed to keep a copy of {} as {} before saving over it",
+            config_path.display(),
+            backup.display()
+        )
+    })?;
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_outcome(::zeroclaw_log::EventOutcome::Success)
+            .with_attrs(::serde_json::json!({
+                "backup_path": backup.display().to_string(),
+                "from_version": version,
+            })),
+        &format!(
+            "Kept a copy of the schema V{version} config as {} before saving over it",
+            backup.display()
+        )
+    );
+    Ok(())
+}
+
 /// Log each retired key a save removed from `config.toml`. Called only once
 /// the file is durably replaced: a failed write leaves the retired keys on
 /// disk and must not claim otherwise.
@@ -25654,7 +25762,9 @@ fn log_retirements_saved(retired: &[crate::migration::MigrationNotice]) {
             crate::migration::MigrationNotice::Renamed { from, .. }
             | crate::migration::MigrationNotice::RenameConflict { from, .. } => from.as_str(),
             crate::migration::MigrationNotice::AssumedV1
-            | crate::migration::MigrationNotice::InferredV3 => continue,
+            | crate::migration::MigrationNotice::InferredV3
+            | crate::migration::MigrationNotice::ReferenceKept { .. }
+            | crate::migration::MigrationNotice::IgnoredEnvOverride { .. } => continue,
         };
         ::zeroclaw_log::record!(
             INFO,
@@ -25664,11 +25774,7 @@ fn log_retirements_saved(retired: &[crate::migration::MigrationNotice]) {
                     "retired_config": path,
                     "notice": notice,
                 })),
-            &format!(
-                "Updated config.toml on save: {}. Backups taken before this save \
-                 still carry the original value.",
-                notice.message()
-            )
+            &format!("Updated config.toml on save: {}.", notice.message())
         );
     }
 }
@@ -40525,19 +40631,24 @@ channel = "telegram.main"
         config
     }
 
+    /// The agent's retired channel entry is gone from the written file and
+    /// its reload; the peer group bound to it is a hard reference and is
+    /// kept for the operator; the live telegram references stay.
     fn assert_retired_channel_references_gone(written: &str) {
-        assert!(!written.contains("notion"), "got:\n{written}");
-        assert!(
-            written.contains("telegram.main") && written.contains("telegram_team"),
-            "the live telegram references must stay; got:\n{written}"
+        let on_disk: toml::Value = toml::from_str(written).unwrap();
+        assert_eq!(
+            on_disk["agents"]["default"]["channels"],
+            toml::Value::Array(vec!["telegram.main".into()]),
+            "got:\n{written}"
         );
+        assert!(written.contains("telegram_team"), "got:\n{written}");
         let reloaded =
             crate::migration::migrate_to_current(written).expect("the written file loads");
         assert_eq!(
             reloaded.agents["default"].channels,
             vec![crate::providers::ChannelRef::new("telegram.main")]
         );
-        assert!(!reloaded.peer_groups.contains_key("notion_team"));
+        assert!(reloaded.peer_groups.contains_key("notion_team"));
         assert!(reloaded.peer_groups.contains_key("telegram_team"));
     }
 
@@ -40587,6 +40698,97 @@ channel = "telegram.main"
             "a successful save clears the dirty set"
         );
         assert_retired_channel_references_gone(&std::fs::read_to_string(&config_path).unwrap());
+    }
+
+    /// A V2 file the daemon has only migrated in memory. Its `[identity]` and
+    /// the agent's `max_tool_iterations` are live V2 inputs that the V2 -> V3
+    /// step moves; an incremental save must not delete them as retired keys.
+    const V2_FILE_WITH_STRUCTURAL_INPUTS: &str = "schema_version = 2\n\n\
+        # Identity for every agent.\n\
+        [identity]\nformat = \"openclaw\"\n\n\
+        [agents.helper]\nprovider = \"openai\"\nmodel = \"gpt-4o-mini\"\n\
+        max_tool_iterations = 42\n";
+
+    #[test]
+    async fn save_dirty_over_a_v2_file_rewrites_it_from_the_migrated_config() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, V2_FILE_WITH_STRUCTURAL_INPUTS).unwrap();
+        let mut config = crate::migration::migrate_to_current(V2_FILE_WITH_STRUCTURAL_INPUTS)
+            .expect("the V2 file loads, migrated in memory");
+        config.config_path = config_path.clone();
+        config.mark_dirty("observability.backend");
+        config.save_dirty().await.unwrap();
+
+        let written = std::fs::read_to_string(&config_path).unwrap();
+        let reloaded = crate::migration::migrate_to_current(&written).expect("it reloads");
+        assert_eq!(
+            reloaded.schema_version,
+            crate::migration::CURRENT_SCHEMA_VERSION
+        );
+        assert!(
+            reloaded
+                .agents
+                .values()
+                .any(|agent| agent.identity.format == "openclaw"),
+            "the V2 identity must survive, lifted into the agents; got:\n{written}"
+        );
+        assert!(
+            reloaded
+                .runtime_profiles
+                .values()
+                .any(|profile| profile.max_tool_iterations == 42),
+            "the agent's V2 iteration limit must survive in its runtime profile; got:\n{written}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("config.toml.v2.backup")).unwrap(),
+            V2_FILE_WITH_STRUCTURAL_INPUTS,
+            "the V2 original is kept before it is rewritten"
+        );
+    }
+
+    /// A file whose version the load could not determine (so the running
+    /// config is defaults) or that is newer than this binary must not be
+    /// saved over: that would relabel it and drop what this binary did not
+    /// read. Both save paths refuse and leave it byte for byte.
+    #[test]
+    async fn saves_refuse_a_file_of_unknown_or_newer_version() {
+        for original in [
+            "[providers.models.openai.extra_headers]\nX-Trace = \"keep\"\n",
+            "schema_version = 9\n\n[security]\ntrust_daemon_uid = false\n",
+        ] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config_path = tmp.path().join("config.toml");
+            std::fs::write(&config_path, original).unwrap();
+            let mut config = Config {
+                config_path: config_path.clone(),
+                ..Config::default()
+            };
+            config.mark_dirty("observability.backend");
+            assert!(config.save_dirty().await.is_err(), "{original}");
+            assert!(config.save().await.is_err(), "{original}");
+            assert_eq!(std::fs::read_to_string(&config_path).unwrap(), original);
+        }
+    }
+
+    /// The first save over a V3 file keeps its original as
+    /// `config.toml.v3.backup`; a later save never replaces that copy.
+    #[test]
+    async fn the_first_save_over_a_v3_file_keeps_it() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = seed_config_with_legacy_nevis_table(tmp.path());
+        let original = std::fs::read_to_string(tmp.path().join("config.toml")).unwrap();
+        config.save().await.unwrap();
+        let backup = tmp.path().join("config.toml.v3.backup");
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), original);
+
+        std::fs::write(tmp.path().join("config.toml"), "schema_version = 3\n").unwrap();
+        config.save().await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&backup).unwrap(),
+            original,
+            "the versioned copy is written once"
+        );
     }
 
     #[test]
@@ -43669,7 +43871,10 @@ model = "gpt-4o"
         // the new-file fallback to full save().
         std::fs::write(
             &config_path,
-            "schema_version = 9\n\n[observability]\nbackend = \"none\"\n",
+            format!(
+                "schema_version = {}\n\n[observability]\nbackend = \"none\"\n",
+                crate::migration::CURRENT_SCHEMA_VERSION
+            ),
         )
         .unwrap();
 
@@ -43729,7 +43934,10 @@ model = "gpt-4o"
         // the new-file fallback to full save().
         std::fs::write(
             &config_path,
-            "schema_version = 9\n\n[observability]\nbackend = \"none\"\n",
+            format!(
+                "schema_version = {}\n\n[observability]\nbackend = \"none\"\n",
+                crate::migration::CURRENT_SCHEMA_VERSION
+            ),
         )
         .unwrap();
 
@@ -43764,7 +43972,10 @@ model = "gpt-4o"
         // the new-file fallback to full save().
         std::fs::write(
             &config_path,
-            "schema_version = 9\n\n[observability]\nbackend = \"none\"\n",
+            format!(
+                "schema_version = {}\n\n[observability]\nbackend = \"none\"\n",
+                crate::migration::CURRENT_SCHEMA_VERSION
+            ),
         )
         .unwrap();
 
