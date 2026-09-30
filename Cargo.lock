@@ -14569,8 +14569,10 @@ dependencies = [
 name = "zeroclaw-rpc-client"
 version = "0.8.5"
 dependencies = [
+ "libc",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "zeroclaw-api",
  "zeroclaw-rpc-proto",

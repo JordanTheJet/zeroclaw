@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -17,6 +17,8 @@ use zeroclaw_api::jsonrpc::{
 };
 use zeroclaw_rpc_proto::types::{InitializeParams, InitializeResult};
 use zeroclaw_rpc_proto::{Method, RPC_PROTOCOL_VERSION};
+
+use crate::verify::{EndpointOwner, EndpointRejection, verify_local_endpoint};
 
 /// How long the `initialize` round trip may take before the dial fails.
 pub const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -50,6 +52,12 @@ pub const INBOUND_REQUEST_REJECTED: i32 = -32050;
 pub enum ClientError {
     /// The transport failed while dialing or writing.
     Io(std::io::Error),
+    /// The local endpoint could not be proven to belong to the expected
+    /// account, so the dial ended before the credential was written.
+    UntrustedEndpoint {
+        endpoint: PathBuf,
+        rejection: EndpointRejection,
+    },
     /// The daemon answered `initialize` with something this client cannot use.
     Handshake(String),
     /// The daemon returned a JSON-RPC error.
@@ -69,6 +77,14 @@ impl fmt::Display for ClientError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io(e) => write!(f, "transport error: {e}"),
+            Self::UntrustedEndpoint {
+                endpoint,
+                rejection,
+            } => write!(
+                f,
+                "refusing to send a credential to core endpoint {}: {rejection}",
+                endpoint.display()
+            ),
             Self::Handshake(msg) => write!(f, "initialize failed: {msg}"),
             Self::Rpc(e) => write!(f, "daemon returned error {}: {}", e.code, e.message),
             Self::Timeout { method, after } => {
@@ -233,6 +249,10 @@ pub struct ConnectOptions {
     pub client_capabilities: Option<Value>,
     /// Ceiling for the handshake; [`DEFAULT_HANDSHAKE_TIMEOUT`] when unset.
     pub handshake_timeout: Option<Duration>,
+    /// The account that must serve the endpoint before
+    /// [`RpcClient::connect_local`] sends `auth_token` to it, checked on
+    /// every dial. [`RpcClient::connect_over`] does not consult it.
+    pub endpoint_owner: EndpointOwner,
 }
 
 impl ConnectOptions {
@@ -336,13 +356,35 @@ fn route_frame(
 
 impl RpcClient {
     /// Dial the daemon's local endpoint and complete the handshake.
+    ///
+    /// When `options` carries an `auth_token`, the endpoint must first prove,
+    /// through the kernel, that `options.endpoint_owner` serves it; otherwise
+    /// the stream is closed with nothing written and the dial fails with
+    /// [`ClientError::UntrustedEndpoint`]. Every call checks again, so a
+    /// reconnect loop re-verifies each new dial. A dial without a token
+    /// presents no credential and is not gated: the daemon authenticates it
+    /// by the peer credential it reads on its own side, which is how a
+    /// `[users]` roster member reaches a daemon running as another account.
     pub async fn connect_local(path: &Path, options: ConnectOptions) -> Result<Self, ClientError> {
         let stream = open_local_stream(path).await?;
+        if options.auth_token.is_some() {
+            verify_local_endpoint(&stream, path, options.endpoint_owner)
+                .await
+                .map_err(|rejection| ClientError::UntrustedEndpoint {
+                    endpoint: path.to_path_buf(),
+                    rejection,
+                })?;
+        }
         Self::connect_over(stream, options).await
     }
 
     /// Run the handshake over an already-open byte stream: a socket, a pipe,
     /// or the daemon's in-process duplex.
+    ///
+    /// The stream is trusted as given: nothing here checks who is on the
+    /// other end. Dial an operating-system endpoint with
+    /// [`RpcClient::connect_local`], which verifies it before a credential
+    /// leaves the client.
     pub async fn connect_over<S>(stream: S, options: ConnectOptions) -> Result<Self, ClientError>
     where
         S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
@@ -1004,6 +1046,262 @@ mod tests {
         .await
         .expect("peer receives every refusal");
         assert_eq!(rejected.load(Ordering::Relaxed), refused);
+    }
+
+    /// Record every byte a client writes and answer its `initialize`, until
+    /// the client closes the stream.
+    async fn record_and_answer<S>(stream: S) -> Vec<u8>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        let (read_half, mut write_half) = tokio::io::split(stream);
+        let mut reader = BufReader::new(read_half);
+        let mut seen = Vec::new();
+        while let Some(line) = read_frame(&mut reader).await {
+            seen.extend_from_slice(line.as_bytes());
+            let Ok(frame) = serde_json::from_str::<Value>(line.trim()) else {
+                continue;
+            };
+            if frame.get("method").and_then(Value::as_str) == Some("initialize") {
+                let response = json!({
+                    "jsonrpc": "2.0", "id": frame["id"],
+                    "result": {
+                        "protocol_version": 1, "server_version": "test", "server_pid": 7,
+                        "capabilities": [], "principal_id": "shared-operator", "commands": [],
+                    },
+                });
+                let _ = write_half
+                    .write_all(format!("{response}\n").as_bytes())
+                    .await;
+            }
+        }
+        seen
+    }
+
+    async fn bytes_seen(peer: JoinHandle<Vec<u8>>) -> Vec<u8> {
+        tokio::time::timeout(Duration::from_secs(5), peer)
+            .await
+            .expect("the client closes the stream")
+            .expect("peer task")
+    }
+
+    fn with_token() -> ConnectOptions {
+        ConnectOptions {
+            auth_token: Some("bearer-secret".to_string()),
+            ..ConnectOptions::default()
+        }
+    }
+
+    /// Serve one connection on a socket bound at `path`.
+    #[cfg(unix)]
+    fn listen_once(path: &Path) -> JoinHandle<Vec<u8>> {
+        let listener = tokio::net::UnixListener::bind(path).expect("bind test socket");
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            record_and_answer(stream).await
+        })
+    }
+
+    /// A directory under `root` with exactly `mode`.
+    #[cfg(unix)]
+    fn dir_with_mode(root: &Path, name: &str, mode: u32) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = root.join(name);
+        std::fs::create_dir(&dir).expect("create dir");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode)).expect("chmod");
+        std::fs::canonicalize(&dir).expect("canonical dir")
+    }
+
+    /// This process's uid, as the owner of a directory it just created.
+    #[cfg(unix)]
+    fn own_uid(dir: &Path) -> u32 {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(dir).expect("tempdir metadata").uid()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_credential_is_never_written_to_an_endpoint_of_another_account() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("daemon.sock");
+        let peer = listen_once(&path);
+        let own = own_uid(dir.path());
+        // The listener runs as this account, so expecting any other uid puts
+        // the client exactly where it would be facing another user's socket.
+        let other = own.wrapping_add(1);
+        let options = ConnectOptions {
+            endpoint_owner: EndpointOwner::Uid(other),
+            ..with_token()
+        };
+        match RpcClient::connect_local(&path, options).await {
+            Err(error @ ClientError::UntrustedEndpoint { .. }) => {
+                let message = error.to_string();
+                let ClientError::UntrustedEndpoint {
+                    endpoint,
+                    rejection,
+                } = error
+                else {
+                    unreachable!()
+                };
+                assert_eq!(endpoint, path);
+                assert_eq!(
+                    rejection,
+                    EndpointRejection::PeerUid {
+                        expected: other,
+                        actual: own
+                    }
+                );
+                assert!(
+                    message.contains(&format!("served by uid {own}, expected {other}")),
+                    "{message}"
+                );
+            }
+            Err(other) => panic!("expected UntrustedEndpoint, got {other}"),
+            Ok(_) => panic!("the dial must be refused"),
+        }
+        assert!(
+            bytes_seen(peer).await.is_empty(),
+            "not one byte may reach an unverified endpoint"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_same_account_endpoint_in_a_private_directory_receives_the_credential() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("daemon.sock");
+        let peer = listen_once(&path);
+        let client = RpcClient::connect_local(&path, with_token())
+            .await
+            .expect("a verified endpoint completes the handshake");
+        assert_eq!(client.handshake().server_version, "test");
+        drop(client);
+        let seen = String::from_utf8(bytes_seen(peer).await).expect("utf-8 frames");
+        assert!(seen.contains("\"auth_token\":\"bearer-secret\""), "{seen}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_socket_in_a_directory_other_accounts_can_write_is_refused() {
+        // Group-writable, other-writable, and `/tmp`-style sticky.
+        for mode in [0o770, 0o707, 0o1777] {
+            let root = tempfile::tempdir().expect("tempdir");
+            let shared = dir_with_mode(root.path(), "shared", mode);
+            let path = shared.join("daemon.sock");
+            let peer = listen_once(&path);
+            match RpcClient::connect_local(&path, with_token()).await {
+                Err(ClientError::UntrustedEndpoint { rejection, .. }) => assert_eq!(
+                    rejection,
+                    EndpointRejection::DirectoryWritable {
+                        dir: shared.clone(),
+                        mode
+                    },
+                    "mode {mode:o}"
+                ),
+                Err(other) => panic!("mode {mode:o}: expected UntrustedEndpoint, got {other}"),
+                Ok(_) => panic!("mode {mode:o}: the dial must be refused"),
+            }
+            assert!(bytes_seen(peer).await.is_empty(), "mode {mode:o}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn every_dial_verifies_the_endpoint_again() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let path = root.path().join("daemon.sock");
+        let options = with_token();
+
+        let first = listen_once(&path);
+        let client = RpcClient::connect_local(&path, options.clone())
+            .await
+            .expect("the original endpoint verifies");
+        drop(client);
+        assert!(!bytes_seen(first).await.is_empty());
+
+        // The endpoint is replaced: the same path now leads to a listener
+        // in a directory any account can write. Nothing from the first
+        // dial may carry over to the second.
+        let shared = dir_with_mode(root.path(), "shared", 0o777);
+        let replacement = shared.join("daemon.sock");
+        let second = listen_once(&replacement);
+        std::fs::remove_file(&path).expect("remove the original socket");
+        std::os::unix::fs::symlink(&replacement, &path).expect("redirect the path");
+        match RpcClient::connect_local(&path, options).await {
+            Err(ClientError::UntrustedEndpoint { rejection, .. }) => assert_eq!(
+                rejection,
+                EndpointRejection::DirectoryWritable {
+                    dir: shared,
+                    mode: 0o777
+                }
+            ),
+            Err(other) => panic!("expected UntrustedEndpoint, got {other}"),
+            Ok(_) => panic!("the replaced endpoint must be refused"),
+        }
+        assert!(bytes_seen(second).await.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_dial_without_a_token_is_not_gated() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let own = own_uid(root.path());
+        let shared = dir_with_mode(root.path(), "shared", 0o777);
+        let path = shared.join("daemon.sock");
+        let _peer = listen_once(&path);
+        // Every check would fail here; a tokenless dial runs none of them.
+        let options = ConnectOptions {
+            endpoint_owner: EndpointOwner::Uid(own.wrapping_add(1)),
+            ..ConnectOptions::default()
+        };
+        let client = RpcClient::connect_local(&path, options)
+            .await
+            .expect("a tokenless dial behaves as before");
+        assert_eq!(client.handshake().server_version, "test");
+    }
+
+    #[cfg(windows)]
+    fn serve_pipe_once(name: &str) -> JoinHandle<Vec<u8>> {
+        use tokio::net::windows::named_pipe::ServerOptions;
+        let server = ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(name)
+            .expect("create test pipe");
+        tokio::spawn(async move {
+            server.connect().await.expect("client connects");
+            record_and_answer(server).await
+        })
+    }
+
+    #[cfg(windows)]
+    fn test_pipe_name(tag: &str) -> String {
+        format!(r"\\.\pipe\zeroclaw-rpc-client-{tag}-{}", std::process::id())
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_refuses_a_credential_dial_it_cannot_verify() {
+        let name = test_pipe_name("credential");
+        let peer = serve_pipe_once(&name);
+        match RpcClient::connect_local(Path::new(&name), with_token()).await {
+            Err(ClientError::UntrustedEndpoint { rejection, .. }) => {
+                assert_eq!(rejection, EndpointRejection::Unsupported);
+            }
+            Err(other) => panic!("expected UntrustedEndpoint, got {other}"),
+            Ok(_) => panic!("an unverifiable pipe must not receive a credential"),
+        }
+        assert!(bytes_seen(peer).await.is_empty());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_dials_without_a_token_as_before() {
+        let name = test_pipe_name("tokenless");
+        let _peer = serve_pipe_once(&name);
+        let client = RpcClient::connect_local(Path::new(&name), ConnectOptions::default())
+            .await
+            .expect("a tokenless dial behaves as before");
+        assert_eq!(client.handshake().server_version, "test");
     }
 
     #[tokio::test]

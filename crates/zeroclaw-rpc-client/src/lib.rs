@@ -12,7 +12,9 @@
 //! [`RpcClient::connect_over`] accepts any byte stream, so the same client
 //! serves the gateway's in-process seam today and the separate gateway
 //! process later; [`RpcClient::connect_local`] dials the daemon endpoint
-//! that [`endpoint::resolve_socket_path`] names.
+//! that [`endpoint::resolve_socket_path`] names, and before it sends a
+//! credential there it checks with the kernel that the expected account
+//! serves the endpoint (see [`verify`]).
 
 // Like `apps/zerocode`, this is a standalone RPC client: it must not link
 // `zeroclaw-log`, so it cannot use `::zeroclaw_spawn::spawn!`, and its two
@@ -24,10 +26,12 @@
 pub mod backoff;
 pub mod client;
 pub mod endpoint;
+pub mod verify;
 
 pub use backoff::Backoff;
 pub use client::{
     ClientError, ConnectOptions, ConnectionState, DEFAULT_HANDSHAKE_TIMEOUT,
     DEFAULT_REQUEST_TIMEOUT, InboundRequest, Notification, RpcClient,
 };
+pub use verify::{EndpointOwner, EndpointRejection};
 pub use zeroclaw_rpc_proto::{Method, RPC_PROTOCOL_VERSION};
