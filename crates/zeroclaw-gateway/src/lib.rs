@@ -33,6 +33,8 @@ pub mod api_webauthn;
 pub mod api_webhook;
 pub mod auth_rate_limit;
 pub mod canvas;
+#[cfg(test)]
+mod core_parity_tests;
 pub mod core_rpc;
 pub mod node_tool;
 pub mod nodes;
