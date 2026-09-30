@@ -6,10 +6,10 @@
 //! the connected socket's peer uid must be the expected account, and the
 //! directory holding the socket must belong to that account with no group or
 //! other write access, so no other account can have placed or swapped the
-//! socket. Both checks run on every dial that carries a credential,
-//! reconnects included, and there is no switch that skips them. Windows
-//! cannot prove the pipe server's account from here yet, so it refuses
-//! credential-bearing dials instead.
+//! socket. Both checks run on every dial that carries a credential (a
+//! bearer, a TUI signature, or forwarded environment), reconnects included,
+//! and there is no switch that skips them. Windows cannot prove the pipe
+//! server's account from here yet, so it refuses those dials instead.
 //!
 //! What this cannot tell apart: two processes of the same account. Malware
 //! running as the core's own user can read its configuration and tokens
@@ -100,7 +100,9 @@ fn check_peer_uid(expected: u32, actual: u32) -> Result<(), EndpointRejection> {
 /// The directory holding the socket must belong to the expected account and
 /// be writable by nobody else. The sticky bit is no exemption: it stops
 /// others from removing the socket, not from binding the path first while
-/// the daemon is down.
+/// the daemon is down. A root-owned directory is refused too, although only
+/// root could plant a socket there; a launcher that places the socket in one
+/// must pass root's uid or move the socket.
 #[cfg(unix)]
 fn check_socket_dir(
     dir: &Path,
@@ -147,6 +149,10 @@ pub(crate) async fn verify_local_endpoint(
     use std::os::unix::fs::MetadataExt;
 
     let expected = owner.expected_uid();
+    // The kernel reports the account of the process that called `listen()`.
+    // The daemon binds and listens itself, so that is the daemon. A socket
+    // handed over by an activating supervisor running as root would report
+    // uid 0 and be refused here.
     let peer = stream
         .peer_cred()
         .map_err(|e| EndpointRejection::PeerUnknown(e.to_string()))?;
@@ -224,6 +230,8 @@ mod tests {
     #[test]
     fn a_directory_others_can_write_is_refused_even_when_sticky() {
         let dir = Path::new("/srv/zc");
+        // `metadata.mode()` carries the file-type bits (0o40000 for a
+        // directory); the check must ignore them.
         for mode in [0o720, 0o702, 0o770, 0o777, 0o1777, 0o40770] {
             let rejection = check_socket_dir(dir, 501, 501, mode).expect_err("writable");
             assert_eq!(
