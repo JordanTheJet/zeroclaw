@@ -1,4 +1,4 @@
-//! Release invariant: the macOS desktop sidecar must contain the dashboard.
+//! Release invariant: every desktop sidecar must contain the dashboard.
 
 use std::{fs, path::Path};
 
@@ -169,4 +169,69 @@ fn desktop_dashboard_smoke_launches_like_a_fresh_install() {
             && script.contains("grep -Fq 'id=\"root\"'"),
         "the dashboard smoke must require a successful SPA response"
     );
+}
+
+#[test]
+fn linux_and_windows_desktop_sidecars_embed_the_web_artifact() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workflow = fs::read_to_string(root.join(".github/workflows/release-stable-manual.yml"))
+        .expect("release workflow should be readable");
+    let linux_job = workflow
+        .split_once("\n  build-desktop-linux:\n")
+        .and_then(|(_, rest)| rest.split_once("\n  build-desktop-windows:\n"))
+        .map(|(job, _)| job)
+        .expect("Linux desktop release job should exist");
+    let windows_job = workflow
+        .split_once("\n  build-desktop-windows:\n")
+        .and_then(|(_, rest)| rest.split_once("\n  sbom:\n"))
+        .map(|(job, _)| job)
+        .expect("Windows desktop release job should exist");
+
+    for (platform, job, triple, kernel) in [
+        (
+            "Linux",
+            linux_job,
+            "x86_64-unknown-linux-gnu",
+            "zeroclaw-x86_64-unknown-linux-gnu",
+        ),
+        (
+            "Windows",
+            windows_job,
+            "x86_64-pc-windows-msvc",
+            "zeroclaw-x86_64-pc-windows-msvc.exe",
+        ),
+    ] {
+        assert!(
+            job.contains("needs: [validate, web]"),
+            "{platform} desktop release must wait for the canonical web-dist artifact"
+        );
+        let restore = job
+            .find("uses: actions/download-artifact@")
+            .unwrap_or_else(|| panic!("{platform} desktop release must restore web-dist"));
+        assert!(
+            job[restore..].contains("name: web-dist") && job[restore..].contains("path: web/dist/"),
+            "{platform} desktop release must restore web-dist at the embedded-web source path"
+        );
+        let stage = job
+            .find(&format!(
+                "prepare-kernel.sh --target {triple} --features embedded-web"
+            ))
+            .unwrap_or_else(|| {
+                panic!("{platform} desktop kernel must enable the embedded-web Cargo feature")
+            });
+        let smoke = job
+            .find(&format!(
+                "scripts/desktop/smoke-dashboard.sh apps/tauri/binaries/{kernel}"
+            ))
+            .unwrap_or_else(|| {
+                panic!("{platform} desktop release must smoke test the staged sidecar")
+            });
+        let bundle = job
+            .find("- name: Build Tauri app (bundled kernel)")
+            .unwrap_or_else(|| panic!("{platform} desktop release must bundle the sidecar"));
+        assert!(
+            restore < stage && stage < smoke && smoke < bundle,
+            "{platform} desktop release must restore web-dist, stage, smoke test, then bundle"
+        );
+    }
 }
