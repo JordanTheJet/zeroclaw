@@ -155,6 +155,61 @@ fn detect_restart_uncached() -> RestartInfo {
     }
 }
 
+// ── Desktop package ownership ────────────────────────────────────
+
+/// The ZeroClaw Desktop app executable. Every desktop package (the macOS
+/// `.app`, the Linux `.deb` and AppImage, and the Windows installers) places
+/// it in the same directory as the kernel sidecar it bundles.
+const DESKTOP_APP_EXECUTABLE: &str = if cfg!(windows) {
+    "zeroclaw-desktop.exe"
+} else {
+    "zeroclaw-desktop"
+};
+
+/// Whether the kernel executable at `exe` was installed by a ZeroClaw Desktop
+/// package, i.e. the desktop app executable sits beside it (or beside the
+/// file a symlink resolves to). A kernel installed separately, even one the
+/// desktop app launches and supervises, has no such sibling.
+fn desktop_package_owns(exe: &std::path::Path) -> bool {
+    let beside_desktop_app = |path: &std::path::Path| {
+        path.parent()
+            .is_some_and(|dir| dir.join(DESKTOP_APP_EXECUTABLE).is_file())
+    };
+    beside_desktop_app(exe)
+        || std::fs::canonicalize(exe).is_ok_and(|real| beside_desktop_app(&real))
+}
+
+/// Whether the running kernel belongs to a ZeroClaw Desktop package. Swapping
+/// it in place would leave the app and its kernel on different versions (and,
+/// on macOS, modify a signed bundle), so the desktop app's own installer owns
+/// its upgrades. Cached: the executable's location is fixed for the process
+/// lifetime.
+pub fn desktop_bundled() -> bool {
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        zeroclaw_runtime::restart::recorded_launch_executable()
+            .map(std::path::Path::to_path_buf)
+            .or_else(|| std::env::current_exe().ok())
+            .is_some_and(|exe| desktop_package_owns(&exe))
+    })
+}
+
+const SELF_UPGRADE_DISABLED: &str =
+    "self-upgrade is disabled; set gateway.allow_self_upgrade = true to enable it";
+const SELF_UPGRADE_DESKTOP_BUNDLED: &str =
+    "this ZeroClaw was installed by ZeroClaw Desktop; update the desktop app to upgrade it";
+
+/// Why `POST /api/version/upgrade` must refuse to swap the binary, if it must.
+fn self_upgrade_refusal(allow_self_upgrade: bool, desktop_bundled: bool) -> Option<&'static str> {
+    if !allow_self_upgrade {
+        Some(SELF_UPGRADE_DISABLED)
+    } else if desktop_bundled {
+        Some(SELF_UPGRADE_DESKTOP_BUNDLED)
+    } else {
+        None
+    }
+}
+
 // ── Version check ────────────────────────────────────────────────
 
 /// Parsed output of `zeroclaw update --check --json`. Field names must match
@@ -412,11 +467,9 @@ pub async fn handle_version_upgrade(
         }
     };
 
-    if !state.config.read().gateway.allow_self_upgrade {
-        return json_error(
-            StatusCode::FORBIDDEN,
-            "self-upgrade is disabled; set gateway.allow_self_upgrade = true to enable it",
-        );
+    let allow_self_upgrade = state.config.read().gateway.allow_self_upgrade;
+    if let Some(refusal) = self_upgrade_refusal(allow_self_upgrade, desktop_bundled()) {
+        return json_error(StatusCode::FORBIDDEN, refusal);
     }
 
     let restart = detect_restart();
@@ -979,5 +1032,94 @@ mod tests {
             } => assert!(standalone_shutdown_tx.is_none()),
             _ => panic!("expected SelfRespawn"),
         }
+    }
+
+    /// Lay out an install directory holding a kernel executable and, when
+    /// `with_desktop_app`, the desktop app executable beside it.
+    fn install_dir(with_desktop_app: bool) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("create install dir");
+        let kernel = dir.path().join(if cfg!(windows) {
+            "zeroclaw.exe"
+        } else {
+            "zeroclaw"
+        });
+        std::fs::write(&kernel, b"kernel").expect("write kernel");
+        if with_desktop_app {
+            std::fs::write(dir.path().join(DESKTOP_APP_EXECUTABLE), b"app")
+                .expect("write desktop app");
+        }
+        (dir, kernel)
+    }
+
+    #[test]
+    fn kernel_beside_the_desktop_app_is_desktop_package_owned() {
+        let (_dir, kernel) = install_dir(true);
+        assert!(desktop_package_owns(&kernel));
+    }
+
+    #[test]
+    fn separately_installed_kernel_is_not_desktop_package_owned() {
+        // A kernel on PATH that the desktop app launches and supervises has
+        // no desktop app beside it and keeps its in-app upgrade.
+        let (_dir, kernel) = install_dir(false);
+        assert!(!desktop_package_owns(&kernel));
+    }
+
+    #[test]
+    fn desktop_app_name_must_be_the_executable_not_a_directory() {
+        let (dir, kernel) = install_dir(false);
+        std::fs::create_dir(dir.path().join(DESKTOP_APP_EXECUTABLE))
+            .expect("create look-alike directory");
+        assert!(!desktop_package_owns(&kernel));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_to_a_bundled_kernel_is_desktop_package_owned() {
+        let (_bundle, kernel) = install_dir(true);
+        let bin = tempfile::tempdir().expect("create bin dir");
+        let link = bin.path().join("zeroclaw");
+        std::os::unix::fs::symlink(&kernel, &link).expect("link kernel onto PATH");
+        assert!(desktop_package_owns(&link));
+    }
+
+    #[test]
+    fn self_upgrade_refusal_keeps_the_config_gate_first() {
+        assert_eq!(
+            self_upgrade_refusal(false, false),
+            Some(SELF_UPGRADE_DISABLED)
+        );
+        assert_eq!(
+            self_upgrade_refusal(false, true),
+            Some(SELF_UPGRADE_DISABLED)
+        );
+    }
+
+    #[test]
+    fn self_upgrade_refusal_blocks_only_desktop_package_kernels() {
+        assert_eq!(
+            self_upgrade_refusal(true, true),
+            Some(SELF_UPGRADE_DESKTOP_BUNDLED)
+        );
+        // Enabled and not package-owned: the swap proceeds, whether or not a
+        // desktop supervisor restarts the process afterwards.
+        assert_eq!(self_upgrade_refusal(true, false), None);
+    }
+
+    #[test]
+    fn desktop_app_executable_matches_the_tauri_package() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let manifest = std::fs::read_to_string(root.join("apps/tauri/Cargo.toml"))
+            .expect("desktop app manifest should be readable");
+        assert!(
+            manifest.contains("name = \"zeroclaw-desktop\""),
+            "desktop packages install the app as `zeroclaw-desktop`; update DESKTOP_APP_EXECUTABLE if the package is renamed"
+        );
+        let config = std::fs::read_to_string(root.join("apps/tauri/tauri.conf.json"))
+            .expect("desktop app config should be readable");
+        assert!(
+            !config.contains("mainBinaryName"),
+            "a Tauri `mainBinaryName` renames the installed app executable; update DESKTOP_APP_EXECUTABLE to match"
+        );
     }
 }
