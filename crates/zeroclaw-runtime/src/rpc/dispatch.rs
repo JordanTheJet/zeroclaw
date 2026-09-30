@@ -12220,6 +12220,57 @@ mod tests {
         assert_eq!(err.code, AUTH_REQUIRED);
     }
 
+    /// A local dispatcher plus the receiver that keeps its outbound channel
+    /// open for the duration of the test.
+    fn local_dispatcher() -> (RpcDispatcher, tokio::sync::mpsc::Receiver<String>) {
+        let ctx = enforcement_ctx(zeroclaw_config::schema::Config::default());
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        (RpcDispatcher::new(ctx, tx, "unix:test".into()), rx)
+    }
+
+    #[tokio::test]
+    async fn initialize_refuses_an_incompatible_protocol_version_in_either_spelling() {
+        let incompatible = RPC_PROTOCOL_VERSION + 1;
+        for key in ["protocol_version", "protocolVersion"] {
+            let (mut dispatcher, _rx) = local_dispatcher();
+            let err = dispatcher
+                .handle_initialize(&json!({ key: incompatible }))
+                .await
+                .expect_err("an incompatible protocol version must be refused");
+            assert_eq!(err.code, VERSION_MISMATCH, "{key}: {}", err.message);
+            assert!(
+                err.message.contains(&format!("client={incompatible}")),
+                "{key}: {}",
+                err.message
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn initialize_accepts_the_current_protocol_version_in_either_spelling() {
+        for key in ["protocol_version", "protocolVersion"] {
+            let (mut dispatcher, _rx) = local_dispatcher();
+            let result = dispatcher
+                .handle_initialize(&json!({ key: RPC_PROTOCOL_VERSION }))
+                .await
+                .unwrap_or_else(|e| panic!("{key}: {}", e.message));
+            assert_eq!(result["protocol_version"], json!(RPC_PROTOCOL_VERSION));
+        }
+    }
+
+    #[tokio::test]
+    async fn initialize_rejects_both_protocol_version_spellings_as_invalid_params() {
+        let (mut dispatcher, _rx) = local_dispatcher();
+        let err = dispatcher
+            .handle_initialize(&json!({
+                "protocol_version": RPC_PROTOCOL_VERSION,
+                "protocolVersion": RPC_PROTOCOL_VERSION
+            }))
+            .await
+            .expect_err("two spellings of the protocol version are ambiguous");
+        assert_eq!(err.code, INVALID_PARAMS, "{}", err.message);
+    }
+
     #[tokio::test]
     async fn local_initialize_with_no_roster_keeps_legacy_behavior() {
         let ctx = enforcement_ctx(zeroclaw_config::schema::Config::default());

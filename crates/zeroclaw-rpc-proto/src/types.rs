@@ -51,7 +51,11 @@ macro_rules! rpc_type {
 
 rpc_type! {
     pub struct InitializeParams {
-        #[serde(default = "default_protocol_version")]
+        // `protocolVersion` is the spelling the handshake docs used to show.
+        // Read it so a mismatched version is refused instead of being
+        // ignored as an unknown key and defaulting to the server's version.
+        // Sending both spellings is rejected as a duplicate field.
+        #[serde(default = "default_protocol_version", alias = "protocolVersion")]
         pub protocol_version: u64,
         /// TUI ID from a previous connection (reconnection).
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1869,6 +1873,44 @@ mod tests {
         // to `1` so the handshake succeeds without an explicit version.
         let p: InitializeParams = serde_json::from_value(json!({})).unwrap();
         assert_eq!(p.protocol_version, 1);
+    }
+
+    #[test]
+    fn initialize_params_reads_the_camel_case_protocol_version() {
+        // A client following the old handshake example sends
+        // `protocolVersion`; its value must reach the version check rather
+        // than be dropped as an unknown key.
+        let p: InitializeParams = serde_json::from_value(json!({"protocolVersion": 2})).unwrap();
+        assert_eq!(p.protocol_version, 2);
+    }
+
+    #[test]
+    fn initialize_params_rejects_both_protocol_version_spellings() {
+        let err = serde_json::from_value::<InitializeParams>(json!({
+            "protocol_version": 1,
+            "protocolVersion": 1
+        }))
+        .expect_err("two spellings of one field are ambiguous");
+        assert!(
+            err.to_string()
+                .contains("duplicate field `protocol_version`"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn initialize_params_serializes_only_the_snake_case_spelling() {
+        let v = serde_json::to_value(InitializeParams {
+            protocol_version: 1,
+            tui_id: None,
+            tui_sig: None,
+            env: std::collections::HashMap::new(),
+            client_capabilities: None,
+            auth_token: None,
+            auth_provider: None,
+        })
+        .unwrap();
+        assert_eq!(v, json!({"protocol_version": 1}));
     }
 
     #[test]
