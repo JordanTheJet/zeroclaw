@@ -15,14 +15,28 @@
 //!
 //! No credential-less connection, ever. A request whose credential is absent,
 //! blank, malformed, or selects a provider that cannot verify a bearer is
-//! answered `401` before any connection is opened or reused. A credential the
-//! core refuses, at the handshake or on a later call, is answered `401` (`403`
-//! when the principal lacks a grant) and its connection leaves the pool; the
-//! request is never retried without the credential or with another one. This
-//! matters beyond the in-process transport, which already refuses an
-//! anonymous `initialize`: on a Unix socket the core admits a same-uid peer
-//! that presents nothing as the shared operator, and with no user roster it
-//! admits any local peer through local compatibility.
+//! answered `401` before any connection is opened or reused. That check is
+//! local and covers shape only: whether a well-formed bearer is valid, and
+//! whether a well-formed `oidc.<alias>` names a configured provider, is the
+//! core's call, made on one dial that presents the credential. A credential
+//! the core refuses, at the handshake or on a later call, is answered `401`
+//! (`403` when the principal lacks a grant) and its connection leaves the
+//! pool; the request is never retried without the credential or with another
+//! one. While the core is unreachable a well-formed credential cannot be
+//! judged and is answered `503`. This matters beyond the in-process transport,
+//! which already refuses an anonymous `initialize`: on a Unix socket the core
+//! admits a same-uid peer that presents nothing as the shared operator, and
+//! with no user roster it admits any local peer through local compatibility.
+//!
+//! Only the pool initializes a connection, with the credential its key was
+//! derived from; a request can never send `initialize` and rebind it.
+//!
+//! The pool holds at most `MAX_CREDENTIALS` open connections, counting one
+//! that is being dialed and one a request still holds after it left the pool.
+//! A connection takes its capacity before it is dialed and returns it only
+//! when it closes. When the pool is full, the least recently used connection
+//! no request holds is closed to make room; if every connection is in use,
+//! the request waits briefly and is then answered `503 core_busy`.
 //!
 //! Two cases stay in-process. With pairing disabled and no provider selected
 //! the caller presents no credential by design, so the request is served by
@@ -43,20 +57,24 @@ use axum::response::{IntoResponse, Response};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::io::DuplexStream;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::Instant;
 use zeroclaw_api::jsonrpc::JsonRpcError;
 use zeroclaw_api::jsonrpc::error_codes::{
     AUTH_REQUIRED, CONNECTION_LIMIT_REACHED, FORBIDDEN, FS_INVALID_PATH, FS_NOT_FOUND,
-    FS_PERMISSION_DENIED, INVALID_PARAMS, METHOD_NOT_FOUND, SESSION_BUSY, SESSION_LIMIT_REACHED,
-    SESSION_NOT_FOUND, SESSION_NOT_OWNED, SOP_ALREADY_EXISTS, SOP_NOT_FOUND, VERSION_MISMATCH,
+    FS_PERMISSION_DENIED, INTERNAL_ERROR, INVALID_PARAMS, INVALID_REQUEST, METHOD_NOT_FOUND,
+    SESSION_BUSY, SESSION_LIMIT_REACHED, SESSION_NOT_FOUND, SESSION_NOT_OWNED, SOP_ALREADY_EXISTS,
+    SOP_NOT_FOUND, VERSION_MISMATCH,
 };
 use zeroclaw_rpc_client::{ClientError, ConnectOptions, ConnectionState, Method, RpcClient};
 use zeroclaw_runtime::rpc::inproc::InprocConnector;
 
 use crate::principal_gate::AUTH_PROVIDER_HEADER;
 
-/// Distinct credentials holding a core connection at once.
+/// Core connections open at once, one per credential.
 const MAX_CREDENTIALS: usize = 64;
+/// How long a request waits for capacity when every connection is in use.
+const CAPACITY_WAIT: Duration = Duration::from_secs(5);
 /// A credential's connection leaves the pool after this long unused.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// How often the idle sweep runs.
@@ -76,6 +94,10 @@ const OIDC_PROVIDER_PREFIX: &str = "oidc.";
 /// gateway's existing denial.
 const PAIR_FIRST_MESSAGE: &str =
     "Unauthorized — pair first via POST /pair, then send Authorization: Bearer <token>";
+/// The 401 message for a missing or unusable bearer under an OIDC
+/// selection, where pairing is not how a caller gets one.
+const OIDC_BEARER_MESSAGE: &str =
+    "Unauthorized — send Authorization: Bearer <access token> for the selected auth provider";
 /// The 401 message for a provider header naming no bearer provider,
 /// unchanged from the config route layer's.
 const INVALID_PROVIDER_MESSAGE: &str = "Invalid auth_provider selection";
@@ -105,14 +127,16 @@ pub struct CoreRpc {
 
 struct Seam {
     pool: Arc<Pool>,
-    /// Whether pairing is required, read from the live pairing authority on
-    /// every request rather than captured at startup.
+    /// Whether pairing is required, asked of the same pairing authority the
+    /// in-process routes check, on every request. The authority fixes the
+    /// setting for its daemon generation; a reload brings a new one.
     pairing_required: Box<dyn Fn() -> bool + Send + Sync>,
 }
 
 impl CoreRpc {
     /// Serve RPC-backed routes through the daemon's in-process connector.
-    /// `pairing_required` reads the live pairing authority.
+    /// `pairing_required` asks the pairing authority the in-process routes
+    /// use.
     pub fn inproc(
         connector: InprocConnector,
         pairing_required: impl Fn() -> bool + Send + Sync + 'static,
@@ -146,9 +170,10 @@ impl CoreRpc {
         if provider.is_none() && !(seam.pairing_required)() {
             return Ok(CoreAccess::InProcess);
         }
+        let provider = provider.unwrap_or(NATIVE_PROVIDER);
         let credential = HttpCredential {
-            provider: provider.unwrap_or(NATIVE_PROVIDER),
-            token: bearer(headers)?,
+            provider,
+            token: bearer(headers, provider)?,
         };
         Arc::clone(&seam.pool)
             .acquire(&credential)
@@ -192,6 +217,8 @@ pub enum CoreError {
     Forbidden(String),
     /// The core could not be reached.
     Unavailable(String),
+    /// Every core connection the gateway may hold is in use.
+    Busy,
     /// The core did not answer in time.
     Timeout,
     /// Any other refusal from the core, mapped by its code.
@@ -213,6 +240,7 @@ impl CoreError {
             Self::AuthRequired(_) => (StatusCode::UNAUTHORIZED, "auth_required"),
             Self::Forbidden(_) => (StatusCode::FORBIDDEN, "forbidden"),
             Self::Unavailable(_) => (StatusCode::SERVICE_UNAVAILABLE, "core_unavailable"),
+            Self::Busy => (StatusCode::SERVICE_UNAVAILABLE, "core_busy"),
             Self::Timeout => (StatusCode::GATEWAY_TIMEOUT, "core_timeout"),
             Self::Rpc(error) => rpc_status(error.code),
         }
@@ -244,6 +272,7 @@ impl IntoResponse for CoreError {
             Self::AuthRequired(message) | Self::Forbidden(message) | Self::Unavailable(message) => {
                 message
             }
+            Self::Busy => "every core connection is in use; retry shortly".to_owned(),
             Self::Timeout => "the core did not answer in time".to_owned(),
             Self::Rpc(error) => error.message,
         };
@@ -279,9 +308,15 @@ fn provider_selection(headers: &HeaderMap) -> Result<Option<&str>, CoreError> {
 }
 
 /// The caller's bearer: non-empty, printable ASCII with no whitespace, and
-/// bounded in length. Anything else is refused before the core sees it.
-fn bearer(headers: &HeaderMap) -> Result<&str, CoreError> {
-    let refused = || CoreError::AuthRequired(PAIR_FIRST_MESSAGE.into());
+/// bounded in length. Anything else is refused before the core sees it, with
+/// the hint that fits the selected provider.
+fn bearer<'h>(headers: &'h HeaderMap, provider: &str) -> Result<&'h str, CoreError> {
+    let hint = if provider == NATIVE_PROVIDER {
+        PAIR_FIRST_MESSAGE
+    } else {
+        OIDC_BEARER_MESSAGE
+    };
+    let refused = || CoreError::AuthRequired(hint.into());
     let token = crate::api::extract_bearer_token(headers).ok_or_else(refused)?;
     if token.is_empty()
         || token.len() > MAX_BEARER_BYTES
@@ -332,6 +367,7 @@ struct PoolLimits {
     max_credentials: usize,
     idle_timeout: Duration,
     sweep_interval: Duration,
+    capacity_wait: Duration,
 }
 
 impl Default for PoolLimits {
@@ -340,6 +376,7 @@ impl Default for PoolLimits {
             max_credentials: MAX_CREDENTIALS,
             idle_timeout: IDLE_TIMEOUT,
             sweep_interval: SWEEP_INTERVAL,
+            capacity_wait: CAPACITY_WAIT,
         }
     }
 }
@@ -347,16 +384,27 @@ impl Default for PoolLimits {
 struct Pool {
     dialer: Box<dyn Dial>,
     limits: PoolLimits,
+    /// One permit per open core connection. A connection takes its permit
+    /// before it is dialed and returns it when it closes.
+    capacity: Arc<Semaphore>,
     slots: Mutex<HashMap<PoolKey, Arc<Slot>>>,
 }
 
-/// One credential's place in the pool. Its connection closes when the slot
-/// leaves the pool and no request still holds it.
+/// A core connection and the capacity it occupies. Held by its slot and by
+/// every request using it; the connection closes, and its capacity returns,
+/// when the last of them lets go.
+struct PooledClient {
+    client: RpcClient,
+    /// Released on drop, whoever drops the connection last.
+    _capacity: OwnedSemaphorePermit,
+}
+
+/// One credential's place in the pool.
 struct Slot {
     /// Serializes dials for this credential, so concurrent first requests
     /// share one connection.
     dial_lock: tokio::sync::Mutex<()>,
-    client: Mutex<Option<Arc<RpcClient>>>,
+    client: Mutex<Option<Arc<PooledClient>>>,
     last_used: Mutex<Instant>,
 }
 
@@ -377,11 +425,18 @@ impl Slot {
         lock(&self.last_used).elapsed()
     }
 
-    fn live_client(&self) -> Option<Arc<RpcClient>> {
+    fn live_client(&self) -> Option<Arc<PooledClient>> {
         lock(&self.client)
             .as_ref()
-            .filter(|client| client.state() == ConnectionState::Connected)
+            .filter(|pooled| pooled.client.state() == ConnectionState::Connected)
             .cloned()
+    }
+
+    /// Whether a request still holds this slot's connection.
+    fn leased(&self) -> bool {
+        lock(&self.client)
+            .as_ref()
+            .is_some_and(|pooled| Arc::strong_count(pooled) > 1)
     }
 }
 
@@ -394,6 +449,7 @@ impl Pool {
         Self {
             dialer,
             limits,
+            capacity: Arc::new(Semaphore::new(limits.max_credentials)),
             slots: Mutex::new(HashMap::new()),
         }
     }
@@ -414,20 +470,33 @@ impl Pool {
             )
         };
         slot.touch();
-        if let Some(client) = slot.live_client() {
-            return Ok(self.call(key, slot, client));
+        if let Some(pooled) = slot.live_client() {
+            return Ok(self.call(key, slot, pooled));
         }
 
         let dialing_slot = Arc::clone(&slot);
         let _dialing = dialing_slot.dial_lock.lock().await;
-        if let Some(client) = slot.live_client() {
-            return Ok(self.call(key, slot, client));
+        if let Some(pooled) = slot.live_client() {
+            return Ok(self.call(key, slot, pooled));
         }
+        // A connection that ended gives its capacity back before this
+        // credential asks for new capacity.
+        drop(lock(&slot.client).take());
+        let capacity = match self.reserve(&key).await {
+            Ok(capacity) => capacity,
+            Err(error) => {
+                self.forget(&key, &slot);
+                return Err(error);
+            }
+        };
         match self.dial(credential).await {
             Ok(client) => {
-                *lock(&slot.client) = Some(Arc::clone(&client));
-                self.enforce_cap(&key);
-                Ok(self.call(key, slot, client))
+                let pooled = Arc::new(PooledClient {
+                    client,
+                    _capacity: capacity,
+                });
+                *lock(&slot.client) = Some(Arc::clone(&pooled));
+                Ok(self.call(key, slot, pooled))
             }
             Err(error) => {
                 self.forget(&key, &slot);
@@ -436,17 +505,61 @@ impl Pool {
         }
     }
 
-    fn call(self: &Arc<Self>, key: PoolKey, slot: Arc<Slot>, client: Arc<RpcClient>) -> CoreCall {
+    /// Capacity for one more connection. When none is free, close the least
+    /// recently used connection no request holds; when every connection is
+    /// in use, wait briefly for one to close.
+    async fn reserve(&self, dialing: &PoolKey) -> Result<OwnedSemaphorePermit, CoreError> {
+        loop {
+            if let Ok(permit) = Arc::clone(&self.capacity).try_acquire_owned() {
+                return Ok(permit);
+            }
+            if !self.evict_one_unleased(dialing) {
+                break;
+            }
+        }
+        tokio::time::timeout(
+            self.limits.capacity_wait,
+            Arc::clone(&self.capacity).acquire_owned(),
+        )
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .ok_or(CoreError::Busy)
+    }
+
+    /// Close one connection no request holds, ended ones first, then the
+    /// least recently used. Returns whether one was closed.
+    fn evict_one_unleased(&self, dialing: &PoolKey) -> bool {
+        let mut slots = lock(&self.slots);
+        let victim = slots
+            .iter()
+            .filter(|(key, slot)| {
+                *key != dialing
+                    && slot.dial_lock.try_lock().is_ok()
+                    && lock(&slot.client).is_some()
+                    && !slot.leased()
+            })
+            .max_by_key(|(_, slot)| (slot.live_client().is_none(), slot.idle_for()))
+            .map(|(key, _)| key.clone());
+        victim.is_some_and(|key| slots.remove(&key).is_some())
+    }
+
+    fn call(
+        self: &Arc<Self>,
+        key: PoolKey,
+        slot: Arc<Slot>,
+        pooled: Arc<PooledClient>,
+    ) -> CoreCall {
         CoreCall {
             pool: Arc::clone(self),
             key,
             slot,
-            client,
+            pooled,
         }
     }
 
     /// Open a connection and present `credential` in its handshake.
-    async fn dial(&self, credential: &HttpCredential<'_>) -> Result<Arc<RpcClient>, CoreError> {
+    async fn dial(&self, credential: &HttpCredential<'_>) -> Result<RpcClient, CoreError> {
         let stream = match tokio::time::timeout(DIAL_TIMEOUT, self.dialer.dial()).await {
             Ok(Some(stream)) => stream,
             Ok(None) | Err(_) => {
@@ -456,7 +569,7 @@ impl Pool {
             }
         };
         match RpcClient::connect_over(stream, credential.connect_options()).await {
-            Ok(client) => Ok(Arc::new(client)),
+            Ok(client) => Ok(client),
             Err(ClientError::Rpc(error)) => {
                 ::zeroclaw_log::record!(
                     INFO,
@@ -488,30 +601,6 @@ impl Pool {
         }
     }
 
-    /// Drop the least recently used connections beyond the credential cap,
-    /// never the one `keep` just opened.
-    fn enforce_cap(&self, keep: &PoolKey) {
-        let mut slots = lock(&self.slots);
-        loop {
-            let live: Vec<(PoolKey, Duration)> = slots
-                .iter()
-                .filter(|(_, slot)| slot.live_client().is_some())
-                .map(|(key, slot)| (key.clone(), slot.idle_for()))
-                .collect();
-            if live.len() <= self.limits.max_credentials {
-                return;
-            }
-            let Some((oldest, _)) = live
-                .into_iter()
-                .filter(|(key, _)| key != keep)
-                .max_by_key(|(_, idle)| *idle)
-            else {
-                return;
-            };
-            slots.remove(&oldest);
-        }
-    }
-
     /// Remove `slot` after a failed dial, if it is still the one registered
     /// for `key` and no other dial gave it a connection.
     fn forget(&self, key: &PoolKey, slot: &Arc<Slot>) {
@@ -525,15 +614,15 @@ impl Pool {
         }
     }
 
-    /// Remove `key`'s slot if it still holds `client`.
-    fn discard(&self, key: &PoolKey, slot: &Arc<Slot>, client: &Arc<RpcClient>) {
+    /// Remove `key`'s slot if it still holds `pooled`.
+    fn discard(&self, key: &PoolKey, slot: &Arc<Slot>, pooled: &Arc<PooledClient>) {
         let mut slots = lock(&self.slots);
         let registered = slots
             .get(key)
             .is_some_and(|current| Arc::ptr_eq(current, slot));
         let holds = lock(&slot.client)
             .as_ref()
-            .is_some_and(|current| Arc::ptr_eq(current, client));
+            .is_some_and(|current| Arc::ptr_eq(current, pooled));
         if registered && holds {
             slots.remove(key);
         }
@@ -545,10 +634,12 @@ impl Pool {
     }
 
     /// Drop connections unused past the idle timeout and slots whose
-    /// connection ended. A slot that is dialing is left alone.
+    /// connection ended. A slot that is dialing, or whose live connection a
+    /// request still holds, is in use and left alone.
     fn sweep_idle_locked(&self, slots: &mut HashMap<PoolKey, Arc<Slot>>) {
         slots.retain(|_, slot| {
-            if slot.dial_lock.try_lock().is_err() {
+            if slot.dial_lock.try_lock().is_err() || (slot.leased() && slot.live_client().is_some())
+            {
                 return true;
             }
             let expired = slot.idle_for() >= self.limits.idle_timeout;
@@ -558,13 +649,19 @@ impl Pool {
         });
     }
 
-    /// Credentials currently holding a live connection.
+    /// Credentials currently holding a live connection in the pool.
     #[cfg(test)]
     fn pooled(&self) -> usize {
         lock(&self.slots)
             .values()
             .filter(|slot| slot.live_client().is_some())
             .count()
+    }
+
+    /// Open core connections, in the pool or still held by a request.
+    #[cfg(test)]
+    fn open_connections(&self) -> usize {
+        self.limits.max_credentials - self.capacity.available_permits()
     }
 }
 
@@ -587,49 +684,64 @@ pub struct CoreCall {
     pool: Arc<Pool>,
     key: PoolKey,
     slot: Arc<Slot>,
-    client: Arc<RpcClient>,
+    pooled: Arc<PooledClient>,
 }
 
 impl CoreCall {
     /// The principal the core bound this connection to.
     pub fn principal_id(&self) -> Option<&str> {
-        self.client.handshake().principal_id.as_deref()
+        self.pooled.client.handshake().principal_id.as_deref()
     }
 
     /// Send `method` on this caller's connection.
     ///
-    /// A credential the core now refuses (`AUTH_REQUIRED`: revoked, expired
-    /// or due for re-verification) ends the connection at once. A missing
-    /// grant (`FORBIDDEN`) or a lost connection takes it out of the pool.
-    /// Either way the next request dials again with the credential it
+    /// `initialize` is refused here without reaching the core: only the pool
+    /// initializes a connection, with the credential its key came from, so a
+    /// request can never rebind a connection to another credential.
+    ///
+    /// A reply from the core stands whatever happens to the connection after
+    /// it. A credential the core now refuses (`AUTH_REQUIRED`: revoked,
+    /// expired or due for re-verification) ends the connection at once; a
+    /// missing grant (`FORBIDDEN`) or a lost connection takes it out of the
+    /// pool. Either way the next request dials again with the credential it
     /// presents. Nothing is retried here.
     pub async fn request(&self, method: Method, params: Value) -> Result<Value, CoreError> {
-        match self.client.request(method, params).await {
+        if method == Method::Initialize {
+            return Err(CoreError::Rpc(JsonRpcError {
+                code: INVALID_REQUEST,
+                message: "initialize is sent only by the gateway's connection pool".into(),
+                data: None,
+            }));
+        }
+        let client = &self.pooled.client;
+        match client.request(method, params).await {
             Ok(value) => {
                 self.slot.touch();
                 Ok(value)
             }
-            // A transport that has gone away can surface as an RPC error
-            // from the client's own outbound queue; the connection state
-            // tells the two apart.
-            Err(error) if self.client.state() != ConnectionState::Connected => {
-                self.pool.discard(&self.key, &self.slot, &self.client);
-                Err(CoreError::Unavailable(format!(
-                    "the core connection was lost: {error}"
-                )))
-            }
-            Err(ClientError::Rpc(error)) => {
+            // The client synthesizes only INTERNAL_ERROR itself, for a request
+            // it could not deliver or whose connection dropped before a reply;
+            // every other code is the core's own reply.
+            Err(ClientError::Rpc(error)) if error.code != INTERNAL_ERROR => {
                 if error.code == AUTH_REQUIRED {
-                    self.pool.discard(&self.key, &self.slot, &self.client);
-                    self.client.shutdown();
-                } else if error.code == FORBIDDEN {
-                    self.pool.discard(&self.key, &self.slot, &self.client);
+                    self.pool.discard(&self.key, &self.slot, &self.pooled);
+                    client.shutdown();
+                } else if error.code == FORBIDDEN || client.state() != ConnectionState::Connected {
+                    self.pool.discard(&self.key, &self.slot, &self.pooled);
                 }
                 Err(CoreError::from_rpc(error))
             }
-            Err(ClientError::Timeout { .. }) => Err(CoreError::Timeout),
+            Err(ClientError::Rpc(error)) if client.state() == ConnectionState::Connected => {
+                Err(CoreError::from_rpc(error))
+            }
+            // A connection that did not answer is not reused: the next
+            // request dials again with its credential.
+            Err(ClientError::Timeout { .. }) => {
+                self.pool.discard(&self.key, &self.slot, &self.pooled);
+                Err(CoreError::Timeout)
+            }
             Err(error) => {
-                self.pool.discard(&self.key, &self.slot, &self.client);
+                self.pool.discard(&self.key, &self.slot, &self.pooled);
                 Err(CoreError::Unavailable(format!(
                     "the core connection was lost: {error}"
                 )))
