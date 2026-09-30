@@ -270,8 +270,9 @@ pub struct StatusResponse {
     pub check_updates: bool,
     /// Whether browser-triggered self-upgrade is enabled.
     pub allow_self_upgrade: bool,
-    /// Whether this kernel was installed by a ZeroClaw Desktop package. Such a
-    /// kernel refuses self-upgrade; updating the desktop app upgrades it.
+    /// Whether this kernel is a ZeroClaw Desktop package's sidecar: built as
+    /// one and still inside its package. Such a kernel refuses self-upgrade;
+    /// updating the desktop app upgrades it.
     pub desktop_bundled: bool,
     /// How the daemon is restarted after an upgrade: supervised, desktop_supervised,
     /// self-respawn, or manual.
