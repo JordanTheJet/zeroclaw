@@ -23,9 +23,12 @@ const ALLOWED_DEPENDENCIES: &[&str] = &[
     "zeroclaw-sop-graph",
 ];
 
-/// Direct dependencies the client crate may declare: the proto allow-list
-/// plus the async runtime it needs to drive a byte stream.
+/// Direct dependencies the client crate may declare, including under a
+/// `[target.*]` table: the proto allow-list plus the async runtime it needs to
+/// drive a byte stream, and `libc` for the effective uid its endpoint check
+/// compares the socket's peer uid with (already linked through tokio).
 const CLIENT_ALLOWED_DEPENDENCIES: &[&str] = &[
+    "libc",
     "serde",
     "serde_json",
     "tokio",
@@ -51,6 +54,18 @@ fn dependency_names(manifest: &toml::Table, table: &str) -> BTreeSet<String> {
         .and_then(|t| t.as_table())
         .map(|t| t.keys().cloned().collect())
         .unwrap_or_default()
+}
+
+/// Dependency names declared under every `[target.<cfg>.<table>]`.
+fn target_dependency_names(manifest: &toml::Table, table: &str) -> BTreeSet<String> {
+    manifest
+        .get("target")
+        .and_then(|t| t.as_table())
+        .into_iter()
+        .flat_map(|targets| targets.values())
+        .filter_map(|target| target.get(table).and_then(|t| t.as_table()))
+        .flat_map(|t| t.keys().cloned())
+        .collect()
 }
 
 #[test]
@@ -92,7 +107,10 @@ fn rpc_client_depends_only_on_foundation_crates_and_tokio() {
     let manifest = read_manifest(CLIENT_MANIFEST);
     let allowed: BTreeSet<&str> = CLIENT_ALLOWED_DEPENDENCIES.iter().copied().collect();
     for table in ["dependencies", "build-dependencies"] {
-        for dep in dependency_names(&manifest, table) {
+        let declared = dependency_names(&manifest, table)
+            .into_iter()
+            .chain(target_dependency_names(&manifest, table));
+        for dep in declared {
             assert!(
                 allowed.contains(dep.as_str()),
                 "zeroclaw-rpc-client [{table}] declares `{dep}`, which is outside its allow-list. \

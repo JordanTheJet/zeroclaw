@@ -261,6 +261,16 @@ explicitly stopped.
 - Windows named pipe: default ACL grants the creating user and `SYSTEM`
 - `SO_PEERCRED` on Linux provides the connecting process PID and UID for
   audit logging; Windows logs `pipe:local` as the peer label
+- Clients built on `zeroclaw-rpc-client` verify the endpoint before sending a
+  credential. When `initialize` would carry an `auth_token`, a TUI signature
+  or forwarded environment, the kernel's peer uid for the connected socket
+  must be the expected account (the client's own by default, or a uid the
+  launcher passes), and the socket's directory must belong to that account
+  with no group or other write access. A sticky shared directory such as
+  `/tmp` does not qualify. The check runs on every dial. On Windows,
+  credential-bearing dials are refused until the client can check the pipe
+  server's account. Dials that carry none of these are not gated. The only
+  other public constructor runs over the daemon's in-process duplex.
 
 ## Quick test
 
