@@ -47,6 +47,7 @@ fn browse_error_response(err: BrowseError) -> Response {
         BrowseError::NotFound(_) => StatusCode::NOT_FOUND,
         BrowseError::NotADirectory(_) => StatusCode::BAD_REQUEST,
         BrowseError::LinkedPath(_) => StatusCode::BAD_REQUEST,
+        BrowseError::PathTooLong => StatusCode::BAD_REQUEST,
         BrowseError::Protected(_) => StatusCode::FORBIDDEN,
         BrowseError::ProtectedFile(_) => StatusCode::FORBIDDEN,
         BrowseError::TooLarge(_, _) => StatusCode::PAYLOAD_TOO_LARGE,

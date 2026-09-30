@@ -540,10 +540,12 @@ pub async fn handle_api_channel_bind(
     };
     let (working, group, channel) = match plan {
         BindPlan::AlreadyBound(already) => return Json(already).into_response(),
+        // The route classifies the write by its effect below.
         BindPlan::Write {
             working,
             group,
             channel,
+            created: _,
         } => (*working, group, channel),
     };
 
@@ -4688,6 +4690,45 @@ mod tests {
                 .is_empty(),
             "a rejected bind must not mutate the peer group"
         );
+    }
+
+    /// `prepare_bind` says whether its write creates the peer group, the
+    /// effect the RPC surface holds the `config` verb to, and a saved bind
+    /// says a reload is due while an idempotent one does not.
+    #[tokio::test]
+    async fn a_bind_reports_its_effect_and_the_reload_it_needs() {
+        use zeroclaw_channels::control::{BindPlan, commit_bind, prepare_bind};
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(config_with_telegram_alias(&tmp, "alerts"));
+        let guard = Arc::clone(&state.config_write_lock).lock_owned().await;
+
+        for (identity, creates) in [("111111111", true), ("222222222", false)] {
+            let plan = prepare_bind(&state.config, &guard, "telegram", "alerts", identity)
+                .await
+                .unwrap_or_else(|failure| panic!("{identity}: {}", failure.message));
+            let BindPlan::Write {
+                working,
+                group,
+                channel,
+                created,
+            } = plan
+            else {
+                panic!("{identity} is not bound yet");
+            };
+            assert_eq!(created, creates, "{identity}");
+            let saved = commit_bind(&state.config, &guard, *working, group, channel, |_| {})
+                .await
+                .unwrap_or_else(|failure| panic!("{identity}: {}", failure.message));
+            assert_eq!(saved["restart_required"], true, "{saved}");
+        }
+
+        let again = prepare_bind(&state.config, &guard, "telegram", "alerts", "111111111")
+            .await
+            .unwrap_or_else(|failure| panic!("{}", failure.message));
+        let BindPlan::AlreadyBound(body) = again else {
+            panic!("the identity is already bound");
+        };
+        assert_eq!(body["restart_required"], false, "{body}");
     }
 
     /// Trust-boundary regression: binding into a `[channels.telegram.<alias>]`

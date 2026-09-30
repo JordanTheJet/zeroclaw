@@ -50,6 +50,10 @@ pub enum BrowseError {
     TooLarge(String, u64),
     #[error("'{0}' passes through a link; it cannot be modified or removed through a link")]
     LinkedPath(String),
+    #[error(
+        "path is too long: at most {MAX_PATH_COMPONENTS} components and {MAX_PATH_BYTES} bytes"
+    )]
+    PathTooLong,
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
@@ -60,7 +64,7 @@ pub fn list_directory(config: &Config, raw: &str) -> Result<BrowseResult, Browse
     let mut result = list_under_root(&config.shared_workspace_dir(), raw)?;
     if raw.trim_matches('/').is_empty() {
         for entry in &mut result.entries {
-            if entry.kind == "dir" && PROTECTED_SHARED_TOP_LEVEL.contains(&entry.name.as_str()) {
+            if entry.kind == "dir" && names_reserved(&entry.name, PROTECTED_SHARED_TOP_LEVEL) {
                 entry.protected = true;
             }
         }
@@ -114,6 +118,20 @@ fn list_under_root(root: &std::path::Path, raw: &str) -> Result<BrowseResult, Br
 }
 
 const PROTECTED_SHARED_TOP_LEVEL: &[&str] = &["skills", "skill-bundles", "knowledge"];
+
+/// The longest path, in bytes, any operation here accepts.
+pub const MAX_PATH_BYTES: usize = 4096;
+
+/// The most components a path any operation here accepts may have after `.`
+/// and `..` are folded.
+///
+/// Creating a directory or a move's destination walks the path one
+/// component at a time without following links, so, unlike one `mkdir` of
+/// the whole path, nothing on the host bounds how deep it goes. Without this
+/// a single request could create millions of nested directories and hold
+/// its worker for minutes doing it. Both bounds are well past any real
+/// workspace path and in the order of the host's own path limit.
+pub const MAX_PATH_COMPONENTS: usize = 256;
 
 /// Create a new directory at `<install>/shared/<raw>`. Idempotent — if the
 /// path already exists as a directory, returns Ok without re-creating.
@@ -171,7 +189,7 @@ pub fn remove_directory(config: &Config, raw: &str) -> Result<(), BrowseError> {
     if relative.is_empty() {
         return Err(BrowseError::Protected("shared".to_string()));
     }
-    if PROTECTED_SHARED_TOP_LEVEL.contains(&relative.as_str()) {
+    if names_reserved(&relative, PROTECTED_SHARED_TOP_LEVEL) {
         return Err(BrowseError::Protected(format!("shared/{relative}")));
     }
     let dir = open_root(&shared, raw)?;
@@ -314,7 +332,13 @@ fn confined<'a>(
 /// never on the raw input. `resolve_under` folds `..` lexically, so a raw
 /// path such as `x/..` or `x/../SOUL.md` passes a check on its own text
 /// while resolving to the root or a protected entry.
+///
+/// A path longer than [`MAX_PATH_BYTES`] or [`MAX_PATH_COMPONENTS`] is refused
+/// here, before anything else looks at it.
 fn resolve_relative(root: &std::path::Path, raw: &str) -> Result<(PathBuf, String), BrowseError> {
+    if raw.len() > MAX_PATH_BYTES {
+        return Err(BrowseError::PathTooLong);
+    }
     let resolved = resolve_under(root, raw)?;
     let normalized_root = resolve_under(root, "")?;
     let relative = resolved
@@ -322,9 +346,11 @@ fn resolve_relative(root: &std::path::Path, raw: &str) -> Result<(PathBuf, Strin
         .unwrap_or(resolved.as_path())
         .components()
         .map(|component| component.as_os_str().to_string_lossy().into_owned())
-        .collect::<Vec<_>>()
-        .join("/");
-    Ok((resolved, relative))
+        .collect::<Vec<_>>();
+    if relative.len() > MAX_PATH_COMPONENTS {
+        return Err(BrowseError::PathTooLong);
+    }
+    Ok((resolved, relative.join("/")))
 }
 
 /// The workspace root for `agent_alias`. The alias becomes a path component
@@ -362,6 +388,18 @@ fn protected_file(rel: &str) -> bool {
 
 fn protected_dir(rel: &str) -> bool {
     names_reserved(rel, AGENT_WORKSPACE_PROTECTED_DIRS)
+}
+
+/// The protected directory `relative` is or lies inside, if any. What such a
+/// directory holds is the runtime's too: `sessions/sessions.db` is the live
+/// session database, so deleting or moving it loses the history as surely as
+/// removing `sessions/` does. Protected directories are top-level, so only
+/// the first component is checked.
+fn protected_top_level_dir(relative: &str) -> Option<&str> {
+    let first = relative
+        .split_once('/')
+        .map_or(relative, |(first, _)| first);
+    protected_dir(first).then_some(first)
 }
 
 /// The protected file that creating `relative`, or moving an entry to or
@@ -545,9 +583,9 @@ pub fn delete_agent_workspace_path(
     if protected_file(&relative) {
         return Err(BrowseError::ProtectedFile(relative));
     }
-    if protected_dir(&relative) {
+    if let Some(protected) = protected_top_level_dir(&relative) {
         return Err(BrowseError::Protected(format!(
-            "agents/{agent_alias}/workspace/{relative}"
+            "agents/{agent_alias}/workspace/{protected}"
         )));
     }
     let dir = open_root(&root, raw)?;
@@ -603,14 +641,11 @@ pub fn move_agent_workspace_path(
     {
         return Err(BrowseError::ProtectedFile(protected.to_string()));
     }
-    if protected_dir(from_trimmed) || protected_dir(to_trimmed) {
+    if let Some(protected) =
+        protected_top_level_dir(from_trimmed).or(protected_top_level_dir(to_trimmed))
+    {
         return Err(BrowseError::Protected(format!(
-            "agents/{agent_alias}/workspace/{}",
-            if protected_dir(from_trimmed) {
-                from_trimmed
-            } else {
-                to_trimmed
-            }
+            "agents/{agent_alias}/workspace/{protected}"
         )));
     }
     if let Some(parent) = std::path::Path::new(to_trimmed).parent()
@@ -1063,6 +1098,24 @@ mod tests {
         }
     }
 
+    /// The shared area's protected names fold as the agent workspace's do: a
+    /// case-insensitive volume resolves `Skills` to `skills`, and Windows
+    /// drops a trailing dot or space. What they hold stays manageable.
+    #[test]
+    fn remove_directory_refuses_every_spelling_of_a_protected_name() {
+        let (dir, cfg) = fixture();
+        std::fs::create_dir_all(dir.path().join("shared/knowledge")).unwrap();
+        for name in ["Skills", "KNOWLEDGE", "skills.", "Skill-Bundles "] {
+            let err = remove_directory(&cfg, name).unwrap_err();
+            assert!(matches!(err, BrowseError::Protected(_)), "{name}: {err:?}");
+        }
+        assert!(dir.path().join("shared/skills/beta").is_dir());
+        assert!(dir.path().join("shared/knowledge").is_dir());
+
+        remove_directory(&cfg, "skills/alpha").unwrap();
+        assert!(!dir.path().join("shared/skills/alpha").exists());
+    }
+
     #[test]
     fn remove_directory_refuses_empty_path() {
         let (_dir, cfg) = fixture();
@@ -1107,6 +1160,14 @@ mod tests {
             ..Config::default()
         };
         (dir, cfg)
+    }
+
+    /// The config [`workspace_fixture`] returns, for a test that moved it.
+    fn cfg_for(dir: &TempDir) -> Config {
+        Config {
+            config_path: dir.path().join("config.toml"),
+            ..Config::default()
+        }
     }
 
     #[test]
@@ -1315,6 +1376,39 @@ mod tests {
         assert!(matches!(err, BrowseError::Protected(_)));
     }
 
+    /// `sessions/` protects what it holds: the live session database inside
+    /// it can be neither deleted nor moved out, nor can anything be moved in,
+    /// in any spelling a case-insensitive volume resolves to the same place.
+    #[test]
+    fn the_sessions_directory_protects_its_contents() {
+        let (dir, cfg) = workspace_fixture();
+        let sessions = dir.path().join("agents/alpha/workspace/sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(sessions.join("sessions.db"), b"live").unwrap();
+
+        for path in ["sessions/sessions.db", "Sessions/sessions.db", "sessions/."] {
+            let err = delete_agent_workspace_path(&cfg, "alpha", path).unwrap_err();
+            assert!(matches!(err, BrowseError::Protected(_)), "{path}: {err:?}");
+        }
+        let out =
+            move_agent_workspace_path(&cfg, "alpha", "sessions/sessions.db", "notes/moved.db")
+                .unwrap_err();
+        assert!(matches!(out, BrowseError::Protected(_)), "{out:?}");
+        let into = move_agent_workspace_path(&cfg, "alpha", "notes/draft.md", "sessions/draft.md")
+            .unwrap_err();
+        assert!(matches!(into, BrowseError::Protected(_)), "{into:?}");
+
+        assert_eq!(
+            std::fs::read(sessions.join("sessions.db")).unwrap(),
+            b"live"
+        );
+        assert!(
+            dir.path()
+                .join("agents/alpha/workspace/notes/draft.md")
+                .is_file()
+        );
+    }
+
     #[test]
     fn make_agent_workspace_directory_creates_nested_path() {
         let (dir, cfg) = workspace_fixture();
@@ -1417,8 +1511,12 @@ mod tests {
     /// destination runs through a file. They take about a
     /// second together; comparing every leading prefix against the protected
     /// names takes minutes at this length.
+    /// A path past the bound is refused before anything looks at it, so a
+    /// megabyte of path costs no more than a short one and makes nothing,
+    /// whichever operation it is handed to. Only a path's first component is
+    /// checked for a protected name, so what remains is linear too.
     #[test]
-    fn a_very_long_path_is_judged_in_linear_time() {
+    fn an_overlong_path_is_refused_before_anything_is_made() {
         assert!(
             AGENT_WORKSPACE_PROTECTED_FILES
                 .iter()
@@ -1430,41 +1528,86 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let _ = tx.send([
+                make_agent_workspace_directory(&cfg, "alpha", &deep),
                 make_agent_workspace_directory(&cfg, "alpha", &format!("SOUL.md/{deep}")),
-                make_agent_workspace_directory(&cfg, "alpha", &format!("notes/draft.md/{deep}")),
-                move_agent_workspace_path(
-                    &cfg,
-                    "alpha",
-                    "missing.txt",
-                    &format!("SOUL.md/{deep}x"),
-                ),
-                move_agent_workspace_path(
-                    &cfg,
-                    "alpha",
-                    "notes/draft.md",
-                    &format!("notes/draft.md/{deep}x"),
-                ),
+                move_agent_workspace_path(&cfg, "alpha", "notes/draft.md", &deep),
+                move_agent_workspace_path(&cfg, "alpha", &deep, "moved"),
+                delete_agent_workspace_path(&cfg, "alpha", &deep),
+                read_agent_workspace_file(&cfg, "alpha", &deep).map(|_| ()),
+                list_agent_workspace(&cfg, "alpha", &deep).map(|_| ()),
+                make_directory(&cfg, &deep),
+                remove_directory(&cfg, &deep),
             ]);
         });
-        let [protected, through_file, missing, onto_file] = rx
+        let results = rx
             .recv_timeout(std::time::Duration::from_secs(20))
-            .expect("judging a long path took more than linear time");
-        assert!(
-            matches!(&protected, Err(BrowseError::ProtectedFile(name)) if name == "SOUL.md"),
-            "{protected:?}"
-        );
-        assert!(
-            matches!(through_file, Err(BrowseError::NotADirectory(_))),
-            "{through_file:?}"
-        );
-        assert!(
-            matches!(missing, Err(BrowseError::NotFound(_))),
-            "{missing:?}"
-        );
-        assert!(onto_file.is_err(), "{onto_file:?}");
+            .expect("refusing a long path took more than linear time");
+        for result in &results {
+            assert!(
+                matches!(result, Err(BrowseError::PathTooLong)),
+                "{result:?}"
+            );
+        }
         let ws = dir.path().join("agents/alpha/workspace");
         assert!(ws.join("notes/draft.md").is_file());
         assert!(!ws.join("a").exists());
+        assert!(!dir.path().join("shared/a").exists());
+    }
+
+    /// Depth is bounded on the path as resolved, by component count, and
+    /// separately by bytes: a short path of long names is refused too, and
+    /// `..` folded away does not count against the bound.
+    #[test]
+    fn the_path_bound_counts_resolved_components_and_bytes() {
+        let (dir, cfg) = workspace_fixture();
+        let ws = dir.path().join("agents/alpha/workspace");
+
+        let too_deep = vec!["d"; MAX_PATH_COMPONENTS + 1].join("/");
+        assert!(too_deep.len() < MAX_PATH_BYTES);
+        assert!(matches!(
+            make_agent_workspace_directory(&cfg, "alpha", &too_deep),
+            Err(BrowseError::PathTooLong)
+        ));
+        assert!(!ws.join("d").exists(), "nothing made for a refused path");
+
+        let long_names = vec!["n".repeat(250); 17].join("/");
+        assert!(long_names.len() > MAX_PATH_BYTES);
+        assert!(matches!(
+            make_agent_workspace_directory(&cfg, "alpha", &long_names),
+            Err(BrowseError::PathTooLong)
+        ));
+
+        // A thousand raw components that fold to one directory are fine.
+        let folded = format!("{}kept", "x/../".repeat(500));
+        assert!(folded.len() < MAX_PATH_BYTES);
+        make_agent_workspace_directory(&cfg, "alpha", &folded).unwrap();
+        assert!(ws.join("kept").is_dir());
+    }
+
+    /// A chain at the bound is legitimate: it is created, a move into it
+    /// lands, and it is removed again, each within a bounded time on a
+    /// test thread's stack.
+    #[test]
+    fn a_path_at_the_bound_is_created_moved_into_and_removed() {
+        let (dir, cfg) = workspace_fixture();
+        let ws = dir.path().join("agents/alpha/workspace");
+        let deepest = vec!["d"; MAX_PATH_COMPONENTS].join("/");
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let made = make_agent_workspace_directory(&cfg, "alpha", &deepest);
+            let into = format!("{}/draft.md", &deepest[..deepest.len() - 2]);
+            let moved = move_agent_workspace_path(&cfg, "alpha", "notes/draft.md", &into);
+            let _ = tx.send((made, moved, into));
+        });
+        let (made, moved, into) = rx
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("a path at the bound took too long");
+        made.unwrap();
+        moved.unwrap();
+        assert!(ws.join(&into).is_file());
+
+        delete_agent_workspace_path(&cfg_for(&dir), "alpha", "d").unwrap();
+        assert!(!ws.join("d").exists());
     }
 
     #[test]

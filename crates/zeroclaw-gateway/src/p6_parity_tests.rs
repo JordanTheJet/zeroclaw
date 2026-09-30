@@ -891,7 +891,7 @@ async fn channels_bind_refuses_alike_on_both_surfaces() {
                 channel_type,
                 alias,
                 "@alice",
-                &|_: &str| Ok(()),
+                &|_: &str, _| Ok(()),
             )
             .await
             .unwrap_err();

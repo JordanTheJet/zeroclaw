@@ -386,11 +386,13 @@ pub enum BindPlan {
     /// is the response body.
     AlreadyBound(Value),
     /// Add the identity to `group`'s `external_peers`: `working` is the
-    /// config to persist.
+    /// config to persist. `created` is whether `group` is new, which makes
+    /// the write a creation rather than an update.
     Write {
         working: Box<Config>,
         group: String,
         channel: String,
+        created: bool,
     },
 }
 
@@ -458,6 +460,8 @@ pub async fn prepare_bind(
         ));
     }
 
+    let groups_before: std::collections::HashSet<String> =
+        working.peer_groups.keys().cloned().collect();
     let target = crate::orchestrator::bind_channel_identity_into(
         &mut working,
         channel_type,
@@ -485,11 +489,13 @@ pub async fn prepare_bind(
             "already_bound": true,
             "group": source,
             "channel": channel,
+            "restart_required": false,
         })));
     };
 
     Ok(BindPlan::Write {
         working: Box::new(working),
+        created: !groups_before.contains(&group),
         group,
         channel,
     })
@@ -520,11 +526,15 @@ pub async fn commit_bind(
     after_save(&working);
     *config.write() = working;
 
+    // Saved, but a running channel keeps the peer set it started with, so
+    // the caller is told a reload is due, as a relink tells it.
     Ok(serde_json::json!({
         "saved": true,
         "already_bound": false,
         "group": group,
         "channel": channel,
+        "restart_required": true,
+        "note": "reload the channels (POST /admin/reload) for the running channel to accept the identity",
     }))
 }
 
@@ -567,7 +577,10 @@ impl zeroclaw_runtime::rpc::channels::ChannelControl for ChannelsControl {
         alias: &str,
         identity: &str,
         authorize_write: &(
-             dyn for<'p> Fn(&'p str) -> Result<(), zeroclaw_api::jsonrpc::JsonRpcError>
+             dyn for<'p> Fn(
+            &'p str,
+            zeroclaw_api::grants::Verb,
+        ) -> Result<(), zeroclaw_api::jsonrpc::JsonRpcError>
                  + Send
                  + Sync
          ),
@@ -592,8 +605,14 @@ impl zeroclaw_runtime::rpc::channels::ChannelControl for ChannelsControl {
                 working,
                 group,
                 channel,
+                created,
             } => {
-                authorize_write(&BindPlan::write_path(&group))?;
+                let verb = if created {
+                    zeroclaw_api::grants::Verb::Create
+                } else {
+                    zeroclaw_api::grants::Verb::Update
+                };
+                authorize_write(&BindPlan::write_path(&group), verb)?;
                 commit_bind(config, config_write_guard, *working, group, channel, |_| {})
                     .await
                     .map_err(to_rpc)

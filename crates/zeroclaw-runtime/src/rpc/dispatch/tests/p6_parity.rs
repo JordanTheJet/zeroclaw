@@ -253,34 +253,120 @@ async fn workspace_methods_require_the_files_grant() {
     assert!(tmp.path().join("agents/alpha/workspace/notes").exists());
 }
 
-/// The wildcard selector passes any alias string, so it is the principal an
-/// alias that escapes `<install>/agents/` would have empowered.
+/// An alias that escapes `<install>/agents/` names no configured agent, so a
+/// wildcard principal is refused it at the selector; an operator, whose
+/// grants cover unconfigured aliases, is refused it by the browse layer's
+/// own alias check. Neither reaches the directory it points at.
 #[tokio::test]
-async fn a_wildcard_principal_cannot_escape_the_agents_tree_through_the_alias() {
+async fn an_alias_cannot_escape_the_agents_tree() {
     let tmp = tempfile::TempDir::new().unwrap();
     let ctx = enforcement_ctx(files_config(&tmp));
     let outside = tmp.path().join("elsewhere");
     std::fs::create_dir_all(outside.join("workspace")).unwrap();
     std::fs::write(outside.join("workspace/secret.md"), b"outside").unwrap();
     let (mut peer, mut rx) = roster_peer(&ctx, WILDCARD_UID).await;
+    let (mut operator, mut operator_rx) = local_operator(&ctx).await;
 
     let absolute = outside.to_string_lossy().to_string();
     for (id, agent) in [(1, "../elsewhere"), (2, absolute.as_str()), (3, "..")] {
-        let response = rpc(
-            &mut peer,
-            &mut rx,
-            id,
-            "fs/read",
-            json!({"agent": agent, "path": "secret.md"}),
-        )
-        .await;
+        let params = json!({"agent": agent, "path": "secret.md"});
+        let response = rpc(&mut peer, &mut rx, id, "fs/read", params.clone()).await;
+        assert_forbidden(&response, &format!("alias {agent:?}"));
+        let response = rpc(&mut operator, &mut operator_rx, id, "fs/read", params).await;
         assert_eq!(
             response["error"]["code"],
             json!(INVALID_PARAMS),
-            "alias {agent:?}: {response}"
+            "operator, alias {agent:?}: {response}"
         );
     }
     assert!(outside.join("workspace/secret.md").exists());
+}
+
+/// A wildcard selector covers every configured agent, not every string. An
+/// alias the configuration does not define still names a directory under
+/// the agents tree, a removed agent's workspace or a new one for any name,
+/// so a principal without operator grants is refused it before anything
+/// touches the disk.
+#[tokio::test]
+async fn a_wildcard_principal_reaches_only_configured_agents() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let ctx = enforcement_ctx(files_config(&tmp));
+    let retired = tmp.path().join("agents/retired/workspace");
+    std::fs::create_dir_all(&retired).unwrap();
+    std::fs::write(retired.join("secret.md"), b"retired secret").unwrap();
+    let (mut peer, mut rx) = roster_peer(&ctx, WILDCARD_UID).await;
+
+    for (id, method, params) in [
+        (
+            1,
+            "fs/read",
+            json!({"agent": "retired", "path": "secret.md"}),
+        ),
+        (
+            2,
+            "fs/delete",
+            json!({"agent": "retired", "path": "secret.md"}),
+        ),
+        (
+            3,
+            "fs/move",
+            json!({"agent": "retired", "from": "secret.md", "to": "moved.md"}),
+        ),
+        (4, "workspace/list", json!({"agent": "retired"})),
+        (5, "fs/mkdir", json!({"agent": "ghost", "path": "planted"})),
+    ] {
+        let response = rpc(&mut peer, &mut rx, id, method, params).await;
+        assert_forbidden(&response, method);
+    }
+    assert!(retired.join("secret.md").is_file());
+    assert!(!tmp.path().join("agents/ghost").exists());
+
+    let read = rpc(
+        &mut peer,
+        &mut rx,
+        6,
+        "fs/read",
+        json!({"agent": "beta", "path": "secret.md"}),
+    )
+    .await;
+    assert_eq!(read["result"]["content"], json!("beta only"), "{read}");
+}
+
+/// A path past the browse bound is an invalid path on the RPC surface, and
+/// nothing is made for it.
+#[tokio::test]
+async fn an_overdeep_path_is_refused_before_anything_is_made() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let ctx = enforcement_ctx(files_config(&tmp));
+    let (mut peer, mut rx) = roster_peer(&ctx, SCOPED).await;
+    let deep = vec!["d"; crate::browse::MAX_PATH_COMPONENTS + 1].join("/");
+
+    let made = rpc(
+        &mut peer,
+        &mut rx,
+        1,
+        "fs/mkdir",
+        json!({"agent": "alpha", "path": deep}),
+    )
+    .await;
+    let moved = rpc(
+        &mut peer,
+        &mut rx,
+        2,
+        "fs/move",
+        json!({"agent": "alpha", "from": "notes", "to": deep}),
+    )
+    .await;
+    for response in [made, moved] {
+        assert_eq!(
+            response["error"]["code"],
+            json!(zeroclaw_api::jsonrpc::error_codes::FS_INVALID_PATH),
+            "{response}"
+        );
+    }
+    let alpha = tmp.path().join("agents/alpha/workspace");
+    assert!(!alpha.join("d").exists());
+    assert!(alpha.join("notes/todo.md").is_file());
 }
 
 #[test]
@@ -881,17 +967,26 @@ impl crate::rpc::channels::ChannelControl for RecordingChannels {
 
     async fn bind(
         &self,
-        _config: &Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>,
+        config: &Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>,
         _config_write_guard: &tokio::sync::OwnedMutexGuard<()>,
         channel_type: &str,
         alias: &str,
         identity: &str,
-        authorize_write: &(dyn for<'p> Fn(&'p str) -> Result<(), JsonRpcError> + Send + Sync),
+        authorize_write: &(
+             dyn for<'p> Fn(&'p str, zeroclaw_api::grants::Verb) -> Result<(), JsonRpcError>
+                 + Send
+                 + Sync
+         ),
     ) -> Result<Value, JsonRpcError> {
-        // The path the real capability writes for a channel's own group.
-        authorize_write(&format!(
-            "peer_groups.{channel_type}_{alias}.external_peers"
-        ))?;
+        // The path and verb the real capability authorizes for a channel's
+        // own group: a creation unless the group already exists.
+        let group = format!("{channel_type}_{alias}");
+        let verb = if config.read().peer_groups.contains_key(&group) {
+            zeroclaw_api::grants::Verb::Update
+        } else {
+            zeroclaw_api::grants::Verb::Create
+        };
+        authorize_write(&format!("peer_groups.{group}.external_peers"), verb)?;
         self.calls
             .lock()
             .push(format!("bind {channel_type}.{alias} {identity}"));
@@ -1024,6 +1119,67 @@ async fn channels_bind_needs_the_peer_groups_config_write_grant() {
         vec!["list".to_string()],
         "the bind never reached the capability"
     );
+}
+
+/// A bind is a config write, so it needs what the dashboard route asks of
+/// one: the `config` verb its effect needs, not only the path. The first
+/// bind for a channel creates its peer group; a later one updates it.
+#[tokio::test]
+async fn channels_bind_needs_the_config_verb_its_effect_needs() {
+    use zeroclaw_api::grants::{Resource, Verb};
+
+    let bind = json!({"channel_type": "telegram", "alias": "main", "identity": "@alice"});
+    let with_config_verbs = |tmp: &tempfile::TempDir, verbs: Vec<Verb>, group_exists: bool| {
+        let mut config = binder_config(tmp, &["*"], &["peer_groups.*"]);
+        let grants = &mut config
+            .permission_profiles
+            .get_mut("binder")
+            .expect("binder_config defines the binder profile")
+            .grants;
+        grants.remove(&Resource::Config);
+        if !verbs.is_empty() {
+            grants.insert(Resource::Config, verbs);
+        }
+        if group_exists {
+            config
+                .peer_groups
+                .insert("telegram_main".into(), Default::default());
+        }
+        config
+    };
+
+    for (what, verbs, group_exists) in [
+        ("a path grant alone", vec![], false),
+        ("config:update for a new group", vec![Verb::Update], false),
+        (
+            "config:create for an existing group",
+            vec![Verb::Create],
+            true,
+        ),
+    ] {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (ctx, channels) = with_channels(with_config_verbs(&tmp, verbs, group_exists));
+        let (mut peer, mut rx) = roster_peer(&ctx, SCOPED).await;
+        let bound = rpc(&mut peer, &mut rx, 1, "channels/bind", bind.clone()).await;
+        assert_forbidden(&bound, what);
+        assert!(channels.calls.lock().is_empty(), "{what}: nothing bound");
+    }
+
+    for (what, verbs, group_exists) in [
+        ("config:create for a new group", vec![Verb::Create], false),
+        (
+            "config:update for an existing group",
+            vec![Verb::Update],
+            true,
+        ),
+    ] {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (ctx, channels) = with_channels(with_config_verbs(&tmp, verbs, group_exists));
+        let (mut peer, mut rx) = roster_peer(&ctx, SCOPED).await;
+        let bound = rpc(&mut peer, &mut rx, 1, "channels/bind", bind.clone()).await;
+        assert_eq!(bound["result"]["saved"], json!(true), "{what}: {bound}");
+        assert_eq!(channels.calls.lock().len(), 1, "{what}");
+    }
 }
 
 // ── System ────────────────────────────────────────────────────────────────
@@ -1561,7 +1717,10 @@ fn binder_config(
         PermissionProfileConfig {
             allowed_agents: agents.iter().map(|a| (*a).to_string()).collect(),
             config_write_paths: paths.iter().map(|p| (*p).to_string()).collect(),
-            grants: HashMap::from([(Resource::Channels, vec![Verb::Read, Verb::Update])]),
+            grants: HashMap::from([
+                (Resource::Channels, vec![Verb::Read, Verb::Update]),
+                (Resource::Config, vec![Verb::Create, Verb::Update]),
+            ]),
             ..PermissionProfileConfig::default()
         },
     );
@@ -2179,7 +2338,11 @@ impl crate::rpc::channels::ChannelControl for ParkingChannels {
         channel_type: &str,
         alias: &str,
         _identity: &str,
-        authorize_write: &(dyn for<'p> Fn(&'p str) -> Result<(), JsonRpcError> + Send + Sync),
+        authorize_write: &(
+             dyn for<'p> Fn(&'p str, zeroclaw_api::grants::Verb) -> Result<(), JsonRpcError>
+                 + Send
+                 + Sync
+         ),
     ) -> Result<Value, JsonRpcError> {
         self.entered.notify_one();
         self.release.notified().await;
@@ -2189,9 +2352,10 @@ impl crate::rpc::channels::ChannelControl for ParkingChannels {
             .clone()
             .expect("the test installs a probe");
         *self.live_at_commit.lock() = Some(probe());
-        authorize_write(&format!(
-            "peer_groups.{channel_type}_{alias}.external_peers"
-        ))?;
+        authorize_write(
+            &format!("peer_groups.{channel_type}_{alias}.external_peers"),
+            zeroclaw_api::grants::Verb::Create,
+        )?;
         Ok(json!({"saved": true, "already_bound": false}))
     }
 }

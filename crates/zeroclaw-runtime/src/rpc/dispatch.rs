@@ -1725,52 +1725,64 @@ impl RpcDispatcher {
 
     /// `workspace/list` and `fs/*`: parse, hold to the agent selector, then
     /// run the shared browse operation. See [`super::workspace`].
-    fn handle_workspace_method(&self, method: Method, params: &Value) -> RpcResult {
-        // Each arm snapshots the config rather than holding the read lock across
-        // filesystem work, as the HTTP adapter does.
-        match method {
+    async fn handle_workspace_method(&self, method: Method, params: &Value) -> RpcResult {
+        use zeroclaw_api::jsonrpc::{
+            FsDeleteRequest, FsMkdirRequest, FsMoveRequest, FsReadRequest, FsRmdirRequest,
+            WorkspaceListRequest,
+        };
+        type Operation = Box<dyn FnOnce(&Config) -> RpcResult + Send>;
+        let operation: Operation = match method {
             Method::WorkspaceList => {
-                let req: zeroclaw_api::jsonrpc::WorkspaceListRequest = parse_params(params)?;
-                self.authorize_workspace_scope(Method::WorkspaceList, req.agent.as_deref())?;
-                let config = self.ctx.config.read().clone();
-                super::workspace::handle_workspace_list(&config, &req)
+                let req: WorkspaceListRequest = parse_params(params)?;
+                self.authorize_workspace_scope(method, req.agent.as_deref())?;
+                Box::new(move |config| super::workspace::handle_workspace_list(config, &req))
             }
             Method::FsMkdir => {
-                let req: zeroclaw_api::jsonrpc::FsMkdirRequest = parse_params(params)?;
-                self.authorize_workspace_scope(Method::FsMkdir, req.agent.as_deref())?;
-                let config = self.ctx.config.read().clone();
-                super::workspace::handle_fs_mkdir(&config, &req)
+                let req: FsMkdirRequest = parse_params(params)?;
+                self.authorize_workspace_scope(method, req.agent.as_deref())?;
+                Box::new(move |config| super::workspace::handle_fs_mkdir(config, &req))
             }
             Method::FsRmdir => {
-                let req: zeroclaw_api::jsonrpc::FsRmdirRequest = parse_params(params)?;
-                self.authorize_workspace_scope(Method::FsRmdir, None)?;
-                let config = self.ctx.config.read().clone();
-                super::workspace::handle_fs_rmdir(&config, &req)
+                let req: FsRmdirRequest = parse_params(params)?;
+                self.authorize_workspace_scope(method, None)?;
+                Box::new(move |config| super::workspace::handle_fs_rmdir(config, &req))
             }
             Method::FsRead => {
-                let req: zeroclaw_api::jsonrpc::FsReadRequest = parse_params(params)?;
-                self.authorize_workspace_scope(Method::FsRead, Some(&req.agent))?;
-                let config = self.ctx.config.read().clone();
-                super::workspace::handle_fs_read(&config, &req)
+                let req: FsReadRequest = parse_params(params)?;
+                self.authorize_workspace_scope(method, Some(&req.agent))?;
+                Box::new(move |config| super::workspace::handle_fs_read(config, &req))
             }
             Method::FsDelete => {
-                let req: zeroclaw_api::jsonrpc::FsDeleteRequest = parse_params(params)?;
-                self.authorize_workspace_scope(Method::FsDelete, Some(&req.agent))?;
-                let config = self.ctx.config.read().clone();
-                super::workspace::handle_fs_delete(&config, &req)
+                let req: FsDeleteRequest = parse_params(params)?;
+                self.authorize_workspace_scope(method, Some(&req.agent))?;
+                Box::new(move |config| super::workspace::handle_fs_delete(config, &req))
             }
             Method::FsMove => {
-                let req: zeroclaw_api::jsonrpc::FsMoveRequest = parse_params(params)?;
-                self.authorize_workspace_scope(Method::FsMove, Some(&req.agent))?;
-                let config = self.ctx.config.read().clone();
-                super::workspace::handle_fs_move(&config, &req)
+                let req: FsMoveRequest = parse_params(params)?;
+                self.authorize_workspace_scope(method, Some(&req.agent))?;
+                Box::new(move |config| super::workspace::handle_fs_move(config, &req))
             }
-
-            _ => Err(rpc_err(
-                INTERNAL_ERROR,
-                format!("{} is not a workspace method", method.wire_name()),
-            )),
-        }
+            _ => {
+                return Err(rpc_err(
+                    INTERNAL_ERROR,
+                    format!("{} is not a workspace method", method.wire_name()),
+                ));
+            }
+        };
+        // A snapshot of the config rather than the read lock held across
+        // filesystem work, as the HTTP adapter does. The work runs on a
+        // blocking worker: creating a directory walks its path one component
+        // at a time, and a recursive delete visits everything beneath it, so
+        // neither belongs on a runtime worker that other connections share.
+        let config = self.ctx.config.read().clone();
+        tokio::task::spawn_blocking(move || operation(&config))
+            .await
+            .map_err(|join| {
+                rpc_err(
+                    INTERNAL_ERROR,
+                    format!("{} task failed: {join}", method.wire_name()),
+                )
+            })?
     }
 
     /// `integrations/list`, `tools/cli-discover`, `plugins/list` and
@@ -1867,8 +1879,20 @@ impl RpcDispatcher {
             sop_engine: self.ctx.sop_engine.clone(),
             sop_audit: self.ctx.sop_audit.clone(),
         };
+        // One listing at a time across every connection, held until the
+        // assembly finishes even if the requesting client goes away: each one
+        // builds every tool and starts the agent's MCP servers, so a weak
+        // `tools:read` grant must not be able to run them in parallel.
+        static TOOL_LISTING: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+        let permit = TOOL_LISTING.try_acquire().map_err(|_| {
+            rpc_err(
+                INTERNAL_ERROR,
+                "another tool listing is being assembled; retry",
+            )
+        })?;
         let handle = tokio::runtime::Handle::current();
         let listed = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
             handle
                 .block_on(crate::tools::listing::agent_tool_specs(
                     &config, &alias, &deps,
@@ -1904,13 +1928,14 @@ impl RpcDispatcher {
         }
         let pairing = Arc::clone(self.ctx.auth.pairing());
         let config = Arc::clone(&self.ctx.config);
-        let registry = {
-            let current = config.read();
-            crate::devices::registry_for(&current, &pairing)
-        };
         let device_error = |failure: crate::devices::DeviceFailure| {
             rpc_err(pairing_error_code(failure.http_status), failure.message)
         };
+        let registry = {
+            let current = config.read();
+            crate::devices::registry_for(&current, &pairing)
+        }
+        .map_err(device_error)?;
         let code_result = |(status, body): (u16, Value)| {
             if status == 200 {
                 Ok(body)
@@ -2029,8 +2054,9 @@ impl RpcDispatcher {
                 let guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
                 let grants = self.recheck_config_write_authority(method, None, &guard)?;
                 self.check_channel_bind(method, &grants, &is_channel, None)?;
-                let authorize_write =
-                    |path: &str| self.check_channel_bind(method, &grants, &is_channel, Some(path));
+                let authorize_write = |path: &str, verb: zeroclaw_api::grants::Verb| {
+                    self.check_channel_bind(method, &grants, &is_channel, Some((path, verb)))
+                };
                 let bound = control
                     .bind(
                         &self.ctx.config,
@@ -2247,26 +2273,33 @@ impl RpcDispatcher {
     }
 
     /// The whole `channels/bind` predicate: the channel's owning agent and,
-    /// once the bind has chosen it, config write access to the path it writes,
-    /// the one the dashboard route authorizes. Admission and the check under
-    /// the config write lock both call this, with different grants.
+    /// once the bind has chosen it, what the dashboard route requires of a
+    /// config write: the `config` verb its effect needs (`create` for a new
+    /// peer group, `update` otherwise) and write access to the path it
+    /// writes. Admission and the check under the config write lock both call
+    /// this, with different grants.
     fn check_channel_bind(
         &self,
         method: Method,
         grants: &zeroclaw_api::grants::ResolvedGrants,
         is_channel: &impl Fn(&zeroclaw_config::schema::ChannelAliasInfo) -> bool,
-        write_path: Option<&str>,
+        write: Option<(&str, zeroclaw_api::grants::Verb)>,
     ) -> Result<(), JsonRpcError> {
         self.check_channel_owner(method, grants, is_channel)?;
-        let Some(path) = write_path else {
+        let Some((path, verb)) = write else {
             return Ok(());
         };
-        if grants.may_write_config(path) {
+        let denied = if !grants.permits(zeroclaw_api::grants::Resource::Config, verb) {
+            crate::rpc::auth::AuthDenied::forbidden(format!(
+                "Principal is not granted config:{verb} for {path:?}"
+            ))
+        } else if !grants.may_write_config(path) {
+            crate::rpc::auth::AuthDenied::forbidden(format!(
+                "Principal is not granted config write access to {path:?}"
+            ))
+        } else {
             return Ok(());
-        }
-        let denied = crate::rpc::auth::AuthDenied::forbidden(format!(
-            "Principal is not granted config write access to {path:?}"
-        ));
+        };
         self.audit_auth_denial(method, &denied);
         Err(rpc_err(denied.code, denied.message))
     }
@@ -2354,10 +2387,15 @@ impl RpcDispatcher {
     /// Hold a `workspace/list` or `fs/*` operation to the principal's agent
     /// selector, before anything touches the filesystem, so a refusal does
     /// not reveal whether a path exists. With `agent`, the principal must be
-    /// entitled to that agent. Without one the operation targets the shared
-    /// area every agent reads, so the principal must be entitled to every
-    /// agent: one scoped to some agents must not change what the others see.
-    /// An unbound dispatcher is refused, as it is for `fs/list_dir`.
+    /// entitled to that agent, and, as [`Self::selector_agent`] holds, a
+    /// principal without operator grants may name only an agent the current
+    /// configuration defines: the alias becomes a directory under the agents
+    /// tree, so a wildcard selector would otherwise reach a removed agent's
+    /// workspace or create one for any name. Without an agent the operation
+    /// targets the shared area every agent reads, so the principal must be
+    /// entitled to every agent: one scoped to some agents must not change
+    /// what the others see. An unbound dispatcher is refused, as it is for
+    /// `fs/list_dir`.
     fn authorize_workspace_scope(
         &self,
         method: Method,
@@ -2366,7 +2404,13 @@ impl RpcDispatcher {
         let Some(grants) = self.stamped_grants() else {
             return Err(rpc_err(AUTH_REQUIRED, "First call must be 'initialize'"));
         };
-        let entitled = grants.may_use_agent(agent.unwrap_or(zeroclaw_api::grants::WILDCARD));
+        let entitled = match agent {
+            Some(alias) => {
+                grants.may_use_agent(alias)
+                    && (grants.admin || self.ctx.config.read().agents.contains_key(alias))
+            }
+            None => grants.may_use_agent(zeroclaw_api::grants::WILDCARD),
+        };
         if entitled {
             return Ok(());
         }
@@ -3682,7 +3726,7 @@ impl RpcDispatcher {
             | Method::FsRmdir
             | Method::FsRead
             | Method::FsDelete
-            | Method::FsMove => self.handle_workspace_method(method, &req.params),
+            | Method::FsMove => self.handle_workspace_method(method, &req.params).await,
 
             // Locales
             Method::LocalesList => super::locales::handle_locales_list(self.tui_id()),

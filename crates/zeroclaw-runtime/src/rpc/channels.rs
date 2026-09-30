@@ -31,8 +31,10 @@ pub trait ChannelControl: Send + Sync {
     /// rechecked its authority under it; `config_write_guard` is that guard.
     ///
     /// Before anything is saved, `authorize_write` is called with the
-    /// concrete config path the bind will write, and a refusal stops it. An
-    /// identity that is already bound writes nothing and is not checked.
+    /// concrete config path the bind will write and the verb its effect
+    /// needs, `Create` when the peer group is new and `Update` otherwise, and
+    /// a refusal stops it. An identity that is already bound writes nothing
+    /// and is not checked.
     async fn bind(
         &self,
         config: &Arc<RwLock<Config>>,
@@ -40,6 +42,10 @@ pub trait ChannelControl: Send + Sync {
         channel_type: &str,
         alias: &str,
         identity: &str,
-        authorize_write: &(dyn for<'p> Fn(&'p str) -> Result<(), JsonRpcError> + Send + Sync),
+        authorize_write: &(
+             dyn for<'p> Fn(&'p str, zeroclaw_api::grants::Verb) -> Result<(), JsonRpcError>
+                 + Send
+                 + Sync
+         ),
     ) -> Result<Value, JsonRpcError>;
 }

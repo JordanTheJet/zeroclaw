@@ -43,20 +43,34 @@ impl DeviceRegistry {
     /// revocation through one would leave the other still listing the
     /// device; every production caller takes this one.
     pub fn shared(data_dir: &Path) -> Arc<Self> {
+        Self::try_shared(data_dir).expect("Failed to open device registry database")
+    }
+
+    /// [`Self::shared`] for a caller that must answer a failure to open the
+    /// database rather than stop the process: a request handler. A failed
+    /// open is not remembered, so a later call tries again.
+    pub fn try_shared(data_dir: &Path) -> Result<Arc<Self>, rusqlite::Error> {
         static REGISTRIES: std::sync::OnceLock<Mutex<HashMap<PathBuf, Arc<DeviceRegistry>>>> =
             std::sync::OnceLock::new();
         let registries = REGISTRIES.get_or_init(|| Mutex::new(HashMap::new()));
         let mut registries = registries.lock();
-        Arc::clone(
-            registries
-                .entry(data_dir.to_path_buf())
-                .or_insert_with(|| Arc::new(Self::new(data_dir))),
-        )
+        if let Some(registry) = registries.get(data_dir) {
+            return Ok(Arc::clone(registry));
+        }
+        let registry = Arc::new(Self::try_new(data_dir)?);
+        registries.insert(data_dir.to_path_buf(), Arc::clone(&registry));
+        Ok(registry)
     }
 
     pub fn new(workspace_dir: &Path) -> Self {
+        Self::try_new(workspace_dir).expect("Failed to open device registry database")
+    }
+
+    /// Open (creating when missing) the registry database under
+    /// `workspace_dir` and load its devices.
+    pub fn try_new(workspace_dir: &Path) -> Result<Self, rusqlite::Error> {
         let db_path = workspace_dir.join("devices.db");
-        let conn = Connection::open(&db_path).expect("Failed to open device registry database");
+        let conn = Connection::open(&db_path)?;
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;
@@ -71,8 +85,7 @@ impl DeviceRegistry {
                 ip_address TEXT,
                 capabilities TEXT
             )",
-        )
-        .expect("Failed to create devices table");
+        )?;
 
         // Additive migration for DBs created before the capabilities column existed.
         // SQLite has no IF NOT EXISTS for columns; the duplicate-column error here is benign.
@@ -81,49 +94,46 @@ impl DeviceRegistry {
         // Warm the in-memory cache from DB
         let mut cache = HashMap::new();
         let mut stmt = conn
-            .prepare("SELECT token_hash, id, name, device_type, paired_at, last_seen, ip_address, capabilities FROM devices")
-            .expect("Failed to prepare device select");
-        let rows = stmt
-            .query_map([], |row| {
-                let token_hash: String = row.get(0)?;
-                let id: String = row.get(1)?;
-                let name: Option<String> = row.get(2)?;
-                let device_type: Option<String> = row.get(3)?;
-                let paired_at_str: String = row.get(4)?;
-                let last_seen_str: String = row.get(5)?;
-                let ip_address: Option<String> = row.get(6)?;
-                let capabilities_json: Option<String> = row.get(7)?;
-                let paired_at = DateTime::parse_from_rfc3339(&paired_at_str)
-                    .map(|dt| dt.with_timezone(&Utc))
-                    .unwrap_or_else(|_| Utc::now());
-                let last_seen = DateTime::parse_from_rfc3339(&last_seen_str)
-                    .map(|dt| dt.with_timezone(&Utc))
-                    .unwrap_or_else(|_| Utc::now());
-                let capabilities = capabilities_json
-                    .as_deref()
-                    .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok());
-                Ok((
-                    token_hash,
-                    DeviceInfo {
-                        id,
-                        name,
-                        device_type,
-                        paired_at,
-                        last_seen,
-                        ip_address,
-                        capabilities,
-                    },
-                ))
-            })
-            .expect("Failed to query devices");
+            .prepare("SELECT token_hash, id, name, device_type, paired_at, last_seen, ip_address, capabilities FROM devices")?;
+        let rows = stmt.query_map([], |row| {
+            let token_hash: String = row.get(0)?;
+            let id: String = row.get(1)?;
+            let name: Option<String> = row.get(2)?;
+            let device_type: Option<String> = row.get(3)?;
+            let paired_at_str: String = row.get(4)?;
+            let last_seen_str: String = row.get(5)?;
+            let ip_address: Option<String> = row.get(6)?;
+            let capabilities_json: Option<String> = row.get(7)?;
+            let paired_at = DateTime::parse_from_rfc3339(&paired_at_str)
+                .map(|dt| dt.with_timezone(&Utc))
+                .unwrap_or_else(|_| Utc::now());
+            let last_seen = DateTime::parse_from_rfc3339(&last_seen_str)
+                .map(|dt| dt.with_timezone(&Utc))
+                .unwrap_or_else(|_| Utc::now());
+            let capabilities = capabilities_json
+                .as_deref()
+                .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok());
+            Ok((
+                token_hash,
+                DeviceInfo {
+                    id,
+                    name,
+                    device_type,
+                    paired_at,
+                    last_seen,
+                    ip_address,
+                    capabilities,
+                },
+            ))
+        })?;
         for (hash, info) in rows.flatten() {
             cache.insert(hash, info);
         }
 
-        Self {
+        Ok(Self {
             cache: Mutex::new(cache),
             db_path,
-        }
+        })
     }
 
     /// A private registry over an explicit database file, for tests that
@@ -347,12 +357,18 @@ impl DeviceFailure {
 
 /// The registry the core's pairing operations use: the process's one
 /// instance for `config`'s data directory, when pairing is required. Without
-/// pairing there are no paired devices to manage.
-#[must_use]
-pub fn registry_for(config: &Config, pairing: &PairingGuard) -> Option<Arc<DeviceRegistry>> {
-    pairing
-        .require_pairing()
-        .then(|| DeviceRegistry::shared(&config.data_dir))
+/// pairing there are no paired devices to manage. A database that cannot be
+/// opened is a failure of the request, not of the process.
+pub fn registry_for(
+    config: &Config,
+    pairing: &PairingGuard,
+) -> Result<Option<Arc<DeviceRegistry>>, DeviceFailure> {
+    if !pairing.require_pairing() {
+        return Ok(None);
+    }
+    DeviceRegistry::try_shared(&config.data_dir)
+        .map(Some)
+        .map_err(|e| DeviceFailure::new(500, format!("device registry unavailable: {e}")))
 }
 
 /// Persist the in-memory paired-token set to `config.toml` and the live
@@ -584,4 +600,31 @@ pub async fn new_pairing_code(
             "message": message,
         }),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A registry database that cannot be opened fails the request that
+    /// needed it, with the status every later registry failure reports,
+    /// instead of panicking the connection task.
+    #[test]
+    fn registry_for_reports_an_unopenable_database() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        std::fs::write(&data_dir, b"a file where the data directory belongs").unwrap();
+        let config = Config {
+            data_dir,
+            ..Config::default()
+        };
+        let policy = zeroclaw_config::pairing::PairingCodePolicy::default;
+
+        let required = PairingGuard::new(true, &[], policy());
+        let failure = registry_for(&config, &required).expect_err("the database cannot open");
+        assert_eq!(failure.http_status, 500, "{}", failure.message);
+
+        let off = PairingGuard::new(false, &[], policy());
+        assert!(matches!(registry_for(&config, &off), Ok(None)));
+    }
 }
