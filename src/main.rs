@@ -17977,7 +17977,14 @@ type = "string"
     #[cfg(feature = "plugins-wasm")]
     fn config_in_dir(dir: &std::path::Path) -> crate::config::schema::Config {
         let path = dir.join("config.toml");
-        std::fs::write(&path, "schema_version = 0\n").expect("seed config file");
+        std::fs::write(
+            &path,
+            format!(
+                "schema_version = {}\n",
+                crate::config::migration::CURRENT_SCHEMA_VERSION
+            ),
+        )
+        .expect("seed config file");
         let mut config = crate::config::schema::Config::default();
         config.config_path = path;
         config.secrets.encrypt = true;

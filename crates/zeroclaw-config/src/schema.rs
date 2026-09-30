@@ -25570,7 +25570,7 @@ impl Config {
             return result;
         }
 
-        let existing = fs::read_to_string(&config_path).await.with_context(|| {
+        let mut existing = fs::read_to_string(&config_path).await.with_context(|| {
             format!(
                 "Failed to read existing config for incremental save: {}",
                 config_path.display()
@@ -25582,13 +25582,13 @@ impl Config {
             // An incremental save edits the file in place and can only retire
             // keys. A V1 or V2 file needs the structural migration first, and
             // some keys it would retire are still live inputs to that step
-            // (`[identity]`, an agent's `max_tool_iterations`). The running
-            // config was migrated when it was loaded, so write all of it.
-            let result = self.save().await;
-            if result.is_ok() {
-                self.clear_dirty();
+            // (`[identity]`, an agent's `max_tool_iterations`). Carry the file
+            // on disk through the typed chain, then edit the result. Writing
+            // the running config whole instead would drop what another
+            // handle saved since this config was loaded.
+            if let Some(migrated) = crate::migration::migrate_file(&existing)? {
+                existing = migrated;
             }
-            return result;
         }
 
         let mut config_to_save = self.clone();
@@ -25665,8 +25665,8 @@ enum OnDiskConfig {
     /// Missing, empty, current, or old enough that reaching the current
     /// schema only retires keys: the save can edit it in place.
     Editable,
-    /// V1 or V2: only the typed migration reads it correctly, so it must be
-    /// rewritten whole from the (already migrated) running config.
+    /// V1 or V2: only the typed migration reads it correctly, so it is
+    /// carried through that chain before any in-place edit.
     NeedsStructuralMigration,
 }
 
@@ -40710,17 +40710,29 @@ channel = "telegram.main"
         max_tool_iterations = 42\n";
 
     #[test]
-    async fn save_dirty_over_a_v2_file_rewrites_it_from_the_migrated_config() {
+    async fn save_dirty_over_a_v2_file_migrates_it_before_editing() {
         let tmp = tempfile::TempDir::new().unwrap();
         let config_path = tmp.path().join("config.toml");
         std::fs::write(&config_path, V2_FILE_WITH_STRUCTURAL_INPUTS).unwrap();
         let mut config = crate::migration::migrate_to_current(V2_FILE_WITH_STRUCTURAL_INPUTS)
             .expect("the V2 file loads, migrated in memory");
         config.config_path = config_path.clone();
+        // Another handle saves a key after this config was loaded.
+        std::fs::write(
+            &config_path,
+            format!(
+                "sops_dir = \"/srv/written-by-the-other-handle\"\n{V2_FILE_WITH_STRUCTURAL_INPUTS}"
+            ),
+        )
+        .unwrap();
         config.mark_dirty("observability.backend");
         config.save_dirty().await.unwrap();
 
         let written = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            written.contains("/srv/written-by-the-other-handle"),
+            "a key another handle saved must survive; got:\n{written}"
+        );
         let reloaded = crate::migration::migrate_to_current(&written).expect("it reloads");
         assert_eq!(
             reloaded.schema_version,
@@ -40740,9 +40752,10 @@ channel = "telegram.main"
                 .any(|profile| profile.max_tool_iterations == 42),
             "the agent's V2 iteration limit must survive in its runtime profile; got:\n{written}"
         );
-        assert_eq!(
-            std::fs::read_to_string(tmp.path().join("config.toml.v2.backup")).unwrap(),
-            V2_FILE_WITH_STRUCTURAL_INPUTS,
+        assert!(
+            std::fs::read_to_string(tmp.path().join("config.toml.v2.backup"))
+                .unwrap()
+                .contains("[identity]"),
             "the V2 original is kept before it is rewritten"
         );
     }
