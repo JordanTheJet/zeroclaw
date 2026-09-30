@@ -477,6 +477,31 @@ pub struct LocalesFetchResponse {
 
 // ── SOP authoring RPC types ──────────────────────────────────────
 
+/// Schema for a field that carries a runtime-owned value as raw JSON. The
+/// field stays `serde_json::Value` because this crate cannot depend on the
+/// runtime; its schema references the runtime type by name, and the RPC
+/// contract generator registers that type under the same definitions path.
+#[cfg(feature = "schema-export")]
+fn runtime_schema_ref(generator: &schemars::SchemaGenerator, name: &str) -> schemars::Schema {
+    let path = generator.settings().definitions_path.as_ref();
+    let path = path.strip_prefix('#').unwrap_or(path);
+    let path = path.strip_suffix('/').unwrap_or(path);
+    schemars::Schema::new_ref(format!("#{path}/{name}"))
+}
+
+/// Schema of a field holding a SOP definition: the runtime's `Sop`.
+#[cfg(feature = "schema-export")]
+pub fn sop_document_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    runtime_schema_ref(generator, "Sop")
+}
+
+/// Schema of a field holding an approval decision: the runtime's
+/// `ApprovalDecision`.
+#[cfg(feature = "schema-export")]
+pub fn approval_decision_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    runtime_schema_ref(generator, "ApprovalDecision")
+}
+
 /// Request payload for SOP read/delete methods that select one SOP by name:
 /// `sops/get`, `sops/graph`, `sops/validate` (by name), `sops/delete`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -504,6 +529,10 @@ pub struct SopRunOverlayRequest {
 pub struct SopDecideRequest {
     pub name: String,
     pub run_id: String,
+    #[cfg_attr(
+        feature = "schema-export",
+        schemars(schema_with = "approval_decision_schema")
+    )]
     pub decision: serde_json::Value,
 }
 
@@ -554,6 +583,10 @@ pub struct SopRunDetailRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct SopSaveRequest {
+    #[cfg_attr(
+        feature = "schema-export",
+        schemars(schema_with = "sop_document_schema")
+    )]
     pub sop: serde_json::Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub original_name: Option<String>,

@@ -14,6 +14,7 @@ use super::types::{
     QuickstartValidateResult, SessionNewParams, SkillsListResult, SkillsReadResult,
     SkillsWriteParams, SopWireDraftParams,
 };
+use crate::sop::approval::ApprovalDecision;
 use crate::sop::graph::RunOverlay;
 use crate::sop::trigger_registry::TriggerSourceRegistry;
 use crate::sop::types::Sop;
@@ -40,13 +41,14 @@ catalog! {
     SkillsListResult, SkillsReadResult, SkillsWriteParams, QuickstartFieldsParams,
     QuickstartFieldsResult, QuickstartValidateResult, QuickstartApplyResult,
     QuickstartDismissParams, Sop, RunOverlay, TriggerSourceRegistry, SopWireDraftParams,
+    ApprovalDecision,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
-    use zeroclaw_rpc_proto::method::EXTERNAL_TYPES;
+    use zeroclaw_rpc_proto::method::{EXTERNAL_TYPES, RUNTIME_DOCUMENT_TYPES};
 
     #[test]
     fn catalog_matches_the_runtime_owned_external_types() {
@@ -54,6 +56,7 @@ mod tests {
             .iter()
             .filter(|(_, owner)| *owner == "zeroclaw-runtime")
             .map(|(name, _)| *name)
+            .chain(RUNTIME_DOCUMENT_TYPES.iter().copied())
             .collect();
         let catalog: BTreeSet<&str> = NAMES.iter().copied().collect();
         assert_eq!(catalog.len(), NAMES.len(), "duplicate catalog entry");

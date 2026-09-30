@@ -19,7 +19,7 @@ use anyhow::{Context, bail, ensure};
 use schemars::{Schema, SchemaGenerator, generate::SchemaSettings};
 use serde_json::{Map, Value, json};
 use std::path::PathBuf;
-use zeroclaw_rpc_proto::method::EXTERNAL_TYPES;
+use zeroclaw_rpc_proto::method::{EXTERNAL_TYPES, RUNTIME_DOCUMENT_TYPES};
 use zeroclaw_rpc_proto::{Method, RPC_PROTOCOL_VERSION, Shape, error_codes, notification, schema};
 use zeroclaw_runtime::rpc::dispatch::{MethodAuthz, MethodAuthzExt};
 
@@ -217,6 +217,15 @@ pub fn render() -> anyhow::Result<String> {
         .iter()
         .map(|(name, code)| (code.to_string(), json!(name)))
         .collect();
+
+    // Wire types that carry a runtime value as raw JSON reference its schema
+    // by name; register those runtime types so the references resolve.
+    for name in RUNTIME_DOCUMENT_TYPES {
+        ensure!(
+            subschema_for_contract(&mut generator, name).is_some(),
+            "document type `{name}` has no schema in either catalog"
+        );
+    }
 
     let schemas = generator.take_definitions(true);
 
@@ -438,6 +447,110 @@ mod tests {
         assert_eq!(renew["params"][0]["required"], json!(true));
         let fetch = by_name("locales/fetch");
         assert_eq!(fetch["result"]["x-zeroclaw-shape"], json!("typed"));
+    }
+
+    /// A Draft 7 validator for one component, resolving its references
+    /// inside the generated document.
+    fn component_validator(doc: &Value, component: &str) -> jsonschema::Validator {
+        let root = json!({
+            "$ref": format!("{DEFINITIONS_PATH}{component}"),
+            "components": doc["components"],
+        });
+        jsonschema::options()
+            .with_draft(jsonschema::Draft::Draft7)
+            .build(&root)
+            .unwrap_or_else(|e| panic!("{component} compiles: {e}"))
+    }
+
+    /// `sops/validate` names its real keys, keeps the draft-or-stored
+    /// constraint, and a present `sop` is judged as a draft even when a
+    /// `name` is also sent.
+    #[test]
+    fn sops_validate_names_its_keys_and_keeps_its_forms() {
+        let doc: Value = serde_json::from_str(&render().expect("render")).expect("valid JSON");
+        let validate = doc["methods"]
+            .as_array()
+            .expect("methods")
+            .iter()
+            .find(|m| m["name"] == json!("sops/validate"))
+            .expect("sops/validate");
+        let names: Vec<&str> = validate["params"]
+            .as_array()
+            .expect("params")
+            .iter()
+            .map(|p| p["name"].as_str().expect("descriptor name"))
+            .collect();
+        assert_eq!(names, ["name", "original_name", "sop"]);
+
+        let validator = component_validator(&doc, "SopValidateParams");
+        let sop = json!({
+            "name": "deploy", "description": "d", "version": "1", "priority": "normal",
+            "execution_mode": "supervised", "triggers": [], "steps": [],
+        });
+        assert!(validator.is_valid(&json!({ "name": "deploy" })));
+        assert!(validator.is_valid(&json!({ "sop": sop, "original_name": "old" })));
+        assert!(!validator.is_valid(&json!({})), "one form is required");
+        assert!(
+            !validator.is_valid(&json!({ "sop": 7, "name": "deploy" })),
+            "a malformed draft does not fall back to the stored form"
+        );
+    }
+
+    /// Fields that carry a SOP or an approval decision as raw JSON accept
+    /// exactly what the runtime parser accepts.
+    #[test]
+    fn raw_sop_and_decision_fields_validate_like_the_runtime_parser() {
+        use zeroclaw_runtime::sop::Sop;
+        use zeroclaw_runtime::sop::approval::ApprovalDecision;
+
+        let doc: Value = serde_json::from_str(&render().expect("render")).expect("valid JSON");
+        let valid_sop = json!({
+            "name": "deploy", "description": "d", "version": "1", "priority": "normal",
+            "execution_mode": "supervised", "triggers": [], "steps": [],
+        });
+        let sop_samples = [
+            valid_sop.clone(),
+            json!(7),
+            json!("deploy"),
+            json!(null),
+            json!({}),
+            json!({ "name": "deploy" }),
+        ];
+        let edit = json!({ "op": "connect", "from": 1, "to": 2, "role": "sequence" });
+        for component in ["SopSaveRequest", "SopDraftParams", "SopWireDraftParams"] {
+            let validator = component_validator(&doc, component);
+            for sample in &sop_samples {
+                let request = json!({ "sop": sample, "edit": edit });
+                assert_eq!(
+                    validator.is_valid(&request),
+                    serde_json::from_value::<Sop>(sample.clone()).is_ok(),
+                    "{component} disagrees with the runtime parser on sop = {sample}"
+                );
+            }
+        }
+        assert!(
+            serde_json::from_value::<Sop>(valid_sop).is_ok(),
+            "the fixture is a real SOP"
+        );
+
+        let validator = component_validator(&doc, "SopDecideRequest");
+        for decision in [
+            json!("approve"),
+            json!({ "deny": { "reason": "no" } }),
+            json!({ "deny": {} }),
+            json!({ "amend": { "text": "t" } }),
+            json!({ "revise": { "guidance": "g" } }),
+            json!("not_a_decision"),
+            json!({ "amend": {} }),
+            json!(7),
+        ] {
+            let request = json!({ "name": "deploy", "run_id": "r1", "decision": decision });
+            assert_eq!(
+                validator.is_valid(&request),
+                serde_json::from_value::<ApprovalDecision>(decision.clone()).is_ok(),
+                "SopDecideRequest disagrees with the runtime parser on decision = {decision}"
+            );
+        }
     }
 
     #[test]

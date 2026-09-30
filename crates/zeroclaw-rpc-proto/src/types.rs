@@ -9,7 +9,6 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use zeroclaw_api::jsonrpc::{SopSaveRequest, SopSelectRequest};
 use zeroclaw_api::tool::OptionDomain;
 
 // ── Re-exports: foundation-crate types that appear on the wire ────────
@@ -593,9 +592,24 @@ rpc_type! {
     /// at all, the call reads the scheduler settings. The daemon treats any
     /// `patch` key as a write request, which it does not implement yet.
     pub struct CronSettingsParams {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        /// A present `null` stays `Some(Value::Null)`: the key's presence,
+        /// not its value, is what asks for a write.
+        #[serde(
+            default,
+            deserialize_with = "present_value",
+            skip_serializing_if = "Option::is_none"
+        )]
         pub patch: Option<Value>,
     }
+}
+
+/// Deserialize a field that is present into `Some`, even when its value is
+/// `null`; an absent field falls back to `None` through `#[serde(default)]`.
+fn present_value<'de, D>(deserializer: D) -> Result<Option<Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Value::deserialize(deserializer).map(Some)
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -1709,21 +1723,37 @@ rpc_type! {
 // ── SOP authoring ────────────────────────────────────────────────────
 // ══════════════════════════════════════════════════════════════════════
 
-/// Params for `sops/validate`: an unsaved draft in the `sops/save` form, or
-/// a stored SOP selected by name. A request carrying a `sop` key is always
-/// validated as a draft.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[serde(untagged)]
-pub enum SopValidateParams {
-    Draft(SopSaveRequest),
-    Stored(SopSelectRequest),
+rpc_type! {
+    /// Params for `sops/validate`: an unsaved draft in the `sops/save` form
+    /// (`sop`, optionally with `original_name`), or a stored SOP selected by
+    /// `name`. A request carrying a `sop` key is always validated as a draft,
+    /// and its `name` is then ignored.
+    #[cfg_attr(
+        feature = "schema-export",
+        schemars(extend("anyOf" = [{ "required": ["sop"] }, { "required": ["name"] }]))
+    )]
+    pub struct SopValidateParams {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(
+            feature = "schema-export",
+            schemars(schema_with = "zeroclaw_api::jsonrpc::sop_document_schema")
+        )]
+        pub sop: Option<Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub original_name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub name: Option<String>,
+    }
 }
 
 rpc_type! {
     /// Params for `sops/graph-draft`: project an unsaved SOP (the `sops/save`
     /// wire form) onto its graph without persisting it.
     pub struct SopDraftParams {
+        #[cfg_attr(
+            feature = "schema-export",
+            schemars(schema_with = "zeroclaw_api::jsonrpc::sop_document_schema")
+        )]
         pub sop: Value,
     }
 }
@@ -2112,19 +2142,31 @@ mod tests {
     fn cron_settings_params_read_without_a_patch() {
         let read: CronSettingsParams = serde_json::from_value(json!({})).unwrap();
         assert!(read.patch.is_none());
+        assert_eq!(serde_json::to_value(&read).unwrap(), json!({}));
         let write: CronSettingsParams =
             serde_json::from_value(json!({ "patch": { "enabled": false } })).unwrap();
         assert_eq!(write.patch, Some(json!({ "enabled": false })));
+        // A present null is still a write request and must round-trip.
+        let null_patch: CronSettingsParams =
+            serde_json::from_value(json!({ "patch": null })).unwrap();
+        assert_eq!(null_patch.patch, Some(Value::Null));
+        assert_eq!(
+            serde_json::to_value(&null_patch).unwrap(),
+            json!({ "patch": null })
+        );
     }
 
     #[test]
-    fn sop_validate_params_tell_a_draft_from_a_stored_sop() {
+    fn sop_validate_params_carry_either_request_form() {
         let draft: SopValidateParams =
-            serde_json::from_value(json!({ "sop": { "name": "deploy" } })).unwrap();
-        assert!(matches!(draft, SopValidateParams::Draft(ref d) if d.sop["name"] == "deploy"));
+            serde_json::from_value(json!({ "sop": { "name": "deploy" }, "original_name": "old" }))
+                .unwrap();
+        assert_eq!(draft.sop, Some(json!({ "name": "deploy" })));
+        assert_eq!(draft.original_name.as_deref(), Some("old"));
         let stored: SopValidateParams =
             serde_json::from_value(json!({ "name": "deploy" })).unwrap();
-        assert!(matches!(stored, SopValidateParams::Stored(ref s) if s.name == "deploy"));
+        assert!(stored.sop.is_none());
+        assert_eq!(stored.name.as_deref(), Some("deploy"));
     }
 
     #[test]

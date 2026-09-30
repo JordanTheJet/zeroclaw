@@ -509,6 +509,12 @@ pub const EXTERNAL_TYPES: &[(&str, &str)] = &[
     ("SopWireDraftParams", "zeroclaw-runtime"),
 ];
 
+/// Runtime-owned types that wire types in this crate or its foundation
+/// crates carry as raw JSON: the field is a `serde_json::Value`, and its
+/// schema references the type by name. The contract generator registers each
+/// from the runtime's catalog so those references resolve.
+pub const RUNTIME_DOCUMENT_TYPES: &[&str] = &["Sop", "ApprovalDecision"];
+
 #[cfg(test)]
 mod tests {
     use super::*;
