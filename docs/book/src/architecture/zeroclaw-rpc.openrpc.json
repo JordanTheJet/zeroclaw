@@ -1080,6 +1080,112 @@
         ],
         "type": "string"
       },
+      "FileUploadBeginParams": {
+        "description": "Parameters for `file/upload/begin`: announce one upload for a session.",
+        "properties": {
+          "filename": {
+            "description": "Display name, at most 255 bytes; storage is content-addressed.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "sha256": {
+            "description": "Optional hex SHA-256 of the whole payload, verified at commit.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "size_bytes": {
+            "description": "Exact decoded size of the whole payload.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "session_id",
+          "size_bytes"
+        ],
+        "type": "object"
+      },
+      "FileUploadBeginResult": {
+        "properties": {
+          "chunk_bytes": {
+            "description": "Largest decoded chunk `file/upload/chunk` accepts.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "max_bytes": {
+            "description": "Largest payload an upload may declare.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "upload_id": {
+            "description": "Identifies the upload on this connection only.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "upload_id",
+          "chunk_bytes",
+          "max_bytes"
+        ],
+        "type": "object"
+      },
+      "FileUploadChunkParams": {
+        "description": "Parameters for `file/upload/chunk`. Chunks arrive in order: `offset`\nmust equal the bytes received so far. Resending an already-accepted\nchunk with identical bytes is acknowledged without change.",
+        "properties": {
+          "data_b64": {
+            "type": "string"
+          },
+          "offset": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "upload_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "upload_id",
+          "offset",
+          "data_b64"
+        ],
+        "type": "object"
+      },
+      "FileUploadChunkResult": {
+        "properties": {
+          "received_bytes": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "received_bytes"
+        ],
+        "type": "object"
+      },
+      "FileUploadCommitParams": {
+        "description": "Parameters for `file/upload/commit`. The result is the same\n`FileEntryResult` that `file/attach` returns for one file.",
+        "properties": {
+          "upload_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "upload_id"
+        ],
+        "type": "object"
+      },
       "FlowRole": {
         "description": "Why a flow wire exists. Mirrors the `StepRouting`/`StepFailure` field it\nwas derived from, so an editor can write edits back to the right place.",
         "oneOf": [
@@ -6582,6 +6688,141 @@
       "x-zeroclaw-params": {
         "shape": "typed",
         "type": "FileAttachParams"
+      }
+    },
+    {
+      "name": "file/upload/begin",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "session_id",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "size_bytes",
+          "required": true,
+          "schema": {
+            "description": "Exact decoded size of the whole payload.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        {
+          "name": "filename",
+          "required": false,
+          "schema": {
+            "description": "Display name, at most 255 bytes; storage is content-addressed.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "sha256",
+          "required": false,
+          "schema": {
+            "description": "Optional hex SHA-256 of the whole payload, verified at commit.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/FileUploadBeginResult"
+        },
+        "x-zeroclaw-shape": "typed"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "files",
+        "verb": "create"
+      },
+      "x-zeroclaw-params": {
+        "shape": "typed",
+        "type": "FileUploadBeginParams"
+      }
+    },
+    {
+      "name": "file/upload/chunk",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "data_b64",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "offset",
+          "required": true,
+          "schema": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        {
+          "name": "upload_id",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/FileUploadChunkResult"
+        },
+        "x-zeroclaw-shape": "typed"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "files",
+        "verb": "create"
+      },
+      "x-zeroclaw-params": {
+        "shape": "typed",
+        "type": "FileUploadChunkParams"
+      }
+    },
+    {
+      "name": "file/upload/commit",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "upload_id",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/FileEntryResult"
+        },
+        "x-zeroclaw-shape": "typed"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "files",
+        "verb": "create"
+      },
+      "x-zeroclaw-params": {
+        "shape": "typed",
+        "type": "FileUploadCommitParams"
       }
     },
     {

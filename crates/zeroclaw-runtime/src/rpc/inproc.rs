@@ -29,7 +29,10 @@ use tokio_util::sync::CancellationToken;
 
 use super::context::RpcContext;
 use super::dispatch::RpcDispatcher;
-use super::local::{MAX_FRAME_BYTES, SHUTDOWN_TIMEOUT, run_writer};
+use super::local::{
+    LOCAL_PEER_WRITE_TIMEOUT, MAX_FRAME_BYTES, SHUTDOWN_TIMEOUT, TERMINAL_FRAME_TIMEOUT,
+    TerminalFrame, WriterTimeouts, frame_too_large_line, run_writer,
+};
 use super::transport::{RpcTransport, TransportKind};
 use crate::security::auth_provider::Credential;
 
@@ -44,18 +47,55 @@ pub const PEER_LABEL: &str = "inproc:gateway";
 pub struct InprocTransport {
     reader: BufReader<tokio::io::ReadHalf<DuplexStream>>,
     writer_tx: mpsc::Sender<String>,
+    /// A last frame for the peer, written ahead of the ordinary queue.
+    terminal_tx: mpsc::Sender<TerminalFrame>,
 }
 
 impl InprocTransport {
-    /// Wrap the daemon's half of a duplex. The writer task ends on `cancel`.
+    /// Wrap the daemon's half of a duplex. The writer is the local socket's
+    /// hardened writer: a per-frame deadline that cancels a peer which stops
+    /// reading, and a terminal-frame lane for the reason a connection closes.
+    /// The writer task ends on `cancel`.
     pub fn new(stream: DuplexStream, cancel: CancellationToken) -> Self {
         let (read_half, write_half) = tokio::io::split(stream);
         let (writer_tx, writer_rx) = mpsc::channel::<String>(64);
-        zeroclaw_spawn::spawn!(run_writer(write_half, writer_rx, cancel, SHUTDOWN_TIMEOUT));
+        let (terminal_tx, terminal_rx) = mpsc::channel::<TerminalFrame>(1);
+        zeroclaw_spawn::spawn!(run_writer(
+            write_half,
+            writer_rx,
+            terminal_rx,
+            cancel,
+            WriterTimeouts {
+                write: LOCAL_PEER_WRITE_TIMEOUT,
+                shutdown: SHUTDOWN_TIMEOUT,
+            },
+            PEER_LABEL.to_string(),
+        ));
         Self {
             reader: BufReader::new(read_half),
             writer_tx,
+            terminal_tx,
         }
+    }
+
+    /// Tell the peer why its connection is closing, ahead of the ordinary
+    /// queue; the writer stops after it. Bounded by `TERMINAL_FRAME_TIMEOUT`
+    /// like the local socket's, so a peer that will not read it is closed
+    /// anyway.
+    async fn send_terminal(&self, line: String) {
+        let (written, written_rx) = tokio::sync::oneshot::channel();
+        let _ = tokio::time::timeout(TERMINAL_FRAME_TIMEOUT, async {
+            if self
+                .terminal_tx
+                .send(TerminalFrame { line, written })
+                .await
+                .is_err()
+            {
+                return;
+            }
+            let _ = written_rx.await;
+        })
+        .await;
     }
 }
 
@@ -72,6 +112,9 @@ impl RpcTransport for InprocTransport {
             Ok(0) => None,
             Ok(_) => {
                 if buf.len() as u64 > MAX_FRAME_BYTES {
+                    // Same refusal as the local socket: the peer learns why
+                    // before it sees end of stream.
+                    self.send_terminal(frame_too_large_line()).await;
                     return None;
                 }
                 Some(String::from_utf8_lossy(&buf).into_owned())
