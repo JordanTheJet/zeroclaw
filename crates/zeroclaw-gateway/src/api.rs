@@ -2419,6 +2419,14 @@ pub async fn handle_claude_code_hook(
     // back to a session we spawned.
     let _ = &state; // retained for future Slack update wiring
 
+    claude_code_hook(&payload)
+}
+
+/// Log a Claude Code hook event and acknowledge it. The separate gateway
+/// answers with this too.
+pub(crate) fn claude_code_hook(
+    payload: &zeroclaw_tools::claude_code_runner::ClaudeCodeHookEvent,
+) -> Json<serde_json::Value> {
     ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"session_id": payload.session_id, "event_type": payload.event_type, "tool_name": payload.tool_name, "summary": payload.summary})), "Claude Code hook event received");
 
     Json(serde_json::json!({ "ok": true }))
