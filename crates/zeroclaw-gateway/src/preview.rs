@@ -24,16 +24,20 @@ use std::sync::Arc;
 
 use axum::Json;
 use axum::Router;
-use axum::extract::{Query, State};
+use axum::extract::rejection::JsonRejection;
+use axum::extract::{Path as UrlPath, Query, State};
 use axum::http::{Method as HttpMethod, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{MethodFilter, MethodRouter, get, on};
+use axum::routing::{MethodFilter, MethodRouter, get, on, post, put};
 use serde_json::json;
 use zeroclaw_rpc_client::{
     ClientError, EndpointOwner, EndpointRejection, Method, RPC_PROTOCOL_VERSION, RpcClient,
 };
 
 use crate::api::CostQuery;
+use crate::api_sop_author::{
+    GraphDraftRequest, ParamOptionsBody, RunsQuery, SopRenameBody, SopRunBody, WireDraftRequest,
+};
 use crate::core_rpc::{CoreAccess, CoreCall, CoreError, CoreRpc};
 
 /// Where the dashboard reaches when no `--listen` is given: the address the
@@ -385,35 +389,17 @@ const REFUSED: &[(&str, &str, Refusal)] = &[
     ("/api/channels", "GET", Refusal::NotPorted),
     ("/api/channels/bind", "POST", Refusal::NotPorted),
     ("/api/channels/{channel}/relink", "POST", Refusal::NotPorted),
-    ("/api/sops", "GET,POST", Refusal::NotPorted),
-    ("/api/sops/{name}", "PUT,DELETE", Refusal::NotPorted),
-    ("/api/sops/{name}/graph", "GET", Refusal::NotPorted),
-    ("/api/sops/{name}/run", "POST", Refusal::NotPorted),
-    ("/api/sops/{name}/rename", "POST", Refusal::NotPorted),
-    ("/api/sops/runs", "GET", Refusal::NotPorted),
-    ("/api/sops/{name}/full", "GET", Refusal::NotPorted),
-    ("/api/sops/wire-draft", "POST", Refusal::NotPorted),
-    ("/api/sops/graph-draft", "POST", Refusal::NotPorted),
-    ("/api/sops/trigger-sources", "GET", Refusal::NotPorted),
+    // The rest of the SOP authoring routes are served; these three wait for
+    // their core methods (`sops/decision-models`, `sops/graph-legend`,
+    // `sops/cancel`).
     ("/api/sops/decision-models", "GET", Refusal::NotPorted),
     ("/api/sops/graph-legend", "GET", Refusal::NotPorted),
-    (
-        "/api/sops/{name}/runs/{run_id}/overlay",
-        "GET",
-        Refusal::NotPorted,
-    ),
-    (
-        "/api/sops/{name}/runs/{run_id}/decide",
-        "POST",
-        Refusal::NotPorted,
-    ),
     (
         "/api/sops/{name}/runs/{run_id}/cancel",
         "POST",
         Refusal::NotPorted,
     ),
     ("/api/tools", "GET", Refusal::NotPorted),
-    ("/api/tools/param-options", "POST", Refusal::NotPorted),
     ("/api/personality", "GET", Refusal::NotPorted),
     ("/api/personality/templates", "GET", Refusal::NotPorted),
     ("/api/personality/{filename}", "GET,PUT", Refusal::NotPorted),
@@ -542,7 +528,26 @@ pub fn router(core: CoreRpc, endpoint: PathBuf, web_dist: Option<PathBuf>) -> Ro
         .route("/api/tuis", get(api_tuis))
         .route("/api/cost", get(api_cost))
         .route("/api/events/history", get(api_events_history))
-        .route("/api/sessions", get(api_sessions_list));
+        .route("/api/sessions", get(api_sessions_list))
+        .route("/api/sops", get(api_sops_list).post(api_sop_create))
+        .route("/api/sops/{name}", put(api_sop_save).delete(api_sop_delete))
+        .route("/api/sops/{name}/graph", get(api_sop_graph))
+        .route("/api/sops/{name}/run", post(api_sop_run))
+        .route("/api/sops/{name}/rename", post(api_sop_rename))
+        .route("/api/sops/runs", get(api_sop_runs))
+        .route("/api/sops/{name}/full", get(api_sop_full))
+        .route("/api/sops/wire-draft", post(api_sop_wire_draft))
+        .route("/api/sops/graph-draft", post(api_sop_graph_draft))
+        .route("/api/sops/trigger-sources", get(api_sop_trigger_sources))
+        .route(
+            "/api/sops/{name}/runs/{run_id}/overlay",
+            get(api_sop_run_overlay),
+        )
+        .route(
+            "/api/sops/{name}/runs/{run_id}/decide",
+            post(api_sop_decide),
+        )
+        .route("/api/tools/param-options", post(api_tools_param_options));
     for &(path, methods, refusal) in REFUSED {
         let handler: MethodRouter<PreviewState> = on(
             method_filter(methods),
@@ -805,6 +810,191 @@ async fn api_events_history(access: Result<CoreAccess, CoreError>) -> Response {
 async fn api_sessions_list(access: Result<CoreAccess, CoreError>) -> Response {
     served(access, |call| async move {
         crate::api::api_sessions_list_through_core(&call).await
+    })
+    .await
+}
+
+/// A served route with a JSON body. The caller's core access is checked
+/// before the body, so a caller without a credential is told to sign in
+/// whatever it sent; a body that does not parse is then refused as the
+/// in-process route refuses it.
+async fn served_with_body<T, F, Fut>(
+    access: Result<CoreAccess, CoreError>,
+    body: Result<Json<T>, JsonRejection>,
+    route: F,
+) -> Response
+where
+    F: FnOnce(CoreCall, T) -> Fut,
+    Fut: Future<Output = Result<Response, CoreError>>,
+{
+    served(access, |call| async move {
+        match body {
+            Ok(Json(body)) => route(call, body).await,
+            Err(rejection) => Ok(rejection.into_response()),
+        }
+    })
+    .await
+}
+
+/// `GET /api/sops`
+async fn api_sops_list(access: Result<CoreAccess, CoreError>) -> Response {
+    served(access, |call| async move {
+        crate::api_sop_author::sops_list_through_core(&call).await
+    })
+    .await
+}
+
+/// `POST /api/sops`
+async fn api_sop_create(
+    access: Result<CoreAccess, CoreError>,
+    body: Result<Json<zeroclaw_runtime::sop::Sop>, JsonRejection>,
+) -> Response {
+    served_with_body(access, body, |call, sop| async move {
+        crate::api_sop_author::sop_create_through_core(&call, sop).await
+    })
+    .await
+}
+
+/// `PUT /api/sops/{name}`
+async fn api_sop_save(
+    UrlPath(name): UrlPath<String>,
+    access: Result<CoreAccess, CoreError>,
+    body: Result<Json<zeroclaw_runtime::sop::Sop>, JsonRejection>,
+) -> Response {
+    served_with_body(access, body, |call, sop| async move {
+        crate::api_sop_author::sop_save_through_core(&call, name, sop).await
+    })
+    .await
+}
+
+/// `DELETE /api/sops/{name}`
+async fn api_sop_delete(
+    UrlPath(name): UrlPath<String>,
+    access: Result<CoreAccess, CoreError>,
+) -> Response {
+    served(access, |call| async move {
+        crate::api_sop_author::sop_delete_through_core(&call, name).await
+    })
+    .await
+}
+
+/// `GET /api/sops/{name}/graph`
+async fn api_sop_graph(
+    UrlPath(name): UrlPath<String>,
+    access: Result<CoreAccess, CoreError>,
+) -> Response {
+    served(access, |call| async move {
+        crate::api_sop_author::sop_graph_through_core(&call, name).await
+    })
+    .await
+}
+
+/// `POST /api/sops/{name}/run`
+async fn api_sop_run(
+    UrlPath(name): UrlPath<String>,
+    access: Result<CoreAccess, CoreError>,
+    body: Result<Json<SopRunBody>, JsonRejection>,
+) -> Response {
+    served_with_body(access, body, |call, body| async move {
+        crate::api_sop_author::sop_run_through_core(&call, name, body).await
+    })
+    .await
+}
+
+/// `POST /api/sops/{name}/rename`
+async fn api_sop_rename(
+    UrlPath(name): UrlPath<String>,
+    access: Result<CoreAccess, CoreError>,
+    body: Result<Json<SopRenameBody>, JsonRejection>,
+) -> Response {
+    served_with_body(access, body, |call, body| async move {
+        crate::api_sop_author::sop_rename_through_core(&call, name, body).await
+    })
+    .await
+}
+
+/// `GET /api/sops/runs`
+async fn api_sop_runs(
+    Query(query): Query<RunsQuery>,
+    access: Result<CoreAccess, CoreError>,
+) -> Response {
+    served(access, |call| async move {
+        crate::api_sop_author::sop_runs_through_core(&call, query).await
+    })
+    .await
+}
+
+/// `GET /api/sops/{name}/full`
+async fn api_sop_full(
+    UrlPath(name): UrlPath<String>,
+    access: Result<CoreAccess, CoreError>,
+) -> Response {
+    served(access, |call| async move {
+        crate::api_sop_author::sop_full_through_core(&call, name).await
+    })
+    .await
+}
+
+/// `POST /api/sops/wire-draft`
+async fn api_sop_wire_draft(
+    access: Result<CoreAccess, CoreError>,
+    body: Result<Json<WireDraftRequest>, JsonRejection>,
+) -> Response {
+    served_with_body(access, body, |call, request| async move {
+        crate::api_sop_author::sop_wire_draft_through_core(&call, request).await
+    })
+    .await
+}
+
+/// `POST /api/sops/graph-draft`
+async fn api_sop_graph_draft(
+    access: Result<CoreAccess, CoreError>,
+    body: Result<Json<GraphDraftRequest>, JsonRejection>,
+) -> Response {
+    served_with_body(access, body, |call, request| async move {
+        crate::api_sop_author::sop_graph_draft_through_core(&call, request).await
+    })
+    .await
+}
+
+/// `GET /api/sops/trigger-sources`
+async fn api_sop_trigger_sources(access: Result<CoreAccess, CoreError>) -> Response {
+    served(access, |call| async move {
+        crate::api_sop_author::sop_trigger_sources_through_core(&call).await
+    })
+    .await
+}
+
+/// `GET /api/sops/{name}/runs/{run_id}/overlay`
+async fn api_sop_run_overlay(
+    UrlPath((name, run_id)): UrlPath<(String, String)>,
+    access: Result<CoreAccess, CoreError>,
+) -> Response {
+    served(access, |call| async move {
+        crate::api_sop_author::sop_run_overlay_through_core(&call, name, run_id).await
+    })
+    .await
+}
+
+/// `POST /api/sops/{name}/runs/{run_id}/decide`
+async fn api_sop_decide(
+    UrlPath((name, run_id)): UrlPath<(String, String)>,
+    access: Result<CoreAccess, CoreError>,
+    body: Result<Json<serde_json::Value>, JsonRejection>,
+) -> Response {
+    served_with_body(access, body, |call, decision| async move {
+        crate::api_sop_author::sop_decide_through_core(&call, name, run_id, decision).await
+    })
+    .await
+}
+
+/// `POST /api/tools/param-options`
+async fn api_tools_param_options(
+    access: Result<CoreAccess, CoreError>,
+    body: Result<Json<ParamOptionsBody>, JsonRejection>,
+) -> Response {
+    served_with_body(access, body, |call, body| async move {
+        crate::api_sop_author::tools_param_options_through_core(&call, body).await
     })
     .await
 }

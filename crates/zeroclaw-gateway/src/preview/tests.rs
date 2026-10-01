@@ -120,6 +120,19 @@ const SERVED: &[&str] = &[
     "/api/cost",
     "/api/events/history",
     "/api/sessions",
+    "/api/sops",
+    "/api/sops/{name}",
+    "/api/sops/{name}/graph",
+    "/api/sops/{name}/run",
+    "/api/sops/{name}/rename",
+    "/api/sops/runs",
+    "/api/sops/{name}/full",
+    "/api/sops/wire-draft",
+    "/api/sops/graph-draft",
+    "/api/sops/trigger-sources",
+    "/api/sops/{name}/runs/{run_id}/overlay",
+    "/api/sops/{name}/runs/{run_id}/decide",
+    "/api/tools/param-options",
 ];
 
 /// Route paths the in-process gateway registers with a string literal, from
@@ -750,6 +763,187 @@ mod against_a_core {
         assert_eq!(json_of(&body)["events"][0]["type"], "agent_start", "{body}");
 
         drop(terminal);
+        core.stop().await;
+    }
+
+    async fn send_json(
+        router: &Router,
+        method: &str,
+        path: &str,
+        token: Option<&str>,
+        body: &str,
+    ) -> (StatusCode, String) {
+        let mut request = Request::builder()
+            .method(method)
+            .uri(path)
+            .header("content-type", "application/json");
+        if let Some(token) = token {
+            request = request.header("authorization", format!("Bearer {token}"));
+        }
+        let response = router
+            .clone()
+            .oneshot(request.body(Body::from(body.to_owned())).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    /// The SOP authoring routes reach the core's `sops/*` methods through the
+    /// separate gateway: a read, a draft, a write, and a decision that counts
+    /// one vote of a quorum of two and answers `202` with the run's overlay.
+    /// A caller without a credential is told to sign in before its body is
+    /// read, and the routes still waiting for core methods stay refused.
+    #[tokio::test]
+    async fn the_sop_authoring_routes_are_served_through_the_core() {
+        use zeroclaw_config::schema::{
+            ApprovalGroupConfig, ApprovalPolicyConfig, SopApprovalConfig,
+        };
+        use zeroclaw_runtime::sop::types::{
+            Sop, SopAdmissionPolicy, SopEvent, SopExecutionMode, SopPriority, SopRunAction,
+            SopStep, SopStepKind, SopTrigger, SopTriggerSource,
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ctx = Core::context(tmp.path());
+        let release = Sop {
+            name: "release".into(),
+            description: "preview".into(),
+            version: "1.0.0".into(),
+            priority: SopPriority::Normal,
+            execution_mode: SopExecutionMode::Deterministic,
+            triggers: vec![SopTrigger::Manual],
+            steps: vec![SopStep {
+                number: 1,
+                title: "sign off".into(),
+                kind: SopStepKind::Checkpoint,
+                policy: Some("prod".into()),
+                ..SopStep::default()
+            }],
+            cooldown_secs: 0,
+            max_concurrent: 1,
+            location: None,
+            deterministic: true,
+            agent: None,
+            admission_policy: SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
+            decision: None,
+        };
+        let sops_dir = tmp.path().join("sops");
+        zeroclaw_runtime::sop::save_sop(&sops_dir, &release).unwrap();
+        let members = [TOKEN, "zc_preview_second"]
+            .iter()
+            .map(|token| {
+                format!(
+                    "http:{}",
+                    zeroclaw_runtime::security::pairing::PairingGuard::token_hash(token)
+                )
+            })
+            .collect();
+        let sop_config = {
+            let mut config = ctx.config.write();
+            config.sop.sops_dir = Some(sops_dir.to_string_lossy().into_owned());
+            config.sop.approval = SopApprovalConfig {
+                groups: std::collections::HashMap::from([(
+                    "release".to_string(),
+                    ApprovalGroupConfig { members },
+                )]),
+                policies: std::collections::HashMap::from([(
+                    "prod".to_string(),
+                    ApprovalPolicyConfig {
+                        required_group: Some("release".into()),
+                        quorum: 2,
+                        request_route: None,
+                        escalation_route: None,
+                    },
+                )]),
+            };
+            config.sop.clone()
+        };
+        let mut engine = zeroclaw_runtime::sop::SopEngine::new(sop_config).with_approval_broker(
+            Arc::new(zeroclaw_runtime::sop::approval::ApprovalBroker::disabled()),
+        );
+        engine.set_sops_for_test(vec![release.clone()]);
+        let run_id = match engine
+            .start_run(
+                "release",
+                SopEvent {
+                    source: SopTriggerSource::Manual,
+                    topic: None,
+                    payload: None,
+                    timestamp: zeroclaw_runtime::sop::engine::now_iso8601(),
+                },
+            )
+            .unwrap()
+        {
+            SopRunAction::CheckpointWait { run_id, .. } => run_id,
+            other => panic!("expected a checkpoint wait, got {other:?}"),
+        };
+        {
+            let ctx = Arc::get_mut(&mut ctx).expect("a fresh context has one owner");
+            ctx.sop_engine = Some(Arc::new(std::sync::Mutex::new(engine)));
+            ctx.sop_audit = Some(Arc::new(zeroclaw_runtime::sop::SopAuditLogger::new(
+                Arc::new(zeroclaw_memory::NoneMemory::new("none")),
+            )));
+        }
+        let core = Core::serve(ctx).await;
+        let rpc = CoreRpc::local(core.endpoint.clone(), EndpointOwner::SameAccount);
+        let preview = router(rpc, core.endpoint.clone(), None);
+
+        let (status, body) = get(&preview, "/api/sops", None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+        let (status, body) =
+            send_json(&preview, "POST", "/api/sops/graph-draft", None, "not json").await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+
+        let (status, body) = get(&preview, "/api/sops", Some(TOKEN)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(json_of(&body)["sops"][0]["name"], "release", "{body}");
+
+        let draft = json!({ "sop": release }).to_string();
+        let (status, body) = send_json(
+            &preview,
+            "POST",
+            "/api/sops/graph-draft",
+            Some(TOKEN),
+            &draft,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(json_of(&body)["nodes"].is_array(), "{body}");
+
+        let mut drafted = release.clone();
+        drafted.name = "drafted".into();
+        let (status, body) = send_json(
+            &preview,
+            "POST",
+            "/api/sops",
+            Some(TOKEN),
+            &serde_json::to_string(&drafted).unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(json_of(&body), json!({ "created": "drafted" }));
+
+        let (status, body) = send_json(
+            &preview,
+            "POST",
+            &format!("/api/sops/release/runs/{run_id}/decide"),
+            Some(TOKEN),
+            "\"approve\"",
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        let overlay = json_of(&body);
+        assert_eq!(overlay["run_id"], run_id.as_str(), "{body}");
+        assert_eq!(overlay["status"], "paused_checkpoint", "{body}");
+        assert!(overlay.get("pending_quorum").is_none(), "{body}");
+
+        let (status, body) = get(&preview, "/api/sops/decision-models", Some(TOKEN)).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert_eq!(json_of(&body)["code"], "capability_missing", "{body}");
+
         core.stop().await;
     }
 

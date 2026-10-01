@@ -97,6 +97,11 @@ fn default_protocol_version() -> u64 {
 /// from terminals. It is a label: it grants nothing.
 pub const CLIENT_KIND_GATEWAY: &str = "gateway";
 
+/// The member a `sops/decide` result carries, set to `true`, when the decision
+/// counted as one vote and the gate still waits for the rest of its quorum.
+/// Absent otherwise, so the result is the run overlay it always was.
+pub const SOP_DECIDE_PENDING_QUORUM: &str = "pending_quorum";
+
 rpc_type! {
     /// Command identity and accepted tokens advertised to an RPC client.
     pub struct CommandDescriptor {

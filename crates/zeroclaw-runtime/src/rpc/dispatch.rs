@@ -9805,16 +9805,23 @@ impl RpcDispatcher {
             .sop_engine
             .as_ref()
             .ok_or_else(|| rpc_err(INTERNAL_ERROR, "SOP subsystem not enabled"))?;
-        // The run executes as the procedure's agents, so the principal must be
-        // entitled to every one of them before anything is dispatched.
-        if self.stamped_grants().is_some() {
-            let sop = engine
-                .lock()
-                .map_err(|_| rpc_err(INTERNAL_ERROR, "SOP engine lock poisoned"))?
-                .get_sop(&req.name)
-                .cloned();
-            if let Some(sop) = sop {
-                self.authorize_sop_agents(Method::SopsRun, &sop, true)?;
+        let sop = engine
+            .lock()
+            .map_err(|_| rpc_err(INTERNAL_ERROR, "SOP engine lock poisoned"))?
+            .get_sop(&req.name)
+            .cloned();
+        if let Some(sop) = &sop {
+            // The run executes as the procedure's agents, so the principal must
+            // be entitled to every one of them before anything is dispatched.
+            if self.stamped_grants().is_some() {
+                self.authorize_sop_agents(Method::SopsRun, sop, true)?;
+            }
+            // This run has no agent turn behind it: the driver started below
+            // executes its steps, so a procedure with no owner for an execute
+            // step would start, take a run id and fail that step. Refuse it
+            // first, on the ownership rule the driver itself applies.
+            if let Some(refusal) = crate::sop::headless_ownership_refusal(sop) {
+                return Err(rpc_err(INVALID_PARAMS, refusal));
             }
         }
         let audit = self
@@ -10061,6 +10068,7 @@ impl RpcDispatcher {
         }
 
         let mut resolved_outcome = None;
+        let mut pending_quorum = false;
         {
             let mut guard = engine
                 .lock()
@@ -10081,7 +10089,7 @@ impl RpcDispatcher {
                 ));
             }
             use crate::sop::approval::{BrokerOutcome, ResolveOutcome};
-            let principal = crate::sop::approval::ApprovalPrincipal::cli(self.tui_id.clone());
+            let principal = self.approval_principal();
             match guard
                 .resolve_via_broker_deferred(&req.run_id, decision, principal)
                 .map_err(|e| rpc_err(INTERNAL_ERROR, e.to_string()))?
@@ -10093,8 +10101,9 @@ impl RpcDispatcher {
                     ResolveOutcome::Denied
                     | ResolveOutcome::AlreadyResolved
                     | ResolveOutcome::Revised,
-                )
-                | BrokerOutcome::PendingQuorum { .. } => {}
+                ) => {}
+                // The vote counted; the gate waits for the rest of its quorum.
+                BrokerOutcome::PendingQuorum { .. } => pending_quorum = true,
                 BrokerOutcome::Resolved(
                     ResolveOutcome::NotWaiting | ResolveOutcome::DeferredAtCapacity,
                 )
@@ -10107,10 +10116,13 @@ impl RpcDispatcher {
                         ),
                     ));
                 }
+                // The credential is valid; this principal may not decide this
+                // gate. That is a missing entitlement, not a credential to
+                // replace, so a client must not drop the credential over it.
                 BrokerOutcome::Resolved(ResolveOutcome::RejectedSelfApproval)
                 | BrokerOutcome::NotAuthorized { .. } => {
                     return Err(rpc_err(
-                        AUTH_REQUIRED,
+                        FORBIDDEN,
                         crate::i18n::get_required_cli_string("sop-rpc-decision-unauthorized"),
                     ));
                 }
@@ -10155,7 +10167,35 @@ impl RpcDispatcher {
             };
             rpc_err(code, msg)
         })?;
-        to_result(overlay)
+        let mut result = to_result(overlay)?;
+        if pending_quorum && let Some(fields) = result.as_object_mut() {
+            fields.insert(
+                zeroclaw_rpc_proto::types::SOP_DECIDE_PENDING_QUORUM.to_owned(),
+                Value::Bool(true),
+            );
+        }
+        Ok(result)
+    }
+
+    /// The approval principal this connection decides as, derived from its
+    /// bound authentication and never from a client-claimed label such as
+    /// the TUI id. A native pairing bearer is the same paired-token subject
+    /// the gateway's HTTP and WebSocket surfaces derive from that token; any
+    /// other authenticated principal is its canonical principal id; the
+    /// unauthenticated shared operator is anonymous, so it satisfies no
+    /// required group.
+    fn approval_principal(&self) -> crate::sop::approval::ApprovalPrincipal {
+        use crate::sop::approval::ApprovalPrincipal;
+        let Some(auth) = self.auth.as_ref() else {
+            return ApprovalPrincipal::rpc_local_operator();
+        };
+        if let Some(subject) = auth.native_token_hash.as_deref() {
+            return ApprovalPrincipal::rpc_paired(subject.to_owned());
+        }
+        if auth.principal.is_authenticated() {
+            return ApprovalPrincipal::rpc_principal(auth.principal.id.as_str().to_owned());
+        }
+        ApprovalPrincipal::rpc_local_operator()
     }
 
     fn handle_sops_validate(&self, params: &Value) -> RpcResult {
@@ -22101,12 +22141,16 @@ mod tests {
         );
     }
 
-    fn make_checkpoint_rpc_dispatcher(
+    /// A context whose SOP engine holds one run parked at a checkpoint that
+    /// the `prod` policy gates: `members` form its required group and
+    /// `quorum` distinct approvers clear it. `configure` adds the pairing
+    /// tokens or roster the test authenticates with.
+    fn make_checkpoint_rpc_fixture(
         quorum: u32,
         members: &[&str],
-        tui_id: &str,
+        configure: impl FnOnce(&mut zeroclaw_config::schema::Config),
     ) -> (
-        RpcDispatcher,
+        Arc<RpcContext>,
         Arc<std::sync::Mutex<crate::sop::SopEngine>>,
         String,
         tempfile::TempDir,
@@ -22175,6 +22219,7 @@ mod tests {
         let mut config = Config::default();
         config.sop.sops_dir = Some(sops_dir.to_string_lossy().into_owned());
         config.sop.approval = SopApprovalConfig { groups, policies };
+        configure(&mut config);
 
         let mut engine = crate::sop::SopEngine::new(config.sop.clone())
             .with_approval_broker(Arc::new(crate::sop::approval::ApprovalBroker::disabled()));
@@ -22200,10 +22245,37 @@ mod tests {
             Arc::new(SessionActorQueue::new(4, 10, 60)),
         ));
         let ctx = RpcContext::minimal_with_sop_engine(config, sessions, Arc::clone(&engine));
+        (ctx, engine, run_id, temp)
+    }
+
+    /// A remote connection authenticated with a native pairing bearer.
+    async fn paired_sop_dispatcher(ctx: &Arc<RpcContext>, token: &str) -> RpcDispatcher {
         let (tx, _rx) = tokio::sync::mpsc::channel(64);
-        let mut dispatcher = RpcDispatcher::new(ctx, tx, "local:test".into());
-        dispatcher.set_tui_id_for_test(Some(tui_id.to_string()));
-        (dispatcher, engine, run_id, temp)
+        let mut dispatcher = RpcDispatcher::new(Arc::clone(ctx), tx, "wss:test".into())
+            .with_transport(
+                crate::rpc::transport::TransportKind::Wss,
+                crate::security::auth_provider::Credential::None,
+            );
+        dispatcher
+            .handle_initialize(&json!({ "auth_token": token }))
+            .await
+            .expect("the paired token authenticates");
+        dispatcher
+    }
+
+    fn paired_subject(token: &str) -> String {
+        zeroclaw_config::pairing::PairingGuard::token_hash(token)
+    }
+
+    fn run_status(
+        engine: &Arc<std::sync::Mutex<crate::sop::SopEngine>>,
+        run_id: &str,
+    ) -> Option<crate::sop::types::SopRunStatus> {
+        engine.lock().unwrap().get_run(run_id).map(|run| run.status)
+    }
+
+    fn checkpoint_decision(run_id: &str) -> Value {
+        json!({ "name": "rpc-checkpoint", "run_id": run_id, "decision": "approve" })
     }
 
     /// An RPC dispatcher over one SOP, with the driver handles under test.
@@ -22347,6 +22419,33 @@ mod tests {
         );
     }
 
+    /// `sops/run` has no agent turn behind it: the driver it starts executes
+    /// the steps. A procedure with an `execute` step no agent owns is refused
+    /// before dispatch, with the reason the headless driver would fail on,
+    /// and no run is started or recorded.
+    #[tokio::test]
+    async fn sops_run_refuses_a_procedure_the_headless_driver_cannot_run() {
+        let sop_name = "unowned";
+        let step = crate::sop::types::SopStep {
+            number: 1,
+            title: "Step one".to_string(),
+            body: "Do the work".to_string(),
+            ..crate::sop::types::SopStep::default()
+        };
+        let sop = manual_sop(sop_name, false, step);
+        let refusal = crate::sop::headless_ownership_refusal(&sop).expect("the step is unowned");
+        let (dispatcher, engine, _temp) = sops_run_dispatcher(sop, None);
+        let error = dispatcher
+            .handle_sops_run(&json!({ "name": sop_name }))
+            .await
+            .expect_err("an unowned procedure must not start headlessly");
+        assert_eq!(error.code, INVALID_PARAMS);
+        assert_eq!(error.message, refusal);
+        let guard = engine.lock().unwrap();
+        assert!(guard.active_runs().is_empty(), "no run was started");
+        assert!(guard.finished_runs(None).is_empty(), "no run id was burned");
+    }
+
     /// A shared producer key must only name a run something is advancing. When
     /// the daemon generation has already drained, the driver is refused and the
     /// run is settled, so the key must not be left pointing at it: the next Git
@@ -22355,10 +22454,12 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn sops_run_withdraws_the_producer_key_when_its_driver_is_refused() {
         let sop_name = "refused";
+        // Owned, so `sops/run` starts it; the refused driver never runs it.
         let step = crate::sop::types::SopStep {
             number: 1,
             title: "Step one".to_string(),
             body: "Do the work".to_string(),
+            agent: Some("ops".to_string()),
             ..crate::sop::types::SopStep::default()
         };
         let handles = crate::sop::SopDriverHandles::default();
@@ -22380,49 +22481,187 @@ mod tests {
         );
     }
 
+    /// The group-approval policy sees the principal the connection
+    /// authenticated as. A native pairing bearer is the same paired-token
+    /// subject the gateway's HTTP and WebSocket surfaces derive, so an
+    /// `http:<subject>` member decides over RPC and a different paired device
+    /// does not. The refusal is a missing entitlement, not a credential to
+    /// replace.
     #[tokio::test]
-    async fn sops_decide_rpc_enforces_checkpoint_membership_and_quorum() {
+    async fn sops_decide_sees_the_paired_subject_the_gateway_sees() {
         use crate::sop::types::SopRunStatus;
 
-        let (unauthorized, engine, run_id, _temp) =
-            make_checkpoint_rpc_dispatcher(1, &["cli:ZeroClawOperator"], "ZeroClawAgent");
-        let error = unauthorized
-            .handle_sops_decide(&json!({
-                "name": "rpc-checkpoint",
-                "run_id": run_id.clone(),
-                "decision": "approve",
-            }))
+        let member = format!("http:{}", paired_subject("zc_member"));
+        let (ctx, engine, run_id, _temp) = make_checkpoint_rpc_fixture(1, &[&member], |config| {
+            config.gateway.paired_tokens = vec!["zc_member".into(), "zc_other".into()];
+        });
+
+        let outsider = paired_sop_dispatcher(&ctx, "zc_other").await;
+        let error = outsider
+            .handle_sops_decide(&checkpoint_decision(&run_id))
             .await
-            .expect_err("unauthorized RPC principal must be rejected");
-        assert_eq!(error.code, AUTH_REQUIRED);
+            .expect_err("a paired device outside the group must be refused");
+        assert_eq!(error.code, FORBIDDEN);
         assert_eq!(
-            engine
-                .lock()
-                .unwrap()
-                .get_run(&run_id)
-                .map(|run| run.status),
+            run_status(&engine, &run_id),
             Some(SopRunStatus::PausedCheckpoint)
         );
 
-        let (pending, engine, run_id, _temp) = make_checkpoint_rpc_dispatcher(
-            2,
-            &["cli:ZeroClawOperator", "cli:ZeroClawMaintainer"],
-            "ZeroClawOperator",
-        );
-        pending
-            .handle_sops_decide(&json!({
-                "name": "rpc-checkpoint",
-                "run_id": run_id.clone(),
-                "decision": "approve",
-            }))
+        let member = paired_sop_dispatcher(&ctx, "zc_member").await;
+        let overlay = member
+            .handle_sops_decide(&checkpoint_decision(&run_id))
             .await
-            .expect("an authorized first vote returns the still-parked overlay");
+            .expect("the group member's paired device clears the gate");
+        assert_ne!(
+            run_status(&engine, &run_id),
+            Some(SopRunStatus::PausedCheckpoint),
+            "an approved checkpoint resumes the run"
+        );
+        assert!(
+            overlay
+                .get(zeroclaw_rpc_proto::types::SOP_DECIDE_PENDING_QUORUM)
+                .is_none(),
+            "a decision that cleared the gate is not pending: {overlay}"
+        );
+    }
+
+    /// One paired credential is one quorum voter however often it votes, and
+    /// a second member's device completes the quorum. While the quorum is
+    /// pending the result says so, beside the run overlay.
+    #[tokio::test]
+    async fn sops_decide_counts_one_paired_credential_as_one_voter() {
+        use crate::sop::types::SopRunStatus;
+
+        let first = format!("http:{}", paired_subject("zc_first"));
+        let second = format!("http:{}", paired_subject("zc_second"));
+        let (ctx, engine, run_id, _temp) =
+            make_checkpoint_rpc_fixture(2, &[&first, &second], |config| {
+                config.gateway.paired_tokens = vec!["zc_first".into(), "zc_second".into()];
+            });
+
+        let first = paired_sop_dispatcher(&ctx, "zc_first").await;
+        for _ in 0..2 {
+            let overlay = first
+                .handle_sops_decide(&checkpoint_decision(&run_id))
+                .await
+                .expect("a member's vote is accepted while quorum is pending");
+            assert_eq!(
+                run_status(&engine, &run_id),
+                Some(SopRunStatus::PausedCheckpoint),
+                "a repeated vote from the same credential must not meet a quorum of two"
+            );
+            assert_eq!(
+                overlay[zeroclaw_rpc_proto::types::SOP_DECIDE_PENDING_QUORUM],
+                true,
+                "{overlay}"
+            );
+            assert_eq!(overlay["run_id"], run_id.as_str(), "the overlay is intact");
+        }
+
+        let second = paired_sop_dispatcher(&ctx, "zc_second").await;
+        let overlay = second
+            .handle_sops_decide(&checkpoint_decision(&run_id))
+            .await
+            .expect("the second member completes the quorum");
+        assert_ne!(
+            run_status(&engine, &run_id),
+            Some(SopRunStatus::PausedCheckpoint)
+        );
+        assert!(
+            overlay
+                .get(zeroclaw_rpc_proto::types::SOP_DECIDE_PENDING_QUORUM)
+                .is_none(),
+            "{overlay}"
+        );
+    }
+
+    /// An authenticated principal decides as its canonical principal id, so
+    /// a `principal:<id>` member is honoured and another roster user is not.
+    #[tokio::test]
+    async fn sops_decide_sees_the_authenticated_roster_principal() {
+        use crate::sop::types::SopRunStatus;
+        use zeroclaw_config::schema::{PermissionProfileConfig, UserConfig};
+
+        let roster = |config: &mut zeroclaw_config::schema::Config| {
+            config.permission_profiles.insert(
+                "operator".into(),
+                PermissionProfileConfig {
+                    allowed_agents: vec!["*".into()],
+                    allowed_tools: vec!["*".into()],
+                    grants: std::collections::HashMap::from([(
+                        zeroclaw_api::grants::Resource::Sops,
+                        vec![
+                            zeroclaw_api::grants::Verb::Read,
+                            zeroclaw_api::grants::Verb::Execute,
+                        ],
+                    )]),
+                    ..PermissionProfileConfig::default()
+                },
+            );
+            for (name, uid) in [("alice", 4242u32), ("bob", 4343u32)] {
+                config.users.insert(
+                    name.into(),
+                    UserConfig {
+                        principal_id: None,
+                        uid: Some(uid),
+                        permission_profiles: vec!["operator".into()],
+                    },
+                );
+            }
+        };
+        // Resolve alice's canonical id the way the daemon does, then gate the
+        // policy on it.
+        let (probe_ctx, _probe_engine, _probe_run, _probe_temp) =
+            make_checkpoint_rpc_fixture(1, &[], roster);
+        let alice_id = scoped_dispatcher(&probe_ctx, 4242)
+            .await
+            .owner_principal_id()
+            .expect("a roster user has a canonical id");
+        let member = format!("principal:{alice_id}");
+        let (ctx, engine, run_id, _temp) = make_checkpoint_rpc_fixture(1, &[&member], roster);
+
+        let bob = scoped_dispatcher(&ctx, 4343).await;
+        let error = bob
+            .handle_sops_decide(&checkpoint_decision(&run_id))
+            .await
+            .expect_err("a roster user outside the group must be refused");
+        assert_eq!(error.code, FORBIDDEN);
         assert_eq!(
-            engine
-                .lock()
-                .unwrap()
-                .get_run(&run_id)
-                .map(|run| run.status),
+            run_status(&engine, &run_id),
+            Some(SopRunStatus::PausedCheckpoint)
+        );
+
+        let alice = scoped_dispatcher(&ctx, 4242).await;
+        alice
+            .handle_sops_decide(&checkpoint_decision(&run_id))
+            .await
+            .expect("the group member clears the gate");
+        assert_ne!(
+            run_status(&engine, &run_id),
+            Some(SopRunStatus::PausedCheckpoint)
+        );
+    }
+
+    /// A client-claimed TUI id is not an approval identity: the unauthenticated
+    /// shared operator is anonymous even when it claims a label a group lists,
+    /// so a policy with a required group fails closed for it.
+    #[tokio::test]
+    async fn sops_decide_ignores_a_claimed_tui_id() {
+        use crate::sop::types::SopRunStatus;
+
+        let (ctx, engine, run_id, _temp) =
+            make_checkpoint_rpc_fixture(1, &["ZeroClawOperator", "cli:ZeroClawOperator"], |_| {});
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let mut operator = RpcDispatcher::new(Arc::clone(&ctx), tx, "local:test".into());
+        operator.set_authenticated_for_test();
+        operator.set_tui_id_for_test(Some("ZeroClawOperator".into()));
+        let error = operator
+            .handle_sops_decide(&checkpoint_decision(&run_id))
+            .await
+            .expect_err("a claimed TUI id must not satisfy group membership");
+        assert_eq!(error.code, FORBIDDEN);
+        assert_eq!(
+            run_status(&engine, &run_id),
             Some(SopRunStatus::PausedCheckpoint)
         );
     }
@@ -22643,7 +22882,7 @@ mod tests {
             }))
             .await
             .expect_err("RPC principal must be rejected by approval_mode=agent_tool");
-        assert_eq!(err.code, AUTH_REQUIRED);
+        assert_eq!(err.code, FORBIDDEN);
         assert!(
             err.message.contains(&crate::i18n::get_required_cli_string(
                 "sop-rpc-decision-unauthorized",
