@@ -696,23 +696,271 @@ async fn feed_released(changes: &tokio::sync::broadcast::Sender<SopRunSummary>) 
 }
 
 /// A subscription whose socket never ran, because the upgrade did not
-/// complete, is still cancelled on the core: the feed does not keep running
-/// on the connection the caller's other requests share.
+/// complete, is still cancelled on the core. Another request holds the same
+/// connection meanwhile, so the feed ends because it was cancelled, not
+/// because its connection closed, and the connection keeps serving.
 #[tokio::test]
 async fn an_abandoned_sop_runs_subscription_is_cancelled_on_the_core() {
     let (engine, changes) = sop_engine();
     let harness = Harness::with_sop_engine(engine);
+    let CoreAccess::Core(keeper) = harness.through_core().await else {
+        panic!("served in-process");
+    };
     let CoreAccess::Core(call) = harness.through_core().await else {
         panic!("served in-process");
     };
-    let (notifications, opened) = crate::ws_sop_runs::subscribe(call)
+    let opened = crate::ws_sop_runs::subscribe(call)
         .await
         .expect("the core opens the feed");
-    assert!(matches!(opened, crate::ws_sop_runs::Opened::Feed { .. }));
+    assert!(matches!(opened, crate::ws_sop_runs::Opened::Feed(_)));
     assert_eq!(changes.receiver_count(), 1, "the core's feed is armed");
-    drop(notifications);
     drop(opened);
     feed_released(&changes).await;
+    keeper
+        .request(zeroclaw_rpc_client::Method::Status, json!({}))
+        .await
+        .expect("the shared connection keeps serving");
+}
+
+/// A dialer that holds the core's first reply carrying a subscription id
+/// until released: the core has opened the subscription, and the gateway's
+/// subscribe request is still waiting for its answer.
+struct HoldSubscribeReply {
+    connector: InprocConnector,
+    held: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+    dials: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl crate::core_rpc::Dial for HoldSubscribeReply {
+    fn dial(&self) -> crate::core_rpc::DialFuture<'_> {
+        use std::sync::atomic::Ordering;
+        use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+        self.dials.fetch_add(1, Ordering::SeqCst);
+        let (held, release) = (Arc::clone(&self.held), Arc::clone(&self.release));
+        Box::pin(async move {
+            let core = self.connector.connect().await?;
+            let (gateway, proxy) = tokio::io::duplex(64 * 1024);
+            let (mut from_gateway, mut to_gateway) = tokio::io::split(proxy);
+            let (from_core, mut to_core) = tokio::io::split(core);
+            zeroclaw_spawn::spawn!(async move {
+                let _ = tokio::io::copy(&mut from_gateway, &mut to_core).await;
+                let _ = to_core.shutdown().await;
+            });
+            zeroclaw_spawn::spawn!(async move {
+                let mut lines = tokio::io::BufReader::new(from_core).lines();
+                let mut holding = true;
+                while let Ok(Some(line)) = lines.next_line().await {
+                    let reply: Value = serde_json::from_str(&line).unwrap_or_default();
+                    if holding && reply["result"]["subscription_id"].is_string() {
+                        holding = false;
+                        held.notify_one();
+                        release.notified().await;
+                    }
+                    if to_gateway
+                        .write_all(format!("{line}\n").as_bytes())
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            });
+            Some(gateway)
+        })
+    }
+}
+
+/// The gateway stops waiting for `sops/subscribe-runs` after the core has
+/// opened the feed and before its answer arrives, as an abandoned handshake
+/// does. Once the answer lands the feed is cancelled, on a connection
+/// another request still holds and that keeps serving.
+#[tokio::test]
+async fn a_sop_runs_subscribe_abandoned_before_its_answer_leaves_no_core_feed() {
+    use std::sync::atomic::Ordering;
+    let (engine, changes) = sop_engine();
+    let harness = Harness::with_sop_engine(engine);
+    let held = harness.holding_subscribe_answers();
+    let keeper = held.call().await;
+    let call = held.call().await;
+    let opening = zeroclaw_spawn::spawn!(crate::ws_sop_runs::subscribe(call));
+    held.answered().await;
+    assert_eq!(
+        changes.receiver_count(),
+        1,
+        "the core opened the feed before answering"
+    );
+    opening.abort();
+    assert!(opening.await.unwrap_err().is_cancelled());
+    held.release.notify_one();
+
+    feed_released(&changes).await;
+    keeper
+        .request(zeroclaw_rpc_client::Method::Status, json!({}))
+        .await
+        .expect("the shared connection keeps serving");
+    assert_eq!(
+        held.dials.load(Ordering::SeqCst),
+        1,
+        "one connection throughout"
+    );
+}
+
+/// A core handle whose connections hold the core's first subscribe answer
+/// until released, from [`Harness::holding_subscribe_answers`].
+struct HeldAnswers {
+    core: CoreRpc,
+    held: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+    dials: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl HeldAnswers {
+    /// A request's connection, bound to the operator's bearer.
+    async fn call(&self) -> crate::core_rpc::CoreCall {
+        match self.core.access(&Harness::headers()).await {
+            Ok(CoreAccess::Core(call)) => call,
+            _ => panic!("no core access"),
+        }
+    }
+
+    /// Resolves once the core has answered a subscribe and the answer is
+    /// being held.
+    async fn answered(&self) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), self.held.notified())
+            .await
+            .expect("the core answered");
+    }
+}
+
+impl Harness {
+    /// A core handle over this harness's core whose connections hold the
+    /// first subscribe answer until released.
+    fn holding_subscribe_answers(&self) -> HeldAnswers {
+        let connector = InprocConnector::new(self.cancel.clone());
+        connector.bind(Arc::clone(&self.ctx));
+        let held = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let dials = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let core = CoreRpc::over_dialer(HoldSubscribeReply {
+            connector,
+            held: Arc::clone(&held),
+            release: Arc::clone(&release),
+            dials: Arc::clone(&dials),
+        });
+        HeldAnswers {
+            core,
+            held,
+            release,
+            dials,
+        }
+    }
+
+    /// `zeroclaw-gw`'s router over `core`, with `request_timeout`.
+    fn preview(&self, core: CoreRpc, request_timeout: std::time::Duration) -> axum::Router {
+        crate::preview::router(
+            core,
+            self._dir.path().join("unused.sock"),
+            None,
+            tokio::sync::watch::channel(false).0,
+            request_timeout,
+        )
+    }
+}
+
+/// `zeroclaw-gw`'s request timeout ends a handshake whose subscribe the core
+/// has not answered in time. The caller gets `408`, and the feed the core
+/// opened meanwhile is cancelled once its answer lands, on a connection
+/// another request still holds.
+#[tokio::test]
+async fn the_preview_timeout_ends_a_stalled_sop_runs_handshake_and_its_feed() {
+    let (engine, changes) = sop_engine();
+    let harness = Harness::with_sop_engine(engine);
+    let held = harness.holding_subscribe_answers();
+    let keeper = held.call().await;
+    let preview_at =
+        serve(harness.preview(held.core.clone(), std::time::Duration::from_millis(300))).await;
+
+    match open_sop_runs(preview_at, Some(TOKEN)).await {
+        Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+            assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+        }
+        other => panic!("a handshake past the timeout is refused: {other:?}"),
+    }
+    held.answered().await;
+    assert_eq!(changes.receiver_count(), 1, "the core opened the feed");
+    held.release.notify_one();
+
+    feed_released(&changes).await;
+    keeper
+        .request(zeroclaw_rpc_client::Method::Status, json!({}))
+        .await
+        .expect("the shared connection keeps serving");
+    assert_eq!(
+        held.dials.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the socket's bearer and the keeper's share one connection"
+    );
+}
+
+/// The request timeout bounds the handshake, not the socket: an upgraded
+/// socket keeps delivering past it.
+#[tokio::test]
+async fn the_preview_timeout_does_not_cut_an_open_sop_runs_socket() {
+    let (engine, changes) = sop_engine();
+    let harness = Harness::with_sop_engine(engine);
+    let preview_at =
+        serve(harness.preview(harness.core.clone(), std::time::Duration::from_millis(300))).await;
+    let mut socket = open_sop_runs(preview_at, Some(TOKEN))
+        .await
+        .expect("the socket opens");
+    assert_eq!(
+        next_frame(&mut socket).await,
+        Some(json!({"type": "snapshot", "runs": []}))
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+    let running = run_change("after-the-timeout", SopRunStatus::Running);
+    changes
+        .send(running.clone())
+        .expect("the feed is still armed");
+    assert_eq!(
+        next_frame(&mut socket).await,
+        Some(json!({"type": "run", "run": running}))
+    );
+}
+
+/// Both routes sit behind `zeroclaw-gw`'s body limit: a request declaring a
+/// body over it, the socket's upgrade included, is answered `413` before the
+/// handler runs.
+#[tokio::test]
+async fn the_new_routes_sit_behind_the_preview_body_limit() {
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt as _;
+    let (engine, changes) = sop_engine();
+    let harness = Harness::with_sop_engine(engine);
+    let preview = harness.preview(
+        harness.core.clone(),
+        std::time::Duration::from_secs(crate::REQUEST_TIMEOUT_SECS),
+    );
+    let oversized = vec![b' '; crate::MAX_BODY_SIZE + 1];
+    for (path, upgrade) in [("/api/version/check", false), ("/ws/sops/runs", true)] {
+        let mut request = Request::get(path)
+            .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+            .header(header::CONTENT_LENGTH, oversized.len());
+        if upgrade {
+            request = request
+                .header(header::CONNECTION, "upgrade")
+                .header(header::UPGRADE, "websocket")
+                .header(header::SEC_WEBSOCKET_VERSION, "13")
+                .header(header::SEC_WEBSOCKET_KEY, "dGhlIHNhbXBsZSBub25jZQ==");
+        }
+        let request = request.body(Body::from(oversized.clone())).unwrap();
+        let response = preview.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE, "{path}");
+    }
+    assert_eq!(changes.receiver_count(), 0, "no feed was opened");
 }
 
 /// The subprotocol bearer counts only when the request has no

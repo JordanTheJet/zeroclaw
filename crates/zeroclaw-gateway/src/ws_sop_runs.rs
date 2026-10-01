@@ -13,7 +13,9 @@
 //! notifications instead.
 
 use super::AppState;
-use crate::core_rpc::{CoreAccess, CoreCall, CoreError, WsCoreAccess, subprotocol_bearer};
+use crate::core_rpc::{
+    CoreAccess, CoreCall, CoreError, CoreSubscription, WsCoreAccess, subprotocol_bearer,
+};
 use axum::{
     extract::{
         State, WebSocketUpgrade,
@@ -170,71 +172,31 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 }
 
 /// How the core answered `sops/subscribe-runs`, as the socket will tell it.
+#[derive(Debug)]
 pub(crate) enum Opened {
-    /// A live subscription: its snapshot, then its changes.
-    Feed {
-        subscription: Subscription,
-        runs: Vec<Value>,
-    },
+    /// A live subscription: its snapshot, then its changes. Dropping it
+    /// cancels it on the core, so neither a socket that ends nor an upgrade
+    /// that never completes leaves the feed running on a connection the
+    /// caller's other requests share.
+    Feed(CoreSubscription<SopsSubscribeRunsResult>),
     /// One frame, then the socket closes: the in-process socket's `disabled`
     /// or `error` frame.
     Ended(Value),
 }
 
-/// One socket's subscription on the caller's core connection. Dropping it
-/// cancels the subscription, so neither a socket that ends nor an upgrade
-/// that never completes leaves the feed running on a connection the
-/// caller's other requests share.
-pub(crate) struct Subscription {
-    core: Option<CoreCall>,
-    id: String,
-}
-
-impl Subscription {
-    fn core(&self) -> &CoreCall {
-        self.core
-            .as_ref()
-            .expect("held until the subscription is dropped")
-    }
-}
-
-impl Drop for Subscription {
-    fn drop(&mut self) {
-        let Some(core) = self.core.take() else {
-            return;
-        };
-        let id = std::mem::take(&mut self.id);
-        // Refused when the caller holds `Sops:Read` without `Logs:Read`; the
-        // pool then stops reusing this connection, and the subscription ends
-        // when the connection does.
-        zeroclaw_spawn::spawn!(async move {
-            let _ = core
-                .request(Method::SubscriptionCancel, json!({ "subscription_id": id }))
-                .await;
-        });
-    }
-}
-
-/// Open the core's run feed for one socket. Notifications are taken first:
-/// a change can reach this connection ahead of the subscribe result. The
-/// two refusals the in-process socket reports as frames, the SOP subsystem
-/// disabled and an engine failure, become that frame; any other refusal is
-/// the caller's error.
-pub(crate) async fn subscribe(
-    core: CoreCall,
-) -> Result<(broadcast::Receiver<Notification>, Opened), CoreError> {
-    let notifications = core.notifications();
-    let opened = match core
-        .call::<SopsSubscribeRunsResult>(Method::SopsSubscribeRuns, json!({}))
+/// Open the core's run feed for one socket. [`CoreCall::subscribe`] owns
+/// the subscription from before the request is sent, so a caller that stops
+/// waiting for the result (an abandoned handshake) leaves no feed behind,
+/// and it listens to the connection first, so a change that arrives ahead
+/// of the result is kept. The two refusals the in-process socket reports as
+/// frames, the SOP subsystem disabled and an engine failure, become that
+/// frame; any other refusal is the caller's error.
+pub(crate) async fn subscribe(core: CoreCall) -> Result<Opened, CoreError> {
+    match core
+        .subscribe::<SopsSubscribeRunsResult>(Method::SopsSubscribeRuns, json!({}))
         .await
     {
-        Ok(opened) => Opened::Feed {
-            runs: opened.runs,
-            subscription: Subscription {
-                core: Some(core),
-                id: opened.subscription_id,
-            },
-        },
+        Ok(subscription) => Ok(Opened::Feed(subscription)),
         Err(CoreError::Rpc(error)) if error.code == INTERNAL_ERROR => {
             let disabled = error
                 .data
@@ -242,15 +204,14 @@ pub(crate) async fn subscribe(
                 .and_then(|data| data.get("reason"))
                 .and_then(Value::as_str)
                 == Some(error_reasons::SOP_DISABLED);
-            Opened::Ended(if disabled {
+            Ok(Opened::Ended(if disabled {
                 json!({ "type": "disabled" })
             } else {
                 json!({ "type": "error", "error": error.message })
-            })
+            }))
         }
-        Err(error) => return Err(error),
-    };
-    Ok((notifications, opened))
+        Err(error) => Err(error),
+    }
 }
 
 /// `GET /ws/sops/runs` through the core, the socket every router serves for
@@ -263,27 +224,29 @@ pub(crate) async fn sop_runs_through_core(
     core: CoreCall,
     ws: WebSocketUpgrade,
 ) -> Result<Response, CoreError> {
-    let (notifications, opened) = subscribe(core).await?;
+    let opened = subscribe(core).await?;
     Ok(ws
-        .on_upgrade(move |socket| relay_from_core(socket, notifications, opened))
+        .on_upgrade(move |socket| relay_from_core(socket, opened))
         .into_response())
 }
 
-async fn relay_from_core(
-    socket: WebSocket,
-    mut notifications: broadcast::Receiver<Notification>,
-    opened: Opened,
-) {
+async fn relay_from_core(socket: WebSocket, opened: Opened) {
     let (mut sender, mut receiver) = socket.split();
     let text = |frame: Value| Message::Text(frame.to_string().into());
-    let (subscription, runs) = match opened {
+    let mut subscription = match opened {
         Opened::Ended(frame) => {
             let _ = sender.send(text(frame)).await;
             return;
         }
-        Opened::Feed { subscription, runs } => (subscription, runs),
+        Opened::Feed(subscription) => subscription,
     };
+    let id = subscription.id().to_owned();
+    // The core connection ended and the feed with it: close, so the client
+    // reconnects and subscribes again.
+    let closed = subscription.closed();
+    tokio::pin!(closed);
 
+    let runs = std::mem::take(&mut subscription.opened.runs);
     if sender
         .send(text(json!({ "type": "snapshot", "runs": runs })))
         .await
@@ -297,8 +260,8 @@ async fn relay_from_core(
                 Some(Ok(Message::Close(_)) | Err(_)) | None => return,
                 Some(Ok(_)) => continue,
             },
-            received = notifications.recv() => match received {
-                Ok(notification) => match frame_for(&notification, &subscription.id) {
+            received = subscription.notifications.recv() => match received {
+                Ok(notification) => match frame_for(&notification, &id) {
                     Some(frame) => frame,
                     None => continue,
                 },
@@ -310,9 +273,7 @@ async fn relay_from_core(
                 }
                 Err(broadcast::error::RecvError::Closed) => return,
             },
-            // The core connection ended and the feed with it: close, so the
-            // client reconnects and subscribes again.
-            () = subscription.core().closed() => {
+            () = &mut closed => {
                 let _ = sender.send(Message::Close(None)).await;
                 return;
             }

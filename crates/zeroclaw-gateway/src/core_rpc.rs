@@ -907,18 +907,6 @@ impl CoreCall {
         }
     }
 
-    /// The core's notifications on this caller's connection, for every
-    /// subscription it holds. Take the receiver before subscribing: a
-    /// notification can arrive ahead of the subscribe result.
-    pub fn notifications(&self) -> tokio::sync::broadcast::Receiver<Notification> {
-        self.pooled.client.notifications()
-    }
-
-    /// Resolve once this caller's core connection has ended.
-    pub async fn closed(&self) {
-        self.pooled.client.closed().await;
-    }
-
     /// [`CoreCall::request`], decoding the result into `T`. A result that
     /// does not decode is the core's fault, reported as a core error.
     pub async fn call<T: DeserializeOwned>(
