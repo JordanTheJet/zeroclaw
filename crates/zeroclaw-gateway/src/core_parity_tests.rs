@@ -1311,6 +1311,11 @@ async fn a_run_is_refused_when_its_procedure_is_deleted_during_the_decision_wait
 #[cfg(unix)]
 fn open_descriptors_of(metadata: &std::fs::Metadata) -> usize {
     use std::os::unix::fs::MetadataExt;
+    // libc's device and inode widths vary by Unix target. Preserve the u64
+    // identity used by MetadataExt without casting an already-u64 field.
+    fn stat_id(value: impl Into<i128>) -> u64 {
+        value.into() as u64
+    }
     std::fs::read_dir("/dev/fd")
         .unwrap()
         .filter_map(Result::ok)
@@ -1325,7 +1330,7 @@ fn open_descriptors_of(metadata: &std::fs::Metadata) -> usize {
             }
             // SAFETY: fstat returned 0, so it initialized `stat`.
             let stat = unsafe { stat.assume_init() };
-            stat.st_dev as u64 == metadata.dev() && stat.st_ino as u64 == metadata.ino()
+            stat_id(stat.st_dev) == metadata.dev() && stat_id(stat.st_ino) == metadata.ino()
         })
         .count()
 }
