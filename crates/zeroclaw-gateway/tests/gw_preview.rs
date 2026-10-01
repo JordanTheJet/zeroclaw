@@ -128,6 +128,14 @@ impl Gateway {
     async fn kill(mut self) {
         self.child.kill().await.expect("kill zeroclaw-gw");
     }
+
+    /// Wait for the process to exit by itself.
+    async fn exits(mut self) -> std::process::ExitStatus {
+        tokio::time::timeout(WAIT, self.child.wait())
+            .await
+            .expect("zeroclaw-gw stops by itself")
+            .expect("wait for zeroclaw-gw")
+    }
 }
 
 /// A plain HTTP/1.1 GET; returns the status and the body as JSON.
@@ -146,7 +154,38 @@ async fn get(address: &str, path: &str, token: Option<&str>) -> (u16, Value) {
         .await
         .expect("a response in time")
         .expect("read the response");
-    let text = String::from_utf8_lossy(&response);
+    parse(&response)
+}
+
+/// An HTTP/1.1 POST of a JSON `body`, over `stream`.
+async fn post_on<S>(mut stream: S, address: &str, path: &str, body: &str) -> (u16, Value)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let request = format!(
+        "POST {path} HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/json\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(request.as_bytes()).await.expect("send");
+    let mut response = Vec::new();
+    // A TLS peer may close without a close_notify once it has answered.
+    let _ = tokio::time::timeout(WAIT, stream.read_to_end(&mut response))
+        .await
+        .expect("a response in time");
+    parse(&response)
+}
+
+async fn post(address: &str, path: &str, body: &str) -> (u16, Value) {
+    let stream = tokio::net::TcpStream::connect(address)
+        .await
+        .expect("connect to zeroclaw-gw");
+    post_on(stream, address, path, body).await
+}
+
+/// The status and the JSON body of an HTTP/1.1 response.
+fn parse(response: &[u8]) -> (u16, Value) {
+    let text = String::from_utf8_lossy(response);
     let (head, body) = text.split_once("\r\n\r\n").expect("headers and body");
     let status = head
         .split_whitespace()
@@ -255,6 +294,110 @@ async fn the_separate_gateway_follows_the_core_through_restarts_of_either() {
     core.stop().await;
 }
 
+const HOOK_EVENT: &str =
+    r#"{"session_id":"s1","event_type":"tool_use","tool_name":"Bash","summary":"ls"}"#;
+
+#[tokio::test]
+async fn it_answers_the_claude_code_hook_and_stops_on_admin_shutdown() {
+    let tmp = tempfile::tempdir().unwrap();
+    let core = Core::serve(Core::context(tmp.path())).await;
+    let gateway = Gateway::spawn(&core.endpoint, &[]).await;
+
+    let (status, ack) = post(&gateway.address, "/hooks/claude-code", HOOK_EVENT).await;
+    assert_eq!(status, 200, "{ack}");
+    assert_eq!(ack, serde_json::json!({ "ok": true }));
+
+    let (status, stopping) = post(&gateway.address, "/admin/shutdown", "").await;
+    assert_eq!(status, 200, "{stopping}");
+    assert_eq!(
+        stopping,
+        serde_json::json!({ "success": true, "message": "Gateway shutdown initiated" })
+    );
+    let exit = gateway.exits().await;
+    assert!(exit.success(), "zeroclaw-gw exited with {exit:?}");
+
+    // Only the gateway stopped: the core still serves its socket.
+    assert!(
+        tokio::net::UnixStream::connect(&core.endpoint)
+            .await
+            .is_ok(),
+        "the core keeps serving"
+    );
+    core.stop().await;
+}
+
+/// Accepts the test's self-signed certificate: these tests check what the
+/// listener serves, not who it is.
+#[derive(Debug)]
+struct AnyServer(Arc<rustls::crypto::CryptoProvider>);
+
+impl rustls::client::danger::ServerCertVerifier for AnyServer {
+    fn verify_server_cert(
+        &self,
+        _: &rustls::pki_types::CertificateDer<'_>,
+        _: &[rustls::pki_types::CertificateDer<'_>],
+        _: &rustls::pki_types::ServerName<'_>,
+        _: &[u8],
+        _: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
+    }
+}
+
+/// An HTTPS POST to the TLS listener at `address`.
+async fn post_tls(address: &str, path: &str, body: &str) -> (u16, Value) {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let config = rustls::ClientConfig::builder_with_provider(Arc::clone(&provider))
+        .with_safe_default_protocol_versions()
+        .expect("TLS versions")
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AnyServer(provider)))
+        .with_no_client_auth();
+    let tcp = tokio::net::TcpStream::connect(address)
+        .await
+        .expect("connect to zeroclaw-gw");
+    let stream = tokio_rustls::TlsConnector::from(Arc::new(config))
+        .connect(
+            rustls::pki_types::ServerName::try_from("localhost").expect("a name"),
+            tcp,
+        )
+        .await
+        .expect("TLS handshake");
+    post_on(stream, address, path, body).await
+}
+
 #[tokio::test]
 async fn without_an_endpoint_it_refuses_to_start() {
     let output = Command::new(env!("CARGO_BIN_EXE_zeroclaw-gw"))
@@ -306,6 +449,13 @@ async fn with_tls_flags_it_serves_https() {
         "the listener speaks TLS, not plain HTTP"
     );
 
-    gateway.kill().await;
+    // Over TLS the routes see the caller's address too: the hook answers,
+    // and a shutdown from loopback stops the process.
+    let (status, ack) = post_tls(&gateway.address, "/hooks/claude-code", HOOK_EVENT).await;
+    assert_eq!(status, 200, "{ack}");
+    let (status, stopping) = post_tls(&gateway.address, "/admin/shutdown", "").await;
+    assert_eq!(status, 200, "{stopping}");
+    let exit = gateway.exits().await;
+    assert!(exit.success(), "zeroclaw-gw exited with {exit:?}");
     core.stop().await;
 }
