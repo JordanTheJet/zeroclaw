@@ -42879,6 +42879,138 @@ stream_tool_arguments = [
         assert_eq!(custom_uri(&masked), Some(stored));
     }
 
+    /// The credential URLs declared outside this module: the A2A server's
+    /// public base and a peer's base, the email OAuth endpoints (members of
+    /// one opaque `oauth2` property), the Gmail push webhook and the voice
+    /// webhook base. The whole-config projection, every listed property and
+    /// every single-property read hide their credentials, and writing each
+    /// property back as shown leaves the config exactly as stored.
+    #[::core::prelude::v1::test]
+    fn credential_urls_outside_the_schema_module_are_masked_and_restored() {
+        use crate::traits::MaskSecrets;
+        const MARKERS: [&str; 6] = [
+            "pw-a2a-server",
+            "q-a2a-peer",
+            "pw-email-token",
+            "q-email-device",
+            "pw-gmail-hook",
+            "q-voice-base",
+        ];
+        let stored = "\
+            [a2a.server]\n\
+            public_base_url = \"https://pub:pw-a2a-server@a2a.example/base\"\n\
+            [[a2a.client.peers]]\n\
+            name = \"team\"\n\
+            base_url = \"https://peer.example/a2a?key=q-a2a-peer\"\n\
+            [channels.email.ops]\n\
+            imap_host = \"imap.example\"\n\
+            smtp_host = \"smtp.example\"\n\
+            username = \"ops\"\n\
+            password = \"\"\n\
+            from_address = \"ops@example.invalid\"\n\
+            [channels.email.ops.oauth2]\n\
+            client_id = \"client\"\n\
+            token_url = \"https://tok:pw-email-token@login.example/token\"\n\
+            device_code_url = \"https://login.example/devicecode?key=q-email-device\"\n\
+            scopes = [\"offline_access\"]\n\
+            [channels.gmail_push.inbox]\n\
+            topic = \"projects/p/topics/t\"\n\
+            webhook_url = \"https://hook:pw-gmail-hook@hooks.example/gmail\"\n\
+            [channels.voice_call.calls]\n\
+            account_id = \"account\"\n\
+            auth_token = \"\"\n\
+            from_number = \"+15550100\"\n\
+            webhook_base_url = \"https://voice.example/base?key=q-voice-base\"\n";
+        let original: Config = toml::from_str(stored).unwrap();
+        let leaks = |text: &str| -> Vec<&str> {
+            MARKERS
+                .into_iter()
+                .filter(|marker| text.contains(marker))
+                .collect()
+        };
+        assert_eq!(
+            leaks(&toml::to_string(&original).unwrap()),
+            MARKERS,
+            "every fixture is a field the config parses"
+        );
+
+        let mut masked = original.clone();
+        masked.mask_secrets();
+        let whole = serde_json::to_string(&masked).unwrap();
+        assert!(leaks(&whole).is_empty(), "{:?}", leaks(&whole));
+        assert_eq!(
+            masked.a2a.server.public_base_url,
+            "https://***MASKED***@a2a.example/base"
+        );
+
+        let mut config = original.clone();
+        let mut written_back = 0;
+        for field in original.prop_fields() {
+            let read = original.get_prop(&field.name).unwrap_or_default();
+            assert!(leaks(&field.display_value).is_empty(), "{}", field.name);
+            assert!(leaks(&read).is_empty(), "{}: {read}", field.name);
+            if crate::url_credentials::carries_mask(&field.display_value) {
+                // An object property reads as a TOML inline table and is
+                // written as JSON, as the dashboard writes it back.
+                let written =
+                    toml::from_str::<toml::Table>(&format!("value = {}", field.display_value))
+                        .ok()
+                        .filter(|parsed| parsed["value"].is_table())
+                        .map_or_else(
+                            || field.display_value.clone(),
+                            |parsed| serde_json::to_string(&parsed["value"]).unwrap(),
+                        );
+                config
+                    .set_prop(&field.name, &written)
+                    .unwrap_or_else(|error| panic!("{}: {error}", field.name));
+                written_back += 1;
+            }
+        }
+        // Five properties: the two OAuth endpoints are one `oauth2` object.
+        assert_eq!(written_back, 5, "each masked property is written back");
+        assert_eq!(
+            toml::to_string(&config).unwrap(),
+            toml::to_string(&original).unwrap(),
+            "writing back what reads show changes nothing"
+        );
+
+        // `restore_secrets_from` puts every stored component back too.
+        masked.restore_secrets_from(&original);
+        assert_eq!(
+            toml::to_string(&masked).unwrap(),
+            toml::to_string(&original).unwrap()
+        );
+    }
+
+    /// The email OAuth settings are one object property: a member written
+    /// with the placeholder and nothing stored behind it is refused.
+    #[::core::prelude::v1::test]
+    fn an_oauth_endpoint_placeholder_with_nothing_stored_is_refused() {
+        let mut config: Config = toml::from_str(
+            "[channels.email.ops]\nimap_host = \"i\"\nsmtp_host = \"s\"\nusername = \"u\"\n\
+             password = \"\"\nfrom_address = \"a@example.invalid\"\n",
+        )
+        .unwrap();
+        let path = config
+            .prop_fields()
+            .into_iter()
+            .map(|field| field.name)
+            .find(|name| name.ends_with("oauth2"))
+            .expect("the oauth2 settings are a listed property");
+        let error = config
+            .set_prop(
+                &path,
+                r#"{"client_id": "c", "token_url": "https://***MASKED***@login.example/token", "device_code_url": "https://login.example/devicecode", "scopes": []}"#,
+            )
+            .expect_err("nothing stored to restore from");
+        assert!(
+            error
+                .downcast_ref::<crate::url_credentials::UnresolvedMask>()
+                .is_some(),
+            "{error}"
+        );
+    }
+
     /// A skill registry's git URL can carry an access token: every read masks
     /// it, and the list written back as shown restores each entry's token
     /// from the stored registry of the same name.

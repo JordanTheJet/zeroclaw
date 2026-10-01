@@ -212,6 +212,10 @@ impl HasPropKind
 
 impl HasPropKind for crate::scattered_types::EmailOAuth2Config {
     const PROP_KIND: PropKind = PropKind::Object;
+
+    fn display_credential_url_terminals() -> Vec<&'static str> {
+        crate::scattered_types::EmailOAuth2Config::CREDENTIAL_URL_FIELDS.to_vec()
+    }
 }
 
 impl HasPropKind for Vec<crate::schema::ClassificationRule> {
@@ -512,7 +516,7 @@ impl CredentialUrlField for String {
     }
 }
 
-impl CredentialUrlField for Option<String> {
+impl<T: CredentialUrlField> CredentialUrlField for Option<T> {
     fn mask_url_credentials(&mut self) {
         if let Some(inner) = self {
             inner.mask_url_credentials();

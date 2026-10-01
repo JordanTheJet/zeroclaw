@@ -322,22 +322,21 @@ pub fn serde_set_prop<T: serde::Serialize + serde::de::DeserializeOwned>(
     let mut table: toml::Table = toml::from_str(&toml::to_string(target)?)?;
     // A `#[credential_url]` value read back masked takes the stored
     // components it masked, so re-posting a displayed URL never stores the
-    // placeholder in place of the credential. An object array is restored
-    // entry by entry once parsed, below.
+    // placeholder in place of the credential. An object, or each entry of an
+    // object array, is restored member by member once parsed, below.
     let masked = credential_url && crate::url_credentials::carries_mask(value_str);
+    let structured = matches!(kind, PropKind::Object | PropKind::ObjectArray);
     let current = table.get(&serde_name).cloned();
     let restored;
-    let value_str = match &current {
-        Some(toml::Value::Array(_)) => value_str,
-        stored if masked => {
-            restored = crate::url_credentials::restore(
-                value_str,
-                stored.as_ref().and_then(toml::Value::as_str),
-            )
-            .map_err(|error| anyhow::Error::new(error.at(name)))?;
-            restored.as_str()
-        }
-        _ => value_str,
+    let value_str = if masked && !structured {
+        restored = crate::url_credentials::restore(
+            value_str,
+            current.as_ref().and_then(toml::Value::as_str),
+        )
+        .map_err(|error| anyhow::Error::new(error.at(name)))?;
+        restored.as_str()
+    } else {
+        value_str
     };
     if (value_str.is_empty() || value_str == crate::traits::UNSET_DISPLAY || value_str == "****")
         && is_option
@@ -349,11 +348,8 @@ pub fn serde_set_prop<T: serde::Serialize + serde::de::DeserializeOwned>(
         } else {
             parse_prop_value(value_str, kind)?
         };
-        if masked
-            && let (toml::Value::Array(entries), Some(toml::Value::Array(stored))) =
-                (&mut parsed, &current)
-        {
-            restore_masked_entries(entries, stored)
+        if masked && structured {
+            restore_masked_value(&mut parsed, current.as_ref())
                 .map_err(|error| anyhow::Error::new(error.at(name)))?;
         }
         table.insert(serde_name, parsed);
@@ -401,17 +397,54 @@ fn restore_masked_entries(
         let [source] = sources.as_slice() else {
             return Err(crate::url_credentials::UnresolvedMask::entry(sources.len()));
         };
-        for key in masked {
-            let edited = fields
-                .get(&key)
-                .and_then(toml::Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-            let restored = crate::url_credentials::restore(
-                &edited,
-                source.get(&key).and_then(toml::Value::as_str),
+        restore_masked_fields(fields, Some(source))?;
+    }
+    Ok(())
+}
+
+/// Restore an object or object-array value a client wrote with masked URL
+/// members, against what is stored. Nothing stored leaves nothing to restore
+/// from, so a member carrying the placeholder is then refused.
+fn restore_masked_value(
+    parsed: &mut toml::Value,
+    current: Option<&toml::Value>,
+) -> Result<(), crate::url_credentials::UnresolvedMask> {
+    match parsed {
+        toml::Value::Array(entries) => {
+            let stored = match current {
+                Some(toml::Value::Array(stored)) => stored.as_slice(),
+                _ => &[],
+            };
+            restore_masked_entries(entries, stored)
+        }
+        toml::Value::Table(fields) => {
+            restore_masked_fields(fields, current.and_then(toml::Value::as_table))
+        }
+        toml::Value::String(value) => {
+            *value = crate::url_credentials::restore(value, current.and_then(toml::Value::as_str))?;
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Restore each string member of `fields` that carries the placeholder from
+/// the same member of `source`, the stored object it was read from.
+fn restore_masked_fields(
+    fields: &mut toml::Table,
+    source: Option<&toml::Table>,
+) -> Result<(), crate::url_credentials::UnresolvedMask> {
+    for (key, value) in fields.iter_mut() {
+        let toml::Value::String(edited) = value else {
+            continue;
+        };
+        if crate::url_credentials::carries_mask(edited) {
+            *edited = crate::url_credentials::restore(
+                edited,
+                source
+                    .and_then(|source| source.get(key))
+                    .and_then(toml::Value::as_str),
             )?;
-            fields.insert(key, toml::Value::String(restored));
         }
     }
     Ok(())
