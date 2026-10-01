@@ -2486,6 +2486,15 @@
           "filename": {
             "type": "string"
           },
+          "max_chars": {
+            "description": "Return at most this many characters of the file, with `truncated`\nset when it is longer: the bounded view the dashboard shows,\nsmall enough to cross the connection whatever the file's size.\nOmitted, the whole file is returned, as before; a client that\nedits and saves what it reads needs all of it.",
+            "format": "uint",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "require_configured_agent": {
             "description": "As on `personality/list`.",
             "type": "boolean"
@@ -6586,6 +6595,19 @@
           }
         },
         {
+          "name": "max_chars",
+          "required": false,
+          "schema": {
+            "description": "Return at most this many characters of the file, with `truncated`\nset when it is longer: the bounded view the dashboard shows,\nsmall enough to cross the connection whatever the file's size.\nOmitted, the whole file is returned, as before; a client that\nedits and saves what it reads needs all of it.",
+            "format": "uint",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        {
           "name": "require_configured_agent",
           "required": false,
           "schema": {
@@ -8026,6 +8048,7 @@
     "-32001": "SESSION_LIMIT_REACHED",
     "-32002": "SESSION_BUSY",
     "-32003": "SESSION_NOT_OWNED",
+    "-32005": "PRECONDITION_FAILED",
     "-32010": "AUTH_REQUIRED",
     "-32011": "VERSION_MISMATCH",
     "-32012": "FORBIDDEN",
