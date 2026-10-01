@@ -346,7 +346,7 @@ const REFUSED: &[(&str, &str, Refusal)] = &[
     // `GET` and `OPTIONS /api/config` are served.
     ("/api/config", "PATCH", Refusal::NotPorted),
     // The core's reads lack the route's `warnings` and its secret reduction
-    // to `{populated}` until the config parity methods land.
+    // to `{populated}`; no open change adds them yet.
     (
         "/api/config/prop",
         "GET,PUT,DELETE,OPTIONS",
@@ -364,8 +364,8 @@ const REFUSED: &[(&str, &str, Refusal)] = &[
         Refusal::NotPorted,
     ),
     ("/api/config/delete-plan", "GET", Refusal::NotPorted),
-    // The core derives readiness differently until the config parity
-    // methods land; so do the sections' `ready` and `completed`.
+    // The core derives readiness differently from the route, and the
+    // sections' `ready` and `completed` too; no open change aligns them yet.
     ("/api/config/status", "GET", Refusal::NotPorted),
     ("/api/config/agent-options", "GET", Refusal::NotPorted),
     ("/api/config/sections", "GET", Refusal::NotPorted),
@@ -844,8 +844,10 @@ where
 }
 
 /// `GET /api/config`: the masked configuration. (`OPTIONS /api/config` is
-/// the configuration's JSON Schema, built into this binary, served as the
-/// in-process route serves it: without a credential.)
+/// the configuration's JSON Schema as this binary builds it, served as the
+/// in-process route serves it: without a credential. It matches the core's
+/// only while both come from the same build, and its `Allow` list names the
+/// in-process route's write methods, which this gateway still refuses.)
 async fn config_get(access: Result<CoreAccess, CoreError>) -> Response {
     served(access, |call| async move {
         crate::api_config::config_get_through_core(&call).await
