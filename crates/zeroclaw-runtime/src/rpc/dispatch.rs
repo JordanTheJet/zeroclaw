@@ -11940,7 +11940,9 @@ struct SopRunsDelivery {
 
 /// Forward run changes to one subscriber until it is cancelled, the
 /// connection closes, a write fails, the feed ends, or the caller loses its
-/// authority.
+/// authority. Each change goes out through [`deliver_frame`], so the grant is
+/// checked after any wait for writer room, and a cancel releases a feed
+/// blocked on a full writer.
 ///
 /// `seq` numbers the changes this subscription delivers. A lag on the feed
 /// advances it by the number of changes the feed lost, after a
@@ -12010,18 +12012,18 @@ async fn deliver_sop_run_changes(delivery: SopRunsDelivery) {
                 }
                 Err(RecvError::Closed) => break 'deliver,
             };
-            if !still_granted(
-                &inbound,
-                binding.as_ref(),
-                Method::SopsSubscribeRuns,
-                &mut checked_generation,
-            ) {
-                break 'deliver;
-            }
             let Ok(json) = serde_json::to_string(&notification) else {
                 break 'deliver;
             };
-            if !rpc.send_raw(json).await {
+            let granted = || {
+                still_granted(
+                    &inbound,
+                    binding.as_ref(),
+                    Method::SopsSubscribeRuns,
+                    &mut checked_generation,
+                )
+            };
+            if !deliver_frame(&rpc, &cancel, granted, json).await {
                 break 'deliver;
             }
         }
@@ -23713,6 +23715,150 @@ mod tests {
             )
             .await,
             "a principal that lost Sops:Read must stop receiving run changes"
+        );
+    }
+
+    /// `alice`, holding `Sops:Read`, subscribed to every SOP's run changes
+    /// on a writer with room for one line, the subscribe reply already read.
+    /// Returns the context (for policy changes), the policy she started
+    /// with, her connection, its writer, the engine's change feed and the
+    /// subscription id.
+    async fn run_subscriber_on_a_one_line_writer(
+        tmp: &tempfile::TempDir,
+    ) -> (
+        Arc<RpcContext>,
+        zeroclaw_config::schema::Config,
+        RpcDispatcher,
+        tokio::sync::mpsc::Receiver<String>,
+        tokio::sync::broadcast::Sender<crate::sop::SopRunSummary>,
+        String,
+    ) {
+        use zeroclaw_api::grants::{Resource, Verb};
+        let (engine, changes, sop_config) = sop_runs_engine(tmp, 16);
+        let mut config = roster_config(4242);
+        config.sop = sop_config;
+        config
+            .permission_profiles
+            .get_mut("reader")
+            .expect("the fixture profile exists")
+            .grants
+            .insert(Resource::Sops, vec![Verb::Read]);
+        let ctx = sop_runs_ctx(config.clone(), &engine);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let mut alice = RpcDispatcher::new(Arc::clone(&ctx), tx, "unix:uid=4242".into())
+            .with_transport(
+                crate::rpc::transport::TransportKind::Local,
+                crate::security::auth_provider::Credential::Peercred { uid: 4242 },
+            );
+        alice
+            .handle_initialize(&json!({}))
+            .await
+            .expect("roster uid authenticates");
+        let opened = rpc(&mut alice, &mut rx, 1, "sops/subscribe-runs", json!({})).await;
+        let id = opened["result"]["subscription_id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("sops/subscribe-runs opens: {opened}"))
+            .to_string();
+        (ctx, config, alice, rx, changes, id)
+    }
+
+    /// Publish a change that takes the writer's only room and one more, and
+    /// return once the first is enqueued and delivery of the second is
+    /// waiting for room.
+    async fn block_run_delivery_on_a_full_writer(
+        changes: &tokio::sync::broadcast::Sender<crate::sop::SopRunSummary>,
+        rx: &tokio::sync::mpsc::Receiver<String>,
+    ) {
+        use crate::sop::SopRunStatus;
+        for run_id in ["SENTINEL-FILL", "SENTINEL-PENDING"] {
+            changes
+                .send(run_change(run_id, "alpha-sop", SopRunStatus::Running))
+                .expect("the subscription listens");
+        }
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while rx.len() < 1 || !changes.is_empty() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the first change takes the room and the second is taken off the feed"
+            );
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    /// `Sops:Read` withdrawn while delivery waits for writer room ends the
+    /// feed before the waiting change is enqueued: authority is checked at
+    /// the enqueue boundary, after the wait, not before it.
+    #[tokio::test]
+    async fn sops_read_withdrawn_while_the_writer_is_full_delivers_no_more_run_changes() {
+        use zeroclaw_api::grants::Resource;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (ctx, config, alice, mut rx, changes, id) =
+            run_subscriber_on_a_one_line_writer(&tmp).await;
+        block_run_delivery_on_a_full_writer(&changes, &rx).await;
+
+        let mut narrowed = config;
+        narrowed
+            .permission_profiles
+            .get_mut("reader")
+            .expect("the fixture profile exists")
+            .grants
+            .remove(&Resource::Sops);
+        ctx.auth
+            .refresh_from_config(&narrowed)
+            .expect("the narrowed policy compiles");
+        let fill = rx.recv().await.expect("the change that took the room");
+        assert!(fill.contains("SENTINEL-FILL"), "{fill}");
+
+        assert!(
+            !next_frame_containing(
+                &mut rx,
+                "SENTINEL-PENDING",
+                std::time::Duration::from_millis(500)
+            )
+            .await,
+            "a change waiting for room must not be enqueued after Sops:Read is gone"
+        );
+        assert!(
+            !alice.subscriptions.lock().contains_key(&id),
+            "the refused feed ends"
+        );
+        assert_eq!(changes.receiver_count(), 0, "and lets go of the engine");
+    }
+
+    /// Cancelling a run subscription whose delivery waits for writer room
+    /// releases the feed at once. It does not wait for the reader to drain,
+    /// and the waiting change is never enqueued.
+    #[tokio::test]
+    async fn a_cancel_releases_a_run_feed_blocked_on_a_full_writer() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (_ctx, _config, alice, mut rx, changes, id) =
+            run_subscriber_on_a_one_line_writer(&tmp).await;
+        block_run_delivery_on_a_full_writer(&changes, &rx).await;
+
+        let cancelled = alice
+            .handle_subscription_cancel(&json!({"subscription_id": id}))
+            .expect("cancel");
+        assert_eq!(cancelled["cancelled"], json!(true));
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+        while changes.receiver_count() > 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "a cancelled feed is released while the writer is still full"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let fill = rx.recv().await.expect("the change that took the room");
+        assert!(fill.contains("SENTINEL-FILL"), "{fill}");
+        assert!(
+            !next_frame_containing(
+                &mut rx,
+                "SENTINEL-PENDING",
+                std::time::Duration::from_millis(500)
+            )
+            .await,
+            "a cancelled feed enqueues nothing more"
         );
     }
 
