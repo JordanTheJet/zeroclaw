@@ -114,7 +114,7 @@ impl OwnedProcesses {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 impl OwnedProcesses {
     fn launched_ids(&self) -> Vec<u32> {
         self.registry()
