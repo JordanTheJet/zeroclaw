@@ -6,7 +6,7 @@ use super::transport::RpcTransport;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use std::io::ErrorKind;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 #[cfg(all(test, unix))]
@@ -165,10 +165,16 @@ fn is_recoverable_accept_error(e: &std::io::Error) -> bool {
 }
 
 pub fn socket_path(config: &Config) -> PathBuf {
+    socket_path_for_data_dir(&config.data_dir)
+}
+
+/// The endpoint a daemon with `data_dir` binds: `ZEROCLAW_SOCKET` when set,
+/// otherwise the platform default under the data directory.
+pub fn socket_path_for_data_dir(data_dir: &Path) -> PathBuf {
     if let Ok(p) = std::env::var("ZEROCLAW_SOCKET") {
         return PathBuf::from(p);
     }
-    platform::default_endpoint(&config.data_dir)
+    platform::default_endpoint(data_dir)
 }
 
 // ── Transport ────────────────────────────────────────────────────
