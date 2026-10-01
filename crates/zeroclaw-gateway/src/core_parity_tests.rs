@@ -814,3 +814,219 @@ async fn the_event_stream_through_the_core_carries_the_in_process_frames_but_no_
     assert_eq!(from_core, without_credentials);
     assert!(from_core.iter().all(|f| f.get("session_id").is_none()));
 }
+
+/// What a [`HoldSubscribeReply`] proxy saw between the pool and the core.
+#[derive(Default)]
+struct HeldReply {
+    /// The subscription the core opened in the reply being held.
+    subscription_id: std::sync::Mutex<Option<String>>,
+    ready: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+    /// Each `subscription/cancel` the core answered: its target and whether
+    /// the core says it cancelled anything.
+    cancels: std::sync::Mutex<Vec<(String, Value)>>,
+    cancel_answered: tokio::sync::Notify,
+}
+
+/// A dialer with a line proxy between the pool and the real core that holds
+/// the core's reply to the first `logs/subscribe` until released. The core
+/// has opened the subscription by the time that reply is held.
+struct HoldSubscribeReply {
+    connector: InprocConnector,
+    armed: Arc<std::sync::atomic::AtomicBool>,
+    held: Arc<HeldReply>,
+}
+
+impl crate::core_rpc::Dial for HoldSubscribeReply {
+    fn dial(&self) -> crate::core_rpc::DialFuture<'_> {
+        let (armed, held) = (Arc::clone(&self.armed), Arc::clone(&self.held));
+        Box::pin(async move {
+            let core = crate::core_rpc::Dial::dial(&self.connector).await?;
+            let (gateway, proxy) = tokio::io::duplex(64 * 1024);
+            zeroclaw_spawn::spawn!(hold_relay(proxy, core, armed, held));
+            Some(gateway)
+        })
+    }
+}
+
+async fn hold_relay(
+    gateway: tokio::io::DuplexStream,
+    core: tokio::io::DuplexStream,
+    armed: Arc<std::sync::atomic::AtomicBool>,
+    held: Arc<HeldReply>,
+) {
+    use std::sync::atomic::Ordering;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let (from_gateway, mut to_gateway) = tokio::io::split(gateway);
+    let (from_core, mut to_core) = tokio::io::split(core);
+    // Request id -> `None` for the held subscribe, or a cancel's target.
+    let watched: Arc<std::sync::Mutex<HashMap<String, Option<String>>>> = Arc::default();
+    let upstream = {
+        let watched = Arc::clone(&watched);
+        async move {
+            let mut lines = BufReader::new(from_gateway).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let message: Value = serde_json::from_str(&line).unwrap_or_default();
+                let id = message["id"].to_string();
+                match message["method"].as_str() {
+                    Some("logs/subscribe") if armed.swap(false, Ordering::SeqCst) => {
+                        watched.lock().unwrap().insert(id, None);
+                    }
+                    Some("subscription/cancel") => {
+                        let target = message["params"]["subscription_id"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_owned();
+                        watched.lock().unwrap().insert(id, Some(target));
+                    }
+                    _ => {}
+                }
+                if to_core
+                    .write_all(format!("{line}\n").as_bytes())
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            let _ = to_core.shutdown().await;
+        }
+    };
+    let downstream = async move {
+        let mut lines = BufReader::new(from_core).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            let message: Value = serde_json::from_str(&line).unwrap_or_default();
+            let watch = if message.get("method").is_none() {
+                watched.lock().unwrap().remove(&message["id"].to_string())
+            } else {
+                None
+            };
+            match watch {
+                Some(None) => {
+                    *held.subscription_id.lock().unwrap() = message["result"]["subscription_id"]
+                        .as_str()
+                        .map(str::to_owned);
+                    held.ready.notify_one();
+                    held.release.notified().await;
+                }
+                Some(Some(target)) => {
+                    let cancelled = message["result"]["cancelled"].clone();
+                    held.cancels.lock().unwrap().push((target, cancelled));
+                    held.cancel_answered.notify_one();
+                }
+                None => {}
+            }
+            if to_gateway
+                .write_all(format!("{line}\n").as_bytes())
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    };
+    tokio::join!(upstream, downstream);
+}
+
+async fn core_call(core: &CoreRpc) -> crate::core_rpc::CoreCall {
+    match core.access(&Harness::headers()).await {
+        Ok(CoreAccess::Core(call)) => call,
+        Ok(CoreAccess::InProcess) => panic!("served in-process"),
+        Err(error) => panic!("no core access: {error:?}"),
+    }
+}
+
+/// A client that leaves `/api/events` while the core's reply to its
+/// `logs/subscribe` is in flight leaves no subscription behind, though
+/// another request keeps the same pooled connection open.
+#[tokio::test]
+async fn an_event_stream_abandoned_during_setup_leaves_no_subscription() {
+    let harness = Harness::new(None);
+    let connector = InprocConnector::new(harness.cancel.clone());
+    connector.bind(Arc::clone(&harness.ctx));
+    let held = Arc::new(HeldReply::default());
+    let core = CoreRpc::over_dialer(HoldSubscribeReply {
+        connector,
+        armed: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        held: Arc::clone(&held),
+    });
+    let keeper = core_call(&core).await;
+    let opening = zeroclaw_spawn::spawn!(crate::sse::events_stream_through_core(
+        core_call(&core).await
+    ));
+    tokio::time::timeout(std::time::Duration::from_secs(5), held.ready.notified())
+        .await
+        .expect("the core opened the subscription");
+    opening.abort();
+    assert!(opening.await.is_err(), "the setup was abandoned");
+    held.release.notify_one();
+    let id = held
+        .subscription_id
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("the core named the subscription it opened");
+
+    // The cancel that nobody waiting on the stream could have sent.
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !held
+            .cancels
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(target, _)| *target == id)
+        {
+            held.cancel_answered.notified().await;
+        }
+    })
+    .await
+    .expect("the abandoned subscription is cancelled");
+    assert_eq!(
+        *held.cancels.lock().unwrap(),
+        vec![(id.clone(), json!(true))],
+        "cancelled once, by the gateway"
+    );
+    let again = keeper
+        .request(
+            zeroclaw_rpc_client::Method::SubscriptionCancel,
+            json!({ "subscription_id": id }),
+        )
+        .await
+        .expect("the connection still serves");
+    assert_eq!(again["cancelled"], json!(false), "nothing left to cancel");
+}
+
+/// The preview router keeps the in-process gateway's body limit on Doctor:
+/// an oversized POST is refused before any check runs.
+#[tokio::test]
+async fn an_oversized_doctor_post_is_refused_by_both_routers() {
+    use tower::ServiceExt as _;
+    let harness = Harness::new(None);
+    let in_process = axum::Router::new()
+        .route(
+            "/api/doctor",
+            axum::routing::post(crate::api::handle_api_doctor),
+        )
+        .with_state(harness.state.clone())
+        .layer(axum::Extension(CoreRpc::default()))
+        .layer(tower_http::limit::RequestBodyLimitLayer::new(
+            crate::MAX_BODY_SIZE,
+        ));
+    let preview = crate::preview::router(
+        harness.core.clone(),
+        harness._dir.path().join("unused.sock"),
+        None,
+        tokio::sync::watch::channel(false).0,
+        std::time::Duration::from_secs(crate::REQUEST_TIMEOUT_SECS),
+    );
+    for router in [in_process, preview] {
+        let oversized = "x".repeat(crate::MAX_BODY_SIZE + 1);
+        let request = axum::http::Request::post("/api/doctor")
+            .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+            .header(header::CONTENT_LENGTH, oversized.len())
+            .body(axum::body::Body::from(oversized))
+            .expect("request");
+        let response = router.oneshot(request).await.expect("an answer");
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+}

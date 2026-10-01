@@ -807,19 +807,6 @@ impl CoreCall {
         self.pooled.client.handshake().principal_id.as_deref()
     }
 
-    /// Notifications arriving on this caller's connection. Take the receiver
-    /// before opening a subscription, so its first frames are not missed.
-    pub fn notifications(&self) -> tokio::sync::broadcast::Receiver<Notification> {
-        self.pooled.client.notifications()
-    }
-
-    /// Resolves once this caller's connection has ended. Owns its hold on
-    /// the connection, so a long-lived stream can wait on it.
-    pub fn closed(&self) -> impl Future<Output = ()> + Send + 'static {
-        let pooled = Arc::clone(&self.pooled);
-        async move { pooled.client.closed().await }
-    }
-
     /// Send `method` on this caller's connection.
     ///
     /// `initialize` is refused here without reaching the core: only the pool

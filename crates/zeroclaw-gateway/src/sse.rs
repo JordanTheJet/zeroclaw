@@ -16,7 +16,7 @@ use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
 use zeroclaw_rpc_client::Method;
 
-use crate::core_rpc::{CoreAccess, CoreCall, CoreError};
+use crate::core_rpc::{CoreAccess, CoreCall, CoreError, CoreSubscription};
 use zeroclaw_rpc_proto::types::LogsSubscribeResult;
 
 pub use zeroclaw_runtime::observability::broadcast::{BroadcastObserver, EventBuffer};
@@ -143,29 +143,24 @@ pub(crate) async fn events_history_through_core(core: &CoreCall) -> Result<Respo
 /// for headless channel login are not on this one.
 ///
 /// The stream ends when the core connection does; the browser's
-/// `EventSource` then reconnects. Closing the stream cancels the
-/// subscription.
+/// `EventSource` then reconnects. [`CoreCall::subscribe`] owns the
+/// subscription from the moment the request is sent: a client that leaves
+/// before the core replies, or closes the stream later, leaves nothing open.
 pub(crate) async fn events_stream_through_core(core: CoreCall) -> Result<Response, CoreError> {
-    // Listen before subscribing, so the first frames are not missed.
-    let notifications = core.notifications();
-    let opened: LogsSubscribeResult = core
-        .call(Method::LogsSubscribe, serde_json::json!({}))
+    let subscription = core
+        .subscribe::<LogsSubscribeResult>(Method::LogsSubscribe, serde_json::json!({}))
         .await?;
-    let delivery = CoreStream {
-        notifications,
-        closed: Box::pin(core.closed()),
-        subscription: CoreSubscription {
-            id: opened.subscription_id,
-            core: Some(core),
-        },
+    let delivery = Delivery {
+        closed: Box::pin(subscription.closed()),
+        subscription,
     };
     let stream = futures_util::stream::unfold(delivery, |mut delivery| async move {
         loop {
             tokio::select! {
                 () = &mut delivery.closed => return None,
-                received = delivery.notifications.recv() => match received {
+                received = delivery.subscription.notifications.recv() => match received {
                     Ok(note) => {
-                        if let Some(frame) = delivery.subscription.public_frame(note) {
+                        if let Some(frame) = public_frame(&delivery.subscription, note) {
                             let event = Event::default().data(frame.to_string());
                             return Some((Ok::<_, Infallible>(event), delivery));
                         }
@@ -182,63 +177,35 @@ pub(crate) async fn events_stream_through_core(core: CoreCall) -> Result<Respons
         .into_response())
 }
 
-struct CoreStream {
-    notifications: tokio::sync::broadcast::Receiver<zeroclaw_rpc_client::Notification>,
+/// One open `/api/events` stream through the core. Dropping it drops the
+/// subscription, which cancels it.
+struct Delivery {
     closed: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
-    subscription: CoreSubscription,
+    subscription: CoreSubscription<LogsSubscribeResult>,
 }
 
-/// One `logs/subscribe` subscription, held open on the caller's connection
-/// for as long as its stream lives.
-struct CoreSubscription {
-    id: String,
-    core: Option<CoreCall>,
-}
-
-impl CoreSubscription {
-    /// The frame `note` carries for this subscription, as the in-process
-    /// stream would deliver it, or `None` when it is another subscription's,
-    /// not a log frame, or a frame this route does not carry.
-    fn public_frame(&self, note: zeroclaw_rpc_client::Notification) -> Option<serde_json::Value> {
-        if note.method != zeroclaw_rpc_proto::notification::LOGS_EVENT {
-            return None;
-        }
-        let mut frame = note.params;
-        let fields = frame.as_object_mut()?;
-        if fields
-            .get("subscription_id")
-            .and_then(serde_json::Value::as_str)
-            != Some(self.id.as_str())
-        {
-            return None;
-        }
-        // The core adds these two to each frame it delivers.
-        fields.remove("subscription_id");
-        fields.remove("seq");
-        is_public_sse_event(&frame).then_some(frame)
+/// The frame `note` carries for `subscription`, as the in-process stream
+/// would deliver it, or `None` when it is another subscription's, not a log
+/// frame, or a frame this route does not carry.
+///
+/// The core drops pairing-credential frames before any RPC subscriber sees
+/// them; a frame that still carries the marker is withheld here as well.
+fn public_frame(
+    subscription: &CoreSubscription<LogsSubscribeResult>,
+    note: zeroclaw_rpc_client::Notification,
+) -> Option<serde_json::Value> {
+    if note.method != zeroclaw_rpc_proto::notification::LOGS_EVENT || !subscription.is_mine(&note) {
+        return None;
     }
-}
-
-impl Drop for CoreSubscription {
-    fn drop(&mut self) {
-        let Some(core) = self.core.take() else {
-            return;
-        };
-        if tokio::runtime::Handle::try_current().is_err() {
-            return;
-        }
-        let subscription_id = std::mem::take(&mut self.id);
-        zeroclaw_spawn::spawn!(async move {
-            // The connection may already be gone, which ends the
-            // subscription with it.
-            let _ = core
-                .request(
-                    Method::SubscriptionCancel,
-                    serde_json::json!({ "subscription_id": subscription_id }),
-                )
-                .await;
-        });
+    let mut frame = note.params;
+    let fields = frame.as_object_mut()?;
+    // The core adds these two to each frame it delivers.
+    fields.remove("subscription_id");
+    fields.remove("seq");
+    if fields.contains_key(zeroclaw_log::EPHEMERAL_BROADCAST_MARKER) {
+        return None;
     }
+    is_public_sse_event(&frame).then_some(frame)
 }
 
 fn history_events_payload(buffer: &EventBuffer) -> serde_json::Value {
