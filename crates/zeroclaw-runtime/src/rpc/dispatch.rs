@@ -2393,7 +2393,7 @@ impl RpcDispatcher {
         method: Method,
         selected_mode: Option<&ChatMode>,
     ) -> Result<Option<super::session::SessionRecord>, JsonRpcError> {
-        self.authorize_address(
+        self.authorize_session_owner_of(
             &SessionAddress::Id(session_id.to_owned()),
             method,
             selected_mode,
@@ -2402,7 +2402,7 @@ impl RpcDispatcher {
     }
 
     /// [`Self::authorize_session_owner_for_mode`] for any address.
-    async fn authorize_address(
+    async fn authorize_session_owner_of(
         &self,
         address: &SessionAddress,
         method: Method,
@@ -7501,7 +7501,7 @@ impl RpcDispatcher {
             .session_address(&req.session_id, req.session_keys.as_deref())
             .await?;
         let authorized = self
-            .authorize_address(&address, Method::SessionMessages, None)
+            .authorize_session_owner_of(&address, Method::SessionMessages, None)
             .await?;
         let expected_generation = self.capture_address_access(&address).await?;
         if cursor_mode && req.before_index.is_some() {
@@ -7795,7 +7795,7 @@ impl RpcDispatcher {
             .session_address(&req.session_id, req.session_keys.as_deref())
             .await?;
         let record = self
-            .authorize_address(&address, Method::SessionState, None)
+            .authorize_session_owner_of(&address, Method::SessionState, None)
             .await?;
         let expected_generation = self.capture_address_access(&address).await?;
         self.ctx.sessions.wait_test_state_read_pause().await;
@@ -7877,7 +7877,7 @@ impl RpcDispatcher {
             .session_address(&req.session_id, req.session_keys.as_deref())
             .await?;
         let authorized = self
-            .authorize_address(&address, Method::SessionDelete, None)
+            .authorize_session_owner_of(&address, Method::SessionDelete, None)
             .await?;
         let expected_generation = self.capture_address_access(&address).await?;
         let requested_identity = self.live_identity(&address).await;
