@@ -19,7 +19,9 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+use zeroclaw_config::api_error::{ConfigApiCode, ConfigApiError};
 use zeroclaw_config::schema::Config;
+use zeroclaw_rpc_proto::error_reasons::{RefusalData, RefusalReason};
 
 use zeroclaw_api::jsonrpc::error_codes::*;
 use zeroclaw_api::jsonrpc::{
@@ -224,6 +226,29 @@ fn rpc_err(code: i32, msg: impl Into<String>) -> JsonRpcError {
         code,
         message: msg.into(),
         data: None,
+    }
+}
+
+/// [`rpc_err`] that also names why the call was refused, in `error.data`.
+/// The code stays the one the site always returned; the reason lets a client
+/// that answers over another protocol (the gateway's HTTP routes) tell
+/// outcomes apart that share a code, without reading the message.
+fn refused(code: i32, reason: RefusalReason, msg: impl Into<String>) -> JsonRpcError {
+    reason.error(code, msg)
+}
+
+/// A refused config operation: the code and message the method has always
+/// answered, carrying in `error.data` the structured config error the
+/// dashboard's config routes answer with, and the reason its code names.
+fn config_refused(code: i32, msg: impl Into<String>, error: ConfigApiError) -> JsonRpcError {
+    RefusalData::config_error(code, msg, error)
+}
+
+/// `error` re-worded as `msg`, keeping its code and its data.
+fn reworded(error: JsonRpcError, msg: impl Into<String>) -> JsonRpcError {
+    JsonRpcError {
+        message: msg.into(),
+        ..error
     }
 }
 
@@ -595,7 +620,11 @@ fn rename_error_to_rpc(
         RenameError::PostCondition(_) => INTERNAL_ERROR,
         _ => INVALID_PARAMS,
     };
-    rpc_err(code, format!("{path}.{from}: {err}"))
+    config_refused(
+        code,
+        format!("{path}.{from}: {err}"),
+        err.api_error(path, from),
+    )
 }
 
 async fn move_renamed_agent_workspace(
@@ -1269,13 +1298,21 @@ impl RpcDispatcher {
         let Some(auth) = self.auth.as_ref() else {
             return Err(rpc_err(AUTH_REQUIRED, "First call must be 'initialize'"));
         };
-        let job = crate::cron::get_job(config, id)
-            .map_err(|e| rpc_err(INVALID_PARAMS, format!("Cron job not found: {e}")))?;
+        // A job the principal may not see is refused exactly as a missing
+        // one, reason included, so neither reveals that the job exists.
+        let job = crate::cron::get_job(config, id).map_err(|e| {
+            refused(
+                INVALID_PARAMS,
+                RefusalReason::NotFound,
+                format!("Cron job not found: {e}"),
+            )
+        })?;
         if auth.grants.may_use_agent(&job.agent_alias) {
             return Ok(job);
         }
-        let denied = rpc_err(
+        let denied = refused(
             INVALID_PARAMS,
+            RefusalReason::NotFound,
             format!("Cron job not found: {}", crate::cron::job_not_found(id)),
         );
         self.audit_auth_denial(
@@ -2700,7 +2737,7 @@ impl RpcDispatcher {
                     if !is_notif {
                         match result {
                             Ok(_) => handle.send_result(id_clone, serde_json::json!({})).await,
-                            Err(e) => handle.send_error(id_clone, e.code, &e.message).await,
+                            Err(e) => handle.send_rpc_error(id_clone, e).await,
                         }
                     }
                 });
@@ -2859,7 +2896,7 @@ impl RpcDispatcher {
 
         match result {
             Ok(v) => self.send_result(req_id, v).await,
-            Err(e) => self.send_error(req_id, e.code, &e.message).await,
+            Err(e) => self.send_rpc_error(req_id, e).await,
         }
     }
 
@@ -3503,7 +3540,7 @@ impl RpcDispatcher {
             .session_queue
             .acquire(&session_id)
             .await
-            .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?;
+            .map_err(Self::session_busy)?;
 
         // A durable row can appear while admission is queued. Resolve its
         // owner again before building or stamping a replacement session.
@@ -4363,7 +4400,7 @@ impl RpcDispatcher {
             .session_queue
             .acquire(&req.session_id)
             .await
-            .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?;
+            .map_err(Self::session_busy)?;
         let current_identity = self.ctx.sessions.generation_and_mode(&req.session_id).await;
         if current_identity != requested_identity {
             if current_identity.is_none() && requested_identity.is_some() {
@@ -4501,7 +4538,7 @@ impl RpcDispatcher {
             .session_queue
             .acquire(sid)
             .await
-            .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?;
+            .map_err(Self::session_busy)?;
         let admitted = match self
             .revalidate_admitted_session(sid, authorized.as_ref())
             .await
@@ -5276,7 +5313,7 @@ impl RpcDispatcher {
                 live_generation_at_entry,
                 cancel.clone(),
             ) => {
-                result.map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?
+                result.map_err(Self::session_busy)?
             }
         };
         if self.connection_cancel.is_cancelled() {
@@ -6482,7 +6519,7 @@ impl RpcDispatcher {
             .ctx
             .session_backend
             .as_ref()
-            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Session persistence is disabled"))?;
+            .ok_or_else(Self::session_persistence_disabled)?;
         let req: SessionListParams = parse_params(params)?;
         let config = self.ctx.config.read().clone();
 
@@ -6740,10 +6777,11 @@ impl RpcDispatcher {
                         "cursor pagination requires an ACP session",
                     ));
                 }
-                let backend =
-                    self.ctx.session_backend.as_ref().ok_or_else(|| {
-                        rpc_err(INTERNAL_ERROR, "Session persistence is disabled")
-                    })?;
+                let backend = self
+                    .ctx
+                    .session_backend
+                    .as_ref()
+                    .ok_or_else(Self::session_persistence_disabled)?;
                 backend
                     .load_with_timestamps(&key)
                     .into_iter()
@@ -6767,7 +6805,7 @@ impl RpcDispatcher {
                     ));
                 }
                 if self.ctx.session_backend.is_none() && self.ctx.acp_session_store.is_none() {
-                    return Err(rpc_err(INTERNAL_ERROR, "Session persistence is disabled"));
+                    return Err(Self::session_persistence_disabled());
                 }
                 Vec::new()
             }
@@ -6851,7 +6889,7 @@ impl RpcDispatcher {
             .ctx
             .session_backend
             .as_ref()
-            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Session persistence is disabled"))?;
+            .ok_or_else(Self::session_persistence_disabled)?;
         if let Some(DurableSession::Chat { key }) = record.and_then(|r| r.durable) {
             match backend.get_session_state(&key) {
                 Ok(Some(ss)) => {
@@ -6905,7 +6943,7 @@ impl RpcDispatcher {
             .session_queue
             .acquire(&req.session_id)
             .await
-            .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?;
+            .map_err(Self::session_busy)?;
 
         let record = match self
             .revalidate_admitted_session(&req.session_id, authorized.as_ref())
@@ -6979,10 +7017,11 @@ impl RpcDispatcher {
                 })?
             }
             Some(DurableSession::Chat { key }) => {
-                let backend =
-                    self.ctx.session_backend.as_ref().ok_or_else(|| {
-                        rpc_err(INTERNAL_ERROR, "Session persistence is disabled")
-                    })?;
+                let backend = self
+                    .ctx
+                    .session_backend
+                    .as_ref()
+                    .ok_or_else(Self::session_persistence_disabled)?;
                 match expected_owner.as_deref() {
                     Some(owner) => backend.delete_session_owned(&key, owner),
                     None => backend.delete_session(&key),
@@ -7079,11 +7118,13 @@ impl RpcDispatcher {
         requested_agent: Option<&str>,
         private_plane: bool,
     ) -> Result<(Arc<dyn zeroclaw_api::memory_traits::Memory>, Option<String>), JsonRpcError> {
-        let memory = self
-            .ctx
-            .memory
-            .clone()
-            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Memory subsystem is not available"))?;
+        let memory = self.ctx.memory.clone().ok_or_else(|| {
+            refused(
+                INTERNAL_ERROR,
+                RefusalReason::Disabled,
+                "Memory subsystem is not available",
+            )
+        })?;
         let Some(alias) = requested_agent
             .map(str::trim)
             .filter(|alias| !alias.is_empty())
@@ -7093,8 +7134,9 @@ impl RpcDispatcher {
         self.selector_agent(method, alias)?;
         let config = self.ctx.config.read().clone();
         if !config.agents.contains_key(alias) {
-            return Err(rpc_err(
+            return Err(refused(
                 INVALID_PARAMS,
+                RefusalReason::Invalid,
                 format!("Unknown agent {alias:?} (no [agents.{alias}] entry configured)"),
             ));
         }
@@ -7200,8 +7242,9 @@ impl RpcDispatcher {
         };
         match entry {
             Some(e) => to_result(MemoryGetResult { entry: Some(e) }),
-            None => Err(rpc_err(
+            None => Err(refused(
                 INTERNAL_ERROR,
+                RefusalReason::NotFound,
                 format!("Memory key `{}` not found", req.key),
             )),
         }
@@ -7427,9 +7470,10 @@ impl RpcDispatcher {
         let req: ConfigGetParams = parse_params(params)?;
         let config = self.ctx.config.read().clone();
         if let Some(prop) = req.prop {
-            let val = config
-                .get_prop(&prop)
-                .map_err(|e| rpc_err(INVALID_PARAMS, format!("Unknown prop: {e}")))?;
+            let val = config.get_prop(&prop).map_err(|e| {
+                let msg = format!("Unknown prop: {e}");
+                config_refused(INVALID_PARAMS, msg, ConfigApiError::for_prop(e, &prop))
+            })?;
             to_result(ConfigGetPropResult { prop, value: val })
         } else {
             // Return full config, masked.
@@ -7543,34 +7587,30 @@ impl RpcDispatcher {
                 &config_write_guard,
             )
             .map_err(|e| {
-                rpc_err(
-                    e.code,
-                    crate::i18n::get_required_cli_string_with_args(
-                        "rpc-config-set-many-entry-rejected",
-                        &[
-                            ("index", &index.to_string()),
-                            ("prop", &entry.prop),
-                            ("reason", &e.message),
-                        ],
-                    ),
-                )
+                let msg = crate::i18n::get_required_cli_string_with_args(
+                    "rpc-config-set-many-entry-rejected",
+                    &[
+                        ("index", &index.to_string()),
+                        ("prop", &entry.prop),
+                        ("reason", &e.message),
+                    ],
+                );
+                reworded(e, msg)
             })?;
         }
         // Boxed for the same stack-frame reason as in `handle_config_set`.
         let mut config = Box::new(self.ctx.config.read().clone());
         for (index, entry) in req.sets.iter().enumerate() {
             Self::stage_config_set(&mut config, &entry.prop, &entry.value).map_err(|e| {
-                rpc_err(
-                    e.code,
-                    crate::i18n::get_required_cli_string_with_args(
-                        "rpc-config-set-many-entry-rejected",
-                        &[
-                            ("index", &index.to_string()),
-                            ("prop", &entry.prop),
-                            ("reason", &e.message),
-                        ],
-                    ),
-                )
+                let msg = crate::i18n::get_required_cli_string_with_args(
+                    "rpc-config-set-many-entry-rejected",
+                    &[
+                        ("index", &index.to_string()),
+                        ("prop", &entry.prop),
+                        ("reason", &e.message),
+                    ],
+                );
+                reworded(e, msg)
             })?;
         }
         // The request paths describe the affected live views; the candidate
@@ -7616,9 +7656,11 @@ impl RpcDispatcher {
         if config.ensure_map_key_for_path(prop) {
             // Refused to vivify the reserved `default` agent: return a
             // reserved error rather than a downstream "Unknown property".
-            return Err(rpc_err(
+            const RESERVED: &str = "alias `default` is reserved and cannot be created";
+            return Err(config_refused(
                 INVALID_PARAMS,
-                "alias `default` is reserved and cannot be created",
+                RESERVED,
+                ConfigApiError::new(ConfigApiCode::ValidationFailed, RESERVED).with_path(prop),
             ));
         }
         let info = config.prop_fields().into_iter().find(|f| f.name == prop);
@@ -7629,7 +7671,7 @@ impl RpcDispatcher {
                 other,
                 info.as_ref().map(|i| i.kind),
             )
-            .map_err(|e| rpc_err(INVALID_PARAMS, e.message))?,
+            .map_err(|e| config_refused(INVALID_PARAMS, e.message.clone(), e.with_path(prop)))?,
         };
         // Reject the masked sentinel for secrets — surfaces echo the
         // masked display value back when no real edit happened, and
@@ -7644,14 +7686,17 @@ impl RpcDispatcher {
                 || value_str == "****"
                 || value_str.is_empty())
         {
-            return Err(rpc_err(
+            let msg = format!("Refusing to overwrite secret `{prop}` with a masked or empty value");
+            return Err(config_refused(
                 INVALID_PARAMS,
-                format!("Refusing to overwrite secret `{prop}` with a masked or empty value"),
+                msg.clone(),
+                ConfigApiError::new(ConfigApiCode::ValidationFailed, msg).with_path(prop),
             ));
         }
-        config
-            .set_prop_persistent(prop, &value_str)
-            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Config set failed: {e}")))
+        config.set_prop_persistent(prop, &value_str).map_err(|e| {
+            let msg = format!("Config set failed: {e}");
+            config_refused(INTERNAL_ERROR, msg, ConfigApiError::for_prop(e, prop))
+        })
     }
 
     fn refresh_memory_embedder_for_model_provider(&self, model_provider_ref: &str) {
@@ -7953,7 +7998,11 @@ impl RpcDispatcher {
 
     fn handle_config_reload(&self) -> RpcResult {
         if !self.schedule_daemon_reload("config") {
-            return Err(rpc_err(INTERNAL_ERROR, "Reload not available"));
+            return Err(refused(
+                INTERNAL_ERROR,
+                RefusalReason::Disabled,
+                "Reload not available",
+            ));
         }
         to_result(ConfigReloadResult { reloading: true })
     }
@@ -8017,9 +8066,10 @@ impl RpcDispatcher {
         )?;
         if let Some(scope) = refresh_scope.as_ref() {
             let mut working = self.ctx.config.read().clone();
-            working
-                .set_prop_persistent(&req.prop, "")
-                .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Config delete failed: {e}")))?;
+            working.set_prop_persistent(&req.prop, "").map_err(|e| {
+                let msg = format!("Config delete failed: {e}");
+                config_refused(INTERNAL_ERROR, msg, ConfigApiError::for_prop(e, &req.prop))
+            })?;
             Box::pin(self.commit_config_with_live_session_refresh(
                 working,
                 &config_write_guard,
@@ -8028,9 +8078,10 @@ impl RpcDispatcher {
             .await?;
         } else {
             let mut working = self.ctx.config.read().clone();
-            working
-                .set_prop_persistent(&req.prop, "")
-                .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Config delete failed: {e}")))?;
+            working.set_prop_persistent(&req.prop, "").map_err(|e| {
+                let msg = format!("Config delete failed: {e}");
+                config_refused(INTERNAL_ERROR, msg, ConfigApiError::for_prop(e, &req.prop))
+            })?;
             self.save_and_swap_config(working, &config_write_guard)
                 .await?;
         }
@@ -8057,9 +8108,10 @@ impl RpcDispatcher {
         let req: ConfigMapKeysParams = parse_params(params)?;
         let config = self.ctx.config.read().clone();
         let keys = config.get_map_keys(&req.path).ok_or_else(|| {
-            rpc_err(
+            config_refused(
                 INVALID_PARAMS,
                 format!("No map-keyed section at `{}`", req.path),
+                ConfigApiError::no_map_section(&req.path),
             )
         })?;
         to_result(ConfigMapKeysResult {
@@ -8084,7 +8136,13 @@ impl RpcDispatcher {
             // path cannot author an `agents.default` the rename guard then traps.
             let created =
                 zeroclaw_config::alias_refs::create_map_key_checked(config, &req.path, &req.key)
-                    .map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))?;
+                    .map_err(|e| {
+                        config_refused(
+                            INVALID_PARAMS,
+                            e.to_string(),
+                            e.api_error(&req.path, &req.key),
+                        )
+                    })?;
             if created {
                 config.mark_dirty(&format!("{}.{}", req.path, req.key));
             }
@@ -8537,11 +8595,13 @@ impl RpcDispatcher {
         if let Some(agent) = req.agent.as_deref() {
             self.selector_agent(Method::CostQuery, agent)?;
         }
-        let tracker = self
-            .ctx
-            .cost_tracker
-            .as_ref()
-            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Cost tracking is not available"))?;
+        let tracker = self.ctx.cost_tracker.as_ref().ok_or_else(|| {
+            refused(
+                INTERNAL_ERROR,
+                RefusalReason::Disabled,
+                "Cost tracking is not available",
+            )
+        })?;
         // Optional `[from, to)` window (RFC3339). Lets callers (the dashboard's
         // Reports view, or an external CLI report) pull day/month/quarter/YTD
         // scalars rather than only the daemon's today/this-month aggregates.
@@ -8598,13 +8658,33 @@ impl RpcDispatcher {
 
     // ── Skills handlers ──────────────────────────────────────────
 
+    /// A skills service failure. A kind the caller can act on names its
+    /// reason and keeps the service's own words, as the dashboard reports
+    /// it; an I/O failure is the core's own, prefixed with what failed.
+    fn skills_failed(what: &str, error: crate::skills::service::ServiceError) -> JsonRpcError {
+        use crate::skills::service::ServiceError;
+        let reason = match &error {
+            ServiceError::Ref(_) | ServiceError::Bundle(_) | ServiceError::Scaffold(_) => {
+                Some(RefusalReason::Invalid)
+            }
+            ServiceError::DocumentParse(_) => Some(RefusalReason::Malformed),
+            ServiceError::NotFound(_) => Some(RefusalReason::NotFound),
+            ServiceError::NotEditable { .. } => Some(RefusalReason::Forbidden),
+            ServiceError::Io(_) => None,
+        };
+        match reason {
+            Some(reason) => refused(INTERNAL_ERROR, reason, error.to_string()),
+            None => rpc_err(INTERNAL_ERROR, format!("{what}: {error}")),
+        }
+    }
+
     fn handle_skills_bundles(&self) -> RpcResult {
         let config = self.ctx.config.read().clone();
         let root = config.install_root_dir();
         let svc = crate::skills::service::SkillsService::new(&config, &root);
         let bundles: Vec<SkillBundleEntry> = svc
             .list_bundles()
-            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Skills bundles failed: {e}")))?
+            .map_err(|e| Self::skills_failed("Skills bundles failed", e))?
             .into_iter()
             .map(|b| SkillBundleEntry {
                 alias: b.alias,
@@ -8623,7 +8703,7 @@ impl RpcDispatcher {
         let svc = crate::skills::service::SkillsService::new(&config, &root);
         let skills: Vec<SkillListEntry> = svc
             .list_skills(req.bundle.as_deref())
-            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Skills list failed: {e}")))?
+            .map_err(|e| Self::skills_failed("Skills list failed", e))?
             .into_iter()
             .map(|s| SkillListEntry {
                 bundle: s.r#ref.bundle().to_string(),
@@ -8643,7 +8723,7 @@ impl RpcDispatcher {
         let skill_ref = resolve_skill_ref(&svc, &req.name, &req.bundle)?;
         let doc = svc
             .read_skill(&skill_ref)
-            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Skill read failed: {e}")))?;
+            .map_err(|e| Self::skills_failed("Skill read failed", e))?;
         to_result(SkillsReadResult {
             bundle: req.bundle,
             name: req.name,
@@ -8663,7 +8743,7 @@ impl RpcDispatcher {
             body: req.body,
         };
         svc.write_skill(&skill_ref, &doc)
-            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Skill write failed: {e}")))?;
+            .map_err(|e| Self::skills_failed("Skill write failed", e))?;
         to_result(SkillsWriteResult {
             bundle: req.bundle,
             name: req.name,
@@ -8678,7 +8758,7 @@ impl RpcDispatcher {
         let svc = crate::skills::service::SkillsService::new(&config, &root);
         let skill_ref = resolve_skill_ref(&svc, &req.name, &req.bundle)?;
         svc.remove_skill(&skill_ref, crate::skills::service::RemoveMode::Archive)
-            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Skill delete failed: {e}")))?;
+            .map_err(|e| Self::skills_failed("Skill delete failed", e))?;
         to_result(SkillsDeleteResult {
             bundle: req.bundle,
             name: req.name,
@@ -9558,14 +9638,23 @@ impl RpcDispatcher {
     }
 
     async fn send_error(&self, id: Value, code: i32, message: &str) {
-        let resp = JsonRpcResponse {
-            jsonrpc: JSONRPC_VERSION,
-            result: None,
-            error: Some(JsonRpcError {
+        self.send_rpc_error(
+            id,
+            JsonRpcError {
                 code,
                 message: message.to_string(),
                 data: None,
-            }),
+            },
+        )
+        .await;
+    }
+
+    /// Send a handler's error as it stands, its `data` included.
+    async fn send_rpc_error(&self, id: Value, error: JsonRpcError) {
+        let resp = JsonRpcResponse {
+            jsonrpc: JSONRPC_VERSION,
+            result: None,
+            error: Some(error),
             id,
         };
         if let Ok(json) = serde_json::to_string(&resp) {
@@ -9765,6 +9854,79 @@ impl RpcDispatcher {
         serde_json::from_value(value.clone()).map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))
     }
 
+    /// A session whose queue refused this request. A full queue is a
+    /// `capacity` refusal; a wait that timed out keeps the bare code, since no
+    /// listed reason means "gave up waiting".
+    fn session_busy(error: zeroclaw_infra::session_queue::SessionQueueError) -> JsonRpcError {
+        use zeroclaw_infra::session_queue::SessionQueueError;
+        let msg = format!("Session busy: {error}");
+        match error {
+            SessionQueueError::QueueFull { .. } => {
+                refused(SESSION_BUSY, RefusalReason::Capacity, msg)
+            }
+            SessionQueueError::Timeout { .. } => rpc_err(SESSION_BUSY, msg),
+        }
+    }
+
+    /// The refusal a session method answers when session persistence is off.
+    fn session_persistence_disabled() -> JsonRpcError {
+        refused(
+            INTERNAL_ERROR,
+            RefusalReason::Disabled,
+            "Session persistence is disabled",
+        )
+    }
+
+    /// The refusal every SOP method answers while the subsystem is off.
+    fn sop_disabled() -> JsonRpcError {
+        refused(
+            INTERNAL_ERROR,
+            RefusalReason::Disabled,
+            "SOP subsystem not enabled",
+        )
+    }
+
+    /// The refusal for a procedure that does not load by `name`. Missing,
+    /// malformed and badly named all answer `not_found`, as the dashboard's
+    /// routes do: there is no procedure by that name to act on.
+    fn sop_not_loaded(name: &str, error: &anyhow::Error) -> JsonRpcError {
+        refused(
+            INVALID_PARAMS,
+            RefusalReason::NotFound,
+            format!("SOP '{name}': {error}"),
+        )
+    }
+
+    /// A SOP authoring failure, answered with the `code` the method gives its
+    /// kind. Unless the method counts it as the core's own failure
+    /// (`INTERNAL_ERROR`), it names the kind as a reason: a missing procedure,
+    /// a name already taken, or a definition the caller must fix.
+    fn sop_author_refused(code: i32, error: &crate::sop::SopAuthorError) -> JsonRpcError {
+        use crate::sop::SopAuthorError;
+        let reason = match error {
+            _ if code == INTERNAL_ERROR => None,
+            SopAuthorError::NotFound(_) => Some(RefusalReason::NotFound),
+            SopAuthorError::AlreadyExists(_) => Some(RefusalReason::Conflict),
+            SopAuthorError::Other(_) => Some(RefusalReason::Invalid),
+            SopAuthorError::Io(_) => None,
+        };
+        match reason {
+            Some(reason) => refused(code, reason, error.to_string()),
+            None => rpc_err(code, error.to_string()),
+        }
+    }
+
+    /// A run accessor's failure: a missing run is the caller's `not_found`;
+    /// anything else (a poisoned engine) is the core's own.
+    fn sop_run_lookup_failed(error: &anyhow::Error) -> JsonRpcError {
+        match error.downcast_ref::<crate::sop::RunLookupError>() {
+            Some(crate::sop::RunLookupError::NotFound(_)) => {
+                refused(INVALID_PARAMS, RefusalReason::NotFound, error.to_string())
+            }
+            _ => rpc_err(INTERNAL_ERROR, error.to_string()),
+        }
+    }
+
     fn handle_sops_list(&self) -> RpcResult {
         let (dir, mode) = self.sops_dir_and_mode();
         let sops = crate::sop::load_sops_from_directory(&dir, mode);
@@ -9775,7 +9937,7 @@ impl RpcDispatcher {
         let req: SopSelectRequest = parse_params(params)?;
         let (dir, mode) = self.sops_dir_and_mode();
         let sop = crate::sop::load_sop_by_name(&dir, &req.name, mode)
-            .map_err(|e| rpc_err(INVALID_PARAMS, format!("SOP '{}': {e}", req.name)))?;
+            .map_err(|e| Self::sop_not_loaded(&req.name, &e))?;
         to_result(sop)
     }
 
@@ -9783,7 +9945,7 @@ impl RpcDispatcher {
         let req: SopSelectRequest = parse_params(params)?;
         let (dir, mode) = self.sops_dir_and_mode();
         let sop = crate::sop::load_sop_by_name(&dir, &req.name, mode)
-            .map_err(|e| rpc_err(INVALID_PARAMS, format!("SOP '{}': {e}", req.name)))?;
+            .map_err(|e| Self::sop_not_loaded(&req.name, &e))?;
         to_result(crate::sop::SopGraph::from_sop_with_specs(
             &sop,
             &self.sop_tool_specs(),
@@ -9797,14 +9959,18 @@ impl RpcDispatcher {
             && !payload.trim().is_empty()
             && serde_json::from_str::<Value>(payload).is_err()
         {
-            return Err(rpc_err(INVALID_PARAMS, "payload is not valid JSON"));
+            return Err(refused(
+                INVALID_PARAMS,
+                RefusalReason::Invalid,
+                "payload is not valid JSON",
+            ));
         }
 
         let engine = self
             .ctx
             .sop_engine
             .as_ref()
-            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "SOP subsystem not enabled"))?;
+            .ok_or_else(Self::sop_disabled)?;
         // The run executes as the procedure's agents, so the principal must be
         // entitled to every one of them before anything is dispatched.
         if self.stamped_grants().is_some() {
@@ -9817,11 +9983,20 @@ impl RpcDispatcher {
                 self.authorize_sop_agents(Method::SopsRun, &sop, true)?;
             }
         }
-        let audit = self
-            .ctx
-            .sop_audit
-            .as_ref()
-            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "SOP subsystem not enabled"))?;
+        let audit = self.ctx.sop_audit.as_ref().ok_or_else(Self::sop_disabled)?;
+        // A run started here has no agent turn behind it: the driver started
+        // below executes its steps, so a procedure with no owner for an
+        // execute step would start, take a run id and fail that step. Refuse
+        // it first, on the ownership rule the driver itself applies, at the
+        // point the dashboard's run route does.
+        let ownership_refusal = engine
+            .lock()
+            .map_err(|_| rpc_err(INTERNAL_ERROR, "SOP engine lock poisoned"))?
+            .get_sop(&req.name)
+            .and_then(crate::sop::headless_ownership_refusal);
+        if let Some(refusal) = ownership_refusal {
+            return Err(refused(INVALID_PARAMS, RefusalReason::Unowned, refusal));
+        }
 
         let payload = req
             .payload
@@ -9836,8 +10011,9 @@ impl RpcDispatcher {
             .filter(|key| !key.is_empty());
         if dedup_key.is_some_and(|key| key.len() > crate::sop::dispatch::MAX_ACTIVE_DEDUP_KEY_BYTES)
         {
-            return Err(rpc_err(
+            return Err(refused(
                 INVALID_PARAMS,
+                RefusalReason::Invalid,
                 format!(
                     "dedup_key exceeds {} bytes",
                     crate::sop::dispatch::MAX_ACTIVE_DEDUP_KEY_BYTES
@@ -9914,12 +10090,26 @@ impl RpcDispatcher {
                         run_id: run_id.clone(),
                     });
                 }
-                crate::sop::dispatch::DispatchResult::Skipped { reason, .. }
-                | crate::sop::dispatch::DispatchResult::BlockedUnsafe { reason, .. } => {
-                    return Err(rpc_err(INVALID_PARAMS, reason.clone()));
+                crate::sop::dispatch::DispatchResult::Skipped { reason, .. } => {
+                    return Err(refused(
+                        INVALID_PARAMS,
+                        RefusalReason::Conflict,
+                        reason.clone(),
+                    ));
+                }
+                crate::sop::dispatch::DispatchResult::BlockedUnsafe { reason, .. } => {
+                    return Err(refused(
+                        INVALID_PARAMS,
+                        RefusalReason::Blocked,
+                        reason.clone(),
+                    ));
                 }
                 crate::sop::dispatch::DispatchResult::Deferred { reason, .. } => {
-                    return Err(rpc_err(INVALID_PARAMS, reason.clone()));
+                    return Err(refused(
+                        INVALID_PARAMS,
+                        RefusalReason::Deferred,
+                        reason.clone(),
+                    ));
                 }
                 crate::sop::dispatch::DispatchResult::Coalesced {
                     existing_run_id, ..
@@ -9932,8 +10122,9 @@ impl RpcDispatcher {
             }
         }
 
-        Err(rpc_err(
+        Err(refused(
             INVALID_PARAMS,
+            RefusalReason::NotFound,
             format!("SOP '{}' has no matching manual trigger", req.name),
         ))
     }
@@ -9944,7 +10135,7 @@ impl RpcDispatcher {
             .ctx
             .sop_engine
             .as_ref()
-            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "SOP subsystem not enabled"))?;
+            .ok_or_else(Self::sop_disabled)?;
         let runs = crate::sop::run_summaries_for(engine, req.sop.as_deref())
             .map_err(|e| rpc_err(INTERNAL_ERROR, e.to_string()))?;
         to_result(serde_json::json!({ "runs": runs }))
@@ -9975,16 +10166,9 @@ impl RpcDispatcher {
             .ctx
             .sop_engine
             .as_ref()
-            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "SOP subsystem not enabled"))?;
-        let (run, active) = crate::sop::run_detail_for(engine, &req.run_id).map_err(|e| {
-            let msg = e.to_string();
-            let code = if msg.contains("not found") {
-                INVALID_PARAMS
-            } else {
-                INTERNAL_ERROR
-            };
-            rpc_err(code, msg)
-        })?;
+            .ok_or_else(Self::sop_disabled)?;
+        let (run, active) = crate::sop::run_detail_for(engine, &req.run_id)
+            .map_err(|e| Self::sop_run_lookup_failed(&e))?;
         let detail = crate::sop::types::SopRunDetail::from_run(&run, active);
         to_result(serde_json::json!({ "run": detail }))
     }
@@ -9993,21 +10177,14 @@ impl RpcDispatcher {
         let req: SopRunOverlayRequest = parse_params(params)?;
         let (dir, mode) = self.sops_dir_and_mode();
         let sop = crate::sop::load_sop_by_name(&dir, &req.name, mode)
-            .map_err(|e| rpc_err(INVALID_PARAMS, format!("SOP '{}': {e}", req.name)))?;
+            .map_err(|e| Self::sop_not_loaded(&req.name, &e))?;
         let engine = self
             .ctx
             .sop_engine
             .as_ref()
-            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "SOP subsystem not enabled"))?;
-        let overlay = crate::sop::run_overlay_for(&sop, engine, &req.run_id).map_err(|e| {
-            let msg = e.to_string();
-            let code = if msg.contains("not found") {
-                INVALID_PARAMS
-            } else {
-                INTERNAL_ERROR
-            };
-            rpc_err(code, msg)
-        })?;
+            .ok_or_else(Self::sop_disabled)?;
+        let overlay = crate::sop::run_overlay_for(&sop, engine, &req.run_id)
+            .map_err(|e| Self::sop_run_lookup_failed(&e))?;
         to_result(overlay)
     }
 
@@ -10015,20 +10192,21 @@ impl RpcDispatcher {
         let req: SopDecideRequest = parse_params(params)?;
         let decision: crate::sop::approval::ApprovalDecision =
             serde_json::from_value(req.decision.clone()).map_err(|e| {
-                rpc_err(
+                refused(
                     INVALID_PARAMS,
+                    RefusalReason::Invalid,
                     format!("decision is not a valid approval decision: {e}"),
                 )
             })?;
 
         let (dir, mode) = self.sops_dir_and_mode();
         let sop = crate::sop::load_sop_by_name(&dir, &req.name, mode)
-            .map_err(|e| rpc_err(INVALID_PARAMS, format!("SOP '{}': {e}", req.name)))?;
+            .map_err(|e| Self::sop_not_loaded(&req.name, &e))?;
         let engine = self
             .ctx
             .sop_engine
             .as_ref()
-            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "SOP subsystem not enabled"))?
+            .ok_or_else(Self::sop_disabled)?
             .clone();
 
         let agent_alias = sop.agent.clone().unwrap_or_default();
@@ -10069,11 +10247,16 @@ impl RpcDispatcher {
                 .get_run(&req.run_id)
                 .map(|run| run.sop_name.clone())
                 .ok_or_else(|| {
-                    rpc_err(INVALID_PARAMS, format!("run '{}' not found", req.run_id))
+                    refused(
+                        INVALID_PARAMS,
+                        RefusalReason::NotFound,
+                        format!("run '{}' not found", req.run_id),
+                    )
                 })?;
             if run_sop_name != req.name {
-                return Err(rpc_err(
+                return Err(refused(
                     INVALID_PARAMS,
+                    RefusalReason::Invalid,
                     format!(
                         "run '{}' belongs to SOP '{}', not '{}'",
                         req.run_id, run_sop_name, req.name
@@ -10096,11 +10279,28 @@ impl RpcDispatcher {
                 )
                 | BrokerOutcome::PendingQuorum { .. } => {}
                 BrokerOutcome::Resolved(
-                    ResolveOutcome::NotWaiting | ResolveOutcome::DeferredAtCapacity,
-                )
-                | BrokerOutcome::NotWaiting => {
-                    return Err(rpc_err(
+                    outcome @ (ResolveOutcome::NotWaiting | ResolveOutcome::DeferredAtCapacity),
+                ) => {
+                    // Approved but over the concurrency caps, the gate stays
+                    // waiting: a retry can clear it once a slot frees.
+                    let reason = if matches!(outcome, ResolveOutcome::DeferredAtCapacity) {
+                        RefusalReason::Deferred
+                    } else {
+                        RefusalReason::Conflict
+                    };
+                    return Err(refused(
                         INVALID_PARAMS,
+                        reason,
+                        crate::i18n::get_required_cli_string_with_args(
+                            "sop-rpc-decision-invalid-state",
+                            &[("run_id", req.run_id.as_str())],
+                        ),
+                    ));
+                }
+                BrokerOutcome::NotWaiting => {
+                    return Err(refused(
+                        INVALID_PARAMS,
+                        RefusalReason::Conflict,
                         crate::i18n::get_required_cli_string_with_args(
                             "sop-rpc-decision-invalid-state",
                             &[("run_id", req.run_id.as_str())],
@@ -10146,15 +10346,8 @@ impl RpcDispatcher {
             );
         }
 
-        let overlay = crate::sop::run_overlay_for(&sop, &engine, &req.run_id).map_err(|e| {
-            let msg = e.to_string();
-            let code = if msg.contains("not found") {
-                INVALID_PARAMS
-            } else {
-                INTERNAL_ERROR
-            };
-            rpc_err(code, msg)
-        })?;
+        let overlay = crate::sop::run_overlay_for(&sop, &engine, &req.run_id)
+            .map_err(|e| Self::sop_run_lookup_failed(&e))?;
         to_result(overlay)
     }
 
@@ -10207,7 +10400,7 @@ impl RpcDispatcher {
                 crate::sop::SopAuthorError::Io(_) => INTERNAL_ERROR,
                 _ => INVALID_PARAMS,
             };
-            rpc_err(code, e.to_string())
+            Self::sop_author_refused(code, &e)
         })?;
         to_result(serde_json::json!({ "saved": sop.name }))
     }
@@ -10222,7 +10415,7 @@ impl RpcDispatcher {
                 crate::sop::SopAuthorError::AlreadyExists(_) => SOP_ALREADY_EXISTS,
                 _ => INVALID_PARAMS,
             };
-            rpc_err(code, e.to_string())
+            Self::sop_author_refused(code, &e)
         })?;
         to_result(serde_json::json!({ "created": sop.name }))
     }
@@ -10236,7 +10429,7 @@ impl RpcDispatcher {
                 crate::sop::SopAuthorError::NotFound(_) => SOP_NOT_FOUND,
                 _ => INTERNAL_ERROR,
             };
-            rpc_err(code, e.to_string())
+            Self::sop_author_refused(code, &e)
         })?;
         to_result(serde_json::json!({ "deleted": req.name }))
     }
@@ -10269,7 +10462,7 @@ impl RpcDispatcher {
                 crate::sop::SopAuthorError::Io(_) => INTERNAL_ERROR,
                 crate::sop::SopAuthorError::Other(_) => INVALID_PARAMS,
             };
-            rpc_err(code, e.to_string())
+            Self::sop_author_refused(code, &e)
         })?;
         to_result(serde_json::json!({ "renamed": req.to, "from": req.from }))
     }
@@ -10285,7 +10478,7 @@ impl RpcDispatcher {
         let edit: crate::sop::WireEdit = serde_json::from_value(edit_val.clone())
             .map_err(|e| rpc_err(INVALID_PARAMS, format!("invalid wire edit: {e}")))?;
         crate::sop::apply_wire(&mut sop, &edit)
-            .map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))?;
+            .map_err(|e| refused(INVALID_PARAMS, RefusalReason::Invalid, e.to_string()))?;
         to_result(serde_json::json!({
             "sop": sop,
             "graph": crate::sop::SopGraph::from_sop_with_specs(&sop, &self.sop_tool_specs()),
@@ -10815,8 +11008,9 @@ fn resolve_skill_ref(
             format!("Invalid skill ref: {name:?} is not a single skill directory name"),
         ));
     }
+    // Worded as the service words it, which is how the dashboard reports it.
     svc.resolve_ref(name, Some(bundle))
-        .map_err(|e| rpc_err(INVALID_PARAMS, format!("Invalid skill ref: {e}")))
+        .map_err(|e| refused(INVALID_PARAMS, RefusalReason::Invalid, e.to_string()))
 }
 
 fn to_result<T: Serialize>(val: T) -> RpcResult {
@@ -22355,10 +22549,12 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn sops_run_withdraws_the_producer_key_when_its_driver_is_refused() {
         let sop_name = "refused";
+        // Owned, so `sops/run` starts it; the refused driver never runs it.
         let step = crate::sop::types::SopStep {
             number: 1,
             title: "Step one".to_string(),
             body: "Do the work".to_string(),
+            agent: Some("ops".to_string()),
             ..crate::sop::types::SopStep::default()
         };
         let handles = crate::sop::SopDriverHandles::default();

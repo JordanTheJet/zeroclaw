@@ -600,8 +600,13 @@ fn capability_missing(route: &str, message: &str, deferred: bool) -> Response {
 }
 
 /// A core refusal with what the operator can do about it, in the shape the
-/// dashboard shows as a banner: `{error, code, hint}`.
-fn explain(error: CoreError) -> Response {
+/// dashboard shows as a banner: `{error, code, hint}`. A refusal the core
+/// classified is the route's own answer, not a fault to explain: it answers
+/// with the in-process route's status and body.
+pub(crate) fn explain(error: CoreError) -> Response {
+    if error.reason().is_some() {
+        return error.into_response();
+    }
     let (status, code) = error.status();
     let message = match error {
         CoreError::AuthRequired(message)
