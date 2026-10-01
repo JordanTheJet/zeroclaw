@@ -10833,6 +10833,13 @@ impl RpcDispatcher {
     /// publication may hold the config while it waits for the authority
     /// state, so the config is never reached under the lease.
     ///
+    /// Lock order: the dispatcher calls this under the SOP engine mutex, and
+    /// it takes the config read lock (released again) and then the authority
+    /// lease, so the order is engine, then config, then authority. No site
+    /// may hold the config lock while it takes the engine mutex: with a
+    /// publication queued for the config, that site and this one would wait
+    /// on each other.
+    ///
     /// [`AuthorityLease`]: crate::rpc::auth::AuthorityLease
     fn admit_sop_run(
         &self,
@@ -10858,6 +10865,56 @@ impl RpcDispatcher {
             return Err(rpc_err(INVALID_PARAMS, refusal));
         }
         Ok(lease)
+    }
+
+    /// Admit a `sops/rename` of `sop`, the definition the rename loaded under
+    /// the SOP authoring lock and is about to move.
+    ///
+    /// [`Self::authorize_existing_sop`] refuses early, before that lock, which
+    /// another writer can hold for seconds; a policy change can land
+    /// meanwhile. This re-resolves the caller's authority from a held
+    /// [`AuthorityLease`], which the rename keeps until its move has
+    /// committed, so a narrowing that arrives during the move waits for it.
+    /// The configured agents are read before the lease, for the reason
+    /// [`Self::admit_sop_run`] gives. An unbound dispatcher passes, as it does
+    /// the early check.
+    ///
+    /// [`AuthorityLease`]: crate::rpc::auth::AuthorityLease
+    fn admit_sop_rename(
+        &self,
+        sop: &crate::sop::Sop,
+    ) -> Result<Option<crate::rpc::auth::AuthorityLease<'_>>, JsonRpcError> {
+        let Some(auth) = self.auth.as_ref() else {
+            return Ok(None);
+        };
+        let method = Method::SopsRename;
+        let agents: Vec<(String, bool)> = {
+            let config = self.ctx.config.read();
+            Self::sop_executing_agents(sop, &config)
+                .into_iter()
+                .map(|alias| {
+                    let configured = config.agents.contains_key(&alias);
+                    (alias, configured)
+                })
+                .collect()
+        };
+        let lease = self.ctx.auth.hold_authority();
+        let grants = current_authority_under(&lease, auth, method).map_err(|denied| {
+            self.audit_auth_denial(method, &denied);
+            rpc_err(denied.code, denied.message)
+        })?;
+        // The plain agent selector, as authoring applies it: a wildcard
+        // covers the configured agents only.
+        for (alias, configured) in &agents {
+            if !((*configured || grants.admin) && grants.may_use_agent(alias)) {
+                let denied = crate::rpc::auth::AuthDenied::forbidden(format!(
+                    "Principal is not entitled to agent {alias:?}"
+                ));
+                self.audit_auth_denial(method, &denied);
+                return Err(rpc_err(denied.code, denied.message));
+            }
+        }
+        Ok(Some(lease))
     }
 
     /// Hold a procedure a principal is about to write to its agent selector,
@@ -11463,8 +11520,24 @@ impl RpcDispatcher {
         }
         let req: SopRenameRequest = parse_params(params)?;
         let (dir, mode) = self.sops_dir_and_mode();
+        // An early refusal only. The rename may then wait for the authoring
+        // lock, so the check that counts is the one inside the transaction.
         self.authorize_existing_sop(Method::SopsRename, &dir, &req.from, mode)?;
-        crate::sop::rename_sop_typed(&dir, &req.from, &req.to, mode).map_err(|e| {
+        let mut refusal = None;
+        let renamed =
+            crate::sop::rename_sop_typed_admitted(&dir, &req.from, &req.to, mode, |sop| match self
+                .admit_sop_rename(sop)
+            {
+                Ok(lease) => Some(lease),
+                Err(denied) => {
+                    refusal = Some(denied);
+                    None
+                }
+            });
+        if let Some(denied) = refusal {
+            return Err(denied);
+        }
+        renamed.map_err(|e| {
             let code = match e {
                 crate::sop::SopAuthorError::NotFound(_) => SOP_NOT_FOUND,
                 crate::sop::SopAuthorError::AlreadyExists(_) => SOP_ALREADY_EXISTS,

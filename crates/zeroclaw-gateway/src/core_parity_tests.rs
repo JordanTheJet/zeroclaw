@@ -1263,3 +1263,296 @@ async fn rename_holds_the_existing_procedure_to_the_agent_selector() {
     let dir = std::path::PathBuf::from(harness.ctx.config.read().sop.sops_dir.clone().unwrap());
     assert!(dir.join("foreign").exists() && !dir.join("stolen").exists());
 }
+
+#[tokio::test]
+async fn a_run_is_refused_when_its_procedure_is_deleted_during_the_decision_wait() {
+    // A second run under the same dedup key would coalesce onto the first,
+    // which a reload keeps active. With the definition gone there is nothing
+    // to admit the caller against, so it must not join that run either.
+    let mut joined = Vec::new();
+    for through_core in [false, true] {
+        let h = Harness::with_sops(vec![gated_sop()], approval(1, &[TOKEN]));
+        let model = h.park_decisions();
+        let first = h
+            .run_parked(&model, h.access(through_core).await, Some("shared"))
+            .await;
+        model.release.notify_one();
+        let (status, body) = first.await.unwrap();
+        assert_eq!(status, StatusCode::OK, "first run: {body}");
+        let first_id = body["run_id"].clone();
+        assert!(first_id.is_string());
+        assert_eq!(h.active_runs(), 1);
+
+        let waiting = h
+            .run_parked(&model, h.access(through_core).await, Some("shared"))
+            .await;
+        let dir = std::path::PathBuf::from(h.state.config.read().sop.sops_dir.clone().unwrap());
+        zeroclaw_runtime::sop::delete_sop_typed(&dir, "deploy").unwrap();
+        h.engine().lock().unwrap().reload(h._dir.path());
+        assert!(h.engine().lock().unwrap().get_sop("deploy").is_none());
+        assert_eq!(h.active_runs(), 1, "a reload keeps the admitted run");
+        assert!(h.ctx.auth.pairing().revoke_token(TOKEN));
+        model.release.notify_one();
+        let (status, body) = waiting.await.unwrap();
+        assert_eq!(h.active_runs(), 1);
+        if status.is_success() {
+            joined.push((through_core, status, body, first_id));
+        }
+    }
+    assert!(
+        joined.is_empty(),
+        "a run of a deleted procedure joined the retained run without an admission \
+         (core, status, body, first run): {joined:?}"
+    );
+}
+
+/// How many open descriptors in this process refer to the file `metadata`
+/// describes.
+#[cfg(unix)]
+fn open_descriptors_of(metadata: &std::fs::Metadata) -> usize {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::read_dir("/dev/fd")
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<libc::c_int>().ok())
+        .filter(|fd| {
+            let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+            // SAFETY: fstat accepts any descriptor and reports EBADF for one
+            // that closed during the listing; `stat` is allocated storage and
+            // is read only after fstat succeeded.
+            if unsafe { libc::fstat(*fd, stat.as_mut_ptr()) } != 0 {
+                return false;
+            }
+            // SAFETY: fstat returned 0, so it initialized `stat`.
+            let stat = unsafe { stat.assume_init() };
+            stat.st_dev as u64 == metadata.dev() && stat.st_ino as u64 == metadata.ino()
+        })
+        .count()
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rename_rechecks_the_agent_selector_after_waiting_for_the_authoring_lock() {
+    use zeroclaw_api::grants::{Resource, Verb};
+    use zeroclaw_config::schema::{PermissionProfileConfig, UserConfig};
+    use zeroclaw_runtime::rpc::{
+        dispatch::RpcDispatcher,
+        inproc::InprocTransport,
+        transport::{RpcTransport, TransportKind},
+    };
+    let mut sop = gated_sop();
+    sop.name = "owned".into();
+    sop.agent = Some("alpha".into());
+    let h = Harness::with_sops(vec![sop], approval(1, &[TOKEN]));
+    {
+        let mut cfg = h.ctx.config.write();
+        cfg.security.trust_daemon_uid = false;
+        cfg.agents.insert("alpha".into(), Default::default());
+        cfg.agents.insert("beta".into(), Default::default());
+        cfg.permission_profiles.insert(
+            "rename-scope".into(),
+            PermissionProfileConfig {
+                allowed_agents: vec!["alpha".into()],
+                allowed_tools: vec!["*".into()],
+                grants: HashMap::from([(
+                    Resource::Sops,
+                    vec![Verb::Read, Verb::Update, Verb::Delete],
+                )]),
+                ..Default::default()
+            },
+        );
+        cfg.users.insert(
+            "rename-user".into(),
+            UserConfig {
+                principal_id: None,
+                uid: Some(4242),
+                permission_profiles: vec!["rename-scope".into()],
+            },
+        );
+        h.ctx.auth.refresh_from_config(&cfg).unwrap();
+    }
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let mut transport = InprocTransport::new(server, h.cancel.clone());
+    let mut dispatcher =
+        RpcDispatcher::new(h.ctx.clone(), transport.writer(), "local:rename".into())
+            .with_transport(
+                TransportKind::Local,
+                zeroclaw_runtime::security::auth_provider::Credential::Peercred { uid: 4242 },
+            );
+    let server_task = zeroclaw_spawn::spawn!(async move { dispatcher.run(&mut transport).await });
+    let client = Arc::new(
+        zeroclaw_rpc_client::RpcClient::connect_over(client, Default::default())
+            .await
+            .unwrap(),
+    );
+    assert_eq!(
+        client.handshake().principal_id.as_deref(),
+        Some("user:rename-user")
+    );
+
+    let dir = std::path::PathBuf::from(h.ctx.config.read().sop.sops_dir.clone().unwrap());
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(dir.join(".sop-authoring.lock"))
+        .unwrap();
+    held.lock().unwrap();
+    let metadata = held.metadata().unwrap();
+    let before = open_descriptors_of(&metadata);
+    assert!(before > 0);
+    let requester = Arc::clone(&client);
+    let pending = zeroclaw_spawn::spawn!(async move {
+        requester
+            .request(
+                zeroclaw_rpc_client::Method::SopsRename,
+                json!({"from": "owned", "to": "moved"}),
+            )
+            .await
+    });
+    // The rename opens the lock file only after its early check, so one more
+    // descriptor on it means the rename passed that check and is waiting for
+    // the transaction.
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while open_descriptors_of(&metadata) <= before {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the rename passed its early check and is waiting for the authoring lock");
+    assert!(!pending.is_finished());
+    {
+        let mut cfg = h.ctx.config.write();
+        cfg.permission_profiles
+            .get_mut("rename-scope")
+            .unwrap()
+            .allowed_agents = vec!["beta".into()];
+        h.ctx.auth.refresh_from_config(&cfg).unwrap();
+    }
+    held.unlock().unwrap();
+    drop(held);
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), pending)
+        .await
+        .unwrap()
+        .unwrap();
+    let current = if dir.join("moved").exists() {
+        "moved"
+    } else {
+        "owned"
+    };
+    let control = client
+        .request(
+            zeroclaw_rpc_client::Method::SopsRename,
+            json!({"from": current, "to": "again"}),
+        )
+        .await;
+    assert!(
+        matches!(&control, Err(zeroclaw_rpc_client::ClientError::Rpc(e)) if e.code == zeroclaw_api::jsonrpc::error_codes::FORBIDDEN),
+        "a fresh request must see the narrowed selector: {control:?}"
+    );
+    client.shutdown();
+    server_task.abort();
+    let moved = dir.join("moved").exists();
+    let original = dir.join("owned").exists();
+    assert!(
+        matches!(&result, Err(zeroclaw_rpc_client::ClientError::Rpc(e)) if e.code == zeroclaw_api::jsonrpc::error_codes::FORBIDDEN)
+            && original
+            && !moved,
+        "the rename used the selector from before its wait: {result:?}, owned={original}, moved={moved}"
+    );
+}
+
+/// An admission whose permit holds a policy read lock, the way the core's
+/// authority lease does, and that queues a policy writer behind its first
+/// permit.
+struct QueuedWriterAdmission {
+    policy: Arc<parking_lot::RwLock<()>>,
+    calls: std::sync::atomic::AtomicUsize,
+    writer: std::sync::Mutex<Option<std::thread::JoinHandle<bool>>>,
+}
+
+impl zeroclaw_runtime::sop::dispatch::SopRunAdmission for QueuedWriterAdmission {
+    fn admit<'a>(
+        &'a self,
+        _sop: &Sop,
+    ) -> Option<Box<dyn zeroclaw_runtime::sop::dispatch::HeldPermit + 'a>> {
+        use std::sync::atomic::Ordering;
+        let held = self.policy.read();
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            let policy = Arc::clone(&self.policy);
+            *self.writer.lock().unwrap() = Some(std::thread::spawn(move || {
+                // A real publication waits without limit; this one gives up
+                // so a regression fails instead of hanging the suite.
+                policy
+                    .try_write_for(std::time::Duration::from_secs(2))
+                    .is_some()
+            }));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+            while !(self.policy.is_locked_exclusive() && self.policy.try_read_recursive().is_some())
+            {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the writer did not queue"
+                );
+                std::thread::yield_now();
+            }
+        }
+        Some(Box::new(held))
+    }
+}
+
+#[tokio::test]
+async fn a_procedure_name_two_manifests_share_is_admitted_once() {
+    use std::sync::atomic::Ordering;
+    let h = Harness::with_sops(vec![gated_sop()], approval(1, &[TOKEN]));
+    let root = std::path::PathBuf::from(h.ctx.config.read().sop.sops_dir.clone().unwrap());
+    let copy = root.join("second-directory");
+    std::fs::create_dir(&copy).unwrap();
+    std::fs::copy(root.join("deploy/SOP.toml"), copy.join("SOP.toml")).unwrap();
+    std::fs::copy(root.join("deploy/SOP.md"), copy.join("SOP.md")).unwrap();
+    h.engine().lock().unwrap().reload(h._dir.path());
+    let loaded = h
+        .engine()
+        .lock()
+        .unwrap()
+        .sops()
+        .iter()
+        .filter(|sop| sop.name == "deploy")
+        .count();
+    // A loader that refused or merged the second manifest would close this
+    // case by itself; today it keeps both.
+    if loaded < 2 {
+        return;
+    }
+    let admission = QueuedWriterAdmission {
+        policy: Arc::new(parking_lot::RwLock::new(())),
+        calls: 0.into(),
+        writer: Default::default(),
+    };
+    let results = zeroclaw_runtime::sop::dispatch::dispatch_sop_event_to_admitted(
+        h.engine(),
+        h.state.sop_audit.as_ref().unwrap(),
+        SopEvent {
+            source: SopTriggerSource::Manual,
+            topic: None,
+            payload: None,
+            timestamp: now_iso8601(),
+        },
+        "deploy",
+        None,
+        &admission,
+    )
+    .await;
+    assert_eq!(admission.calls.load(Ordering::SeqCst), 1, "{results:?}");
+    let wrote = admission
+        .writer
+        .lock()
+        .unwrap()
+        .take()
+        .unwrap()
+        .join()
+        .unwrap();
+    assert!(
+        wrote,
+        "a second admission on the dispatching thread waited behind the queued writer"
+    );
+}
