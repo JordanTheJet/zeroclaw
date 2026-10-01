@@ -234,6 +234,9 @@ pub enum CoreError {
     Forbidden(String),
     /// The core could not be reached.
     Unavailable(String),
+    /// The endpoint is not served by the account the gateway expects, so
+    /// nothing was sent to it.
+    UntrustedEndpoint(String),
     /// Every core connection the gateway may hold is in use.
     Busy,
     /// The core did not answer in time.
@@ -257,6 +260,9 @@ impl CoreError {
             Self::AuthRequired(_) => (StatusCode::UNAUTHORIZED, "auth_required"),
             Self::Forbidden(_) => (StatusCode::FORBIDDEN, "forbidden"),
             Self::Unavailable(_) => (StatusCode::SERVICE_UNAVAILABLE, "core_unavailable"),
+            Self::UntrustedEndpoint(_) => {
+                (StatusCode::SERVICE_UNAVAILABLE, "core_untrusted_endpoint")
+            }
             Self::Busy => (StatusCode::SERVICE_UNAVAILABLE, "core_busy"),
             Self::Timeout => (StatusCode::GATEWAY_TIMEOUT, "core_timeout"),
             Self::Rpc(error) => rpc_status(error.code),
@@ -286,9 +292,10 @@ impl IntoResponse for CoreError {
     fn into_response(self) -> Response {
         let (status, code) = self.status();
         let message = match self {
-            Self::AuthRequired(message) | Self::Forbidden(message) | Self::Unavailable(message) => {
-                message
-            }
+            Self::AuthRequired(message)
+            | Self::Forbidden(message)
+            | Self::Unavailable(message)
+            | Self::UntrustedEndpoint(message) => message,
             Self::Busy => "every core connection is in use; retry shortly".to_owned(),
             Self::Timeout => "the core did not answer in time".to_owned(),
             Self::Rpc(error) => error.message,
@@ -643,13 +650,15 @@ impl Pool {
                         .with_attrs(::serde_json::json!({ "error": error.to_string() })),
                     "gateway could not open a core connection"
                 );
-                Err(CoreError::Unavailable(match (&self.connector, &error) {
-                    // Nothing was sent: the endpoint is not served by the
-                    // account the gateway runs as.
-                    (_, ClientError::UntrustedEndpoint { .. }) => format!(
+                // Nothing was sent: the endpoint is not served by the account
+                // the gateway runs as.
+                if let ClientError::UntrustedEndpoint { .. } = &error {
+                    return Err(CoreError::UntrustedEndpoint(format!(
                         "refusing to send the credential: {error}; run the gateway as the same \
                          OS account as the core"
-                    ),
+                    )));
+                }
+                Err(CoreError::Unavailable(match (&self.connector, &error) {
                     (Connector::Local { endpoint, .. }, _) => format!(
                         "the core is not reachable at {}: {error}",
                         endpoint.display()

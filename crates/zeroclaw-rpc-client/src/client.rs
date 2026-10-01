@@ -393,6 +393,22 @@ impl RpcClient {
         Self::initialize_over(stream, options).await
     }
 
+    /// Check that the daemon's local endpoint at `path` accepts a connection
+    /// and that `owner` serves it, then close it without writing a byte.
+    ///
+    /// For health checks. It runs the same kernel checks a credential-bearing
+    /// [`RpcClient::connect_local`] runs, whatever the caller would send, and
+    /// sends no `initialize`: a probe opens no session and presents nothing.
+    pub async fn probe_local(path: &Path, owner: EndpointOwner) -> Result<(), ClientError> {
+        let stream = open_local_stream(path).await?;
+        verify_local_endpoint(&stream, path, owner)
+            .await
+            .map_err(|rejection| ClientError::UntrustedEndpoint {
+                endpoint: path.to_path_buf(),
+                rejection,
+            })
+    }
+
     /// Run the handshake over the daemon's in-process duplex, the transport
     /// its in-process connector hands out.
     ///
@@ -1328,6 +1344,49 @@ mod tests {
                 "{kind}: not one byte may reach an unverified endpoint"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_probe_checks_the_endpoint_like_a_credential_dial_and_writes_nothing() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let own = own_uid(root.path());
+
+        let path = root.path().join("daemon.sock");
+        let peer = listen_once(&path);
+        RpcClient::probe_local(&path, EndpointOwner::SameAccount)
+            .await
+            .expect("a private same-account endpoint passes");
+        assert!(
+            bytes_seen(peer).await.is_empty(),
+            "a passing probe writes nothing"
+        );
+
+        let shared = dir_with_mode(root.path(), "shared", 0o777);
+        let path = shared.join("daemon.sock");
+        let peer = listen_once(&path);
+        match RpcClient::probe_local(&path, EndpointOwner::SameAccount).await {
+            Err(ClientError::UntrustedEndpoint { rejection, .. }) => assert_eq!(
+                rejection,
+                EndpointRejection::DirectoryWritable {
+                    dir: shared.clone(),
+                    mode: 0o777
+                }
+            ),
+            other => panic!("expected UntrustedEndpoint, got {other:?}"),
+        }
+        assert!(bytes_seen(peer).await.is_empty());
+
+        let path = root.path().join("other.sock");
+        let peer = listen_once(&path);
+        match RpcClient::probe_local(&path, EndpointOwner::Uid(own.wrapping_add(1))).await {
+            Err(ClientError::UntrustedEndpoint { rejection, .. }) => assert!(
+                matches!(rejection, EndpointRejection::PeerUid { .. }),
+                "{rejection}"
+            ),
+            other => panic!("expected UntrustedEndpoint, got {other:?}"),
+        }
+        assert!(bytes_seen(peer).await.is_empty());
     }
 
     #[cfg(unix)]

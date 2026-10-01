@@ -114,6 +114,13 @@ const SERVED: &[&str] = &["/health", "/api/openapi.json", "/api/docs"];
 
 /// Route paths the in-process gateway registers with a string literal, from
 /// its production source (test modules excluded).
+///
+/// A source scan, not the router itself: it covers the four files that
+/// register production routes today. A route registered elsewhere, or
+/// through a `const`, `format!`, `route_service` or `nest`, is invisible to
+/// it; add that file here, or list the path by hand, when one appears. The
+/// other route-registering modules (`ws`, `sse`, `api_pairing`,
+/// `api_config`, `webhook_ingress`) register routes only in their tests.
 fn in_process_routes() -> BTreeSet<String> {
     let sources = [
         include_str!("../lib.rs"),
@@ -238,6 +245,36 @@ async fn a_refused_credential_and_an_unreachable_core_explain_themselves_distinc
     );
 }
 
+#[tokio::test]
+async fn busy_timeout_and_an_untrusted_endpoint_get_their_own_hints() {
+    let (status, body) = explained(CoreError::UntrustedEndpoint(
+        "refusing to send the credential".into(),
+    ))
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["code"], "core_untrusted_endpoint");
+    assert!(
+        body["hint"]
+            .as_str()
+            .is_some_and(|h| h.contains("same OS account")),
+        "{body}"
+    );
+
+    let (_, busy) = explained(CoreError::Busy).await;
+    let (_, timeout) = explained(CoreError::Timeout).await;
+    assert_eq!(busy["code"], "core_busy");
+    assert_eq!(timeout["code"], "core_timeout");
+    for body in [&busy, &timeout] {
+        assert!(
+            !body["hint"]
+                .as_str()
+                .is_some_and(|h| h.contains("zeroclaw daemon")),
+            "a running core is not told to start: {body}"
+        );
+    }
+    assert_ne!(busy["hint"], timeout["hint"]);
+}
+
 // ── The router, against a real core on a real socket ─────────────
 
 #[cfg(unix)]
@@ -321,11 +358,17 @@ mod against_a_core {
         }
     }
 
+    /// A dashboard build laid out as `vite build` writes it: the page at the
+    /// root, assets under `assets/`, all referenced as `/_app/...`.
     fn web_dist(dir: &Path) -> PathBuf {
         let dist = dir.join("dist");
-        std::fs::create_dir_all(dist.join("_app")).unwrap();
-        std::fs::write(dist.join("index.html"), "<html>preview dashboard</html>").unwrap();
-        std::fs::write(dist.join("_app").join("app.js"), "console.log(1)").unwrap();
+        std::fs::create_dir_all(dist.join("assets")).unwrap();
+        std::fs::write(
+            dist.join("index.html"),
+            r#"<html>preview dashboard<script src="/_app/assets/app.js"></script></html>"#,
+        )
+        .unwrap();
+        std::fs::write(dist.join("assets").join("app.js"), "console.log(1)").unwrap();
         dist
     }
 
@@ -355,6 +398,76 @@ mod against_a_core {
 
     fn json_of(body: &str) -> serde_json::Value {
         serde_json::from_str(body).unwrap_or_else(|e| panic!("not JSON ({e}): {body}"))
+    }
+
+    async fn headers_of(router: &Router, path: &str) -> axum::http::HeaderMap {
+        router
+            .clone()
+            .oneshot(Request::get(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .headers()
+            .clone()
+    }
+
+    /// A listener that is not a core: it records what each connection
+    /// writes, up to the first newline or EOF, then closes it.
+    struct Recorder {
+        endpoint: PathBuf,
+        seen: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl Recorder {
+        fn bind(dir: &Path) -> Self {
+            use tokio::io::AsyncBufReadExt as _;
+            let endpoint = dir.join("daemon.sock");
+            let listener = tokio::net::UnixListener::bind(&endpoint).unwrap();
+            let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let task = {
+                let seen = Arc::clone(&seen);
+                zeroclaw_spawn::spawn!(async move {
+                    while let Ok((stream, _)) = listener.accept().await {
+                        let mut reader = tokio::io::BufReader::new(stream);
+                        let mut bytes = Vec::new();
+                        let _ = tokio::time::timeout(
+                            Duration::from_secs(5),
+                            reader.read_until(b'\n', &mut bytes),
+                        )
+                        .await;
+                        seen.lock().unwrap().push(bytes);
+                    }
+                })
+            };
+            Self {
+                endpoint,
+                seen,
+                task,
+            }
+        }
+
+        fn connections(&self) -> Vec<Vec<u8>> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+
+    impl Drop for Recorder {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    async fn wait_for_connections(recorder: &Recorder, count: usize) {
+        for _ in 0..250 {
+            if recorder.connections().len() >= count {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!(
+            "expected {count} connections, saw {}",
+            recorder.connections().len()
+        );
     }
 
     #[tokio::test]
@@ -415,7 +528,15 @@ mod against_a_core {
         }
 
         // Nothing under an API prefix falls through to the dashboard page.
-        for path in ["/api/no-such-route", "/ws/other", "/admin/other"] {
+        for path in [
+            "/api/no-such-route",
+            "/ws/other",
+            "/admin/other",
+            "/api",
+            "/ws",
+            "/acp/",
+            "/pair/",
+        ] {
             let (status, body) = get(&router, path, Some(TOKEN)).await;
             assert_eq!(status, StatusCode::NOT_FOUND, "{path}: {body}");
             assert_eq!(json_of(&body)["code"], "not_found", "{path}");
@@ -424,7 +545,8 @@ mod against_a_core {
         let (status, body) = get(&router, "/sessions", None).await;
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains("preview dashboard"), "{body}");
-        let (status, body) = get(&router, "/_app/app.js", None).await;
+        // Assets resolve where the page's own references point.
+        let (status, body) = get(&router, "/_app/assets/app.js", None).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, "console.log(1)");
         let (status, _) = get(&router, "/api/openapi.json", None).await;
@@ -458,6 +580,150 @@ mod against_a_core {
         let (status, body) = get(&router, CORE_LINK_PATH, Some(TOKEN)).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         core.stop().await;
+    }
+
+    #[tokio::test]
+    async fn health_tells_the_dashboard_to_sign_in_and_names_no_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let core = Core::start(tmp.path()).await;
+        let router = router(
+            CoreRpc::local(core.endpoint.clone(), EndpointOwner::SameAccount),
+            core.endpoint.clone(),
+            None,
+        );
+        let private = tmp.path().display().to_string();
+        let expected_sign_in = serde_json::json!({
+            "pairing_code": false, "bearer": true, "verify": CORE_LINK_PATH,
+        });
+
+        let (status, body) = get(&router, "/health", None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let health = json_of(&body);
+        assert_eq!(
+            health["require_pairing"], true,
+            "a dashboard must never read a missing field as pairing off"
+        );
+        assert_eq!(health["sign_in"], expected_sign_in);
+        assert!(!body.contains(&private), "no path in public health: {body}");
+
+        let headers = headers_of(&router, "/health").await;
+        assert_eq!(headers["x-frame-options"], "DENY");
+        assert!(headers.contains_key("content-security-policy"));
+
+        let ctx = core.stop().await;
+        let (status, body) = get(&router, "/health", None).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        let health = json_of(&body);
+        assert_eq!(health["require_pairing"], true);
+        assert_eq!(health["sign_in"], expected_sign_in);
+        assert_eq!(health["code"], "core_unavailable");
+        assert!(health["hint"].is_string(), "{body}");
+        assert!(!body.contains(&private), "no path in public health: {body}");
+        drop(ctx);
+    }
+
+    /// The requests a fresh browser makes, in order: no stored token, then
+    /// a token the core refuses, then one it accepts.
+    #[tokio::test]
+    async fn a_fresh_browser_signs_in_with_an_existing_token() {
+        let tmp = tempfile::tempdir().unwrap();
+        let core = Core::start(tmp.path()).await;
+        let router = router(
+            CoreRpc::local(core.endpoint.clone(), EndpointOwner::SameAccount),
+            core.endpoint.clone(),
+            Some(web_dist(tmp.path())),
+        );
+
+        // The page loads; health says to sign in with a token, and where to
+        // check it.
+        let (status, _) = get(&router, "/", None).await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, body) = get(&router, "/health", None).await;
+        let health = json_of(&body);
+        assert_eq!(health["require_pairing"], true);
+        assert_eq!(health["sign_in"]["bearer"], true);
+        assert_eq!(health["sign_in"]["pairing_code"], false);
+        let verify = health["sign_in"]["verify"].as_str().unwrap().to_owned();
+
+        // A token the core refuses: 401, so the sign-in screen stays.
+        let (status, body) = get(&router, &verify, Some("zc_not_paired")).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+        assert_eq!(json_of(&body)["code"], "auth_required");
+
+        // The token the core accepts: data.
+        let (status, body) = get(&router, &verify, Some(TOKEN)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(json_of(&body)["principal_id"], "shared-operator");
+        core.stop().await;
+    }
+
+    #[tokio::test]
+    async fn the_health_probe_sends_nothing_and_its_connection_serves_nothing_else() {
+        let tmp = tempfile::tempdir().unwrap();
+        let recorder = Recorder::bind(tmp.path());
+        let router = router(
+            CoreRpc::local(recorder.endpoint.clone(), EndpointOwner::SameAccount),
+            recorder.endpoint.clone(),
+            None,
+        );
+
+        let (status, body) = get(&router, "/health", None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(json_of(&body)["core"]["link"], "reachable");
+        wait_for_connections(&recorder, 1).await;
+        assert_eq!(
+            recorder.connections()[0],
+            Vec::<u8>::new(),
+            "the probe writes nothing, not even a tokenless initialize"
+        );
+
+        // A domain call dials its own connection and presents its own
+        // credential; the probe's connection is already gone.
+        let (status, _) = get(&router, CORE_LINK_PATH, Some(TOKEN)).await;
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the recorder is no core"
+        );
+        wait_for_connections(&recorder, 2).await;
+        let connections = recorder.connections();
+        assert_eq!(connections.len(), 2);
+        let frame: serde_json::Value = serde_json::from_slice(&connections[1]).unwrap();
+        assert_eq!(frame["method"], "initialize");
+        assert_eq!(frame["params"]["auth_token"], TOKEN);
+    }
+
+    #[tokio::test]
+    async fn an_endpoint_that_fails_the_account_check_is_untrusted_and_hears_nothing() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let shared = tmp.path().join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let recorder = Recorder::bind(&shared);
+        let router = router(
+            CoreRpc::local(recorder.endpoint.clone(), EndpointOwner::SameAccount),
+            recorder.endpoint.clone(),
+            None,
+        );
+
+        let (status, body) = get(&router, "/health", None).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        let health = json_of(&body);
+        assert_eq!(health["code"], "core_untrusted_endpoint");
+        assert_eq!(health["core"]["link"], "untrusted");
+        assert!(!body.contains(&shared.display().to_string()), "{body}");
+
+        let (status, body) = get(&router, CORE_LINK_PATH, Some(TOKEN)).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert_eq!(json_of(&body)["code"], "core_untrusted_endpoint");
+        assert!(json_of(&body)["hint"].is_string(), "{body}");
+
+        wait_for_connections(&recorder, 2).await;
+        assert!(
+            recorder.connections().iter().all(Vec::is_empty),
+            "nothing reaches an endpoint that fails the check"
+        );
     }
 
     #[tokio::test]

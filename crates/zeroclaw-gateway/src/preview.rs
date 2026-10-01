@@ -26,7 +26,9 @@ use axum::http::{Method as HttpMethod, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{MethodFilter, MethodRouter, get, on};
 use serde_json::json;
-use zeroclaw_rpc_client::{EndpointOwner, Method, RPC_PROTOCOL_VERSION};
+use zeroclaw_rpc_client::{
+    ClientError, EndpointOwner, EndpointRejection, Method, RPC_PROTOCOL_VERSION, RpcClient,
+};
 
 use crate::core_rpc::{CoreAccess, CoreError, CoreRpc};
 
@@ -39,8 +41,14 @@ pub const DEFAULT_LISTEN: &str = "127.0.0.1:42617";
 pub const CORE_LINK_PATH: &str = "/api/gateway/core";
 
 /// How long the health probe waits to reach the core's endpoint.
-#[cfg(unix)]
 const HEALTH_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// What to do when the core is down or busy.
+const HINT_START_CORE: &str =
+    "Start the core with `zeroclaw daemon`, or point zeroclaw-gw at its socket with --socket PATH.";
+/// What to do when the endpoint fails the same-account check.
+const HINT_SAME_ACCOUNT: &str = "Run zeroclaw-gw as the same OS account as the core, and keep the \
+     core's socket in a directory only that account can write.";
 
 pub const USAGE: &str = "\
 zeroclaw-gw: preview of the gateway as its own process
@@ -477,6 +485,8 @@ const REFUSED: &[(&str, &str, Refusal)] = &[
 const API_PREFIXES: &[&str] = &[
     "/api/",
     "/ws/",
+    "/acp/",
+    "/pair/",
     "/admin/",
     "/oidc/",
     "/.well-known/",
@@ -538,15 +548,15 @@ pub fn router(core: CoreRpc, endpoint: PathBuf, web_dist: Option<PathBuf>) -> Ro
         );
         router = router.route(path, handler);
     }
+    // The dashboard build references its files as `/_app/<path>` and keeps
+    // them at `<dist>/<path>`, as the in-process gateway serves them.
     if let Some(dist) = &state.web_dist {
-        router = router.nest_service(
-            "/_app",
-            tower_http::services::ServeDir::new(dist.join("_app")),
-        );
+        router = router.nest_service("/_app", tower_http::services::ServeDir::new(dist.as_path()));
     }
     router
         .fallback(fallback)
         .layer(axum::Extension(core))
+        .layer(axum::middleware::from_fn(crate::security_headers::apply))
         .with_state(state)
 }
 
@@ -592,7 +602,8 @@ fn explain(error: CoreError) -> Response {
     let message = match error {
         CoreError::AuthRequired(message)
         | CoreError::Forbidden(message)
-        | CoreError::Unavailable(message) => message,
+        | CoreError::Unavailable(message)
+        | CoreError::UntrustedEndpoint(message) => message,
         CoreError::Busy => "every core connection this gateway may hold is in use".into(),
         CoreError::Timeout => "the core did not answer in time".into(),
         CoreError::Rpc(error) => error.message,
@@ -601,9 +612,12 @@ fn explain(error: CoreError) -> Response {
         "auth_required" => {
             "Sign in again: send Authorization: Bearer <token> with a token the core accepts."
         }
-        "core_unavailable" | "core_busy" | "core_timeout" => {
-            "Start the core with `zeroclaw daemon`, or point zeroclaw-gw at its socket with \
-             --socket PATH."
+        "core_unavailable" => HINT_START_CORE,
+        "core_untrusted_endpoint" => HINT_SAME_ACCOUNT,
+        "core_busy" => "Every core connection this gateway may hold is in use: retry shortly.",
+        "core_timeout" => {
+            "The core is up but did not answer in time: retry, and check the core's log if it \
+             keeps happening."
         }
         "core_incompatible" => {
             "zeroclaw-gw and the core speak different protocol versions: install matching \
@@ -619,60 +633,106 @@ fn explain(error: CoreError) -> Response {
         .into_response()
 }
 
-/// Whether the core's endpoint accepts a connection. Nothing is written on
-/// it: a probe that sent a handshake without a credential would be the
-/// credential-less connection this gateway never opens.
-async fn endpoint_reachable(endpoint: &Path) -> Result<(), String> {
-    #[cfg(unix)]
+/// Why the health probe could not vouch for the core's endpoint.
+enum ProbeFailure {
+    /// Nothing accepted the connection.
+    Unreachable(String),
+    /// Something accepted it, but it failed the same-account check.
+    Untrusted(&'static str),
+}
+
+/// Whether the core's endpoint accepts a connection from this account and
+/// passes the same kernel checks a credential-bearing dial makes. Nothing is
+/// written on it: a probe that sent a handshake without a credential would
+/// be the credential-less connection this gateway never opens.
+async fn probe_endpoint(endpoint: &Path) -> Result<(), ProbeFailure> {
+    match tokio::time::timeout(
+        HEALTH_PROBE_TIMEOUT,
+        RpcClient::probe_local(endpoint, EndpointOwner::SameAccount),
+    )
+    .await
     {
-        match tokio::time::timeout(
-            HEALTH_PROBE_TIMEOUT,
-            tokio::net::UnixStream::connect(endpoint),
-        )
-        .await
-        {
-            Ok(Ok(stream)) => {
-                drop(stream);
-                Ok(())
-            }
-            Ok(Err(error)) => Err(error.to_string()),
-            Err(_) => Err("the endpoint did not accept within the probe timeout".into()),
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(ClientError::UntrustedEndpoint { rejection, .. })) => {
+            Err(ProbeFailure::Untrusted(untrusted_reason(&rejection)))
         }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = endpoint;
-        Err("the preview gateway runs on Unix only".into())
+        Ok(Err(error)) => Err(ProbeFailure::Unreachable(error.to_string())),
+        Err(_) => Err(ProbeFailure::Unreachable(
+            "the endpoint did not accept within the probe timeout".into(),
+        )),
     }
 }
 
+/// A refusal in words that name no path or account, for the unauthenticated
+/// health route. The authenticated core-link route gives the details.
+fn untrusted_reason(rejection: &EndpointRejection) -> &'static str {
+    match rejection {
+        EndpointRejection::PeerUid { .. } => "another OS account serves it",
+        EndpointRejection::PeerUnknown(_) => "the kernel did not report which account serves it",
+        EndpointRejection::DirectoryOwner { .. } => "its directory belongs to another OS account",
+        EndpointRejection::DirectoryWritable { .. } => "other accounts can write to its directory",
+        EndpointRejection::DirectoryUnreadable { .. } => "its directory could not be inspected",
+        EndpointRejection::Unsupported => "this platform cannot verify which account serves it",
+    }
+}
+
+/// How a dashboard signs in to the preview. There is no pairing-code
+/// exchange, so the dashboard asks for an existing token and checks it
+/// against the core-link route.
+fn sign_in() -> serde_json::Value {
+    json!({ "pairing_code": false, "bearer": true, "verify": CORE_LINK_PATH })
+}
+
 /// `GET /health`: this process is up, and whether the core's endpoint
-/// accepts connections. `503` with a banner-ready message when it does not.
+/// accepts connections from this account. `503` with a banner-ready message
+/// when it does not. The body names no path.
+///
+/// `require_pairing` is always `true`: every request needs a bearer, and a
+/// dashboard written for the in-process gateway must never read a missing
+/// field as "pairing off".
 async fn health(State(state): State<PreviewState>) -> Response {
-    let endpoint = state.endpoint.display().to_string();
-    match endpoint_reachable(&state.endpoint).await {
+    match probe_endpoint(&state.endpoint).await {
         Ok(()) => (
             StatusCode::OK,
             Json(json!({
                 "status": "ok",
                 "gateway": "zeroclaw-gw preview",
                 "version": env!("CARGO_PKG_VERSION"),
-                "core": { "link": "reachable", "endpoint": endpoint },
+                "require_pairing": true,
+                "sign_in": sign_in(),
+                "core": { "link": "reachable" },
             })),
         )
             .into_response(),
-        Err(detail) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({
-                "status": "degraded",
-                "code": "core_unavailable",
-                "error": format!("The ZeroClaw core is not reachable at {endpoint}: {detail}"),
-                "hint": "Start the core with `zeroclaw daemon`, or point zeroclaw-gw at its \
-                         socket with --socket PATH.",
-                "core": { "link": "unreachable", "endpoint": endpoint },
-            })),
-        )
-            .into_response(),
+        Err(failure) => {
+            let (code, link, error, hint) = match failure {
+                ProbeFailure::Unreachable(detail) => (
+                    "core_unavailable",
+                    "unreachable",
+                    format!("The ZeroClaw core is not reachable: {detail}"),
+                    HINT_START_CORE,
+                ),
+                ProbeFailure::Untrusted(reason) => (
+                    "core_untrusted_endpoint",
+                    "untrusted",
+                    format!("The core's endpoint failed the same-account check: {reason}"),
+                    HINT_SAME_ACCOUNT,
+                ),
+            };
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({
+                    "status": "degraded",
+                    "code": code,
+                    "error": error,
+                    "hint": hint,
+                    "require_pairing": true,
+                    "sign_in": sign_in(),
+                    "core": { "link": link },
+                })),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -714,7 +774,11 @@ async fn core_link(access: Result<CoreAccess, CoreError>) -> Response {
 /// `404` for anything under an API or machine prefix.
 async fn fallback(State(state): State<PreviewState>, method: HttpMethod, uri: Uri) -> Response {
     let path = uri.path();
-    let api = API_PREFIXES.iter().any(|prefix| path.starts_with(prefix));
+    // The namespace root itself (`/api`, `/ws`) is as much the API's as
+    // anything under it.
+    let api = API_PREFIXES
+        .iter()
+        .any(|prefix| path.starts_with(prefix) || path == prefix.trim_end_matches('/'));
     if api || method != HttpMethod::GET {
         return (
             StatusCode::NOT_FOUND,
@@ -786,7 +850,12 @@ pub async fn serve(bootstrap: Bootstrap) -> anyhow::Result<()> {
     };
 
     let core = CoreRpc::local(bootstrap.endpoint.clone(), EndpointOwner::SameAccount);
-    let app = router(core, bootstrap.endpoint.clone(), bootstrap.web_dist.clone());
+    let mut app = router(core, bootstrap.endpoint.clone(), bootstrap.web_dist.clone());
+    if tls.is_some() {
+        app = app.layer(axum::middleware::from_fn(
+            crate::security_headers::apply_with_hsts,
+        ));
+    }
     let listener = tokio::net::TcpListener::bind(bootstrap.listen).await?;
     let address = listener.local_addr()?;
     let scheme = if tls.is_some() { "https" } else { "http" };
