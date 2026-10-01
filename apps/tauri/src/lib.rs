@@ -167,7 +167,11 @@ async fn ensure_daemon(app: tauri::AppHandle, state: state::SharedState) {
 /// gateway. For a gateway that was already running, the code is minted
 /// through the kernel CLI, which presents the gateway's owner-only admin
 /// token; see [`daemon::mint_pairing_code`].
-async fn auto_pair(state: &state::SharedState) -> Option<String> {
+///
+/// With a launched core, whether pairing is needed is the proven listener's
+/// own answer, and not getting it is an error, never "no token needed".
+/// `Ok(None)` means no token is handed over, not that the WebView holds none.
+async fn auto_pair(state: &state::SharedState) -> Result<Option<String>, String> {
     let (url, core) = {
         let s = state.read().await;
         (s.gateway_url.clone(), s.core.clone())
@@ -176,8 +180,15 @@ async fn auto_pair(state: &state::SharedState) -> Option<String> {
     let client = GatewayClient::new(&url, None).with_core(core.clone());
 
     // Check if gateway is reachable and requires pairing.
-    if !client.requires_pairing().await.unwrap_or(false) {
-        return None; // Pairing disabled — no token needed.
+    let requires_pairing = match client.requires_pairing().await {
+        Ok(requires) => requires,
+        Err(error) if core.is_some() => return Err(error.to_string()),
+        // A gateway that was already running and does not answer pairs
+        // nothing; there is nothing to prove it against.
+        Err(_) => false,
+    };
+    if !requires_pairing {
+        return Ok(None); // Pairing disabled — no token needed.
     }
 
     // Check if we already have a valid token in state.
@@ -186,29 +197,34 @@ async fn auto_pair(state: &state::SharedState) -> Option<String> {
         if let Some(ref token) = s.token {
             let authed = GatewayClient::new(&url, Some(token)).with_core(core.clone());
             if authed.validate_token().await.unwrap_or(false) {
-                return Some(token.clone()); // Existing token is valid.
+                return Ok(Some(token.clone())); // Existing token is valid.
             }
         }
     }
 
     // No valid token — mint a new code and exchange it.
     let code = match &core {
-        Some(core) => core.new_pairing_code().await.ok()?,
-        None => {
-            let binary = daemon::find_zeroclaw_binary()?;
-            tokio::task::spawn_blocking(move || daemon::mint_pairing_code(&binary, GATEWAY_PORT))
-                .await
-                .ok()?
-                .ok()?
-        }
+        Some(core) => core.new_pairing_code().await.ok(),
+        None => match daemon::find_zeroclaw_binary() {
+            Some(binary) => tokio::task::spawn_blocking(move || {
+                daemon::mint_pairing_code(&binary, GATEWAY_PORT)
+            })
+            .await
+            .ok()
+            .and_then(Result::ok),
+            None => None,
+        },
+    };
+    let Some(code) = code else {
+        return Ok(None);
     };
     match client.pair_with_code(&code).await {
         Ok(token) => {
             let mut s = state.write().await;
             s.token = Some(token.clone());
-            Some(token)
+            Ok(Some(token))
         }
-        Err(_) => None, // Gateway may not be ready yet; health poller will retry.
+        Err(_) => Ok(None), // Gateway may not be ready yet; health poller will retry.
     }
 }
 
@@ -216,6 +232,59 @@ async fn auto_pair(state: &state::SharedState) -> Option<String> {
 #[tauri::command]
 async fn get_startup(state: tauri::State<'_, state::SharedState>) -> Result<Startup, String> {
     Ok(state.read().await.startup.clone())
+}
+
+/// What the dashboard window opens with.
+struct DashboardOpening {
+    url: tauri::Url,
+    /// The bearer the WebView is given, when pairing produced one.
+    token: Option<String>,
+}
+
+/// Whether the dashboard may open now, and with what.
+async fn admit_dashboard(state: &state::SharedState) -> Result<DashboardOpening, String> {
+    // Only a ready startup may open the dashboard or pair with its gateway,
+    // whatever the splash believed when it asked.
+    let base = {
+        let s = state.read().await;
+        s.startup.dashboard_gate()?;
+        s.gateway_url.clone()
+    };
+    let token = auto_pair(state).await.map_err(unproven_dashboard)?;
+    let core = {
+        let s = state.read().await;
+        s.startup.dashboard_gate()?;
+        s.core.clone()
+    };
+    // Whenever the app launched the core, the dashboard opens only on an
+    // address proven, right now, to be that core's gateway, whatever pairing
+    // found: the WebView sends the token there from now on, and may hold the
+    // origin's saved credentials even when no token is handed over.
+    if let Some(core) = core {
+        core.prove()
+            .await
+            .map_err(|failure| unproven_dashboard(failure.to_string()))?;
+    }
+
+    let dashboard_url = format!("{}/", base.trim_end_matches('/'));
+    let url = tauri::Url::parse(&dashboard_url).map_err(|e| e.to_string())?;
+    Ok(DashboardOpening { url, token })
+}
+
+/// Why the dashboard was not opened on an address that did not prove itself.
+fn unproven_dashboard(failure: String) -> String {
+    format!(
+        "The dashboard address is not the ZeroClaw core's gateway right now ({failure}), so the dashboard was not opened. Reopen ZeroClaw."
+    )
+}
+
+/// Build the dashboard window with `open_window`, only once
+/// [`admit_dashboard`] admits it.
+async fn open_admitted_dashboard(
+    state: &state::SharedState,
+    open_window: impl FnOnce(DashboardOpening) -> Result<(), String>,
+) -> Result<(), String> {
+    open_window(admit_dashboard(state).await?)
 }
 
 #[tauri::command]
@@ -229,48 +298,24 @@ async fn open_dashboard(
         return Ok(());
     }
 
-    // Only a ready startup may open the dashboard or pair with its gateway,
-    // whatever the splash believed when it asked.
-    let base = {
-        let s = state.read().await;
-        s.startup.dashboard_gate()?;
-        s.gateway_url.clone()
-    };
-    let token = auto_pair(state.inner()).await;
-    let core = {
-        let s = state.read().await;
-        s.startup.dashboard_gate()?;
-        s.core.clone()
-    };
-    // The WebView sends the token to the dashboard address from now on. Prove
-    // that address is the launched core's own gateway once more, right
-    // before handing the token over.
-    if token.is_some()
-        && let Some(core) = core
-    {
-        core.prove().await.map_err(|failure| {
-            format!(
-                "The dashboard address is not the ZeroClaw core's gateway right now ({failure}), so it was not opened with your credential. Reopen ZeroClaw."
-            )
-        })?;
-    }
-
-    let dashboard_url = format!("{}/", base.trim_end_matches('/'));
-    let parsed = tauri::Url::parse(&dashboard_url).map_err(|e| e.to_string())?;
-
-    let mut builder = WebviewWindowBuilder::new(&app, "main", WebviewUrl::External(parsed))
-        .title("ZeroClaw")
-        .inner_size(1200.0, 800.0)
-        .center()
-        .resizable(true);
-    if let Some(token) = token {
-        let escaped = token.replace('\\', "\\\\").replace('\'', "\\'");
-        let script = format!(
-            "try {{ localStorage.setItem('zeroclaw_token', '{escaped}'); }} catch (e) {{}}"
-        );
-        builder = builder.initialization_script(script.as_str());
-    }
-    builder.build().map_err(|e| e.to_string())?;
+    open_admitted_dashboard(state.inner(), |opening| {
+        let mut builder =
+            WebviewWindowBuilder::new(&app, "main", WebviewUrl::External(opening.url))
+                .title("ZeroClaw")
+                .inner_size(1200.0, 800.0)
+                .center()
+                .resizable(true);
+        if let Some(token) = opening.token {
+            let escaped = token.replace('\\', "\\\\").replace('\'', "\\'");
+            let script = format!(
+                "try {{ localStorage.setItem('zeroclaw_token', '{escaped}'); }} catch (e) {{}}"
+            );
+            builder = builder.initialization_script(script.as_str());
+        }
+        builder.build().map_err(|e| e.to_string())?;
+        Ok(())
+    })
+    .await?;
 
     // Hand off from the splash to the dashboard.
     if let Some(splash) = app.get_webview_window("splash") {

@@ -242,43 +242,23 @@ struct GatewayProgress {
 /// One check of the launched daemon's gateway: `Ok(true)` once the dashboard
 /// address proves it is the core's own gateway.
 ///
-/// The proof is the readiness. It is checked against a challenge the core
-/// issues over the verified RPC connection, only while its gateway's
-/// listener accepts connections on exactly the dashboard's address, which
-/// the supervisor pins. A process ID the address reports over HTTP is a
-/// diagnostic only: it decides what the failure says, never whether the
-/// address is trusted.
+/// The proof is the readiness, and it alone admits. It is checked against a
+/// challenge the core issues over the verified RPC connection for the
+/// listener it vouches for at exactly the dashboard's address, which the
+/// supervisor pins: the core's own gateway, or a separate gateway that
+/// registered its listener there. What the core's own gateway reports only
+/// explains a failed proof (see [`own_gateway`]), as a process ID the address
+/// reports over HTTP does: neither ever decides that the address is trusted.
 async fn launched_gateway_ready(
     core: &RpcClient,
     gateway_url: &str,
     progress: &mut GatewayProgress,
 ) -> Result<bool, StartupFailure> {
-    // The daemon rejects `"params": null`; an empty object is the no-argument
-    // form it accepts.
-    let health = core
-        .request(Method::Health, Value::Object(serde_json::Map::new()))
-        .await
-        .map_err(|error| core_stopped(&error.to_string()))?;
-    if let Some(error) = gateway_port_held(&health) {
-        return Err(StartupFailure::PortHeld(format!(
-            "Another program is using the dashboard's address {gateway_url}: {error}. Close it and reopen ZeroClaw."
-        )));
-    }
     let dashboard = dashboard_addr(gateway_url).ok_or_else(|| {
         StartupFailure::Incompatible(format!(
             "The dashboard address {gateway_url} is not an IP address and port this app can check."
         ))
     })?;
-    // The core's own gateway, when it has one, reports where it is bound. On
-    // another address it cannot be the dashboard's, and whatever answers
-    // there is another program.
-    if let Some(bound) = health["components"]["gateway"]["bound_addr"].as_str()
-        && bound.parse::<SocketAddr>().ok() != Some(dashboard)
-    {
-        return Err(StartupFailure::PortHeld(format!(
-            "The ZeroClaw core's gateway is listening on {bound}, not on the dashboard's address {dashboard}. Another program may hold that address; close it and reopen ZeroClaw."
-        )));
-    }
     match crate::possession::prove_gateway(core, dashboard).await {
         Ok(_proven) => Ok(true),
         Err(ProofFailure::CoreUnavailable(error)) => Err(core_stopped(&error)),
@@ -289,7 +269,7 @@ async fn launched_gateway_ready(
             "The ZeroClaw core's gateway is listening on {bound}, not on the dashboard's address {dashboard}. Another program may hold that address; close it and reopen ZeroClaw."
         ))),
         Err(ProofFailure::NotBound) => {
-            let gateway = &health["components"]["gateway"];
+            let gateway = own_gateway(core, gateway_url, dashboard).await?;
             progress.mismatches = 0;
             progress.note = gateway["last_error"]
                 .as_str()
@@ -302,11 +282,13 @@ async fn launched_gateway_ready(
             Ok(false)
         }
         Err(failure @ ProofFailure::Unreachable(_)) => {
+            own_gateway(core, gateway_url, dashboard).await?;
             progress.mismatches = 0;
             progress.note = Some(failure.to_string());
             Ok(false)
         }
         Err(failure @ ProofFailure::Mismatch { .. }) => {
+            own_gateway(core, gateway_url, dashboard).await?;
             progress.mismatches += 1;
             progress.note = Some(failure.to_string());
             if progress.mismatches < PROOF_MISMATCHES_HELD {
@@ -318,6 +300,41 @@ async fn launched_gateway_ready(
             )))
         }
     }
+}
+
+/// The core's report on its own gateway, asked only once the dashboard
+/// address has not proven itself, to explain why. A port another program
+/// holds (the gateway's bind error), or the gateway bound to another address,
+/// ends the wait as `port_held`; otherwise the gateway's report, for the
+/// note. It never admits an address.
+async fn own_gateway(
+    core: &RpcClient,
+    gateway_url: &str,
+    dashboard: SocketAddr,
+) -> Result<Value, StartupFailure> {
+    // The daemon rejects `"params": null`; an empty object is the no-argument
+    // form it accepts.
+    let health = core
+        .request(Method::Health, Value::Object(serde_json::Map::new()))
+        .await
+        .map_err(|error| core_stopped(&error.to_string()))?;
+    if let Some(error) = gateway_port_held(&health) {
+        return Err(StartupFailure::PortHeld(format!(
+            "Another program is using the dashboard's address {gateway_url}: {error}. Close it and reopen ZeroClaw."
+        )));
+    }
+    let gateway = &health["components"]["gateway"];
+    // The core's own gateway, when it has one, reports where it is bound. On
+    // another address it cannot be the dashboard's, and whatever answers
+    // there is another program.
+    if let Some(bound) = gateway["bound_addr"].as_str()
+        && bound.parse::<SocketAddr>().ok() != Some(dashboard)
+    {
+        return Err(StartupFailure::PortHeld(format!(
+            "The ZeroClaw core's gateway is listening on {bound}, not on the dashboard's address {dashboard}. Another program may hold that address; close it and reopen ZeroClaw."
+        )));
+    }
+    Ok(gateway.clone())
 }
 
 fn core_stopped(error: &str) -> StartupFailure {
@@ -837,6 +854,167 @@ mod tests {
         );
     }
 
+    /// A gateway in another process that registered its listener at the
+    /// dashboard address, and answers the challenge for it, is ready whatever
+    /// the core's own gateway reports: here that it lost the port, or that it
+    /// listens somewhere else. The proof decides; the core's own report only
+    /// explains a failure.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_proven_registered_listener_is_ready_whatever_the_core_s_own_gateway_reports() {
+        for (label, own) in [
+            ("lost", gateway_health("error", Some(PORT_HELD), None)),
+            ("elsewhere", gateway_health("ok", None, Some("127.0.0.1:1"))),
+        ] {
+            let mut gateway = CopiedPidServer::start_with(4_000_000, None, Some(FAKE_KEY), None);
+            let dashboard = format!("http://127.0.0.1:{}", gateway.port);
+            let core = FakeCore::start_with(
+                label,
+                own,
+                CoreOptions {
+                    registered: Some(bound_addr_of(&dashboard)),
+                    ..CoreOptions::default()
+                },
+            )
+            .await;
+            let outcome = await_gateway(&dashboard, Some(&core.client), SHORT).await;
+            gateway.stop();
+            if let Err(failure) = outcome {
+                panic!("{label}: a registered listener that proves itself is ready: {failure:?}");
+            }
+        }
+    }
+
+    /// A challenge the core issued while its listener held the dashboard
+    /// address, delivered only after that listener let go and another program
+    /// took the address, admits nothing: the new holder cannot answer it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_challenge_delivered_after_the_listener_moved_admits_nothing() {
+        let gateway = ProvingHttp::start(Some(FAKE_KEY));
+        let (port, url) = (gateway.port, gateway.url.clone());
+        let (held, arrived) = std::sync::mpsc::sync_channel(1);
+        let (release, released) = std::sync::mpsc::sync_channel(1);
+        let core = FakeCore::start_with(
+            "late",
+            gateway_health("ok", None, Some(&bound_addr_of(&url))),
+            CoreOptions {
+                hold: Some(("gateway/possession-challenge", held, released)),
+                ..CoreOptions::default()
+            },
+        )
+        .await;
+        let waiting =
+            async move { await_gateway(&url, Some(&core.client), Duration::from_secs(3)).await };
+        let replace_listener = async move {
+            tokio::task::spawn_blocking(move || arrived.recv_timeout(Duration::from_secs(5)))
+                .await
+                .unwrap()
+                .expect("the challenge is held");
+
+            gateway.stop();
+            let impostor = CopiedPidServer::start_with(std::process::id(), Some(port), None, None);
+            assert_eq!(impostor.port, port, "the impostor took the address");
+            release.send(()).unwrap();
+            impostor
+        };
+        let (outcome, mut impostor) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(waiting, replace_listener)
+        })
+        .await
+        .expect("the wait ends");
+        impostor.stop();
+        assert!(outcome.is_err(), "{outcome:?}");
+    }
+
+    /// The app's state after a ready startup with the core this test serves.
+    #[cfg(unix)]
+    async fn ready_state(
+        url: &str,
+        link: crate::possession::CoreLink,
+        token: &str,
+    ) -> crate::state::SharedState {
+        let state = crate::state::shared_state();
+        {
+            let mut s = state.write().await;
+            s.gateway_url = url.to_string();
+            s.startup = crate::state::Startup::Ready;
+            s.core = Some(std::sync::Arc::new(link));
+            s.token = Some(token.to_string());
+        }
+        state
+    }
+
+    /// The dashboard opens only on an address proven right then to be the
+    /// core's gateway, whatever the pairing check found. A listener that
+    /// proved itself, replaced by a program without its key that says no
+    /// pairing is needed, gets no dashboard window though a token is saved,
+    /// and never sees the token.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_replaced_listener_saying_no_pairing_is_needed_gets_no_dashboard() {
+        let gateway = ProvingHttp::start(Some(FAKE_KEY));
+        let (port, url) = (gateway.port, gateway.url.clone());
+        let core = FakeCore::start(
+            "nopair",
+            gateway_health("ok", None, Some(&bound_addr_of(&url))),
+            false,
+        )
+        .await;
+        await_gateway(&url, Some(&core.client), SHORT)
+            .await
+            .expect("the core's listener proves itself");
+        let (link, dir) = core.into_link(&url);
+        let state = ready_state(&url, link, "zc_saved").await;
+
+        gateway.stop();
+        let log = dir.0.join("impostor.log");
+        let mut impostor =
+            CopiedPidServer::start_with(std::process::id(), Some(port), None, Some(&log));
+        assert_eq!(impostor.port, port, "the impostor took the address");
+        let mut windows = 0;
+        let outcome = crate::open_admitted_dashboard(&state, |_| {
+            windows += 1;
+            Ok(())
+        })
+        .await;
+        impostor.stop();
+
+        let refused = outcome.expect_err("an unproven address gets no dashboard");
+        assert_eq!(windows, 0, "no dashboard window was built");
+        assert!(
+            refused.contains("not the ZeroClaw core's gateway"),
+            "{refused}"
+        );
+        let received = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(!received.contains("zc_saved"), "{received}");
+    }
+
+    /// On an address that proves itself, the dashboard window is built once,
+    /// with the saved token.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_dashboard_opens_on_a_proven_address_with_the_saved_token() {
+        let gateway = ProvingHttp::start(Some(FAKE_KEY));
+        let url = gateway.url.clone();
+        let core = FakeCore::start(
+            "open",
+            gateway_health("ok", None, Some(&bound_addr_of(&url))),
+            false,
+        )
+        .await;
+        let (link, _dir) = core.into_link(&url);
+        let state = ready_state(&url, link, "zc_saved").await;
+        let mut opened = Vec::new();
+        crate::open_admitted_dashboard(&state, |opening| {
+            opened.push(opening.token);
+            Ok(())
+        })
+        .await
+        .expect("a proven address opens");
+        assert_eq!(opened, vec![Some("zc_saved".to_string())]);
+    }
+
     #[cfg(unix)]
     const SHORT: Duration = Duration::from_secs(10);
     /// The fake core's possession key, and the proof any holder of it gives.
@@ -1068,7 +1246,8 @@ mod tests {
                     .unwrap();
                 let _ = file.write_all(head.to_ascii_lowercase().as_bytes());
             }
-            let mut body = json!({ "status": "ok", "runtime": { "pid": pid } });
+            let mut body =
+                json!({ "status": "ok", "require_pairing": false, "runtime": { "pid": pid } });
             if let (Some(key), Some(nonce)) = (key.as_deref(), challenge_of(&head)) {
                 body["challenge_proof"] = json!(proof_of(key, &nonce));
             }
@@ -1080,6 +1259,28 @@ mod tests {
             let _ = reader.get_mut().write_all(response.as_bytes());
         }
         std::process::exit(0);
+    }
+
+    /// How a [`FakeCore`] differs from a plain current core.
+    #[cfg(unix)]
+    #[derive(Default)]
+    struct CoreOptions {
+        /// Never answer `health`.
+        stall: bool,
+        /// Answer neither the challenge nor `pairing/new-code`, like a core
+        /// from before the possession proof.
+        predates_proof: bool,
+        /// The address of a gateway in another process that registered its
+        /// listener with the core, which the core vouches for with the fake
+        /// key after its own listener.
+        registered: Option<String>,
+        /// Hold the first answer to this method: tell the first channel it
+        /// is held, and answer once the second one fires.
+        hold: Option<(
+            &'static str,
+            std::sync::mpsc::SyncSender<()>,
+            std::sync::mpsc::Receiver<()>,
+        )>,
     }
 
     /// A launched core on a private socket, already verified: it answers
@@ -1096,16 +1297,38 @@ mod tests {
     #[cfg(unix)]
     impl FakeCore {
         async fn start(label: &str, health: Value, stall: bool) -> Self {
-            Self::start_as(label, health, stall, false).await
+            Self::start_with(
+                label,
+                health,
+                CoreOptions {
+                    stall,
+                    ..CoreOptions::default()
+                },
+            )
+            .await
         }
 
         /// A core of this protocol from before the possession proof: it
         /// answers neither the challenge nor `pairing/new-code`.
         async fn start_predating_the_proof(label: &str, health: Value) -> Self {
-            Self::start_as(label, health, false, true).await
+            Self::start_with(
+                label,
+                health,
+                CoreOptions {
+                    predates_proof: true,
+                    ..CoreOptions::default()
+                },
+            )
+            .await
         }
 
-        async fn start_as(label: &str, health: Value, stall: bool, predates_proof: bool) -> Self {
+        async fn start_with(label: &str, health: Value, options: CoreOptions) -> Self {
+            let CoreOptions {
+                stall,
+                predates_proof,
+                registered,
+                mut hold,
+            } = options;
             use std::io::{BufRead, BufReader, Write};
             let dir = PrivateDir::new(label);
             let endpoint = dir.0.join("d.sock");
@@ -1166,11 +1389,17 @@ mod tests {
                             health.clone()
                         }
                         // Like the core: a challenge for the listener it
-                        // vouches for at the asked address, here the one its
-                        // health report names, proved with the fake key.
+                        // vouches for at the asked address, its own (the one
+                        // its health report names) first, then a registered
+                        // one, proved with the fake key.
                         Some("gateway/possession-challenge") => {
-                            let bound = health["components"]["gateway"]["bound_addr"].as_str();
-                            if bound.is_some() && request["params"]["addr"].as_str() == bound {
+                            let asked = request["params"]["addr"].as_str();
+                            let own = health["components"]["gateway"]["bound_addr"].as_str();
+                            let bound = [own, registered.as_deref()]
+                                .into_iter()
+                                .flatten()
+                                .find(|bound| asked == Some(*bound));
+                            if let Some(bound) = bound {
                                 let nonce = format!(
                                     "nonce-{}",
                                     next_nonce.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
@@ -1191,6 +1420,14 @@ mod tests {
                         }),
                         _ => json!({}),
                     };
+                    if hold
+                        .as_ref()
+                        .is_some_and(|(method, _, _)| request["method"].as_str() == Some(*method))
+                        && let Some((_, arrived, release)) = hold.take()
+                    {
+                        let _ = arrived.send(());
+                        let _ = release.recv();
+                    }
                     let answer = json!({ "jsonrpc": "2.0", "id": request["id"], "result": result });
                     if write.write_all(format!("{answer}\n").as_bytes()).is_err() {
                         break;
@@ -1283,7 +1520,8 @@ mod tests {
                                     return;
                                 }
                                 let answer = if head.starts_with("get /health") {
-                                    let mut report = json!({ "status": "ok" });
+                                    let mut report =
+                                        json!({ "status": "ok", "require_pairing": true });
                                     if let (Some(key), Some(nonce)) = (key, challenge_of(&head)) {
                                         report["challenge_proof"] = json!(proof_of(key, &nonce));
                                     }

@@ -148,8 +148,21 @@ impl GatewayClient {
         Self::json_of(&body)
     }
 
-    /// Check whether the gateway requires pairing.
+    /// Whether the gateway requires pairing. With a core, the answer is the
+    /// proven listener's own: the `/health` its proof was answered with. A
+    /// failed proof, or an answer that does not say, is an error, never "no
+    /// pairing". Without a core, the plain `/health` answer, `false` when it
+    /// does not say.
     pub async fn requires_pairing(&self) -> Result<bool> {
+        if let Some(core) = &self.core {
+            let proven = core
+                .prove()
+                .await
+                .map_err(|failure| anyhow::Error::msg(failure.to_string()))?;
+            return proven.health()["require_pairing"]
+                .as_bool()
+                .context("its answer did not say whether it requires pairing");
+        }
         let resp = self
             .client
             .get(format!("{}/health", self.base_url))

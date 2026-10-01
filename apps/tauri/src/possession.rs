@@ -135,9 +135,17 @@ pub struct ProvenConnection {
     connection: std::pin::Pin<Box<Connection<TokioIo<tokio::net::TcpStream>, Full<Bytes>>>>,
     closed: bool,
     authority: String,
+    /// The `/health` the proof was answered with.
+    health: Value,
 }
 
 impl ProvenConnection {
+    /// The proven listener's own `/health` answer, the one that carried the
+    /// proof.
+    pub fn health(&self) -> &Value {
+        &self.health
+    }
+
     /// Send one request on this connection: the status and the body.
     pub async fn send(
         &mut self,
@@ -220,6 +228,7 @@ pub async fn prove_gateway(
         connection: Box::pin(connection),
         closed: false,
         authority: dashboard.to_string(),
+        health: Value::Null,
     };
     let (status, body) = proven
         .send(
@@ -233,6 +242,7 @@ pub async fn prove_gateway(
     let report: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
     let answered = report[PROOF_FIELD].as_str().unwrap_or_default();
     if status == 200 && same_proof(answered, &challenge.proof) {
+        proven.health = report;
         Ok(proven)
     } else {
         Err(ProofFailure::Mismatch {
