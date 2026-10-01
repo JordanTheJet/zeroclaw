@@ -726,13 +726,13 @@ async fn the_upgrade_is_refused_before_it_happens() {
 }
 
 #[tokio::test]
-async fn only_the_connection_that_started_a_turn_can_stop_it() {
+async fn another_device_of_the_operator_can_stop_the_turn() {
     let provider = ScriptedProvider::spawn(vec![Reply::Slow(LONG_REPLY)]).await;
     let tmp = tempfile::tempdir().unwrap();
     let core = Core::serve(chat_config(tmp.path(), &provider.base_url(), false)).await;
     let gateway = Gateway::spawn(&core.endpoint).await;
 
-    let mut chat = open_chat(&gateway.address, "chat-owned").await;
+    let mut chat = open_chat(&gateway.address, "chat-elsewhere").await;
     next_frame(&mut chat).await;
     send(
         &mut chat,
@@ -741,30 +741,14 @@ async fn only_the_connection_that_started_a_turn_can_stop_it() {
     .await;
     assert_eq!(next_frame(&mut chat).await["type"], "chunk");
 
-    // Another device's credential reaches the core on its own connection,
-    // which does not own the turn. The in-process gateway would stop it. The
-    // refusal answers at once, without waiting for the turn to end.
-    let asked = tokio::time::Instant::now();
+    // Another paired device of the same operator reaches the core on its own
+    // connection; the core lets the operator stop its own turn from there,
+    // as the in-process gateway does for any paired device.
     let (status, body) = http(
         &gateway.address,
         "POST",
-        "/api/sessions/chat-owned/abort",
+        "/api/sessions/chat-elsewhere/abort",
         Some(OTHER_TOKEN),
-    )
-    .await;
-    assert_eq!(status, 403, "{body}");
-    assert_eq!(body["code"], "forbidden", "{body}");
-    assert!(
-        asked.elapsed() < Duration::from_secs(10),
-        "the refusal waited {:?}, as long as the turn runs",
-        asked.elapsed()
-    );
-    assert!(core.ctx.sessions.has_inflight_turn("chat-owned"));
-    let (status, body) = http(
-        &gateway.address,
-        "POST",
-        "/api/sessions/chat-owned/abort",
-        Some(TOKEN),
     )
     .await;
     assert_eq!((status, body), (200, json!({"status": "aborted"})));

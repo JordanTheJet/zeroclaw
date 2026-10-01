@@ -37710,6 +37710,34 @@ mod tests {
         );
     }
 
+    /// A running turn holds its session's agent. Refusing a cancel from a
+    /// connection that does not own the session must not wait for that turn.
+    #[tokio::test]
+    async fn a_refused_cancel_does_not_wait_for_the_running_turn() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let (mut dispatcher_a, mut dispatcher_b, sessions) =
+            make_two_dispatchers_sharing_context(config);
+        let (session_id, token) =
+            create_session_with_owner(&mut dispatcher_a, &sessions, "tui-A").await;
+        let agent = sessions
+            .get_agent(&session_id)
+            .await
+            .expect("the session has an agent");
+        let _running_turn = agent.lock().await;
+
+        dispatcher_b.set_tui_id_for_test(Some("tui-B".to_string()));
+        let refused = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            dispatcher_b.handle_session_cancel(&json!({ "session_id": session_id })),
+        )
+        .await
+        .expect("the refusal answers while the turn still runs")
+        .expect_err("a non-owner's cancel is refused");
+        assert_eq!(refused.code, SESSION_NOT_OWNED);
+        assert!(!token.is_cancelled());
+    }
+
     #[tokio::test]
     async fn session_cancel_from_anonymous_dispatcher_is_rejected() {
         let tmp = tempfile::TempDir::new().unwrap();
