@@ -539,13 +539,9 @@ async fn a_disabled_session_store_answers_the_listing_route_alike() {
     let harness = Harness::new(None);
     let mut state = harness.state.clone();
     state.session_backend = None;
-    let in_process = crate::api::handle_api_sessions_list(
-        State(state),
-        CoreAccess::InProcess,
-        Harness::headers(),
-    )
-    .await
-    .into_response();
+    let in_process = crate::api::handle_api_sessions_list(State(state), Harness::headers())
+        .await
+        .into_response();
     let core = harness.core().await;
     let through_core = crate::api::api_sessions_list_through_core(&core)
         .await
