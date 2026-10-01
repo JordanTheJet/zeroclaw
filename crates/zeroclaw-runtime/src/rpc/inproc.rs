@@ -28,7 +28,7 @@ use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
 use super::context::RpcContext;
-use super::dispatch::RpcDispatcher;
+use super::dispatch::{RpcAccessPolicy, RpcDispatcher};
 use super::local::{
     LOCAL_PEER_WRITE_TIMEOUT, MAX_FRAME_BYTES, SHUTDOWN_TIMEOUT, TERMINAL_FRAME_TIMEOUT,
     TerminalFrame, WriterTimeouts, frame_too_large_line, run_writer,
@@ -389,11 +389,13 @@ async fn serve(
     let _count_guard = activity.clone();
     let mut transport = InprocTransport::new(stream, conn_cancel.clone());
     let writer_tx = transport.writer();
-    let mut dispatcher = RpcDispatcher::new_with_connection_cancel(
+    let mut dispatcher = RpcDispatcher::new_with_cancel_and_channel_access(
         Arc::clone(&ctx),
         writer_tx,
         transport.peer_label(),
         conn_cancel.clone(),
+        RpcAccessPolicy::RemoteSessionOwner,
+        None,
     )
     .with_connection_activity(activity)
     .with_transport(transport.kind(), transport.credential());
@@ -432,6 +434,19 @@ mod tests {
         let session_queue = Arc::new(SessionActorQueue::new(4, 10, 60));
         let sessions = Arc::new(SessionStore::new(64, session_queue));
         RpcContext::minimal(config, sessions)
+    }
+
+    /// Give `ctx` a TUI identity signing key, as a daemon with a
+    /// `.secret_key` has. The duplex is served under the non-local session
+    /// policy, whose `initialize` refuses every caller while signing is off,
+    /// so a test about the credential layer needs signing on to reach it.
+    fn with_tui_signing(mut ctx: Arc<RpcContext>, key_dir: &std::path::Path) -> Arc<RpcContext> {
+        std::fs::write(key_dir.join(".secret_key"), "42".repeat(32)).unwrap();
+        Arc::get_mut(&mut ctx)
+            .expect("a fresh context has one owner")
+            .tui_registry = Arc::new(crate::rpc::tui_identity::TuiRegistry::new(key_dir));
+        assert!(ctx.tui_registry.signing_is_enabled());
+        ctx
     }
 
     fn rpc_request<T: serde::Serialize>(method: Method, params: &T, id: u64) -> String {
@@ -477,7 +492,7 @@ mod tests {
             config.users.is_empty(),
             "this test is about the no-roster case"
         );
-        let ctx = ctx_for(config);
+        let ctx = with_tui_signing(ctx_for(config), tmp.path());
         let cancel = CancellationToken::new();
         let connector = InprocConnector::new(cancel.clone());
         assert!(!connector.is_bound());
@@ -512,7 +527,7 @@ mod tests {
         let mut config = base_config(tmp.path());
         config.gateway.require_pairing = true;
         config.gateway.paired_tokens = vec!["zc_inproc_test_token".to_string()];
-        let ctx = ctx_for(config);
+        let ctx = with_tui_signing(ctx_for(config), tmp.path());
         let cancel = CancellationToken::new();
         let connector = InprocConnector::new(cancel.clone());
         connector.bind(ctx);
@@ -544,6 +559,61 @@ mod tests {
         let status: StatusResult = serde_json::from_value(frame["result"].clone()).unwrap();
         assert_eq!(status.active_sessions, 0);
 
+        writer
+            .write_all(
+                rpc_request(
+                    Method::SessionState,
+                    &serde_json::json!({ "session_id": "not-owned-by-this-connection" }),
+                    3,
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let frame = read_frame(&mut reader).await;
+        assert_eq!(
+            frame["error"]["code"],
+            zeroclaw_api::jsonrpc::error_codes::SESSION_NOT_OWNED,
+            "an authenticated duplex must use the non-local session owner gate"
+        );
+
+        cancel.cancel();
+        drop(writer);
+    }
+
+    /// The duplex is a non-local caller, so the remote identity fence applies
+    /// to it as it does to WSS: while TUI identity signing is off, even a
+    /// valid paired token does not open it.
+    #[tokio::test]
+    async fn duplex_with_a_paired_token_is_refused_while_tui_signing_is_off() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = base_config(tmp.path());
+        config.gateway.require_pairing = true;
+        config.gateway.paired_tokens = vec!["zc_inproc_test_token".to_string()];
+        let ctx = ctx_for(config);
+        assert!(!ctx.tui_registry.signing_is_enabled());
+        let cancel = CancellationToken::new();
+        let connector = InprocConnector::new(cancel.clone());
+        connector.bind(ctx);
+
+        let stream = connector.connect().await.expect("bound connector connects");
+        let (read_half, mut writer) = tokio::io::split(stream);
+        let mut reader = BufReader::new(read_half);
+
+        let params = InitializeParams {
+            auth_token: Some("zc_inproc_test_token".to_string()),
+            ..initialize_params()
+        };
+        writer
+            .write_all(rpc_request(Method::Initialize, &params, 1).as_bytes())
+            .await
+            .unwrap();
+        let frame = read_frame(&mut reader).await;
+        assert_eq!(
+            frame["error"]["code"],
+            zeroclaw_api::jsonrpc::error_codes::AUTH_REQUIRED,
+            "the duplex must not bypass the remote identity fence: {frame}"
+        );
         cancel.cancel();
         drop(writer);
     }
@@ -567,7 +637,7 @@ mod tests {
                 permission_profiles: vec!["operator".into()],
             },
         );
-        let ctx = ctx_for(config);
+        let ctx = with_tui_signing(ctx_for(config), tmp.path());
         let cancel = CancellationToken::new();
         let connector = InprocConnector::new(cancel.clone());
         connector.bind(ctx);
