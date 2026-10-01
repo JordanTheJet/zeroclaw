@@ -762,8 +762,8 @@ mod against_a_core {
     /// The config reads answer through the separate gateway exactly what the
     /// in-process routes compute from the same configuration themselves,
     /// errors included. The model catalog lists a configured alias through
-    /// that alias's own endpoint, which the core resolves from the route's
-    /// `alias`.
+    /// that alias's own endpoint, which the core resolves from the dotted
+    /// `<family>.<alias>` reference the gateway sends.
     #[tokio::test]
     async fn the_config_reads_answer_as_the_in_process_gateway_computes_them() {
         use crate::api_config::{
@@ -919,6 +919,139 @@ mod against_a_core {
         assert_eq!(json_of(&body)["route"], "PATCH /api/config");
 
         core.stop().await;
+    }
+
+    /// A link to the core that drops every `config/catalog-models` param but
+    /// `model_provider`, as a core that knows no other catalog param does,
+    /// and counts the params it dropped.
+    struct ProviderParamOnly {
+        endpoint: PathBuf,
+        dropped: Arc<AtomicUsize>,
+    }
+
+    impl crate::core_rpc::Dial for ProviderParamOnly {
+        fn dial(&self) -> crate::core_rpc::DialFuture<'_> {
+            let endpoint = self.endpoint.clone();
+            let dropped = Arc::clone(&self.dropped);
+            Box::pin(async move {
+                use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+                let upstream = tokio::net::UnixStream::connect(endpoint).await.ok()?;
+                let (gateway_end, bridge) = tokio::io::duplex(64 * 1024);
+                let (from_gateway, mut to_gateway) = tokio::io::split(bridge);
+                let (mut from_core, mut to_core) = upstream.into_split();
+                zeroclaw_spawn::spawn!(async move {
+                    let forward = async move {
+                        let mut lines = BufReader::new(from_gateway).lines();
+                        while let Ok(Some(mut line)) = lines.next_line().await {
+                            if let Ok(mut frame) = serde_json::from_str::<serde_json::Value>(&line)
+                                && frame["method"] == "config/catalog-models"
+                                && let Some(params) = frame["params"].as_object_mut()
+                            {
+                                let sent = params.len();
+                                params.retain(|name, _| name == "model_provider");
+                                dropped.fetch_add(
+                                    sent - params.len(),
+                                    std::sync::atomic::Ordering::SeqCst,
+                                );
+                                line = frame.to_string();
+                            }
+                            line.push('\n');
+                            if to_core.write_all(line.as_bytes()).await.is_err() {
+                                break;
+                            }
+                        }
+                    };
+                    tokio::select! {
+                        () = forward => {}
+                        _ = tokio::io::copy(&mut from_core, &mut to_gateway) => {}
+                    }
+                });
+                Some(gateway_end)
+            })
+        }
+    }
+
+    /// A core that knows no catalog param but `model_provider` still lists
+    /// the alias the dashboard selected, and still refuses one that is not
+    /// configured, as the in-process route does: the gateway names the alias
+    /// in the dotted `<family>.<alias>` reference every core resolves, so it
+    /// sends nothing such a core would drop. The `custom` family has no public
+    /// catalog, so a lost alias could not reach the network either.
+    #[tokio::test]
+    async fn a_core_that_knows_only_the_provider_param_still_lists_the_selected_alias() {
+        use crate::api_sections::{ModelsQuery, handle_catalog_models};
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let listing = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "object": "list",
+                "data": [{ "id": "gpt-4o", "object": "model" }],
+            })))
+            .mount(&listing)
+            .await;
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = Core::context(tmp.path());
+        let configured: zeroclaw_config::schema::Config = toml::from_str(&format!(
+            "[providers.models.custom.work]\nuri = \"{}\"\napi_key = \"sk-preview-test\"\n",
+            listing.uri()
+        ))
+        .expect("a configured provider alias");
+        ctx.config.write().providers = configured.providers;
+        let state = State(crate::api::test_state(ctx.config.read().clone()));
+        let core = Core::serve(ctx).await;
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let preview = router(
+            CoreRpc::over_dialer(ProviderParamOnly {
+                endpoint: core.endpoint.clone(),
+                dropped: Arc::clone(&dropped),
+            }),
+            core.endpoint.clone(),
+            None,
+        );
+
+        let mut served = Vec::new();
+        for alias in ["work", "missing"] {
+            let query = Query(ModelsQuery {
+                model_provider: "custom".into(),
+                alias: Some(alias.into()),
+            });
+            let in_process =
+                handle_catalog_models(state.clone(), CoreAccess::InProcess, query).await;
+            let status = in_process.status();
+            let body = in_process.into_body().collect().await.unwrap().to_bytes();
+            let expected = (
+                status,
+                serde_json::from_slice::<serde_json::Value>(&body).expect("a JSON body"),
+            );
+            let path = format!("/api/config/catalog/models?model_provider=custom&alias={alias}");
+            let (status, body) = get(&preview, &path, Some(TOKEN)).await;
+            let answer = (status, json_of(&body));
+            assert_eq!(answer, expected, "{path}");
+            served.push(answer);
+        }
+        core.stop().await;
+
+        let [(listed, catalog), (refused, error)] = served.as_slice() else {
+            panic!("one answer per alias: {served:?}");
+        };
+        assert_eq!(*listed, StatusCode::OK, "{catalog}");
+        assert_eq!(catalog["model_provider"], "custom", "{catalog}");
+        assert_eq!(catalog["live"], true, "{catalog}");
+        assert!(
+            catalog["models"]
+                .as_array()
+                .is_some_and(|models| models.iter().any(|m| m == "gpt-4o")),
+            "{catalog}"
+        );
+        assert_eq!(*refused, StatusCode::BAD_REQUEST, "{error}");
+        assert_eq!(error["code"], "validation_failed", "{error}");
+        assert_eq!(
+            dropped.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the gateway sent a catalog param an older core drops"
+        );
     }
 
     #[tokio::test]

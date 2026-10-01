@@ -120,19 +120,26 @@ pub async fn handle_catalog_models(
     .into_response()
 }
 
-/// `GET /api/config/catalog/models` through the core, which lists through the
-/// selected alias's profile as this route does. A catalog the core cannot
-/// list is refused as invalid params, answered as the in-process route does.
+/// `GET /api/config/catalog/models` through the core. The selected alias
+/// travels as the dotted `<family>.<alias>` reference in `model_provider`,
+/// which every core resolves to that profile, so a core that predates any
+/// newer catalog parameter still lists the selected endpoint instead of the
+/// family's catalog. The answer names the bare family, as the in-process
+/// route's does. A catalog the core cannot list is refused as invalid
+/// params, answered as the in-process route does.
 pub(crate) async fn catalog_models_through_core(
     core: &CoreCall,
     q: &ModelsQuery,
 ) -> Result<Response, CoreError> {
-    let mut params = serde_json::json!({ "model_provider": q.model_provider });
-    if let Some(alias) = q.alias.as_deref() {
-        params["alias"] = serde_json::Value::from(alias);
-    }
-    match core.request(Method::ConfigCatalogModels, params).await {
-        Ok(catalog) => Ok(axum::Json(catalog).into_response()),
+    let params = serde_json::json!({ "model_provider": q.catalog_provider_ref() });
+    match core
+        .call::<CatalogModelsResult>(Method::ConfigCatalogModels, params)
+        .await
+    {
+        Ok(mut catalog) => {
+            catalog.model_provider = q.model_provider.clone();
+            Ok(axum::Json(catalog).into_response())
+        }
         Err(CoreError::Rpc(error)) if error.code == INVALID_PARAMS => Ok(error_response(
             ConfigApiError::new(ConfigApiCode::ValidationFailed, error.message),
         )),
