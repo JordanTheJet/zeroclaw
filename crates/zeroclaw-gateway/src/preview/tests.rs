@@ -120,6 +120,10 @@ const SERVED: &[&str] = &[
     "/api/cost",
     "/api/events/history",
     "/api/sessions",
+    "/api/status",
+    "/api/logs",
+    "/api/doctor",
+    "/api/events",
 ];
 
 /// Route paths the in-process gateway registers with a string literal, from
@@ -637,6 +641,23 @@ mod against_a_core {
             "/api/sessions" => handle_api_sessions_list(state, access, headers)
                 .await
                 .into_response(),
+            "/api/status" => crate::api::handle_api_status(
+                state,
+                headers,
+                Query(crate::api::StatusQuery::default()),
+                access,
+            )
+            .await
+            .into_response(),
+            "/api/logs" => {
+                crate::api_logs::handle_api_logs(
+                    state,
+                    headers,
+                    Query(std::collections::HashMap::new()),
+                    access,
+                )
+                .await
+            }
             other => panic!("no in-process handler for {other}"),
         };
         let body = response.into_body().collect().await.unwrap().to_bytes();
@@ -648,6 +669,9 @@ mod against_a_core {
     /// reaches the same core, and lists only terminals as terminals.
     #[tokio::test]
     async fn the_ported_routes_answer_as_the_in_process_gateway_does() {
+        // `/api/logs` reads the process-wide log writer: keep a test that
+        // installs one from changing it between the two reads.
+        let _writer = zeroclaw_log::__private_test_writer_lock();
         let tmp = tempfile::tempdir().unwrap();
         let mut ctx = Core::context(tmp.path());
         let config = ctx.config.read().clone();
@@ -688,6 +712,10 @@ mod against_a_core {
             .clone()
             .expect("the core names the terminal");
 
+        // `/api/doctor` runs the core's live checks, dozens of short
+        // processes: its body is compared once, in the core parity suite.
+        let (status, body) = get(&preview, "/api/doctor", None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
         for path in [
             "/api/health",
             "/api/tuis",
@@ -695,6 +723,8 @@ mod against_a_core {
             "/api/cost?agent=main",
             "/api/events/history",
             "/api/sessions",
+            "/api/status",
+            "/api/logs",
         ] {
             let (status, body) = get(&preview, path, None).await;
             assert_eq!(status, StatusCode::UNAUTHORIZED, "{path}: {body}");
@@ -707,6 +737,10 @@ mod against_a_core {
                 let mut body = json_of(body);
                 if let Some(health) = body.get_mut("health").and_then(|h| h.as_object_mut()) {
                     health.remove("updated_at");
+                }
+                // The status body also carries a resource sample.
+                if let Some(fields) = body.as_object_mut() {
+                    fields.remove("process");
                 }
                 body
             };

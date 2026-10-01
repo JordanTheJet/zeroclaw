@@ -17,6 +17,7 @@ use tokio_stream::wrappers::BroadcastStream;
 use zeroclaw_rpc_client::Method;
 
 use crate::core_rpc::{CoreAccess, CoreCall, CoreError};
+use zeroclaw_rpc_proto::types::LogsSubscribeResult;
 
 pub use zeroclaw_runtime::observability::broadcast::{BroadcastObserver, EventBuffer};
 use zeroclaw_runtime::observability::broadcast::{history_events, is_public_event};
@@ -132,6 +133,112 @@ pub(crate) async fn events_history_through_core(core: &CoreCall) -> Result<Respo
         .request(Method::EventsHistory, serde_json::json!({}))
         .await?;
     Ok(Json(history).into_response())
+}
+
+/// `GET /api/events` through the core: the caller's own `logs/subscribe`
+/// stream, narrowed to the frames this route carries (no session-scoped
+/// frames). The core refuses the stream to a scoped principal, and it never
+/// sends pairing credentials to a gateway's connection, so the QR payloads
+/// and pair codes the in-process stream gives its authenticated subscribers
+/// for headless channel login are not on this one.
+///
+/// The stream ends when the core connection does; the browser's
+/// `EventSource` then reconnects. Closing the stream cancels the
+/// subscription.
+pub(crate) async fn events_stream_through_core(core: CoreCall) -> Result<Response, CoreError> {
+    // Listen before subscribing, so the first frames are not missed.
+    let notifications = core.notifications();
+    let opened: LogsSubscribeResult = core
+        .call(Method::LogsSubscribe, serde_json::json!({}))
+        .await?;
+    let delivery = CoreStream {
+        notifications,
+        closed: Box::pin(core.closed()),
+        subscription: CoreSubscription {
+            id: opened.subscription_id,
+            core: Some(core),
+        },
+    };
+    let stream = futures_util::stream::unfold(delivery, |mut delivery| async move {
+        loop {
+            tokio::select! {
+                () = &mut delivery.closed => return None,
+                received = delivery.notifications.recv() => match received {
+                    Ok(note) => {
+                        if let Some(frame) = delivery.subscription.public_frame(note) {
+                            let event = Event::default().data(frame.to_string());
+                            return Some((Ok::<_, Infallible>(event), delivery));
+                        }
+                    }
+                    // Lagged frames are skipped, as the in-process stream skips them.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+                },
+            }
+        }
+    });
+    Ok(Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response())
+}
+
+struct CoreStream {
+    notifications: tokio::sync::broadcast::Receiver<zeroclaw_rpc_client::Notification>,
+    closed: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
+    subscription: CoreSubscription,
+}
+
+/// One `logs/subscribe` subscription, held open on the caller's connection
+/// for as long as its stream lives.
+struct CoreSubscription {
+    id: String,
+    core: Option<CoreCall>,
+}
+
+impl CoreSubscription {
+    /// The frame `note` carries for this subscription, as the in-process
+    /// stream would deliver it, or `None` when it is another subscription's,
+    /// not a log frame, or a frame this route does not carry.
+    fn public_frame(&self, note: zeroclaw_rpc_client::Notification) -> Option<serde_json::Value> {
+        if note.method != zeroclaw_rpc_proto::notification::LOGS_EVENT {
+            return None;
+        }
+        let mut frame = note.params;
+        let fields = frame.as_object_mut()?;
+        if fields
+            .get("subscription_id")
+            .and_then(serde_json::Value::as_str)
+            != Some(self.id.as_str())
+        {
+            return None;
+        }
+        // The core adds these two to each frame it delivers.
+        fields.remove("subscription_id");
+        fields.remove("seq");
+        is_public_sse_event(&frame).then_some(frame)
+    }
+}
+
+impl Drop for CoreSubscription {
+    fn drop(&mut self) {
+        let Some(core) = self.core.take() else {
+            return;
+        };
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+        let subscription_id = std::mem::take(&mut self.id);
+        zeroclaw_spawn::spawn!(async move {
+            // The connection may already be gone, which ends the
+            // subscription with it.
+            let _ = core
+                .request(
+                    Method::SubscriptionCancel,
+                    serde_json::json!({ "subscription_id": subscription_id }),
+                )
+                .await;
+        });
+    }
 }
 
 fn history_events_payload(buffer: &EventBuffer) -> serde_json::Value {

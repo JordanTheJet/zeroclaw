@@ -958,6 +958,17 @@
         ],
         "type": "object"
       },
+      "DoctorRunParams": {
+        "description": "`doctor/run` params. Optional; a core that predates them ignores them\nand runs the full suite.",
+        "properties": {
+          "static_only": {
+            "default": false,
+            "description": "Run only the configuration, workspace, daemon and environment\nchecks: no provider auth check and no live model probes.",
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      },
       "EventsHistoryResult": {
         "description": "`events/history`: recent observer frames, oldest first.",
         "properties": {
@@ -1597,6 +1608,13 @@
               "null"
             ]
           },
+          "field_eq": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Exact matches on attribution fields, by key (`agent_alias`,\n`channel`, `channel_alias`, ...); every pair must match. A key that\nis not an attribution field is refused.",
+            "type": "object"
+          },
           "hide_internal": {
             "default": false,
             "type": "boolean"
@@ -1623,6 +1641,11 @@
               "string",
               "null"
             ]
+          },
+          "report_disabled": {
+            "default": false,
+            "description": "With log persistence off, answer an empty page with\n`persistence_enabled: false` instead of refusing.",
+            "type": "boolean"
           },
           "severity_min": {
             "default": null,
@@ -1696,6 +1719,20 @@
           "at_end": {
             "type": "boolean"
           },
+          "attribution_keys": {
+            "description": "Every key `field_eq` accepts.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "daemon_started_at": {
+            "description": "RFC 3339 UTC time the daemon started, for \"since daemon start\".",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "events": {
             "items": true,
             "type": "array"
@@ -1744,6 +1781,11 @@
               "string",
               "null"
             ]
+          },
+          "persistence_enabled": {
+            "default": true,
+            "description": "Whether the daemon persists its log. `false` only on the empty page\na `report_disabled` query gets; a core that predates the field\nomits it, and refuses instead when persistence is off.",
+            "type": "boolean"
           }
         },
         "required": [
@@ -3898,6 +3940,126 @@
         },
         "type": "object"
       },
+      "StatusOverview": {
+        "description": "The dashboard's status overview, reported when `status` is asked for\nit. Every field describes the core's own process and configuration.",
+        "properties": {
+          "agent_alias": {
+            "description": "The agent the model fields were resolved for, as requested, or\n`None` for the install-wide view.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "allow_self_upgrade": {
+            "type": "boolean"
+          },
+          "channels": {
+            "additionalProperties": {
+              "type": "boolean"
+            },
+            "description": "Every configured channel instance, keyed `<type>.<alias>`.",
+            "type": "object"
+          },
+          "check_updates": {
+            "type": "boolean"
+          },
+          "daemon_started_at": {
+            "description": "RFC 3339 UTC time the daemon started.",
+            "type": "string"
+          },
+          "gateway_port": {
+            "description": "The configured gateway port.",
+            "format": "uint16",
+            "maximum": 65535,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "health": {
+            "description": "The component health snapshot, as the `health` method reports it\nwithout `process`."
+          },
+          "locale": {
+            "type": "string"
+          },
+          "memory_backend": {
+            "description": "The memory backend's name (`none` when memory is off).",
+            "type": "string"
+          },
+          "model": {
+            "description": "The resolved model; empty when none is configured.",
+            "type": "string"
+          },
+          "model_provider": {
+            "description": "Dotted `<type>.<alias>` of the resolved model provider, or `None`\nwhen none is configured.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "paired": {
+            "description": "Whether any client is paired.",
+            "type": "boolean"
+          },
+          "process": {
+            "description": "The core process's resource sample."
+          },
+          "restart_hint": {
+            "description": "The command or instruction to show for that restart.",
+            "type": "string"
+          },
+          "restart_mode": {
+            "description": "How the daemon restarts after an upgrade: `desktop_supervised`,\n`supervised`, `self_respawn` or `manual`.",
+            "type": "string"
+          },
+          "temperature": {
+            "description": "The resolved temperature, or `None` when none is configured.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "uptime_seconds": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "model",
+          "memory_backend",
+          "uptime_seconds",
+          "daemon_started_at",
+          "gateway_port",
+          "locale",
+          "paired",
+          "channels",
+          "health",
+          "process",
+          "check_updates",
+          "allow_self_upgrade",
+          "restart_mode",
+          "restart_hint"
+        ],
+        "type": "object"
+      },
+      "StatusParams": {
+        "description": "`status` params. Both are optional, and a core that predates them\nignores them and answers without an overview.",
+        "properties": {
+          "agent": {
+            "description": "Resolve the overview's model provider, model, temperature and\nmemory backend for this agent instead of the install-wide default.\nThe caller must be entitled to the agent.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "overview": {
+            "default": false,
+            "description": "Also report the dashboard overview, [`StatusResult::overview`].",
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      },
       "StatusResult": {
         "properties": {
           "active_sessions": {
@@ -3932,6 +4094,17 @@
               "string",
               "null"
             ]
+          },
+          "overview": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/StatusOverview"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Present when the params asked for it (`overview: true`)."
           },
           "protocol_version": {
             "format": "uint64",
@@ -4242,7 +4415,28 @@
     {
       "name": "status",
       "paramStructure": "by-name",
-      "params": [],
+      "params": [
+        {
+          "name": "agent",
+          "required": false,
+          "schema": {
+            "description": "Resolve the overview's model provider, model, temperature and\nmemory backend for this agent instead of the install-wide default.\nThe caller must be entitled to the agent.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "overview",
+          "required": false,
+          "schema": {
+            "default": false,
+            "description": "Also report the dashboard overview, [`StatusResult::overview`].",
+            "type": "boolean"
+          }
+        }
+      ],
       "result": {
         "name": "result",
         "schema": {
@@ -4256,7 +4450,8 @@
         "verb": "read"
       },
       "x-zeroclaw-params": {
-        "shape": "none"
+        "shape": "typed",
+        "type": "StatusParams"
       }
     },
     {
@@ -4282,7 +4477,17 @@
     {
       "name": "doctor/run",
       "paramStructure": "by-name",
-      "params": [],
+      "params": [
+        {
+          "name": "static_only",
+          "required": false,
+          "schema": {
+            "default": false,
+            "description": "Run only the configuration, workspace, daemon and environment\nchecks: no provider auth check and no live model probes.",
+            "type": "boolean"
+          }
+        }
+      ],
       "result": {
         "name": "result",
         "schema": {
@@ -4297,7 +4502,8 @@
         "verb": "execute"
       },
       "x-zeroclaw-params": {
-        "shape": "none"
+        "shape": "typed",
+        "type": "DoctorRunParams"
       }
     },
     {
@@ -6367,6 +6573,17 @@
           }
         },
         {
+          "name": "field_eq",
+          "required": false,
+          "schema": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Exact matches on attribution fields, by key (`agent_alias`,\n`channel`, `channel_alias`, ...); every pair must match. A key that\nis not an attribution field is refused.",
+            "type": "object"
+          }
+        },
+        {
           "name": "hide_internal",
           "required": false,
           "schema": {
@@ -6407,6 +6624,15 @@
               "string",
               "null"
             ]
+          }
+        },
+        {
+          "name": "report_disabled",
+          "required": false,
+          "schema": {
+            "default": false,
+            "description": "With log persistence off, answer an empty page with\n`persistence_enabled: false` instead of refusing.",
+            "type": "boolean"
           }
         },
         {

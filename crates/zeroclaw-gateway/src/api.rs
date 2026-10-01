@@ -11,11 +11,13 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use zeroclaw_api::jsonrpc::JsonRpcError;
-use zeroclaw_api::jsonrpc::error_codes::INTERNAL_ERROR;
+use zeroclaw_api::jsonrpc::error_codes::{INTERNAL_ERROR, METHOD_NOT_FOUND};
 use zeroclaw_config::schema::{ChannelAliasInfo, Config};
 use zeroclaw_memory::MemoryEntry;
 use zeroclaw_rpc_client::Method;
-use zeroclaw_rpc_proto::types::{CLIENT_KIND_GATEWAY, SessionEntry, SessionListResult};
+use zeroclaw_rpc_proto::types::{
+    CLIENT_KIND_GATEWAY, SessionEntry, SessionListResult, StatusResult,
+};
 
 use crate::core_rpc::{CoreCall, CoreError};
 
@@ -242,7 +244,7 @@ pub struct SessionMessagePostBody {
 
 // ── Handlers ────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct StatusNodes {
     pub connected: Vec<String>,
@@ -289,6 +291,7 @@ pub struct StatusResponse {
 /// reflect that specific agent's resolved config; omit it for the
 /// install-wide summary.
 #[derive(Debug, Deserialize)]
+#[cfg_attr(test, derive(Clone, Default))]
 pub struct StatusQuery {
     #[serde(default)]
     pub agent: Option<String>,
@@ -299,7 +302,13 @@ pub async fn handle_api_status(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<StatusQuery>,
+    access: CoreAccess,
 ) -> impl IntoResponse {
+    if let CoreAccess::Core(core) = access {
+        return api_status_through_core(&core, &query, status_nodes(&state))
+            .await
+            .unwrap_or_else(IntoResponse::into_response);
+    }
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
@@ -307,60 +316,19 @@ pub async fn handle_api_status(
     let config = state.config.read().clone();
     let health = zeroclaw_runtime::health::snapshot();
 
-    // Per-alias map keyed by composite `<type>.<alias>`. Every
-    // populated `[channels.<type>.<alias>]` is a separate dashboard row.
-    let mut channels = BTreeMap::new();
-    for info in config.channels_by_alias() {
-        let composite = format!("{}.{}", info.channel_type, info.alias);
-        channels.insert(composite, true);
-    }
-
-    let locale = config
-        .locale
-        .as_deref()
-        .filter(|s| !s.is_empty())
-        .map(String::from)
-        .unwrap_or_else(zeroclaw_runtime::i18n::detect_locale);
-
     // Per-agent resolution when `?agent=<alias>` is supplied. Falls back
     // to the install-wide first-of-each view when the alias is unknown
     // (so the dashboard's old shape still renders during onboarding,
     // before any agent exists).
     let agent_alias = query.agent.as_deref().filter(|s| !s.trim().is_empty());
-    let (model_provider, model, temperature, memory_backend) =
-        match agent_alias.and_then(|alias| config.agent(alias).map(|a| (alias, a))) {
-            Some((alias, agent)) => {
-                let provider_ref = if agent.model_provider.is_empty() {
-                    None
-                } else {
-                    Some(agent.model_provider.as_str().to_string())
-                };
-                let resolved = config.resolved_model_provider_for_agent(alias);
-                let model = resolved
-                    .as_ref()
-                    .and_then(|(_, _, cfg)| cfg.model.clone())
-                    .unwrap_or_default();
-                let temperature: Option<f64> =
-                    resolved.as_ref().and_then(|(_, _, cfg)| cfg.temperature);
-                let backend_kind = agent.memory.backend;
-                let backend = serde_json::to_value(backend_kind)
-                    .ok()
-                    .and_then(|v| v.as_str().map(String::from))
-                    .unwrap_or_else(|| format!("{backend_kind:?}").to_lowercase());
-                (provider_ref, model, temperature, backend)
-            }
-            None => (
-                config
-                    .providers
-                    .models
-                    .iter_entries()
-                    .next()
-                    .map(|(ty, alias, _)| format!("{ty}.{alias}")),
-                state.model.clone(),
-                state.temperature,
-                state.mem.name().to_string(),
-            ),
-        };
+    let view = agent_alias
+        .and_then(|alias| zeroclaw_runtime::status::agent_model_view(&config, alias))
+        .unwrap_or_else(|| zeroclaw_runtime::status::ModelView {
+            model_provider: zeroclaw_runtime::status::install_wide_model_provider(&config),
+            model: state.model.clone(),
+            temperature: state.temperature,
+            memory_backend: state.mem.name().to_string(),
+        });
 
     let process = zeroclaw_runtime::process_stats::sample();
 
@@ -370,20 +338,17 @@ pub async fn handle_api_status(
 
     let body = StatusResponse {
         version: env!("CARGO_PKG_VERSION").to_string(),
-        model_provider,
-        model,
-        temperature,
+        model_provider: view.model_provider,
+        model: view.model,
+        temperature: view.temperature,
         uptime_seconds: health.uptime_seconds,
         daemon_started_at: zeroclaw_runtime::health::daemon_started_at(),
         gateway_port: config.gateway.port,
-        locale,
-        memory_backend,
+        locale: zeroclaw_runtime::status::locale(&config),
+        memory_backend: view.memory_backend,
         paired: state.pairing.is_paired(),
-        channels,
-        nodes: StatusNodes {
-            connected: state.node_registry.node_ids(),
-            mdns_peers: state.mdns_peer_registry.snapshots(),
-        },
+        channels: zeroclaw_runtime::status::channel_rows(&config),
+        nodes: status_nodes(&state),
         health,
         agent_alias: agent_alias.map(String::from),
         process,
@@ -394,6 +359,75 @@ pub async fn handle_api_status(
     };
 
     Json(body).into_response()
+}
+
+/// The nodes this gateway itself serves; nodes connect to a gateway, not to
+/// the core.
+fn status_nodes(state: &AppState) -> StatusNodes {
+    StatusNodes {
+        connected: state.node_registry.node_ids(),
+        mdns_peers: state.mdns_peer_registry.snapshots(),
+    }
+}
+
+/// `GET /api/status` through the core, the body every router serves for it.
+/// The core reports its own process, health and configuration; `nodes` are
+/// the serving gateway's own.
+pub(crate) async fn api_status_through_core(
+    core: &CoreCall,
+    query: &StatusQuery,
+    nodes: StatusNodes,
+) -> Result<Response, CoreError> {
+    let mut params = serde_json::json!({ "overview": true });
+    if let Some(agent) = query.agent.as_deref().filter(|s| !s.trim().is_empty()) {
+        params["agent"] = agent.into();
+    }
+    let status: StatusResult = core.call(Method::Status, params).await?;
+    let Some(overview) = status.overview else {
+        return Err(CoreError::Rpc(JsonRpcError {
+            code: METHOD_NOT_FOUND,
+            message: "the core does not report the dashboard status overview; run a core \
+                      of this gateway's version"
+                .into(),
+            data: None,
+        }));
+    };
+    let undecodable = |what: &str, error: serde_json::Error| {
+        CoreError::Rpc(JsonRpcError {
+            code: INTERNAL_ERROR,
+            message: format!("undecodable status {what}: {error}"),
+            data: None,
+        })
+    };
+    let health = serde_json::from_value(overview.health).map_err(|e| undecodable("health", e))?;
+    let process =
+        serde_json::from_value(overview.process).map_err(|e| undecodable("process", e))?;
+    // A restart mode this gateway does not know is shown as manual: the
+    // dashboard then offers no automatic restart.
+    let restart_mode = serde_json::from_value(serde_json::Value::String(overview.restart_mode))
+        .unwrap_or(crate::version::RestartMode::Manual);
+    Ok(Json(StatusResponse {
+        version: status.server_version,
+        model_provider: overview.model_provider,
+        model: overview.model,
+        temperature: overview.temperature,
+        uptime_seconds: overview.uptime_seconds,
+        daemon_started_at: overview.daemon_started_at,
+        gateway_port: overview.gateway_port,
+        locale: overview.locale,
+        memory_backend: overview.memory_backend,
+        paired: overview.paired,
+        channels: overview.channels,
+        nodes,
+        health,
+        agent_alias: overview.agent_alias,
+        process,
+        check_updates: overview.check_updates,
+        allow_self_upgrade: overview.allow_self_upgrade,
+        restart_mode,
+        restart_hint: overview.restart_hint,
+    })
+    .into_response())
 }
 
 #[derive(Debug, Deserialize)]
@@ -975,7 +1009,13 @@ pub async fn handle_api_integrations_settings(
 pub async fn handle_api_doctor(
     State(state): State<AppState>,
     headers: HeaderMap,
+    access: CoreAccess,
 ) -> impl IntoResponse {
+    if let CoreAccess::Core(core) = access {
+        return api_doctor_through_core(&core)
+            .await
+            .unwrap_or_else(IntoResponse::into_response);
+    }
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
@@ -1005,6 +1045,23 @@ pub async fn handle_api_doctor(
         }
     }))
     .into_response()
+}
+
+/// `GET`/`POST /api/doctor` through the core, the body every router serves
+/// for it: the core's static checks, without the live provider probes the
+/// full `doctor/run` suite adds.
+pub(crate) async fn api_doctor_through_core(core: &CoreCall) -> Result<Response, CoreError> {
+    let run = core
+        .request(
+            Method::DoctorRun,
+            serde_json::json!({ "static_only": true }),
+        )
+        .await?;
+    Ok(Json(serde_json::json!({
+        "results": run["results"],
+        "summary": run["summary"],
+    }))
+    .into_response())
 }
 
 async fn resolve_memory_handle(
@@ -2693,6 +2750,7 @@ pub(crate) mod tests {
             State(state),
             HeaderMap::new(),
             Query(StatusQuery { agent: None }),
+            CoreAccess::InProcess,
         )
         .await
         .into_response();
@@ -2724,6 +2782,7 @@ pub(crate) mod tests {
             State(state),
             HeaderMap::new(),
             Query(StatusQuery { agent: None }),
+            CoreAccess::InProcess,
         )
         .await
         .into_response();

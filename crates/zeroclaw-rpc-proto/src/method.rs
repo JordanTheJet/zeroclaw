@@ -296,9 +296,9 @@ impl Method {
         let (params, result) = match self {
             // Core
             M::Initialize => (Typed("InitializeParams"), Typed("InitializeResult")),
-            M::Status => (None, Typed("StatusResult")),
+            M::Status => (Typed("StatusParams"), Typed("StatusResult")),
             M::Health => (None, Untyped),
-            M::DoctorRun => (None, Typed("DoctorRunResult")),
+            M::DoctorRun => (Typed("DoctorRunParams"), Typed("DoctorRunResult")),
 
             // Sessions
             M::SessionNew => (Typed("SessionNewParams"), Typed("SessionNewResult")),

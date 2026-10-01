@@ -43,6 +43,13 @@ impl Drop for Harness {
 
 impl Harness {
     fn new(cost_tracker: Option<Arc<CostTracker>>) -> Self {
+        Self::configured(cost_tracker, |_| {})
+    }
+
+    fn configured(
+        cost_tracker: Option<Arc<CostTracker>>,
+        configure: impl FnOnce(&mut zeroclaw_config::schema::Config),
+    ) -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut config = zeroclaw_config::schema::Config {
             data_dir: dir.path().to_path_buf(),
@@ -51,6 +58,7 @@ impl Harness {
         };
         config.gateway.require_pairing = true;
         config.gateway.paired_tokens = vec![TOKEN.into()];
+        configure(&mut config);
         let sessions = Arc::new(zeroclaw_runtime::rpc::session::SessionStore::new(
             16,
             Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
@@ -58,17 +66,24 @@ impl Harness {
             )),
         ));
         let history = Arc::new(EventBuffer::new(16));
+        let mut state = crate::api::test_state(config.clone());
+        // As under the daemon: the gateway's install-wide model is the
+        // daemon's seed entry, and both read one memory backend and one bus.
+        let (model, temperature) = zeroclaw_runtime::status::install_wide_model(&config);
+        state.model = model;
+        state.temperature = temperature;
         let mut ctx = RpcContext::for_live_test(config.clone(), sessions);
         {
             let ctx = Arc::get_mut(&mut ctx).expect("a fresh context is unshared");
             ctx.cost_tracker = cost_tracker.clone();
             ctx.event_history = Some(Arc::clone(&history));
+            ctx.memory = Some(Arc::clone(&state.mem));
+            ctx.event_tx = Some(state.event_tx.clone());
         }
         let cancel = tokio_util::sync::CancellationToken::new();
         let connector = InprocConnector::new(cancel.clone());
         connector.bind(Arc::clone(&ctx));
 
-        let mut state = crate::api::test_state(config);
         state.pairing = Arc::clone(ctx.auth.pairing());
         state.cost_tracker = cost_tracker;
         state.event_buffer = history;
@@ -441,4 +456,361 @@ async fn api_cost_with_tracking_disabled_matches_the_in_process_body() {
     .await;
     let body = assert_same(in_process, core);
     assert_eq!(body["cost"]["request_count"], 0);
+}
+
+// ── Status, doctor, logs and the event stream ────────────────────
+
+/// A provider entry with a model and temperature, and an agent on it.
+fn with_a_provider_and_an_agent(config: &mut zeroclaw_config::schema::Config) {
+    let entry = config
+        .providers
+        .models
+        .ensure("openai", "parity")
+        .expect("`openai` slot must exist");
+    entry.model = Some("parity-model".into());
+    entry.temperature = Some(0.4);
+    config.agents.insert(
+        "parity-agent".into(),
+        zeroclaw_config::schema::AliasedAgentConfig {
+            enabled: true,
+            model_provider: "openai.parity".into(),
+            ..Default::default()
+        },
+    );
+}
+
+/// The status body without what moves between two reads of one process:
+/// the resource sample and the snapshot's own timestamp.
+fn steady_status((status, mut body): (StatusCode, Value)) -> (StatusCode, Value) {
+    if let Some(fields) = body.as_object_mut() {
+        fields.remove("process");
+        if let Some(health) = fields.get_mut("health").and_then(Value::as_object_mut) {
+            health.remove("updated_at");
+        }
+    }
+    (status, body)
+}
+
+#[tokio::test]
+async fn api_status_through_the_core_matches_the_in_process_body() {
+    // The second configuration names a runtime shell the core cannot
+    // describe; the route has always answered regardless.
+    for broken_runtime in [false, true] {
+        let harness = Harness::configured(None, |config| {
+            with_a_provider_and_an_agent(config);
+            if broken_runtime {
+                config.runtime.shell = Some("   ".into());
+            }
+        });
+        status_parity(&harness).await;
+    }
+}
+
+async fn status_parity(harness: &Harness) {
+    for agent in [None, Some("parity-agent"), Some("no-such-agent"), Some(" ")] {
+        let query = || crate::api::StatusQuery {
+            agent: agent.map(String::from),
+        };
+        // Uptime and the process-wide component table can move between the
+        // reads: compare against an in-process body that held still.
+        for attempt in 0.. {
+            let read_in_process = || async {
+                steady_status(
+                    body_of(
+                        crate::api::handle_api_status(
+                            State(harness.state.clone()),
+                            Harness::headers(),
+                            Query(query()),
+                            CoreAccess::InProcess,
+                        )
+                        .await
+                        .into_response(),
+                    )
+                    .await,
+                )
+            };
+            let before = read_in_process().await;
+            let core = steady_status(
+                body_of(
+                    crate::api::handle_api_status(
+                        State(harness.state.clone()),
+                        Harness::headers(),
+                        Query(query()),
+                        harness.through_core().await,
+                    )
+                    .await
+                    .into_response(),
+                )
+                .await,
+            );
+            let after = read_in_process().await;
+            if before != after {
+                assert!(attempt < 20, "the status snapshot never held still");
+                continue;
+            }
+            let body = assert_same(before, core);
+            match agent {
+                Some("parity-agent") => {
+                    assert_eq!(body["model"], "parity-model");
+                    assert_eq!(body["model_provider"], "openai.parity");
+                }
+                _ => {
+                    assert_eq!(body["model"], "parity-model");
+                    assert_eq!(body["temperature"], 0.4);
+                }
+            }
+            break;
+        }
+    }
+}
+
+/// The doctor body without the one figure that moves between two runs: the
+/// free disk space other processes are writing to.
+fn steady_doctor((status, mut body): (StatusCode, Value)) -> (StatusCode, Value) {
+    for result in body["results"].as_array_mut().into_iter().flatten() {
+        if result["message"]
+            .as_str()
+            .is_some_and(|m| m.starts_with("disk space: "))
+        {
+            result["message"] = json!("disk space: <free> MB available");
+        }
+    }
+    (status, body)
+}
+
+#[tokio::test]
+async fn api_doctor_through_the_core_matches_the_in_process_body() {
+    let harness = Harness::configured(None, with_a_provider_and_an_agent);
+    let in_process = steady_doctor(
+        body_of(
+            crate::api::handle_api_doctor(
+                State(harness.state.clone()),
+                Harness::headers(),
+                CoreAccess::InProcess,
+            )
+            .await
+            .into_response(),
+        )
+        .await,
+    );
+    let core = steady_doctor(
+        body_of(
+            crate::api::handle_api_doctor(
+                State(harness.state.clone()),
+                Harness::headers(),
+                harness.through_core().await,
+            )
+            .await
+            .into_response(),
+        )
+        .await,
+    );
+    let body = assert_same(in_process, core);
+    assert!(
+        body["results"].as_array().is_some_and(|r| !r.is_empty()),
+        "{body}"
+    );
+}
+
+async fn logs_body(
+    harness: &Harness,
+    query: &[(&str, &str)],
+    through_core: bool,
+) -> (StatusCode, Value) {
+    let params: HashMap<String, String> = query
+        .iter()
+        .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+        .collect();
+    let access = if through_core {
+        harness.through_core().await
+    } else {
+        CoreAccess::InProcess
+    };
+    body_of(
+        crate::api_logs::handle_api_logs(
+            State(harness.state.clone()),
+            Harness::headers(),
+            Query(params),
+            access,
+        )
+        .await,
+    )
+    .await
+}
+
+fn install_log_writer(dir: &std::path::Path, persistence: &str) {
+    zeroclaw_log::init_from_config(
+        &zeroclaw_log::LogConfig {
+            log_persistence: persistence.into(),
+            log_persistence_path: "state/runtime-trace.jsonl".into(),
+            ..Default::default()
+        },
+        dir,
+    );
+}
+
+#[tokio::test]
+async fn api_logs_through_the_core_matches_the_in_process_body() {
+    let _writer = zeroclaw_log::__private_test_writer_lock();
+    let harness = Harness::new(None);
+    let logs = tempfile::tempdir().expect("tempdir");
+
+    // Persistence off: both answer the empty page that says so.
+    install_log_writer(logs.path(), "none");
+    let in_process = logs_body(&harness, &[], false).await;
+    let body = assert_same(in_process, logs_body(&harness, &[], true).await);
+    assert_eq!(body["persistence_enabled"], false, "{body}");
+
+    // Persistence on, with events other tests in this process may add to:
+    // every query below is narrowed to this test's own marker.
+    install_log_writer(logs.path(), "rolling");
+    let marker = uuid::Uuid::new_v4().to_string();
+    for (agent, channel) in [
+        ("alpha", "telegram.ops"),
+        ("beta", "telegram.ops"),
+        ("alpha", "discord.dev"),
+    ] {
+        let mut event = zeroclaw_log::LogEvent::new(
+            zeroclaw_log::Severity::Info,
+            "note",
+            zeroclaw_log::EventCategory::Agent,
+        );
+        event.message = Some(marker.clone());
+        // The logging layer writes a composite field with its decomposed
+        // keys; a raw event carries them only when set here.
+        let (channel_type, channel_alias) = channel.split_once('.').expect("<type>.<alias>");
+        for (key, value) in [
+            ("agent_alias", agent),
+            ("channel", channel),
+            ("channel_type", channel_type),
+            ("channel_alias", channel_alias),
+        ] {
+            event.zeroclaw.fields.insert(key.into(), value.into());
+        }
+        zeroclaw_log::record_event(event);
+    }
+    zeroclaw_log::flush_for_test().expect("flush");
+
+    for (query, expected) in [
+        (vec![("q", marker.as_str())], Some(3)),
+        (
+            vec![("q", marker.as_str()), ("agent_alias", "alpha")],
+            Some(2),
+        ),
+        (
+            vec![
+                ("q", marker.as_str()),
+                ("agent_alias", "alpha"),
+                ("channel", "telegram.ops"),
+            ],
+            Some(1),
+        ),
+        (
+            vec![("q", marker.as_str()), ("channel_alias", "dev")],
+            Some(1),
+        ),
+        (vec![("q", marker.as_str()), ("limit", "1")], Some(1)),
+        (
+            vec![("q", marker.as_str()), ("limit", "not-a-number")],
+            Some(3),
+        ),
+        (vec![("q", marker.as_str()), ("agent_alias", "")], Some(3)),
+        (vec![("q", marker.as_str()), ("no_such_field", "x")], None),
+        (vec![("until_segment_cursor", "garbage")], None),
+    ] {
+        let in_process = logs_body(&harness, &query, false).await;
+        let core = logs_body(&harness, &query, true).await;
+        assert_eq!(core, in_process, "{query:?}");
+        match expected {
+            Some(count) => {
+                assert_eq!(in_process.0, StatusCode::OK, "{query:?}: {}", in_process.1);
+                assert_eq!(
+                    in_process.1["events"].as_array().map(Vec::len),
+                    Some(count),
+                    "{query:?}: {}",
+                    in_process.1
+                );
+                assert_eq!(in_process.1["persistence_enabled"], true);
+            }
+            None => assert_eq!(in_process.0, StatusCode::BAD_REQUEST, "{query:?}"),
+        }
+    }
+
+    install_log_writer(logs.path(), "none");
+}
+
+/// Read `count` events from an SSE body, or what arrived before `wait`.
+async fn sse_events(response: Response, count: usize) -> Vec<Value> {
+    let mut body = response.into_body();
+    let mut text = String::new();
+    let mut events = Vec::new();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while events.len() < count {
+        let Ok(Some(Ok(frame))) = tokio::time::timeout_at(deadline, body.frame()).await else {
+            break;
+        };
+        if let Ok(data) = frame.into_data() {
+            text.push_str(&String::from_utf8_lossy(&data));
+        }
+        while let Some(end) = text.find("\n\n") {
+            let block: String = text.drain(..end + 2).collect();
+            for line in block.lines() {
+                if let Some(data) = line.strip_prefix("data: ") {
+                    events.push(serde_json::from_str(data).expect("an SSE data line is JSON"));
+                }
+            }
+        }
+    }
+    events
+}
+
+#[tokio::test]
+async fn the_event_stream_through_the_core_carries_the_in_process_frames_but_no_credentials() {
+    let harness = Harness::new(None);
+    let in_process =
+        crate::sse::handle_sse_events(State(harness.state.clone()), Harness::headers())
+            .await
+            .into_response();
+    let CoreAccess::Core(call) = harness.through_core().await else {
+        unreachable!("through_core answers Core");
+    };
+    let core = crate::sse::events_stream_through_core(call)
+        .await
+        .expect("the core opens the stream");
+
+    let frames = [
+        json!({"type": "agent_start", "source": "observability", "provider": "test"}),
+        json!({"type": "message", "session_id": "s-1", "content": "private"}),
+        json!({"type": "channel_login", "channel": "whatsapp.ops", "status": "waiting"}),
+        {
+            let mut frame = json!({
+                "type": "channel_login",
+                "channel": "whatsapp.ops",
+                "qr": "pairing-secret",
+            });
+            frame[zeroclaw_log::EPHEMERAL_BROADCAST_MARKER] = json!(true);
+            frame
+        },
+        json!({"type": "tool_call", "source": "observability", "tool": "shell"}),
+    ];
+    for frame in &frames {
+        harness
+            .state
+            .event_tx
+            .send(frame.clone())
+            .expect("subscribers");
+    }
+
+    let from_process = sse_events(in_process, 4).await;
+    let from_core = sse_events(core, 3).await;
+    // The in-process stream: every public frame, and the pairing frame for
+    // its authenticated subscriber, marker stripped.
+    assert_eq!(from_process.len(), 4, "{from_process:?}");
+    assert!(from_process.iter().any(|f| f["qr"] == "pairing-secret"));
+    let without_credentials: Vec<Value> = from_process
+        .into_iter()
+        .filter(|f| f.get("qr").is_none())
+        .collect();
+    assert_eq!(from_core, without_credentials);
+    assert!(from_core.iter().all(|f| f.get("session_id").is_none()));
 }

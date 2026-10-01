@@ -35,7 +35,8 @@ macro_rules! catalog {
 
 catalog! {
     // Core
-    InitializeParams, CommandDescriptor, InitializeResult, StatusResult, DoctorSummary,
+    InitializeParams, CommandDescriptor, InitializeResult, StatusParams, StatusOverview,
+    StatusResult, DoctorRunParams, DoctorSummary,
     // TUI
     TuiListEntry, TuiListResult,
     // Sessions

@@ -321,10 +321,6 @@ const REFUSED: &[(&str, &str, Refusal)] = &[
     ("/hooks/claude-code", "POST", Refusal::Deferred("hooks")),
     ("/metrics", "GET", Refusal::Deferred("metrics")),
     // Dashboard routes not yet served through the core.
-    ("/api/status", "GET", Refusal::NotPorted),
-    ("/api/logs", "GET", Refusal::NotPorted),
-    ("/api/doctor", "GET,POST", Refusal::NotPorted),
-    ("/api/events", "GET", Refusal::NotPorted),
     ("/api/version/check", "GET", Refusal::NotPorted),
     ("/api/version/upgrade", "POST", Refusal::NotPorted),
     ("/api/version/upgrade/status", "GET", Refusal::NotPorted),
@@ -542,7 +538,11 @@ pub fn router(core: CoreRpc, endpoint: PathBuf, web_dist: Option<PathBuf>) -> Ro
         .route("/api/tuis", get(api_tuis))
         .route("/api/cost", get(api_cost))
         .route("/api/events/history", get(api_events_history))
-        .route("/api/sessions", get(api_sessions_list));
+        .route("/api/sessions", get(api_sessions_list))
+        .route("/api/status", get(api_status))
+        .route("/api/logs", get(api_logs))
+        .route("/api/doctor", get(api_doctor).post(api_doctor))
+        .route("/api/events", get(api_events));
     for &(path, methods, refusal) in REFUSED {
         let handler: MethodRouter<PreviewState> = on(
             method_filter(methods),
@@ -807,6 +807,41 @@ async fn api_sessions_list(access: Result<CoreAccess, CoreError>) -> Response {
         crate::api::api_sessions_list_through_core(&call).await
     })
     .await
+}
+
+/// `GET /api/status`. This gateway serves no nodes.
+async fn api_status(
+    Query(query): Query<crate::api::StatusQuery>,
+    access: Result<CoreAccess, CoreError>,
+) -> Response {
+    served(access, |call| async move {
+        crate::api::api_status_through_core(&call, &query, crate::api::StatusNodes::default()).await
+    })
+    .await
+}
+
+/// `GET /api/logs`
+async fn api_logs(
+    Query(params): Query<std::collections::HashMap<String, String>>,
+    access: Result<CoreAccess, CoreError>,
+) -> Response {
+    served(access, |call| async move {
+        crate::api_logs::api_logs_through_core(&call, &params).await
+    })
+    .await
+}
+
+/// `GET`/`POST /api/doctor`
+async fn api_doctor(access: Result<CoreAccess, CoreError>) -> Response {
+    served(access, |call| async move {
+        crate::api::api_doctor_through_core(&call).await
+    })
+    .await
+}
+
+/// `GET /api/events`
+async fn api_events(access: Result<CoreAccess, CoreError>) -> Response {
+    served(access, crate::sse::events_stream_through_core).await
 }
 
 /// `GET /api/gateway/core`: which principal the caller's credential binds

@@ -2677,10 +2677,10 @@ impl RpcDispatcher {
         let result = match method {
             // Core
             Method::Initialize => self.handle_initialize(&req.params).await,
-            Method::Status => self.handle_status().await,
+            Method::Status => self.handle_status(&req.params).await,
             Method::Health => self.handle_health(),
             // Heap-pinned for the same reason as `ConfigSet` below.
-            Method::DoctorRun => Box::pin(self.handle_doctor_run()).await,
+            Method::DoctorRun => Box::pin(self.handle_doctor_run(&req.params)).await,
 
             // Sessions
             Method::SessionNew => Box::pin(self.handle_session_new(&req.params)).await,
@@ -3194,13 +3194,30 @@ impl RpcDispatcher {
         Ok(response)
     }
 
-    async fn handle_status(&self) -> RpcResult {
+    async fn handle_status(&self, params: &Value) -> RpcResult {
+        let req: StatusParams = if params.is_null() {
+            StatusParams::default()
+        } else {
+            parse_params(params)?
+        };
+        let agent = req
+            .agent
+            .as_deref()
+            .filter(|alias| !alias.trim().is_empty());
         let ids = self.ctx.sessions.list_ids().await;
         let config_path = self.ctx.config.read().config_path.clone();
         let config_kind = zeroclaw_config::schema::classify_runtime_config_kind(&config_path).await;
         let runtime_context = {
             let config = self.ctx.config.read();
-            status_runtime_context(&config, config_kind)?
+            status_runtime_context(&config, config_kind)
+        };
+        // The dashboard's overview does not depend on a runtime the core can
+        // describe: when it cannot, the overview still answers and the runtime
+        // fields are left out, as the dashboard route has always answered.
+        let runtime_context = match runtime_context {
+            Ok(context) => Some(context),
+            Err(_) if req.overview => None,
+            Err(error) => return Err(error),
         };
         // Count persisted sessions (channel-originated) that aren't already
         // in the in-memory RPC store.
@@ -3211,17 +3228,82 @@ impl RpcDispatcher {
             .map(|b| b.list_sessions_with_metadata().len())
             .unwrap_or(0);
         let total = ids.len().max(persisted_count);
+        // Checked here, after every await above, so the answer reflects the
+        // caller's entitlement at the moment the agent's details are read.
+        let overview = if req.overview {
+            if let Some(alias) = agent {
+                self.selector_agent(Method::Status, alias)?;
+            }
+            Some(self.status_overview(agent))
+        } else {
+            None
+        };
+        let (config_dir, config_file, config_kind, local_ipc_endpoint, shell_profile) =
+            match runtime_context {
+                Some(context) => (
+                    Some(context.config_dir),
+                    Some(context.config_file),
+                    Some(context.config_kind),
+                    Some(context.local_ipc_endpoint),
+                    context.shell_profile,
+                ),
+                None => (None, None, None, None, None),
+            };
         to_result(StatusResult {
             server_version: env!("CARGO_PKG_VERSION").to_string(),
             protocol_version: RPC_PROTOCOL_VERSION,
             active_sessions: total,
             session_ids: ids,
-            config_dir: Some(runtime_context.config_dir),
-            config_file: Some(runtime_context.config_file),
-            config_kind: Some(runtime_context.config_kind),
-            local_ipc_endpoint: Some(runtime_context.local_ipc_endpoint),
-            shell_profile: runtime_context.shell_profile,
+            config_dir,
+            config_file,
+            config_kind,
+            local_ipc_endpoint,
+            shell_profile,
+            overview,
         })
+    }
+
+    /// The dashboard's status overview: the core's own process, health and
+    /// configuration, with the model fields resolved for `agent` when it
+    /// names a configured agent and install-wide otherwise.
+    fn status_overview(&self, agent: Option<&str>) -> StatusOverview {
+        let config = self.ctx.config.read().clone();
+        let health = crate::health::snapshot();
+        let view = agent
+            .and_then(|alias| crate::status::agent_model_view(&config, alias))
+            .unwrap_or_else(|| {
+                let (model, temperature) = crate::status::install_wide_model(&config);
+                crate::status::ModelView {
+                    model_provider: crate::status::install_wide_model_provider(&config),
+                    model,
+                    temperature,
+                    memory_backend: self
+                        .ctx
+                        .memory
+                        .as_ref()
+                        .map_or_else(|| "none".to_string(), |memory| memory.name().to_string()),
+                }
+            });
+        let restart = crate::restart::detect_restart();
+        StatusOverview {
+            agent_alias: agent.map(String::from),
+            model_provider: view.model_provider,
+            model: view.model,
+            temperature: view.temperature,
+            memory_backend: view.memory_backend,
+            uptime_seconds: health.uptime_seconds,
+            daemon_started_at: crate::health::daemon_started_at(),
+            gateway_port: config.gateway.port,
+            locale: crate::status::locale(&config),
+            paired: self.ctx.auth.pairing().is_paired(),
+            channels: crate::status::channel_rows(&config),
+            health: serde_json::to_value(&health).unwrap_or_default(),
+            process: serde_json::to_value(crate::process_stats::sample()).unwrap_or_default(),
+            check_updates: config.gateway.check_updates,
+            allow_self_upgrade: config.gateway.allow_self_upgrade,
+            restart_mode: restart.mode.as_str().to_string(),
+            restart_hint: restart.hint,
+        }
     }
 
     fn handle_health(&self) -> RpcResult {
@@ -3236,8 +3318,22 @@ impl RpcDispatcher {
         Ok(val)
     }
 
-    async fn handle_doctor_run(&self) -> RpcResult {
+    async fn handle_doctor_run(&self, params: &Value) -> RpcResult {
+        let req: DoctorRunParams = if params.is_null() {
+            DoctorRunParams::default()
+        } else {
+            parse_params(params)?
+        };
         let config = self.ctx.config.read().clone();
+        if req.static_only {
+            let results = crate::doctor::diagnose(&config);
+            return to_result(DoctorRunResult {
+                summary: doctor_summary(&results),
+                results,
+                log_path: zeroclaw_log::active_log_path().map(|p| p.to_string_lossy().to_string()),
+                timed_out_phase: None,
+            });
+        }
         self.run_doctor(Box::pin(crate::doctor::probe_models(&config)))
             .await
     }
@@ -9169,15 +9265,41 @@ impl RpcDispatcher {
     #[allow(deprecated)] // we still forward the legacy cursor for backwards compat
     async fn handle_logs_query(&self, params: &Value) -> RpcResult {
         let p: LogsQueryParams = parse_params(params)?;
+        if let Some(key) = p
+            .field_eq
+            .keys()
+            .find(|key| !zeroclaw_log::is_attribution_field(key))
+        {
+            return Err(rpc_err(
+                INVALID_PARAMS,
+                format!("field_eq: {key} is not an attribution field"),
+            ));
+        }
 
         let Some((active, reads_archives)) = zeroclaw_log::active_log_query_scope() else {
+            if p.report_disabled {
+                return to_result(LogsQueryResult {
+                    events: Vec::new(),
+                    log_path: None,
+                    next_cursor: None,
+                    next_cursor_line_offset: None,
+                    next_segment_cursor: None,
+                    at_end: true,
+                    incomplete: false,
+                    persistence_enabled: false,
+                    daemon_started_at: Some(crate::health::daemon_started_at()),
+                    attribution_keys: zeroclaw_log::attribution_keys(),
+                });
+            }
             return Err(rpc_err(INTERNAL_ERROR, "Log persistence is not enabled"));
         };
 
-        let field_eq = p
-            .sop_run_id
-            .map(|run_id| std::collections::BTreeMap::from([("sop_run_id".into(), run_id)]))
-            .unwrap_or_default();
+        // `sop_run_id` is shorthand for the same attribution match; when both
+        // name it, the dedicated param wins.
+        let mut field_eq = p.field_eq;
+        if let Some(run_id) = p.sop_run_id {
+            field_eq.insert("sop_run_id".into(), run_id);
+        }
         let filter = zeroclaw_log::LogFilter {
             since_ts: p.since_ts,
             until_ts: p.until_ts,
@@ -9231,6 +9353,9 @@ impl RpcDispatcher {
             next_segment_cursor: page.next_segment_cursor,
             at_end: page.at_end,
             incomplete: page.incomplete,
+            persistence_enabled: true,
+            daemon_started_at: Some(crate::health::daemon_started_at()),
+            attribution_keys: zeroclaw_log::attribution_keys(),
         })
     }
 
@@ -14535,6 +14660,122 @@ mod tests {
             let response = rpc(&mut alice, &mut rx, id, "cost/query", params).await;
             assert_ne!(response["error"]["code"], json!(FORBIDDEN), "{response}");
         }
+    }
+
+    /// `status` reports the dashboard overview only when asked for it, with the
+    /// model fields resolved install-wide or for the named agent.
+    #[tokio::test]
+    async fn status_reports_the_overview_only_when_asked() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let (dispatcher, _sessions) = make_acp_test_dispatcher(config.clone());
+        let status_of =
+            |value: Value| -> StatusResult { serde_json::from_value(value).expect("status shape") };
+
+        let plain = status_of(dispatcher.handle_status(&Value::Null).await.unwrap());
+        assert!(plain.overview.is_none());
+        let plain = status_of(dispatcher.handle_status(&json!({})).await.unwrap());
+        assert!(plain.overview.is_none());
+
+        let overview = status_of(
+            dispatcher
+                .handle_status(&json!({"overview": true}))
+                .await
+                .unwrap(),
+        )
+        .overview
+        .expect("asked for the overview");
+        assert_eq!(overview.agent_alias, None);
+        assert_eq!(
+            overview.model_provider,
+            crate::status::install_wide_model_provider(&config)
+        );
+        assert_eq!(overview.model, "test-model");
+        let memory = dispatcher
+            .ctx
+            .memory
+            .as_ref()
+            .map_or_else(|| "none".to_string(), |m| m.name().to_string());
+        assert_eq!(overview.memory_backend, memory);
+        assert_eq!(overview.gateway_port, config.gateway.port);
+        assert_eq!(overview.channels, crate::status::channel_rows(&config));
+        assert!(
+            overview.health["components"].is_object(),
+            "{:?}",
+            overview.health
+        );
+        assert!(overview.health.get("process").is_none());
+        assert!(
+            overview.process.get("rss_bytes").is_some(),
+            "{:?}",
+            overview.process
+        );
+        assert_eq!(
+            overview.restart_mode,
+            crate::restart::detect_restart().mode.as_str()
+        );
+        assert_eq!(
+            overview.daemon_started_at,
+            crate::health::daemon_started_at()
+        );
+
+        let for_agent = status_of(
+            dispatcher
+                .handle_status(&json!({"overview": true, "agent": "test-agent"}))
+                .await
+                .unwrap(),
+        )
+        .overview
+        .expect("asked for the overview");
+        let view = crate::status::agent_model_view(&config, "test-agent").expect("configured");
+        assert_eq!(for_agent.agent_alias.as_deref(), Some("test-agent"));
+        assert_eq!(for_agent.model_provider, view.model_provider);
+        assert_eq!(for_agent.model, view.model);
+        assert_eq!(for_agent.memory_backend, view.memory_backend);
+    }
+
+    #[tokio::test]
+    async fn status_overview_refuses_an_agent_outside_the_principals_selector() {
+        use zeroclaw_api::grants::{Resource, Verb};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = agent_scoped_config_in(&tmp, 4242);
+        // `status` itself is admitted, so a refusal can only be the selector's.
+        config
+            .permission_profiles
+            .get_mut("cron-alpha")
+            .expect("the fixture profile exists")
+            .grants
+            .insert(Resource::System, vec![Verb::Read]);
+        let ctx = enforcement_ctx(config);
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+
+        let refused = rpc(
+            &mut alice,
+            &mut rx,
+            1,
+            "status",
+            json!({"overview": true, "agent": "beta"}),
+        )
+        .await;
+        assert_eq!(refused["error"]["code"], json!(FORBIDDEN), "{refused}");
+        let admitted = rpc(
+            &mut alice,
+            &mut rx,
+            2,
+            "status",
+            json!({"overview": true, "agent": "alpha"}),
+        )
+        .await;
+        assert_eq!(
+            admitted["result"]["overview"]["agent_alias"],
+            json!("alpha"),
+            "{admitted}"
+        );
+        let install_wide = rpc(&mut alice, &mut rx, 3, "status", json!({"overview": true})).await;
+        assert!(
+            install_wide["result"]["overview"].is_object(),
+            "{install_wide}"
+        );
     }
 
     #[tokio::test]
@@ -25027,6 +25268,32 @@ mod tests {
         );
     }
 
+    /// A runtime the core cannot describe refuses a plain `status`, as before,
+    /// but the dashboard overview still answers, without the runtime fields.
+    #[tokio::test]
+    async fn the_status_overview_answers_when_the_runtime_cannot_be_described() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = make_acp_test_config(&tmp);
+        config.runtime.shell = Some("   ".into());
+        let (dispatcher, _sessions) = make_acp_test_dispatcher(config);
+
+        let error = dispatcher
+            .handle_status(&Value::Null)
+            .await
+            .expect_err("a plain status still refuses");
+        assert_eq!(error.code, INTERNAL_ERROR);
+        let status: StatusResult = serde_json::from_value(
+            dispatcher
+                .handle_status(&json!({"overview": true}))
+                .await
+                .expect("the overview answers"),
+        )
+        .unwrap();
+        assert!(status.overview.is_some());
+        assert!(status.config_dir.is_none());
+        assert!(status.shell_profile.is_none());
+    }
+
     #[tokio::test]
     async fn handle_status_includes_runtime_context_fields() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -25037,7 +25304,10 @@ mod tests {
         };
         let (dispatcher, _sessions) = make_acp_test_dispatcher(config.clone());
 
-        let value = dispatcher.handle_status().await.expect("status result");
+        let value = dispatcher
+            .handle_status(&Value::Null)
+            .await
+            .expect("status result");
         let status: StatusResult = serde_json::from_value(value).expect("status shape");
 
         assert_eq!(
@@ -25427,6 +25697,155 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn doctor_run_static_only_runs_only_the_static_checks() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let (dispatcher, _sessions) = make_acp_test_dispatcher(config.clone());
+
+        // One static check reads live state, the free disk space other
+        // processes are writing to; that figure is compared without its value.
+        let steady = |mut results: Value| {
+            for result in results.as_array_mut().into_iter().flatten() {
+                if result["message"]
+                    .as_str()
+                    .is_some_and(|m| m.starts_with("disk space: "))
+                {
+                    result["message"] = json!("disk space: <free> MB available");
+                }
+            }
+            results
+        };
+        let result = dispatcher
+            .handle_doctor_run(&json!({"static_only": true}))
+            .await
+            .expect("doctor/run must succeed");
+        assert_eq!(
+            steady(result["results"].clone()),
+            steady(serde_json::to_value(crate::doctor::diagnose(&config)).unwrap())
+        );
+        let results: Vec<crate::doctor::DiagResult> =
+            serde_json::from_value(result["results"].clone()).unwrap();
+        assert_eq!(
+            result["summary"],
+            serde_json::to_value(doctor_summary(&results)).unwrap()
+        );
+        assert!(result.get("timed_out_phase").is_none(), "{result}");
+    }
+
+    #[tokio::test]
+    async fn logs_query_refuses_a_field_that_is_not_an_attribution_field() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (dispatcher, _sessions) = make_acp_test_dispatcher(make_acp_test_config(&tmp));
+        let error = dispatcher
+            .handle_logs_query(&json!({"field_eq": {"not_a_field": "x"}}))
+            .await
+            .expect_err("an unknown field is refused");
+        assert_eq!(error.code, INVALID_PARAMS);
+        assert!(error.message.contains("not_a_field"), "{}", error.message);
+    }
+
+    #[tokio::test]
+    async fn logs_query_reports_disabled_persistence_only_when_asked() {
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let tmp = tempfile::TempDir::new().unwrap();
+        zeroclaw_log::init_from_config(
+            &zeroclaw_log::LogConfig {
+                log_persistence: "none".into(),
+                log_persistence_path: "state/runtime-trace.jsonl".into(),
+                ..Default::default()
+            },
+            tmp.path(),
+        );
+        let (dispatcher, _sessions) = make_acp_test_dispatcher(make_acp_test_config(&tmp));
+
+        let error = dispatcher
+            .handle_logs_query(&json!({}))
+            .await
+            .expect_err("a plain query is refused with persistence off");
+        assert_eq!(error.code, INTERNAL_ERROR);
+        let page: LogsQueryResult = serde_json::from_value(
+            dispatcher
+                .handle_logs_query(&json!({"report_disabled": true}))
+                .await
+                .expect("an empty page"),
+        )
+        .unwrap();
+        assert!(page.events.is_empty());
+        assert!(page.at_end);
+        assert!(!page.persistence_enabled);
+        assert_eq!(
+            page.daemon_started_at.as_deref(),
+            Some(crate::health::daemon_started_at().as_str())
+        );
+        assert_eq!(page.attribution_keys, zeroclaw_log::attribution_keys());
+    }
+
+    #[tokio::test]
+    async fn logs_query_filters_by_attribution_fields() {
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let tmp = tempfile::TempDir::new().unwrap();
+        zeroclaw_log::init_from_config(
+            &zeroclaw_log::LogConfig {
+                log_persistence: "rolling".into(),
+                log_persistence_path: "state/runtime-trace.jsonl".into(),
+                ..Default::default()
+            },
+            tmp.path(),
+        );
+        let marker = uuid::Uuid::new_v4().to_string();
+        for (agent, channel) in [
+            ("alpha", "telegram.ops"),
+            ("beta", "telegram.ops"),
+            ("alpha", "discord.dev"),
+        ] {
+            let mut event = zeroclaw_log::LogEvent::new(
+                zeroclaw_log::Severity::Info,
+                "note",
+                zeroclaw_log::EventCategory::Agent,
+            );
+            event.message = Some(marker.clone());
+            event
+                .zeroclaw
+                .fields
+                .insert("agent_alias".into(), agent.into());
+            event
+                .zeroclaw
+                .fields
+                .insert("channel".into(), channel.into());
+            zeroclaw_log::record_event(event);
+        }
+        zeroclaw_log::flush_for_test().expect("flush");
+        let (dispatcher, _sessions) = make_acp_test_dispatcher(make_acp_test_config(&tmp));
+
+        let page: LogsQueryResult = serde_json::from_value(
+            dispatcher
+                .handle_logs_query(&json!({
+                    "q": marker,
+                    "field_eq": {"agent_alias": "alpha", "channel": "telegram.ops"},
+                }))
+                .await
+                .expect("a page"),
+        )
+        .unwrap();
+        assert_eq!(page.events.len(), 1, "{:?}", page.events);
+        assert_eq!(page.events[0]["zeroclaw"]["agent_alias"], json!("alpha"));
+        assert_eq!(page.events[0]["zeroclaw"]["channel"], json!("telegram.ops"));
+        assert!(page.persistence_enabled);
+        assert!(page.daemon_started_at.is_some());
+        assert_eq!(page.attribution_keys, zeroclaw_log::attribution_keys());
+
+        // Restore a disabled writer so later tests start from a clean state.
+        zeroclaw_log::init_from_config(
+            &zeroclaw_log::LogConfig {
+                log_persistence: "none".into(),
+                log_persistence_path: "state/runtime-trace.jsonl".into(),
+                ..Default::default()
+            },
+            tmp.path(),
+        );
+    }
+
+    #[tokio::test]
     async fn doctor_run_omits_log_path_when_persistence_is_disabled() {
         // Serialize against the other tests that mutate the process-global
         // writer state (the two transition tests below) and install an
@@ -25448,7 +25867,7 @@ mod tests {
         let (dispatcher, _sessions) = make_acp_test_dispatcher(config);
 
         let result = dispatcher
-            .handle_doctor_run()
+            .handle_doctor_run(&Value::Null)
             .await
             .expect("doctor/run must succeed");
         let obj = result.as_object().expect("result must be an object");
@@ -25482,7 +25901,7 @@ mod tests {
         let (dispatcher, _sessions) = make_acp_test_dispatcher(config);
 
         let result = dispatcher
-            .handle_doctor_run()
+            .handle_doctor_run(&Value::Null)
             .await
             .expect("doctor/run must succeed");
         let obj = result.as_object().expect("result must be an object");
@@ -25527,7 +25946,7 @@ mod tests {
         let (dispatcher, _sessions) = make_acp_test_dispatcher(config);
 
         let result = dispatcher
-            .handle_doctor_run()
+            .handle_doctor_run(&Value::Null)
             .await
             .expect("doctor/run must succeed");
         let obj = result.as_object().expect("result must be an object");

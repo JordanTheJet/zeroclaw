@@ -42,7 +42,12 @@ impl Core {
                 4, 10, 60,
             )),
         ));
-        RpcContext::for_live_test(config, sessions)
+        let mut ctx = RpcContext::for_live_test(config, sessions);
+        // A daemon always has an event bus; the event stream reads it.
+        Arc::get_mut(&mut ctx)
+            .expect("a fresh context has one owner")
+            .event_tx = Some(tokio::sync::broadcast::channel(64).0);
+        ctx
     }
 
     async fn serve(ctx: Arc<RpcContext>) -> Self {
@@ -157,6 +162,42 @@ async fn get(address: &str, path: &str, token: Option<&str>) -> (u16, Value) {
     (status, body)
 }
 
+/// Open a streaming GET and return its status and content type, without
+/// waiting for the stream to end.
+async fn stream_head(address: &str, path: &str, token: &str) -> (u16, String) {
+    let mut stream = tokio::net::TcpStream::connect(address)
+        .await
+        .expect("connect to zeroclaw-gw");
+    let request =
+        format!("GET {path} HTTP/1.1\r\nHost: {address}\r\nAuthorization: Bearer {token}\r\n\r\n");
+    stream.write_all(request.as_bytes()).await.expect("send");
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        let read = tokio::time::timeout(WAIT, stream.read(&mut byte))
+            .await
+            .expect("headers in time")
+            .expect("read the headers");
+        assert_eq!(read, 1, "the stream closed before its headers");
+        head.push(byte[0]);
+    }
+    let head = String::from_utf8_lossy(&head);
+    let status = head
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse().ok())
+        .expect("a status code");
+    let content_type = head
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-type")
+                .then(|| value.trim().to_owned())
+        })
+        .unwrap_or_default();
+    (status, content_type)
+}
+
 /// Poll `path` until it answers `status`.
 async fn until_status(address: &str, path: &str, token: Option<&str>, status: u16) -> Value {
     let deadline = tokio::time::Instant::now() + WAIT;
@@ -190,7 +231,7 @@ async fn the_separate_gateway_follows_the_core_through_restarts_of_either() {
     assert_eq!(status, 401, "{refused}");
     assert_eq!(refused["code"], "auth_required");
     assert!(refused["hint"].is_string(), "{refused}");
-    let (status, refused) = get(&gateway.address, "/api/status", Some(TOKEN)).await;
+    let (status, refused) = get(&gateway.address, "/api/cron", Some(TOKEN)).await;
     assert_eq!(status, 503, "{refused}");
     assert_eq!(refused["code"], "capability_missing");
 
@@ -200,6 +241,22 @@ async fn the_separate_gateway_follows_the_core_through_restarts_of_either() {
     let (status, health) = get(&gateway.address, "/api/health", Some(TOKEN)).await;
     assert_eq!(status, 200, "{health}");
     assert!(health["health"]["components"].is_object(), "{health}");
+    // Status, logs and doctor describe the core's process, not this one's.
+    let (status, overview) = get(&gateway.address, "/api/status", Some(TOKEN)).await;
+    assert_eq!(status, 200, "{overview}");
+    assert_eq!(overview["health"]["pid"], std::process::id(), "{overview}");
+    assert_eq!(overview["nodes"]["connected"], serde_json::json!([]));
+    let (status, logs) = get(&gateway.address, "/api/logs?agent_alias=x", Some(TOKEN)).await;
+    assert_eq!(status, 200, "{logs}");
+    assert!(logs["attribution_keys"].is_array(), "{logs}");
+    let (status, refused) = get(&gateway.address, "/api/logs?no_such=x", Some(TOKEN)).await;
+    assert_eq!(status, 400, "{refused}");
+    let (status, doctor) = get(&gateway.address, "/api/doctor", Some(TOKEN)).await;
+    assert_eq!(status, 200, "{doctor}");
+    assert!(doctor["summary"]["ok"].is_number(), "{doctor}");
+    let (status, content_type) = stream_head(&gateway.address, "/api/events", TOKEN).await;
+    assert_eq!(status, 200);
+    assert_eq!(content_type, "text/event-stream");
     let (status, tuis) = get(&gateway.address, "/api/tuis", Some(TOKEN)).await;
     assert_eq!(status, 200, "{tuis}");
     assert_eq!(tuis["tuis"], serde_json::json!([]), "{tuis}");

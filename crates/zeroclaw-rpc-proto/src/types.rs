@@ -140,6 +140,63 @@ rpc_type! {
 }
 
 rpc_type! {
+    /// `status` params. Both are optional, and a core that predates them
+    /// ignores them and answers without an overview.
+    #[derive(Default)]
+    pub struct StatusParams {
+        /// Also report the dashboard overview, [`StatusResult::overview`].
+        #[serde(default)]
+        pub overview: bool,
+        /// Resolve the overview's model provider, model, temperature and
+        /// memory backend for this agent instead of the install-wide default.
+        /// The caller must be entitled to the agent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub agent: Option<String>,
+    }
+}
+
+rpc_type! {
+    /// The dashboard's status overview, reported when `status` is asked for
+    /// it. Every field describes the core's own process and configuration.
+    pub struct StatusOverview {
+        /// The agent the model fields were resolved for, as requested, or
+        /// `None` for the install-wide view.
+        pub agent_alias: Option<String>,
+        /// Dotted `<type>.<alias>` of the resolved model provider, or `None`
+        /// when none is configured.
+        pub model_provider: Option<String>,
+        /// The resolved model; empty when none is configured.
+        pub model: String,
+        /// The resolved temperature, or `None` when none is configured.
+        pub temperature: Option<f64>,
+        /// The memory backend's name (`none` when memory is off).
+        pub memory_backend: String,
+        pub uptime_seconds: u64,
+        /// RFC 3339 UTC time the daemon started.
+        pub daemon_started_at: String,
+        /// The configured gateway port.
+        pub gateway_port: u16,
+        pub locale: String,
+        /// Whether any client is paired.
+        pub paired: bool,
+        /// Every configured channel instance, keyed `<type>.<alias>`.
+        pub channels: std::collections::BTreeMap<String, bool>,
+        /// The component health snapshot, as the `health` method reports it
+        /// without `process`.
+        pub health: serde_json::Value,
+        /// The core process's resource sample.
+        pub process: serde_json::Value,
+        pub check_updates: bool,
+        pub allow_self_upgrade: bool,
+        /// How the daemon restarts after an upgrade: `desktop_supervised`,
+        /// `supervised`, `self_respawn` or `manual`.
+        pub restart_mode: String,
+        /// The command or instruction to show for that restart.
+        pub restart_hint: String,
+    }
+}
+
+rpc_type! {
     pub struct StatusResult {
         pub server_version: String,
         pub protocol_version: u64,
@@ -155,10 +212,25 @@ rpc_type! {
         pub local_ipc_endpoint: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub shell_profile: Option<RuntimeShellProfile>,
+        /// Present when the params asked for it (`overview: true`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub overview: Option<StatusOverview>,
     }
 }
 
 // Health: no params, result is `Value` from `health::snapshot_json()`.
+
+rpc_type! {
+    /// `doctor/run` params. Optional; a core that predates them ignores them
+    /// and runs the full suite.
+    #[derive(Default)]
+    pub struct DoctorRunParams {
+        /// Run only the configuration, workspace, daemon and environment
+        /// checks: no provider auth check and no live model probes.
+        #[serde(default)]
+        pub static_only: bool,
+    }
+}
 
 rpc_type! {
     pub struct DoctorSummary {
@@ -1433,6 +1505,15 @@ rpc_type! {
         pub hide_internal: bool,
         #[serde(default)]
         pub limit: Option<usize>,
+        /// Exact matches on attribution fields, by key (`agent_alias`,
+        /// `channel`, `channel_alias`, ...); every pair must match. A key that
+        /// is not an attribution field is refused.
+        #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+        pub field_eq: std::collections::BTreeMap<String, String>,
+        /// With log persistence off, answer an empty page with
+        /// `persistence_enabled: false` instead of refusing.
+        #[serde(default)]
+        pub report_disabled: bool,
     }
 }
 
@@ -1470,7 +1551,22 @@ rpc_type! {
         /// so a client that stops paging on `at_end` should say the history is
         /// partial rather than present it as complete.
         pub incomplete: bool,
+        /// Whether the daemon persists its log. `false` only on the empty page
+        /// a `report_disabled` query gets; a core that predates the field
+        /// omits it, and refuses instead when persistence is off.
+        #[serde(default = "persistence_enabled_by_default")]
+        pub persistence_enabled: bool,
+        /// RFC 3339 UTC time the daemon started, for "since daemon start".
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub daemon_started_at: Option<String>,
+        /// Every key `field_eq` accepts.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub attribution_keys: Vec<String>,
     }
+}
+
+fn persistence_enabled_by_default() -> bool {
+    true
 }
 
 rpc_type! {
@@ -1762,6 +1858,7 @@ mod tests {
                 name: "pwsh".into(),
                 family: RuntimeShellFamily::PowerShell,
             }),
+            overview: None,
         };
 
         let wire = serde_json::to_value(&status).unwrap();
@@ -2046,6 +2143,32 @@ mod tests {
     }
 
     #[test]
+    fn a_logs_page_from_an_older_core_reads_as_persisted() {
+        // An older core refuses rather than answering an empty page when
+        // persistence is off, so a page without the field was persisted.
+        let page: LogsQueryResult = serde_json::from_value(json!({
+            "events": [],
+            "next_cursor": null,
+            "next_cursor_line_offset": null,
+            "next_segment_cursor": null,
+            "at_end": true,
+            "incomplete": false,
+        }))
+        .unwrap();
+        assert!(page.persistence_enabled);
+        assert!(page.daemon_started_at.is_none());
+        assert!(page.attribution_keys.is_empty());
+        let status: StatusResult = serde_json::from_value(json!({
+            "server_version": "0.8.5",
+            "protocol_version": 1,
+            "active_sessions": 0,
+            "session_ids": [],
+        }))
+        .unwrap();
+        assert!(status.overview.is_none());
+    }
+
+    #[test]
     #[allow(deprecated)]
     fn logs_query_result_exposes_active_log_path_when_present() {
         let result = LogsQueryResult {
@@ -2056,6 +2179,9 @@ mod tests {
             next_segment_cursor: None,
             at_end: true,
             incomplete: false,
+            persistence_enabled: true,
+            daemon_started_at: None,
+            attribution_keys: Vec::new(),
         };
 
         let value = serde_json::to_value(result).expect("logs/query result");

@@ -69,7 +69,7 @@ use zeroclaw_api::jsonrpc::error_codes::{
     SOP_NOT_FOUND, VERSION_MISMATCH,
 };
 use zeroclaw_rpc_client::{
-    ClientError, ConnectOptions, ConnectionState, EndpointOwner, Method, RpcClient,
+    ClientError, ConnectOptions, ConnectionState, EndpointOwner, Method, Notification, RpcClient,
 };
 use zeroclaw_rpc_proto::types::CLIENT_KIND_GATEWAY;
 use zeroclaw_runtime::rpc::inproc::InprocConnector;
@@ -797,6 +797,19 @@ impl CoreCall {
     /// The principal the core bound this connection to.
     pub fn principal_id(&self) -> Option<&str> {
         self.pooled.client.handshake().principal_id.as_deref()
+    }
+
+    /// Notifications arriving on this caller's connection. Take the receiver
+    /// before opening a subscription, so its first frames are not missed.
+    pub fn notifications(&self) -> tokio::sync::broadcast::Receiver<Notification> {
+        self.pooled.client.notifications()
+    }
+
+    /// Resolves once this caller's connection has ended. Owns its hold on
+    /// the connection, so a long-lived stream can wait on it.
+    pub fn closed(&self) -> impl Future<Output = ()> + Send + 'static {
+        let pooled = Arc::clone(&self.pooled);
+        async move { pooled.client.closed().await }
     }
 
     /// Send `method` on this caller's connection.
