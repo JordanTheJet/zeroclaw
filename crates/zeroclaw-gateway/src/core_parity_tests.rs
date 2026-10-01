@@ -88,6 +88,10 @@ impl Harness {
                 ..Default::default()
             },
         );
+        // The daemon's TUI identity signing key. The in-process connector is
+        // a non-local caller, and the core refuses its `initialize` while
+        // signing is off.
+        std::fs::write(dir.path().join(".secret_key"), "42".repeat(32)).expect("signing key");
         let sessions = Arc::new(zeroclaw_runtime::rpc::session::SessionStore::new(
             16,
             Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
@@ -96,6 +100,7 @@ impl Harness {
         ));
         let history = Arc::new(EventBuffer::new(16));
         let mut ctx = RpcContext::for_live_test(config.clone(), sessions);
+        assert!(ctx.tui_registry.signing_is_enabled());
         {
             let ctx = Arc::get_mut(&mut ctx).expect("a fresh context is unshared");
             ctx.cost_tracker = cost_tracker.clone();

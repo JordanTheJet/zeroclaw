@@ -187,6 +187,10 @@ impl Harness {
         let sops_dir = dir.path().join("sops");
         std::fs::create_dir_all(&sops_dir).expect("a SOP directory");
         config.sop.sops_dir = Some(sops_dir.to_string_lossy().into_owned());
+        // The daemon's TUI identity signing key. The in-process connector is
+        // a non-local caller, and the core refuses its `initialize` while
+        // signing is off.
+        std::fs::write(dir.path().join(".secret_key"), "42".repeat(32)).expect("signing key");
         let sop_parts = sops.map(|sops| {
             for sop in &sops {
                 zeroclaw_runtime::sop::save_sop(&sops_dir, sop).expect("save a SOP");
@@ -207,6 +211,7 @@ impl Harness {
             )),
         ));
         let mut ctx = RpcContext::for_live_test(config.clone(), sessions);
+        assert!(ctx.tui_registry.signing_is_enabled());
         {
             let ctx = Arc::get_mut(&mut ctx).expect("a fresh context is unshared");
             ctx.sop_engine = sop_parts.as_ref().map(|(engine, _)| Arc::clone(engine));
@@ -539,13 +544,9 @@ async fn a_disabled_session_store_answers_the_listing_route_alike() {
     let harness = Harness::new(None);
     let mut state = harness.state.clone();
     state.session_backend = None;
-    let in_process = crate::api::handle_api_sessions_list(
-        State(state),
-        CoreAccess::InProcess,
-        Harness::headers(),
-    )
-    .await
-    .into_response();
+    let in_process = crate::api::handle_api_sessions_list(State(state), Harness::headers())
+        .await
+        .into_response();
     let core = harness.core().await;
     let through_core = crate::api::api_sessions_list_through_core(&core)
         .await
