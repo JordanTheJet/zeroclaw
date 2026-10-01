@@ -4103,7 +4103,7 @@ impl RpcDispatcher {
                     .session_queue
                     .acquire(&session_id)
                     .await
-                    .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?;
+                    .map_err(Self::session_busy)?;
                 let grants = self.recheck_authority_after_admission(Method::SessionNew)?;
                 if let Some(grants) = grants.as_ref() {
                     self.selector_session_agent_with_grants(

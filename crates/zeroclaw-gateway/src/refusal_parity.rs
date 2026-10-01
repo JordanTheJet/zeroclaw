@@ -184,6 +184,10 @@ impl Harness {
         };
         config.gateway.require_pairing = true;
         config.gateway.paired_tokens = vec![TOKEN.into()];
+        // The daemon's TUI identity signing key. The in-process connector is
+        // a non-local caller, and the core refuses its `initialize` while
+        // signing is off.
+        std::fs::write(dir.path().join(".secret_key"), "42".repeat(32)).expect("signing key");
         let sops_dir = dir.path().join("sops");
         std::fs::create_dir_all(&sops_dir).expect("a SOP directory");
         config.sop.sops_dir = Some(sops_dir.to_string_lossy().into_owned());
@@ -207,6 +211,7 @@ impl Harness {
             )),
         ));
         let mut ctx = RpcContext::for_live_test(config.clone(), sessions);
+        assert!(ctx.tui_registry.signing_is_enabled());
         {
             let ctx = Arc::get_mut(&mut ctx).expect("a fresh context is unshared");
             ctx.sop_engine = sop_parts.as_ref().map(|(engine, _)| Arc::clone(engine));
