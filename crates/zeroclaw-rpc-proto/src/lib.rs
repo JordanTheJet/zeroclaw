@@ -107,19 +107,20 @@ pub mod feature {
     /// bundle's directory.
     pub const CONFIG_SKILL_BUNDLE_DIR: &str = "config.skill_bundle_dir";
 
-    /// Every extension this build's core supports.
-    pub const ALL: &[&str] = &[TUI_CLIENT_KIND, CONFIG_PATCH_OPS, CONFIG_SKILL_BUNDLE_DIR];
+    /// Every extension name this protocol defines. A core advertises only
+    /// the ones it implements, from its own list beside the handlers.
+    pub const KNOWN: &[&str] = &[TUI_CLIENT_KIND, CONFIG_PATCH_OPS, CONFIG_SKILL_BUNDLE_DIR];
 
     #[cfg(test)]
     mod tests {
-        use super::ALL;
+        use super::KNOWN;
         use std::collections::BTreeSet;
 
         #[test]
         fn feature_names_are_unique_and_scoped_to_an_area() {
-            let names: BTreeSet<_> = ALL.iter().collect();
-            assert_eq!(names.len(), ALL.len(), "duplicate feature name");
-            for name in ALL {
+            let names: BTreeSet<_> = KNOWN.iter().collect();
+            assert_eq!(names.len(), KNOWN.len(), "duplicate feature name");
+            for name in KNOWN {
                 let (area, extension) = name
                     .split_once('.')
                     .unwrap_or_else(|| panic!("{name} is not <area>.<extension>"));

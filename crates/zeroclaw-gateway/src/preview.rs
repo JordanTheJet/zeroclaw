@@ -29,6 +29,7 @@
 //! the preview refuses to start there.
 
 use std::future::Future;
+use std::io::Write as _;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -736,12 +737,23 @@ fn report_refused_core(core: &str, gateway: &str) {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     if reported.as_deref() != Some(core) {
-        eprintln!(
-            "zeroclaw-gw: refusing to serve through the core: it is version {core}, this \
-             gateway is version {gateway} (core_version_mismatch)"
-        );
+        // Written so that a closed stderr cannot panic the request handler.
+        let _ = writeln!(std::io::stderr(), "{}", refused_core_notice(core, gateway));
         *reported = Some(core.to_owned());
     }
+}
+
+/// The operator's note on stderr when a core of another version is refused.
+fn refused_core_notice(core: &str, gateway: &str) -> String {
+    zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+        "cli-gw-core-version-refused",
+        &[("core", core), ("gateway", gateway)],
+    )
+}
+
+/// The operator's note on stderr at start under `--allow-version-skew`.
+fn version_skew_notice() -> String {
+    zeroclaw_runtime::i18n::get_required_cli_string("cli-gw-version-skew-allowed")
 }
 
 /// Why the health probe could not vouch for the core's endpoint.
@@ -1171,6 +1183,14 @@ async fn fallback(State(state): State<PreviewState>, method: HttpMethod, uri: Ur
     }
 }
 
+/// The operator's note on stderr once the preview serves `url`.
+fn serving_notice(url: &str, endpoint: &Path) -> String {
+    zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+        "cli-gw-preview-serving",
+        &[("url", url), ("endpoint", &endpoint.display().to_string())],
+    )
+}
+
 /// Run the preview until interrupted. Prints `READY <url>` on stdout once
 /// it is serving.
 pub async fn serve(bootstrap: Bootstrap) -> anyhow::Result<()> {
@@ -1224,16 +1244,14 @@ pub async fn serve(bootstrap: Bootstrap) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(bootstrap.listen).await?;
     let address = listener.local_addr()?;
     let scheme = if tls.is_some() { "https" } else { "http" };
+    // i18n-exempt: `READY <url>` is the startup line a supervisor parses, not prose
     println!("READY {scheme}://{address}");
     eprintln!(
-        "zeroclaw-gw preview serving {scheme}://{address}; core endpoint {}",
-        bootstrap.endpoint.display()
+        "{}",
+        serving_notice(&format!("{scheme}://{address}"), &bootstrap.endpoint)
     );
     if bootstrap.version_skew == VersionSkew::Allow {
-        eprintln!(
-            "zeroclaw-gw: --allow-version-skew: serving through a core of any version; for \
-             development only, answers may silently lack what was asked for"
-        );
+        let _ = writeln!(std::io::stderr(), "{}", version_skew_notice());
     }
 
     match tls {

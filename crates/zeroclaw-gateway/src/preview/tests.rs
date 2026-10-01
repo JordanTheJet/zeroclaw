@@ -543,6 +543,33 @@ async fn every_route_sits_behind_the_in_process_request_limits() {
     assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
 }
 
+/// The serving note comes from the Fluent catalog: a missing key would
+/// render as the `{key}` sentinel instead of the text.
+#[test]
+fn the_serving_notice_resolves_via_fluent() {
+    let notice = serving_notice("http://127.0.0.1:42617", Path::new("/run/zeroclaw.sock"));
+    assert!(!notice.starts_with('{'), "missing Fluent string: {notice}");
+    assert!(notice.contains("http://127.0.0.1:42617"), "{notice}");
+    assert!(notice.contains("/run/zeroclaw.sock"), "{notice}");
+}
+
+/// The version check's notes come from the Fluent catalog too, and name
+/// what an operator (and the binary test) looks for.
+#[test]
+fn the_version_notices_resolve_via_fluent() {
+    let refused = refused_core_notice("0.0.0-other", "0.8.5");
+    assert!(
+        !refused.starts_with('{'),
+        "missing Fluent string: {refused}"
+    );
+    for expected in ["0.0.0-other", "0.8.5", "core_version_mismatch"] {
+        assert!(refused.contains(expected), "{refused}");
+    }
+    let skew = version_skew_notice();
+    assert!(!skew.starts_with('{'), "missing Fluent string: {skew}");
+    assert!(skew.contains("--allow-version-skew"), "{skew}");
+}
+
 // ── The router, against a real core on a real socket ─────────────
 
 #[cfg(unix)]
@@ -775,7 +802,7 @@ mod against_a_core {
         assert_eq!(link["core"]["server_version"], env!("CARGO_PKG_VERSION"));
         assert_eq!(
             link["core"]["features"],
-            json!(zeroclaw_rpc_proto::feature::ALL),
+            json!(zeroclaw_runtime::rpc::dispatch::ADVERTISED_FEATURES),
             "the core-link diagnostic reports what the core advertised"
         );
         assert_eq!(link["gateway"]["protocol_version"], RPC_PROTOCOL_VERSION);
