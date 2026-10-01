@@ -50,6 +50,14 @@
 //! the caller presents no credential by design, so the request is served by
 //! the route's in-process body exactly as before. A gateway with no core
 //! attached (a standalone run) serves every request in-process.
+//!
+//! A gateway in its own process serves only through a core of its own
+//! version unless told otherwise (see [`VersionSkew`]). Both sides speak one
+//! protocol version, so a core of another version accepts the same requests
+//! but may ignore a param this gateway sends or omit a field it reads, and
+//! the route would answer `200` with the wrong content. The pool checks the
+//! version the core reports on every connection it opens, before any request
+//! is sent on it, and a mismatch answers `503 core_version_mismatch`.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -85,7 +93,7 @@ use zeroclaw_runtime::rpc::inproc::InprocConnector;
 use crate::principal_gate::AUTH_PROVIDER_HEADER;
 
 /// Core connections open at once, one per credential.
-const MAX_CREDENTIALS: usize = 64;
+pub(crate) const MAX_CREDENTIALS: usize = 64;
 /// How long a request waits for capacity when every connection is in use.
 const CAPACITY_WAIT: Duration = Duration::from_secs(5);
 /// A credential's connection leaves the pool after this long unused.
@@ -97,6 +105,10 @@ const DIAL_TIMEOUT: Duration = Duration::from_secs(5);
 /// Longest bearer forwarded to the core. An OIDC access token is well
 /// below this; anything longer is refused as malformed.
 const MAX_BEARER_BYTES: usize = 8 * 1024;
+
+/// The version a core must report for a gateway in its own process to serve
+/// through it: this build's own.
+const GATEWAY_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// The provider a bare bearer selects, as in the RPC handshake.
 const NATIVE_PROVIDER: &str = "native";
@@ -161,10 +173,38 @@ impl CoreRpc {
     /// `endpoint`, which `owner` must serve: every dial verifies that
     /// through the kernel before the caller's credential is written. A
     /// gateway in its own process has no in-process path, so every request
-    /// needs a credential.
-    pub fn local(endpoint: PathBuf, owner: EndpointOwner) -> Self {
-        let limits = PoolLimits::default();
-        Self::with_pool(Pool::local(endpoint, owner, limits), || true)
+    /// needs a credential. `skew` decides whether a core of another version
+    /// is served.
+    pub fn local(endpoint: PathBuf, owner: EndpointOwner, skew: VersionSkew) -> Self {
+        Self::local_expecting(endpoint, owner, skew, GATEWAY_VERSION)
+    }
+
+    /// [`CoreRpc::local`] expecting the core to report `version`, so a test
+    /// can have a real core refused.
+    #[cfg(test)]
+    pub(crate) fn local_expecting_version(
+        endpoint: PathBuf,
+        owner: EndpointOwner,
+        skew: VersionSkew,
+        version: &'static str,
+    ) -> Self {
+        Self::local_expecting(endpoint, owner, skew, version)
+    }
+
+    fn local_expecting(
+        endpoint: PathBuf,
+        owner: EndpointOwner,
+        skew: VersionSkew,
+        version: &'static str,
+    ) -> Self {
+        let connector = Connector::Local {
+            endpoint,
+            owner,
+            version,
+            skew,
+        };
+        let pool = Pool::with_connector(connector, PoolLimits::default());
+        Self::with_pool(pool, || true)
     }
 
     fn with_dialer(
@@ -209,6 +249,19 @@ impl CoreRpc {
     }
 }
 
+/// Whether a gateway in its own process serves through a core whose
+/// reported version differs from its own. The in-process gateway is part of
+/// the core's own binary and is never checked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VersionSkew {
+    /// Refuse: every core-backed route answers `503 core_version_mismatch`
+    /// until a core of this gateway's version answers. The default.
+    Refuse,
+    /// Serve anyway. For development only, where the two are rebuilt
+    /// separately; the answers may silently lack what the gateway asked for.
+    Allow,
+}
+
 /// How one HTTP request reaches the core.
 pub enum CoreAccess {
     /// Through the core, on a connection bound to the caller's credential.
@@ -251,6 +304,9 @@ pub enum CoreError {
     Busy,
     /// The core did not answer in time.
     Timeout,
+    /// The core reports another version than this gateway's, and version
+    /// skew is refused. Nothing but the handshake was sent to it.
+    VersionMismatch { core: String, gateway: String },
     /// Any other refusal from the core, mapped by its code.
     Rpc(JsonRpcError),
 }
@@ -275,6 +331,9 @@ impl CoreError {
             }
             Self::Busy => (StatusCode::SERVICE_UNAVAILABLE, "core_busy"),
             Self::Timeout => (StatusCode::GATEWAY_TIMEOUT, "core_timeout"),
+            Self::VersionMismatch { .. } => {
+                (StatusCode::SERVICE_UNAVAILABLE, "core_version_mismatch")
+            }
             Self::Rpc(error) => rpc_status(error.code),
         }
     }
@@ -308,6 +367,7 @@ impl IntoResponse for CoreError {
             | Self::UntrustedEndpoint(message) => message,
             Self::Busy => "every core connection is in use; retry shortly".to_owned(),
             Self::Timeout => "the core did not answer in time".to_owned(),
+            Self::VersionMismatch { core, gateway } => version_mismatch_message(&core, &gateway),
             Self::Rpc(error) => error.message,
         };
         (
@@ -316,6 +376,14 @@ impl IntoResponse for CoreError {
         )
             .into_response()
     }
+}
+
+/// What a refused version mismatch says, naming both versions.
+pub(crate) fn version_mismatch_message(core: &str, gateway: &str) -> String {
+    format!(
+        "the core is version {core} but this gateway is version {gateway}; it serves only \
+         through a core of its own version"
+    )
 }
 
 /// The provider the caller selected, `None` when the header is absent.
@@ -423,10 +491,14 @@ enum Connector {
     /// The daemon's in-process duplex, or a test's stand-in.
     Duplex(Box<dyn Dial>),
     /// The daemon's local socket. The client verifies through the kernel
-    /// that `owner` serves `endpoint` before it writes the credential.
+    /// that `owner` serves `endpoint` before it writes the credential, and
+    /// the pool checks that the core reports `version`, refusing it or not
+    /// as `skew` says.
     Local {
         endpoint: PathBuf,
         owner: EndpointOwner,
+        version: &'static str,
+        skew: VersionSkew,
     },
 }
 
@@ -499,10 +571,6 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 impl Pool {
     fn new(dialer: Box<dyn Dial>, limits: PoolLimits) -> Self {
         Self::with_connector(Connector::Duplex(dialer), limits)
-    }
-
-    fn local(endpoint: PathBuf, owner: EndpointOwner, limits: PoolLimits) -> Self {
-        Self::with_connector(Connector::Local { endpoint, owner }, limits)
     }
 
     fn with_connector(connector: Connector, limits: PoolLimits) -> Self {
@@ -640,7 +708,9 @@ impl Pool {
                 };
                 RpcClient::connect_over(stream, credential.connect_options()).await
             }
-            Connector::Local { endpoint, owner } => {
+            Connector::Local {
+                endpoint, owner, ..
+            } => {
                 let options = ConnectOptions {
                     endpoint_owner: *owner,
                     ..credential.connect_options()
@@ -649,7 +719,7 @@ impl Pool {
             }
         };
         match connected {
-            Ok(client) => Ok(client),
+            Ok(client) => self.admit_version(client),
             Err(ClientError::Rpc(error)) => {
                 ::zeroclaw_log::record!(
                     INFO,
@@ -691,6 +761,51 @@ impl Pool {
                         "the core connection could not be established".into()
                     }
                 }))
+            }
+        }
+    }
+
+    /// Keep a fresh connection only if its core may serve this gateway. The
+    /// in-process core is the same binary, so only a core behind a socket is
+    /// checked: it must report this gateway's own version, unless skew is
+    /// allowed. A refused connection is dropped before any request is sent
+    /// on it, which closes it, and the next request dials and checks again,
+    /// so a core restarted at the right version is served.
+    fn admit_version(&self, client: RpcClient) -> Result<RpcClient, CoreError> {
+        let Connector::Local { version, skew, .. } = &self.connector else {
+            return Ok(client);
+        };
+        let core = &client.handshake().server_version;
+        if core == version {
+            return Ok(client);
+        }
+        let attrs = serde_json::json!({
+            "code": "core_version_mismatch",
+            "core_version": core,
+            "gateway_version": version,
+        });
+        match skew {
+            VersionSkew::Allow => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(attrs),
+                    "gateway serving through a core of another version: version skew is allowed"
+                );
+                Ok(client)
+            }
+            VersionSkew::Refuse => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(attrs),
+                    "gateway refused a core of another version"
+                );
+                Err(CoreError::VersionMismatch {
+                    core: core.clone(),
+                    gateway: (*version).to_owned(),
+                })
             }
         }
     }
@@ -799,6 +914,12 @@ impl CoreCall {
     /// The principal the core bound this connection to.
     pub fn principal_id(&self) -> Option<&str> {
         self.pooled.client.handshake().principal_id.as_deref()
+    }
+
+    /// The additive extensions the core advertised on this connection's
+    /// handshake; empty for an older core that advertises none.
+    pub fn core_features(&self) -> &[String] {
+        &self.pooled.client.handshake().features
     }
 
     /// Send `method` on this caller's connection.

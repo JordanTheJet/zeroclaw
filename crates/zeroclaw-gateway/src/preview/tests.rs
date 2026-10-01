@@ -61,6 +61,15 @@ fn defaults_serve_on_loopback_without_tls_or_dashboard() {
 }
 
 #[test]
+fn version_skew_is_refused_unless_the_flag_allows_it() {
+    let plain = bootstrap(&["--socket", "/s"], None).unwrap();
+    assert_eq!(plain.version_skew, VersionSkew::Refuse);
+    let allowed = bootstrap(&["--socket", "/s", "--allow-version-skew"], None).unwrap();
+    assert_eq!(allowed.version_skew, VersionSkew::Allow);
+    assert!(USAGE.contains("--allow-version-skew"), "{USAGE}");
+}
+
+#[test]
 fn a_public_listen_address_needs_an_explicit_opt_in() {
     let refused = bootstrap(&["--socket", "/s", "--listen", "0.0.0.0:8080"], None).unwrap_err();
     assert!(refused.contains("--allow-public-bind"), "{refused}");
@@ -255,6 +264,33 @@ async fn a_protocol_mismatch_says_to_install_matching_versions() {
             .is_some_and(|hint| hint.contains("matching versions")),
         "{body}"
     );
+}
+
+#[tokio::test]
+async fn a_version_mismatch_names_both_versions_and_says_to_install_matching_ones() {
+    let (status, body) = explained(CoreError::VersionMismatch {
+        core: "0.8.4".into(),
+        gateway: "0.8.5".into(),
+    })
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["code"], "core_version_mismatch");
+    assert_eq!(
+        body["versions"],
+        json!({ "core": "0.8.4", "gateway": "0.8.5" })
+    );
+    let error = body["error"].as_str().expect("a message");
+    assert!(error.contains("0.8.4") && error.contains("0.8.5"), "{body}");
+    assert!(
+        body["hint"]
+            .as_str()
+            .is_some_and(|hint| hint.contains("matching versions")),
+        "{body}"
+    );
+
+    // Other refusals carry no versions.
+    let (_, body) = explained(CoreError::Busy).await;
+    assert!(body.get("versions").is_none(), "{body}");
 }
 
 #[tokio::test]
@@ -469,6 +505,23 @@ fn the_serving_notice_resolves_via_fluent() {
     assert!(notice.contains("/run/zeroclaw.sock"), "{notice}");
 }
 
+/// The version check's notes come from the Fluent catalog too, and name
+/// what an operator (and the binary test) looks for.
+#[test]
+fn the_version_notices_resolve_via_fluent() {
+    let refused = refused_core_notice("0.0.0-other", "0.8.5");
+    assert!(
+        !refused.starts_with('{'),
+        "missing Fluent string: {refused}"
+    );
+    for expected in ["0.0.0-other", "0.8.5", "core_version_mismatch"] {
+        assert!(refused.contains(expected), "{refused}");
+    }
+    let skew = version_skew_notice();
+    assert!(!skew.starts_with('{'), "missing Fluent string: {skew}");
+    assert!(skew.contains("--allow-version-skew"), "{skew}");
+}
+
 // ── The router, against a real core on a real socket ─────────────
 
 #[cfg(unix)]
@@ -672,7 +725,11 @@ mod against_a_core {
         let tmp = tempfile::tempdir().unwrap();
         let core = Core::start(tmp.path()).await;
         let router = router(
-            CoreRpc::local(core.endpoint.clone(), EndpointOwner::SameAccount),
+            CoreRpc::local(
+                core.endpoint.clone(),
+                EndpointOwner::SameAccount,
+                VersionSkew::Refuse,
+            ),
             core.endpoint.clone(),
             Some(web_dist(tmp.path())),
             watch::channel(false).0,
@@ -695,6 +752,11 @@ mod against_a_core {
         let link = json_of(&body);
         assert_eq!(link["principal_id"], "shared-operator");
         assert_eq!(link["core"]["server_version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(
+            link["core"]["features"],
+            json!(zeroclaw_runtime::rpc::dispatch::ADVERTISED_FEATURES),
+            "the core-link diagnostic reports what the core advertised"
+        );
         assert_eq!(link["gateway"]["protocol_version"], RPC_PROTOCOL_VERSION);
 
         // A dashboard route not served yet: the credential first, then a
@@ -875,7 +937,11 @@ mod against_a_core {
             ctx.event_history = Some(history);
         }
         let core = Core::serve(ctx).await;
-        let rpc = CoreRpc::local(core.endpoint.clone(), EndpointOwner::SameAccount);
+        let rpc = CoreRpc::local(
+            core.endpoint.clone(),
+            EndpointOwner::SameAccount,
+            VersionSkew::Refuse,
+        );
         let preview = router(
             rpc.clone(),
             core.endpoint.clone(),
@@ -981,7 +1047,11 @@ mod against_a_core {
         let tmp = tempfile::tempdir().unwrap();
         let core = Core::start(tmp.path()).await;
         let router = router(
-            CoreRpc::local(core.endpoint.clone(), EndpointOwner::SameAccount),
+            CoreRpc::local(
+                core.endpoint.clone(),
+                EndpointOwner::SameAccount,
+                VersionSkew::Refuse,
+            ),
             core.endpoint.clone(),
             None,
             watch::channel(false).0,
@@ -1025,7 +1095,11 @@ mod against_a_core {
         let tmp = tempfile::tempdir().unwrap();
         let core = Core::start(tmp.path()).await;
         let router = router(
-            CoreRpc::local(core.endpoint.clone(), EndpointOwner::SameAccount),
+            CoreRpc::local(
+                core.endpoint.clone(),
+                EndpointOwner::SameAccount,
+                VersionSkew::Refuse,
+            ),
             core.endpoint.clone(),
             Some(web_dist(tmp.path())),
             watch::channel(false).0,
@@ -1060,7 +1134,11 @@ mod against_a_core {
         let tmp = tempfile::tempdir().unwrap();
         let recorder = Recorder::bind(tmp.path());
         let router = router(
-            CoreRpc::local(recorder.endpoint.clone(), EndpointOwner::SameAccount),
+            CoreRpc::local(
+                recorder.endpoint.clone(),
+                EndpointOwner::SameAccount,
+                VersionSkew::Refuse,
+            ),
             recorder.endpoint.clone(),
             None,
             watch::channel(false).0,
@@ -1102,7 +1180,11 @@ mod against_a_core {
         std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777)).unwrap();
         let recorder = Recorder::bind(&shared);
         let router = router(
-            CoreRpc::local(recorder.endpoint.clone(), EndpointOwner::SameAccount),
+            CoreRpc::local(
+                recorder.endpoint.clone(),
+                EndpointOwner::SameAccount,
+                VersionSkew::Refuse,
+            ),
             recorder.endpoint.clone(),
             None,
             watch::channel(false).0,
@@ -1128,12 +1210,281 @@ mod against_a_core {
         );
     }
 
+    /// A core that answers `initialize` with `handshake`, `status` with the
+    /// version it reported, and any other method with an empty object, and
+    /// records every method it is sent.
+    struct ScriptedCore {
+        endpoint: PathBuf,
+        methods: Arc<std::sync::Mutex<Vec<String>>>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl ScriptedCore {
+        fn bind(endpoint: &Path, handshake: serde_json::Value) -> Self {
+            let listener = tokio::net::UnixListener::bind(endpoint).unwrap();
+            let methods = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let task = {
+                let methods = Arc::clone(&methods);
+                zeroclaw_spawn::spawn!(async move {
+                    while let Ok((stream, _)) = listener.accept().await {
+                        let answered =
+                            Self::answer(stream, handshake.clone(), Arc::clone(&methods));
+                        zeroclaw_spawn::spawn!(answered);
+                    }
+                })
+            };
+            Self {
+                endpoint: endpoint.to_path_buf(),
+                methods,
+                task,
+            }
+        }
+
+        async fn answer(
+            stream: tokio::net::UnixStream,
+            handshake: serde_json::Value,
+            methods: Arc<std::sync::Mutex<Vec<String>>>,
+        ) {
+            use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+            let (read, mut write) = tokio::io::split(stream);
+            let mut lines = tokio::io::BufReader::new(read).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let frame: serde_json::Value = serde_json::from_str(&line).unwrap();
+                let method = frame["method"].as_str().unwrap_or_default().to_owned();
+                let result = match method.as_str() {
+                    "initialize" => handshake.clone(),
+                    "status" => json!({
+                        "server_version": handshake["server_version"],
+                        "protocol_version": 1,
+                        "active_sessions": 0,
+                        "session_ids": [],
+                    }),
+                    _ => json!({}),
+                };
+                methods.lock().unwrap().push(method);
+                let answer = json!({ "jsonrpc": "2.0", "id": frame["id"], "result": result });
+                if write
+                    .write_all(format!("{answer}\n").as_bytes())
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }
+
+        fn methods(&self) -> Vec<String> {
+            self.methods.lock().unwrap().clone()
+        }
+
+        /// Stop accepting and free the endpoint for another core.
+        fn stop(self) {
+            self.task.abort();
+            let _ = std::fs::remove_file(&self.endpoint);
+        }
+    }
+
+    /// A handshake from a core of `version` that advertises no features,
+    /// as a core older than the `features` field does.
+    fn handshake_of(version: &str) -> serde_json::Value {
+        json!({
+            "protocol_version": 1,
+            "server_version": version,
+            "server_pid": 1,
+            "principal_id": "shared-operator",
+        })
+    }
+
+    const OTHER_VERSION: &str = "0.0.0-other";
+
+    #[tokio::test]
+    async fn a_core_of_another_version_is_refused_and_hears_nothing_past_the_handshake() {
+        let tmp = tempfile::tempdir().unwrap();
+        let endpoint = tmp.path().join("daemon.sock");
+        let core = ScriptedCore::bind(&endpoint, handshake_of(OTHER_VERSION));
+        let router = router(
+            CoreRpc::local(
+                endpoint.clone(),
+                EndpointOwner::SameAccount,
+                VersionSkew::Refuse,
+            ),
+            endpoint.clone(),
+            Some(web_dist(tmp.path())),
+        );
+
+        // Every core-backed route, served or not yet ported, is refused with
+        // both versions named.
+        for path in [CORE_LINK_PATH, "/api/tuis", "/api/sessions", "/api/cron"] {
+            let (status, body) = get(&router, path, Some(TOKEN)).await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{path}: {body}");
+            let refused = json_of(&body);
+            assert_eq!(refused["code"], "core_version_mismatch", "{path}: {body}");
+            assert_eq!(
+                refused["versions"],
+                json!({ "core": OTHER_VERSION, "gateway": env!("CARGO_PKG_VERSION") }),
+                "{path}"
+            );
+            assert!(
+                refused["error"].as_str().is_some_and(
+                    |e| e.contains(OTHER_VERSION) && e.contains(env!("CARGO_PKG_VERSION"))
+                ),
+                "{path}: {body}"
+            );
+            assert!(refused["hint"].is_string(), "{path}: {body}");
+        }
+        // The credential is still checked first.
+        let (status, _) = get(&router, CORE_LINK_PATH, None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        // The gateway's own routes keep answering.
+        let (status, body) = get(&router, "/health", None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, _) = get(&router, "/api/openapi.json", None).await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, body) = get(&router, "/sessions", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("preview dashboard"), "{body}");
+        let (status, body) = send(&router, "POST", "/webhook", None).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert_eq!(json_of(&body)["code"], "capability_missing");
+
+        let methods = core.methods();
+        assert!(!methods.is_empty(), "the core was dialed");
+        assert!(
+            methods.iter().all(|method| method == "initialize"),
+            "nothing past the handshake reaches a refused core: {methods:?}"
+        );
+
+        // A core of this gateway's version comes up on the same endpoint:
+        // the next request dials it, checks it, and is served.
+        core.stop();
+        let core = ScriptedCore::bind(&endpoint, handshake_of(env!("CARGO_PKG_VERSION")));
+        let (status, body) = get(&router, CORE_LINK_PATH, Some(TOKEN)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            json_of(&body)["core"]["server_version"],
+            env!("CARGO_PKG_VERSION")
+        );
+        core.stop();
+    }
+
+    /// A refused connection is closed at once: the real core drops what it
+    /// registered for it at `initialize`, and the gateway gives back the
+    /// capacity the connection held, so refusals beyond the pool's size are
+    /// still refusals, not `core_busy`.
+    #[tokio::test]
+    async fn a_refused_connection_leaves_nothing_behind_in_the_core_or_the_pool() {
+        const EXPECTED: &str = "0.0.0-expected";
+        let tmp = tempfile::tempdir().unwrap();
+        let core = Core::start(tmp.path()).await;
+        let router = router(
+            CoreRpc::local_expecting_version(
+                core.endpoint.clone(),
+                EndpointOwner::SameAccount,
+                VersionSkew::Refuse,
+                EXPECTED,
+            ),
+            core.endpoint.clone(),
+            None,
+        );
+
+        for attempt in 0..(crate::core_rpc::MAX_CREDENTIALS + 6) {
+            let (status, body) = get(&router, CORE_LINK_PATH, Some(TOKEN)).await;
+            assert_eq!(
+                status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "attempt {attempt}: {body}"
+            );
+            let refused = json_of(&body);
+            assert_eq!(
+                refused["code"], "core_version_mismatch",
+                "attempt {attempt}: {body}"
+            );
+            assert_eq!(
+                refused["versions"],
+                json!({ "core": env!("CARGO_PKG_VERSION"), "gateway": EXPECTED })
+            );
+        }
+
+        for _ in 0..250 {
+            if core.ctx.tui_registry.list().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            core.ctx.tui_registry.list().is_empty(),
+            "the core still holds a refused connection: {:?}",
+            core.ctx
+                .tui_registry
+                .list()
+                .iter()
+                .map(|tui| &tui.client_kind)
+                .collect::<Vec<_>>()
+        );
+        core.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_core_of_this_version_that_advertises_no_features_is_served() {
+        let tmp = tempfile::tempdir().unwrap();
+        let endpoint = tmp.path().join("daemon.sock");
+        let core = ScriptedCore::bind(&endpoint, handshake_of(env!("CARGO_PKG_VERSION")));
+        let router = router(
+            CoreRpc::local(
+                endpoint.clone(),
+                EndpointOwner::SameAccount,
+                VersionSkew::Refuse,
+            ),
+            endpoint.clone(),
+            None,
+        );
+
+        let (status, body) = get(&router, CORE_LINK_PATH, Some(TOKEN)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let link = json_of(&body);
+        assert_eq!(link["core"]["server_version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(link["core"]["features"], json!([]), "{body}");
+        assert_eq!(core.methods(), ["initialize", "status"]);
+        core.stop();
+    }
+
+    #[tokio::test]
+    async fn allowing_version_skew_serves_a_core_of_another_version() {
+        let tmp = tempfile::tempdir().unwrap();
+        let endpoint = tmp.path().join("daemon.sock");
+        let mut handshake = handshake_of(OTHER_VERSION);
+        handshake["features"] = json!(["tui.client_kind"]);
+        let core = ScriptedCore::bind(&endpoint, handshake);
+        let router = router(
+            CoreRpc::local(
+                endpoint.clone(),
+                EndpointOwner::SameAccount,
+                VersionSkew::Allow,
+            ),
+            endpoint.clone(),
+            None,
+        );
+
+        let (status, body) = get(&router, CORE_LINK_PATH, Some(TOKEN)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let link = json_of(&body);
+        assert_eq!(link["core"]["server_version"], OTHER_VERSION);
+        assert_eq!(link["core"]["features"], json!(["tui.client_kind"]));
+        assert_eq!(core.methods(), ["initialize", "status"]);
+        core.stop();
+    }
+
     #[tokio::test]
     async fn no_dashboard_build_means_no_page_fallback() {
         let tmp = tempfile::tempdir().unwrap();
         let core = Core::start(tmp.path()).await;
         let router = router(
-            CoreRpc::local(core.endpoint.clone(), EndpointOwner::SameAccount),
+            CoreRpc::local(
+                core.endpoint.clone(),
+                EndpointOwner::SameAccount,
+                VersionSkew::Refuse,
+            ),
             core.endpoint.clone(),
             None,
             watch::channel(false).0,
