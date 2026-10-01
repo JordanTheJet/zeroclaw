@@ -133,13 +133,5 @@ cargo tauri build          # native build on each platform
 
 - `.github/workflows/desktop-check.yml` runs clippy and `cargo test -p zeroclaw-desktop`
   on macOS, Linux, and Windows for PRs that touch `apps/tauri/**`.
-- `.github/workflows/desktop-bundle-check.yml` builds the self-contained installer on all
-  three platforms (real dashboard, `embedded-web` kernel sidecar, unsigned `cargo tauri build`)
-  and runs `scripts/desktop/smoke-dashboard.sh` against the staged kernel. It runs for PRs that
-  change desktop packaging inputs and on manual dispatch.
-
-To run the dashboard smoke locally against a staged kernel:
-
-```sh
-scripts/desktop/smoke-dashboard.sh apps/tauri/binaries/zeroclaw-<target-triple>
-```
+- The installers are built only by the desktop jobs in
+  `.github/workflows/release-stable-manual.yml`, during a stable release.
