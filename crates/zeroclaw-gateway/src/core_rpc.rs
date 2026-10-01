@@ -38,6 +38,14 @@
 //! no request holds is closed to make room; if every connection is in use,
 //! the request waits briefly and is then answered `503 core_busy`.
 //!
+//! A subscription is opened through [`CoreCall::subscribe`] and nowhere
+//! else. The core creates a subscription before it replies, so a caller that
+//! stops waiting in between would leave it running on a pooled connection
+//! that other requests keep alive. `subscribe` owns the subscription from
+//! before its request is sent until the caller holds it, and the holder
+//! cancels it when dropped. If the core refuses or cannot take that cancel,
+//! the connection is retired, which ends every subscription on it.
+//!
 //! Two cases stay in-process. With pairing disabled and no provider selected
 //! the caller presents no credential by design, so the request is served by
 //! the route's in-process body exactly as before. A gateway with no core
@@ -59,7 +67,7 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::io::DuplexStream;
-use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, broadcast, oneshot};
 use tokio::time::Instant;
 use zeroclaw_api::jsonrpc::JsonRpcError;
 use zeroclaw_api::jsonrpc::error_codes::{
@@ -69,7 +77,7 @@ use zeroclaw_api::jsonrpc::error_codes::{
     SOP_NOT_FOUND, VERSION_MISMATCH,
 };
 use zeroclaw_rpc_client::{
-    ClientError, ConnectOptions, ConnectionState, EndpointOwner, Method, RpcClient,
+    ClientError, ConnectOptions, ConnectionState, EndpointOwner, Method, Notification, RpcClient,
 };
 use zeroclaw_rpc_proto::types::CLIENT_KIND_GATEWAY;
 use zeroclaw_runtime::rpc::inproc::InprocConnector;
@@ -870,6 +878,176 @@ impl CoreCall {
                 data: None,
             })
         })
+    }
+}
+
+// ── Subscriptions ────────────────────────────────────────────────
+
+/// A subscription the core opened on one caller's connection, held for as
+/// long as this value lives. Dropping it cancels the subscription; if the
+/// core refuses that cancel or cannot take it, the connection is retired,
+/// which ends every subscription on it.
+pub struct CoreSubscription<T> {
+    /// The subscribe method's result.
+    pub opened: T,
+    /// The notifications arriving on the connection, from before the
+    /// subscribe request was sent, so none of this subscription's first
+    /// frames are missed. Every subscription on the connection shares them:
+    /// [`Self::is_mine`] tells this one's apart.
+    pub notifications: broadcast::Receiver<Notification>,
+    held: Subscribed,
+}
+
+impl<T> CoreSubscription<T> {
+    /// The id the core gave this subscription.
+    pub fn id(&self) -> &str {
+        &self.held.id
+    }
+
+    /// Whether `notification` is this subscription's: a frame, or a notice
+    /// such as `subscription/lagged`, naming its id.
+    pub fn is_mine(&self, notification: &Notification) -> bool {
+        notification
+            .params
+            .get("subscription_id")
+            .and_then(Value::as_str)
+            == Some(self.id())
+    }
+
+    /// The caller's connection, for other requests while the subscription
+    /// lives.
+    pub fn call(&self) -> &CoreCall {
+        self.held.call.as_ref().expect("held until dropped")
+    }
+
+    /// Resolves once the connection carrying this subscription has ended.
+    pub fn closed(&self) -> impl Future<Output = ()> + Send + 'static {
+        let pooled = Arc::clone(&self.call().pooled);
+        async move { pooled.client.closed().await }
+    }
+}
+
+impl<T: std::fmt::Debug> std::fmt::Debug for CoreSubscription<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CoreSubscription")
+            .field("id", &self.held.id)
+            .field("opened", &self.opened)
+            .finish_non_exhaustive()
+    }
+}
+
+/// An open subscription and the connection it is on. Dropping it cancels
+/// the subscription, retiring the connection if that fails.
+struct Subscribed {
+    id: String,
+    call: Option<CoreCall>,
+}
+
+impl Drop for Subscribed {
+    fn drop(&mut self) {
+        let Some(call) = self.call.take() else {
+            return;
+        };
+        if tokio::runtime::Handle::try_current().is_err() {
+            // Nothing left to send a cancel on: ending the connection ends
+            // the subscription.
+            call.retire();
+            return;
+        }
+        let subscription_id = std::mem::take(&mut self.id);
+        zeroclaw_spawn::spawn!(async move {
+            let cancelled = call
+                .request(
+                    Method::SubscriptionCancel,
+                    serde_json::json!({ "subscription_id": subscription_id }),
+                )
+                .await;
+            // Refused (a principal may hold the grant to subscribe and not
+            // the one to cancel) or not taken (a timeout, a lost
+            // connection): the subscription may still be running, so the
+            // connection goes, and the subscription with it.
+            if cancelled.is_err() {
+                call.retire();
+            }
+        });
+    }
+}
+
+impl CoreCall {
+    /// Open a subscription with `method` on this caller's connection, and
+    /// own it across the whole round trip.
+    ///
+    /// The core creates a subscription before it replies. The request runs
+    /// on its own task, so a caller that stops waiting (its future dropped)
+    /// does not take the reply with it: a subscription the core opened
+    /// anyway is cancelled as soon as the reply arrives, and the connection
+    /// is retired if that cancel fails. A reply that names no subscription,
+    /// or a request that timed out, leaves one that cannot be cancelled by
+    /// id, so the connection is retired then too. A refusal opens nothing.
+    pub async fn subscribe<T: DeserializeOwned>(
+        self,
+        method: Method,
+        params: Value,
+    ) -> Result<CoreSubscription<T>, CoreError> {
+        // Listen first: a frame can reach the connection ahead of the reply.
+        let notifications = self.pooled.client.notifications();
+        let (deliver, delivered) = oneshot::channel::<Result<(Value, Subscribed), CoreError>>();
+        zeroclaw_spawn::spawn!(async move {
+            let opened = match self.request(method, params).await {
+                Ok(opened) => opened,
+                Err(error) => {
+                    if matches!(error, CoreError::Timeout) {
+                        // The core may have opened it after all.
+                        self.retire();
+                    }
+                    let _ = deliver.send(Err(error));
+                    return;
+                }
+            };
+            let Some(id) = opened
+                .get("subscription_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+            else {
+                self.retire();
+                let _ = deliver.send(Err(CoreError::Rpc(JsonRpcError {
+                    code: INTERNAL_ERROR,
+                    message: format!("{} named no subscription", method.wire_name()),
+                    data: None,
+                })));
+                return;
+            };
+            let held = Subscribed {
+                id,
+                call: Some(self),
+            };
+            // A caller that has gone hands it back, and dropping it here
+            // cancels it. One that goes after this send drops it unread with
+            // the channel, which cancels it the same way.
+            let _ = deliver.send(Ok((opened, held)));
+        });
+        let (opened, held) = delivered.await.map_err(|_| {
+            CoreError::Unavailable("the subscription request ended without an answer".into())
+        })??;
+        let opened = serde_json::from_value(opened).map_err(|error| {
+            CoreError::Rpc(JsonRpcError {
+                code: INTERNAL_ERROR,
+                message: format!("undecodable {} result: {error}", method.wire_name()),
+                data: None,
+            })
+        })?;
+        Ok(CoreSubscription {
+            opened,
+            notifications,
+            held,
+        })
+    }
+
+    /// Take this connection out of service: out of the pool and closed, so
+    /// the core ends whatever it still holds for it.
+    fn retire(&self) {
+        self.pool.discard(&self.key, &self.slot, &self.pooled);
+        self.pooled.client.shutdown();
     }
 }
 

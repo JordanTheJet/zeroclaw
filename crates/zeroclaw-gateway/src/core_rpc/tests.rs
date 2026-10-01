@@ -1327,3 +1327,352 @@ async fn an_unknown_oidc_alias_is_the_cores_call_and_is_never_pooled() {
     assert_eq!(pool_of(&core).open_connections(), 0);
     cancel.cancel();
 }
+
+// ── Subscriptions ────────────────────────────────────────────────
+
+/// What a [`ProxyDial`] does to the traffic between the pool and the core.
+#[derive(Default)]
+struct Faults {
+    /// Hold the core's reply to the next request with this method.
+    hold: Mutex<Option<&'static str>>,
+    /// The subscription id in the reply being held.
+    held: Mutex<Option<String>>,
+    held_ready: Notify,
+    release: Notify,
+    /// Answer every `subscription/cancel` with a refusal, never reaching the
+    /// core.
+    refuse_cancel: AtomicBool,
+    /// The ids of the `subscription/cancel` requests the core answered.
+    cancelled: Mutex<Vec<String>>,
+    /// The pool closed its side of a connection.
+    closed_by_gateway: AtomicBool,
+}
+
+/// A dialer that puts a line proxy between the pool and the real core, so a
+/// test can hold a reply the core has already sent, or refuse a cancel.
+struct ProxyDial {
+    connector: InprocConnector,
+    faults: Arc<Faults>,
+    dials: Arc<AtomicUsize>,
+}
+
+impl Dial for ProxyDial {
+    fn dial(&self) -> DialFuture<'_> {
+        self.dials.fetch_add(1, Ordering::SeqCst);
+        let faults = Arc::clone(&self.faults);
+        Box::pin(async move {
+            let core = self.connector.dial().await?;
+            let (gateway, proxy) = tokio::io::duplex(64 * 1024);
+            zeroclaw_spawn::spawn!(relay(proxy, core, faults));
+            Some(gateway)
+        })
+    }
+}
+
+async fn relay(gateway: DuplexStream, core: DuplexStream, faults: Arc<Faults>) {
+    let (from_gateway, to_gateway) = tokio::io::split(gateway);
+    let (from_core, mut to_core) = tokio::io::split(core);
+    let to_gateway = Arc::new(tokio::sync::Mutex::new(to_gateway));
+    let held_ids: Arc<Mutex<HashSet<String>>> = Arc::default();
+    let cancels: Arc<Mutex<HashMap<String, String>>> = Arc::default();
+
+    let upstream = {
+        let (faults, to_gateway, held_ids, cancels) = (
+            Arc::clone(&faults),
+            Arc::clone(&to_gateway),
+            Arc::clone(&held_ids),
+            Arc::clone(&cancels),
+        );
+        async move {
+            let mut lines = BufReader::new(from_gateway).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let message: Value = serde_json::from_str(&line).unwrap_or_default();
+                let id = message["id"].to_string();
+                let method = message["method"].as_str();
+                if method == Some("subscription/cancel") {
+                    if faults.refuse_cancel.load(Ordering::SeqCst) {
+                        let refusal = json!({
+                            "jsonrpc": "2.0",
+                            "id": message["id"],
+                            "error": { "code": FORBIDDEN, "message": "refused by the test" },
+                        });
+                        let mut out = to_gateway.lock().await;
+                        let _ = out.write_all(format!("{refusal}\n").as_bytes()).await;
+                        continue;
+                    }
+                    let target = message["params"]["subscription_id"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_owned();
+                    lock(&cancels).insert(id.clone(), target);
+                }
+                let hold = *lock(&faults.hold);
+                if method.is_some() && method == hold {
+                    lock(&held_ids).insert(id);
+                    *lock(&faults.hold) = None;
+                }
+                if to_core
+                    .write_all(format!("{line}\n").as_bytes())
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            faults.closed_by_gateway.store(true, Ordering::SeqCst);
+            let _ = to_core.shutdown().await;
+        }
+    };
+    let downstream = async move {
+        let mut lines = BufReader::new(from_core).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            let message: Value = serde_json::from_str(&line).unwrap_or_default();
+            let id = message["id"].to_string();
+            if message.get("method").is_none() {
+                if lock(&held_ids).remove(&id) {
+                    *lock(&faults.held) = message["result"]["subscription_id"]
+                        .as_str()
+                        .map(str::to_owned);
+                    faults.held_ready.notify_one();
+                    faults.release.notified().await;
+                }
+                if let Some(target) = lock(&cancels).remove(&id) {
+                    lock(&faults.cancelled).push(target);
+                }
+            }
+            let mut out = to_gateway.lock().await;
+            if out.write_all(format!("{line}\n").as_bytes()).await.is_err() {
+                break;
+            }
+        }
+    };
+    tokio::join!(upstream, downstream);
+}
+
+/// A real in-process core that streams events, behind a [`ProxyDial`], with
+/// one paired native bearer.
+fn proxied_core() -> (
+    tempfile::TempDir,
+    Arc<zeroclaw_runtime::rpc::context::RpcContext>,
+    tokio_util::sync::CancellationToken,
+    InprocConnector,
+    CoreRpc,
+    Arc<Faults>,
+    Arc<AtomicUsize>,
+) {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let mut config = zeroclaw_config::schema::Config {
+        data_dir: tmp.path().to_path_buf(),
+        config_path: tmp.path().join("config.toml"),
+        ..Default::default()
+    };
+    config.gateway.require_pairing = true;
+    config.gateway.paired_tokens = vec!["zc_sub".into()];
+    let sessions = Arc::new(zeroclaw_runtime::rpc::session::SessionStore::new(
+        16,
+        Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
+            4, 10, 60,
+        )),
+    ));
+    let mut ctx = zeroclaw_runtime::rpc::context::RpcContext::for_live_test(config, sessions);
+    Arc::get_mut(&mut ctx)
+        .expect("a fresh context has one owner")
+        .event_tx = Some(tokio::sync::broadcast::channel(64).0);
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let connector = InprocConnector::new(cancel.clone());
+    connector.bind(Arc::clone(&ctx));
+    let faults = Arc::new(Faults::default());
+    let dials = Arc::new(AtomicUsize::new(0));
+    let core = CoreRpc::with_dialer(
+        ProxyDial {
+            connector: connector.clone(),
+            faults: Arc::clone(&faults),
+            dials: Arc::clone(&dials),
+        },
+        || true,
+        PoolLimits::default(),
+    );
+    (tmp, ctx, cancel, connector, core, faults, dials)
+}
+
+/// Publish one log frame carrying `probe`.
+fn publish(ctx: &zeroclaw_runtime::rpc::context::RpcContext, probe: &str) {
+    ctx.subscriptions.publish(
+        zeroclaw_runtime::rpc::subscription::Source::Logs,
+        json!({ "type": "log", "message": probe }),
+    );
+}
+
+/// Publish a frame and wait until `live` receives it; return every frame of
+/// `abandoned` that arrived on the connection meanwhile.
+async fn frames_for(
+    ctx: &zeroclaw_runtime::rpc::context::RpcContext,
+    live: &mut CoreSubscription<Value>,
+    abandoned: &str,
+    probe: &str,
+) -> Vec<Value> {
+    publish(ctx, probe);
+    let mut leaked = Vec::new();
+    let reached = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let Ok(note) = live.notifications.recv().await else {
+                continue;
+            };
+            if note.params["subscription_id"] == abandoned {
+                leaked.push(note.params.clone());
+            }
+            if live.is_mine(&note) && note.params["message"] == probe {
+                return;
+            }
+        }
+    })
+    .await;
+    assert!(reached.is_ok(), "the live subscription never saw {probe}");
+    // Give a frame for the abandoned subscription, if any, a moment more.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    while let Ok(note) = live.notifications.try_recv() {
+        if note.params["subscription_id"] == abandoned {
+            leaked.push(note.params);
+        }
+    }
+    leaked
+}
+
+async fn wait_for_cancel(faults: &Faults, id: &str) {
+    wait_until(&format!("the core cancelling {id}"), || {
+        lock(&faults.cancelled)
+            .iter()
+            .any(|cancelled| cancelled == id)
+    })
+    .await;
+}
+
+/// The core opens the subscription and replies, but the caller has stopped
+/// waiting by the time the reply arrives. The late subscription is cancelled
+/// and its connection stays in use, carrying nothing for it.
+#[tokio::test]
+async fn a_caller_that_stops_waiting_leaves_no_subscription_behind() {
+    let (_tmp, ctx, cancel, _connector, core, faults, dials) = proxied_core();
+    *lock(&faults.hold) = Some("logs/subscribe");
+    let caller = call_for(&core, "zc_sub").await;
+    let waiting = zeroclaw_spawn::spawn!(async move {
+        caller
+            .subscribe::<Value>(Method::LogsSubscribe, json!({}))
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), faults.held_ready.notified())
+        .await
+        .expect("the core replied");
+    let abandoned = lock(&faults.held).clone().expect("the reply names it");
+    waiting.abort();
+    assert!(waiting.await.unwrap_err().is_cancelled());
+    faults.release.notify_one();
+
+    // The late subscription is cancelled; the connection stays pooled and
+    // in use.
+    wait_for_cancel(&faults, &abandoned).await;
+    let mut live = call_for(&core, "zc_sub")
+        .await
+        .subscribe::<Value>(Method::LogsSubscribe, json!({}))
+        .await
+        .expect("a live subscription on the same connection");
+    assert_eq!(dials.load(Ordering::SeqCst), 1, "the same connection");
+    let leaked = frames_for(&ctx, &mut live, &abandoned, "after-abandon").await;
+    assert!(
+        leaked.is_empty(),
+        "the abandoned subscription delivered {leaked:?}"
+    );
+    assert!(!faults.closed_by_gateway.load(Ordering::SeqCst));
+    cancel.cancel();
+}
+
+/// The caller held the subscription and dropped it at once, as a failed
+/// upgrade does: it is cancelled.
+#[tokio::test]
+async fn a_subscription_dropped_after_it_opened_is_cancelled() {
+    let (_tmp, ctx, cancel, _connector, core, faults, _dials) = proxied_core();
+    let dropped = call_for(&core, "zc_sub")
+        .await
+        .subscribe::<Value>(Method::LogsSubscribe, json!({}))
+        .await
+        .expect("subscribed");
+    let id = dropped.id().to_owned();
+    assert_eq!(dropped.opened["subscription_id"], id);
+    drop(dropped);
+
+    wait_for_cancel(&faults, &id).await;
+    let mut live = call_for(&core, "zc_sub")
+        .await
+        .subscribe::<Value>(Method::LogsSubscribe, json!({}))
+        .await
+        .expect("a live subscription");
+    let leaked = frames_for(&ctx, &mut live, &id, "after-drop").await;
+    assert!(
+        leaked.is_empty(),
+        "the dropped subscription delivered {leaked:?}"
+    );
+    cancel.cancel();
+}
+
+/// A cancel the core refuses leaves a subscription that cannot be ended by
+/// id. Another request still holds the connection, which alone would keep
+/// it (and the subscription) open, so the connection is retired: closed and
+/// out of the pool, and the next request dials again.
+#[tokio::test]
+async fn a_refused_cancel_retires_the_connection() {
+    let (_tmp, _ctx, cancel, connector, core, faults, dials) = proxied_core();
+    faults.refuse_cancel.store(true, Ordering::SeqCst);
+    let subscription = call_for(&core, "zc_sub")
+        .await
+        .subscribe::<Value>(Method::LogsSubscribe, json!({}))
+        .await
+        .expect("subscribed");
+    let keeper = call_for(&core, "zc_sub").await;
+    assert_eq!(dials.load(Ordering::SeqCst), 1, "both on one connection");
+    assert!(connector.connection_count() > 0);
+    drop(subscription);
+
+    wait_until("the gateway closing the connection", || {
+        faults.closed_by_gateway.load(Ordering::SeqCst)
+    })
+    .await;
+    assert!(
+        keeper.request(Method::Status, json!({})).await.is_err(),
+        "the retired connection serves nothing more"
+    );
+    drop(keeper);
+    wait_until("the core seeing it close", || {
+        connector.connection_count() == 0
+    })
+    .await;
+    call_for(&core, "zc_sub")
+        .await
+        .request(Method::Status, json!({}))
+        .await
+        .expect("the next request");
+    assert_eq!(dials.load(Ordering::SeqCst), 2, "a fresh connection");
+    cancel.cancel();
+}
+
+/// A refused subscribe opens nothing and keeps the connection.
+#[tokio::test]
+async fn a_refused_subscribe_opens_nothing() {
+    let (_tmp, _ctx, cancel, _connector, core, faults, dials) = proxied_core();
+    let refused = call_for(&core, "zc_sub")
+        .await
+        .subscribe::<Value>(
+            Method::LogsSubscribe,
+            json!({ "since_seq": "not a number" }),
+        )
+        .await
+        .expect_err("refused");
+    assert_eq!(status_of(&refused).0, StatusCode::BAD_REQUEST);
+    call_for(&core, "zc_sub")
+        .await
+        .request(Method::Status, json!({}))
+        .await
+        .expect("the connection still serves");
+    assert_eq!(dials.load(Ordering::SeqCst), 1);
+    assert!(!faults.closed_by_gateway.load(Ordering::SeqCst));
+    cancel.cancel();
+}
