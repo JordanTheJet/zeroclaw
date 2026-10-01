@@ -3219,6 +3219,27 @@ impl RpcDispatcher {
                 "process".to_string(),
                 serde_json::to_value(&stats).unwrap_or_default(),
             );
+            // The address the daemon's own gateway listener bound in its
+            // current generation. Absent until it binds, so a client never
+            // mistakes the configured address for a bound one.
+            if let Some(addr) = self
+                .ctx
+                .gateway_binding
+                .as_ref()
+                .and_then(crate::rpc::context::GatewayBinding::bound_addr)
+            {
+                let components = obj
+                    .entry("components")
+                    .or_insert_with(|| Value::Object(serde_json::Map::new()));
+                if let Some(components) = components.as_object_mut() {
+                    let gateway = components
+                        .entry("gateway")
+                        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+                    if let Some(gateway) = gateway.as_object_mut() {
+                        gateway.insert("bound_addr".to_string(), Value::String(addr.to_string()));
+                    }
+                }
+            }
         }
         Ok(val)
     }
@@ -25006,6 +25027,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn health_reports_the_gateway_bound_address_only_once_bound() {
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            config_path: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("data"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let mut ctx = Arc::try_unwrap(RpcContext::minimal(config, sessions))
+            .ok()
+            .expect("minimal test context should be uniquely owned");
+        let bound = Arc::new(std::sync::Mutex::new(None::<std::net::SocketAddr>));
+        let reported = Arc::clone(&bound);
+        ctx.gateway_binding = Some(crate::rpc::context::GatewayBinding::new(move || {
+            *reported.lock().unwrap()
+        }));
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let dispatcher = RpcDispatcher::new(Arc::new(ctx), tx, "test-peer".into());
+
+        let before = dispatcher.handle_health().expect("health result");
+        assert!(
+            before["components"]["gateway"].get("bound_addr").is_none(),
+            "{before}"
+        );
+
+        *bound.lock().unwrap() = Some("127.0.0.1:42617".parse().unwrap());
+        let after = dispatcher.handle_health().expect("health result");
+        assert_eq!(
+            after["components"]["gateway"]["bound_addr"],
+            "127.0.0.1:42617"
+        );
+    }
+
+    #[tokio::test]
     async fn handle_status_includes_runtime_context_fields() {
         let tmp = tempfile::TempDir::new().unwrap();
         let config = zeroclaw_config::schema::Config {
@@ -34550,6 +34607,7 @@ mod tests {
             subscriptions: Arc::new(crate::rpc::subscription::SubscriptionHub::new()),
             reload_tx: None,
             gateway_shutdown_tx: None,
+            gateway_binding: None,
             approval_pending: Arc::new(crate::rpc::context::ApprovalPendingMap::default()),
             tui_registry: Arc::new(crate::rpc::tui_identity::TuiRegistry::new_unsigned()),
             acp_session_store: None,
@@ -34601,6 +34659,7 @@ mod tests {
             subscriptions: Arc::new(crate::rpc::subscription::SubscriptionHub::new()),
             reload_tx: None,
             gateway_shutdown_tx: None,
+            gateway_binding: None,
             approval_pending: Arc::new(crate::rpc::context::ApprovalPendingMap::default()),
             tui_registry: Arc::new(crate::rpc::tui_identity::TuiRegistry::new_unsigned()),
             acp_session_store: None,
@@ -34711,6 +34770,7 @@ mod tests {
             subscriptions: Arc::new(crate::rpc::subscription::SubscriptionHub::new()),
             reload_tx: None,
             gateway_shutdown_tx: None,
+            gateway_binding: None,
             approval_pending: Arc::new(crate::rpc::context::ApprovalPendingMap::default()),
             tui_registry: Arc::new(crate::rpc::tui_identity::TuiRegistry::new_unsigned()),
             acp_session_store: None,

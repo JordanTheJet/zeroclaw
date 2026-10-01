@@ -48,6 +48,11 @@ const SERVICE_LOG_WRITER_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 const DESKTOP_PIPE_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 const DESKTOP_READINESS_FRAME_MAX_BYTES: usize = 4096;
+/// The host the desktop app opens its dashboard on. With RPC readiness the
+/// supervisor pins the daemon's gateway to it, so the address the core
+/// reports as bound is the address the app dials.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+const DESKTOP_GATEWAY_HOST: &str = "127.0.0.1";
 /// How often RPC readiness retries the daemon endpoint while it starts.
 const DESKTOP_ENDPOINT_POLL: Duration = Duration::from_millis(100);
 const SERVICE_STOP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -1444,6 +1449,17 @@ async fn wait_for_desktop_endpoint(
     }
 }
 
+/// The supervised daemon's arguments. `gateway_host`, set in RPC-readiness
+/// mode, overrides the configured gateway host.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+fn desktop_daemon_args(port: u16, gateway_host: Option<&str>) -> Vec<String> {
+    let mut args = vec!["daemon".to_string(), "-p".to_string(), port.to_string()];
+    if let Some(host) = gateway_host {
+        args.extend(["--host".to_string(), host.to_string()]);
+    }
+    args
+}
+
 /// Run the desktop supervisor. `rpc_readiness` selects
 /// [`DesktopReadiness::Rpc`]; without it the supervisor keeps the `READY`
 /// line older desktop apps expect.
@@ -1526,12 +1542,14 @@ async fn run_desktop_capture_with_executable(
     port: u16,
     readiness: DesktopReadiness,
 ) -> Result<()> {
+    let gateway_host =
+        matches!(readiness, DesktopReadiness::Rpc { .. }).then_some(DESKTOP_GATEWAY_HOST);
     run_with_desktop_capture_mode(
         path,
         &readiness,
         move || {
             let mut command = TokioCommand::new(&executable);
-            command.arg("daemon").arg("-p").arg(port.to_string());
+            command.args(desktop_daemon_args(port, gateway_host));
             Ok(command)
         },
         &mut emit_desktop_frame,
@@ -4306,6 +4324,15 @@ mod bounded_service_log_tests {
                 frame.len()
             );
         }
+    }
+
+    #[test]
+    fn desktop_daemon_pins_its_gateway_host_only_for_rpc_readiness() {
+        assert_eq!(desktop_daemon_args(42617, None), ["daemon", "-p", "42617"]);
+        assert_eq!(
+            desktop_daemon_args(42617, Some(DESKTOP_GATEWAY_HOST)),
+            ["daemon", "-p", "42617", "--host", "127.0.0.1"]
+        );
     }
 
     #[test]

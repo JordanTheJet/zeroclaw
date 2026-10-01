@@ -42,10 +42,14 @@ The app then dials that endpoint. On Unix it first checks that the endpoint is
 served by the app's own OS account. It completes the RPC handshake and checks
 the protocol version. For a kernel bundled beside the app, it also checks that
 the kernel's version equals the app's. Only then does it wait, up to 60
-seconds in all, for the dashboard's gateway. The core must report that its
-gateway bound the dashboard port, and the dashboard address must answer
-`/health` as the core's own process. An HTTP answer alone is never enough,
-since any program can hold the port.
+seconds in all, for the dashboard's gateway. In this mode the supervisor pins
+the daemon's gateway to `127.0.0.1` (`--host 127.0.0.1`). The core's RPC
+`health` reports `components.gateway.bound_addr`, the address its gateway
+listener actually bound in its current generation, and only once it has bound.
+That address must equal the dashboard's address (`127.0.0.1:42617`) before the
+app trusts the dashboard's HTTP `/health` or pairs with it. The process ID the
+dashboard address reports over HTTP is a diagnostic: a different one refuses,
+and a matching one admits nothing, since any program can copy it.
 
 The app records the outcome as its startup state. The splash polls that state
 and opens the dashboard only once it is ready, and `open_dashboard` itself

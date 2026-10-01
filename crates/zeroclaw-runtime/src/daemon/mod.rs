@@ -240,6 +240,16 @@ impl StartupReadinessAttempt {
     }
 }
 
+/// The gateway address the RPC `health` report reads: what the current
+/// gateway generation's listener actually bound, `None` before it binds and
+/// once that generation ends.
+fn gateway_binding(
+    readiness_tx: &tokio::sync::watch::Sender<StartupReadiness>,
+) -> crate::rpc::context::GatewayBinding {
+    let readiness = readiness_tx.subscribe();
+    crate::rpc::context::GatewayBinding::new(move || readiness.borrow().gateway_addr)
+}
+
 impl Drop for StartupReadinessAttempt {
     fn drop(&mut self) {
         self.readiness_tx.send_modify(|state| match self.component {
@@ -595,11 +605,12 @@ pub async fn run(
 
     let channels_cancel = tokio_util::sync::CancellationToken::new();
     let (gateway_shutdown_tx, _) = tokio::sync::watch::channel::<bool>(false);
-    let (startup_readiness_tx, startup_readiness_rx) = if startup_feedback_enabled {
+    // The readiness watch also backs the gateway address `health` reports
+    // over RPC, so it exists even without startup feedback; only the
+    // feedback wait reads this receiver.
+    let (startup_readiness_tx, startup_readiness_rx) = {
         let (tx, rx) = tokio::sync::watch::channel(StartupReadiness::default());
-        (Some(tx), Some(rx))
-    } else {
-        (None, None)
+        (Some(tx), startup_feedback_enabled.then_some(rx))
     };
     let (socket_startup_tracker, socket_startup_rx) = SocketStartupTracker::new();
     let mut gateway_required = false;
@@ -928,6 +939,7 @@ pub async fn run(
             },
             reload_tx: Some(reload_tx.clone()),
             gateway_shutdown_tx: Some(gateway_shutdown_tx.clone()),
+            gateway_binding: startup_readiness_tx.as_ref().map(gateway_binding),
             approval_pending: std::sync::Arc::new(
                 crate::rpc::context::ApprovalPendingMap::default(),
             ),
@@ -7051,6 +7063,30 @@ mod tests {
                 ("0.0.0.0".to_string(), 43211),
             ],
             "each gateway start fires the hook exactly once, with its own bound port"
+        );
+    }
+
+    #[test]
+    fn gateway_binding_follows_the_current_gateway_generation() {
+        let (tx, _rx) = tokio::sync::watch::channel(StartupReadiness::default());
+        let binding = gateway_binding(&tx);
+        let addr: std::net::SocketAddr = "127.0.0.1:42617".parse().unwrap();
+
+        let (attempt, reporter) = StartupReadinessAttempt::gateway(Some(tx.clone()));
+        let reporter = reporter.expect("a readiness reporter");
+        assert_eq!(binding.bound_addr(), None, "not bound yet");
+        reporter.report_ready(addr);
+        assert_eq!(binding.bound_addr(), Some(addr));
+
+        drop(attempt);
+        assert_eq!(binding.bound_addr(), None, "that generation ended");
+
+        let (_next, _next_reporter) = StartupReadinessAttempt::gateway(Some(tx.clone()));
+        reporter.report_ready(addr);
+        assert_eq!(
+            binding.bound_addr(),
+            None,
+            "an earlier generation's bind is not the current one"
         );
     }
 

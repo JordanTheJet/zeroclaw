@@ -9,6 +9,7 @@
 
 use crate::gateway_client::GatewayClient;
 use serde_json::Value;
+use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::time::Duration;
 use zeroclaw_rpc_client::{
@@ -199,12 +200,12 @@ pub async fn await_gateway(
     budget: Duration,
 ) -> Result<(), StartupFailure> {
     let client = GatewayClient::new(gateway_url, None);
-    let mut last_gateway_error = None;
+    let mut last_gateway_note = None;
     let wait = async {
         loop {
             let ready = match core {
                 Some(core) => {
-                    launched_gateway_ready(&client, core, gateway_url, &mut last_gateway_error)
+                    launched_gateway_ready(&client, core, gateway_url, &mut last_gateway_note)
                         .await?
                 }
                 None => client.get_health().await.unwrap_or(false),
@@ -217,8 +218,8 @@ pub async fn await_gateway(
     };
     let outcome = tokio::time::timeout(budget, wait).await;
     outcome.unwrap_or_else(|_| {
-        let reported = last_gateway_error
-            .map(|error| format!(" Its gateway last reported: {error}."))
+        let reported = last_gateway_note
+            .map(|note| format!(" Its gateway: {note}."))
             .unwrap_or_default();
         Err(StartupFailure::Timeout(format!(
             "ZeroClaw did not finish starting within {} seconds.{reported} Its log is in the ZeroClaw config directory under logs/zeroclaw-desktop-daemon.log.",
@@ -228,12 +229,21 @@ pub async fn await_gateway(
 }
 
 /// One check of the launched daemon's gateway: `Ok(true)` once the core
-/// reports it bound and the dashboard address answers as the core's process.
+/// reports its gateway listener bound to exactly the dashboard's address and
+/// that address answers `/health`.
+///
+/// The bound address is the proof. It arrives over the verified RPC
+/// connection, from the core's own listener, and only after that listener
+/// bound; the supervisor pins the gateway to the dashboard's host. While the
+/// core holds that exact address no other program can listen on it, so the
+/// HTTP answer there is the core's. The process ID the address reports over
+/// HTTP is a diagnostic only: a different one refuses, but a matching one
+/// admits nothing, since any program can copy it.
 async fn launched_gateway_ready(
     client: &GatewayClient,
     core: &RpcClient,
     gateway_url: &str,
-    last_gateway_error: &mut Option<String>,
+    last_gateway_note: &mut Option<String>,
 ) -> Result<bool, StartupFailure> {
     // The daemon rejects `"params": null`; an empty object is the no-argument
     // form it accepts.
@@ -251,27 +261,49 @@ async fn launched_gateway_ready(
         )));
     }
     let gateway = &health["components"]["gateway"];
-    if gateway["status"].as_str() != Some("ok") {
-        *last_gateway_error = gateway["last_error"].as_str().map(str::to_string);
+    let Some(bound) = gateway["bound_addr"].as_str() else {
+        *last_gateway_note = gateway["last_error"]
+            .as_str()
+            .map(str::to_string)
+            .or_else(|| {
+                (gateway["status"].as_str() == Some("ok"))
+                    .then(|| "it is running but has not reported the address it bound".to_string())
+            });
         return Ok(false);
+    };
+    let dashboard = dashboard_addr(gateway_url).ok_or_else(|| {
+        StartupFailure::Incompatible(format!(
+            "The dashboard address {gateway_url} is not an IP address and port this app can check."
+        ))
+    })?;
+    if bound.parse::<SocketAddr>().ok() != Some(dashboard) {
+        return Err(StartupFailure::PortHeld(format!(
+            "The ZeroClaw core's gateway is listening on {bound}, not on the dashboard's address {dashboard}. Another program may hold that address; close it and reopen ZeroClaw."
+        )));
     }
-    // The core's gateway is bound and serving. A program bound to a more
-    // specific address on the same port would still take loopback
-    // connections, so the address must answer as the core's own process.
     let Some(report) = client.health_report().await else {
         return Ok(false);
     };
     let core_pid = core.handshake().server_pid;
     match report["runtime"]["pid"].as_u64() {
-        Some(pid) if pid == u64::from(core_pid) => Ok(true),
-        answered => Err(StartupFailure::PortHeld(format!(
-            "Another program answers on the dashboard's address {gateway_url} ({}), not the ZeroClaw core this app started (process {core_pid}). Close it and reopen ZeroClaw.",
-            answered.map_or_else(
-                || "it does not report a ZeroClaw process".to_string(),
-                |pid| format!("it reports process {pid}")
-            )
+        Some(pid) if pid != u64::from(core_pid) => Err(StartupFailure::PortHeld(format!(
+            "The dashboard's address {gateway_url} answers as process {pid}, not the ZeroClaw core this app started (process {core_pid}). Close the other program and reopen ZeroClaw."
         ))),
+        _ => Ok(true),
     }
+}
+
+/// The dashboard's socket address, from its URL: an IP literal and a port.
+fn dashboard_addr(gateway_url: &str) -> Option<SocketAddr> {
+    let url = reqwest::Url::parse(gateway_url).ok()?;
+    let host = url.host_str()?;
+    let ip: IpAddr = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host)
+        .parse()
+        .ok()?;
+    Some(SocketAddr::new(ip, url.port_or_known_default()?))
 }
 
 #[cfg(test)]
@@ -403,7 +435,12 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn a_foreign_http_answer_does_not_override_the_core_s_port_failure() {
-        let core = FakeCore::start("held", gateway_health("error", Some(PORT_HELD)), false).await;
+        let core = FakeCore::start(
+            "held",
+            gateway_health("error", Some(PORT_HELD), None),
+            false,
+        )
+        .await;
         let control = await_gateway(&fake_http(503, None), Some(&core.client), SHORT).await;
         assert!(
             matches!(control, Err(StartupFailure::PortHeld(_))),
@@ -423,39 +460,92 @@ mod tests {
         );
     }
 
-    /// The core's gateway reports itself bound, but the dashboard address
-    /// answers as another process (or as no ZeroClaw at all).
+    /// The core reports its gateway bound to the dashboard address, but that
+    /// address answers as another process: the PID mismatch still refuses.
     #[cfg(unix)]
     #[tokio::test]
-    async fn an_address_answering_as_another_process_is_not_the_launched_gateway() {
-        let core = FakeCore::start("other", gateway_health("ok", None), false).await;
+    async fn an_address_answering_as_another_process_is_refused() {
         let other_pid = std::process::id() + 1;
-        for body in [Some(json!({ "runtime": { "pid": other_pid } })), None] {
-            let outcome =
-                await_gateway(&fake_http(200, body.clone()), Some(&core.client), SHORT).await;
-            match outcome {
-                Err(StartupFailure::PortHeld(message)) => {
-                    assert!(
-                        message.contains(&std::process::id().to_string()),
-                        "{message}"
-                    );
-                }
-                other => panic!("{body:?}: expected PortHeld, got {other:?}"),
+        let gateway = fake_http(200, Some(json!({ "runtime": { "pid": other_pid } })));
+        let core = FakeCore::start(
+            "other",
+            gateway_health("ok", None, Some(&bound_addr_of(&gateway))),
+            false,
+        )
+        .await;
+        match await_gateway(&gateway, Some(&core.client), SHORT).await {
+            Err(StartupFailure::PortHeld(message)) => {
+                assert!(message.contains(&other_pid.to_string()), "{message}");
             }
+            other => panic!("expected PortHeld, got {other:?}"),
         }
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn the_launched_gateway_is_ready_once_the_core_and_its_address_agree() {
-        let core = FakeCore::start("agree", gateway_health("ok", None), false).await;
+    async fn the_launched_gateway_is_ready_once_the_core_reports_the_dashboard_address_bound() {
         let gateway = fake_http(
             200,
             Some(json!({ "runtime": { "pid": std::process::id() } })),
         );
+        let core = FakeCore::start(
+            "agree",
+            gateway_health("ok", None, Some(&bound_addr_of(&gateway))),
+            false,
+        )
+        .await;
         await_gateway(&gateway, Some(&core.client), SHORT)
             .await
             .expect("the core's own gateway answers");
+    }
+
+    /// The core's gateway is bound somewhere else (here IPv6 loopback on the
+    /// same port), while a separate process listens on the dashboard address
+    /// and reports the core's real process ID. Copying the ID gains nothing:
+    /// only the address the core reports as bound admits.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_distinct_process_copying_the_core_pid_is_refused() {
+        let core_pid = std::process::id();
+        let mut impostor = CopiedPidServer::start(core_pid);
+        assert_ne!(impostor.pid(), core_pid, "the impostor is its own process");
+        let dashboard = format!("http://127.0.0.1:{}", impostor.port);
+        let core = FakeCore::start(
+            "copied",
+            gateway_health("ok", None, Some(&format!("[::1]:{}", impostor.port))),
+            false,
+        )
+        .await;
+
+        let outcome = await_gateway(&dashboard, Some(&core.client), SHORT).await;
+        impostor.stop();
+        match outcome {
+            Err(StartupFailure::PortHeld(message)) => {
+                assert!(message.contains("[::1]"), "{message}");
+            }
+            other => panic!("the copied process ID must not admit the address: {other:?}"),
+        }
+    }
+
+    /// Without a bound address from the core, an HTTP answer carrying the
+    /// core's own process ID is still not readiness.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_core_pid_alone_never_admits_the_dashboard_address() {
+        let gateway = fake_http(
+            200,
+            Some(json!({ "runtime": { "pid": std::process::id() } })),
+        );
+        let core = FakeCore::start("unbound", gateway_health("ok", None, None), false).await;
+        match await_gateway(&gateway, Some(&core.client), Duration::from_millis(300)).await {
+            Err(StartupFailure::Timeout(message)) => {
+                assert!(
+                    message.contains("has not reported the address it bound"),
+                    "{message}"
+                );
+            }
+            other => panic!("expected a timeout, got {other:?}"),
+        }
     }
 
     /// An HTTP answer, even from the right process, is not readiness while
@@ -466,7 +556,7 @@ mod tests {
     async fn a_gateway_the_core_does_not_report_bound_is_not_ready() {
         let core = FakeCore::start(
             "start",
-            gateway_health("error", Some("TLS key missing")),
+            gateway_health("error", Some("TLS key missing"), None),
             false,
         )
         .await;
@@ -487,7 +577,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn the_gateway_deadline_bounds_an_in_flight_core_request() {
-        let core = FakeCore::start("stall", gateway_health("ok", None), true).await;
+        let core = FakeCore::start("stall", gateway_health("ok", None, None), true).await;
         let gateway = fake_http(503, None);
         let started = Instant::now();
         let outcome = tokio::time::timeout(
@@ -518,8 +608,115 @@ mod tests {
     const PORT_HELD: &str = "Failed to bind 127.0.0.1:42617: Address already in use (os error 48)";
 
     #[cfg(unix)]
-    fn gateway_health(status: &str, last_error: Option<&str>) -> Value {
-        json!({ "components": { "gateway": { "status": status, "last_error": last_error } } })
+    fn gateway_health(status: &str, last_error: Option<&str>, bound_addr: Option<&str>) -> Value {
+        let mut gateway = json!({ "status": status, "last_error": last_error });
+        if let Some(bound_addr) = bound_addr {
+            gateway["bound_addr"] = json!(bound_addr);
+        }
+        json!({ "components": { "gateway": gateway } })
+    }
+
+    /// The `host:port` a `fake_http` URL listens on.
+    #[cfg(unix)]
+    fn bound_addr_of(url: &str) -> String {
+        url.trim_start_matches("http://").to_string()
+    }
+
+    #[cfg(unix)]
+    const COPIED_PID_ENV: &str = "ZEROCLAW_DESKTOP_TEST_COPIED_PID";
+
+    /// A separate process serving `/health` on a loopback port and reporting
+    /// whatever process ID it is given: the test binary itself, re-run as
+    /// [`copied_pid_http_helper`].
+    #[cfg(unix)]
+    struct CopiedPidServer {
+        child: std::process::Child,
+        port: u16,
+    }
+
+    #[cfg(unix)]
+    impl CopiedPidServer {
+        fn start(reported_pid: u32) -> Self {
+            use std::io::BufRead;
+            let mut child =
+                std::process::Command::new(std::env::current_exe().expect("test binary"))
+                    .args([
+                        "--exact",
+                        "readiness::tests::copied_pid_http_helper",
+                        "--ignored",
+                        "--nocapture",
+                        "--test-threads=1",
+                    ])
+                    .env(COPIED_PID_ENV, reported_pid.to_string())
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .expect("start the impostor process");
+            let stdout = child.stdout.take().expect("impostor stdout");
+            let port = std::io::BufReader::new(stdout)
+                .lines()
+                .map_while(Result::ok)
+                // libtest's own `test … ...` prefix can share the line.
+                .find_map(|line| {
+                    line.rsplit_once("PORT ")
+                        .and_then(|(_, port)| port.trim().parse().ok())
+                })
+                .expect("the impostor reports its port");
+            Self { child, port }
+        }
+
+        fn pid(&self) -> u32 {
+            self.child.id()
+        }
+
+        fn stop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for CopiedPidServer {
+        fn drop(&mut self) {
+            self.stop();
+        }
+    }
+
+    /// The impostor process for `a_distinct_process_copying_the_core_pid_is_refused`.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "subprocess helper for a_distinct_process_copying_the_core_pid_is_refused"]
+    fn copied_pid_http_helper() {
+        use std::io::{BufRead, BufReader, Write};
+        let Some(pid) = std::env::var_os(COPIED_PID_ENV) else {
+            return;
+        };
+        let body = json!({ "status": "ok", "runtime": { "pid": pid.to_string_lossy().parse::<u32>().unwrap() } })
+            .to_string();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        println!("PORT {}", listener.local_addr().unwrap().port());
+        std::io::stdout().flush().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < deadline {
+            let Ok((stream, _)) = listener.accept() else {
+                std::thread::sleep(Duration::from_millis(10));
+                continue;
+            };
+            let _ = stream.set_nonblocking(false);
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            while reader.read_line(&mut line).unwrap_or(0) > 0 && line != "\r\n" {
+                line.clear();
+            }
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = reader.get_mut().write_all(response.as_bytes());
+        }
+        std::process::exit(0);
     }
 
     /// A launched core on a private socket, already verified: it answers

@@ -121,6 +121,24 @@ impl ApprovalPendingMap {
 /// value into delegated handlers without lifetime coupling.
 pub(crate) type ConfigWriteGuard = tokio::sync::OwnedMutexGuard<()>;
 
+/// Where the daemon's own gateway listener is bound: the address it actually
+/// got, for the current gateway generation. `None` until that generation
+/// binds, and again once it ends, until the next generation binds.
+#[derive(Clone)]
+pub struct GatewayBinding(Arc<dyn Fn() -> Option<std::net::SocketAddr> + Send + Sync>);
+
+impl GatewayBinding {
+    pub fn new(
+        bound_addr: impl Fn() -> Option<std::net::SocketAddr> + Send + Sync + 'static,
+    ) -> Self {
+        Self(Arc::new(bound_addr))
+    }
+
+    pub fn bound_addr(&self) -> Option<std::net::SocketAddr> {
+        (self.0)()
+    }
+}
+
 /// Daemon-wide state shared across all RPC connections.
 pub struct RpcContext {
     /// Live config behind a read-write lock so `config/set` can mutate
@@ -176,6 +194,10 @@ pub struct RpcContext {
     /// Write `true` to ask the current gateway listener to shut down before
     /// daemon reload rebinds the same address.
     pub gateway_shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
+
+    /// The daemon gateway's bound address, reported by `health`. `None` when
+    /// this context has no daemon gateway (standalone and test contexts).
+    pub gateway_binding: Option<GatewayBinding>,
 
     /// In-flight approval requests waiting for session/approve RPC calls.
     pub approval_pending: Arc<ApprovalPendingMap>,
@@ -274,6 +296,7 @@ impl RpcContext {
             subscriptions: Arc::new(crate::rpc::subscription::SubscriptionHub::new()),
             reload_tx: None,
             gateway_shutdown_tx: None,
+            gateway_binding: None,
             approval_pending: Arc::new(ApprovalPendingMap::default()),
             tui_registry: Arc::new(TuiRegistry::new(&tui_dir)),
             acp_session_store: AcpSessionStore::new(data_dir.as_path()).ok().map(Arc::new),
@@ -303,6 +326,7 @@ impl RpcContext {
             subscriptions: Arc::new(crate::rpc::subscription::SubscriptionHub::new()),
             reload_tx: None,
             gateway_shutdown_tx: None,
+            gateway_binding: None,
             approval_pending: Arc::new(ApprovalPendingMap::default()),
             tui_registry: Arc::new(TuiRegistry::new_unsigned()),
             acp_session_store: None,
@@ -341,6 +365,7 @@ impl RpcContext {
             subscriptions: Arc::new(crate::rpc::subscription::SubscriptionHub::new()),
             reload_tx: None,
             gateway_shutdown_tx: None,
+            gateway_binding: None,
             approval_pending: Arc::new(ApprovalPendingMap::default()),
             tui_registry: Arc::new(TuiRegistry::new_unsigned()),
             acp_session_store: None,
@@ -420,6 +445,7 @@ impl RpcContext {
             subscriptions,
             reload_tx: None,
             gateway_shutdown_tx: None,
+            gateway_binding: None,
             approval_pending: Arc::new(ApprovalPendingMap::default()),
             tui_registry: Arc::new(TuiRegistry::new_unsigned()),
             acp_session_store: None,
@@ -453,6 +479,7 @@ impl RpcContext {
             subscriptions: Arc::new(crate::rpc::subscription::SubscriptionHub::new()),
             reload_tx: None,
             gateway_shutdown_tx: None,
+            gateway_binding: None,
             approval_pending: Arc::new(ApprovalPendingMap::default()),
             tui_registry: Arc::new(TuiRegistry::new_unsigned()),
             acp_session_store: None,
@@ -492,6 +519,7 @@ impl RpcContext {
             subscriptions: Arc::new(crate::rpc::subscription::SubscriptionHub::new()),
             reload_tx: None,
             gateway_shutdown_tx: None,
+            gateway_binding: None,
             approval_pending: Arc::new(ApprovalPendingMap::default()),
             tui_registry: Arc::new(TuiRegistry::new_unsigned()),
             acp_session_store: None,
@@ -524,6 +552,7 @@ impl RpcContext {
             subscriptions: Arc::new(crate::rpc::subscription::SubscriptionHub::new()),
             reload_tx: None,
             gateway_shutdown_tx: None,
+            gateway_binding: None,
             approval_pending: Arc::new(ApprovalPendingMap::default()),
             tui_registry: Arc::new(TuiRegistry::new_unsigned()),
             acp_session_store: None,
@@ -557,6 +586,7 @@ impl RpcContext {
             subscriptions: Arc::new(crate::rpc::subscription::SubscriptionHub::new()),
             reload_tx: None,
             gateway_shutdown_tx: None,
+            gateway_binding: None,
             approval_pending: Arc::new(ApprovalPendingMap::default()),
             tui_registry: Arc::new(TuiRegistry::new_unsigned()),
             acp_session_store: None,
@@ -591,6 +621,7 @@ impl RpcContext {
             subscriptions: Arc::new(crate::rpc::subscription::SubscriptionHub::new()),
             reload_tx: None,
             gateway_shutdown_tx: None,
+            gateway_binding: None,
             approval_pending: Arc::new(ApprovalPendingMap::default()),
             tui_registry: Arc::new(TuiRegistry::new_unsigned()),
             acp_session_store,
@@ -625,6 +656,7 @@ impl RpcContext {
             subscriptions: Arc::new(crate::rpc::subscription::SubscriptionHub::new()),
             reload_tx,
             gateway_shutdown_tx,
+            gateway_binding: None,
             approval_pending: Arc::new(ApprovalPendingMap::default()),
             tui_registry: Arc::new(TuiRegistry::new_unsigned()),
             acp_session_store: None,
