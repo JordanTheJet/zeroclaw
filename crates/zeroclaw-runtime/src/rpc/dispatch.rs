@@ -751,6 +751,13 @@ async fn drain_channel_generation_without_dispatcher(
     schedule_daemon_reload_from_parts(reload_tx, gateway_shutdown_tx, "config-channel-generation");
 }
 
+/// Test-created synchronization at the status overview's read boundary.
+#[cfg(test)]
+struct StatusOverviewTestHooks {
+    before_read: Arc<dyn Fn() + Send + Sync>,
+    after_read: Arc<dyn Fn() + Send + Sync>,
+}
+
 /// Per-connection dispatcher. Shared state lives in [`RpcContext`].
 pub struct RpcDispatcher {
     ctx: Arc<RpcContext>,
@@ -809,6 +816,8 @@ pub struct RpcDispatcher {
     /// on its ledger status (a revoked cert cannot self-renew, A5) and authz still
     /// resolves from the registry.
     peer_cert_fingerprint: Option<String>,
+    #[cfg(test)]
+    status_overview_test_hooks: Option<Arc<StatusOverviewTestHooks>>,
 }
 
 /// Read an allowlisted personality file through a handle on `workspace`, with
@@ -939,6 +948,8 @@ impl RpcDispatcher {
             uploads: std::sync::Mutex::default(),
             initialize_deadline: None,
             peer_cert_fingerprint: None,
+            #[cfg(test)]
+            status_overview_test_hooks: None,
         }
     }
 
@@ -2732,6 +2743,8 @@ impl RpcDispatcher {
             // Prompt handles do not read frames.
             initialize_deadline: None,
             peer_cert_fingerprint: self.peer_cert_fingerprint.clone(),
+            #[cfg(test)]
+            status_overview_test_hooks: self.status_overview_test_hooks.clone(),
         }
     }
 
@@ -3688,12 +3701,21 @@ impl RpcDispatcher {
             .map(|b| b.list_sessions_with_metadata().len())
             .unwrap_or(0);
         let total = ids.len().max(persisted_count);
-        // The caller's grants are resolved again here, after every await
-        // above, rather than read from the connection's stamp: a policy
-        // publication can land while the request waits, and the answer must
-        // reflect the caller's entitlement when the agent's details are read.
+        // Resolve after every await, and hold authority until the overview
+        // has been read: a policy publication or pairing revocation must not
+        // land between the agent-selector check and the data it guards.
         let overview = if req.overview {
-            let grants = self.recheck_authority_after_admission(Method::Status)?;
+            let lease = self.ctx.auth.hold_authority();
+            let grants = self
+                .auth
+                .as_ref()
+                .map(|auth| {
+                    current_authority_under(&lease, auth, Method::Status).map_err(|denied| {
+                        self.audit_auth_denial(Method::Status, &denied);
+                        rpc_err(denied.code, denied.message)
+                    })
+                })
+                .transpose()?;
             if let Some(alias) = agent {
                 match &grants {
                     Some(grants) => {
@@ -3704,7 +3726,17 @@ impl RpcDispatcher {
                     None => self.selector_agent(Method::Status, alias)?,
                 }
             }
-            Some(self.status_overview(agent))
+            #[cfg(test)]
+            if let Some(hooks) = &self.status_overview_test_hooks {
+                (hooks.before_read)();
+            }
+            let overview = self.status_overview(agent);
+            #[cfg(test)]
+            if let Some(hooks) = &self.status_overview_test_hooks {
+                (hooks.after_read)();
+            }
+            drop(lease);
+            Some(overview)
         } else {
             None
         };
@@ -16338,6 +16370,114 @@ mod tests {
         assert!(waited.get("result").is_none(), "{waited}");
         let fresh = rpc(&mut alice, &mut rx, 3, "status", params).await;
         assert_eq!(fresh["error"]["code"], json!(FORBIDDEN), "{fresh}");
+    }
+
+    /// A real status request keeps a concurrent policy publication queued
+    /// from its final selector check through the selected agent's read.
+    #[tokio::test]
+    async fn status_overview_holds_authority_through_the_agent_read() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use zeroclaw_api::grants::{Resource, Verb};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = agent_scoped_config_in(&tmp, 4242);
+        config
+            .permission_profiles
+            .get_mut("cron-alpha")
+            .unwrap()
+            .grants
+            .insert(Resource::System, vec![Verb::Read]);
+        let mut narrowed = config.clone();
+        narrowed
+            .permission_profiles
+            .get_mut("cron-alpha")
+            .unwrap()
+            .allowed_agents
+            .clear();
+        let ctx = enforcement_ctx(config);
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+        let revision = ctx.auth.accepted_revision().saturating_add(1);
+        let timeline: RaceTimeline = Arc::default();
+        let published = Arc::new(AtomicBool::new(false));
+        let publisher = Arc::new(std::sync::Mutex::new(None));
+        let before_read = {
+            let (ctx, timeline, published, publisher) = (
+                Arc::clone(&ctx),
+                Arc::clone(&timeline),
+                Arc::clone(&published),
+                Arc::clone(&publisher),
+            );
+            Arc::new(move || {
+                let handle = {
+                    let (auth, narrowed, timeline, published) = (
+                        Arc::clone(&ctx.auth),
+                        narrowed.clone(),
+                        Arc::clone(&timeline),
+                        Arc::clone(&published),
+                    );
+                    std::thread::spawn(move || {
+                        auth.publish_accepted(&narrowed, revision).unwrap();
+                        published.store(true, Ordering::SeqCst);
+                        timeline.lock().unwrap().push("publication finished");
+                    })
+                };
+                *publisher.lock().unwrap() = Some(handle);
+                let started = std::time::Instant::now();
+                while !ctx.auth.publication_queued_behind_a_lease() {
+                    assert!(
+                        !published.load(Ordering::SeqCst),
+                        "publication finished between the selector check and the read"
+                    );
+                    assert!(
+                        started.elapsed() < std::time::Duration::from_secs(10),
+                        "publication never reached its lock"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                timeline
+                    .lock()
+                    .unwrap()
+                    .push("publication queued before read");
+            })
+        };
+        let after_read = {
+            let (ctx, timeline, published) = (
+                Arc::clone(&ctx),
+                Arc::clone(&timeline),
+                Arc::clone(&published),
+            );
+            Arc::new(move || {
+                assert!(ctx.auth.publication_queued_behind_a_lease());
+                assert!(!published.load(Ordering::SeqCst));
+                timeline
+                    .lock()
+                    .unwrap()
+                    .push("overview read before publication");
+            })
+        };
+        alice.status_overview_test_hooks = Some(Arc::new(StatusOverviewTestHooks {
+            before_read,
+            after_read,
+        }));
+        let params = json!({"overview": true, "agent": "alpha"});
+        let response = rpc(&mut alice, &mut rx, 1, "status", params.clone()).await;
+        alice.status_overview_test_hooks = None;
+        publisher.lock().unwrap().take().unwrap().join().unwrap();
+        assert_eq!(
+            response["result"]["overview"]["agent_alias"],
+            json!("alpha")
+        );
+        assert_eq!(
+            *timeline.lock().unwrap(),
+            [
+                "publication queued before read",
+                "overview read before publication",
+                "publication finished",
+            ]
+        );
+        let refused = rpc(&mut alice, &mut rx, 2, "status", params).await;
+        assert_eq!(refused["error"]["code"], json!(FORBIDDEN), "{refused}");
+        assert!(refused.get("result").is_none(), "{refused}");
     }
 
     #[tokio::test]
