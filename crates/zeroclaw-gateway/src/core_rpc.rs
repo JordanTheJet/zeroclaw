@@ -103,7 +103,7 @@ const OIDC_BEARER_MESSAGE: &str =
 /// unchanged from the config route layer's.
 const INVALID_PROVIDER_MESSAGE: &str = "Invalid auth_provider selection";
 
-pub(crate) type DialFuture<'a> = Pin<Box<dyn Future<Output = Option<DuplexStream>> + Send + 'a>>;
+type DialFuture<'a> = Pin<Box<dyn Future<Output = Option<DuplexStream>> + Send + 'a>>;
 
 /// Opens a transport to the core. The in-process connector implements it;
 /// tests substitute their own.
@@ -143,12 +143,6 @@ impl CoreRpc {
         pairing_required: impl Fn() -> bool + Send + Sync + 'static,
     ) -> Self {
         Self::with_dialer(connector, pairing_required, PoolLimits::default())
-    }
-
-    /// A handle over any dialer, for route tests outside this module.
-    #[cfg(test)]
-    pub(crate) fn over_dialer(dialer: impl Dial) -> Self {
-        Self::with_dialer(dialer, || true, PoolLimits::default())
     }
 
     fn with_dialer(
