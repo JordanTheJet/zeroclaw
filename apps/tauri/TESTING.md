@@ -27,6 +27,41 @@ On launch:
 > `503 "no daemon supervisor — running as standalone gateway"`, so the new agent
 > won't go live until the process is restarted. The daemon hot-reloads instead.
 
+### Readiness when the app starts its own daemon
+
+When the kernel supports it (the app checks with
+`zeroclaw service run-desktop-daemon --rpc-readiness --help`), the app launches
+the supervisor with `--rpc-readiness`. The supervisor then:
+
+1. resolves the daemon's RPC endpoint with the kernel's own resolver;
+2. passes it to the daemon as `ZEROCLAW_SOCKET`;
+3. reports `READY {"endpoint":…,"pid":…}` only once that endpoint accepts
+   connections served by the daemon it started.
+
+The app then dials that endpoint. On Unix it first checks that the endpoint is
+served by the app's own OS account. It completes the RPC handshake and checks
+the protocol version. For a kernel bundled beside the app, it also checks that
+the kernel's version equals the app's. Only then does it wait, up to 60
+seconds, for the dashboard's `/health`.
+
+Each way this can fail shows its own message on the splash:
+
+| Splash kind | Cause |
+|---|---|
+| `endpoint_held` | Another process already serves the endpoint, or serves it as another account. |
+| `incompatible` | The protocol differs, or a bundled kernel's version differs from the app's. |
+| `port_held` | The core reports that its gateway could not bind the dashboard port. |
+| `timeout` | A deadline passed: the kernel's capability check, the supervisor's readiness report (60 seconds with `--rpc-readiness`, 10 without), or the dashboard's `/health` after it. |
+
+The app stops the daemon it started on every failure except a `/health`
+timeout, where the daemon may still finish starting. A supervisor that never
+reports readiness is stopped.
+
+A kernel without `--rpc-readiness` rejects the flag in that check. The app then
+uses the original `READY` line and waits for `/health` with the same deadline.
+Older apps never pass the flag, so a newer kernel answers them with the exact
+`READY` line they expect.
+
 The desktop supervisor writes combined daemon stdout and stderr to `<config-dir>/logs/zeroclaw-desktop-daemon.log`, where `<config-dir>` follows canonical config resolution precedence: `ZEROCLAW_CONFIG_DIR`, then `ZEROCLAW_DATA_DIR`, then deprecated `ZEROCLAW_WORKSPACE`, then Homebrew/default resolution. The capture is capped at 8 MiB and retains the newest tail when the cap is crossed.
 
 ## Self-contained build (bundled kernel)

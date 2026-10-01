@@ -106,17 +106,24 @@
       // can't (e.g. the `zeroclaw` binary is missing). Once a status arrives it
       // owns the message, so the polling loop stops overwriting it.
       let statusLocked = false;
+      // Failures that mean the daemon this app started can never serve the
+      // dashboard: stop polling so a foreign process on the port is never
+      // opened as the dashboard.
+      const FINAL_KINDS = new Set(["incompatible", "endpoint_held", "port_held"]);
+      const ERROR_KINDS = new Set(["error", "missing", "timeout", ...FINAL_KINDS]);
+      let finalFailure = false;
       window.__TAURI__?.event
         ?.listen("zeroclaw://splash-status", (event) => {
           const { kind, message } = event.payload ?? {};
           if (!message) return;
           statusLocked = true;
           statusEl.textContent = message;
-          if (kind === "error" || kind === "missing") {
+          if (ERROR_KINDS.has(kind)) {
             spinnerEl.style.display = "none";
             statusEl.classList.add("error");
             hintEl.classList.remove("show");
           }
+          if (FINAL_KINDS.has(kind)) finalFailure = true;
         })
         .catch(() => {});
 
@@ -124,7 +131,7 @@
       let attempts = 0;
 
       async function tick() {
-        if (launching) return;
+        if (launching || finalFailure) return;
         attempts += 1;
 
         let healthy = false;

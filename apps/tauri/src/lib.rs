@@ -6,6 +6,7 @@ pub mod daemon;
 pub mod gateway_client;
 pub mod health;
 pub mod macos;
+pub mod readiness;
 pub mod state;
 pub mod tray;
 
@@ -23,7 +24,8 @@ const GATEWAY_PORT: u16 = 42617;
 /// harmless.
 #[derive(Clone, serde::Serialize)]
 struct SplashStatus {
-    /// `starting` | `error` | `missing`.
+    /// `starting` | `error` | `missing` | `timeout` | `incompatible` |
+    /// `endpoint_held` | `port_held`.
     kind: &'static str,
     message: String,
 }
@@ -57,17 +59,65 @@ async fn ensure_daemon(app: tauri::AppHandle, state: state::SharedState) {
                     message: "Starting the ZeroClaw daemon…".to_string(),
                 },
             );
-            if let Err(e) = daemon::spawn_daemon(&bin, GATEWAY_PORT) {
-                let _ = app.emit(
-                    "zeroclaw://splash-status",
-                    SplashStatus {
-                        kind: "error",
-                        message: format!("Couldn't start the ZeroClaw daemon: {e}"),
-                    },
-                );
+            let bundled = daemon::is_bundled_kernel(&bin);
+            match daemon::spawn_daemon(&bin, GATEWAY_PORT) {
+                Err(e) => {
+                    let status = match daemon::ReadinessFailure::from_launch_error(&e) {
+                        Some(failure) if failure.reason == "endpoint_held" => SplashStatus {
+                            kind: "endpoint_held",
+                            message: format!(
+                                "Couldn't start the ZeroClaw daemon: {failure}. Stop the other ZeroClaw and reopen the app."
+                            ),
+                        },
+                        _ if e.kind() == std::io::ErrorKind::TimedOut => SplashStatus {
+                            kind: "timeout",
+                            message: format!("Couldn't start the ZeroClaw daemon in time: {e}"),
+                        },
+                        _ => SplashStatus {
+                            kind: "error",
+                            message: format!("Couldn't start the ZeroClaw daemon: {e}"),
+                        },
+                    };
+                    let _ = app.emit("zeroclaw://splash-status", status);
+                }
+                Ok(mut launched) => {
+                    let outcome = match &launched.readiness {
+                        daemon::Readiness::Rpc { endpoint, pid } => {
+                            match readiness::verify_core(endpoint, *pid, bundled).await {
+                                Ok(core) => {
+                                    readiness::await_gateway(
+                                        &url,
+                                        Some(&core),
+                                        readiness::GATEWAY_READY_DEADLINE,
+                                    )
+                                    .await
+                                }
+                                Err(failure) => Err(failure),
+                            }
+                        }
+                        // An older kernel reports readiness at daemon start;
+                        // only the gateway's health can say more.
+                        daemon::Readiness::Spawned => {
+                            readiness::await_gateway(&url, None, readiness::GATEWAY_READY_DEADLINE)
+                                .await
+                        }
+                    };
+                    if let Err(failure) = outcome {
+                        let _ = app.emit(
+                            "zeroclaw://splash-status",
+                            SplashStatus {
+                                kind: failure.kind(),
+                                message: failure.message().to_string(),
+                            },
+                        );
+                        if failure.is_final() {
+                            let _ = daemon::terminate_supervisor_tree(&mut launched.child);
+                        }
+                    }
+                    // On success the splash's health poll detects the gateway
+                    // and calls `open_dashboard`.
+                }
             }
-            // On success the splash's health poll detects the daemon and
-            // calls `open_dashboard`.
         }
         None => {
             let _ = app.emit(

@@ -14260,6 +14260,7 @@ dependencies = [
  "tauri-plugin-store",
  "tauri-utils",
  "tokio",
+ "zeroclaw-rpc-client",
 ]
 
 [[package]]
