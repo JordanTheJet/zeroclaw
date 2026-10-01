@@ -507,6 +507,10 @@ mod tests {
         assert!(validator.is_valid(&json!({ "sop": sop, "original_name": "old" })));
         assert!(!validator.is_valid(&json!({})), "one form is required");
         assert!(
+            !validator.is_valid(&json!({ "name": null })),
+            "the stored selector is a string"
+        );
+        assert!(
             !validator.is_valid(&json!({ "sop": 7, "name": "deploy" })),
             "a malformed draft does not fall back to the stored form"
         );

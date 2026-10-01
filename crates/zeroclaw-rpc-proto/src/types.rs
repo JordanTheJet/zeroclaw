@@ -1782,7 +1782,14 @@ rpc_type! {
         schemars(extend("anyOf" = [{ "required": ["sop"] }, { "required": ["name"] }]))
     )]
     pub struct SopValidateParams {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        /// A present `null` stays `Some(Value::Null)`, so a malformed draft
+        /// keeps its draft form through a round trip instead of becoming a
+        /// stored-SOP request.
+        #[serde(
+            default,
+            deserialize_with = "present_value",
+            skip_serializing_if = "Option::is_none"
+        )]
         #[cfg_attr(
             feature = "schema-export",
             schemars(schema_with = "zeroclaw_api::jsonrpc::sop_document_schema")
@@ -1790,7 +1797,10 @@ rpc_type! {
         pub sop: Option<Value>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub original_name: Option<String>,
+        /// The stored selector must be a string when present; the handler
+        /// reads it as one.
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "schema-export", schemars(with = "String"))]
         pub name: Option<String>,
     }
 }
@@ -2262,6 +2272,14 @@ mod tests {
             serde_json::from_value(json!({ "name": "deploy" })).unwrap();
         assert!(stored.sop.is_none());
         assert_eq!(stored.name.as_deref(), Some("deploy"));
+        // A null draft stays a draft through a round trip.
+        let null_draft: SopValidateParams =
+            serde_json::from_value(json!({ "sop": null, "name": "deploy" })).unwrap();
+        assert_eq!(null_draft.sop, Some(Value::Null));
+        assert_eq!(
+            serde_json::to_value(&null_draft).unwrap(),
+            json!({ "sop": null, "name": "deploy" })
+        );
     }
 
     #[test]

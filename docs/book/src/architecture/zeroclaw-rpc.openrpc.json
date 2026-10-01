@@ -7326,10 +7326,8 @@
         "description": "Params for `sops/validate`: an unsaved draft in the `sops/save` form\n(`sop`, optionally with `original_name`), or a stored SOP selected by\n`name`. A request carrying a `sop` key is always validated as a draft,\nand its `name` is then ignored.",
         "properties": {
           "name": {
-            "type": [
-              "string",
-              "null"
-            ]
+            "description": "The stored selector must be a string when present; the handler\nreads it as one.",
+            "type": "string"
           },
           "original_name": {
             "type": [
@@ -7338,7 +7336,12 @@
             ]
           },
           "sop": {
-            "$ref": "#/components/schemas/Sop"
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/Sop"
+              }
+            ],
+            "description": "A present `null` stays `Some(Value::Null)`, so a malformed draft\nkeeps its draft form through a round trip instead of becoming a\nstored-SOP request."
           }
         },
         "type": "object"
@@ -11541,10 +11544,8 @@
           "name": "name",
           "required": false,
           "schema": {
-            "type": [
-              "string",
-              "null"
-            ]
+            "description": "The stored selector must be a string when present; the handler\nreads it as one.",
+            "type": "string"
           }
         },
         {
@@ -11561,7 +11562,12 @@
           "name": "sop",
           "required": false,
           "schema": {
-            "$ref": "#/components/schemas/Sop"
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/Sop"
+              }
+            ],
+            "description": "A present `null` stays `Some(Value::Null)`, so a malformed draft\nkeeps its draft form through a round trip instead of becoming a\nstored-SOP request."
           }
         }
       ],
