@@ -56,12 +56,9 @@ impl GatewayClient {
     ) -> Result<(u16, Vec<u8>)> {
         let auth = self.auth_header();
         if let Some(core) = &self.core {
-            let mut proven = core
-                .prove()
-                .await
-                .map_err(|failure| {
-                    anyhow::Error::msg(format!("refusing to send a credential: {failure}"))
-                })?;
+            let mut proven = core.prove().await.map_err(|failure| {
+                anyhow::Error::msg(format!("refusing to send a credential: {failure}"))
+            })?;
             let mut headers = Vec::new();
             if let Some(auth) = auth.as_deref() {
                 headers.push(("Authorization", auth));

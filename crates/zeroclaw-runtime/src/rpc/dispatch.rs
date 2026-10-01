@@ -3304,10 +3304,12 @@ impl RpcDispatcher {
             Method::ToolsParamOptions => self.handle_tools_param_options(params),
             Method::GatewayPossessionChallenge => self.handle_gateway_possession_challenge(params),
             Method::GatewayRegisterListener => {
-                self.handle_gateway_register_listener(method, params)
+                self.handle_gateway_register_listener(method, params).await
             }
-            Method::GatewayReleaseListener => self.handle_gateway_release_listener(method, params),
-            Method::PairingNewCode => self.handle_pairing_new_code(method, params),
+            Method::GatewayReleaseListener => {
+                self.handle_gateway_release_listener(method, params).await
+            }
+            Method::PairingNewCode => self.handle_pairing_new_code(method, params).await,
         };
 
         if is_notification {
@@ -3762,8 +3764,11 @@ impl RpcDispatcher {
                 })?;
                 // The daemon's own listener first: it holds the address while
                 // it is published, so nothing else can be serving it then.
-                own.filter(|own| own.addr == addr)
-                    .or_else(|| self.ctx.external_gateways.bound_at(addr))
+                own.filter(|own| own.addr == addr).or_else(|| {
+                    self.ctx
+                        .external_gateways
+                        .bound_at(addr, |registrant| self.still_local_admin(registrant))
+                })
             }
         };
         let Some(bound) = bound else {
@@ -3777,27 +3782,54 @@ impl RpcDispatcher {
         }))
     }
 
-    /// Refuse a gateway-listener or pairing operation to anyone but an
-    /// administrator on the local socket.
-    fn require_local_admin(&self, method: Method) -> Result<(), JsonRpcError> {
-        let refusal = if self.transport_kind != crate::rpc::transport::TransportKind::Local {
-            Some(format!(
+    /// Admit an administrator on the local socket to an operation that
+    /// decides who a credential reaches (registering a listener, minting a
+    /// pairing code). The authority is resolved again, on fresh grants, after
+    /// the config write lock is granted: every policy publication and pairing
+    /// change takes that lock, so a grant narrowed or a credential revoked
+    /// while this waited is refused here. The returned guard is held through
+    /// the effect; the caller's binding comes with it.
+    async fn admit_local_admin(
+        &self,
+        method: Method,
+    ) -> Result<(ConfigWriteGuard, crate::rpc::auth::ConnectionAuth), JsonRpcError> {
+        let refuse = |message: String| {
+            let denied = crate::rpc::auth::AuthDenied::forbidden(message);
+            self.audit_auth_denial(method, &denied);
+            rpc_err(denied.code, denied.message)
+        };
+        if self.transport_kind != crate::rpc::transport::TransportKind::Local {
+            return Err(refuse(format!(
                 "{} is served only over the local socket",
                 method.wire_name()
-            ))
-        } else if !self.stamped_grants().is_some_and(|grants| grants.admin) {
-            Some(format!("{} requires an administrator", method.wire_name()))
-        } else {
-            None
-        };
-        match refusal {
-            Some(message) => {
-                let denied = crate::rpc::auth::AuthDenied::forbidden(message);
+            )));
+        }
+        let guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
+        match (
+            self.recheck_authority_after_admission(method)?,
+            self.auth.clone(),
+        ) {
+            (Some(grants), Some(binding)) if grants.admin => Ok((guard, binding)),
+            (Some(_), _) => Err(refuse(format!(
+                "{} requires an administrator",
+                method.wire_name()
+            ))),
+            (None, _) => {
+                let denied = crate::rpc::auth::AuthDenied::auth_required(
+                    crate::i18n::get_required_cli_string("rpc-auth-first-call-initialize"),
+                );
                 self.audit_auth_denial(method, &denied);
                 Err(rpc_err(denied.code, denied.message))
             }
-            None => Ok(()),
         }
+    }
+
+    /// Whether the binding that registered a listener is, on current grants,
+    /// still an administrator: the core vouches for a registered listener
+    /// only while its registrant could register it now.
+    fn still_local_admin(&self, registrant: &crate::rpc::auth::ConnectionAuth) -> bool {
+        current_authority(&self.ctx.auth, registrant, Method::GatewayRegisterListener)
+            .is_ok_and(|grants| grants.admin)
     }
 
     /// `gateway/register-listener {addr, possession}`: a gateway in another
@@ -3811,13 +3843,13 @@ impl RpcDispatcher {
     /// Administrators on the local socket only: the registration makes
     /// `gateway/possession-challenge` vouch for that listener, so whoever
     /// registers is trusted with every credential sent to the address.
-    fn handle_gateway_register_listener(&self, method: Method, params: &Value) -> RpcResult {
+    async fn handle_gateway_register_listener(&self, method: Method, params: &Value) -> RpcResult {
         #[derive(serde::Deserialize)]
         struct RegisterParams {
             addr: String,
             possession: String,
         }
-        self.require_local_admin(method)?;
+        let (_authority, registrant) = self.admit_local_admin(method).await?;
         let req: RegisterParams = parse_params(params)?;
         let addr: std::net::SocketAddr = req.addr.parse().map_err(|_| {
             rpc_err(
@@ -3827,10 +3859,23 @@ impl RpcDispatcher {
         })?;
         let possession = crate::daemon::GatewayPossession::from_hex(&req.possession)
             .ok_or_else(|| rpc_err(INVALID_PARAMS, "possession must be 32 bytes of hex"))?;
-        let registration_id = self.ctx.external_gateways.register(
-            crate::rpc::context::BoundGateway { addr, possession },
-            &self.connection_token,
-        );
+        let registration_id = self
+            .ctx
+            .external_gateways
+            .register(
+                crate::rpc::context::BoundGateway { addr, possession },
+                &self.connection_token,
+                registrant,
+            )
+            .ok_or_else(|| {
+                rpc_err(
+                    INVALID_REQUEST,
+                    format!(
+                        "at most {} gateway listeners may be registered at once",
+                        crate::rpc::context::MAX_EXTERNAL_GATEWAY_LISTENERS
+                    ),
+                )
+            })?;
         Ok(serde_json::json!({ "registration_id": registration_id }))
     }
 
@@ -3838,12 +3883,12 @@ impl RpcDispatcher {
     /// stops accepting connections; the core stops vouching for its address.
     /// Only the connection that registered it can release it. Returns
     /// `{released}`.
-    fn handle_gateway_release_listener(&self, method: Method, params: &Value) -> RpcResult {
+    async fn handle_gateway_release_listener(&self, method: Method, params: &Value) -> RpcResult {
         #[derive(serde::Deserialize)]
         struct ReleaseParams {
             registration_id: u64,
         }
-        self.require_local_admin(method)?;
+        let (_authority, _) = self.admit_local_admin(method).await?;
         let req: ReleaseParams = parse_params(params)?;
         let released = self
             .ctx
@@ -3861,13 +3906,13 @@ impl RpcDispatcher {
     /// owner is checked by the kernel, so the code reaches its caller without
     /// crossing the gateway's HTTP port, and no admin token is presented
     /// anywhere. Rotating credentials (`rotate`) is not served here.
-    fn handle_pairing_new_code(&self, method: Method, params: &Value) -> RpcResult {
+    async fn handle_pairing_new_code(&self, method: Method, params: &Value) -> RpcResult {
         #[derive(serde::Deserialize)]
         struct PairingNewCodeParams {
             #[serde(default)]
             rotate: Option<String>,
         }
-        self.require_local_admin(method)?;
+        let (_authority, _) = self.admit_local_admin(method).await?;
         let req: PairingNewCodeParams = parse_params(params)?;
         if req
             .rotate
@@ -26883,6 +26928,7 @@ mod tests {
 
         let registered = gateway
             .handle_gateway_register_listener(Method::GatewayRegisterListener, &register)
+            .await
             .unwrap();
         let id = registered["registration_id"].as_u64().expect("an id");
         let issued = challenge();
@@ -26897,6 +26943,7 @@ mod tests {
                 Method::GatewayReleaseListener,
                 &json!({ "registration_id": id }),
             )
+            .await
             .unwrap();
         assert_eq!(foreign, json!({ "released": false }));
         assert_eq!(challenge()["bound_addr"], "127.0.0.1:42617");
@@ -26906,12 +26953,14 @@ mod tests {
                 Method::GatewayReleaseListener,
                 &json!({ "registration_id": id }),
             )
+            .await
             .unwrap();
         assert_eq!(own, json!({ "released": true }));
         assert_eq!(challenge(), json!({ "bound_addr": null }));
 
         gateway
             .handle_gateway_register_listener(Method::GatewayRegisterListener, &register)
+            .await
             .unwrap();
         assert_eq!(challenge()["bound_addr"], "127.0.0.1:42617");
         drop(gateway);
@@ -26943,23 +26992,309 @@ mod tests {
             "addr": "127.0.0.1:42617",
             "possession": crate::daemon::GatewayPossession::generate().to_hex(),
         });
-        for dispatcher in [&remote, &unauthenticated] {
+        for (dispatcher, refused) in [(&remote, FORBIDDEN), (&unauthenticated, AUTH_REQUIRED)] {
             let error = dispatcher
                 .handle_gateway_register_listener(Method::GatewayRegisterListener, &register)
+                .await
                 .unwrap_err();
-            assert_eq!(error.code, FORBIDDEN, "{}", error.message);
+            assert_eq!(error.code, refused, "{}", error.message);
             let error = dispatcher
                 .handle_pairing_new_code(Method::PairingNewCode, &json!({}))
+                .await
                 .unwrap_err();
-            assert_eq!(error.code, FORBIDDEN, "{}", error.message);
+            assert_eq!(error.code, refused, "{}", error.message);
         }
         let bad_key = local_admin(&ctx)
             .handle_gateway_register_listener(
                 Method::GatewayRegisterListener,
                 &json!({ "addr": "127.0.0.1:42617", "possession": "abcd" }),
             )
+            .await
             .unwrap_err();
         assert_eq!(bad_key.code, INVALID_PARAMS);
+    }
+
+    /// Minting a pairing code and registering a listener wait for the config
+    /// write lock and then check the caller's authority again on current
+    /// grants: a credential revoked while the call waits is refused, and
+    /// nothing is minted or registered.
+    #[tokio::test]
+    async fn a_credential_revoked_while_waiting_mints_and_registers_nothing() {
+        let (ctx, _tmp) = possession_test_context(|config| {
+            config.gateway.require_pairing = true;
+            config.gateway.paired_tokens = vec!["zc_mint".to_string(), "zc_register".to_string()];
+        });
+        let ctx = Arc::new(ctx);
+        let paired = |token: &'static str| {
+            let ctx = Arc::clone(&ctx);
+            async move {
+                let (mut dispatcher, _rx) = local_peer(&ctx, 7777);
+                dispatcher
+                    .handle_initialize(&json!({ "auth_token": token }))
+                    .await
+                    .expect("the paired token authenticates");
+                dispatcher
+            }
+        };
+        let key = crate::daemon::GatewayPossession::generate();
+        let register = json!({ "addr": "127.0.0.1:42617", "possession": key.to_hex() });
+
+        // Unchanged, the same connection may do both.
+        let control = paired("zc_mint").await;
+        let issued = control
+            .handle_pairing_new_code(Method::PairingNewCode, &json!({}))
+            .await
+            .expect("an administrator mints a code");
+        let code = issued["pairing_code"].as_str().expect("a code").to_string();
+        let id = control
+            .handle_gateway_register_listener(Method::GatewayRegisterListener, &register)
+            .await
+            .expect("an administrator registers a listener")["registration_id"]
+            .as_u64()
+            .expect("an id");
+        assert!(ctx.external_gateways.release(id, &control.connection_token));
+
+        let minter = paired("zc_mint").await;
+        let refused = rpc_result_after_midwait_policy_change(
+            Arc::clone(&ctx),
+            async move {
+                minter
+                    .handle_pairing_new_code(Method::PairingNewCode, &json!({}))
+                    .await
+            },
+            |ctx| assert!(ctx.auth.pairing().revoke_token("zc_mint")),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(refused.code, AUTH_REQUIRED, "{}", refused.message);
+        assert_eq!(
+            ctx.auth.pairing().pairing_code().as_deref(),
+            Some(code.as_str()),
+            "no new code was minted"
+        );
+
+        let registrar = paired("zc_register").await;
+        let refused = rpc_result_after_midwait_policy_change(
+            Arc::clone(&ctx),
+            async move {
+                registrar
+                    .handle_gateway_register_listener(Method::GatewayRegisterListener, &register)
+                    .await
+            },
+            |ctx| assert!(ctx.auth.pairing().revoke_token("zc_register")),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(refused.code, AUTH_REQUIRED, "{}", refused.message);
+        assert!(
+            ctx.external_gateways
+                .bound_at("127.0.0.1:42617".parse().unwrap(), |_| true)
+                .is_none(),
+            "no listener was registered"
+        );
+    }
+
+    /// The administrator requirement is checked on the grants in force once
+    /// the call has waited, not on those stamped at `initialize`: a profile
+    /// narrowed from administrator to plain System grants while the call
+    /// waits is refused, though those grants still pass the method's gate.
+    #[tokio::test]
+    async fn an_administrator_narrowed_while_waiting_mints_and_registers_nothing() {
+        use zeroclaw_api::grants::{Resource, Verb};
+        use zeroclaw_config::schema::{PermissionProfileConfig, UserConfig};
+        let (ctx, _tmp) = possession_test_context(|config| {
+            config.gateway.require_pairing = true;
+            config.permission_profiles.insert(
+                "operator".into(),
+                PermissionProfileConfig {
+                    admin: true,
+                    ..PermissionProfileConfig::default()
+                },
+            );
+            config.users.insert(
+                "alice".into(),
+                UserConfig {
+                    principal_id: None,
+                    uid: Some(4242),
+                    permission_profiles: vec!["operator".into()],
+                },
+            );
+        });
+        let ctx = Arc::new(ctx);
+        let narrow = |ctx: &Arc<RpcContext>| {
+            let mut narrowed = ctx.config.read().clone();
+            narrowed.permission_profiles.insert(
+                "operator".into(),
+                PermissionProfileConfig {
+                    grants: std::collections::HashMap::from([(
+                        Resource::System,
+                        vec![Verb::Read, Verb::Create, Verb::Delete],
+                    )]),
+                    ..PermissionProfileConfig::default()
+                },
+            );
+            ctx.auth
+                .refresh_from_config(&narrowed)
+                .expect("the narrowed policy compiles");
+        };
+        let restore = |ctx: &Arc<RpcContext>| {
+            let accepted = ctx.config.read().clone();
+            ctx.auth
+                .refresh_from_config(&accepted)
+                .expect("the accepted policy compiles");
+        };
+        let key = crate::daemon::GatewayPossession::generate();
+        let register = json!({ "addr": "127.0.0.1:42617", "possession": key.to_hex() });
+
+        // Unchanged, alice may do both.
+        let (control, _rx) = roster_peer(&ctx, 4242).await;
+        control
+            .handle_pairing_new_code(Method::PairingNewCode, &json!({}))
+            .await
+            .expect("an administrator mints a code");
+        let id = control
+            .handle_gateway_register_listener(Method::GatewayRegisterListener, &register)
+            .await
+            .expect("an administrator registers a listener")["registration_id"]
+            .as_u64()
+            .expect("an id");
+        assert!(ctx.external_gateways.release(id, &control.connection_token));
+        let code_before = ctx.auth.pairing().pairing_code();
+
+        let (minter, _rx) = roster_peer(&ctx, 4242).await;
+        let refused = rpc_result_after_midwait_policy_change(
+            Arc::clone(&ctx),
+            async move {
+                minter
+                    .handle_pairing_new_code(Method::PairingNewCode, &json!({}))
+                    .await
+            },
+            narrow,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(refused.code, FORBIDDEN, "{}", refused.message);
+        assert_eq!(
+            ctx.auth.pairing().pairing_code(),
+            code_before,
+            "no new code was minted"
+        );
+
+        restore(&ctx);
+        let (registrar, _rx) = roster_peer(&ctx, 4242).await;
+        let refused = rpc_result_after_midwait_policy_change(
+            Arc::clone(&ctx),
+            async move {
+                registrar
+                    .handle_gateway_register_listener(Method::GatewayRegisterListener, &register)
+                    .await
+            },
+            narrow,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(refused.code, FORBIDDEN, "{}", refused.message);
+        assert!(
+            ctx.external_gateways
+                .bound_at("127.0.0.1:42617".parse().unwrap(), |_| true)
+                .is_none(),
+            "no listener was registered"
+        );
+    }
+
+    /// The core vouches for a registered listener only while its registrant
+    /// is still an administrator on current grants: a credential revoked
+    /// after registering ends the registration, though its connection stays
+    /// open.
+    #[tokio::test]
+    async fn a_registration_ends_when_its_registrant_loses_authority() {
+        let (ctx, _tmp) = possession_test_context(|config| {
+            config.gateway.require_pairing = true;
+            config.gateway.paired_tokens = vec!["zc_gw".to_string()];
+        });
+        let ctx = Arc::new(ctx);
+        let (mut gateway, _rx) = local_peer(&ctx, 7777);
+        gateway
+            .handle_initialize(&json!({"auth_token": "zc_gw"}))
+            .await
+            .expect("the paired token authenticates");
+        let desktop = local_admin(&ctx);
+        let key = crate::daemon::GatewayPossession::generate();
+        let register = json!({ "addr": "127.0.0.1:42617", "possession": key.to_hex() });
+        let challenge = || {
+            desktop
+                .handle_gateway_possession_challenge(&json!({ "addr": "127.0.0.1:42617" }))
+                .unwrap()
+        };
+
+        gateway
+            .handle_gateway_register_listener(Method::GatewayRegisterListener, &register)
+            .await
+            .expect("an administrator registers a listener");
+        assert_eq!(challenge()["bound_addr"], "127.0.0.1:42617");
+
+        assert!(ctx.auth.pairing().revoke_token("zc_gw"));
+        assert_eq!(
+            challenge(),
+            json!({ "bound_addr": null }),
+            "a registrant that lost its authority is not vouched for"
+        );
+        let again = gateway
+            .handle_gateway_register_listener(Method::GatewayRegisterListener, &register)
+            .await
+            .unwrap_err();
+        assert_eq!(again.code, AUTH_REQUIRED, "{}", again.message);
+    }
+
+    /// Live registrations are capped, and a released one frees its place.
+    #[tokio::test]
+    async fn external_listener_registrations_are_capped() {
+        use crate::rpc::context::{
+            BoundGateway, ExternalGatewayListeners, MAX_EXTERNAL_GATEWAY_LISTENERS,
+        };
+        let (ctx, _tmp) = possession_test_context(|_| {});
+        let registrant = local_admin(&Arc::new(ctx))
+            .auth
+            .clone()
+            .expect("a bound administrator");
+        let listeners = ExternalGatewayListeners::default();
+        let connection = Arc::new(());
+        let bound = BoundGateway {
+            addr: "127.0.0.1:42617".parse().unwrap(),
+            possession: crate::daemon::GatewayPossession::generate(),
+        };
+        let ids: Vec<u64> = (0..MAX_EXTERNAL_GATEWAY_LISTENERS)
+            .map(|_| {
+                listeners
+                    .register(bound, &connection, registrant.clone())
+                    .expect("under the cap")
+            })
+            .collect();
+        assert_eq!(
+            listeners.register(bound, &connection, registrant.clone()),
+            None
+        );
+        assert!(listeners.release(ids[0], &connection));
+        assert!(
+            listeners
+                .register(bound, &connection, registrant.clone())
+                .is_some()
+        );
+
+        let closing = Arc::new(());
+        let other = ExternalGatewayListeners::default();
+        for _ in 0..MAX_EXTERNAL_GATEWAY_LISTENERS {
+            other
+                .register(bound, &closing, registrant.clone())
+                .expect("under the cap");
+        }
+        drop(closing);
+        assert!(
+            other
+                .register(bound, &connection, registrant.clone())
+                .is_some(),
+            "a closed connection's registrations free their places"
+        );
     }
 
     /// A code minted over the local socket is one the gateway's `/pair`
@@ -26972,6 +27307,7 @@ mod tests {
         let ctx = Arc::new(ctx);
         let issued = local_admin(&ctx)
             .handle_pairing_new_code(Method::PairingNewCode, &json!({}))
+            .await
             .unwrap();
         assert_eq!(issued["success"], true);
         let code = issued["pairing_code"].as_str().expect("a code");
@@ -26986,6 +27322,7 @@ mod tests {
 
         let rotate = local_admin(&ctx)
             .handle_pairing_new_code(Method::PairingNewCode, &json!({ "rotate": "all" }))
+            .await
             .unwrap_err();
         assert_eq!(rotate.code, INVALID_PARAMS);
 
@@ -26994,6 +27331,7 @@ mod tests {
         });
         let disabled = local_admin(&Arc::new(open_ctx))
             .handle_pairing_new_code(Method::PairingNewCode, &json!({}))
+            .await
             .unwrap_err();
         assert_eq!(disabled.code, INVALID_PARAMS);
     }

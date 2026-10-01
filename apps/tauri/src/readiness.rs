@@ -282,6 +282,9 @@ async fn launched_gateway_ready(
     match crate::possession::prove_gateway(core, dashboard).await {
         Ok(_proven) => Ok(true),
         Err(ProofFailure::CoreUnavailable(error)) => Err(core_stopped(&error)),
+        Err(failure @ ProofFailure::Unsupported(_)) => Err(StartupFailure::Incompatible(format!(
+            "The dashboard's address cannot be proven: {failure}."
+        ))),
         Err(ProofFailure::ElsewhereBound(bound)) => Err(StartupFailure::PortHeld(format!(
             "The ZeroClaw core's gateway is listening on {bound}, not on the dashboard's address {dashboard}. Another program may hold that address; close it and reopen ZeroClaw."
         ))),
@@ -526,6 +529,44 @@ mod tests {
         await_gateway(&gateway.url, Some(&core.client), SHORT)
             .await
             .expect("the core's own gateway answers");
+    }
+
+    /// A separately installed core of this protocol from before the proof
+    /// cannot vouch for its gateway. That is reported as a version skew, not
+    /// as a stopped core, and no credential is sent anywhere.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_core_that_predates_the_proof_is_incompatible() {
+        let gateway = ProvingHttp::start(Some(FAKE_KEY));
+        let core = FakeCore::start_predating_the_proof(
+            "older",
+            gateway_health("ok", None, Some(&bound_addr_of(&gateway.url))),
+        )
+        .await;
+        match await_gateway(&gateway.url, Some(&core.client), SHORT).await {
+            Err(failure @ StartupFailure::Incompatible(_)) => {
+                assert!(failure.is_final());
+                assert!(
+                    failure.message().contains("gateway/possession-challenge"),
+                    "{}",
+                    failure.message()
+                );
+            }
+            other => panic!("an older core must be reported incompatible: {other:?}"),
+        }
+        let (link, _dir) = core.into_link(&gateway.url);
+        let refused = link
+            .new_pairing_code()
+            .await
+            .expect_err("an older core mints no code");
+        assert!(
+            refused.contains("does not support pairing/new-code"),
+            "{refused}"
+        );
+        assert!(
+            gateway.seen().is_empty(),
+            "nothing reached the dashboard address"
+        );
     }
 
     /// A separate process on the dashboard address reports the core's real
@@ -1055,6 +1096,16 @@ mod tests {
     #[cfg(unix)]
     impl FakeCore {
         async fn start(label: &str, health: Value, stall: bool) -> Self {
+            Self::start_as(label, health, stall, false).await
+        }
+
+        /// A core of this protocol from before the possession proof: it
+        /// answers neither the challenge nor `pairing/new-code`.
+        async fn start_predating_the_proof(label: &str, health: Value) -> Self {
+            Self::start_as(label, health, false, true).await
+        }
+
+        async fn start_as(label: &str, health: Value, stall: bool, predates_proof: bool) -> Self {
             use std::io::{BufRead, BufReader, Write};
             let dir = PrivateDir::new(label);
             let endpoint = dir.0.join("d.sock");
@@ -1079,6 +1130,22 @@ mod tests {
                                 "code": -32600,
                                 "message": "Invalid request: params must be an object or array when present"
                             }
+                        });
+                        if write.write_all(format!("{refusal}\n").as_bytes()).is_err() {
+                            break;
+                        }
+                        continue;
+                    }
+                    if predates_proof
+                        && matches!(
+                            request["method"].as_str(),
+                            Some("gateway/possession-challenge" | "pairing/new-code")
+                        )
+                    {
+                        let refusal = json!({
+                            "jsonrpc": "2.0",
+                            "id": request["id"],
+                            "error": { "code": error_codes::METHOD_NOT_FOUND, "message": "Method not found" }
                         });
                         if write.write_all(format!("{refusal}\n").as_bytes()).is_err() {
                             break;

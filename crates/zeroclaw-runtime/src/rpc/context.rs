@@ -164,11 +164,15 @@ impl GatewayBinding {
     }
 }
 
+/// The most gateway listeners in other processes registered at once.
+pub const MAX_EXTERNAL_GATEWAY_LISTENERS: usize = 64;
+
 /// Gateway listeners in other processes (a separate `zeroclaw-gw`) that
 /// registered with the core over their own local administrator connection,
 /// each with the address it bound and the key it proves possession with. A
-/// registration lives only as long as the connection that made it, and ends
-/// earlier when that gateway releases it at its shutdown signal.
+/// registration lives only as long as the connection that made it and the
+/// authority its registrant held, and ends earlier when that gateway
+/// releases it at its shutdown signal.
 #[derive(Default)]
 pub struct ExternalGatewayListeners {
     next_id: std::sync::atomic::AtomicU64,
@@ -180,23 +184,36 @@ struct ExternalGatewayListener {
     bound: BoundGateway,
     /// The registering connection's liveness: dead once it closes.
     connection: std::sync::Weak<()>,
+    /// Who registered it, re-resolved on current grants whenever the core
+    /// vouches for it.
+    registrant: crate::rpc::auth::ConnectionAuth,
 }
 
 impl ExternalGatewayListeners {
-    /// Register a listener for as long as `connection` lives. Returns its id.
-    pub fn register(&self, bound: BoundGateway, connection: &Arc<()>) -> u64 {
+    /// Register a listener for as long as `connection` lives. Returns its
+    /// id, or `None` when [`MAX_EXTERNAL_GATEWAY_LISTENERS`] live ones exist.
+    pub fn register(
+        &self,
+        bound: BoundGateway,
+        connection: &Arc<()>,
+        registrant: crate::rpc::auth::ConnectionAuth,
+    ) -> Option<u64> {
+        let mut listeners = self.listeners.lock();
+        listeners.retain(|listener| listener.connection.strong_count() > 0);
+        if listeners.len() >= MAX_EXTERNAL_GATEWAY_LISTENERS {
+            return None;
+        }
         let id = self
             .next_id
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             .wrapping_add(1);
-        let mut listeners = self.listeners.lock();
-        listeners.retain(|listener| listener.connection.strong_count() > 0);
         listeners.push(ExternalGatewayListener {
             id,
             bound,
             connection: Arc::downgrade(connection),
+            registrant,
         });
-        id
+        Some(id)
     }
 
     /// End registration `id`, if `connection` made it. Whether it did.
@@ -214,10 +231,19 @@ impl ExternalGatewayListeners {
     }
 
     /// The listener registered for `addr` by a connection that is still
-    /// open, the most recent one if several are.
-    pub fn bound_at(&self, addr: std::net::SocketAddr) -> Option<BoundGateway> {
+    /// open, by a registrant `admitted` still accepts, the most recent one if
+    /// several are. A registration at `addr` whose registrant is no longer
+    /// admitted ends here.
+    pub fn bound_at(
+        &self,
+        addr: std::net::SocketAddr,
+        admitted: impl Fn(&crate::rpc::auth::ConnectionAuth) -> bool,
+    ) -> Option<BoundGateway> {
         let mut listeners = self.listeners.lock();
-        listeners.retain(|listener| listener.connection.strong_count() > 0);
+        listeners.retain(|listener| {
+            listener.connection.strong_count() > 0
+                && (listener.bound.addr != addr || admitted(&listener.registrant))
+        });
         listeners
             .iter()
             .rev()

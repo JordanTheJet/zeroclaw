@@ -24,7 +24,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use zeroclaw_rpc_client::{Method, RpcClient};
+use zeroclaw_rpc_client::{ClientError, Method, RpcClient, error_codes};
 
 /// The `/health` query parameter carrying the nonce, and the body field the
 /// core's gateway answers with.
@@ -40,6 +40,9 @@ const MAX_BODY_BYTES: usize = 1 << 20;
 pub enum ProofFailure {
     /// The core did not answer over RPC.
     CoreUnavailable(String),
+    /// The core answers but predates the method named: it cannot vouch for
+    /// any gateway, so nothing it serves is trusted with a credential.
+    Unsupported(&'static str),
     /// No listener of the core accepts connections right now.
     NotBound,
     /// The core's listener holds another address than the dashboard's.
@@ -55,6 +58,10 @@ impl std::fmt::Display for ProofFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::CoreUnavailable(error) => write!(f, "the ZeroClaw core did not answer: {error}"),
+            Self::Unsupported(method) => write!(
+                f,
+                "the ZeroClaw core does not support {method}; install a ZeroClaw core as new as this app"
+            ),
             Self::NotBound => {
                 f.write_str("the ZeroClaw core's gateway is not accepting connections")
             }
@@ -90,7 +97,7 @@ async fn challenge(core: &RpcClient, dashboard: SocketAddr) -> Result<Challenge,
             serde_json::json!({ "addr": dashboard.to_string() }),
         )
         .await
-        .map_err(|error| ProofFailure::CoreUnavailable(error.to_string()))?;
+        .map_err(|error| refused(Method::GatewayPossessionChallenge, error))?;
     let Some(bound) = issued["bound_addr"].as_str() else {
         return Err(ProofFailure::NotBound);
     };
@@ -105,6 +112,17 @@ async fn challenge(core: &RpcClient, dashboard: SocketAddr) -> Result<Challenge,
         _ => Err(ProofFailure::CoreUnavailable(
             "the core issued a challenge without a nonce or proof".to_string(),
         )),
+    }
+}
+
+/// Classify a refused request by its JSON-RPC code: a core that predates the
+/// method is a version skew, not an outage.
+fn refused(method: Method, error: ClientError) -> ProofFailure {
+    match error {
+        ClientError::Rpc(rpc) if rpc.code == error_codes::METHOD_NOT_FOUND => {
+            ProofFailure::Unsupported(method.wire_name())
+        }
+        other => ProofFailure::CoreUnavailable(other.to_string()),
     }
 }
 
@@ -303,7 +321,10 @@ impl CoreLink {
                 Value::Object(serde_json::Map::new()),
             )
             .await
-            .map_err(|error| format!("the core refused a pairing code: {error}"))?;
+            .map_err(|error| match refused(Method::PairingNewCode, error) {
+                unsupported @ ProofFailure::Unsupported(_) => unsupported.to_string(),
+                other => format!("the core refused a pairing code: {other}"),
+            })?;
         issued["pairing_code"]
             .as_str()
             .map(str::to_string)
