@@ -3287,7 +3287,7 @@ impl RpcDispatcher {
             // Config
             Method::ConfigGet => self.handle_config_get(params),
             Method::ConfigSet => Box::pin(self.handle_config_set(params)).await,
-            Method::ConfigSetMany => Box::pin(self.handle_config_set_many(params)).await,
+            Method::ConfigSetMany => self.handle_config_set_many(params).await,
             Method::ConfigValidate => self.handle_config_validate(),
             Method::ConfigReload => self.handle_config_reload(params),
             Method::ConfigList => self.handle_config_list(params),
@@ -8339,153 +8339,160 @@ impl RpcDispatcher {
     /// is held, so an unbounded batch would let one frame hold every other
     /// config writer off for as long as it liked. Real batches are a form's
     /// worth of fields; an over-long batch is a caller error like an empty one.
-    async fn handle_config_set_many(&self, params: &Value) -> RpcResult {
-        let req: ConfigSetManyParams = parse_params(params)?;
-        if let Some(ops) = req.ops {
-            if !req.sets.is_empty() {
+    fn handle_config_set_many<'a>(&'a self, params: &'a Value) -> BoxRpcFuture<'a> {
+        Box::pin(async move {
+            let req: ConfigSetManyParams = parse_params(params)?;
+            if let Some(ops) = req.ops {
+                if !req.sets.is_empty() {
+                    return Err(rpc_err(
+                        INVALID_PARAMS,
+                        "config/set-many takes `sets` or `ops`, not both",
+                    ));
+                }
+                return self.handle_config_patch(ops, req.drift_guard).await;
+            }
+            if req.drift_guard {
                 return Err(rpc_err(
                     INVALID_PARAMS,
-                    "config/set-many takes `sets` or `ops`, not both",
+                    "config/set-many `drift_guard` applies to an `ops` batch",
                 ));
             }
-            return self.handle_config_patch(ops, req.drift_guard).await;
-        }
-        if req.drift_guard {
-            return Err(rpc_err(
-                INVALID_PARAMS,
-                "config/set-many `drift_guard` applies to an `ops` batch",
-            ));
-        }
-        if req.sets.is_empty() {
-            return Err(rpc_err(
-                INVALID_PARAMS,
-                crate::i18n::get_required_cli_string("rpc-config-set-many-empty"),
-            ));
-        }
-        if req.sets.len() > Self::CONFIG_SET_MANY_MAX_ENTRIES {
-            return Err(rpc_err(
-                INVALID_PARAMS,
-                crate::i18n::get_required_cli_string_with_args(
-                    "rpc-config-set-many-limit",
-                    &[
-                        ("limit", &Self::CONFIG_SET_MANY_MAX_ENTRIES.to_string()),
-                        ("count", &req.sets.len().to_string()),
-                    ],
-                ),
-            ));
-        }
-        for (index, entry) in req.sets.iter().enumerate() {
-            self.selector_config_write(Method::ConfigSetMany, &entry.prop)
-                .map_err(|e| {
-                    rpc_err(
-                        e.code,
-                        crate::i18n::get_required_cli_string_with_args(
-                            "rpc-config-set-many-entry-rejected",
-                            &[
-                                ("index", &index.to_string()),
-                                ("prop", &entry.prop),
-                                ("reason", &e.message),
-                            ],
-                        ),
-                    )
-                })?;
-        }
-        let aliases: std::collections::BTreeSet<_> = req
-            .sets
-            .iter()
-            .filter_map(|entry| zeroclaw_config::alias_refs::agent_alias_for_prop_path(&entry.prop))
-            .collect();
-        let _agent_config_reservations: Vec<_> = aliases
-            .into_iter()
-            .map(|alias| self.ctx.agent_lifecycle.reserve_config_mutation(alias))
-            .collect::<Result<_, _>>()
-            .map_err(|error| rpc_err(INVALID_PARAMS, error.to_string()))?;
-        let channel_agents: std::collections::BTreeSet<_> = req
-            .sets
-            .iter()
-            .filter_map(|entry| agent_alias_from_channel_auth_prop(&entry.prop))
-            .collect();
-        let config_write_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
-        for (index, entry) in req.sets.iter().enumerate() {
-            self.recheck_config_write_authority(
-                Method::ConfigSetMany,
-                Some(&entry.prop),
-                &config_write_guard,
-            )
-            .map_err(|e| {
-                let msg = crate::i18n::get_required_cli_string_with_args(
-                    "rpc-config-set-many-entry-rejected",
-                    &[
-                        ("index", &index.to_string()),
-                        ("prop", &entry.prop),
-                        ("reason", &e.message),
-                    ],
-                );
-                reworded(e, msg)
-            })?;
-        }
-        // Boxed for the same stack-frame reason as in `handle_config_set`.
-        let old_config = self.ctx.config.read().clone();
-        let channel_generation_revocation = self.prepare_channel_generation_revocation(
-            req.sets
+            if req.sets.is_empty() {
+                return Err(rpc_err(
+                    INVALID_PARAMS,
+                    crate::i18n::get_required_cli_string("rpc-config-set-many-empty"),
+                ));
+            }
+            if req.sets.len() > Self::CONFIG_SET_MANY_MAX_ENTRIES {
+                return Err(rpc_err(
+                    INVALID_PARAMS,
+                    crate::i18n::get_required_cli_string_with_args(
+                        "rpc-config-set-many-limit",
+                        &[
+                            ("limit", &Self::CONFIG_SET_MANY_MAX_ENTRIES.to_string()),
+                            ("count", &req.sets.len().to_string()),
+                        ],
+                    ),
+                ));
+            }
+            for (index, entry) in req.sets.iter().enumerate() {
+                self.selector_config_write(Method::ConfigSetMany, &entry.prop)
+                    .map_err(|e| {
+                        rpc_err(
+                            e.code,
+                            crate::i18n::get_required_cli_string_with_args(
+                                "rpc-config-set-many-entry-rejected",
+                                &[
+                                    ("index", &index.to_string()),
+                                    ("prop", &entry.prop),
+                                    ("reason", &e.message),
+                                ],
+                            ),
+                        )
+                    })?;
+            }
+            let aliases: std::collections::BTreeSet<_> = req
+                .sets
                 .iter()
-                .any(|entry| is_channel_generation_prop(&entry.prop)),
-            &old_config,
-        )?;
-        let mut config = Box::new(old_config.clone());
-        for (index, entry) in req.sets.iter().enumerate() {
-            Self::stage_config_set(&mut config, &entry.prop, &entry.value).map_err(|e| {
-                let msg = crate::i18n::get_required_cli_string_with_args(
-                    "rpc-config-set-many-entry-rejected",
-                    &[
-                        ("index", &index.to_string()),
-                        ("prop", &entry.prop),
-                        ("reason", &e.message),
-                    ],
-                );
-                reworded(e, msg)
-            })?;
-        }
-        // The request paths describe the affected live views; the candidate
-        // config remains their canonical source. Prepare all affected sessions
-        // before the one commit, including batches that change several routes.
-        let scopes: Vec<_> = req
-            .sets
-            .iter()
-            .filter_map(|entry| LiveSessionRefreshScope::for_prop(&entry.prop))
-            .collect();
-        if scopes.is_empty() {
-            self.save_and_swap_config(*config, &config_write_guard)
+                .filter_map(|entry| {
+                    zeroclaw_config::alias_refs::agent_alias_for_prop_path(&entry.prop)
+                })
+                .collect();
+            let _agent_config_reservations: Vec<_> = aliases
+                .into_iter()
+                .map(|alias| self.ctx.agent_lifecycle.reserve_config_mutation(alias))
+                .collect::<Result<_, _>>()
+                .map_err(|error| rpc_err(INVALID_PARAMS, error.to_string()))?;
+            let channel_agents: std::collections::BTreeSet<_> = req
+                .sets
+                .iter()
+                .filter_map(|entry| agent_alias_from_channel_auth_prop(&entry.prop))
+                .collect();
+            let config_write_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
+            for (index, entry) in req.sets.iter().enumerate() {
+                self.recheck_config_write_authority(
+                    Method::ConfigSetMany,
+                    Some(&entry.prop),
+                    &config_write_guard,
+                )
+                .map_err(|e| {
+                    let msg = crate::i18n::get_required_cli_string_with_args(
+                        "rpc-config-set-many-entry-rejected",
+                        &[
+                            ("index", &index.to_string()),
+                            ("prop", &entry.prop),
+                            ("reason", &e.message),
+                        ],
+                    );
+                    reworded(e, msg)
+                })?;
+            }
+            // Boxed for the same stack-frame reason as in `handle_config_set`.
+            let old_config = self.ctx.config.read().clone();
+            let channel_generation_revocation = self.prepare_channel_generation_revocation(
+                req.sets
+                    .iter()
+                    .any(|entry| is_channel_generation_prop(&entry.prop)),
+                &old_config,
+            )?;
+            let mut config = Box::new(old_config.clone());
+            for (index, entry) in req.sets.iter().enumerate() {
+                Self::stage_config_set(&mut config, &entry.prop, &entry.value).map_err(|e| {
+                    let msg = crate::i18n::get_required_cli_string_with_args(
+                        "rpc-config-set-many-entry-rejected",
+                        &[
+                            ("index", &index.to_string()),
+                            ("prop", &entry.prop),
+                            ("reason", &e.message),
+                        ],
+                    );
+                    reworded(e, msg)
+                })?;
+            }
+            // The request paths describe the affected live views; the candidate
+            // config remains their canonical source. Prepare all affected sessions
+            // before the one commit, including batches that change several routes.
+            let scopes: Vec<_> = req
+                .sets
+                .iter()
+                .filter_map(|entry| LiveSessionRefreshScope::for_prop(&entry.prop))
+                .collect();
+            if scopes.is_empty() {
+                self.save_and_swap_config(*config, &config_write_guard)
+                    .await?;
+            } else {
+                Box::pin(self.commit_config_with_live_session_refresh(
+                    *config,
+                    &config_write_guard,
+                    &LiveSessionRefreshScope::Batch(scopes),
+                ))
                 .await?;
-        } else {
-            Box::pin(self.commit_config_with_live_session_refresh(
-                *config,
-                &config_write_guard,
-                &LiveSessionRefreshScope::Batch(scopes),
-            ))
-            .await?;
-        }
-        let _config_write_guard = self
-            .finish_channel_generation_mutation(channel_generation_revocation, config_write_guard)
-            .await?;
-        let new_config = self.ctx.config.read().clone();
-        for alias in channel_agents {
-            self.refresh_live_channel_handles_between_configs(&old_config, &new_config, &alias)
-                .await;
-        }
-        let props: Vec<String> = req.sets.into_iter().map(|entry| entry.prop).collect();
-        let providers: std::collections::BTreeSet<_> = props
-            .iter()
-            .filter_map(|prop| model_provider_ref_from_provider_profile_prop(prop))
-            .collect();
-        for provider in providers {
-            self.refresh_memory_embedder_for_model_provider(&provider);
-        }
-        to_result(ConfigSetManyResult {
-            props,
-            set: true,
-            results: Vec::new(),
-            warnings: Vec::new(),
+            }
+            let _config_write_guard = self
+                .finish_channel_generation_mutation(
+                    channel_generation_revocation,
+                    config_write_guard,
+                )
+                .await?;
+            let new_config = self.ctx.config.read().clone();
+            for alias in channel_agents {
+                self.refresh_live_channel_handles_between_configs(&old_config, &new_config, &alias)
+                    .await;
+            }
+            let props: Vec<String> = req.sets.into_iter().map(|entry| entry.prop).collect();
+            let providers: std::collections::BTreeSet<_> = props
+                .iter()
+                .filter_map(|prop| model_provider_ref_from_provider_profile_prop(prop))
+                .collect();
+            for provider in providers {
+                self.refresh_memory_embedder_for_model_provider(&provider);
+            }
+            to_result(ConfigSetManyResult {
+                props,
+                set: true,
+                results: Vec::new(),
+                warnings: Vec::new(),
+            })
         })
     }
 
@@ -9286,94 +9293,97 @@ impl RpcDispatcher {
         })
     }
 
-    async fn handle_config_map_key_create(&self, params: &Value) -> RpcResult {
-        let req: ConfigMapKeyCreateParams = parse_params(params)?;
-        let key_path = format!("{}.{}", req.path, req.key);
-        self.selector_config_write(Method::ConfigMapKeyCreate, &key_path)?;
-        let _agent_config_reservation = (req.path == "agents")
-            .then(|| self.ctx.agent_lifecycle.reserve_config_mutation(&req.key))
-            .transpose()
-            .map_err(|error| rpc_err(INVALID_PARAMS, error.to_string()))?;
-        let config_write_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
-        self.recheck_config_write_authority(
-            Method::ConfigMapKeyCreate,
-            Some(&key_path),
-            &config_write_guard,
-        )?;
-        let create = |config: &mut Config| -> Result<bool, JsonRpcError> {
-            // Shared guarded boundary: enforces the reserved-agent rule (the
-            // `default` runtime fallback) on this surface too, so the RPC create
-            // path cannot author an `agents.default` the rename guard then traps.
-            let created =
-                zeroclaw_config::alias_refs::create_map_key_checked(config, &req.path, &req.key)
-                    .map_err(|e| {
-                        config_refused(
-                            INVALID_PARAMS,
-                            e.to_string(),
-                            e.api_error(&req.path, &req.key),
-                        )
-                    })?;
-            if created {
-                config.mark_dirty(&format!("{}.{}", req.path, req.key));
-            }
-            Ok(created)
-        };
-        let created = if touches_model_routes(&req.path) {
-            let mut working = self.ctx.config.read().clone();
-            let created = create(&mut working)?;
-            if created {
-                Box::pin(self.commit_config_with_live_session_refresh(
-                    working,
-                    &config_write_guard,
-                    &LiveSessionRefreshScope::ModelRoutes,
-                ))
-                .await?;
-            }
-            created
-        } else {
-            let before = self.ctx.config.read().clone();
-            let mut working = before.clone();
-            let created = create(&mut working)?;
-            if created {
-                if req.path == "skill_bundles" {
-                    // Directory creation and persistence are one admitted job.
-                    let commit = {
-                        let authority = self.ctx.auth.hold_authority();
-                        self.authorize_config_write_effects(
-                            Method::ConfigMapKeyCreate,
-                            &before,
-                            &working,
-                            &[],
-                            &authority,
-                        )?;
-                        let dispatcher = self.spawn_handle();
-                        let key = req.key.clone();
-                        crate::live_config_authority::spawn_agent_lifecycle_job(Box::pin(
-                            async move {
-                                Self::scaffold_skill_bundle_dir(&working, &key).await;
-                                dispatcher
-                                    .save_and_swap_config(working, &config_write_guard)
-                                    .await
-                            },
-                        ))
-                    };
-                    commit.await.map_err(|error| {
-                        rpc_err(
-                            INTERNAL_ERROR,
-                            format!("Skill bundle create task failed: {error}"),
-                        )
-                    })??;
-                } else {
-                    self.save_and_swap_config(working, &config_write_guard)
-                        .await?;
+    fn handle_config_map_key_create<'a>(&'a self, params: &'a Value) -> BoxRpcFuture<'a> {
+        Box::pin(async move {
+            let req: ConfigMapKeyCreateParams = parse_params(params)?;
+            let key_path = format!("{}.{}", req.path, req.key);
+            self.selector_config_write(Method::ConfigMapKeyCreate, &key_path)?;
+            let _agent_config_reservation = (req.path == "agents")
+                .then(|| self.ctx.agent_lifecycle.reserve_config_mutation(&req.key))
+                .transpose()
+                .map_err(|error| rpc_err(INVALID_PARAMS, error.to_string()))?;
+            let config_write_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
+            self.recheck_config_write_authority(
+                Method::ConfigMapKeyCreate,
+                Some(&key_path),
+                &config_write_guard,
+            )?;
+            let create = |config: &mut Config| -> Result<bool, JsonRpcError> {
+                // Shared guarded boundary: enforces the reserved-agent rule (the
+                // `default` runtime fallback) on this surface too, so the RPC create
+                // path cannot author an `agents.default` the rename guard then traps.
+                let created = zeroclaw_config::alias_refs::create_map_key_checked(
+                    config, &req.path, &req.key,
+                )
+                .map_err(|e| {
+                    config_refused(
+                        INVALID_PARAMS,
+                        e.to_string(),
+                        e.api_error(&req.path, &req.key),
+                    )
+                })?;
+                if created {
+                    config.mark_dirty(&format!("{}.{}", req.path, req.key));
                 }
-            }
-            created
-        };
-        to_result(ConfigMapKeyCreateResult {
-            path: req.path,
-            key: req.key,
-            created,
+                Ok(created)
+            };
+            let created = if touches_model_routes(&req.path) {
+                let mut working = self.ctx.config.read().clone();
+                let created = create(&mut working)?;
+                if created {
+                    Box::pin(self.commit_config_with_live_session_refresh(
+                        working,
+                        &config_write_guard,
+                        &LiveSessionRefreshScope::ModelRoutes,
+                    ))
+                    .await?;
+                }
+                created
+            } else {
+                let before = self.ctx.config.read().clone();
+                let mut working = before.clone();
+                let created = create(&mut working)?;
+                if created {
+                    if req.path == "skill_bundles" {
+                        // Directory creation and persistence are one admitted job.
+                        let commit = {
+                            let authority = self.ctx.auth.hold_authority();
+                            self.authorize_config_write_effects(
+                                Method::ConfigMapKeyCreate,
+                                &before,
+                                &working,
+                                &[],
+                                &authority,
+                            )?;
+                            let dispatcher = self.spawn_handle();
+                            let key = req.key.clone();
+                            crate::live_config_authority::spawn_agent_lifecycle_job(Box::pin(
+                                async move {
+                                    Self::scaffold_skill_bundle_dir(&working, &key).await;
+                                    dispatcher
+                                        .save_and_swap_config(working, &config_write_guard)
+                                        .await
+                                },
+                            ))
+                        };
+                        commit.await.map_err(|error| {
+                            rpc_err(
+                                INTERNAL_ERROR,
+                                format!("Skill bundle create task failed: {error}"),
+                            )
+                        })??;
+                    } else {
+                        self.save_and_swap_config(working, &config_write_guard)
+                            .await?;
+                    }
+                }
+                created
+            };
+            to_result(ConfigMapKeyCreateResult {
+                path: req.path,
+                key: req.key,
+                created,
+            })
         })
     }
 
