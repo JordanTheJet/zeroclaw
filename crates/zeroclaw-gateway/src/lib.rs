@@ -374,58 +374,45 @@ impl GatewayRateLimiter {
 }
 
 /// Request keys the generic `/webhook` and `/sop/*` routes have admitted.
-/// Plugin webhook deliveries keep their own store, which the daemon creates
-/// per gateway run (`zeroclaw_api::webhook::WebhookReservationStore`).
+///
+/// It records into the gateway run's webhook store
+/// (`zeroclaw_api::webhook::WebhookReservationStore`), the same store plugin
+/// webhook deliveries reserve in, so both kinds share one committed-key
+/// budget (`[gateway] idempotency_max_keys`) and evict each other's oldest
+/// keys under pressure.
 #[derive(Debug)]
 pub struct IdempotencyStore {
-    ttl: Duration,
-    max_keys: usize,
-    entries: Mutex<IdempotencyEntries>,
-}
-
-#[derive(Debug, Default)]
-struct IdempotencyEntries {
-    committed: HashMap<String, Instant>,
+    store: Arc<zeroclaw_api::webhook::WebhookReservationStore>,
 }
 
 impl IdempotencyStore {
+    /// A store of its own, for callers with no plugin webhook ingress.
     pub fn new(ttl: Duration, max_keys: usize) -> Self {
-        Self {
-            ttl,
-            max_keys: max_keys.max(1),
-            entries: Mutex::new(IdempotencyEntries::default()),
-        }
+        Self::shared(Arc::new(
+            zeroclaw_api::webhook::WebhookReservationStore::new(ttl, max_keys),
+        ))
+    }
+
+    /// Record into `store`, shared with the run's plugin webhook deliveries.
+    pub fn shared(store: Arc<zeroclaw_api::webhook::WebhookReservationStore>) -> Self {
+        Self { store }
     }
 
     /// Returns true if this key is new and is now recorded.
     fn record_if_new(&self, key: &str) -> bool {
-        let now = Instant::now();
-        let mut entries = self.entries.lock();
-
-        entries
-            .committed
-            .retain(|_, seen_at| now.duration_since(*seen_at) < self.ttl);
-
-        if entries.committed.contains_key(key) {
-            return false;
-        }
-
-        if entries.committed.len() >= self.max_keys {
-            let evict_key = entries
-                .committed
-                .iter()
-                .min_by_key(|(_, seen_at)| *seen_at)
-                .map(|(k, _)| k.clone());
-            if let Some(evict_key) = evict_key {
-                entries.committed.remove(&evict_key);
-            } else {
-                return false;
-            }
-        }
-
-        entries.committed.insert(key.to_owned(), now);
-        true
+        self.store.record_if_new(key)
     }
+}
+
+/// The generic webhook routes' key store for one gateway run. It records into
+/// the run's plugin webhook store, so `/webhook`, `/sop/*` and plugin
+/// deliveries keep sharing one committed-key budget.
+fn generic_webhook_idempotency(
+    plugin_webhook_reservations: &Arc<zeroclaw_api::webhook::WebhookReservationStore>,
+) -> Arc<IdempotencyStore> {
+    Arc::new(IdempotencyStore::shared(Arc::clone(
+        plugin_webhook_reservations,
+    )))
 }
 
 fn parse_client_ip(value: &str) -> Option<IpAddr> {
@@ -1649,8 +1636,7 @@ pub async fn run_gateway_with_plugin_webhooks(
         config.gateway.webhook_rate_limit_per_minute,
         rate_limit_max_keys,
     ));
-    let (idempotency_ttl, idempotency_max_keys) = idempotency_limits(&config);
-    let idempotency_store = Arc::new(IdempotencyStore::new(idempotency_ttl, idempotency_max_keys));
+    let idempotency_store = generic_webhook_idempotency(&plugin_webhook_reservations);
 
     // Resolve optional path prefix for reverse-proxy deployments.
     let path_prefix: Option<&str> = config
@@ -7140,11 +7126,10 @@ path = "{trigger_path}"
         std::thread::sleep(Duration::from_millis(2));
         assert!(store.record_if_new("k3"));
 
-        let entries = store.entries.lock();
-        assert_eq!(entries.committed.len(), 2);
-        assert!(!entries.committed.contains_key("k1"));
-        assert!(entries.committed.contains_key("k2"));
-        assert!(entries.committed.contains_key("k3"));
+        assert_eq!(store.store.committed_len(), 2);
+        assert!(!store.record_if_new("k3"), "k3 is still held");
+        assert!(!store.record_if_new("k2"), "k2 is still held");
+        assert!(store.record_if_new("k1"), "k1 was evicted");
     }
 
     #[test]
@@ -11618,10 +11603,9 @@ data: [DONE]\n\n";
         std::thread::sleep(Duration::from_millis(2));
         assert!(store.record_if_new("new-key"));
 
-        let entries = store.entries.lock();
-        assert_eq!(entries.committed.len(), 1);
-        assert!(!entries.committed.contains_key("old-key"));
-        assert!(entries.committed.contains_key("new-key"));
+        assert_eq!(store.store.committed_len(), 1);
+        assert!(!store.record_if_new("new-key"), "the newest key is kept");
+        assert!(store.record_if_new("old-key"), "the oldest key was evicted");
     }
 
     #[test]
@@ -11749,8 +11733,10 @@ data: [DONE]\n\n";
             handle.join().unwrap();
         }
 
-        let entries = store.entries.lock();
-        assert!(entries.committed.len() <= 1000, "should respect max_keys");
+        assert!(
+            store.store.committed_len() <= 1000,
+            "should respect max_keys"
+        );
     }
 
     #[test]

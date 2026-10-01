@@ -145,15 +145,20 @@ impl WebhookIdempotency {
     }
 }
 
-/// The deduplication store behind plugin webhook deliveries.
+/// The deduplication store behind every webhook ingress of one gateway run.
 ///
-/// A delivery reserves its message's key, then commits it once the message is
-/// enqueued for the channel or rolls it back when the delivery fails. A
-/// duplicate of a committed key is acknowledged without being delivered
-/// again; a duplicate of a key still in flight waits for its owner's outcome.
-/// Committed keys expire after `ttl`. Committed and in-flight keys are each
-/// bounded by `max_keys`: the oldest committed key is evicted to make room,
-/// and a new delivery is refused while every in-flight slot is taken.
+/// A plugin delivery reserves its message's key, then commits it once the
+/// message is enqueued for the channel or rolls it back when the delivery
+/// fails. A duplicate of a committed key is acknowledged without being
+/// delivered again; a duplicate of a key still in flight waits for its
+/// owner's outcome. The generic `/webhook` and `/sop/*` routes record their
+/// keys through [`Self::record_if_new`].
+///
+/// Both kinds share one committed map bounded by `max_keys`, so committing
+/// either kind evicts the oldest committed key of either kind. Committed keys
+/// expire after `ttl`. In-flight plugin reservations are bounded separately by
+/// the same `max_keys`, and a new delivery is refused while every in-flight
+/// slot is taken.
 ///
 /// The daemon creates one store for each gateway run, so its contents last
 /// exactly as long as that run.
@@ -239,18 +244,50 @@ impl WebhookReservationStore {
         entries
             .committed
             .retain(|_, seen_at| now.duration_since(*seen_at) < self.ttl);
-        if entries.committed.len() >= self.max_keys {
-            let evict_key = entries
-                .committed
-                .iter()
-                .min_by_key(|(_, seen_at)| *seen_at)
-                .map(|(key, _)| key.clone());
-            if let Some(evict_key) = evict_key {
-                entries.committed.remove(&evict_key);
-            }
-        }
+        Self::make_committed_room(&mut entries, self.max_keys);
         entries.committed.insert(token.key().to_string(), now);
         true
+    }
+
+    /// Record `key` for a generic webhook request. `true` when the key is new
+    /// and is now recorded; `false` for a key already committed or held by an
+    /// in-flight plugin delivery. Records count against the same committed
+    /// bound as plugin deliveries.
+    #[must_use]
+    pub fn record_if_new(&self, key: &str) -> bool {
+        let now = Instant::now();
+        let mut entries = self.entries();
+        entries
+            .committed
+            .retain(|_, seen_at| now.duration_since(*seen_at) < self.ttl);
+        if entries.committed.contains_key(key) || entries.pending.contains_key(key) {
+            return false;
+        }
+        Self::make_committed_room(&mut entries, self.max_keys);
+        entries.committed.insert(key.to_owned(), now);
+        true
+    }
+
+    /// Committed keys currently held, across both ingress kinds. Expired keys
+    /// are dropped on the next record or reservation, not by this call.
+    #[must_use]
+    pub fn committed_len(&self) -> usize {
+        self.entries().committed.len()
+    }
+
+    /// Evict the oldest committed key when the committed map is full.
+    fn make_committed_room(entries: &mut ReservationEntries, max_keys: usize) {
+        if entries.committed.len() < max_keys {
+            return;
+        }
+        let oldest = entries
+            .committed
+            .iter()
+            .min_by_key(|(_, seen_at)| *seen_at)
+            .map(|(key, _)| key.clone());
+        if let Some(oldest) = oldest {
+            entries.committed.remove(&oldest);
+        }
     }
 
     /// Release the reservation `token` owns, so a retry can deliver. `false`
@@ -577,5 +614,49 @@ mod tests {
             matches!(expiring.begin("short"), WebhookReservation::Owner(_)),
             "a committed key past its TTL is no longer a duplicate"
         );
+    }
+
+    #[test]
+    fn generic_records_and_plugin_commits_share_one_committed_budget() {
+        use super::{WebhookReservation, WebhookReservationStore};
+        use std::time::Duration;
+
+        let commit = |store: &WebhookReservationStore, key: &str| match store.begin(key) {
+            WebhookReservation::Owner(token) => assert!(store.commit(&token)),
+            _ => panic!("{key} must be new"),
+        };
+
+        // A plugin commit, then a generic record, with room for one key: the
+        // generic record evicts the plugin key, so the plugin key is new again.
+        let store = WebhookReservationStore::new(Duration::from_secs(300), 1);
+        commit(&store, "plugin");
+        assert!(store.record_if_new("generic"));
+        assert_eq!(store.committed_len(), 1);
+        assert!(matches!(
+            store.begin("plugin"),
+            WebhookReservation::Owner(_)
+        ));
+
+        // The other order: the plugin commit evicts the generic key.
+        let store = WebhookReservationStore::new(Duration::from_secs(300), 1);
+        assert!(store.record_if_new("generic"));
+        commit(&store, "plugin");
+        assert!(store.record_if_new("generic"));
+    }
+
+    #[test]
+    fn a_generic_record_treats_an_in_flight_plugin_key_as_seen() {
+        use super::{WebhookReservation, WebhookReservationStore};
+        use std::time::Duration;
+
+        let store = WebhookReservationStore::new(Duration::from_secs(300), 4);
+        let owner = match store.begin("shared-key") {
+            WebhookReservation::Owner(token) => token,
+            _ => panic!("first delivery owns the key"),
+        };
+        assert!(!store.record_if_new("shared-key"));
+        assert!(store.rollback(&owner));
+        assert!(store.record_if_new("shared-key"));
+        assert!(!store.record_if_new("shared-key"));
     }
 }

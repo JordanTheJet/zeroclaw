@@ -515,14 +515,15 @@ fn plugin_webhook_keys_are_unchanged_and_scoped_by_path() {
     );
 }
 
-/// Plugin reservations and the generic `/webhook` keys live in separate
-/// stores: plugin work holding every in-flight slot cannot make the generic
-/// path report a duplicate.
+/// In-flight plugin reservations are bounded apart from committed keys, so
+/// plugin work holding every in-flight slot cannot make the generic path
+/// report a duplicate, although both record into the run's one store.
 #[test]
-fn plugin_reservations_and_generic_webhook_keys_are_independent() {
+fn plugin_in_flight_pressure_does_not_block_generic_webhook_keys() {
     use zeroclaw_api::webhook::WebhookReservation;
 
     let reservations = Arc::new(WebhookReservationStore::new(Duration::from_secs(300), 1));
+    let generic = crate::generic_webhook_idempotency(&reservations);
     let idempotency = plugin_webhook_idempotency(Arc::clone(&reservations), "fixture");
     let _owner = match idempotency.begin("first") {
         WebhookReservation::Owner(token) => token,
@@ -532,7 +533,6 @@ fn plugin_reservations_and_generic_webhook_keys_are_independent() {
         idempotency.begin("second"),
         WebhookReservation::Unavailable
     ));
-    let generic = crate::IdempotencyStore::new(Duration::from_secs(300), 1);
     assert!(generic.record_if_new("native-webhook-key"));
 }
 
@@ -622,5 +622,46 @@ async fn plugin_webhook_deduplication_lasts_one_gateway_run() {
         deliver(next_run).await,
         "delivered",
         "a new gateway run starts with empty deduplication"
+    );
+}
+
+/// The generic routes and plugin deliveries of one gateway run share one
+/// committed-key budget, as they did when the gateway owned both: with room
+/// for one key, recording either kind evicts the other, in both orders. The
+/// stores are built the way the gateway builds them for a run.
+#[test]
+fn review_committed_capacity_preserves_cross_ingress_eviction() {
+    use zeroclaw_api::webhook::WebhookReservation;
+    fn replay_after_other_kind(plugin_first: bool) -> bool {
+        let ttl = Duration::from_secs(300);
+        let reservations = Arc::new(zeroclaw_api::webhook::WebhookReservationStore::new(ttl, 1));
+        let generic = crate::generic_webhook_idempotency(&reservations);
+        let plugin = plugin_webhook_idempotency(reservations, "fixture");
+        let generic_key = crate::idempotency_storage_key(None, "review-generic");
+        let commit_plugin = || {
+            let owner = match plugin.begin("review-plugin") {
+                WebhookReservation::Owner(owner) => owner,
+                _ => panic!("first plugin delivery must be new"),
+            };
+            assert!(plugin.commit(&owner));
+        };
+        if plugin_first {
+            commit_plugin();
+            assert!(generic.record_if_new(&generic_key));
+            matches!(plugin.begin("review-plugin"), WebhookReservation::Owner(_))
+        } else {
+            assert!(generic.record_if_new(&generic_key));
+            commit_plugin();
+            generic.record_if_new(&generic_key)
+        }
+    }
+    let observed = (
+        replay_after_other_kind(true),
+        replay_after_other_kind(false),
+    );
+    assert_eq!(
+        observed,
+        (true, true),
+        "the single committed-key budget must preserve baseline eviction in both directions"
     );
 }
