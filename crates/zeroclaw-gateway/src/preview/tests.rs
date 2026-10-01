@@ -496,6 +496,84 @@ async fn every_route_sits_behind_the_in_process_request_limits() {
     assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
 }
 
+/// The cron and memory routes sit behind the same limits: each answers
+/// `413` to a body over the in-process limit before its handler runs (no
+/// core listens here), the manual run on its long-running lane included,
+/// and a write whose body never finishes arriving is answered `408` within
+/// the request timeout.
+#[tokio::test]
+async fn the_cron_and_memory_routes_sit_behind_the_request_limits() {
+    use axum::body::{Body, Bytes};
+    use axum::http::Request;
+    use futures_util::StreamExt as _;
+    use tower::ServiceExt as _;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let endpoint = tmp.path().join("daemon.sock");
+    let preview = router(
+        CoreRpc::local(endpoint.clone(), EndpointOwner::SameAccount),
+        endpoint,
+        None,
+        watch::channel(false).0,
+        Duration::from_millis(300),
+        Duration::from_secs(crate::LONG_RUNNING_REQUEST_TIMEOUT_SECS),
+    );
+    let loopback = ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40_000)));
+
+    let oversized = vec![b' '; crate::MAX_BODY_SIZE + 1];
+    for (method, path) in [
+        ("GET", "/api/cron"),
+        ("GET", "/api/cron/settings"),
+        ("PATCH", "/api/cron/settings"),
+        ("DELETE", "/api/cron/parity-job"),
+        ("POST", "/api/cron/parity-job/run"),
+        ("GET", "/api/cron/parity-job/runs"),
+        ("GET", "/api/memory"),
+        ("POST", "/api/memory"),
+        ("DELETE", "/api/memory/parity-key"),
+    ] {
+        let request = Request::builder()
+            .method(method)
+            .uri(path)
+            .header("content-type", "application/json")
+            .header("content-length", oversized.len())
+            .extension(loopback)
+            .body(Body::from(oversized.clone()))
+            .unwrap();
+        let response = preview.clone().oneshot(request).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "{method} {path}"
+        );
+    }
+
+    for (method, path) in [("POST", "/api/memory"), ("PATCH", "/api/cron/settings")] {
+        let stalled = Body::from_stream(
+            futures_util::stream::once(async { Ok::<_, std::io::Error>(Bytes::from_static(b"{")) })
+                .chain(futures_util::stream::pending()),
+        );
+        let request = Request::builder()
+            .method(method)
+            .uri(path)
+            .header("content-type", "application/json")
+            .header("content-length", "100")
+            .extension(loopback)
+            .body(stalled)
+            .unwrap();
+        let response =
+            tokio::time::timeout(Duration::from_secs(10), preview.clone().oneshot(request))
+                .await
+                .expect("a stalled write is answered within the timeout")
+                .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::REQUEST_TIMEOUT,
+            "{method} {path}"
+        );
+    }
+}
+
 // ── The router, against a real core on a real socket ─────────────
 
 #[cfg(unix)]
