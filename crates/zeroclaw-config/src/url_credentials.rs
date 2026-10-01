@@ -54,10 +54,20 @@ impl UrlParts<'_> {
     }
 }
 
-/// Split `url` into its parts. The fragment starts at the first `#`, the
-/// query at the first `?` before it, the authority ends at the first `/`
-/// after `scheme://`, and the userinfo is everything in the authority before
-/// its last `@`.
+/// Schemes the runtime's URL parser (`reqwest::Url`, which follows the WHATWG
+/// URL standard) treats as special: any run of `/` and `\` after the colon
+/// comes before the authority, and a `\` also ends it.
+const SPECIAL_SCHEMES: [&str; 6] = ["ftp", "file", "http", "https", "ws", "wss"];
+
+/// Split `url` into its parts, with the boundaries the runtime's URL parser
+/// draws. The fragment starts at the first `#` and the query at the first
+/// `?` before it. The authority follows the scheme: for `http`, `https`,
+/// `ws`, `wss`, `ftp` and `file`, after any run of `/` and `\`, so `http:/h`,
+/// `http:///h` and `http:\\h` all name host `h`; for any other scheme, after
+/// `//`. It ends at the next `/`, or `\` for those schemes. A prefix such as
+/// `custom:` before the scheme stays with it. A value with no scheme is read
+/// as `authority/path`, the way a client that assumes `http://` reads it.
+/// The userinfo is everything in the authority before its last `@`.
 #[must_use]
 pub fn split(url: &str) -> UrlParts<'_> {
     let (before_fragment, fragment) = match url.split_once('#') {
@@ -68,11 +78,11 @@ pub fn split(url: &str) -> UrlParts<'_> {
         Some((before, query)) => (before, Some(query)),
         None => (before_fragment, None),
     };
-    let scheme_end = before_query
-        .find("://")
-        .map_or(0, |separator| separator + 3);
-    let (scheme, rest) = before_query.split_at(scheme_end);
-    let authority_end = rest.find('/').unwrap_or(rest.len());
+    let found = locate(before_query);
+    let (scheme, rest) = before_query.split_at(found.authority);
+    let authority_end = rest
+        .find(|c| c == '/' || (found.special && c == '\\'))
+        .unwrap_or(rest.len());
     let (userinfo, location) = match rest[..authority_end].rfind('@') {
         Some(at) => (Some(&rest[..at]), &rest[at + 1..]),
         None => (None, rest),
@@ -86,25 +96,119 @@ pub fn split(url: &str) -> UrlParts<'_> {
     }
 }
 
+/// Where a URL's scheme and authority start, as [`split`] reads them.
+struct Located {
+    /// The scheme's first byte, past leading whitespace and any `name:`
+    /// prefix; for a value with no scheme, its first non-blank byte.
+    scheme: usize,
+    /// The authority's first byte.
+    authority: usize,
+    /// Whether the scheme is special (and a value with no scheme, read as
+    /// `http`, counts as one).
+    special: bool,
+}
+
+/// Walk `name:` prefixes from the first non-blank byte of `url` until a
+/// special scheme, or a scheme followed by `//`. Anything else is a value
+/// with no scheme.
+fn locate(url: &str) -> Located {
+    let leading = url.len() - url.trim_start().len();
+    let mut at = leading;
+    while let Some(colon) = scheme_len(&url[at..]) {
+        let name = &url[at..at + colon];
+        let after = at + colon + 1;
+        if SPECIAL_SCHEMES
+            .iter()
+            .any(|scheme| name.eq_ignore_ascii_case(scheme))
+        {
+            let slashes = url[after..]
+                .find(|c| c != '/' && c != '\\')
+                .unwrap_or(url.len() - after);
+            return Located {
+                scheme: at,
+                authority: after + slashes,
+                special: true,
+            };
+        }
+        if url[after..].starts_with("//") {
+            return Located {
+                scheme: at,
+                authority: after + 2,
+                special: false,
+            };
+        }
+        at = after;
+    }
+    Located {
+        scheme: leading,
+        authority: leading,
+        special: true,
+    }
+}
+
+/// The length of the scheme `s` starts with, when it is followed by `:`: an
+/// ASCII letter, then letters, digits, `+`, `-` or `.`.
+fn scheme_len(s: &str) -> Option<usize> {
+    let colon = s.find(':')?;
+    let mut chars = s[..colon].chars();
+    let first = chars.next()?;
+    (first.is_ascii_alphabetic()
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')))
+    .then_some(colon)
+}
+
 /// `url` with its userinfo, query and fragment, each when present and not
 /// empty, shown as [`MASKED_SECRET`]:
 /// `https://***MASKED***@host/v1?***MASKED***`. A URL without any of them
-/// comes back unchanged.
+/// comes back unchanged. Should the runtime's URL parser still find a
+/// credential in the result, which [`split`] is built never to allow, the
+/// whole value is masked instead.
 #[must_use]
 pub fn mask(url: &str) -> String {
     let parts = split(url);
-    parts.join(
+    let masked = parts.join(
         masked(parts.userinfo),
         masked(parts.query),
         masked(parts.fragment),
-    )
+    );
+    if parser_finds_credentials(&masked) {
+        return MASKED_SECRET.to_string();
+    }
+    masked
 }
 
 /// `url` without its userinfo, query and fragment: the bare endpoint, which
-/// keeps none of the components [`mask`] hides.
+/// keeps none of the components [`mask`] hides. Empty should the runtime's
+/// URL parser still find a credential in it.
 #[must_use]
 pub fn endpoint(url: &str) -> String {
-    split(url).join(None, None, None)
+    let endpoint = split(url).join(None, None, None);
+    if parser_finds_credentials(&endpoint) {
+        return String::new();
+    }
+    endpoint
+}
+
+/// Whether the runtime's URL parser finds a userinfo, query or fragment in
+/// `url` that is neither empty nor the placeholder. The parse starts at the
+/// scheme, past a prefix such as `custom:`. A value that parses without a
+/// host is read again with `http://` in front, as reqwest reads a proxy
+/// written without a scheme.
+fn parser_finds_credentials(url: &str) -> bool {
+    let candidate = &url[locate(url).scheme..];
+    let parsed = match reqwest::Url::parse(candidate) {
+        Ok(parsed) if parsed.has_host() => Some(parsed),
+        _ => reqwest::Url::parse(&format!("http://{candidate}")).ok(),
+    };
+    let sensitive = |component: Option<&str>| {
+        component.is_some_and(|value| !value.is_empty() && value != MASKED_SECRET)
+    };
+    parsed.is_some_and(|parsed| {
+        sensitive(Some(parsed.username()))
+            || sensitive(parsed.password())
+            || sensitive(parsed.query())
+            || sensitive(parsed.fragment())
+    })
 }
 
 /// A component as a read shows it: masked unless absent or empty.
@@ -246,6 +350,103 @@ mod tests {
         // No scheme: the authority still starts the string.
         let parts = split("user:pw@localhost:11434");
         assert_eq!((parts.scheme, parts.userinfo), ("", Some("user:pw")));
+    }
+
+    /// Spellings the runtime's URL parser accepts, each with the userinfo it
+    /// finds there (or none).
+    const SPELLINGS: [(&str, Option<&str>); 18] = [
+        ("http://u:pw@h/v1", Some("u:pw")),
+        ("http:///u:pw@h/v1", Some("u:pw")),
+        ("http:/u:pw@h/v1", Some("u:pw")),
+        ("http:////u:pw@h/v1", Some("u:pw")),
+        ("HTTP:///u:pw@h/v1", Some("u:pw")),
+        ("https:\\\\u:pw@h\\v1", Some("u:pw")),
+        ("https:/\\u:pw@h/v1", Some("u:pw")),
+        ("wss:///u:pw@h", Some("u:pw")),
+        ("  https://u:pw@h/v1", Some("u:pw")),
+        ("socks5://u:pw@h:1080", Some("u:pw")),
+        ("redis://:pw@h:6379/0", Some(":pw")),
+        ("postgres://u:pw@h/db", Some("u:pw")),
+        ("https://u:p@ss@h/", Some("u:p@ss")),
+        ("https://h/users/@me", None),
+        ("https://example.invalid\\docs@v1", None),
+        ("socks5:///u:pw@h", None),
+        ("https://h:8443/v1", None),
+        ("http://[::1]:9/v1", None),
+    ];
+
+    /// `split` draws the userinfo where the runtime's URL parser does, for
+    /// every spelling it accepts, and the masked value leaves the parser
+    /// nothing to find.
+    #[test]
+    fn split_agrees_with_the_runtime_parser_on_the_userinfo() {
+        for (url, userinfo) in SPELLINGS {
+            let parsed = reqwest::Url::parse(url).expect(url);
+            let parser_sees = !parsed.username().is_empty() || parsed.password().is_some();
+            assert_eq!(parser_sees, userinfo.is_some(), "{url}: the fixture");
+            assert_eq!(split(url).userinfo, userinfo, "{url}");
+            let masked = reqwest::Url::parse(&mask(url)).expect(url);
+            assert_eq!(masked.password(), None, "{url}: {}", mask(url));
+            if userinfo.is_some() {
+                assert_eq!(masked.username(), MASKED_SECRET, "{url}");
+            }
+        }
+    }
+
+    /// Alternate spellings round-trip through a masked read and an echo, and
+    /// a URL without a credential is left byte for byte.
+    #[test]
+    fn alternate_spellings_mask_and_restore() {
+        for (stored, masked) in [
+            (
+                "http:///u:pw@127.0.0.1:9/v1",
+                "http:///***MASKED***@127.0.0.1:9/v1",
+            ),
+            (
+                "http:/u:pw@127.0.0.1:9/v1",
+                "http:/***MASKED***@127.0.0.1:9/v1",
+            ),
+            (
+                "http:////u:pw@127.0.0.1:9/v1",
+                "http:////***MASKED***@127.0.0.1:9/v1",
+            ),
+            (
+                "custom:http:///u:pw@h/v1?key=k",
+                "custom:http:///***MASKED***@h/v1?***MASKED***",
+            ),
+        ] {
+            assert_eq!(mask(stored), masked, "{stored}");
+            assert_eq!(restore(masked, Some(stored)).unwrap(), stored);
+            assert_eq!(endpoint(stored), endpoint(masked), "{stored}");
+        }
+        for url in [
+            "https://example.invalid\\docs@v1",
+            "custom:https://api.example/v1",
+            "localhost:11434",
+            "socks5:///u:pw@h",
+        ] {
+            assert_eq!(mask(url), url, "unchanged: {url}");
+        }
+    }
+
+    /// A value the runtime's parser reads differently from `split`, here a
+    /// scheme with a tab in it, which the parser removes, is masked whole.
+    #[test]
+    fn a_value_split_cannot_read_is_masked_whole() {
+        assert_eq!(mask("ht\ttp://u:pw@h/v1"), MASKED_SECRET);
+        assert_eq!(endpoint("ht\ttp://u:pw@h/v1"), "");
+    }
+
+    /// An unencoded `/` ends the authority, for `split` as for the parser,
+    /// which rejects what is left (`user:p` is not a host and port).
+    #[test]
+    fn a_slash_ends_the_authority_as_it_does_for_the_parser() {
+        assert_eq!(split("https://user:p/w@host/").userinfo, None);
+        assert!(reqwest::Url::parse("https://user:p/w@host/").is_err());
+        assert_eq!(
+            split("https://user:p%2Fw@host/").userinfo,
+            Some("user:p%2Fw")
+        );
     }
 
     #[test]
