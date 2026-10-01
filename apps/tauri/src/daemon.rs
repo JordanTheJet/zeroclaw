@@ -826,6 +826,18 @@ fn desktop_daemon_command(binary: &Path, port: u16) -> Command {
 mod tests {
     use super::*;
 
+    /// Run a fixture's capability probe once, untimed. The first exec of a
+    /// new file can take seconds on a loaded macOS host, which the launch's
+    /// timed probe would otherwise be measuring.
+    #[cfg(unix)]
+    fn warm_probe(binary: &Path) {
+        let status = Command::new(binary)
+            .args(["service", "run-desktop-daemon", "--help"])
+            .status()
+            .expect("warm fixture");
+        assert!(status.success(), "fixture must answer the capability probe");
+    }
+
     /// Launch `binary` the way the app does, into a fresh owned registry.
     #[cfg(unix)]
     fn launch(binary: &Path) -> std::io::Result<()> {
@@ -1070,6 +1082,7 @@ mod tests {
         fs::write(&binary, fixture).expect("write supervisor fixture");
         fs::set_permissions(&binary, fs::Permissions::from_mode(0o700))
             .expect("make supervisor fixture executable");
+        warm_probe(&binary);
 
         let error = launch(&binary).expect_err("log-open failure must reject startup");
         let error = error.to_string();
@@ -1140,6 +1153,7 @@ mod tests {
         fs::write(&binary, fixture).expect("write exiting supervisor fixture");
         fs::set_permissions(&binary, fs::Permissions::from_mode(0o700))
             .expect("make exiting supervisor fixture executable");
+        warm_probe(&binary);
 
         let error = launch(&binary).expect_err("invalid readiness must reject startup");
         assert!(error.to_string().contains("invalid readiness response"));

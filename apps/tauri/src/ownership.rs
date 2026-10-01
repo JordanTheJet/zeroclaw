@@ -86,15 +86,15 @@ impl OwnedProcesses {
         match ready {
             Ok(()) => Ok(()),
             Err(startup_error) => {
+                // Stop it while still holding the registry: a Quit waiting
+                // for the lock must not see it gone until it is stopped.
                 let (_, mut child) = registry.launched.remove(index);
+                let stopped = crate::daemon::terminate_supervisor_tree(
+                    &mut child,
+                    crate::daemon::STARTUP_CLEANUP_GRACE,
+                );
                 drop(registry);
-                Err(crate::daemon::attach_cleanup_error(
-                    startup_error,
-                    crate::daemon::terminate_supervisor_tree(
-                        &mut child,
-                        crate::daemon::STARTUP_CLEANUP_GRACE,
-                    ),
-                ))
+                Err(crate::daemon::attach_cleanup_error(startup_error, stopped))
             }
         }
     }
@@ -113,19 +113,23 @@ impl OwnedProcesses {
     /// Trees still starting are stopped too, so nothing this instance launched
     /// is left running when this returns. Every handle is released either way;
     /// the errors are returned.
+    ///
+    /// Every stop of a recorded tree, here or after a failed readiness check,
+    /// happens while the registry lock is held, so the registry is empty only
+    /// once the trees taken from it have stopped.
     pub fn quit(&self, grace: Duration) -> Vec<std::io::Error> {
-        let launched = {
-            let mut registry = self.registry();
-            registry.closing = true;
-            std::mem::take(&mut registry.launched)
-        };
-        launched
+        let mut registry = self.registry();
+        registry.closing = true;
+        let launched = std::mem::take(&mut registry.launched);
+        let errors = launched
             .into_iter()
             .rev()
             .filter_map(|(_, mut child)| {
                 crate::daemon::terminate_supervisor_tree(&mut child, grace).err()
             })
-            .collect()
+            .collect();
+        drop(registry);
+        errors
     }
 }
 
@@ -267,6 +271,30 @@ mod tests {
                          while :; do sleep 1; done\n"
                     ),
                 )
+            }
+
+            /// A supervisor that reports an invalid readiness line, so the
+            /// launch stops it, and that ignores SIGTERM (recording that it
+            /// arrived) until [`Fixture::stop`], so that stop takes the whole
+            /// startup cleanup grace and ends with SIGKILL.
+            fn slow_failing_supervisor(&self, tag: &str) -> PathBuf {
+                let dir = Self::literal(&self.dir);
+                self.script(
+                    tag,
+                    &format!(
+                        "#!/bin/sh\n\
+                         if [ \"${{1:-}}\" = service ] && [ \"${{2:-}}\" = run-desktop-daemon ] && [ \"${{3:-}}\" = --help ]; then exit 0; fi\n\
+                         printf '%s' \"$$\" > '{dir}/started'\n\
+                         term='{dir}/term-received'\n\
+                         trap 'printf x > \"$term\"' TERM\n\
+                         printf '%s\\n' INVALID\n\
+                         while [ ! -f '{dir}/stop' ]; do sleep 0.1; done\n"
+                    ),
+                )
+            }
+
+            fn stop(&self) {
+                let _ = fs::write(self.dir.join("stop"), b"");
             }
 
             fn release(&self) {
@@ -593,6 +621,73 @@ mod tests {
             let _ = started_pid(&fixture);
             let errors = owned.quit(TEST_GRACE);
             // Leave the directory for the parent test to inspect.
+            std::mem::forget(fixture);
+            std::process::exit(if errors.is_empty() { 0 } else { 1 });
+        }
+
+        /// A launch whose readiness failed is being stopped (SIGTERM sent,
+        /// startup cleanup grace running) when the app Quits and exits at
+        /// once. Quit must not return before that stop finishes, or the app's
+        /// exit kills the thread doing it and the supervisor survives.
+        #[test]
+        fn a_failed_start_still_cleaning_up_does_not_survive_an_app_exit() {
+            let fixture = Fixture::new("failstop");
+            let binary = fixture.slow_failing_supervisor("core");
+            let status = Command::new(std::env::current_exe().expect("test binary"))
+                .args([
+                    "--exact",
+                    "ownership::tests::process_trees::quit_during_failed_start_cleanup_helper",
+                    "--ignored",
+                    "--test-threads=1",
+                ])
+                .env(EXIT_HELPER_BINARY_ENV, &binary)
+                .env(EXIT_HELPER_DIR_ENV, &fixture.dir)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .expect("run the app stand-in");
+            let supervisor = started_pid(&fixture);
+            let survived = !wait_gone(supervisor);
+            if survived {
+                // Let it end on its own before the fixture directory goes.
+                fixture.stop();
+                wait_gone(supervisor);
+            }
+            assert!(status.success(), "app stand-in failed: {status}");
+            assert!(
+                !survived,
+                "a supervisor whose failed start was still being stopped survived the app's exit"
+            );
+        }
+
+        /// The app stand-in: start a launch that fails readiness, wait until
+        /// its cleanup has sent SIGTERM, then Quit and exit immediately.
+        #[test]
+        #[ignore = "subprocess helper for a_failed_start_still_cleaning_up_does_not_survive_an_app_exit"]
+        fn quit_during_failed_start_cleanup_helper() {
+            let (Some(binary), Some(dir)) = (
+                std::env::var_os(EXIT_HELPER_BINARY_ENV),
+                std::env::var_os(EXIT_HELPER_DIR_ENV),
+            ) else {
+                return;
+            };
+            let fixture = Fixture {
+                dir: PathBuf::from(dir),
+            };
+            let owned = std::sync::Arc::new(OwnedProcesses::default());
+            let launching = std::sync::Arc::clone(&owned);
+            let binary = PathBuf::from(binary);
+            std::thread::spawn(move || launching.launch(&binary, 0));
+            let term = fixture.dir.join("term-received");
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !term.exists() {
+                if Instant::now() >= deadline {
+                    std::process::exit(2);
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let errors = owned.quit(TEST_GRACE);
             std::mem::forget(fixture);
             std::process::exit(if errors.is_empty() { 0 } else { 1 });
         }
