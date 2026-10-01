@@ -9,9 +9,10 @@
 //! socket. On Windows the process the kernel names as the pipe's server
 //! must run as the expected account, and the pipe itself must be owned by
 //! that account (or the Administrators group) with no write access for a
-//! broad group (see [`pipe`]). These checks run on every dial that carries a
-//! credential (a bearer, a TUI signature, or forwarded environment),
-//! reconnects included, and there is no switch that skips them.
+//! broad group (the `pipe` module, built for Windows). These checks run on
+//! every dial that carries a credential (a bearer, a TUI signature, or
+//! forwarded environment), reconnects included, and there is no switch that
+//! skips them.
 //!
 //! What this cannot tell apart: two processes of the same account. Malware
 //! running as the core's own user can read its configuration and tokens

@@ -47,7 +47,9 @@ find a daemon an earlier binary started that has not been restarted. Finding
 it does not make it usable: zerocode still requires the daemon's version to
 equal its own, so against an older daemon it reports the mismatch, which means
 restart the daemon, instead of starting a second daemon beside it. The daemon
-binds only the new name.
+binds only the new name. Clients built on `zeroclaw-rpc-client` check the
+older name exactly as they check the new one before they send a credential
+(see [Security](#security)).
 
 Clients choose the data directory themselves. zerocode uses
 `<config_dir>/data`; it does not follow `ZEROCLAW_DATA_DIR`,
@@ -312,9 +314,10 @@ explicitly stopped.
   callers, or all signed-in users write to it, create instances under its
   name, or change its security. A uid owner is refused there, since a uid
   names no Windows account. The check runs on every dial and writes nothing
-  to an endpoint it refuses. Dials that carry none of these are not gated.
-  The only other public constructor runs over the daemon's in-process
-  duplex.
+  to an endpoint it refuses, the new pipe name or the older one alike. Dials
+  that carry none of these are not gated. The only other public constructor
+  runs over the daemon's in-process duplex. zerocode has its own client and
+  does not run this check yet.
 
 ## Quick test
 

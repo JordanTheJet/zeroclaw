@@ -973,6 +973,193 @@ mod tests {
         assert_eq!(client.handshake().server_version, "test");
     }
 
+    /// The fallback endpoint is checked exactly as the primary is: a
+    /// credential-bearing dial that falls through to an endpoint of another
+    /// account writes nothing there.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_fallback_endpoint_of_another_account_receives_nothing() {
+        for (kind, options) in credential_bearing_dials() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let legacy = dir.path().join("legacy.sock");
+            let peer = listen_once(&legacy);
+            let endpoints = crate::endpoint::ClientEndpoints {
+                primary: dir.path().join("primary.sock"),
+                legacy: Some(legacy.clone()),
+            };
+            let own = own_uid(dir.path());
+            let options = ConnectOptions {
+                endpoint_owner: EndpointOwner::Uid(own.wrapping_add(1)),
+                ..options
+            };
+            match RpcClient::connect_local_endpoints(&endpoints, options).await {
+                Err(ClientError::UntrustedEndpoint {
+                    endpoint,
+                    rejection,
+                }) => {
+                    assert_eq!(endpoint, legacy, "{kind}");
+                    assert_eq!(
+                        rejection,
+                        EndpointRejection::PeerUid {
+                            expected: own.wrapping_add(1),
+                            actual: own
+                        },
+                        "{kind}"
+                    );
+                }
+                Err(other) => panic!("{kind}: expected UntrustedEndpoint, got {other}"),
+                Ok(_) => panic!("{kind}: the fallback must be refused"),
+            }
+            assert!(
+                bytes_seen(peer).await.is_empty(),
+                "{kind}: not one byte may reach an unverified fallback"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_fallback_endpoint_in_a_shared_directory_receives_nothing() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let shared = dir_with_mode(root.path(), "shared", 0o777);
+        let legacy = shared.join("legacy.sock");
+        let peer = listen_once(&legacy);
+        let endpoints = crate::endpoint::ClientEndpoints {
+            primary: root.path().join("primary.sock"),
+            legacy: Some(legacy),
+        };
+        match RpcClient::connect_local_endpoints(&endpoints, with_token()).await {
+            Err(ClientError::UntrustedEndpoint { rejection, .. }) => assert_eq!(
+                rejection,
+                EndpointRejection::DirectoryWritable {
+                    dir: shared,
+                    mode: 0o777
+                }
+            ),
+            Err(other) => panic!("expected UntrustedEndpoint, got {other}"),
+            Ok(_) => panic!("the fallback must be refused"),
+        }
+        assert!(bytes_seen(peer).await.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_verified_fallback_endpoint_receives_the_credential() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let legacy = dir.path().join("legacy.sock");
+        let peer = listen_once(&legacy);
+        let endpoints = crate::endpoint::ClientEndpoints {
+            primary: dir.path().join("primary.sock"),
+            legacy: Some(legacy),
+        };
+        let client = RpcClient::connect_local_endpoints(&endpoints, with_token())
+            .await
+            .expect("a verified fallback completes the handshake");
+        assert_eq!(client.handshake().server_version, "test");
+        drop(client);
+        let seen = String::from_utf8(bytes_seen(peer).await).expect("utf-8 frames");
+        assert!(seen.contains("\"auth_token\":\"bearer-secret\""), "{seen}");
+    }
+
+    /// A primary that is present but fails the check is reported: the
+    /// fallback is not dialed in its place.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_untrusted_primary_is_reported_and_the_fallback_is_not_dialed() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let shared = dir_with_mode(root.path(), "shared", 0o777);
+        let primary = shared.join("primary.sock");
+        let primary_peer = listen_once(&primary);
+        let legacy = root.path().join("legacy.sock");
+        let legacy_listener =
+            tokio::net::UnixListener::bind(&legacy).expect("bind the fallback socket");
+        let endpoints = crate::endpoint::ClientEndpoints {
+            primary: primary.clone(),
+            legacy: Some(legacy),
+        };
+        match RpcClient::connect_local_endpoints(&endpoints, with_token()).await {
+            Err(ClientError::UntrustedEndpoint {
+                endpoint,
+                rejection,
+            }) => {
+                assert_eq!(endpoint, primary);
+                assert_eq!(
+                    rejection,
+                    EndpointRejection::DirectoryWritable {
+                        dir: shared,
+                        mode: 0o777
+                    }
+                );
+            }
+            Err(other) => panic!("expected UntrustedEndpoint, got {other}"),
+            Ok(_) => panic!("the untrusted primary must be refused"),
+        }
+        assert!(bytes_seen(primary_peer).await.is_empty());
+        // A dial would sit in the listener's backlog even if the client had
+        // already closed it.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), legacy_listener.accept())
+                .await
+                .is_err(),
+            "the fallback must not be dialed"
+        );
+    }
+
+    /// The legacy pipe is checked exactly as the stable one is. The pipe is
+    /// served by this process, but the dial expects another account.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_writes_nothing_to_a_legacy_pipe_another_account_serves() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "zc-rpcc-{}-pipe-untrusted-legacy",
+            std::process::id()
+        ));
+        let endpoints = crate::endpoint::client_endpoints_with(None, &data_dir);
+        let legacy = endpoints
+            .legacy
+            .clone()
+            .expect("a Windows client without an override carries the legacy pipe");
+        let peer = serve_pipe_once(&legacy.to_string_lossy());
+        let other = crate::verify::pipe::Sid::new(5, &[21, 1, 2, 3, 1001]);
+        crate::verify::expect_account_for_test(Some(other.clone()));
+        let outcome = RpcClient::connect_local_endpoints(&endpoints, with_token()).await;
+        crate::verify::expect_account_for_test(None);
+        match outcome {
+            Err(ClientError::UntrustedEndpoint {
+                endpoint,
+                rejection: EndpointRejection::ServerAccount { expected, .. },
+            }) => {
+                assert_eq!(endpoint, legacy);
+                assert_eq!(expected, other.to_string());
+            }
+            Err(error) => panic!("expected ServerAccount, got {error}"),
+            Ok(_) => panic!("another account's legacy pipe must not receive a credential"),
+        }
+        assert!(bytes_seen(peer).await.is_empty());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_sends_the_credential_to_a_legacy_pipe_this_account_serves() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "zc-rpcc-{}-pipe-trusted-legacy",
+            std::process::id()
+        ));
+        let endpoints = crate::endpoint::client_endpoints_with(None, &data_dir);
+        let legacy = endpoints
+            .legacy
+            .clone()
+            .expect("a Windows client without an override carries the legacy pipe");
+        let peer = serve_pipe_once(&legacy.to_string_lossy());
+        let client = RpcClient::connect_local_endpoints(&endpoints, with_token())
+            .await
+            .expect("a legacy pipe this account serves verifies");
+        assert_eq!(client.handshake().server_version, "test");
+        drop(client);
+        let seen = String::from_utf8(bytes_seen(peer).await).expect("utf-8 frames");
+        assert!(seen.contains("bearer-secret"), "{seen}");
+    }
+
     #[tokio::test]
     async fn handshake_and_request_round_trip() {
         let (client_half, server_half) = tokio::io::duplex(64 * 1024);
