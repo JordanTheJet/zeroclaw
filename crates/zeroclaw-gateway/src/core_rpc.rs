@@ -55,6 +55,7 @@ use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
+use serde::de::DeserializeOwned;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::io::DuplexStream;
@@ -105,7 +106,7 @@ const OIDC_BEARER_MESSAGE: &str =
 /// unchanged from the config route layer's.
 const INVALID_PROVIDER_MESSAGE: &str = "Invalid auth_provider selection";
 
-type DialFuture<'a> = Pin<Box<dyn Future<Output = Option<DuplexStream>> + Send + 'a>>;
+pub(crate) type DialFuture<'a> = Pin<Box<dyn Future<Output = Option<DuplexStream>> + Send + 'a>>;
 
 /// Opens a transport to the core. The in-process connector implements it;
 /// tests substitute their own.
@@ -145,6 +146,12 @@ impl CoreRpc {
         pairing_required: impl Fn() -> bool + Send + Sync + 'static,
     ) -> Self {
         Self::with_dialer(connector, pairing_required, PoolLimits::default())
+    }
+
+    /// A handle over any dialer, for route tests outside this module.
+    #[cfg(test)]
+    pub(crate) fn over_dialer(dialer: impl Dial) -> Self {
+        Self::with_dialer(dialer, || true, PoolLimits::default())
     }
 
     /// Serve RPC-backed routes through the daemon's local socket at
@@ -842,6 +849,23 @@ impl CoreCall {
                 )))
             }
         }
+    }
+
+    /// [`CoreCall::request`], decoding the result into `T`. A result that
+    /// does not decode is the core's fault, reported as a core error.
+    pub async fn call<T: DeserializeOwned>(
+        &self,
+        method: Method,
+        params: Value,
+    ) -> Result<T, CoreError> {
+        let value = self.request(method, params).await?;
+        serde_json::from_value(value).map_err(|error| {
+            CoreError::Rpc(JsonRpcError {
+                code: INTERNAL_ERROR,
+                message: format!("undecodable {} result: {error}", method.wire_name()),
+                data: None,
+            })
+        })
     }
 }
 

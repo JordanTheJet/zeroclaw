@@ -6731,16 +6731,17 @@ impl RpcDispatcher {
                         rpc_err(INTERNAL_ERROR, "Session persistence is disabled")
                     })?;
                 backend
-                    .load(&key)
+                    .load_with_timestamps(&key)
                     .into_iter()
-                    .map(|message| MessageEntry {
-                        role: message.role,
-                        content: message.content,
+                    .map(|row| MessageEntry {
+                        role: row.message.role,
+                        content: row.message.content,
                         kind: MessageEntryKind::Message,
                         tool_call_id: None,
                         tool_name: None,
                         tool_input: None,
                         tool_output: None,
+                        created_at: row.created_at.map(|at| at.to_rfc3339()),
                     })
                     .collect()
             }
@@ -10451,6 +10452,7 @@ fn conversation_message_entries(messages: &[ConversationMessage]) -> Vec<Message
                 tool_name: None,
                 tool_input: None,
                 tool_output: None,
+                created_at: None,
             }),
             ConversationMessage::AssistantToolCalls {
                 text, tool_calls, ..
@@ -10464,6 +10466,7 @@ fn conversation_message_entries(messages: &[ConversationMessage]) -> Vec<Message
                         tool_name: None,
                         tool_input: None,
                         tool_output: None,
+                        created_at: None,
                     });
                 }
 
@@ -10484,6 +10487,7 @@ fn conversation_message_entries(messages: &[ConversationMessage]) -> Vec<Message
                                 .unwrap_or_else(|_| Value::String(call.arguments.clone())),
                         ),
                         tool_output: None,
+                        created_at: None,
                     });
                 }
             }
@@ -10521,6 +10525,7 @@ fn conversation_message_entries(messages: &[ConversationMessage]) -> Vec<Message
                                 .then(|| result.tool_name.clone()),
                             tool_input: None,
                             tool_output: Some(output),
+                            created_at: None,
                         });
                     }
                 }
