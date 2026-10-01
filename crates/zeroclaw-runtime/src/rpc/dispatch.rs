@@ -26059,7 +26059,7 @@ mod tests {
             let archived = std::fs::read_dir(shared.join("_deleted")).is_ok_and(|entries| {
                 entries
                     .flatten()
-                    .any(|entry| entry.file_name().to_string_lossy().starts_with(name))
+                    .any(|entry| entry.file_name().to_string_lossy().contains(name))
             });
             assert_eq!(archived, !purge, "{name}");
         }

@@ -1060,9 +1060,17 @@ mod against_a_core {
                 )
                 .unwrap();
         }
+        let bundle_dir = config.install_root_dir().join("shared/skills/team");
         let workspace = config.agent_workspace_dir("main");
         std::fs::create_dir_all(&workspace).unwrap();
         std::fs::write(workspace.join("SOUL.md"), "# Soul\n").unwrap();
+        // Larger than one RPC frame (8 MiB): the core must cut it to the
+        // editor's view before it crosses the connection.
+        std::fs::write(
+            workspace.join("AGENTS.md"),
+            "a".repeat(8 * 1024 * 1024 + 1024),
+        )
+        .unwrap();
         std::fs::write(
             workspace.join("IDENTITY.md"),
             "x".repeat(MAX_FILE_CHARS + 10),
@@ -1133,6 +1141,18 @@ mod against_a_core {
                     headers(),
                     local(),
                     file("IDENTITY.md"),
+                    agent(Some("main")),
+                )
+                .await
+                .into_response(),
+            ),
+            (
+                "/api/personality/AGENTS.md?agent=main",
+                handle_get(
+                    state.clone(),
+                    headers(),
+                    local(),
+                    file("AGENTS.md"),
                     agent(Some("main")),
                 )
                 .await
@@ -1231,20 +1251,55 @@ mod against_a_core {
                 "{path}"
             );
         }
-        // Refusals the core makes without yet saying which refusal it was (a
-        // missing skill, an unknown bundle or agent): refused, but with the
-        // gateway's generic mapping of the core's code until it does.
-        for path in [
-            "/api/skills/bundles/team/skills/missing",
-            "/api/skills/bundles/nope/skills/alpha",
-            "/api/personality?agent=ghost",
-            "/api/personality/SOUL.md?agent=ghost",
-        ] {
-            let (status, body) = served(&preview, "GET", path).await;
-            assert!(
-                status.is_client_error() || status.is_server_error(),
-                "{path}: {status} {body}"
-            );
+        // Read refusals: the in-process route's status and body, which the
+        // core's refusal reasons carry. A skill whose document has no
+        // frontmatter, and a directory in the bundle that is not a skill (no
+        // manifest), join the bundle now, after the reads above.
+        std::fs::create_dir_all(bundle_dir.join("broken")).unwrap();
+        std::fs::write(bundle_dir.join("broken/SKILL.md"), "no frontmatter\n").unwrap();
+        std::fs::create_dir_all(bundle_dir.join("no-manifest")).unwrap();
+        let read_refusals = [
+            (
+                "/api/skills/bundles/team/skills/missing",
+                StatusCode::NOT_FOUND,
+                handle_read_skill(state.clone(), headers(), local(), skill("team", "missing"))
+                    .await,
+            ),
+            (
+                "/api/skills/bundles/nope/skills/alpha",
+                StatusCode::BAD_REQUEST,
+                handle_read_skill(state.clone(), headers(), local(), skill("nope", "alpha")).await,
+            ),
+            (
+                "/api/skills/bundles/team/skills/broken",
+                StatusCode::UNPROCESSABLE_ENTITY,
+                handle_read_skill(state.clone(), headers(), local(), skill("team", "broken")).await,
+            ),
+            (
+                "/api/personality?agent=ghost",
+                StatusCode::NOT_FOUND,
+                handle_index(state.clone(), headers(), local(), agent(Some("ghost")))
+                    .await
+                    .into_response(),
+            ),
+            (
+                "/api/personality/SOUL.md?agent=ghost",
+                StatusCode::NOT_FOUND,
+                handle_get(
+                    state.clone(),
+                    headers(),
+                    local(),
+                    file("SOUL.md"),
+                    agent(Some("ghost")),
+                )
+                .await
+                .into_response(),
+            ),
+        ];
+        for (path, status, in_process) in read_refusals {
+            let in_process = answer(in_process).await;
+            assert_eq!(in_process.0, status, "{path}: {in_process:?}");
+            assert_eq!(served(&preview, "GET", path).await, in_process, "{path}");
         }
 
         // Personality writes that are refused, before anything is written.
@@ -1277,9 +1332,9 @@ mod against_a_core {
             assert_eq!(served, answer(in_process).await, "PUT {path}");
             assert_ne!(served.0, StatusCode::OK, "PUT {path}");
         }
-        // A drifted write is a conflict on both, naming the file. The file's
-        // current content rides in the core's error `data`, which the core
-        // does not put on the wire yet.
+        // A drifted write is a conflict on both, with the file's current
+        // content and mtime for the editor to reconcile: the operator may
+        // read personality files.
         let (status, drifted) = send_json(
             &preview,
             "PUT",
@@ -1301,18 +1356,29 @@ mod against_a_core {
         )
         .await;
         assert_eq!(status, StatusCode::CONFLICT, "{drifted}");
-        assert_eq!(status, in_process_status);
-        assert_eq!(drifted["error"], in_process["error"]);
-        assert_eq!(drifted["filename"], in_process["filename"]);
-        // The core refuses an unknown agent before anything is written.
-        let (status, body) = send_json(
+        assert_eq!((status, &drifted), (in_process_status, &in_process));
+        assert_eq!(drifted["current_content"], "# Soul\n");
+        assert!(drifted["current_mtime_ms"].is_i64(), "{drifted}");
+        // An unknown agent: the in-process answer, before anything is written.
+        let served_ghost = send_json(
             &preview,
             "PUT",
             "/api/personality/SOUL.md?agent=ghost",
             json!({ "content": "x" }),
         )
         .await;
-        assert!(status.is_client_error(), "{status} {body}");
+        let in_process_ghost = handle_put(
+            state.clone(),
+            headers(),
+            local(),
+            file("SOUL.md"),
+            agent(Some("ghost")),
+            Json(put("x".to_owned(), None)),
+        )
+        .await
+        .into_response();
+        assert_eq!(served_ghost, answer(in_process_ghost).await);
+        assert_eq!(served_ghost.0, StatusCode::NOT_FOUND);
         assert_eq!(
             std::fs::read_to_string(workspace.join("SOUL.md")).unwrap(),
             "# Soul\n"
@@ -1382,16 +1448,31 @@ mod against_a_core {
             assert_eq!(read["frontmatter"]["description"], "edited", "{name}");
             assert_eq!(read["body"], "# Edited\n", "{name}");
         }
-        let missing_write = send_json(
-            &preview,
-            "PUT",
-            "/api/skills/bundles/team/skills/missing",
-            edited("missing"),
-        )
-        .await;
+        let write_refusals = [
+            ("team", "missing", StatusCode::NOT_FOUND),
+            ("team", "no-manifest", StatusCode::FORBIDDEN),
+            ("nope", "alpha", StatusCode::BAD_REQUEST),
+        ];
+        for (bundle, name, status) in write_refusals {
+            let path = format!("/api/skills/bundles/{bundle}/skills/{name}");
+            let served_write = send_json(&preview, "PUT", &path, edited(name)).await;
+            let local_write = answer(
+                handle_write_skill(
+                    state.clone(),
+                    headers(),
+                    local(),
+                    skill(bundle, name),
+                    Json(serde_json::from_value::<SkillWriteBody>(edited(name)).unwrap()),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(local_write.0, status, "PUT {path}: {local_write:?}");
+            assert_eq!(served_write, local_write, "PUT {path}");
+        }
         assert!(
-            missing_write.0.is_client_error() || missing_write.0.is_server_error(),
-            "{missing_write:?}"
+            !bundle_dir.join("no-manifest/SKILL.md").exists(),
+            "nothing is written into a directory that is not a skill"
         );
 
         let bundle = config.install_root_dir().join("shared/skills/team");
@@ -1430,16 +1511,90 @@ mod against_a_core {
                 assert_eq!(archived(&name), !purge, "{name} archived");
             }
         }
-        let missing_delete = served(
-            &preview,
-            "DELETE",
-            "/api/skills/bundles/team/skills/missing",
+        for (name, status) in [
+            ("missing", StatusCode::NOT_FOUND),
+            ("no-manifest", StatusCode::FORBIDDEN),
+        ] {
+            let path = format!("/api/skills/bundles/team/skills/{name}");
+            let served_delete = served(&preview, "DELETE", &path).await;
+            let local_delete = answer(
+                handle_delete_skill(
+                    state.clone(),
+                    headers(),
+                    local(),
+                    skill("team", name),
+                    Query(DeleteQuery { purge: false }),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(local_delete.0, status, "DELETE {path}: {local_delete:?}");
+            assert_eq!(served_delete, local_delete, "DELETE {path}");
+        }
+        assert!(
+            bundle_dir.join("no-manifest").exists(),
+            "a directory that is not a skill is not removed"
+        );
+
+        // A request over the production body limit is refused before any
+        // route runs, by both gateways alike, and writes nothing.
+        let over_limit = || {
+            let mut request = crate::refusal_parity::oversized(
+                axum::http::Method::PUT,
+                "/api/personality/SOUL.md?agent=main",
+                crate::MAX_BODY_SIZE,
+            );
+            request.headers_mut().insert(
+                axum::http::header::AUTHORIZATION,
+                format!("Bearer {TOKEN}").parse().unwrap(),
+            );
+            request
+        };
+        let in_process_router = Router::new()
+            .route(
+                "/api/personality/{filename}",
+                axum::routing::put(handle_put),
+            )
+            .with_state(crate::api::test_state(config.clone()))
+            .layer(axum::Extension(CoreRpc::default()))
+            .layer(tower_http::limit::RequestBodyLimitLayer::new(
+                crate::MAX_BODY_SIZE,
+            ));
+        let before = std::fs::read_to_string(workspace.join("SOUL.md")).unwrap();
+        crate::refusal_parity::assert_refusal_parity(
+            "PUT /api/personality/SOUL.md over the body limit",
+            StatusCode::PAYLOAD_TOO_LARGE,
+            in_process_router.oneshot(over_limit()).await.unwrap(),
+            [preview.clone().oneshot(over_limit()).await.unwrap()],
         )
         .await;
-        assert!(
-            missing_delete.0.is_client_error() || missing_delete.0.is_server_error(),
-            "{missing_delete:?}"
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("SOUL.md")).unwrap(),
+            before,
+            "an oversized request changes nothing"
         );
+
+        // A request with no credential is refused without waiting for a body
+        // that never comes, as the in-process gateway refuses it.
+        for path in [
+            "/api/personality/SOUL.md?agent=main",
+            "/api/skills/bundles/team/skills/alpha",
+        ] {
+            let request = Request::builder()
+                .method("PUT")
+                .uri(path)
+                .header("content-type", "application/json")
+                .body(Body::from_stream(tokio_stream::pending::<
+                    Result<axum::body::Bytes, std::io::Error>,
+                >()))
+                .unwrap();
+            let response =
+                tokio::time::timeout(Duration::from_secs(2), preview.clone().oneshot(request))
+                    .await
+                    .unwrap_or_else(|_| panic!("PUT {path}: the refusal waited for the body"))
+                    .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "PUT {path}");
+        }
 
         // Creating a skill waits on the core's method for it.
         let (status, body) = send(
