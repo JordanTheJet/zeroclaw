@@ -42982,6 +42982,104 @@ stream_tool_arguments = [
         );
     }
 
+    /// The Gmail push webhook secret and the voice-call auth token are
+    /// credentials. Config reads (the whole-config projection, the property
+    /// listing and each property read) hide them as they hide every secret,
+    /// both are classified secret, which is what makes `config/set` and the
+    /// HTTP property writes refuse their masked form, and a masked config
+    /// written back restores them from the stored one.
+    #[::core::prelude::v1::test]
+    fn gmail_push_and_voice_call_credentials_are_secret() {
+        use crate::traits::MaskSecrets;
+        const MARKERS: [&str; 2] = ["whsec-gmail-11388", "voice-token-11388"];
+        let original: Config = toml::from_str(
+            "[channels.gmail_push.inbox]\n\
+             topic = \"projects/p/topics/t\"\n\
+             webhook_secret = \"whsec-gmail-11388\"\n\
+             [channels.voice_call.calls]\n\
+             account_id = \"account\"\n\
+             auth_token = \"voice-token-11388\"\n\
+             from_number = \"+15550100\"\n",
+        )
+        .unwrap();
+        let leaks = |text: &str| -> Vec<&str> {
+            MARKERS
+                .into_iter()
+                .filter(|marker| text.contains(marker))
+                .collect()
+        };
+        assert_eq!(
+            leaks(&toml::to_string(&original).unwrap()),
+            MARKERS,
+            "both fixtures are fields the config parses"
+        );
+        // Every way a reader can see the two values, collected before any
+        // assertion so a failure names each exposure.
+        let mut exposed = Vec::new();
+        let mut masked = original.clone();
+        masked.mask_secrets();
+        let whole = serde_json::to_string(&masked).unwrap();
+        for marker in leaks(&whole) {
+            exposed.push(format!("the masked whole config shows {marker}"));
+        }
+        let listed: Vec<_> = original
+            .prop_fields()
+            .into_iter()
+            .filter(|field| {
+                field.name == "channels.gmail_push.inbox.webhook_secret"
+                    || field.name == "channels.voice_call.calls.auth_token"
+            })
+            .collect();
+        assert_eq!(
+            listed.len(),
+            2,
+            "{:?}",
+            listed.iter().map(|f| &f.name).collect::<Vec<_>>()
+        );
+        for field in &listed {
+            for marker in leaks(&field.display_value) {
+                exposed.push(format!("the listing shows {} as {marker}", field.name));
+            }
+            let read = original.get_prop(&field.name).unwrap();
+            for marker in leaks(&read) {
+                exposed.push(format!("reading {} returns {marker}", field.name));
+            }
+            if !field.is_secret || !Config::prop_is_secret(&field.name) {
+                exposed.push(format!("{} is not classified secret", field.name));
+            }
+        }
+        for (secret, path) in [
+            (
+                crate::scattered_types::GmailPushConfig::prop_is_secret(
+                    "channels.gmail.webhook_secret",
+                ),
+                "channels.gmail.webhook_secret",
+            ),
+            (
+                crate::scattered_types::VoiceCallConfig::prop_is_secret(
+                    "channels.voice_call.auth_token",
+                ),
+                "channels.voice_call.auth_token",
+            ),
+        ] {
+            if !secret {
+                exposed.push(format!("{path} is not classified secret"));
+            }
+        }
+        assert!(
+            exposed.is_empty(),
+            "credentials exposed:\n{}",
+            exposed.join("\n")
+        );
+
+        masked.restore_secrets_from(&original);
+        assert_eq!(
+            toml::to_string(&masked).unwrap(),
+            toml::to_string(&original).unwrap(),
+            "the masked config written back keeps the stored credentials"
+        );
+    }
+
     /// The email OAuth settings are one object property: a member written
     /// with the placeholder and nothing stored behind it is refused.
     #[::core::prelude::v1::test]

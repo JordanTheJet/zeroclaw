@@ -672,6 +672,9 @@ pub struct GmailPushConfig {
     #[credential_url]
     pub webhook_url: String,
     #[serde(default)]
+    #[secret]
+    #[credential_class = "encrypted_secret"]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub webhook_secret: String,
 
     /// Tools excluded from this channel's tool spec. When set, these tools
@@ -783,6 +786,9 @@ pub struct VoiceCallConfig {
     #[serde(default)]
     pub model_provider: VoiceProvider,
     pub account_id: String,
+    #[secret]
+    #[credential_class = "encrypted_secret"]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub auth_token: String,
     pub from_number: String,
     #[serde(default = "default_webhook_port")]
