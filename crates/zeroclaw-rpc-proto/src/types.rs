@@ -1573,6 +1573,17 @@ pub enum SessionUpdateEvent {
         /// Absent for legacy or missing-session terminal events.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         message_count: Option<usize>,
+        /// For a `Failed` turn the agent ran: a stable code
+        /// (`PROVIDER_ERROR`, `AUTH_ERROR` or `AGENT_ERROR`). Absent for
+        /// other outcomes, for a prompt refused before its turn ran, and from
+        /// a core that predates it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error_code: Option<String>,
+        /// With `error_code`: the message a chat client shows, localized for
+        /// a provider delivery failure and otherwise the sanitized
+        /// diagnostic.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error_message: Option<String>,
     },
     /// Emitted whenever older whole turns were dropped from structured history
     /// to fit a token budget or message cap. Surfaces a user-visible "context
@@ -1875,11 +1886,15 @@ mod tests {
             content: "cancelled".into(),
             client_turn_generation: Some(9),
             message_count: Some(4),
+            error_code: None,
+            error_message: None,
         };
         let v = serde_json::to_value(evt).unwrap();
         assert_eq!(v["type"], json!("turn_complete"));
         assert_eq!(v["client_turn_generation"], json!(9));
         assert_eq!(v["message_count"], json!(4));
+        assert!(v.get("error_code").is_none(), "got: {v}");
+        assert!(v.get("error_message").is_none(), "got: {v}");
     }
 
     #[test]

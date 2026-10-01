@@ -120,6 +120,8 @@ const SERVED: &[&str] = &[
     "/api/cost",
     "/api/events/history",
     "/api/sessions",
+    "/ws/chat",
+    "/api/sessions/{id}/abort",
 ];
 
 /// Route paths the in-process gateway registers with a string literal, from

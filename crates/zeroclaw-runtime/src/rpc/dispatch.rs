@@ -3398,6 +3398,19 @@ impl RpcDispatcher {
     async fn handle_session_new(&self, params: &Value) -> RpcResult {
         let req: SessionNewParams = parse_params(params)?;
         self.selector_session_agent(Method::SessionNew, &req.agent_alias)?;
+        // An agent that is not configured cannot run a session: refuse it as
+        // invalid input now, rather than as an internal error once building
+        // the agent fails. A caller the selector already refused learns
+        // nothing more here.
+        if !self.ctx.config.read().agents.contains_key(&req.agent_alias) {
+            return Err(rpc_err(
+                INVALID_PARAMS,
+                format!(
+                    "Unknown agent `{alias}` — no [agents.{alias}] entry configured.",
+                    alias = req.agent_alias
+                ),
+            ));
+        }
         let chat_mode = req.chat_mode.clone().unwrap_or(ChatMode::Chat);
         let resuming = req.session_id.is_some();
         // Check the selected existing session's owner before admission. The
@@ -6138,7 +6151,7 @@ impl RpcDispatcher {
                         })),
                     "turn failed; emitting TurnComplete so the client exits the working state"
                 );
-                self.emit_turn_complete(
+                self.emit_turn_complete_reporting(
                     &req.session_id,
                     crate::rpc::types::TurnCompletionOutcome::Failed,
                     user_message
@@ -6146,6 +6159,7 @@ impl RpcDispatcher {
                         .unwrap_or_else(|| format!("turn failed: {e}")),
                     req.client_turn_generation,
                     message_count,
+                    Some(e.failure_report()),
                 )
                 .await;
                 Err(rpc_err(
@@ -6191,12 +6205,41 @@ impl RpcDispatcher {
         client_turn_generation: Option<u64>,
         message_count: Option<usize>,
     ) {
+        self.emit_turn_complete_reporting(
+            session_id,
+            outcome,
+            content,
+            client_turn_generation,
+            message_count,
+            None,
+        )
+        .await;
+    }
+
+    /// [`Self::emit_turn_complete`] for a turn whose failure the agent
+    /// reported: the terminal event also carries that report's code and
+    /// message, which a chat client shows as its error.
+    async fn emit_turn_complete_reporting(
+        &self,
+        session_id: &str,
+        outcome: crate::rpc::types::TurnCompletionOutcome,
+        content: String,
+        client_turn_generation: Option<u64>,
+        message_count: Option<usize>,
+        failure: Option<crate::agent::TurnFailureReport>,
+    ) {
+        let (error_code, error_message) = match failure {
+            Some(report) => (Some(report.code.to_string()), Some(report.message)),
+            None => (None, None),
+        };
         let update = SessionUpdateEvent::TurnComplete {
             session_id: session_id.to_string(),
             outcome,
             content,
             client_turn_generation,
             message_count,
+            error_code,
+            error_message,
         };
         if let Ok(params) = serde_json::to_value(update) {
             let n = JsonRpcNotification::new(notification::SESSION_UPDATE, params);
@@ -6411,9 +6454,14 @@ impl RpcDispatcher {
             _ => false,
         };
         if !allowed {
+            // A running turn holds the agent. The refusal must not wait for
+            // that turn to end just to label its log line.
             let (agent_alias, model_provider, model) =
                 match self.ctx.sessions.get_agent(&req.session_id).await {
-                    Some(agent) => agent.lock().await.attribution_fields(),
+                    Some(agent) => agent
+                        .try_lock()
+                        .map(|agent| agent.attribution_fields())
+                        .unwrap_or_default(),
                     None => (String::new(), String::new(), String::new()),
                 };
             let span = ::zeroclaw_log::info_span!(
@@ -34473,6 +34521,69 @@ mod tests {
             "missing-session is not Completed and not Cancelled — it is a \
              distinct Failed verdict. Folding it into Cancelled would lie \
              about whether the user pressed Esc."
+        );
+        assert!(
+            v["params"].get("error_code").is_none(),
+            "a prompt refused before its turn ran carries no turn failure report: {v}"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_new_refuses_an_unconfigured_agent_as_invalid_input() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (dispatcher, _rx, _sessions) = make_dispatcher_with_capture(make_acp_test_config(&tmp));
+        let error = dispatcher
+            .handle_session_new_for_test(&json!({"agent_alias": "nobody"}))
+            .await
+            .expect_err("an unconfigured agent is refused");
+        assert_eq!(error.code, INVALID_PARAMS);
+        assert!(error.message.contains("nobody"), "{}", error.message);
+    }
+
+    /// A turn the agent ran and failed reports the code and message a chat
+    /// client shows, from the same classifier the in-process chat socket
+    /// uses.
+    #[tokio::test]
+    async fn a_failed_turn_reports_its_error_on_turn_complete() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = make_acp_test_config(&tmp);
+        config.reliability.provider_retries = 0;
+        config.reliability.provider_backoff_ms = 0;
+        let (dispatcher, mut rx, _sessions) = make_dispatcher_with_capture(config);
+        let created = dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "exclude_memory": true,
+                "session_id": "failing-turn",
+            }))
+            .await
+            .expect("session/new");
+        assert_eq!(created["session_id"], "failing-turn");
+
+        // The provider listens nowhere, so the turn fails in the agent.
+        let error = dispatcher
+            .handle_session_prompt(&json!({"session_id": "failing-turn", "prompt": "hello"}))
+            .await
+            .expect_err("the turn fails");
+        assert_eq!(error.code, INTERNAL_ERROR);
+        let complete = loop {
+            let raw = rx.try_recv().expect("the turn's terminal event was queued");
+            let frame: Value = serde_json::from_str(&raw).unwrap();
+            if frame["params"]["type"] == "turn_complete" {
+                break frame;
+            }
+        };
+        assert_eq!(complete["params"]["outcome"], "failed", "{complete}");
+        let code = complete["params"]["error_code"].as_str().expect("a code");
+        assert!(
+            ["PROVIDER_ERROR", "AUTH_ERROR", "AGENT_ERROR"].contains(&code),
+            "{complete}"
+        );
+        assert!(
+            complete["params"]["error_message"]
+                .as_str()
+                .is_some_and(|message| !message.is_empty()),
+            "{complete}"
         );
     }
 

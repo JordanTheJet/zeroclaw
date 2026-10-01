@@ -53,6 +53,21 @@ impl TurnError {
             Self::Panicked(_) | Self::AgentError(_) => None,
         }
     }
+
+    /// The report a chat client gets for this failure, built from the same
+    /// diagnostic and message the in-process chat socket reports.
+    pub fn failure_report(&self) -> crate::agent::TurnFailureReport {
+        match self {
+            Self::TerminalCompletion {
+                diagnostic,
+                user_message,
+            } => crate::agent::turn_failure_report(diagnostic, Some(user_message), true),
+            Self::AgentError(diagnostic) => {
+                crate::agent::turn_failure_report(diagnostic, None, false)
+            }
+            Self::Panicked(_) => crate::agent::turn_failure_report(&self.to_string(), None, false),
+        }
+    }
 }
 
 /// Attribution fields attached to the tracing span for the duration of a turn.
@@ -374,6 +389,34 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_failed_turn_reports_the_code_and_message_a_chat_client_shows() {
+        let terminal = super::TurnError::TerminalCompletion {
+            diagnostic: "provider completed without final text or tool calls".into(),
+            user_message: "The model returned nothing.".into(),
+        };
+        let report = terminal.failure_report();
+        assert_eq!(report.code, "PROVIDER_ERROR");
+        assert_eq!(report.message, "The model returned nothing.");
+
+        for (diagnostic, code) in [
+            ("Invalid API key for this request", "AUTH_ERROR"),
+            (
+                "model_provider custom.fixture is unreachable",
+                "PROVIDER_ERROR",
+            ),
+            ("the tool loop gave up", "AGENT_ERROR"),
+        ] {
+            let report = super::TurnError::AgentError(diagnostic.into()).failure_report();
+            assert_eq!(report.code, code, "{diagnostic}");
+            assert_eq!(
+                report.message,
+                zeroclaw_providers::sanitize_api_error(diagnostic),
+                "{diagnostic}"
+            );
+        }
+    }
+
     use super::*;
     use tokio::sync::mpsc;
 

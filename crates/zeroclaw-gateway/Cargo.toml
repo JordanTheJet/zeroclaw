@@ -138,3 +138,8 @@ required-features = ["gw-bin"]
 name = "gw_preview"
 path = "tests/gw_preview.rs"
 required-features = ["gw-bin"]
+
+[[test]]
+name = "gw_chat"
+path = "tests/gw_chat.rs"
+required-features = ["gw-bin"]

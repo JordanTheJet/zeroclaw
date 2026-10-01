@@ -3604,6 +3604,20 @@
                 "description": "Final assistant text (Completed) or partial accumulated text\nat cancel point (Cancelled).",
                 "type": "string"
               },
+              "error_code": {
+                "description": "For a `Failed` turn the agent ran: a stable code\n(`PROVIDER_ERROR`, `AUTH_ERROR` or `AGENT_ERROR`). Absent for\nother outcomes, for a prompt refused before its turn ran, and from\na core that predates it.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "error_message": {
+                "description": "With `error_code`: the message a chat client shows, localized for\na provider delivery failure and otherwise the sanitized\ndiagnostic.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
               "message_count": {
                 "description": "Authoritative projected conversation-entry count after this turn.\nAbsent for legacy or missing-session terminal events.",
                 "format": "uint",

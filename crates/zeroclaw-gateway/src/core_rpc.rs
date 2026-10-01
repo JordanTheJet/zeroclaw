@@ -69,7 +69,8 @@ use zeroclaw_api::jsonrpc::error_codes::{
     SOP_NOT_FOUND, VERSION_MISMATCH,
 };
 use zeroclaw_rpc_client::{
-    ClientError, ConnectOptions, ConnectionState, EndpointOwner, Method, RpcClient,
+    ClientError, ConnectOptions, ConnectionState, DEFAULT_REQUEST_TIMEOUT, EndpointOwner, Method,
+    Notification, RpcClient,
 };
 use zeroclaw_rpc_proto::types::CLIENT_KIND_GATEWAY;
 use zeroclaw_runtime::rpc::inproc::InprocConnector;
@@ -799,6 +800,19 @@ impl CoreCall {
         self.pooled.client.handshake().principal_id.as_deref()
     }
 
+    /// Notifications arriving on this caller's connection. Take the receiver
+    /// before opening a subscription, so its first frames are not missed.
+    pub fn notifications(&self) -> tokio::sync::broadcast::Receiver<Notification> {
+        self.pooled.client.notifications()
+    }
+
+    /// Resolves once this caller's connection has ended. Owns its hold on
+    /// the connection, so a long-lived stream can wait on it.
+    pub fn closed(&self) -> impl Future<Output = ()> + Send + 'static {
+        let pooled = Arc::clone(&self.pooled);
+        async move { pooled.client.closed().await }
+    }
+
     /// Send `method` on this caller's connection.
     ///
     /// `initialize` is refused here without reaching the core: only the pool
@@ -812,6 +826,19 @@ impl CoreCall {
     /// pool. Either way the next request dials again with the credential it
     /// presents. Nothing is retried here.
     pub async fn request(&self, method: Method, params: Value) -> Result<Value, CoreError> {
+        self.request_within(method, params, DEFAULT_REQUEST_TIMEOUT)
+            .await
+    }
+
+    /// [`CoreCall::request`] with its own ceiling, for a call that lasts as
+    /// long as the work it starts: `session/prompt` answers when its turn
+    /// ends.
+    pub async fn request_within(
+        &self,
+        method: Method,
+        params: Value,
+        ceiling: Duration,
+    ) -> Result<Value, CoreError> {
         if method == Method::Initialize {
             return Err(CoreError::Rpc(JsonRpcError {
                 code: INVALID_REQUEST,
@@ -820,7 +847,10 @@ impl CoreCall {
             }));
         }
         let client = &self.pooled.client;
-        match client.request(method, params).await {
+        match client
+            .request_with_timeout(method.wire_name(), params, ceiling)
+            .await
+        {
             Ok(value) => {
                 self.slot.touch();
                 Ok(value)

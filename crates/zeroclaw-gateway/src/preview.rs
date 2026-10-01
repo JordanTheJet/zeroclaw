@@ -336,8 +336,6 @@ const REFUSED: &[(&str, &str, Refusal)] = &[
         Refusal::NotPorted,
     ),
     ("/api/sessions/{id}/state", "GET", Refusal::NotPorted),
-    ("/api/sessions/{id}/abort", "POST", Refusal::NotPorted),
-    ("/ws/chat", "GET", Refusal::NotPorted),
     ("/ws/sops/runs", "GET", Refusal::NotPorted),
     ("/ws/canvas/{id}", "GET", Refusal::NotPorted),
     ("/api/config", "GET,PATCH,OPTIONS", Refusal::NotPorted),
@@ -542,7 +540,12 @@ pub fn router(core: CoreRpc, endpoint: PathBuf, web_dist: Option<PathBuf>) -> Ro
         .route("/api/tuis", get(api_tuis))
         .route("/api/cost", get(api_cost))
         .route("/api/events/history", get(api_events_history))
-        .route("/api/sessions", get(api_sessions_list));
+        .route("/api/sessions", get(api_sessions_list))
+        .route("/ws/chat", get(ws_chat))
+        .route(
+            "/api/sessions/{id}/abort",
+            axum::routing::post(api_session_abort),
+        );
     for &(path, methods, refusal) in REFUSED {
         let handler: MethodRouter<PreviewState> = on(
             method_filter(methods),
@@ -805,6 +808,43 @@ async fn api_events_history(access: Result<CoreAccess, CoreError>) -> Response {
 async fn api_sessions_list(access: Result<CoreAccess, CoreError>) -> Response {
     served(access, |call| async move {
         crate::api::api_sessions_list_through_core(&call).await
+    })
+    .await
+}
+
+/// `GET /ws/chat`: the dashboard chat, its turns run by the core. A browser
+/// cannot set a header on a WebSocket, so the bearer may also come in the
+/// `bearer.` subprotocol or the `token` query parameter, as on the in-process
+/// gateway. The upgrade is refused before it happens without a credential the
+/// core accepts.
+async fn ws_chat(
+    axum::Extension(core): axum::Extension<CoreRpc>,
+    Query(params): Query<crate::ws::WsQuery>,
+    headers: axum::http::HeaderMap,
+    ws: axum::extract::ws::WebSocketUpgrade,
+) -> Response {
+    let mut presented = headers.clone();
+    if let Some(token) = crate::ws::extract_ws_token(&headers, params.token.as_deref())
+        && let Ok(value) = axum::http::HeaderValue::from_str(&format!("Bearer {token}"))
+    {
+        presented.insert(axum::http::header::AUTHORIZATION, value);
+    }
+    let call = match attached(core.access(&presented).await) {
+        Ok(call) => call,
+        Err(error) => return explain(error),
+    };
+    crate::chat_core::ws_chat_through_core(call, params, &headers, ws)
+        .await
+        .unwrap_or_else(explain)
+}
+
+/// `POST /api/sessions/{id}/abort`: cancel the session's running turn.
+async fn api_session_abort(
+    axum::extract::Path(id): axum::extract::Path<String>,
+    access: Result<CoreAccess, CoreError>,
+) -> Response {
+    served(access, |call| async move {
+        crate::chat_core::abort_through_core(&call, &id).await
     })
     .await
 }
