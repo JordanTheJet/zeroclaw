@@ -120,6 +120,12 @@ const SERVED: &[&str] = &[
     "/api/cost",
     "/api/events/history",
     "/api/sessions",
+    "/api/skills/bundles",
+    "/api/skills/bundles/{alias}/skills",
+    "/api/skills/bundles/{alias}/skills/{name}",
+    "/api/personality",
+    "/api/personality/templates",
+    "/api/personality/{filename}",
 ];
 
 /// Route paths the in-process gateway registers with a string literal, from
@@ -750,6 +756,486 @@ mod against_a_core {
         assert_eq!(json_of(&body)["events"][0]["type"], "agent_start", "{body}");
 
         drop(terminal);
+        core.stop().await;
+    }
+
+    /// The skills and personality routes answer through the separate gateway
+    /// what the in-process routes compute from the same configuration and
+    /// files themselves: refusals included, and writes leaving the same files.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn skills_and_personality_answer_as_the_in_process_gateway_does() {
+        use crate::api_personality::{
+            AgentQuery, PersonalityPutBody, TemplateQuery, handle_get, handle_index, handle_put,
+            handle_templates,
+        };
+        use crate::api_skills::{
+            DeleteQuery, SkillWriteBody, handle_delete_skill, handle_list_bundles,
+            handle_list_skills, handle_read_skill, handle_write_skill,
+        };
+        use axum::extract::Path as UrlPath;
+        use zeroclaw_runtime::agent::personality::MAX_FILE_CHARS;
+        use zeroclaw_runtime::skills::{ScaffoldOptions, SkillFrontmatter, SkillsService};
+
+        async fn answer(response: Response) -> (StatusCode, serde_json::Value) {
+            let status = response.status();
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            (status, comparable(&String::from_utf8_lossy(&body)))
+        }
+        fn comparable(body: &str) -> serde_json::Value {
+            if body.is_empty() {
+                serde_json::Value::Null
+            } else {
+                json_of(body)
+            }
+        }
+        async fn send_json(
+            router: &Router,
+            method: &str,
+            path: &str,
+            body: serde_json::Value,
+        ) -> (StatusCode, serde_json::Value) {
+            let request = Request::builder()
+                .method(method)
+                .uri(path)
+                .header("authorization", format!("Bearer {TOKEN}"))
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap();
+            answer(router.clone().oneshot(request).await.unwrap()).await
+        }
+        async fn served(
+            router: &Router,
+            method: &str,
+            path: &str,
+        ) -> (StatusCode, serde_json::Value) {
+            let (status, body) = send(router, method, path, Some(TOKEN)).await;
+            (status, comparable(&body))
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = Core::context(tmp.path());
+        {
+            let configured: zeroclaw_config::schema::Config =
+                toml::from_str("[skill_bundles.team]\n\n[agents.main]\n")
+                    .expect("a skill bundle and an agent");
+            let mut config = ctx.config.write();
+            config.skill_bundles = configured.skill_bundles;
+            config.agents = configured.agents;
+        }
+        let config = ctx.config.read().clone();
+        let service = SkillsService::new(&config, config.install_root_dir());
+        for name in [
+            "alpha",
+            "write-served",
+            "write-local",
+            "purge-served",
+            "purge-local",
+            "archive-served",
+            "archive-local",
+        ] {
+            let target = service.resolve_ref(name, Some("team")).unwrap();
+            service
+                .scaffold_skill(
+                    &target,
+                    SkillFrontmatter {
+                        name: name.into(),
+                        description: "stub".into(),
+                        ..Default::default()
+                    },
+                    ScaffoldOptions::default(),
+                )
+                .unwrap();
+        }
+        let workspace = config.agent_workspace_dir("main");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("SOUL.md"), "# Soul\n").unwrap();
+        std::fs::write(
+            workspace.join("IDENTITY.md"),
+            "x".repeat(MAX_FILE_CHARS + 10),
+        )
+        .unwrap();
+
+        let core = Core::serve(ctx).await;
+        let preview = router(
+            CoreRpc::local(core.endpoint.clone(), EndpointOwner::SameAccount),
+            core.endpoint.clone(),
+            None,
+        );
+        let state = State(crate::api::test_state(config.clone()));
+        let headers = axum::http::HeaderMap::new;
+        let local = || CoreAccess::InProcess;
+        let agent = |alias: Option<&str>| {
+            Query(AgentQuery {
+                agent: alias.map(Into::into),
+            })
+        };
+        let skill = |bundle: &str, name: &str| UrlPath((bundle.to_owned(), name.to_owned()));
+        let file = |name: &str| UrlPath(name.to_owned());
+
+        // Reads, and refusals that change nothing.
+        let reads = [
+            (
+                "/api/skills/bundles",
+                handle_list_bundles(state.clone(), headers(), local()).await,
+            ),
+            (
+                "/api/skills/bundles/team/skills",
+                handle_list_skills(state.clone(), headers(), local(), UrlPath("team".into())).await,
+            ),
+            (
+                "/api/skills/bundles/team/skills/alpha",
+                handle_read_skill(state.clone(), headers(), local(), skill("team", "alpha")).await,
+            ),
+            (
+                "/api/personality?agent=main",
+                handle_index(state.clone(), headers(), local(), agent(Some("main")))
+                    .await
+                    .into_response(),
+            ),
+            (
+                "/api/personality",
+                handle_index(state.clone(), headers(), local(), agent(None))
+                    .await
+                    .into_response(),
+            ),
+            (
+                "/api/personality/SOUL.md?agent=main",
+                handle_get(
+                    state.clone(),
+                    headers(),
+                    local(),
+                    file("SOUL.md"),
+                    agent(Some("main")),
+                )
+                .await
+                .into_response(),
+            ),
+            (
+                "/api/personality/IDENTITY.md?agent=main",
+                handle_get(
+                    state.clone(),
+                    headers(),
+                    local(),
+                    file("IDENTITY.md"),
+                    agent(Some("main")),
+                )
+                .await
+                .into_response(),
+            ),
+            (
+                "/api/personality/USER.md?agent=main",
+                handle_get(
+                    state.clone(),
+                    headers(),
+                    local(),
+                    file("USER.md"),
+                    agent(Some("main")),
+                )
+                .await
+                .into_response(),
+            ),
+            (
+                "/api/personality/OTHER.md?agent=main",
+                handle_get(
+                    state.clone(),
+                    headers(),
+                    local(),
+                    file("OTHER.md"),
+                    agent(Some("main")),
+                )
+                .await
+                .into_response(),
+            ),
+            (
+                "/api/personality/templates",
+                handle_templates(
+                    state.clone(),
+                    headers(),
+                    local(),
+                    Query(TemplateQuery::default()),
+                )
+                .await
+                .into_response(),
+            ),
+            (
+                "/api/personality/templates?agent=main",
+                handle_templates(
+                    state.clone(),
+                    headers(),
+                    local(),
+                    Query(TemplateQuery {
+                        agent: Some("main".into()),
+                        ..TemplateQuery::default()
+                    }),
+                )
+                .await
+                .into_response(),
+            ),
+            (
+                "/api/personality/templates?agent=ghost",
+                handle_templates(
+                    state.clone(),
+                    headers(),
+                    local(),
+                    Query(TemplateQuery {
+                        agent: Some("ghost".into()),
+                        ..TemplateQuery::default()
+                    }),
+                )
+                .await
+                .into_response(),
+            ),
+            (
+                "/api/personality/templates?agent=main&agent_name=Ada&user_name=Lin\
+                 &timezone=Asia%2FTokyo&communication_style=terse&include_memory=false",
+                handle_templates(
+                    state.clone(),
+                    headers(),
+                    local(),
+                    Query(TemplateQuery {
+                        agent: Some("main".into()),
+                        agent_name: Some("Ada".into()),
+                        user_name: Some("Lin".into()),
+                        timezone: Some("Asia/Tokyo".into()),
+                        communication_style: Some("terse".into()),
+                        include_memory: Some(false),
+                        ..TemplateQuery::default()
+                    }),
+                )
+                .await
+                .into_response(),
+            ),
+        ];
+        for (path, in_process) in reads {
+            let (status, _) = send(&preview, "GET", path, None).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{path}");
+            assert_eq!(
+                served(&preview, "GET", path).await,
+                answer(in_process).await,
+                "{path}"
+            );
+        }
+        // Refusals the core makes without yet saying which refusal it was (a
+        // missing skill, an unknown bundle or agent): refused, but with the
+        // gateway's generic mapping of the core's code until it does.
+        for path in [
+            "/api/skills/bundles/team/skills/missing",
+            "/api/skills/bundles/nope/skills/alpha",
+            "/api/personality?agent=ghost",
+            "/api/personality/SOUL.md?agent=ghost",
+        ] {
+            let (status, body) = served(&preview, "GET", path).await;
+            assert!(
+                status.is_client_error() || status.is_server_error(),
+                "{path}: {status} {body}"
+            );
+        }
+
+        // Personality writes that are refused, before anything is written.
+        let put = |content: String, expected_mtime_ms: Option<i64>| PersonalityPutBody {
+            content,
+            expected_mtime_ms,
+        };
+        // Refused before the core: the same answer.
+        let refused_writes = [
+            ("SOUL.md", "main", "y".repeat(MAX_FILE_CHARS + 1), None),
+            ("OTHER.md", "main", "x".to_owned(), None),
+        ];
+        for (name, alias, content, expected) in refused_writes {
+            let path = format!("/api/personality/{name}?agent={alias}");
+            let mut body = json!({ "content": content });
+            if let Some(expected) = expected {
+                body["expected_mtime_ms"] = json!(expected);
+            }
+            let served = send_json(&preview, "PUT", &path, body).await;
+            let in_process = handle_put(
+                state.clone(),
+                headers(),
+                local(),
+                file(name),
+                agent(Some(alias)),
+                Json(put(content, expected)),
+            )
+            .await
+            .into_response();
+            assert_eq!(served, answer(in_process).await, "PUT {path}");
+            assert_ne!(served.0, StatusCode::OK, "PUT {path}");
+        }
+        // A drifted write is a conflict on both, naming the file. The file's
+        // current content rides in the core's error `data`, which the core
+        // does not put on the wire yet.
+        let (status, drifted) = send_json(
+            &preview,
+            "PUT",
+            "/api/personality/SOUL.md?agent=main",
+            json!({ "content": "# Drifted\n", "expected_mtime_ms": 1 }),
+        )
+        .await;
+        let (in_process_status, in_process) = answer(
+            handle_put(
+                state.clone(),
+                headers(),
+                local(),
+                file("SOUL.md"),
+                agent(Some("main")),
+                Json(put("# Drifted\n".to_owned(), Some(1))),
+            )
+            .await
+            .into_response(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{drifted}");
+        assert_eq!(status, in_process_status);
+        assert_eq!(drifted["error"], in_process["error"]);
+        assert_eq!(drifted["filename"], in_process["filename"]);
+        // The core refuses an unknown agent before anything is written.
+        let (status, body) = send_json(
+            &preview,
+            "PUT",
+            "/api/personality/SOUL.md?agent=ghost",
+            json!({ "content": "x" }),
+        )
+        .await;
+        assert!(status.is_client_error(), "{status} {body}");
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("SOUL.md")).unwrap(),
+            "# Soul\n"
+        );
+        assert!(
+            !config.agent_workspace_dir("ghost").exists(),
+            "nothing is written for an agent that is not configured"
+        );
+
+        // A write the editor saw the current version of lands, and answers
+        // with what is now on disk.
+        let (_, read) = served(&preview, "GET", "/api/personality/SOUL.md?agent=main").await;
+        let (status, written) = send_json(
+            &preview,
+            "PUT",
+            "/api/personality/SOUL.md?agent=main",
+            json!({ "content": "# New soul\n", "expected_mtime_ms": read["mtime_ms"] }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{written}");
+        let (_, on_disk) = answer(
+            handle_get(
+                state.clone(),
+                headers(),
+                local(),
+                file("SOUL.md"),
+                agent(Some("main")),
+            )
+            .await
+            .into_response(),
+        )
+        .await;
+        assert_eq!(on_disk["content"], "# New soul\n");
+        assert_eq!(written["bytes_written"], 11);
+        assert_eq!(written["mtime_ms"], on_disk["mtime_ms"]);
+
+        // Skill writes and deletes: the same request on twin skills, one
+        // through each gateway, answers the same and leaves the same files.
+        let edited = |name: &str| {
+            json!({
+                "frontmatter": { "name": name, "description": "edited" },
+                "body": "# Edited\n",
+            })
+        };
+        let served_write = send_json(
+            &preview,
+            "PUT",
+            "/api/skills/bundles/team/skills/write-served",
+            edited("write-served"),
+        )
+        .await;
+        let local_write = handle_write_skill(
+            state.clone(),
+            headers(),
+            local(),
+            skill("team", "write-local"),
+            Json(serde_json::from_value::<SkillWriteBody>(edited("write-local")).unwrap()),
+        )
+        .await;
+        assert_eq!(served_write, answer(local_write).await);
+        assert_eq!(served_write.0, StatusCode::NO_CONTENT);
+        for name in ["write-served", "write-local"] {
+            let (_, read) = answer(
+                handle_read_skill(state.clone(), headers(), local(), skill("team", name)).await,
+            )
+            .await;
+            assert_eq!(read["frontmatter"]["description"], "edited", "{name}");
+            assert_eq!(read["body"], "# Edited\n", "{name}");
+        }
+        let missing_write = send_json(
+            &preview,
+            "PUT",
+            "/api/skills/bundles/team/skills/missing",
+            edited("missing"),
+        )
+        .await;
+        assert!(
+            missing_write.0.is_client_error() || missing_write.0.is_server_error(),
+            "{missing_write:?}"
+        );
+
+        let bundle = config.install_root_dir().join("shared/skills/team");
+        let archive = config.install_root_dir().join("shared/skills/_deleted");
+        let archived = |name: &str| {
+            std::fs::read_dir(&archive).is_ok_and(|entries| {
+                entries
+                    .flatten()
+                    .any(|entry| entry.file_name().to_string_lossy().contains(name))
+            })
+        };
+        for (purge, suffix) in [(true, "purge"), (false, "archive")] {
+            let query = if purge { "?purge=true" } else { "" };
+            let served_delete = served(
+                &preview,
+                "DELETE",
+                &format!("/api/skills/bundles/team/skills/{suffix}-served{query}"),
+            )
+            .await;
+            let local_delete = handle_delete_skill(
+                state.clone(),
+                headers(),
+                local(),
+                skill("team", &format!("{suffix}-local")),
+                Query(DeleteQuery { purge }),
+            )
+            .await;
+            assert_eq!(served_delete, answer(local_delete).await, "{suffix}");
+            assert_eq!(served_delete.0, StatusCode::NO_CONTENT, "{suffix}");
+            for side in ["served", "local"] {
+                let name = format!("{suffix}-{side}");
+                assert!(
+                    !bundle.join(&name).exists(),
+                    "{name} is gone from the bundle"
+                );
+                assert_eq!(archived(&name), !purge, "{name} archived");
+            }
+        }
+        let missing_delete = served(
+            &preview,
+            "DELETE",
+            "/api/skills/bundles/team/skills/missing",
+        )
+        .await;
+        assert!(
+            missing_delete.0.is_client_error() || missing_delete.0.is_server_error(),
+            "{missing_delete:?}"
+        );
+
+        // Creating a skill waits on the core's method for it.
+        let (status, body) = send(
+            &preview,
+            "POST",
+            "/api/skills/bundles/team/skills",
+            Some(TOKEN),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+
         core.stop().await;
     }
 

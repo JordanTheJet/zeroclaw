@@ -24,7 +24,8 @@ use std::sync::Arc;
 
 use axum::Json;
 use axum::Router;
-use axum::extract::{Query, State};
+use axum::extract::rejection::{JsonRejection, PathRejection, QueryRejection};
+use axum::extract::{Path as UrlPath, Query, State};
 use axum::http::{Method as HttpMethod, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{MethodFilter, MethodRouter, get, on};
@@ -34,6 +35,8 @@ use zeroclaw_rpc_client::{
 };
 
 use crate::api::CostQuery;
+use crate::api_personality::{AgentQuery, PersonalityPutBody, TemplateQuery};
+use crate::api_skills::{DeleteQuery, SkillWriteBody};
 use crate::core_rpc::{CoreAccess, CoreCall, CoreError, CoreRpc};
 
 /// Where the dashboard reaches when no `--listen` is given: the address the
@@ -414,9 +417,6 @@ const REFUSED: &[(&str, &str, Refusal)] = &[
     ),
     ("/api/tools", "GET", Refusal::NotPorted),
     ("/api/tools/param-options", "POST", Refusal::NotPorted),
-    ("/api/personality", "GET", Refusal::NotPorted),
-    ("/api/personality/templates", "GET", Refusal::NotPorted),
-    ("/api/personality/{filename}", "GET,PUT", Refusal::NotPorted),
     ("/api/browse", "GET", Refusal::NotPorted),
     ("/api/browse/mkdir", "POST", Refusal::NotPorted),
     ("/api/browse/rmdir", "DELETE", Refusal::NotPorted),
@@ -445,17 +445,14 @@ const REFUSED: &[(&str, &str, Refusal)] = &[
         "POST",
         Refusal::NotPorted,
     ),
+    // The core has no method yet for an agent's effective skills, the slash
+    // option kinds, or creating a skill; the P4 parity methods add them.
     ("/api/agents/{alias}/skills", "GET", Refusal::NotPorted),
-    ("/api/skills/bundles", "GET", Refusal::NotPorted),
     ("/api/skills/slash-option-kinds", "GET", Refusal::NotPorted),
+    // `GET` on this path is served.
     (
         "/api/skills/bundles/{alias}/skills",
-        "GET,POST",
-        Refusal::NotPorted,
-    ),
-    (
-        "/api/skills/bundles/{alias}/skills/{name}",
-        "GET,PUT,DELETE",
+        "POST",
         Refusal::NotPorted,
     ),
     ("/api/cron", "GET,POST", Refusal::NotPorted),
@@ -542,7 +539,19 @@ pub fn router(core: CoreRpc, endpoint: PathBuf, web_dist: Option<PathBuf>) -> Ro
         .route("/api/tuis", get(api_tuis))
         .route("/api/cost", get(api_cost))
         .route("/api/events/history", get(api_events_history))
-        .route("/api/sessions", get(api_sessions_list));
+        .route("/api/sessions", get(api_sessions_list))
+        .route("/api/skills/bundles", get(skills_bundles))
+        .route("/api/skills/bundles/{alias}/skills", get(skills_list))
+        .route(
+            "/api/skills/bundles/{alias}/skills/{name}",
+            get(skill_read).put(skill_write).delete(skill_delete),
+        )
+        .route("/api/personality", get(personality_index))
+        .route("/api/personality/templates", get(personality_templates))
+        .route(
+            "/api/personality/{filename}",
+            get(personality_get).put(personality_put),
+        );
     for &(path, methods, refusal) in REFUSED {
         let handler: MethodRouter<PreviewState> = on(
             method_filter(methods),
@@ -805,6 +814,163 @@ async fn api_events_history(access: Result<CoreAccess, CoreError>) -> Response {
 async fn api_sessions_list(access: Result<CoreAccess, CoreError>) -> Response {
     served(access, |call| async move {
         crate::api::api_sessions_list_through_core(&call).await
+    })
+    .await
+}
+
+/// A dashboard route the core serves whose input the request carries (path,
+/// query or body). The credential is checked before the input, as the
+/// in-process gateway's authentication runs before anything it parses is
+/// used.
+async fn served_with<T, F, Fut>(
+    access: Result<CoreAccess, CoreError>,
+    input: Result<T, Response>,
+    body: F,
+) -> Response
+where
+    F: FnOnce(CoreCall, T) -> Fut,
+    Fut: Future<Output = Result<Response, CoreError>>,
+{
+    let call = match attached(access) {
+        Ok(call) => call,
+        Err(error) => return explain(error),
+    };
+    match input {
+        Ok(input) => body(call, input).await.unwrap_or_else(explain),
+        Err(rejection) => rejection,
+    }
+}
+
+/// `GET /api/skills/bundles`
+async fn skills_bundles(access: Result<CoreAccess, CoreError>) -> Response {
+    served(access, |call| async move {
+        crate::api_skills::list_bundles_through_core(&call).await
+    })
+    .await
+}
+
+/// `GET /api/skills/bundles/{alias}/skills`
+async fn skills_list(
+    access: Result<CoreAccess, CoreError>,
+    path: Result<UrlPath<String>, PathRejection>,
+) -> Response {
+    let input = path
+        .map(|UrlPath(alias)| alias)
+        .map_err(IntoResponse::into_response);
+    served_with(access, input, |call, alias| async move {
+        crate::api_skills::list_skills_through_core(&call, &alias).await
+    })
+    .await
+}
+
+/// `GET /api/skills/bundles/{alias}/skills/{name}`
+async fn skill_read(
+    access: Result<CoreAccess, CoreError>,
+    path: Result<UrlPath<(String, String)>, PathRejection>,
+) -> Response {
+    let input = path
+        .map(|UrlPath(path)| path)
+        .map_err(IntoResponse::into_response);
+    served_with(access, input, |call, (alias, name)| async move {
+        crate::api_skills::read_skill_through_core(&call, &alias, &name).await
+    })
+    .await
+}
+
+/// `PUT /api/skills/bundles/{alias}/skills/{name}`
+async fn skill_write(
+    access: Result<CoreAccess, CoreError>,
+    path: Result<UrlPath<(String, String)>, PathRejection>,
+    body: Result<Json<SkillWriteBody>, JsonRejection>,
+) -> Response {
+    let input = match (path, body) {
+        (Ok(UrlPath(path)), Ok(Json(body))) => Ok((path, body)),
+        (Err(rejection), _) => Err(rejection.into_response()),
+        (_, Err(rejection)) => Err(rejection.into_response()),
+    };
+    served_with(access, input, |call, ((alias, name), body)| async move {
+        crate::api_skills::write_skill_through_core(&call, &alias, &name, &body).await
+    })
+    .await
+}
+
+/// `DELETE /api/skills/bundles/{alias}/skills/{name}`
+async fn skill_delete(
+    access: Result<CoreAccess, CoreError>,
+    path: Result<UrlPath<(String, String)>, PathRejection>,
+    query: Result<Query<DeleteQuery>, QueryRejection>,
+) -> Response {
+    let input = match (path, query) {
+        (Ok(UrlPath(path)), Ok(Query(query))) => Ok((path, query)),
+        (Err(rejection), _) => Err(rejection.into_response()),
+        (_, Err(rejection)) => Err(rejection.into_response()),
+    };
+    served_with(access, input, |call, ((alias, name), query)| async move {
+        crate::api_skills::delete_skill_through_core(&call, &alias, &name, &query).await
+    })
+    .await
+}
+
+/// `GET /api/personality`
+async fn personality_index(
+    access: Result<CoreAccess, CoreError>,
+    query: Result<Query<AgentQuery>, QueryRejection>,
+) -> Response {
+    let input = query
+        .map(|Query(query)| query)
+        .map_err(IntoResponse::into_response);
+    served_with(access, input, |call, query| async move {
+        crate::api_personality::index_through_core(&call, &query).await
+    })
+    .await
+}
+
+/// `GET /api/personality/templates`
+async fn personality_templates(
+    access: Result<CoreAccess, CoreError>,
+    query: Result<Query<TemplateQuery>, QueryRejection>,
+) -> Response {
+    let input = query
+        .map(|Query(query)| query)
+        .map_err(IntoResponse::into_response);
+    served_with(access, input, |call, query| async move {
+        crate::api_personality::templates_through_core(&call, &query).await
+    })
+    .await
+}
+
+/// `GET /api/personality/{filename}`
+async fn personality_get(
+    access: Result<CoreAccess, CoreError>,
+    path: Result<UrlPath<String>, PathRejection>,
+    query: Result<Query<AgentQuery>, QueryRejection>,
+) -> Response {
+    let input = match (path, query) {
+        (Ok(UrlPath(filename)), Ok(Query(query))) => Ok((filename, query)),
+        (Err(rejection), _) => Err(rejection.into_response()),
+        (_, Err(rejection)) => Err(rejection.into_response()),
+    };
+    served_with(access, input, |call, (filename, query)| async move {
+        crate::api_personality::get_through_core(&call, &filename, &query).await
+    })
+    .await
+}
+
+/// `PUT /api/personality/{filename}`
+async fn personality_put(
+    access: Result<CoreAccess, CoreError>,
+    path: Result<UrlPath<String>, PathRejection>,
+    query: Result<Query<AgentQuery>, QueryRejection>,
+    body: Result<Json<PersonalityPutBody>, JsonRejection>,
+) -> Response {
+    let input = match (path, query, body) {
+        (Ok(UrlPath(filename)), Ok(Query(query)), Ok(Json(body))) => Ok((filename, query, body)),
+        (Err(rejection), _, _) => Err(rejection.into_response()),
+        (_, Err(rejection), _) => Err(rejection.into_response()),
+        (_, _, Err(rejection)) => Err(rejection.into_response()),
+    };
+    served_with(access, input, |call, (filename, query, body)| async move {
+        crate::api_personality::put_through_core(&call, &filename, &query, &body).await
     })
     .await
 }
