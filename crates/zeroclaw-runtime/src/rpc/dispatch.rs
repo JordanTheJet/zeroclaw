@@ -7140,7 +7140,7 @@ impl RpcDispatcher {
                 .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Memory list failed: {e}")))?,
         };
         let count = entries.len();
-        let entries = truncate_memory_previews(entries);
+        let entries = truncate_memory_contents(entries, req.content_max_chars);
         to_result(MemoryListResult { entries, count })
     }
 
@@ -7174,7 +7174,7 @@ impl RpcDispatcher {
                 .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Memory search failed: {e}")))?,
         };
         let count = entries.len();
-        let entries = truncate_memory_previews(entries);
+        let entries = truncate_memory_contents(entries, req.content_max_chars);
         to_result(MemorySearchResult { entries, count })
     }
 
@@ -7246,7 +7246,8 @@ impl RpcDispatcher {
         let (mem, agent) = self
             .memory_for_request(Method::MemoryDelete, req.agent.as_deref(), plane.is_some())
             .await?;
-        match plane {
+        // Whether an entry under the key was actually removed.
+        let deleted = match plane {
             Some(scope) => mem
                 .forget_for_principal(&scope.with_agent(agent), &req.key)
                 .await
@@ -7258,7 +7259,7 @@ impl RpcDispatcher {
         };
         to_result(MemoryDeleteResult {
             key: req.key,
-            deleted: true,
+            deleted,
         })
     }
 
@@ -7350,12 +7351,17 @@ impl RpcDispatcher {
     async fn handle_cron_delete(&self, params: &Value) -> RpcResult {
         let req: CronIdParams = parse_params(params)?;
         let config = self.ctx.config.read().clone();
-        let job = self.authorize_cron_job(Method::CronDelete, &config, &req.id)?;
-        // As with the patch path, a scoped principal's delete carries the
-        // owner into the statement so a concurrent rename cannot widen it.
         if self.has_admin_grants() {
+            // An operator removes by id as the HTTP route does: the job and
+            // its run history, or only the retained history of a job whose
+            // row is already gone (a completed one-shot). `remove_job`
+            // refuses an id that has neither.
             crate::cron::remove_job(&config, &req.id)
         } else {
+            // A scoped principal's delete carries the owner into the
+            // statement, as on the patch path, so a concurrent rename
+            // cannot widen it; a job it does not own is not found.
+            let job = self.authorize_cron_job(Method::CronDelete, &config, &req.id)?;
             crate::cron::remove_job_for_agent(&config, &req.id, &job.agent_alias)
         }
         .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Cron delete failed: {e}")))?;
@@ -7368,18 +7374,32 @@ impl RpcDispatcher {
     async fn handle_cron_runs(&self, params: &Value) -> RpcResult {
         let req: CronRunsParams = parse_params(params)?;
         let config = self.ctx.config.read().clone();
-        let job = self.authorize_cron_job(Method::CronRuns, &config, &req.id)?;
         let limit = req.limit.unwrap_or(20) as usize;
+        if self.has_admin_grants() {
+            // An operator reads history by id as the HTTP route does,
+            // including the runs a completed one-shot keeps after its job row
+            // is gone. An id with neither a job nor a run is not found.
+            if let Err(error) = crate::cron::get_job(&config, &req.id) {
+                let retained =
+                    crate::cron::list_runs(&config, &req.id, 1).is_ok_and(|runs| !runs.is_empty());
+                if !retained {
+                    return Err(rpc_err(
+                        INVALID_PARAMS,
+                        format!("Cron job not found: {error}"),
+                    ));
+                }
+            }
+            let runs = crate::cron::list_runs(&config, &req.id, limit)
+                .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Cron runs failed: {e}")))?;
+            return to_result(CronRunsResult { runs });
+        }
+        let job = self.authorize_cron_job(Method::CronRuns, &config, &req.id)?;
         // A scoped principal was authorized against the job's owner at lookup.
         // Read history only while that agent still owns the job, so an
         // ownership change between the lookup and the read cannot return
         // another agent's runs.
-        let runs = if self.has_admin_grants() {
-            crate::cron::list_runs(&config, &req.id, limit)
-        } else {
-            crate::cron::list_runs_for_agent(&config, &req.id, &job.agent_alias, limit)
-        }
-        .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Cron runs failed: {e}")))?;
+        let runs = crate::cron::list_runs_for_agent(&config, &req.id, &job.agent_alias, limit)
+            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Cron runs failed: {e}")))?;
         to_result(CronRunsResult { runs })
     }
 
@@ -10827,6 +10847,34 @@ const MEMORY_PREVIEW_CONTENT_BYTES: usize = 200;
 
 /// Truncate each entry's `content` to the preview budget. Operates
 /// in place to avoid a second allocation per entry.
+/// Each entry's `content` for a memory listing: the default 200-byte preview,
+/// or, when the caller asks for a character bound, at most that many
+/// characters, ending in `...` when cut.
+fn truncate_memory_contents(
+    entries: Vec<zeroclaw_api::memory_traits::MemoryEntry>,
+    content_max_chars: Option<usize>,
+) -> Vec<zeroclaw_api::memory_traits::MemoryEntry> {
+    let Some(max_chars) = content_max_chars else {
+        return truncate_memory_previews(entries);
+    };
+    entries
+        .into_iter()
+        .map(|mut entry| {
+            if entry.content.char_indices().nth(max_chars).is_some() {
+                let keep = max_chars.saturating_sub(3);
+                let cut = entry
+                    .content
+                    .char_indices()
+                    .nth(keep)
+                    .map_or(entry.content.len(), |(index, _)| index);
+                entry.content.truncate(cut);
+                entry.content.push_str("...");
+            }
+            entry
+        })
+        .collect()
+}
+
 fn truncate_memory_previews(
     mut entries: Vec<zeroclaw_api::memory_traits::MemoryEntry>,
 ) -> Vec<zeroclaw_api::memory_traits::MemoryEntry> {

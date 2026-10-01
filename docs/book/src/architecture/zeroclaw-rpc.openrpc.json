@@ -1917,6 +1917,15 @@
               "null"
             ]
           },
+          "content_max_chars": {
+            "description": "When set, each entry's `content` is cut to at most this many\ncharacters, ending in `...` when cut, instead of the default\n200-byte preview.",
+            "format": "uint",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "plane": {
             "description": "Memory plane: `\"private\"` (the caller's own; the default for every\nauthenticated principal) or `\"shared\"` (honoured only for callers\nwith the admin bypass, audited).",
             "type": [
@@ -1957,6 +1966,15 @@
           "agent": {
             "type": [
               "string",
+              "null"
+            ]
+          },
+          "content_max_chars": {
+            "description": "When set, each entry's `content` is cut to at most this many\ncharacters, ending in `...` when cut, instead of the default\n200-byte preview; see `MemoryListParams::content_max_chars`.",
+            "format": "uint",
+            "minimum": 0,
+            "type": [
+              "integer",
               "null"
             ]
           },
@@ -4807,6 +4825,19 @@
           }
         },
         {
+          "name": "content_max_chars",
+          "required": false,
+          "schema": {
+            "description": "When set, each entry's `content` is cut to at most this many\ncharacters, ending in `...` when cut, instead of the default\n200-byte preview.",
+            "format": "uint",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        {
           "name": "plane",
           "required": false,
           "schema": {
@@ -4862,6 +4893,19 @@
           "schema": {
             "type": [
               "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "content_max_chars",
+          "required": false,
+          "schema": {
+            "description": "When set, each entry's `content` is cut to at most this many\ncharacters, ending in `...` when cut, instead of the default\n200-byte preview; see `MemoryListParams::content_max_chars`.",
+            "format": "uint",
+            "minimum": 0,
+            "type": [
+              "integer",
               "null"
             ]
           }

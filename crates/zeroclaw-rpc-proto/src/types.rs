@@ -441,6 +441,11 @@ rpc_type! {
         /// with the admin bypass, audited).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub plane: Option<String>,
+        /// When set, each entry's `content` is cut to at most this many
+        /// characters, ending in `...` when cut, instead of the default
+        /// 200-byte preview.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub content_max_chars: Option<usize>,
     }
 }
 
@@ -469,6 +474,11 @@ rpc_type! {
         /// Memory plane; see `MemoryListParams::plane`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub plane: Option<String>,
+        /// When set, each entry's `content` is cut to at most this many
+        /// characters, ending in `...` when cut, instead of the default
+        /// 200-byte preview; see `MemoryListParams::content_max_chars`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub content_max_chars: Option<usize>,
     }
 }
 
