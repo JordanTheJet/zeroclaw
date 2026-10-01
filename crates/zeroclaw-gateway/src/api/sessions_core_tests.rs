@@ -1,22 +1,19 @@
 //! The sessions routes with a core attached.
 //!
-//! `GET /api/sessions` answers the same HTTP whether the core or the
-//! gateway's in-process body serves it. Parity runs against the daemon's real
-//! in-process connector over one session store, opened twice as in
-//! production: once by the core, once by the gateway.
+//! In the in-process gateway every sessions route stays in-process. These
+//! tests attach the daemon's real in-process connector over one session
+//! store, opened twice as in production: once by the core, once by the
+//! gateway. They pin why, one test per hazard a core-backed version had: a
+//! listing the core scopes to the gateway's own connection, a revoked bearer
+//! cancelling a turn, the core acting on a competing row, a delete returning
+//! while the gateway's own turn still runs, and a transcript too large for one
+//! RPC frame.
 //!
-//! In the in-process gateway, the routes that address one session keep their
-//! in-process bodies, because that gateway runs chat turns a delete must
-//! settle first. One test per hazard a core-backed version had pins them: a
-//! revoked bearer cancelling a turn, the core acting on a competing row, a
-//! delete returning while the gateway's own turn still runs, and a transcript
-//! too large for one RPC frame.
-//!
-//! The separate zeroclaw-gw, which runs no turns, serves those routes through
-//! the core by exact stored key. The last section pins how it reads a
-//! transcript across pages; the preview's tests hold its parity.
+//! The separate zeroclaw-gw, which runs no turns, serves the per-session
+//! routes through the core by exact stored key. The last section pins how it
+//! reads a transcript across pages; the preview's tests hold its parity.
 
-use super::tests::{response_json, test_state, test_state_with_session_backend};
+use super::tests::{response_json, test_state_with_session_backend};
 use super::*;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -26,13 +23,16 @@ use axum::http::HeaderValue;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream};
 use tokio_util::sync::CancellationToken;
+use zeroclaw_api::jsonrpc::error_codes::SESSION_NOT_OWNED;
 use zeroclaw_config::schema::Config;
 use zeroclaw_infra::session_backend::{SessionBackend, SessionContext};
 use zeroclaw_providers::ChatMessage;
+use zeroclaw_rpc_client::Method;
+use zeroclaw_rpc_proto::types::SessionListResult;
 use zeroclaw_runtime::rpc::context::RpcContext;
 use zeroclaw_runtime::rpc::inproc::InprocConnector;
 
-use crate::core_rpc::{CoreRpc, Dial, DialFuture};
+use crate::core_rpc::{CoreAccess, CoreError, CoreRpc, Dial, DialFuture};
 
 const OPERATOR_TOKEN: &str = "zc_gw_operator";
 
@@ -75,6 +75,10 @@ fn stores() -> Stores {
     };
     config.gateway.require_pairing = true;
     config.gateway.paired_tokens = vec![OPERATOR_TOKEN.into()];
+    // The daemon's TUI identity signing key. The in-process connector is a
+    // non-local caller, and the core refuses its `initialize` while signing
+    // is off.
+    std::fs::write(tmp.path().join(".secret_key"), "42".repeat(32)).expect("signing key");
     let sessions = Arc::new(zeroclaw_runtime::rpc::session::SessionStore::new(
         16,
         Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
@@ -82,6 +86,7 @@ fn stores() -> Stores {
         )),
     ));
     let mut ctx = RpcContext::for_live_test(config.clone(), sessions);
+    assert!(ctx.tui_registry.signing_is_enabled());
     Arc::get_mut(&mut ctx)
         .expect("a fresh context has one owner")
         .session_backend = Some(open_store(&config));
@@ -171,30 +176,36 @@ fn register_turn(state: &AppState, cancel_key: &str) -> CancellationToken {
     token
 }
 
-// ── The listing, through the core ─────────────────────────────────
+// ── Why the listing stays in-process ──────────────────────────────
 
+/// `GET /api/sessions` lists every attributable session from the gateway's
+/// own store while a core is attached. The core would list none of them for
+/// the gateway's credential-bound connection: for a non-local caller it
+/// lists only the sessions that connection opened.
 #[tokio::test]
-async fn the_listing_is_the_same_through_the_core() {
-    let stores = stores();
+async fn the_listing_stays_in_process_with_a_core_attached() {
+    let stores = stores().with_shared_pairing();
     seed(&*stores.backend);
-    let access = through(&stores.core, OPERATOR_TOKEN).await;
 
-    let core = answer(
-        handle_api_sessions_list(State(stores.state.clone()), access, HeaderMap::new()).await,
-    )
-    .await;
-    let local = answer(
-        handle_api_sessions_list(
-            State(stores.state.clone()),
-            CoreAccess::InProcess,
-            HeaderMap::new(),
-        )
-        .await,
-    )
-    .await;
-    assert_eq!(core, local, "GET /api/sessions");
+    let CoreAccess::Core(call) = through(&stores.core, OPERATOR_TOKEN).await else {
+        unreachable!()
+    };
+    let core_listed: SessionListResult = call
+        .call(Method::SessionList, json!({}))
+        .await
+        .expect("the core lists");
+    assert!(
+        core_listed.sessions.is_empty(),
+        "the core lists only this connection's own sessions: {:?}",
+        core_listed.sessions
+    );
 
-    let rows = core.1["sessions"].as_array().expect("a sessions array");
+    let (status, body) =
+        answer(handle_api_sessions_list(State(stores.state.clone()), bearer(OPERATOR_TOKEN)).await)
+            .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let rows = body["sessions"].as_array().expect("a sessions array");
     let row = |key: &str| {
         rows.iter()
             .find(|row| row["session_key"] == key)
@@ -223,17 +234,13 @@ async fn a_revoked_bearer_with_a_pooled_connection_cancels_nothing() {
     seed(&*stores.backend);
     let turn = register_turn(&stores.state, "gw_alpha");
 
-    // Warm the pool: a core-backed read with the operator's bearer.
-    let (status, _) = answer(
-        handle_api_sessions_list(
-            State(stores.state.clone()),
-            through(&stores.core, OPERATOR_TOKEN).await,
-            bearer(OPERATOR_TOKEN),
-        )
-        .await,
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
+    // Warm the pool: a core request with the operator's bearer.
+    let CoreAccess::Core(call) = through(&stores.core, OPERATOR_TOKEN).await else {
+        unreachable!()
+    };
+    call.request(Method::Status, json!({}))
+        .await
+        .expect("the operator's status");
 
     assert!(stores.ctx.auth.pairing().revoke_token(OPERATOR_TOKEN));
     let (status, body) = answer(
@@ -250,9 +257,11 @@ async fn a_revoked_bearer_with_a_pooled_connection_cancels_nothing() {
     assert!(stores.backend.session_exists("gw_alpha"));
 }
 
-/// With `gw_alpha` and a same-owner `rpc_gw_alpha`, the core resolves the
-/// id `gw_alpha` to the RPC row. The routes act on the row this gateway
-/// selected, because they do not ask the core to resolve it.
+/// With `gw_alpha` and a same-owner `rpc_gw_alpha`, the core never answers
+/// for the gateway's row when asked for the id `gw_alpha`: it resolves the id
+/// to the RPC row, or refuses it to a caller that does not own it. The routes
+/// act on the row this gateway selected, because they do not ask the core to
+/// resolve it.
 #[tokio::test]
 async fn a_competing_rpc_row_never_answers_for_the_gateway_row() {
     let stores = stores();
@@ -265,18 +274,24 @@ async fn a_competing_rpc_row_never_answers_for_the_gateway_row() {
         )
         .unwrap();
 
-    // The hazard is real: asked for `gw_alpha`, the core reads the RPC row.
+    // The hazard: asked for `gw_alpha`, the core never reads the gateway's
+    // row. It reads the RPC row, or refuses a caller that does not own it.
     let CoreAccess::Core(call) = through(&stores.core, OPERATOR_TOKEN).await else {
         unreachable!()
     };
-    let core_read = call
+    match call
         .request(Method::SessionMessages, json!({ "session_id": "gw_alpha" }))
         .await
-        .expect("the core answers");
-    assert_eq!(
-        core_read["messages"][0]["content"], "different RPC conversation",
-        "the core's resolver prefers the rpc_ row"
-    );
+    {
+        Ok(core_read) => assert_eq!(
+            core_read["messages"][0]["content"], "different RPC conversation",
+            "the core's resolver prefers the rpc_ row"
+        ),
+        Err(CoreError::Rpc(refused)) => {
+            assert_eq!(refused.code, SESSION_NOT_OWNED, "{refused:?}");
+        }
+        Err(other) => panic!("the core neither read nor refused the id: {other:?}"),
+    }
 
     let (status, body) = answer(
         handle_api_session_messages(
@@ -474,35 +489,6 @@ async fn serve_scripted(core: Arc<ScriptedCore>, stream: DuplexStream) {
             break;
         }
     }
-}
-
-#[tokio::test]
-async fn with_gateway_persistence_off_the_core_is_not_asked() {
-    let scripted = Arc::new(ScriptedCore::default());
-    let core = CoreRpc::over_dialer(Scripted(Arc::clone(&scripted)));
-    let state = test_state(Config::default());
-    assert!(state.session_backend.is_none());
-
-    let list = answer(
-        handle_api_sessions_list(
-            State(state.clone()),
-            through(&core, OPERATOR_TOKEN).await,
-            HeaderMap::new(),
-        )
-        .await,
-    )
-    .await;
-    assert_eq!(
-        list,
-        (
-            StatusCode::OK,
-            json!({"sessions": [], "message": "Session persistence is disabled"})
-        )
-    );
-    assert!(
-        scripted.methods.lock().unwrap().is_empty(),
-        "no session method reached the core"
-    );
 }
 
 // ── zeroclaw-gw's transcript read: pages, oldest first ───────────
