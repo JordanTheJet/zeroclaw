@@ -3841,7 +3841,10 @@ impl RpcDispatcher {
     ///
     /// Administrators on the local socket only: the registration makes
     /// `gateway/possession-challenge` vouch for that listener, so whoever
-    /// registers is trusted with every credential sent to the address.
+    /// registers is trusted with every credential sent to the address. Of
+    /// several live registrations for one address, the most recent is the one
+    /// vouched for. A registrant that is no longer an administrator holds no
+    /// place under the cap.
     async fn handle_gateway_register_listener(&self, method: Method, params: &Value) -> RpcResult {
         let (_authority, registrant) = self.admit_local_admin(method).await?;
         let req: GatewayRegisterListenerParams = parse_params(params)?;
@@ -3860,6 +3863,7 @@ impl RpcDispatcher {
                 crate::rpc::context::BoundGateway { addr, possession },
                 &self.connection_token,
                 registrant,
+                |registrant| self.still_local_admin(registrant),
             )
             .ok_or_else(|| {
                 rpc_err(
@@ -27256,18 +27260,18 @@ mod tests {
         let ids: Vec<u64> = (0..MAX_EXTERNAL_GATEWAY_LISTENERS)
             .map(|_| {
                 listeners
-                    .register(bound, &connection, registrant.clone())
+                    .register(bound, &connection, registrant.clone(), |_| true)
                     .expect("under the cap")
             })
             .collect();
         assert_eq!(
-            listeners.register(bound, &connection, registrant.clone()),
+            listeners.register(bound, &connection, registrant.clone(), |_| true),
             None
         );
         assert!(listeners.release(ids[0], &connection));
         assert!(
             listeners
-                .register(bound, &connection, registrant.clone())
+                .register(bound, &connection, registrant.clone(), |_| true)
                 .is_some()
         );
 
@@ -27275,15 +27279,61 @@ mod tests {
         let other = ExternalGatewayListeners::default();
         for _ in 0..MAX_EXTERNAL_GATEWAY_LISTENERS {
             other
-                .register(bound, &closing, registrant.clone())
+                .register(bound, &closing, registrant.clone(), |_| true)
                 .expect("under the cap");
         }
         drop(closing);
         assert!(
             other
-                .register(bound, &connection, registrant.clone())
+                .register(bound, &connection, registrant.clone(), |_| true)
                 .is_some(),
             "a closed connection's registrations free their places"
+        );
+    }
+
+    /// A registrant that has lost its authority holds no place among the
+    /// live registrations. A fresh administrator registers although the
+    /// revoked one's registrations fill the cap on a connection that stays
+    /// open, and although nobody has asked for any of those addresses.
+    #[tokio::test]
+    async fn a_revoked_registrant_frees_its_listener_places() {
+        use crate::rpc::context::MAX_EXTERNAL_GATEWAY_LISTENERS;
+        let (ctx, _tmp) = possession_test_context(|config| {
+            config.gateway.require_pairing = true;
+            config.gateway.paired_tokens = vec!["zc_registrant".into()];
+        });
+        let ctx = Arc::new(ctx);
+        let (mut revoked, _rx) = local_peer(&ctx, 7777);
+        revoked
+            .handle_initialize(&json!({ "auth_token": "zc_registrant" }))
+            .await
+            .expect("a paired administrator");
+        let key = crate::daemon::GatewayPossession::generate();
+        for port in 0..MAX_EXTERNAL_GATEWAY_LISTENERS {
+            revoked
+                .handle_gateway_register_listener(
+                    Method::GatewayRegisterListener,
+                    &json!({
+                        "addr": format!("127.0.0.1:{}", 45_000 + port),
+                        "possession": key.to_hex(),
+                    }),
+                )
+                .await
+                .expect("under the cap");
+        }
+        let fresh = local_admin(&ctx);
+        assert!(ctx.auth.pairing().revoke_token("zc_registrant"));
+        assert!(!fresh.still_local_admin(revoked.auth.as_ref().expect("bound")));
+
+        let registered = fresh
+            .handle_gateway_register_listener(
+                Method::GatewayRegisterListener,
+                &json!({ "addr": "127.0.0.1:46000", "possession": key.to_hex() }),
+            )
+            .await;
+        assert!(
+            registered.is_ok(),
+            "a revoked registrant's places are free: {registered:?}"
         );
     }
 

@@ -192,14 +192,20 @@ struct ExternalGatewayListener {
 impl ExternalGatewayListeners {
     /// Register a listener for as long as `connection` lives. Returns its
     /// id, or `None` when [`MAX_EXTERNAL_GATEWAY_LISTENERS`] live ones exist.
+    /// A registration is live while its connection is open and `admitted`
+    /// still accepts its registrant; the others end here, before the count,
+    /// so a registrant that lost its authority holds no place.
     pub fn register(
         &self,
         bound: BoundGateway,
         connection: &Arc<()>,
         registrant: crate::rpc::auth::ConnectionAuth,
+        admitted: impl Fn(&crate::rpc::auth::ConnectionAuth) -> bool,
     ) -> Option<u64> {
         let mut listeners = self.listeners.lock();
-        listeners.retain(|listener| listener.connection.strong_count() > 0);
+        listeners.retain(|listener| {
+            listener.connection.strong_count() > 0 && admitted(&listener.registrant)
+        });
         if listeners.len() >= MAX_EXTERNAL_GATEWAY_LISTENERS {
             return None;
         }
@@ -231,9 +237,12 @@ impl ExternalGatewayListeners {
     }
 
     /// The listener registered for `addr` by a connection that is still
-    /// open, by a registrant `admitted` still accepts, the most recent one if
-    /// several are. A registration at `addr` whose registrant is no longer
-    /// admitted ends here.
+    /// open, by a registrant `admitted` still accepts. Several may be: a
+    /// gateway restarting at the same address registers before its
+    /// predecessor's connection has closed. The most recent one is vouched
+    /// for, and an older one only once every newer one has ended. A
+    /// registration at `addr` whose registrant is no longer admitted ends
+    /// here.
     pub fn bound_at(
         &self,
         addr: std::net::SocketAddr,
