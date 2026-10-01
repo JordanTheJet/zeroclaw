@@ -347,7 +347,7 @@ impl Method {
             M::ConfigSet => (Typed("ConfigSetParams"), Typed("ConfigSetResult")),
             M::ConfigSetMany => (Typed("ConfigSetManyParams"), Typed("ConfigSetManyResult")),
             M::ConfigValidate => (None, Typed("ConfigValidateResult")),
-            M::ConfigReload => (None, Typed("ConfigReloadResult")),
+            M::ConfigReload => (Typed("ConfigReloadParams"), Typed("ConfigReloadResult")),
             M::ConfigList => (Typed("ConfigListParams"), Typed("ConfigListResult")),
             M::ConfigDelete => (Typed("ConfigDeleteParams"), Typed("ConfigDeleteResult")),
             M::ConfigMapKeys => (Typed("ConfigMapKeysParams"), Typed("ConfigMapKeysResult")),

@@ -367,10 +367,13 @@ fn principal_tool_ceiling(grants: &zeroclaw_api::grants::ResolvedGrants) -> Opti
 /// - `config.skill_bundle_dir`: `config/map-key-create` under `skill_bundles`
 ///   creates the bundle's directory
 ///   (`config_map_key_create_scaffolds_a_skill_bundle_directory`).
+/// - `config.remote_admin_reload`: remote HTTP reload admission uses the
+///   live core policy (`config_reload_remote_admin_checks_live_policy`).
 pub const ADVERTISED_FEATURES: &[&str] = &[
     zeroclaw_rpc_proto::feature::TUI_CLIENT_KIND,
     zeroclaw_rpc_proto::feature::CONFIG_PATCH_OPS,
     zeroclaw_rpc_proto::feature::CONFIG_SKILL_BUNDLE_DIR,
+    zeroclaw_rpc_proto::feature::CONFIG_REMOTE_ADMIN_RELOAD,
 ];
 
 fn declared_client_kind(capabilities: Option<&Value>) -> Option<String> {
@@ -674,6 +677,18 @@ fn rename_error_to_rpc(
         err.api_error(path, from),
     )
 }
+
+/// The remote HTTP reload refusal when the operator did not opt in.
+pub const REMOTE_ADMIN_RELOAD_DISABLED: &str = "Remote admin reload is disabled. Call from localhost, \
+     or set gateway.allow_remote_admin = true (with pairing \
+     enabled, then pair) to allow authenticated remote reloads.";
+
+/// The remote HTTP reload refusal when the actual pairing guard is disabled.
+pub const REMOTE_ADMIN_RELOAD_NO_PAIRING: &str = "Remote admin reload requires pairing. \
+    gateway.allow_remote_admin is enabled but \
+    gateway.require_pairing is off, so remote callers \
+    cannot be authenticated. Enable require_pairing, or \
+    call /admin/reload from localhost.";
 
 async fn move_renamed_agent_workspace(
     old_workspace: &std::path::Path,
@@ -3274,7 +3289,7 @@ impl RpcDispatcher {
             Method::ConfigSet => Box::pin(self.handle_config_set(params)).await,
             Method::ConfigSetMany => Box::pin(self.handle_config_set_many(params)).await,
             Method::ConfigValidate => self.handle_config_validate(),
-            Method::ConfigReload => self.handle_config_reload(),
+            Method::ConfigReload => self.handle_config_reload(params),
             Method::ConfigList => self.handle_config_list(params),
             Method::ConfigDelete => Box::pin(self.handle_config_delete(params)).await,
             Method::ConfigMapKeys => self.handle_config_map_keys(params),
@@ -9114,7 +9129,37 @@ impl RpcDispatcher {
         }
     }
 
-    fn handle_config_reload(&self) -> RpcResult {
+    fn handle_config_reload(&self, params: &Value) -> RpcResult {
+        let req = if params.is_null() {
+            ConfigReloadParams::default()
+        } else {
+            parse_params::<ConfigReloadParams>(params)?
+        };
+        let authority = self.ctx.auth.hold_authority();
+        if let Some(auth) = self.auth.as_ref() {
+            current_authority_under(&authority, auth, Method::ConfigReload).map_err(|denied| {
+                self.audit_auth_denial(Method::ConfigReload, &denied);
+                rpc_err(denied.code, denied.message)
+            })?;
+        }
+        // Keep canonical config still through the synchronous reload enqueue.
+        let config = self.ctx.config.read();
+        if req.remote_admin {
+            if !config.gateway.allow_remote_admin {
+                return Err(refused(
+                    FORBIDDEN,
+                    RefusalReason::Forbidden,
+                    REMOTE_ADMIN_RELOAD_DISABLED,
+                ));
+            }
+            if !self.ctx.auth.pairing().require_pairing() {
+                return Err(refused(
+                    FORBIDDEN,
+                    RefusalReason::Forbidden,
+                    REMOTE_ADMIN_RELOAD_NO_PAIRING,
+                ));
+            }
+        }
         if !self.schedule_daemon_reload("config") {
             return Err(refused(
                 INTERNAL_ERROR,
@@ -25751,7 +25796,7 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::channel(64);
         let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-reload:pid=1".into());
 
-        let result = dispatcher.handle_config_reload();
+        let result = dispatcher.handle_config_reload(&Value::Null);
         assert!(
             result.is_ok(),
             "config/reload should accept reload-capable contexts"
@@ -39967,6 +40012,51 @@ mod tests {
             let saved = std::fs::read_to_string(&ctx.config.read().config_path).unwrap();
             let saved: toml::Value = toml::from_str(&saved).unwrap();
             assert_eq!(saved["memory"]["backend"].as_str(), Some("none"));
+        });
+    }
+
+    #[test]
+    fn config_reload_remote_admin_checks_live_policy() {
+        run_on_a_large_stack(|| async move {
+            let mut config = Config::default();
+            config.gateway.allow_remote_admin = true;
+            config.gateway.require_pairing = true;
+            let mut inner = Arc::try_unwrap(enforcement_ctx(config))
+                .unwrap_or_else(|_| panic!("fresh context is uniquely owned"));
+            let (reload_tx, mut reload_rx) = tokio::sync::watch::channel(false);
+            inner.reload_tx = Some(reload_tx);
+            let ctx = Arc::new(inner);
+            let (tx, _rx) = tokio::sync::mpsc::channel(64);
+            let mut dispatcher =
+                RpcDispatcher::new(Arc::clone(&ctx), tx, "reload-policy-test".into());
+            dispatcher.set_authenticated_for_test();
+            // The request's origin is context, never a snapshot of the opt-in.
+            ctx.config.write().gateway.allow_remote_admin = false;
+            let denied = dispatcher
+                .handle_config_reload(&json!({"remote_admin": true}))
+                .expect_err("the live opt-out must refuse remote reload");
+            assert_eq!(denied.code, FORBIDDEN);
+            assert_eq!(denied.message, REMOTE_ADMIN_RELOAD_DISABLED);
+            assert!(!reload_rx.has_changed().unwrap());
+            dispatcher
+                .handle_config_reload(&Value::Null)
+                .expect("older local callers need no new params");
+            tokio::time::timeout(std::time::Duration::from_secs(10), reload_rx.changed())
+                .await
+                .expect("local reload is enqueued")
+                .unwrap();
+            assert!(*reload_rx.borrow());
+
+            let mut config = Config::default();
+            config.gateway.allow_remote_admin = true;
+            config.gateway.require_pairing = false;
+            let (mut dispatcher, _sessions) = make_acp_test_dispatcher(config);
+            dispatcher.set_authenticated_for_test();
+            let denied = dispatcher
+                .handle_config_reload(&json!({"remote_admin": true}))
+                .expect_err("opt-in without actual pairing must be refused");
+            assert_eq!(denied.code, FORBIDDEN);
+            assert_eq!(denied.message, REMOTE_ADMIN_RELOAD_NO_PAIRING);
         });
     }
 

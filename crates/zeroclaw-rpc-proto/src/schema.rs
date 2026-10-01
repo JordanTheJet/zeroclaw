@@ -52,7 +52,7 @@ catalog! {
     CronIdParams, CronPatchParams, CronDeleteResult, CronRunsParams, CronTriggerResult,
     // Config
     ConfigGetParams, ConfigGetPropResult, ConfigSetParams, ConfigSetResult, ConfigSetManyParams, ConfigPatchOp, ConfigPatchOpResult, ConfigSetManyResult, ConfigValidateResult,
-    ConfigReloadResult, ConfigListParams, ConfigListResult, ConfigDeleteParams, ConfigDeleteResult,
+    ConfigReloadParams, ConfigReloadResult, ConfigListParams, ConfigListResult, ConfigDeleteParams, ConfigDeleteResult,
     ConfigMapKeysParams, ConfigMapKeysResult, ConfigResolveAliasSourceParams,
     ConfigResolveAliasSourceResult, ConfigMapKeyCreateParams, ConfigMapKeyCreateResult,
     ConfigMapKeyDeleteParams, ConfigMapKeyDeleteResult, ConfigMapKeyRenameParams,

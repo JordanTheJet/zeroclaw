@@ -748,6 +748,17 @@ rpc_type! {
 }
 
 rpc_type! {
+    #[derive(Default)]
+    pub struct ConfigReloadParams {
+        /// Set by the HTTP edge when the caller is not on loopback. The
+        /// core checks its live remote-admin flag and pairing guard before
+        /// enqueuing the reload. Omitted, existing local callers are unchanged.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        pub remote_admin: bool,
+    }
+}
+
+rpc_type! {
     pub struct ConfigReloadResult {
         pub reloading: bool,
     }

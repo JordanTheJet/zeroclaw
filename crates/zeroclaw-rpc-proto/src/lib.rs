@@ -107,9 +107,18 @@ pub mod feature {
     /// bundle's directory.
     pub const CONFIG_SKILL_BUNDLE_DIR: &str = "config.skill_bundle_dir";
 
+    /// `config/reload` accepts remote HTTP origin context and checks the
+    /// live remote-admin policy in the core at reload admission.
+    pub const CONFIG_REMOTE_ADMIN_RELOAD: &str = "config.remote_admin_reload";
+
     /// Every extension name this protocol defines. A core advertises only
     /// the ones it implements, from its own list beside the handlers.
-    pub const KNOWN: &[&str] = &[TUI_CLIENT_KIND, CONFIG_PATCH_OPS, CONFIG_SKILL_BUNDLE_DIR];
+    pub const KNOWN: &[&str] = &[
+        TUI_CLIENT_KIND,
+        CONFIG_PATCH_OPS,
+        CONFIG_SKILL_BUNDLE_DIR,
+        CONFIG_REMOTE_ADMIN_RELOAD,
+    ];
 
     #[cfg(test)]
     mod tests {
