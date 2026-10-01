@@ -23,6 +23,9 @@ base64 = "0.22"
 [dev-dependencies]
 tauri-utils = { version = "2.0", features = ["build-2"] }
 
+[target.'cfg(unix)'.dev-dependencies]
+process-wrap = { version = "=9.0.0", default-features = false, features = ["std"] }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSImage", "NSRunningApplication"] }

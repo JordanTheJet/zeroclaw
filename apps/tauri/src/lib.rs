@@ -274,7 +274,7 @@ pub fn run() {
             // reused, or one left by an earlier run, keeps running.
             RunEvent::Exit => {
                 let owned = app.state::<SharedOwnedProcesses>();
-                for error in owned.quit(ownership::QUIT_GRACE, ownership::LAUNCH_SETTLE_WAIT) {
+                for error in owned.quit(ownership::QUIT_GRACE) {
                     eprintln!("ZeroClaw Desktop: stopping the daemon it launched failed: {error}");
                 }
             }

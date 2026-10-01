@@ -17,7 +17,7 @@ use std::time::Instant;
 const READINESS_FRAME_MAX_BYTES: usize = 4096;
 const CAPABILITY_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 /// How long a supervisor that failed startup gets to exit before it is forced.
-const STARTUP_CLEANUP_GRACE: Duration = Duration::from_millis(250);
+pub(crate) const STARTUP_CLEANUP_GRACE: Duration = Duration::from_millis(250);
 /// How long to wait for a terminated job's supervisor to report its exit.
 #[cfg(windows)]
 const WINDOWS_JOB_EXIT_WAIT: Duration = Duration::from_secs(5);
@@ -98,12 +98,15 @@ pub fn find_zeroclaw_binary() -> Option<PathBuf> {
     None
 }
 
-/// Spawn the bounded desktop daemon supervisor and return its handle once it
-/// reports readiness. The handle is the only proof that this app instance
-/// launched the tree: keep it (see [`crate::ownership`]) to be able to stop the
-/// tree on Quit. The supervisor owns the daemon's lifecycle and log capture.
-pub fn spawn_daemon(binary: &Path, port: u16) -> std::io::Result<Supervisor> {
-    ensure_desktop_supervisor_capability(binary)?;
+/// Spawn the bounded desktop daemon supervisor and take its readiness pipe.
+/// The returned handle is the only proof that this app instance launched the
+/// tree: the caller must hand it to its owner (see [`crate::ownership`]) before
+/// waiting for readiness, so Quit can stop the tree at any point. The
+/// supervisor owns the daemon's lifecycle and log capture.
+pub(crate) fn spawn_supervisor(
+    binary: &Path,
+    port: u16,
+) -> std::io::Result<(Supervisor, std::process::ChildStdout)> {
     let mut cmd = desktop_daemon_command(binary, port);
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -122,75 +125,144 @@ pub fn spawn_daemon(binary: &Path, port: u16) -> std::io::Result<Supervisor> {
     let mut child: Supervisor = cmd.spawn()?;
     // Created suspended and assigned to a job this handle owns before it
     // runs, so every descendant starts inside the job. The job does not kill
-    // on close: an app crash leaves the tree running, as on Unix.
+    // on close: an app crash leaves the tree running, as on Unix. If the job
+    // cannot be set up after the process exists, the guard kills it.
     #[cfg(windows)]
     let mut child: Supervisor = {
         use process_wrap::std::{CommandWrap as StdCommandWrap, CreationFlags, JobObject};
         use windows::Win32::System::Threading::{
             CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, DETACHED_PROCESS,
         };
+        let guard = SetupFailureGuard::armed();
         let mut wrapped = StdCommandWrap::from(cmd);
         wrapped
             .wrap(CreationFlags(
                 DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW,
             ))
+            .wrap(guard.clone())
             .wrap(JobObject);
-        wrapped.spawn()?
+        let child = wrapped.spawn()?;
+        guard.disarm();
+        child
     };
     #[cfg(not(windows))]
     let stdout = child.stdout.take();
     #[cfg(windows)]
     let stdout = child.stdout().take();
-    let stdout = match stdout {
-        Some(stdout) => stdout,
+    match stdout {
+        Some(stdout) => Ok((child, stdout)),
         None => {
             let startup_error = std::io::Error::new(
                 std::io::ErrorKind::BrokenPipe,
                 "desktop supervisor stdout unavailable",
             );
-            return Err(attach_cleanup_error(
+            Err(attach_cleanup_error(
                 startup_error,
                 terminate_supervisor_tree(&mut child, STARTUP_CLEANUP_GRACE),
-            ));
+            ))
         }
-    };
+    }
+}
+
+/// Wait for the supervisor's one readiness frame.
+pub(crate) fn read_readiness(stdout: std::process::ChildStdout) -> std::io::Result<Option<String>> {
     let (sender, receiver) = mpsc::channel();
     std::thread::spawn(move || {
         let _ = sender.send(read_readiness_frame(stdout));
     });
-    let frame = match receiver.recv_timeout(Duration::from_secs(10)) {
+    match receiver.recv_timeout(Duration::from_secs(10)) {
         Ok(result) => result,
-        Err(mpsc::RecvTimeoutError::Timeout) => {
-            let startup_error = std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "desktop supervisor readiness timed out",
-            );
-            return Err(attach_cleanup_error(
-                startup_error,
-                terminate_supervisor_tree(&mut child, STARTUP_CLEANUP_GRACE),
-            ));
-        }
-        Err(mpsc::RecvTimeoutError::Disconnected) => {
-            let startup_error = std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "desktop supervisor readiness reader exited unexpectedly",
-            );
-            return Err(attach_cleanup_error(
-                startup_error,
-                terminate_supervisor_tree(&mut child, STARTUP_CLEANUP_GRACE),
-            ));
-        }
-    };
-    match validate_readiness_frame(frame, || peek_supervisor_exit(&mut child)) {
-        Ok(()) => Ok(child),
-        Err(startup_error) => Err(attach_cleanup_error(
-            startup_error,
-            terminate_supervisor_tree(&mut child, STARTUP_CLEANUP_GRACE),
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "desktop supervisor readiness timed out",
+        )),
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "desktop supervisor readiness reader exited unexpectedly",
         )),
     }
 }
 
-fn validate_readiness_frame<F>(
+/// Kills and reaps a spawned process if the rest of its setup fails after the
+/// process exists: on Windows, creating its job, assigning the suspended
+/// process to it, or resuming it. Disarmed once the whole spawn succeeds, so a
+/// supervisor that started keeps the job's no-kill-on-close crash policy.
+#[cfg(any(windows, test))]
+#[derive(Clone, Debug)]
+struct SetupFailureGuard(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+#[cfg(any(windows, test))]
+impl SetupFailureGuard {
+    fn armed() -> Self {
+        Self(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+            true,
+        )))
+    }
+
+    fn disarm(&self) {
+        self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[cfg(any(windows, test))]
+impl process_wrap::std::CommandWrapper for SetupFailureGuard {
+    fn wrap_child(
+        &mut self,
+        child: Box<dyn process_wrap::std::ChildWrapper>,
+        _core: &process_wrap::std::CommandWrap,
+    ) -> std::io::Result<Box<dyn process_wrap::std::ChildWrapper>> {
+        Ok(Box::new(SetupFailureChild {
+            child: Some(child),
+            armed: std::sync::Arc::clone(&self.0),
+        }))
+    }
+}
+
+#[cfg(any(windows, test))]
+#[derive(Debug)]
+struct SetupFailureChild {
+    child: Option<Box<dyn process_wrap::std::ChildWrapper>>,
+    armed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[cfg(any(windows, test))]
+impl process_wrap::std::ChildWrapper for SetupFailureChild {
+    fn inner(&self) -> &dyn process_wrap::std::ChildWrapper {
+        self.child.as_deref().expect("guard child must be present")
+    }
+
+    fn inner_mut(&mut self) -> &mut dyn process_wrap::std::ChildWrapper {
+        self.child
+            .as_deref_mut()
+            .expect("guard child must be present")
+    }
+
+    fn into_inner(mut self: Box<Self>) -> Box<dyn process_wrap::std::ChildWrapper> {
+        self.child.take().expect("guard child must be present")
+    }
+}
+
+#[cfg(any(windows, test))]
+impl Drop for SetupFailureChild {
+    fn drop(&mut self) {
+        if !self.armed.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        let Some(child) = self.child.as_deref_mut() else {
+            return;
+        };
+        let _ = child.start_kill();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            match child.try_wait() {
+                Ok(Some(_)) | Err(_) => break,
+                Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+            }
+        }
+    }
+}
+
+pub(crate) fn validate_readiness_frame<F>(
     frame: std::io::Result<Option<String>>,
     status_probe: F,
 ) -> std::io::Result<()>
@@ -221,7 +293,7 @@ where
     parse_readiness_line(&line).map_err(std::io::Error::other)
 }
 
-fn ensure_desktop_supervisor_capability(binary: &Path) -> std::io::Result<()> {
+pub(crate) fn ensure_desktop_supervisor_capability(binary: &Path) -> std::io::Result<()> {
     ensure_desktop_supervisor_capability_with_timeout(binary, CAPABILITY_PROBE_TIMEOUT)
 }
 
@@ -438,7 +510,7 @@ fn read_readiness_frame<R: Read>(mut reader: R) -> std::io::Result<Option<String
     })
 }
 
-fn attach_cleanup_error(
+pub(crate) fn attach_cleanup_error(
     startup_error: std::io::Error,
     cleanup_result: std::io::Result<()>,
 ) -> std::io::Error {
@@ -672,7 +744,7 @@ pub(crate) fn supervisor_exited(pid: u32) -> std::io::Result<bool> {
 /// The supervisor's exit status once it has exited. On Unix it is left
 /// unreaped so cleanup can still signal its process group safely; on Windows
 /// the open process handle already keeps its PID from being reused.
-fn peek_supervisor_exit(
+pub(crate) fn peek_supervisor_exit(
     child: &mut Supervisor,
 ) -> std::io::Result<Option<std::process::ExitStatus>> {
     #[cfg(unix)]
@@ -753,6 +825,11 @@ fn desktop_daemon_command(binary: &Path, port: u16) -> Command {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Launch `binary` the way the app does, into a fresh owned registry.
+    fn launch(binary: &Path) -> std::io::Result<()> {
+        crate::ownership::OwnedProcesses::default().launch(binary, 0)
+    }
     #[cfg(unix)]
     use std::fs;
 
@@ -829,7 +906,7 @@ mod tests {
         fs::set_permissions(&binary, fs::Permissions::from_mode(0o700))
             .expect("make old kernel fixture executable");
 
-        let error = spawn_daemon(&binary, 0).expect_err("old kernel must be rejected");
+        let error = launch(&binary).expect_err("old kernel must be rejected");
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
         assert!(error.to_string().contains(&binary.display().to_string()));
         assert!(error.to_string().contains("supports this command"));
@@ -993,7 +1070,7 @@ mod tests {
         fs::set_permissions(&binary, fs::Permissions::from_mode(0o700))
             .expect("make supervisor fixture executable");
 
-        let error = spawn_daemon(&binary, 0).expect_err("log-open failure must reject startup");
+        let error = launch(&binary).expect_err("log-open failure must reject startup");
         let error = error.to_string();
         let detail_prefix = format!("failed to open desktop log {}: ", log_destination.display());
         let (_, detail) = error
@@ -1063,7 +1140,7 @@ mod tests {
         fs::set_permissions(&binary, fs::Permissions::from_mode(0o700))
             .expect("make exiting supervisor fixture executable");
 
-        let error = spawn_daemon(&binary, 0).expect_err("invalid readiness must reject startup");
+        let error = launch(&binary).expect_err("invalid readiness must reject startup");
         assert!(error.to_string().contains("invalid readiness response"));
         assert!(!error.to_string().contains("cleanup failed"));
         let descendant_pid: i32 = fs::read_to_string(&pid_file)
@@ -1080,5 +1157,73 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         panic!("descendant process {descendant_pid} remained alive after cleanup");
+    }
+
+    /// A wrapper that fails after the process exists, as job creation,
+    /// assignment or resumption can on Windows, and reports the PID it saw.
+    #[cfg(unix)]
+    #[derive(Debug)]
+    struct FailAfterSpawn(std::sync::Arc<std::sync::Mutex<Option<u32>>>);
+
+    #[cfg(unix)]
+    impl process_wrap::std::CommandWrapper for FailAfterSpawn {
+        fn wrap_child(
+            &mut self,
+            child: Box<dyn process_wrap::std::ChildWrapper>,
+            _core: &process_wrap::std::CommandWrap,
+        ) -> std::io::Result<Box<dyn process_wrap::std::ChildWrapper>> {
+            *self.0.lock().expect("pid cell") = Some(child.id());
+            Err(std::io::Error::other("job setup failed"))
+        }
+    }
+
+    #[cfg(unix)]
+    fn sleeper() -> process_wrap::std::CommandWrap {
+        let mut command = Command::new("sleep");
+        command.arg("30");
+        process_wrap::std::CommandWrap::from(command)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_spawn_whose_setup_fails_after_the_process_exists_kills_it() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let mut wrapped = sleeper();
+        wrapped
+            .wrap(SetupFailureGuard::armed())
+            .wrap(FailAfterSpawn(std::sync::Arc::clone(&seen)));
+        let error = wrapped.spawn().expect_err("setup fails after the spawn");
+        assert!(error.to_string().contains("job setup failed"));
+        let pid = seen
+            .lock()
+            .expect("pid cell")
+            .expect("the process existed before setup failed");
+        let pid = i32::try_from(pid).expect("pid fits in pid_t");
+        // The guard killed and reaped it: the PID no longer names a process.
+        let result = unsafe { kill(pid, 0) };
+        assert_eq!(result, -1, "the half-set-up process was left running");
+        assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(ESRCH));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_disarmed_guard_leaves_a_started_process_running() {
+        let guard = SetupFailureGuard::armed();
+        let mut wrapped = sleeper();
+        wrapped.wrap(guard.clone());
+        let child = wrapped.spawn().expect("spawn succeeds");
+        guard.disarm();
+        let pid = i32::try_from(child.id()).expect("pid fits in pid_t");
+        drop(child);
+        assert_eq!(
+            unsafe { kill(pid, 0) },
+            0,
+            "a disarmed guard must not kill a started process"
+        );
+        // SAFETY: the test spawned `pid` and has not reaped it.
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+            libc::waitpid(pid, std::ptr::null_mut(), 0);
+        }
     }
 }

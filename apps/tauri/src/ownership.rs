@@ -8,13 +8,14 @@
 //! external. It is never adopted, whatever its PID, executable path, or
 //! anything it reports about itself, and quitting never signals it.
 //!
-//! Quitting seals the registry first: a launch that has not started yet is
-//! refused, and one already starting is waited for and stopped with the rest,
-//! so a supervisor cannot slip past Quit while it is still getting ready.
+//! A supervisor is recorded the moment it is spawned, under the same lock
+//! Quit takes to seal the registry, and before it reports readiness. Quit
+//! therefore holds every handle there is to hold, and stops each tree before
+//! it returns, whether or not that tree had finished starting.
 
 use crate::daemon::Supervisor;
 use std::path::Path;
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 /// How long quitting waits for an owned supervisor to stop its daemon before
@@ -22,32 +23,27 @@ use std::time::Duration;
 /// and then drains the daemon's output.
 pub const QUIT_GRACE: Duration = Duration::from_secs(15);
 
-/// How long quitting waits for launches already underway to be recorded. A
-/// launch takes at most the capability probe, the readiness wait and startup
-/// cleanup, well within this bound.
-pub const LAUNCH_SETTLE_WAIT: Duration = Duration::from_secs(30);
-
-/// Supervisor trees this app instance launched, and the launches in progress.
+/// Supervisor trees this app instance launched, ready or still starting.
 #[derive(Debug, Default)]
 pub struct OwnedProcesses {
     registry: Mutex<Registry>,
-    launch_settled: Condvar,
 }
 
 #[derive(Debug, Default)]
 struct Registry {
-    /// Oldest first.
-    launched: Vec<Supervisor>,
-    /// Launches admitted and not yet recorded or failed.
-    pending: usize,
-    /// Set when quitting starts; no launch is admitted after it.
+    next_id: u64,
+    /// Oldest first, each with the ID its launch uses to find it again.
+    launched: Vec<(u64, Supervisor)>,
+    /// Set when quitting starts; nothing is spawned after it.
     closing: bool,
-    /// Set once quitting has taken the launched trees to stop them.
-    drained: bool,
 }
 
 /// The owned-process registry shared between startup and exit.
 pub type SharedOwnedProcesses = Arc<OwnedProcesses>;
+
+fn quitting() -> std::io::Error {
+    std::io::Error::other("the app is quitting, so it does not start a daemon")
+}
 
 impl OwnedProcesses {
     fn registry(&self) -> MutexGuard<'_, Registry> {
@@ -59,58 +55,77 @@ impl OwnedProcesses {
         self.registry().launched.is_empty()
     }
 
-    /// Launch the desktop supervisor for `binary` and record it as owned. It
-    /// is refused once quitting has started. A launch that fails readiness is
-    /// cleaned up by [`crate::daemon::spawn_daemon`] and never recorded.
+    /// Launch the desktop supervisor for `binary` and keep it as owned. It is
+    /// refused once quitting has started. A launch whose readiness fails is
+    /// stopped and forgotten; one that Quit stopped while it was starting
+    /// reports so.
     pub fn launch(&self, binary: &Path, port: u16) -> std::io::Result<()> {
-        let pending = {
+        if self.registry().closing {
+            return Err(quitting());
+        }
+        crate::daemon::ensure_desktop_supervisor_capability(binary)?;
+        let (id, stdout) = {
             let mut registry = self.registry();
             if registry.closing {
-                return Err(std::io::Error::other(
-                    "the app is quitting, so it does not start a daemon",
-                ));
+                return Err(quitting());
             }
-            registry.pending += 1;
-            PendingLaunch {
-                owned: self,
-                settled: false,
-            }
+            let (child, stdout) = crate::daemon::spawn_supervisor(binary, port)?;
+            let id = registry.next_id;
+            registry.next_id += 1;
+            registry.launched.push((id, child));
+            (id, stdout)
         };
-        let child = crate::daemon::spawn_daemon(binary, port)?;
-        pending.record(child)
+        let frame = crate::daemon::read_readiness(stdout);
+        let ready = crate::daemon::validate_readiness_frame(frame, || self.peek_exit(id));
+        let mut registry = self.registry();
+        let Some(index) = registry.launched.iter().position(|(entry, _)| *entry == id) else {
+            return Err(std::io::Error::other(
+                "the app quit while the daemon was starting; it was stopped",
+            ));
+        };
+        match ready {
+            Ok(()) => Ok(()),
+            Err(startup_error) => {
+                let (_, mut child) = registry.launched.remove(index);
+                drop(registry);
+                Err(crate::daemon::attach_cleanup_error(
+                    startup_error,
+                    crate::daemon::terminate_supervisor_tree(
+                        &mut child,
+                        crate::daemon::STARTUP_CLEANUP_GRACE,
+                    ),
+                ))
+            }
+        }
     }
 
-    /// Stop every owned tree through its handle, newest first, so a gateway
-    /// launched after its core stops before the core. Launch admission is
-    /// sealed first, and launches already starting are waited for, up to
-    /// `launch_wait`, so their trees are stopped too. Every handle is
-    /// released either way; the errors are returned.
-    pub fn quit(&self, grace: Duration, launch_wait: Duration) -> Vec<std::io::Error> {
+    /// The exit status of a recorded supervisor, without reaping it on Unix.
+    fn peek_exit(&self, id: u64) -> std::io::Result<Option<std::process::ExitStatus>> {
         let mut registry = self.registry();
-        registry.closing = true;
-        let (mut registry, wait) = self
-            .launch_settled
-            .wait_timeout_while(registry, launch_wait, |registry| registry.pending > 0)
-            .unwrap_or_else(PoisonError::into_inner);
-        let mut errors = Vec::new();
-        if wait.timed_out() {
-            errors.push(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                format!(
-                    "{} daemon launch(es) were still starting; each stops its own daemon when it finishes",
-                    registry.pending
-                ),
-            ));
+        match registry.launched.iter_mut().find(|(entry, _)| *entry == id) {
+            Some((_, child)) => crate::daemon::peek_supervisor_exit(child),
+            None => Ok(None),
         }
-        registry.drained = true;
-        let launched = std::mem::take(&mut registry.launched);
-        drop(registry);
-        for mut child in launched.into_iter().rev() {
-            if let Err(error) = crate::daemon::terminate_supervisor_tree(&mut child, grace) {
-                errors.push(error);
-            }
-        }
-        errors
+    }
+
+    /// Seal the registry and stop every owned tree through its handle, newest
+    /// first, so a gateway launched after its core stops before the core.
+    /// Trees still starting are stopped too, so nothing this instance launched
+    /// is left running when this returns. Every handle is released either way;
+    /// the errors are returned.
+    pub fn quit(&self, grace: Duration) -> Vec<std::io::Error> {
+        let launched = {
+            let mut registry = self.registry();
+            registry.closing = true;
+            std::mem::take(&mut registry.launched)
+        };
+        launched
+            .into_iter()
+            .rev()
+            .filter_map(|(_, mut child)| {
+                crate::daemon::terminate_supervisor_tree(&mut child, grace).err()
+            })
+            .collect()
     }
 }
 
@@ -120,54 +135,16 @@ impl OwnedProcesses {
         self.registry()
             .launched
             .iter()
-            .map(|child| child.id())
+            .map(|(_, child)| child.id())
             .collect()
     }
 
     /// Take the handles out, as an app crash loses them.
     fn lose_handles(&self) -> Vec<Supervisor> {
         std::mem::take(&mut self.registry().launched)
-    }
-}
-
-/// A launch admitted into the registry. Recording its supervisor, or
-/// dropping it when the launch fails, settles it and wakes a waiting quit.
-struct PendingLaunch<'a> {
-    owned: &'a OwnedProcesses,
-    settled: bool,
-}
-
-impl PendingLaunch<'_> {
-    fn record(mut self, mut child: Supervisor) -> std::io::Result<()> {
-        let mut registry = self.owned.registry();
-        registry.pending -= 1;
-        self.settled = true;
-        if !registry.drained {
-            registry.launched.push(child);
-            drop(registry);
-            self.owned.launch_settled.notify_all();
-            return Ok(());
-        }
-        // Quitting gave up waiting and has already stopped the rest: this
-        // launch stops its own tree instead of leaving it running.
-        drop(registry);
-        self.owned.launch_settled.notify_all();
-        let stopped = crate::daemon::terminate_supervisor_tree(&mut child, QUIT_GRACE);
-        Err(std::io::Error::other(match stopped {
-            Ok(()) => "the app quit while the daemon was starting; it was stopped".to_string(),
-            Err(error) => {
-                format!("the app quit while the daemon was starting; stopping it failed: {error}")
-            }
-        }))
-    }
-}
-
-impl Drop for PendingLaunch<'_> {
-    fn drop(&mut self) {
-        if !self.settled {
-            self.owned.registry().pending -= 1;
-            self.owned.launch_settled.notify_all();
-        }
+            .into_iter()
+            .map(|(_, child)| child)
+            .collect()
     }
 }
 
@@ -192,11 +169,7 @@ mod tests {
     fn a_new_registry_owns_nothing() {
         let owned = OwnedProcesses::default();
         assert!(owned.is_empty());
-        assert!(
-            owned
-                .quit(Duration::from_millis(10), Duration::from_millis(10))
-                .is_empty()
-        );
+        assert!(owned.quit(Duration::from_millis(10)).is_empty());
     }
 
     #[cfg(unix)]
@@ -398,9 +371,6 @@ mod tests {
             let _ = child.wait();
         }
 
-        /// Settle wait for tests whose launches finish quickly.
-        const TEST_SETTLE: Duration = Duration::from_secs(10);
-
         #[test]
         fn quit_stops_the_tree_this_instance_launched() {
             let fixture = Fixture::new("owned");
@@ -410,7 +380,7 @@ mod tests {
 
             let supervisor = owned.launched_ids()[0];
             let descendant = fixture.descendant_of(supervisor);
-            assert!(owned.quit(TEST_GRACE, TEST_SETTLE).is_empty());
+            assert!(owned.quit(TEST_GRACE).is_empty());
 
             assert!(owned.is_empty());
             assert!(wait_gone(descendant), "owned descendant survived Quit");
@@ -427,7 +397,7 @@ mod tests {
             let owned = OwnedProcesses::default();
             owned.launch(&binary, 0).expect("launch owned daemon");
 
-            assert!(owned.quit(TEST_GRACE, TEST_SETTLE).is_empty());
+            assert!(owned.quit(TEST_GRACE).is_empty());
 
             let external_pid = i32::try_from(external.id()).expect("pid");
             assert!(alive(external_pid), "Quit stopped an external daemon");
@@ -455,7 +425,7 @@ mod tests {
             // adopts the leftover, even though it runs the same executable.
             let relaunched = OwnedProcesses::default();
             assert!(relaunched.is_empty());
-            assert!(relaunched.quit(TEST_GRACE, TEST_SETTLE).is_empty());
+            assert!(relaunched.quit(TEST_GRACE).is_empty());
             assert!(
                 alive(leftover_pid),
                 "a relaunch stopped an earlier run's daemon"
@@ -484,7 +454,7 @@ mod tests {
             let external = fixture.start_external(&binary);
             let external_descendant = fixture.descendant_of(external.id());
 
-            assert!(owned.quit(TEST_GRACE, TEST_SETTLE).is_empty());
+            assert!(owned.quit(TEST_GRACE).is_empty());
             assert!(
                 wait_gone(descendant),
                 "SIGTERM-ignoring descendant of the owned group survived Quit"
@@ -508,7 +478,7 @@ mod tests {
             assert!(owned.is_empty());
             // The failed launch settled, so Quit does not wait for it.
             let started = Instant::now();
-            assert!(owned.quit(TEST_GRACE, TEST_SETTLE).is_empty());
+            assert!(owned.quit(TEST_GRACE).is_empty());
             assert!(started.elapsed() < Duration::from_secs(1));
         }
 
@@ -521,7 +491,7 @@ mod tests {
             owned.launch(&core, 0).expect("launch core");
             owned.launch(&gateway, 0).expect("launch gateway");
 
-            assert!(owned.quit(TEST_GRACE, TEST_SETTLE).is_empty());
+            assert!(owned.quit(TEST_GRACE).is_empty());
             assert_eq!(fixture.stop_order(), "gateway\ncore\n");
         }
 
@@ -542,7 +512,7 @@ mod tests {
         }
 
         #[test]
-        fn quit_waits_for_a_launch_that_is_still_starting() {
+        fn quit_stops_a_launch_that_is_still_starting() {
             let fixture = Fixture::new("starting");
             let binary = fixture.gated_supervisor("core");
             let owned = std::sync::Arc::new(OwnedProcesses::default());
@@ -551,34 +521,80 @@ mod tests {
             let launch = std::thread::spawn(move || launching.launch(&binary, 0));
             let supervisor = started_pid(&fixture);
 
-            // Quit begins while the supervisor is spawned but not yet ready.
-            let quitting = std::sync::Arc::clone(&owned);
-            let (quit_done, quit_result) = std::sync::mpsc::channel();
-            std::thread::spawn(move || {
-                let _ = quit_done.send(quitting.quit(TEST_GRACE, TEST_SETTLE));
-            });
+            // Quit while the supervisor is spawned but has not reported READY:
+            // it is already recorded, so Quit stops it before returning.
+            assert!(owned.quit(TEST_GRACE).is_empty());
             assert!(
-                quit_result
-                    .recv_timeout(Duration::from_millis(500))
-                    .is_err(),
-                "Quit finished while a launch was still starting"
-            );
-
-            fixture.release();
-            launch
-                .join()
-                .expect("launch thread")
-                .expect("the launch completes and is recorded");
-            let errors = quit_result
-                .recv_timeout(Duration::from_secs(15))
-                .expect("Quit finishes once the launch is recorded");
-            assert!(errors.is_empty(), "{errors:?}");
-            assert!(
-                wait_gone(supervisor),
-                "the launch that was starting survived Quit"
+                !alive(supervisor),
+                "the starting supervisor outlived the Quit that returned"
             );
             assert_eq!(fixture.stop_order(), "core\n");
+
+            fixture.release();
+            let error = launch
+                .join()
+                .expect("launch thread")
+                .expect_err("the launch learns Quit stopped it");
+            assert!(error.to_string().contains("quit"), "{error}");
             assert!(owned.is_empty());
+        }
+
+        /// The app exits as soon as its Exit callback returns from Quit. Run
+        /// exactly that in a child process and check, from outside, that the
+        /// supervisor it was starting did not survive it.
+        #[test]
+        fn nothing_launched_survives_an_app_exit_right_after_quit() {
+            let fixture = Fixture::new("exit");
+            let binary = fixture.gated_supervisor("core");
+            let status = Command::new(std::env::current_exe().expect("test binary"))
+                .args([
+                    "--exact",
+                    "ownership::tests::process_trees::quit_then_exit_helper",
+                    "--ignored",
+                    "--test-threads=1",
+                ])
+                .env(EXIT_HELPER_BINARY_ENV, &binary)
+                .env(EXIT_HELPER_DIR_ENV, &fixture.dir)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .expect("run the app stand-in");
+            assert!(status.success(), "app stand-in failed: {status}");
+            let supervisor = started_pid(&fixture);
+            assert!(
+                wait_gone(supervisor),
+                "a supervisor launched before Quit survived the app's exit"
+            );
+        }
+
+        const EXIT_HELPER_BINARY_ENV: &str = "ZEROCLAW_DESKTOP_TEST_EXIT_BINARY";
+        const EXIT_HELPER_DIR_ENV: &str = "ZEROCLAW_DESKTOP_TEST_EXIT_DIR";
+
+        /// The app stand-in: start a launch that waits for READY, Quit while
+        /// it waits, and exit the process immediately, as the Exit callback
+        /// does.
+        #[test]
+        #[ignore = "subprocess helper for nothing_launched_survives_an_app_exit_right_after_quit"]
+        fn quit_then_exit_helper() {
+            let (Some(binary), Some(dir)) = (
+                std::env::var_os(EXIT_HELPER_BINARY_ENV),
+                std::env::var_os(EXIT_HELPER_DIR_ENV),
+            ) else {
+                return;
+            };
+            let fixture = Fixture {
+                dir: PathBuf::from(dir),
+            };
+            let owned = std::sync::Arc::new(OwnedProcesses::default());
+            let launching = std::sync::Arc::clone(&owned);
+            let binary = PathBuf::from(binary);
+            std::thread::spawn(move || launching.launch(&binary, 0));
+            let _ = started_pid(&fixture);
+            let errors = owned.quit(TEST_GRACE);
+            // Leave the directory for the parent test to inspect.
+            std::mem::forget(fixture);
+            std::process::exit(if errors.is_empty() { 0 } else { 1 });
         }
 
         #[test]
@@ -586,39 +602,12 @@ mod tests {
             let fixture = Fixture::new("sealed");
             let binary = fixture.supervisor("core");
             let owned = OwnedProcesses::default();
-            assert!(owned.quit(TEST_GRACE, TEST_SETTLE).is_empty());
+            assert!(owned.quit(TEST_GRACE).is_empty());
 
             let error = owned
                 .launch(&binary, 0)
                 .expect_err("no launch is admitted once quitting started");
             assert!(error.to_string().contains("quitting"));
-            assert!(owned.is_empty());
-        }
-
-        #[test]
-        fn a_launch_that_outlives_the_settle_wait_stops_its_own_tree() {
-            let fixture = Fixture::new("late");
-            let binary = fixture.gated_supervisor("core");
-            let owned = std::sync::Arc::new(OwnedProcesses::default());
-
-            let launching = std::sync::Arc::clone(&owned);
-            let launch = std::thread::spawn(move || launching.launch(&binary, 0));
-            let supervisor = started_pid(&fixture);
-
-            let errors = owned.quit(TEST_GRACE, Duration::from_millis(200));
-            assert_eq!(errors.len(), 1, "{errors:?}");
-            assert_eq!(errors[0].kind(), std::io::ErrorKind::TimedOut);
-
-            fixture.release();
-            let error = launch
-                .join()
-                .expect("launch thread")
-                .expect_err("a launch that finishes after Quit drained is not kept");
-            assert!(error.to_string().contains("it was stopped"), "{error}");
-            assert!(
-                wait_gone(supervisor),
-                "the late launch left its tree running"
-            );
             assert!(owned.is_empty());
         }
     }
