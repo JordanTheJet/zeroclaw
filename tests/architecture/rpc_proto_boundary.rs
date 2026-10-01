@@ -25,13 +25,16 @@ const ALLOWED_DEPENDENCIES: &[&str] = &[
 
 /// Direct dependencies the client crate may declare, including under a
 /// `[target.*]` table: the proto allow-list plus the async runtime it needs to
-/// drive a byte stream, and `libc` for the effective uid its endpoint check
-/// compares the socket's peer uid with (already linked through tokio).
+/// drive a byte stream, `libc` for the effective uid its endpoint check
+/// compares the socket's peer uid with, and `windows-sys` for the pipe
+/// server's account and the pipe's owner and access list on Windows (both
+/// already linked through tokio).
 const CLIENT_ALLOWED_DEPENDENCIES: &[&str] = &[
     "libc",
     "serde",
     "serde_json",
     "tokio",
+    "windows-sys",
     "zeroclaw-api",
     "zeroclaw-rpc-proto",
 ];

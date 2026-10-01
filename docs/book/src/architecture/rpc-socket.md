@@ -267,10 +267,16 @@ explicitly stopped.
   must be the expected account (the client's own by default, or a uid the
   launcher passes), and the socket's directory must belong to that account
   with no group or other write access. A sticky shared directory such as
-  `/tmp` does not qualify. The check runs on every dial. On Windows,
-  credential-bearing dials are refused until the client can check the pipe
-  server's account. Dials that carry none of these are not gated. The only
-  other public constructor runs over the daemon's in-process duplex.
+  `/tmp` does not qualify. On Windows, the process the kernel names as the
+  pipe's server must run as the client's own account, the pipe must be owned
+  by that account (or by the Administrators group, as it is when an elevated
+  process created it), and its access list must not let Everyone, anonymous
+  callers, or all signed-in users write to it, create instances under its
+  name, or change its security. A uid owner is refused there, since a uid
+  names no Windows account. The check runs on every dial and writes nothing
+  to an endpoint it refuses. Dials that carry none of these are not gated.
+  The only other public constructor runs over the daemon's in-process
+  duplex.
 
 ## Quick test
 

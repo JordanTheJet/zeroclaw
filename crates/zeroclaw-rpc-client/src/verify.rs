@@ -6,10 +6,12 @@
 //! the connected socket's peer uid must be the expected account, and the
 //! directory holding the socket must belong to that account with no group or
 //! other write access, so no other account can have placed or swapped the
-//! socket. Both checks run on every dial that carries a credential (a
-//! bearer, a TUI signature, or forwarded environment), reconnects included,
-//! and there is no switch that skips them. Windows cannot prove the pipe
-//! server's account from here yet, so it refuses those dials instead.
+//! socket. On Windows the process the kernel names as the pipe's server
+//! must run as the expected account, and the pipe itself must be owned by
+//! that account (or the Administrators group) with no write access for a
+//! broad group (see [`pipe`]). These checks run on every dial that carries a
+//! credential (a bearer, a TUI signature, or forwarded environment),
+//! reconnects included, and there is no switch that skips them.
 //!
 //! What this cannot tell apart: two processes of the same account. Malware
 //! running as the core's own user can read its configuration and tokens
@@ -17,6 +19,9 @@
 
 use std::fmt;
 use std::path::{Path, PathBuf};
+
+#[cfg(any(windows, test))]
+pub(crate) mod pipe;
 
 /// The OS account that must serve a local endpoint before
 /// [`crate::RpcClient::connect_local`] sends it a credential.
@@ -27,7 +32,8 @@ pub enum EndpointOwner {
     #[default]
     SameAccount,
     /// A specific Unix uid, for a launcher that runs the core under its own
-    /// account and hands the client that account.
+    /// account and hands the client that account. A uid names no Windows
+    /// account, so a Windows dial that asks for one is refused.
     Uid(u32),
 }
 
@@ -49,9 +55,27 @@ pub enum EndpointRejection {
     DirectoryWritable { dir: PathBuf, mode: u32 },
     /// The socket's location could not be resolved or inspected.
     DirectoryUnreadable { dir: PathBuf, error: String },
-    /// This platform cannot yet prove who serves the endpoint, so
-    /// credential-bearing dials are refused outright.
+    /// The requested owner cannot be checked on this platform (a Unix uid
+    /// on Windows), so the credential-bearing dial is refused.
     Unsupported,
+    /// The process the kernel names as the pipe's server runs as another
+    /// Windows account. The accounts are SIDs.
+    ServerAccount {
+        pid: u32,
+        expected: String,
+        actual: String,
+    },
+    /// The pipe is owned by an account that is neither the expected one nor
+    /// the Administrators group.
+    PipeOwner { expected: String, actual: String },
+    /// A broad group (everyone, anonymous, or every signed-in user) may write
+    /// to the pipe, add instances of its own, or change its security.
+    /// `access` is the access mask granted to `account`.
+    PipeWritable { account: String, access: u32 },
+    /// The pipe has no access list, so every account may do anything to it.
+    PipeUnprotected,
+    /// The pipe's owner and access list could not be read or understood.
+    PipeSecurityUnreadable(String),
 }
 
 impl fmt::Display for EndpointRejection {
@@ -81,7 +105,30 @@ impl fmt::Display for EndpointRejection {
                 write!(f, "cannot inspect its directory {}: {error}", dir.display())
             }
             Self::Unsupported => {
-                f.write_str("this platform cannot verify which account serves a local endpoint yet")
+                f.write_str("the requested endpoint owner cannot be checked on this platform")
+            }
+            Self::ServerAccount {
+                pid,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "served by process {pid} running as {actual}, expected {expected}"
+            ),
+            Self::PipeOwner { expected, actual } => write!(
+                f,
+                "the pipe is owned by {actual}, not by {expected} or the Administrators group"
+            ),
+            Self::PipeWritable { account, access } => write!(
+                f,
+                "the pipe lets {account} write to it, add instances or change its security \
+                 (access {access:#010x})"
+            ),
+            Self::PipeUnprotected => {
+                f.write_str("the pipe has no access list, so every account can use or replace it")
+            }
+            Self::PipeSecurityUnreadable(error) => {
+                write!(f, "cannot read the pipe's owner and access list: {error}")
             }
         }
     }
@@ -177,15 +224,48 @@ pub(crate) async fn verify_local_endpoint(
     check_socket_dir(dir, expected, metadata.uid(), metadata.mode())
 }
 
-/// Windows cannot prove the pipe server's account from this crate yet, so a
-/// credential-bearing dial is refused rather than sent unverified.
+/// Prove the pipe `stream` holds is served, owned and kept private by
+/// `owner` before anything is written to it (see [`pipe`]).
 #[cfg(windows)]
 pub(crate) async fn verify_local_endpoint(
-    _stream: &tokio::net::windows::named_pipe::NamedPipeClient,
+    stream: &tokio::net::windows::named_pipe::NamedPipeClient,
     _path: &Path,
-    _owner: EndpointOwner,
+    owner: EndpointOwner,
 ) -> Result<(), EndpointRejection> {
-    Err(EndpointRejection::Unsupported)
+    use std::os::windows::io::AsRawHandle;
+    match owner {
+        EndpointOwner::SameAccount => pipe::verify_pipe_server(
+            &pipe::Win32Pipe::new(stream.as_raw_handle()),
+            expected_account_override(),
+        ),
+        EndpointOwner::Uid(_) => Err(EndpointRejection::Unsupported),
+    }
+}
+
+#[cfg(all(windows, not(test)))]
+fn expected_account_override() -> Option<pipe::Sid> {
+    None
+}
+
+#[cfg(all(windows, test))]
+thread_local! {
+    /// Under test, the account a pipe must be served by instead of this
+    /// process's own, so a real pipe this process serves can stand in for
+    /// one another account serves.
+    static EXPECTED_ACCOUNT: std::cell::RefCell<Option<pipe::Sid>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(all(windows, test))]
+fn expected_account_override() -> Option<pipe::Sid> {
+    EXPECTED_ACCOUNT.with(|expected| expected.borrow().clone())
+}
+
+/// Expect `account` to serve pipes dialed on this thread, until reset with
+/// `None`.
+#[cfg(all(windows, test))]
+pub(crate) fn expect_account_for_test(account: Option<pipe::Sid>) {
+    EXPECTED_ACCOUNT.with(|expected| *expected.borrow_mut() = account);
 }
 
 #[cfg(all(test, unix))]

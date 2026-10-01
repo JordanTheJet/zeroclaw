@@ -1372,19 +1372,67 @@ mod tests {
 
     #[cfg(windows)]
     #[tokio::test]
-    async fn windows_refuses_a_credential_dial_it_cannot_verify() {
+    async fn windows_sends_each_credential_to_a_pipe_this_account_serves() {
         for (n, (kind, options)) in credential_bearing_dials().into_iter().enumerate() {
-            let name = test_pipe_name(&format!("credential-{n}"));
+            let name = test_pipe_name(&format!("own-{n}"));
+            let peer = serve_pipe_once(&name);
+            let client = RpcClient::connect_local(Path::new(&name), options)
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("{kind}: a pipe this account serves verifies: {error}")
+                });
+            assert_eq!(client.handshake().server_version, "test", "{kind}");
+            drop(client);
+            let seen = String::from_utf8(bytes_seen(peer).await).expect("utf-8 frames");
+            assert!(seen.contains("secret"), "{kind}: {seen}");
+        }
+    }
+
+    /// The pipe is served by this process, but the dial expects another
+    /// account: exactly where it would stand facing another user's pipe.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_writes_nothing_to_a_pipe_another_account_serves() {
+        let other = crate::verify::pipe::Sid::new(5, &[21, 1, 2, 3, 1001]);
+        crate::verify::expect_account_for_test(Some(other.clone()));
+        for (n, (kind, options)) in credential_bearing_dials().into_iter().enumerate() {
+            let name = test_pipe_name(&format!("other-{n}"));
             let peer = serve_pipe_once(&name);
             match RpcClient::connect_local(Path::new(&name), options).await {
-                Err(ClientError::UntrustedEndpoint { rejection, .. }) => {
-                    assert_eq!(rejection, EndpointRejection::Unsupported, "{kind}");
-                }
-                Err(other) => panic!("{kind}: expected UntrustedEndpoint, got {other}"),
-                Ok(_) => panic!("{kind}: an unverifiable pipe must not receive a credential"),
+                Err(ClientError::UntrustedEndpoint { rejection, .. }) => match rejection {
+                    EndpointRejection::ServerAccount { expected, .. } => {
+                        assert_eq!(expected, other.to_string(), "{kind}");
+                    }
+                    rejection => panic!("{kind}: expected ServerAccount, got {rejection}"),
+                },
+                Err(error) => panic!("{kind}: expected UntrustedEndpoint, got {error}"),
+                Ok(_) => panic!("{kind}: another account's pipe must not receive a credential"),
             }
-            assert!(bytes_seen(peer).await.is_empty(), "{kind}");
+            assert!(
+                bytes_seen(peer).await.is_empty(),
+                "{kind}: not one byte may reach an unverified pipe"
+            );
         }
+        crate::verify::expect_account_for_test(None);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_refuses_a_uid_owner_with_nothing_written() {
+        let name = test_pipe_name("uid-owner");
+        let peer = serve_pipe_once(&name);
+        let options = ConnectOptions {
+            endpoint_owner: EndpointOwner::Uid(1000),
+            ..with_token()
+        };
+        match RpcClient::connect_local(Path::new(&name), options).await {
+            Err(ClientError::UntrustedEndpoint { rejection, .. }) => {
+                assert_eq!(rejection, EndpointRejection::Unsupported);
+            }
+            Err(error) => panic!("expected UntrustedEndpoint, got {error}"),
+            Ok(_) => panic!("a uid names no Windows account"),
+        }
+        assert!(bytes_seen(peer).await.is_empty());
     }
 
     #[cfg(windows)]
