@@ -13,10 +13,11 @@
 //! which serves the gateway's in-process seam today;
 //! [`RpcClient::connect_local`] dials the daemon endpoint that
 //! [`endpoint::resolve_socket_path`] names, which the separate gateway
-//! process will use, and before it sends a credential there it checks with
-//! the kernel that the expected account serves the endpoint (see
-//! [`verify`]). No public constructor runs the handshake over any other
-//! stream.
+//! process will use, and [`RpcClient::connect_local_endpoints`] also falls
+//! back to the older Windows pipe name that [`endpoint::client_endpoints`]
+//! lists. Before either sends a credential to an endpoint, it checks with the
+//! kernel that the expected account serves it (see [`verify`]). No public
+//! constructor runs the handshake over any other stream.
 
 // Like `apps/zerocode`, this is a standalone RPC client: it must not link
 // `zeroclaw-log`, so it cannot use `::zeroclaw_spawn::spawn!`, and its two

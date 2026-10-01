@@ -164,11 +164,10 @@ fn is_recoverable_accept_error(e: &std::io::Error) -> bool {
     false
 }
 
+/// The endpoint this daemon binds: the shared resolver every client also
+/// uses, so a client that knows the data directory dials the same place.
 pub fn socket_path(config: &Config) -> PathBuf {
-    if let Ok(p) = std::env::var("ZEROCLAW_SOCKET") {
-        return PathBuf::from(p);
-    }
-    platform::default_endpoint(&config.data_dir)
+    zeroclaw_api::rpc_endpoint::resolve_endpoint(&config.data_dir)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1046,10 +1045,6 @@ mod platform {
         }
     }
 
-    pub fn default_endpoint(data_dir: &Path) -> PathBuf {
-        data_dir.join("daemon.sock")
-    }
-
     /// Creates the endpoint directory and tightens it to owner-only access.
     ///
     /// The chmod is best-effort on purpose: a directory this process just
@@ -1205,7 +1200,7 @@ mod platform {
 #[cfg(windows)]
 mod platform {
     use anyhow::{Context, Result};
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
     use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
 
     /// On Windows the "listener" is a single pending server instance. After
@@ -1214,14 +1209,6 @@ mod platform {
     pub type LocalListener = NamedPipeServer;
     pub type LocalStream = NamedPipeServer;
     pub struct EndpointGuard;
-
-    pub fn default_endpoint(data_dir: &Path) -> PathBuf {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-        let mut hasher = DefaultHasher::new();
-        data_dir.hash(&mut hasher);
-        PathBuf::from(format!(r"\\.\pipe\zeroclaw-{:x}", hasher.finish()))
-    }
 
     pub async fn prepare_parent(_path: &Path) -> Result<()> {
         // Named pipes live in the kernel object namespace, not the
@@ -1771,6 +1758,24 @@ mod tests {
 
         drop(listener);
         drop(guard);
+    }
+
+    #[test]
+    fn socket_path_is_the_shared_resolver_for_every_data_dir() {
+        // The daemon binds what every client resolves; the client crates run
+        // the same table against the same resolver.
+        for dir in zeroclaw_api::rpc_endpoint::AGREEMENT_DATA_DIRS {
+            let data_dir = std::path::PathBuf::from(dir);
+            let config = Config {
+                data_dir: data_dir.clone(),
+                ..Config::default()
+            };
+            assert_eq!(
+                socket_path(&config),
+                zeroclaw_api::rpc_endpoint::resolve_endpoint(&data_dir),
+                "{dir}"
+            );
+        }
     }
 
     #[cfg(unix)]
