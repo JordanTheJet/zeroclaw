@@ -22,7 +22,7 @@ zerocode spawns an ephemeral one.
 
 On a local connection, fresh **Chat** and **Code** sessions start in the
 directory you launched zerocode from, so file and shell tools operate on that
-project. A restarted local session does the same. If zerocode cannot read that
+project. A restarted local session does the same. If zerocode cannot determine that
 directory, or its path is not valid UTF-8, the session is not created and the
 reason is shown, rather than silently starting somewhere else.
 

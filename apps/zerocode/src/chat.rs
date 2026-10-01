@@ -2212,6 +2212,7 @@ impl Chat {
                         "zc-chat-error-create-session",
                         &[("error", &error)],
                     ));
+                    self.after_session_start().await;
                     return SessionStartOutcome::Failed(error);
                 }
             }
@@ -21744,6 +21745,89 @@ mod tests {
         if let Ok(Some(raw)) = tokio::time::timeout(Duration::from_millis(100), rx.recv()).await {
             panic!("{reason}, but the client sent {raw}");
         }
+    }
+
+    async fn assert_sibling_capture_refusal_restores_active_session(
+        pane_kind: PaneKind,
+        launch_dir: LaunchDirSource,
+    ) {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let mut chat = local_code_chat_with_session(&rpc, "sess-old", "/selected/project");
+        chat.pane_kind = pane_kind;
+        chat.launch_dir = launch_dir;
+        let capture_error = default_fresh_session_cwd(crate::client::Transport::Local, launch_dir)
+            .expect_err("the fixture must refuse launch capture")
+            .localized();
+        if let ChatPhase::Active(state) = &mut chat.phase {
+            state.input_bar.insert_text("preserved draft");
+            state.turn_in_flight = true;
+        }
+
+        tokio::time::timeout(Duration::from_secs(2), chat.add_agent_session("alpha"))
+            .await
+            .expect("capture refusal must finish without an RPC response");
+        assert_no_rpc_request(
+            &mut rx,
+            "a refused sibling capture must send no RPC request",
+        )
+        .await;
+        assert_eq!(chat.current_session_id(), Some("sess-old"));
+        assert_eq!(chat.current_cwd(), Some("/selected/project"));
+        assert_eq!(chat.tracked_session_count(), 1);
+        assert!(
+            chat.background.is_empty(),
+            "the focused session must be restored"
+        );
+        let ChatPhase::Active(state) = &chat.phase else {
+            panic!("capture refusal must return to the active session");
+        };
+        assert_eq!(state.input_bar.input(), "preserved draft");
+        assert!(
+            state.turn_in_flight,
+            "the running turn must remain in flight"
+        );
+        assert!(
+            state
+                .info_message
+                .as_ref()
+                .is_some_and(|notice| notice.text.contains(&capture_error)),
+            "the capture refusal must be visible as a notice"
+        );
+    }
+
+    #[tokio::test]
+    async fn sibling_start_chat_deleted_launch_directory_restores_active_session() {
+        assert_sibling_capture_refusal_restores_active_session(PaneKind::Chat, removed_launch_dir)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn sibling_start_code_deleted_launch_directory_restores_active_session() {
+        assert_sibling_capture_refusal_restores_active_session(PaneKind::Acp, removed_launch_dir)
+            .await;
+    }
+
+    #[cfg(unix)]
+    fn non_utf8_launch_dir() -> std::io::Result<std::path::PathBuf> {
+        use std::os::unix::ffi::OsStrExt;
+        Ok(std::path::PathBuf::from(std::ffi::OsStr::from_bytes(
+            b"/launch/\xff",
+        )))
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sibling_start_chat_non_utf8_launch_directory_restores_active_session() {
+        assert_sibling_capture_refusal_restores_active_session(PaneKind::Chat, non_utf8_launch_dir)
+            .await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sibling_start_code_non_utf8_launch_directory_restores_active_session() {
+        assert_sibling_capture_refusal_restores_active_session(PaneKind::Acp, non_utf8_launch_dir)
+            .await;
     }
 
     #[tokio::test]
