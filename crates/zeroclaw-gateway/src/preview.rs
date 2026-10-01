@@ -10,6 +10,11 @@
 //! to in-process state or to the dashboard's page fallback. Routes join as
 //! they are ported.
 //!
+//! Every route sits behind the in-process gateway's request limits: a body
+//! of at most [`crate::MAX_BODY_SIZE`] bytes (`413` beyond it) and an answer
+//! within the request timeout (`408` after it), so a slow or oversized
+//! request is bounded here as it is there, shutdown included.
+//!
 //! It is configured from flags and the environment only and never reads
 //! `config.toml`. It runs as the same OS account as the core: every
 //! connection verifies through the kernel that this account serves the
@@ -21,6 +26,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::Json;
 use axum::Router;
@@ -46,7 +52,7 @@ pub const DEFAULT_LISTEN: &str = "127.0.0.1:42617";
 pub const CORE_LINK_PATH: &str = "/api/gateway/core";
 
 /// How long the health probe waits to reach the core's endpoint.
-const HEALTH_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// What to do when the core is down or busy.
 const HINT_START_CORE: &str =
@@ -70,6 +76,9 @@ Options:
   --web-dist DIR        serve the dashboard from DIR (must hold index.html)
   --tls-cert PEM        serve HTTPS with this certificate (needs --tls-key)
   --tls-key PEM         the certificate's private key (needs --tls-cert)
+  --request-timeout SECS
+                        answer 408 to a request not done within SECS
+                        [default: 30, the in-process gateway's default]
   -h, --help            print this help
   -V, --version         print the version
 
@@ -84,6 +93,8 @@ pub struct Bootstrap {
     pub endpoint: PathBuf,
     pub web_dist: Option<PathBuf>,
     pub tls: Option<TlsFiles>,
+    /// How long a request may take before it is answered `408`.
+    pub request_timeout: Duration,
 }
 
 /// The PEM files for serving HTTPS.
@@ -113,6 +124,7 @@ pub fn parse_args(
     let mut web_dist: Option<PathBuf> = None;
     let mut tls_cert: Option<PathBuf> = None;
     let mut tls_key: Option<PathBuf> = None;
+    let mut request_timeout = Duration::from_secs(crate::REQUEST_TIMEOUT_SECS);
     let mut allow_public_bind = false;
 
     let mut args = args.into_iter();
@@ -131,6 +143,17 @@ pub fn parse_args(
             "--web-dist" => web_dist = Some(value("--web-dist")?.into()),
             "--tls-cert" => tls_cert = Some(value("--tls-cert")?.into()),
             "--tls-key" => tls_key = Some(value("--tls-key")?.into()),
+            "--request-timeout" => {
+                let secs = value("--request-timeout")?;
+                request_timeout = secs
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|secs| *secs > 0)
+                    .map(Duration::from_secs)
+                    .ok_or_else(|| {
+                        format!("--request-timeout {secs:?} is not a positive number of seconds")
+                    })?;
+            }
             "--allow-public-bind" => allow_public_bind = true,
             "--config" | "--config-dir" => {
                 return Err(format!(
@@ -177,6 +200,7 @@ pub fn parse_args(
         endpoint,
         web_dist,
         tls,
+        request_timeout,
     }))
 }
 
@@ -529,12 +553,15 @@ struct PreviewState {
 /// probe; `web_dist` holds the built dashboard. `POST /admin/shutdown` sets
 /// `shutdown`, which the caller serving the router stops on. Serve it with
 /// the peer's address (`into_make_service_with_connect_info`), which that
-/// route checks.
+/// route checks. Every route answers `413` to a body over
+/// [`crate::MAX_BODY_SIZE`] and `408` to a request not done within
+/// `request_timeout`, as the in-process gateway's routes do.
 pub fn router(
     core: CoreRpc,
     endpoint: PathBuf,
     web_dist: Option<PathBuf>,
     shutdown: watch::Sender<bool>,
+    request_timeout: Duration,
 ) -> Router {
     let state = PreviewState {
         endpoint: Arc::new(endpoint),
@@ -573,6 +600,13 @@ pub fn router(
     router
         .fallback(fallback)
         .layer(axum::Extension(core))
+        .layer(tower_http::limit::RequestBodyLimitLayer::new(
+            crate::MAX_BODY_SIZE,
+        ))
+        .layer(tower_http::timeout::TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            request_timeout,
+        ))
         .layer(axum::middleware::from_fn(crate::security_headers::apply))
         .with_state(state)
 }
@@ -954,6 +988,7 @@ pub async fn serve(bootstrap: Bootstrap) -> anyhow::Result<()> {
         bootstrap.endpoint.clone(),
         bootstrap.web_dist.clone(),
         shutdown,
+        bootstrap.request_timeout,
     );
     if tls.is_some() {
         app = app.layer(axum::middleware::from_fn(
@@ -978,26 +1013,43 @@ pub async fn serve(bootstrap: Bootstrap) -> anyhow::Result<()> {
             .with_graceful_shutdown(stop_requested(shutdown_requested))
             .await?;
         }
-        Some(acceptor) => serve_tls(listener, acceptor, app, shutdown_requested).await?,
+        Some(acceptor) => {
+            serve_tls(
+                listener,
+                acceptor,
+                app,
+                shutdown_requested,
+                bootstrap.request_timeout,
+            )
+            .await?;
+        }
     }
     Ok(())
 }
 
+/// Serve HTTPS until asked to stop, then let the requests in flight finish
+/// and their answers (the shutdown acknowledgement among them) reach the
+/// caller, as the plain listener does: each connection closes once its
+/// request is answered. A connection that does not finish within
+/// `request_timeout` is dropped, so stopping stays bounded.
 async fn serve_tls(
     listener: tokio::net::TcpListener,
     acceptor: tokio_rustls::TlsAcceptor,
     app: Router,
     shutdown_requested: watch::Receiver<bool>,
+    request_timeout: Duration,
 ) -> anyhow::Result<()> {
     let shutdown = stop_requested(shutdown_requested);
     tokio::pin!(shutdown);
+    let connections = hyper_util::server::graceful::GracefulShutdown::new();
     loop {
         let (tcp, peer) = tokio::select! {
             accepted = listener.accept() => accepted?,
-            () = &mut shutdown => return Ok(()),
+            () = &mut shutdown => break,
         };
         let acceptor = acceptor.clone();
         let app = app.clone();
+        let watcher = connections.watcher();
         zeroclaw_spawn::spawn!(async move {
             let Ok(stream) = acceptor.accept(tcp).await else {
                 return;
@@ -1006,12 +1058,15 @@ async fn serve_tls(
                 request.extensions_mut().insert(ConnectInfo(peer));
                 tower::ServiceExt::oneshot(app.clone(), request)
             });
-            let _ =
-                hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
-                    .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
-                    .await;
+            let builder =
+                hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
+            let _ = watcher
+                .watch(builder.serve_connection(hyper_util::rt::TokioIo::new(stream), service))
+                .await;
         });
     }
+    let _ = tokio::time::timeout(request_timeout, connections.shutdown()).await;
+    Ok(())
 }
 
 /// Resolves when this process should stop: on a signal, or once

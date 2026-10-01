@@ -376,8 +376,8 @@ impl rustls::client::danger::ServerCertVerifier for AnyServer {
     }
 }
 
-/// An HTTPS POST to the TLS listener at `address`.
-async fn post_tls(address: &str, path: &str, body: &str) -> (u16, Value) {
+/// A TLS connection to the listener at `address`.
+async fn connect_tls(address: &str) -> tokio_rustls::client::TlsStream<tokio::net::TcpStream> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let config = rustls::ClientConfig::builder_with_provider(Arc::clone(&provider))
         .with_safe_default_protocol_versions()
@@ -388,14 +388,196 @@ async fn post_tls(address: &str, path: &str, body: &str) -> (u16, Value) {
     let tcp = tokio::net::TcpStream::connect(address)
         .await
         .expect("connect to zeroclaw-gw");
-    let stream = tokio_rustls::TlsConnector::from(Arc::new(config))
+    tokio_rustls::TlsConnector::from(Arc::new(config))
         .connect(
             rustls::pki_types::ServerName::try_from("localhost").expect("a name"),
             tcp,
         )
         .await
-        .expect("TLS handshake");
-    post_on(stream, address, path, body).await
+        .expect("TLS handshake")
+}
+
+/// An HTTPS POST to the TLS listener at `address`.
+async fn post_tls(address: &str, path: &str, body: &str) -> (u16, Value) {
+    post_on(connect_tls(address).await, address, path, body).await
+}
+
+/// The in-process gateway as the daemon serves it (`run_gateway`, every
+/// route and its middleware), with no core: its hook and shutdown routes
+/// need none.
+struct InProcess {
+    addr: std::net::SocketAddr,
+    server: tokio::task::JoinHandle<anyhow::Result<()>>,
+    _root: tempfile::TempDir,
+}
+
+impl InProcess {
+    async fn start(request_timeout_secs: u64) -> Self {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = zeroclaw_config::schema::Config {
+            data_dir: root.path().to_path_buf(),
+            config_path: root.path().join("config.toml"),
+            ..Default::default()
+        };
+        config.gateway.require_pairing = false;
+        config.gateway.request_timeout_secs = request_timeout_secs;
+        config.memory.backend = "none".into();
+        let probe = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let (reload_tx, _) = tokio::sync::watch::channel(false);
+        let controls = zeroclaw_runtime::daemon::GatewayReloadControls {
+            shutdown_tx,
+            reload_tx,
+            inproc: None,
+        };
+        let (ready_tx, mut ready_rx) = tokio::sync::watch::channel(None);
+        let readiness = zeroclaw_runtime::daemon::GatewayReadinessReporter::new(move |addr| {
+            let _ = ready_tx.send(Some(addr));
+        });
+        let server = zeroclaw_spawn::spawn!(async move {
+            zeroclaw_gateway::run_gateway(
+                "127.0.0.1",
+                port,
+                config,
+                None,
+                Some(controls),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(readiness),
+            )
+            .await
+        });
+        let addr = tokio::time::timeout(WAIT, async {
+            ready_rx.wait_for(Option::is_some).await.expect("readiness");
+            ready_rx.borrow().expect("the bound address")
+        })
+        .await
+        .expect("the in-process gateway serves");
+        Self {
+            addr,
+            server,
+            _root: root,
+        }
+    }
+}
+
+/// A hook request on `address` that declares a 100-byte body and sends only
+/// `{`, left open.
+async fn stalled_hook(address: &str) -> tokio::net::TcpStream {
+    let mut stream = tokio::net::TcpStream::connect(address)
+        .await
+        .expect("connect");
+    stream
+        .write_all(
+            format!(
+                "POST /hooks/claude-code HTTP/1.1\r\nHost: {address}\r\n\
+                 Content-Type: application/json\r\nContent-Length: 100\r\n\r\n{{"
+            )
+            .as_bytes(),
+        )
+        .await
+        .expect("send");
+    stream
+}
+
+/// The status the server answers on `stream`.
+async fn status_of(stream: tokio::net::TcpStream) -> u16 {
+    let mut line = String::new();
+    tokio::time::timeout(WAIT, BufReader::new(stream).read_line(&mut line))
+        .await
+        .expect("an answer in time")
+        .expect("read the status line");
+    line.split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse().ok())
+        .unwrap_or_else(|| panic!("a status line: {line:?}"))
+}
+
+/// Both gateways answer an oversized body `413` and a request that stalls
+/// `408` after their timeout, and a shutdown requested while a hook request
+/// stalls stops the process within that bound, not when the caller lets go.
+#[tokio::test]
+async fn the_request_limits_match_the_in_process_gateway() {
+    const TIMEOUT_SECS: u64 = 2;
+    let in_process = InProcess::start(TIMEOUT_SECS).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let core = Core::serve(Core::context(tmp.path())).await;
+    let gateway = Gateway::spawn(
+        &core.endpoint,
+        &["--request-timeout", &TIMEOUT_SECS.to_string()],
+    )
+    .await;
+    let in_process_address = in_process.addr.to_string();
+
+    let oversized = format!(
+        r#"{{"session_id":"s1","event_type":"tool_use","summary":"{}"}}"#,
+        "x".repeat(70_000)
+    );
+    for path in ["/hooks/claude-code", "/admin/shutdown"] {
+        let served = post(&gateway.address, path, &oversized).await;
+        let reference = post(&in_process_address, path, &oversized).await;
+        assert_eq!(served, reference, "{path}");
+        assert_eq!(served.0, 413, "{path}: {:?}", served.1);
+    }
+    // The oversized shutdown stopped neither.
+    assert_eq!(
+        get(&gateway.address, "/health", None).await.0,
+        200,
+        "zeroclaw-gw keeps serving"
+    );
+    assert!(
+        !in_process.server.is_finished(),
+        "the in-process gateway keeps serving"
+    );
+
+    for address in [&gateway.address, &in_process_address] {
+        let started = std::time::Instant::now();
+        assert_eq!(
+            status_of(stalled_hook(address).await).await,
+            408,
+            "{address}"
+        );
+        let took = started.elapsed();
+        assert!(
+            took >= Duration::from_secs(TIMEOUT_SECS)
+                && took < Duration::from_secs(TIMEOUT_SECS + 5),
+            "{address}: answered after {took:?}"
+        );
+    }
+
+    // A stalled hook request stays open while shutdown is asked for: each
+    // process still stops within its request timeout.
+    let pending = stalled_hook(&gateway.address).await;
+    let (status, _) = post(&gateway.address, "/admin/shutdown", "").await;
+    assert_eq!(status, 200);
+    let started = std::time::Instant::now();
+    let exit = gateway.exits().await;
+    assert!(exit.success(), "zeroclaw-gw exited with {exit:?}");
+    assert!(
+        started.elapsed() < Duration::from_secs(TIMEOUT_SECS + 5),
+        "zeroclaw-gw stopped after {:?}",
+        started.elapsed()
+    );
+    drop(pending);
+
+    let pending = stalled_hook(&in_process_address).await;
+    let (status, _) = post(&in_process_address, "/admin/shutdown", "").await;
+    assert_eq!(status, 200);
+    let stopped =
+        tokio::time::timeout(Duration::from_secs(TIMEOUT_SECS + 5), in_process.server).await;
+    assert!(
+        stopped.is_ok(),
+        "the in-process gateway stops within its timeout"
+    );
+    drop(pending);
+
+    core.stop().await;
 }
 
 #[tokio::test]
@@ -431,6 +613,8 @@ async fn with_tls_flags_it_serves_https() {
             cert_path.to_str().unwrap(),
             "--tls-key",
             key_path.to_str().unwrap(),
+            "--request-timeout",
+            "2",
         ],
     )
     .await;
@@ -450,12 +634,34 @@ async fn with_tls_flags_it_serves_https() {
     );
 
     // Over TLS the routes see the caller's address too: the hook answers,
-    // and a shutdown from loopback stops the process.
+    // and a shutdown from loopback stops the process. A hook request left
+    // stalled over TLS neither keeps it running past the request timeout
+    // nor cuts off the shutdown's own answer.
     let (status, ack) = post_tls(&gateway.address, "/hooks/claude-code", HOOK_EVENT).await;
     assert_eq!(status, 200, "{ack}");
+    let mut pending = connect_tls(&gateway.address).await;
+    pending
+        .write_all(
+            b"POST /hooks/claude-code HTTP/1.1\r\nHost: localhost\r\n\
+              Content-Type: application/json\r\nContent-Length: 100\r\n\r\n{",
+        )
+        .await
+        .expect("send");
+    pending.flush().await.expect("flush");
     let (status, stopping) = post_tls(&gateway.address, "/admin/shutdown", "").await;
     assert_eq!(status, 200, "{stopping}");
+    assert_eq!(
+        stopping,
+        serde_json::json!({ "success": true, "message": "Gateway shutdown initiated" })
+    );
+    let started = std::time::Instant::now();
     let exit = gateway.exits().await;
     assert!(exit.success(), "zeroclaw-gw exited with {exit:?}");
+    assert!(
+        started.elapsed() < Duration::from_secs(2 + 5),
+        "zeroclaw-gw stopped after {:?}",
+        started.elapsed()
+    );
+    drop(pending);
     core.stop().await;
 }
