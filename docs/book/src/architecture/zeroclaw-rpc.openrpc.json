@@ -1,6 +1,87 @@
 {
   "components": {
     "schemas": {
+      "AgentDeleteParams": {
+        "properties": {
+          "alias": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "alias"
+        ],
+        "type": "object"
+      },
+      "AgentDeletePreviewResult": {
+        "properties": {
+          "alias": {
+            "type": "string"
+          },
+          "allowed": {
+            "type": "boolean"
+          },
+          "blockers": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "owned_state": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "scrubs": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "alias",
+          "allowed",
+          "blockers",
+          "scrubs",
+          "owned_state"
+        ],
+        "type": "object"
+      },
+      "AgentDeleteResult": {
+        "properties": {
+          "alias": {
+            "type": "string"
+          },
+          "deleted": {
+            "type": "boolean"
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "scrubbed": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "warnings": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "alias",
+          "deleted",
+          "scrubbed",
+          "warnings"
+        ],
+        "type": "object"
+      },
       "AgentEntry": {
         "properties": {
           "alias": {
@@ -491,6 +572,12 @@
           "renamed": {
             "type": "boolean"
           },
+          "rewritten": {
+            "default": 0,
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
           "to": {
             "type": "string"
           },
@@ -693,6 +780,12 @@
       "ConfigSetParams": {
         "description": "Value is polymorphic: a JSON string passes through as-is (backward\ncompat); any other JSON type is coerced via `coerce_for_set_prop`.",
         "properties": {
+          "comment": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "prop": {
             "type": "string"
           },
@@ -5434,6 +5527,16 @@
           "name": "value",
           "required": true,
           "schema": true
+        },
+        {
+          "name": "comment",
+          "required": false,
+          "schema": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
         }
       ],
       "result": {
@@ -5817,6 +5920,64 @@
       },
       "x-zeroclaw-params": {
         "shape": "none"
+      }
+    },
+    {
+      "name": "agents/delete-preview",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "alias",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/AgentDeletePreviewResult"
+        },
+        "x-zeroclaw-shape": "typed"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "agents",
+        "verb": "read"
+      },
+      "x-zeroclaw-params": {
+        "shape": "typed",
+        "type": "AgentDeleteParams"
+      }
+    },
+    {
+      "name": "agents/delete",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "alias",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/AgentDeleteResult"
+        },
+        "x-zeroclaw-shape": "typed"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "agents",
+        "verb": "delete"
+      },
+      "x-zeroclaw-params": {
+        "shape": "typed",
+        "type": "AgentDeleteParams"
       }
     },
     {
