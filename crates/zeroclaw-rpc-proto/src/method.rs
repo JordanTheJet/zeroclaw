@@ -73,6 +73,8 @@ pub enum Method {
     // Agents
     AgentsList,
     AgentsStatus,
+    AgentDeletePreview,
+    AgentDelete,
 
     // Cost
     CostQuery,
@@ -206,6 +208,8 @@ impl Method {
         // Agents
         (Method::AgentsList, "agents/list"),
         (Method::AgentsStatus, "agents/status"),
+        (Method::AgentDeletePreview, "agents/delete-preview"),
+        (Method::AgentDelete, "agents/delete"),
         // Cost
         (Method::CostQuery, "cost/query"),
         (Method::CostOrg, "cost/org"),
@@ -380,6 +384,11 @@ impl Method {
             // Agents and cost
             M::AgentsList => (None, Typed("AgentsListResult")),
             M::AgentsStatus => (None, Typed("AgentsStatusResult")),
+            M::AgentDeletePreview => (
+                Typed("AgentDeleteParams"),
+                Typed("AgentDeletePreviewResult"),
+            ),
+            M::AgentDelete => (Typed("AgentDeleteParams"), Typed("AgentDeleteResult")),
             M::CostQuery => (Typed("CostQueryParams"), Typed("CostSummary")),
             M::CostOrg => (None, Untyped),
 
