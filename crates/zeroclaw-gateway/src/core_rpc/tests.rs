@@ -1070,6 +1070,87 @@ async fn a_waiter_takes_the_capacity_a_request_lets_go_of() {
     assert_eq!(pool_of(&core).open_connections(), 1);
 }
 
+type ReserveFuture = Pin<Box<dyn Future<Output = Result<OwnedSemaphorePermit, CoreError>> + Send>>;
+
+/// A waker that polls the future it wakes on the spot, inside the waking
+/// call. A waiter on another runtime worker can run at exactly that moment;
+/// a current-thread test cannot otherwise reach it.
+struct EagerWaiter {
+    future: Mutex<Option<ReserveFuture>>,
+    outcome: Mutex<Option<Result<OwnedSemaphorePermit, CoreError>>>,
+    polls: AtomicUsize,
+}
+
+impl EagerWaiter {
+    fn poll_now(self: &Arc<Self>) {
+        let waker = std::task::Waker::from(Arc::clone(self));
+        let mut cx = std::task::Context::from_waker(&waker);
+        let mut future = lock(&self.future);
+        if let Some(pending) = future.as_mut() {
+            self.polls.fetch_add(1, Ordering::SeqCst);
+            if let std::task::Poll::Ready(outcome) = pending.as_mut().poll(&mut cx) {
+                *future = None;
+                *lock(&self.outcome) = Some(outcome);
+            }
+        }
+    }
+}
+
+impl std::task::Wake for EagerWaiter {
+    fn wake(self: Arc<Self>) {
+        self.poll_now();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.poll_now();
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_waiter_woken_by_a_release_finds_the_connection_evictable() {
+    let fake = FakeCore::accepting(&["zc_a", "zc_b"]);
+    let limits = PoolLimits {
+        max_credentials: 1,
+        capacity_wait: Duration::from_millis(200),
+        ..PoolLimits::default()
+    };
+    let core = core_over(&fake, true, limits);
+    let a = call_for(&core, "zc_a").await;
+    connection_of(&a).await;
+
+    let pool = pool_of(&core);
+    let b_key = HttpCredential {
+        provider: NATIVE_PROVIDER,
+        token: "zc_b",
+    }
+    .key();
+    let waiter = Arc::new(EagerWaiter {
+        future: Mutex::new(Some(Box::pin(async move { pool.reserve(&b_key).await }))),
+        outcome: Mutex::new(None),
+        polls: AtomicUsize::new(0),
+    });
+    waiter.poll_now();
+    assert!(
+        lock(&waiter.outcome).is_none(),
+        "a still holds the capacity"
+    );
+
+    // Dropping a's request wakes the waiter, which re-checks at once. By
+    // then a's hold on the connection must already be gone.
+    let polls = waiter.polls.load(Ordering::SeqCst);
+    drop(a);
+    assert!(
+        waiter.polls.load(Ordering::SeqCst) > polls,
+        "the release woke the waiter"
+    );
+    tokio::time::advance(Duration::from_millis(201)).await;
+    let outcome = lock(&waiter.outcome).take();
+    assert!(
+        matches!(outcome, Some(Ok(_))),
+        "an idle connection existed before the deadline, but reserve answered {outcome:?}"
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_dial_in_progress_holds_capacity() {
     let limits = PoolLimits {

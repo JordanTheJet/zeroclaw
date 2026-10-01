@@ -565,6 +565,7 @@ impl Pool {
             key,
             slot,
             pooled,
+            _lease_released: LeaseReleased(Arc::clone(self)),
         }
     }
 
@@ -695,13 +696,19 @@ pub struct CoreCall {
     key: PoolKey,
     slot: Arc<Slot>,
     pooled: Arc<PooledClient>,
+    /// Must stay the last field. Fields drop in declaration order, so by the
+    /// time this wakes the waiters, `pooled` above has already released the
+    /// request's hold on the connection and they find it evictable.
+    _lease_released: LeaseReleased,
 }
 
-impl Drop for CoreCall {
+/// Wakes requests waiting for capacity when a request lets go of its
+/// connection, which may have left that connection idle and evictable.
+struct LeaseReleased(Arc<Pool>);
+
+impl Drop for LeaseReleased {
     fn drop(&mut self) {
-        // This connection may now be idle and evictable; a request waiting
-        // for capacity rechecks.
-        self.pool.lease_released.notify_waiters();
+        self.0.lease_released.notify_waiters();
     }
 }
 
