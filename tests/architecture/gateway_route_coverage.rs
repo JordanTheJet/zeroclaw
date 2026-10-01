@@ -7,16 +7,29 @@
 //! gateway crate's source. It is parsed from `lib.rs` down its module tree,
 //! leaving out code that exists only in test builds. Every router call that
 //! registers something (`.route`, `.route_service`, a router's `.fallback`,
-//! `.nest`, `.merge`) must resolve completely: its path to a literal, a string
-//! constant wherever in the workspace it is declared, or a `format!` over
-//! those, and its method router to Axum's method-router constructors. A
-//! registration the scan cannot resolve fails the gate instead of dropping
-//! out of the inventory. The gate also fails when
+//! `.nest`, `.merge`) must resolve completely, or the gate fails naming it:
+//! - its path to a literal, a string constant wherever in the workspace it
+//!   is declared, a `format!` over those, or a runtime value that
+//!   [`RUNTIME_VALUES`] lists for the function using it;
+//! - its method router to Axum's method-router constructors, identified by
+//!   where their names are imported from, not by spelling;
+//! - a merged or nested router to `Router::new()`, a gateway function, or
+//!   local `let` bindings of those.
+//!
+//! A name bound twice in one module, a module declared twice, and a module
+//! whose file a `cfg_attr` chooses are refused, not guessed. The gate also
+//! fails when
 //! - the gateway registers a route [`ROUTES`] does not classify,
 //! - [`ROUTES`] classifies a route the gateway no longer registers,
 //! - an `Rpc` entry names a method missing from the runtime's own
 //!   `Method::ALL`, or
 //! - the coverage document's route table or counts differ from [`ROUTES`].
+//!
+//! Threat model: this is a tripwire for ordinary changes to the gateway's
+//! router, not a defence against code written to get past it. It reads
+//! registrations the way gateway code writes them and refuses what it cannot
+//! resolve, but it does not expand macros, run build scripts, or follow a
+//! value through anything but a `let` in the same function.
 //!
 //! A route whose core method exists only in an open pull request stays
 //! `Deferred` until that method is on master.
@@ -266,6 +279,15 @@ const MOUNTS: &[(&str, &str)] = &[(
     "the whole router, under the configured gateway.path_prefix",
 )];
 
+/// The variables a route path may take a runtime value from, as `(file,
+/// function, variable)`: the path is written `<variable>`. A path built from
+/// any other name the scan cannot resolve fails the gate.
+const RUNTIME_VALUES: &[(&str, &str, &str)] = &[(
+    "crates/zeroclaw-gateway/src/lib.rs",
+    "run_gateway_with_plugin_webhooks",
+    "prefix",
+)];
+
 const GATEWAY_CRATE: &str = "zeroclaw_gateway";
 const COVERAGE_DOC: &str = "docs/book/src/architecture/gateway-ipc-coverage.md";
 
@@ -395,6 +417,19 @@ fn test_only(attrs: &[Attribute]) -> bool {
         .any(|attr| attr.parse_args::<Meta>().ok().as_ref().and_then(cfg_value) == Some(false))
 }
 
+/// Whether a `#[cfg_attr(..)]` among these attributes sets the module's
+/// file, so which file is built depends on the configuration.
+fn conditional_path(attrs: &[Attribute]) -> bool {
+    attrs.iter().any(|attr| match &attr.meta {
+        Meta::List(list) if list.path.is_ident("cfg_attr") => list
+            .tokens
+            .clone()
+            .into_iter()
+            .any(|token| matches!(token, TokenTree::Ident(ident) if ident == "path")),
+        _ => false,
+    })
+}
+
 fn item_attrs(item: &Item) -> &[Attribute] {
     match item {
         Item::Const(item) => &item.attrs,
@@ -489,13 +524,18 @@ fn flatten_use(
     }
 }
 
-/// A module's string constants and imports, including those inside its
-/// functions, but not its child modules' or its test-only code's.
+fn idents(path: &syn::Path) -> Vec<String> {
+    path.segments.iter().map(|s| s.ident.to_string()).collect()
+}
+
+/// A module's string constants, imports and functions, including those
+/// inside its functions, but not its child modules' or its test-only code's.
 #[derive(Default)]
 struct Names {
-    consts: HashMap<String, String>,
+    consts: Vec<(String, String)>,
     uses: Vec<(String, Vec<String>)>,
     globs: Vec<Vec<String>>,
+    fns: BTreeSet<String>,
 }
 
 impl<'ast> Visit<'ast> for Names {
@@ -510,11 +550,15 @@ impl<'ast> Visit<'ast> for Names {
                     ..
                 }) = &*item.expr
                 {
-                    self.consts.insert(item.ident.to_string(), value.value());
+                    self.consts.push((item.ident.to_string(), value.value()));
                 }
             }
             Item::Use(item) if item.leading_colon.is_none() => {
                 flatten_use(&item.tree, Vec::new(), &mut self.uses, &mut self.globs);
+            }
+            Item::Fn(function) => {
+                self.fns.insert(function.sig.ident.to_string());
+                visit::visit_item(self, item);
             }
             _ => visit::visit_item(self, item),
         }
@@ -542,24 +586,33 @@ struct Module {
     /// The directory its `mod name;` children's files are in.
     dir: PathBuf,
     items: Vec<Item>,
-    /// Its child modules outside test-only code.
+    /// Its child modules outside test-only code, each named once.
     children: Vec<String>,
     consts: HashMap<String, String>,
     /// What its `use` items import, by name, as paths from a crate's root.
     uses: HashMap<String, Vec<String>>,
     /// The modules its `use path::*` items import from.
     globs: Vec<Vec<String>>,
+    /// The functions it declares, at any depth.
+    fns: BTreeSet<String>,
+    /// Names bound to more than one thing anywhere in the module: constants
+    /// with different values, imports of different items, or a constant and
+    /// an import. Code in the module could mean either, so the scan resolves
+    /// neither.
+    ambiguous: BTreeSet<String>,
 }
 
 impl Module {
     fn new(krate: &str, path: Vec<String>, file: PathBuf, dir: PathBuf, items: Vec<Item>) -> Self {
-        let children = items
-            .iter()
-            .filter_map(|item| match item {
-                Item::Mod(module) if !test_only(&module.attrs) => Some(module.ident.to_string()),
-                _ => None,
-            })
-            .collect();
+        let mut children: Vec<String> = Vec::new();
+        for item in &items {
+            if let Item::Mod(module) = item
+                && !test_only(&module.attrs)
+                && !children.iter().any(|child| module.ident == child)
+            {
+                children.push(module.ident.to_string());
+            }
+        }
         let mut names = Names::default();
         for item in &items {
             names.visit_item(item);
@@ -571,15 +624,38 @@ impl Module {
             dir,
             items,
             children,
-            consts: names.consts,
+            consts: HashMap::new(),
             uses: HashMap::new(),
             globs: Vec::new(),
+            fns: names.fns,
+            ambiguous: BTreeSet::new(),
         };
-        module.uses = names
-            .uses
-            .into_iter()
-            .map(|(name, path)| (name, module.absolute(&path)))
-            .collect();
+        let mut consts: HashMap<String, BTreeSet<String>> = HashMap::new();
+        for (name, value) in names.consts {
+            consts.entry(name).or_default().insert(value);
+        }
+        let mut uses: HashMap<String, BTreeSet<Vec<String>>> = HashMap::new();
+        for (name, path) in names.uses {
+            uses.entry(name).or_default().insert(module.absolute(&path));
+        }
+        for (name, values) in consts {
+            if values.len() == 1 && !uses.contains_key(&name) {
+                module
+                    .consts
+                    .insert(name, values.into_iter().next().expect("one value"));
+            } else {
+                module.ambiguous.insert(name);
+            }
+        }
+        for (name, targets) in uses {
+            if targets.len() == 1 && !module.ambiguous.contains(&name) {
+                module
+                    .uses
+                    .insert(name, targets.into_iter().next().expect("one target"));
+            } else {
+                module.ambiguous.insert(name);
+            }
+        }
         module.globs = names
             .globs
             .iter()
@@ -588,11 +664,31 @@ impl Module {
         module
     }
 
-    fn child(&self, name: &str) -> Option<&ItemMod> {
-        self.items.iter().find_map(|item| match item {
-            Item::Mod(module) if module.ident == name && !test_only(&module.attrs) => Some(module),
-            _ => None,
-        })
+    /// The one declaration of the child module `name` that a production
+    /// build compiles. Two such declarations, or a file chosen by
+    /// `cfg_attr`, leave the module's content to the build configuration, so
+    /// the scan refuses them rather than read one.
+    fn child(&self, name: &str) -> Result<&ItemMod, String> {
+        let declarations: Vec<&ItemMod> = self
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Mod(module) if module.ident == name && !test_only(&module.attrs) => {
+                    Some(module)
+                }
+                _ => None,
+            })
+            .collect();
+        match declarations.as_slice() {
+            [] => Err(format!("{} has no module {name}", self.krate)),
+            [declaration] if conditional_path(&declaration.attrs) => Err(format!(
+                "module `{name}` takes its file from a `cfg_attr` path"
+            )),
+            [declaration] => Ok(declaration),
+            _ => Err(format!(
+                "module `{name}` is declared more than once under different conditions"
+            )),
+        }
     }
 
     /// A path written in this module, as a path from its crate's root: the
@@ -659,7 +755,8 @@ impl Workspace {
     }
 
     /// The module at `path` in the workspace crate `krate`, unless the crate
-    /// is not in the workspace or the module exists only in test builds.
+    /// is not in the workspace, the module exists only in test builds, or
+    /// which source is the module depends on the build configuration.
     fn module(&self, krate: &str, path: &[String]) -> Result<Rc<Module>, String> {
         let key = (krate.to_owned(), path.to_vec());
         if let Some(cached) = self.modules.borrow().get(&key) {
@@ -688,7 +785,7 @@ impl Workspace {
         let parent = self.module(krate, parent_path)?;
         let declaration = parent
             .child(name)
-            .ok_or_else(|| format!("{krate} has no module {}", path.join("::")))?;
+            .map_err(|why| format!("{}: {why}", self.sources.display(&parent.file)))?;
         if let Some((_, items)) = &declaration.content {
             let dir = parent.dir.join(name);
             return Ok(Module::new(
@@ -764,6 +861,9 @@ impl Workspace {
 
     /// The string constant `name` as code inside `module` sees it.
     fn lookup(&self, module: &Module, name: &str, depth: usize) -> Option<String> {
+        if module.ambiguous.contains(name) {
+            return None;
+        }
         if let Some(value) = module.consts.get(name) {
             return Some(value.clone());
         }
@@ -776,6 +876,28 @@ impl Workspace {
             self.constant(&target, depth + 1)
         })
     }
+
+    /// The path `name` is imported from in `module`, directly or through a
+    /// glob import, as a path from a crate's root.
+    fn import(&self, module: &Module, name: &str, depth: usize) -> Option<Vec<String>> {
+        if depth > 16 || module.ambiguous.contains(name) {
+            return None;
+        }
+        if let Some(target) = module.uses.get(name) {
+            return Some(target.clone());
+        }
+        if module.fns.contains(name) {
+            return None;
+        }
+        module.globs.iter().find_map(|glob| {
+            if glob.as_slice() == ["axum", "routing"] {
+                return Some(vec!["axum".into(), "routing".into(), name.to_owned()]);
+            }
+            let (krate, path) = glob.split_first()?;
+            let from = self.module(krate, path).ok()?;
+            self.import(&from, name, depth + 1)
+        })
+    }
 }
 
 /// What the scan found in the gateway's source.
@@ -785,18 +907,25 @@ struct Scan {
     routes: BTreeSet<(String, String)>,
     /// The paths routers are nested under.
     mounts: BTreeSet<String>,
+    /// The `(file, function, variable)` runtime values route paths use.
+    runtime_values: BTreeSet<(String, String, String)>,
     /// Router calls the scan could not resolve, with where they are.
     unresolved: Vec<String>,
 }
 
-fn scan(sources: Sources) -> Scan {
+fn scan(sources: Sources, runtime_values: &[(&str, &str, &str)]) -> Scan {
     let workspace = Workspace::new(sources);
     let mut scan = Scan::default();
-    scan_module(&workspace, &[], &mut scan);
+    scan_module(&workspace, &[], runtime_values, &mut scan);
     scan
 }
 
-fn scan_module(workspace: &Workspace, path: &[String], scan: &mut Scan) {
+fn scan_module(
+    workspace: &Workspace,
+    path: &[String],
+    runtime_values: &[(&str, &str, &str)],
+    scan: &mut Scan,
+) {
     let module = match workspace.module(GATEWAY_CRATE, path) {
         Ok(module) => module,
         Err(error) => {
@@ -807,7 +936,9 @@ fn scan_module(workspace: &Workspace, path: &[String], scan: &mut Scan) {
     let mut registrations = Registrations {
         workspace,
         module: &module,
+        runtime_values,
         scan,
+        functions: Vec::new(),
     };
     for item in &module.items {
         registrations.visit_item(item);
@@ -815,33 +946,8 @@ fn scan_module(workspace: &Workspace, path: &[String], scan: &mut Scan) {
     for child in &module.children {
         let mut child_path = path.to_vec();
         child_path.push(child.clone());
-        scan_module(workspace, &child_path, scan);
+        scan_module(workspace, &child_path, runtime_values, scan);
     }
-}
-
-/// The name of the Axum method-router constructor that `func` names (`get`,
-/// `on`, `any_service`, ..), bare or through `routing::` or `axum::routing::`.
-fn method_router_constructor(func: &Expr) -> Option<String> {
-    let Expr::Path(path) = func else {
-        return None;
-    };
-    let segments: Vec<String> = path
-        .path
-        .segments
-        .iter()
-        .map(|s| s.ident.to_string())
-        .collect();
-    let (name, prefix) = segments.split_last()?;
-    let routing = matches!(
-        prefix
-            .iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>()
-            .as_slice(),
-        [] | ["routing"] | ["axum", "routing"]
-    );
-    let known = http_method(name).is_some() || name == "on" || name == "on_service";
-    (routing && known).then(|| name.clone())
 }
 
 fn http_method(call: &str) -> Option<&'static str> {
@@ -852,45 +958,8 @@ fn http_method(call: &str) -> Option<&'static str> {
         .map(|(_, method)| *method)
 }
 
-/// Whether `expr` is a method-router chain: one that starts at an Axum
-/// method-router constructor.
-fn is_method_router(expr: &Expr) -> bool {
-    match expr {
-        Expr::MethodCall(call) => is_method_router(&call.receiver),
-        Expr::Call(call) => method_router_constructor(&call.func).is_some(),
-        Expr::Paren(expr) => is_method_router(&expr.expr),
-        _ => false,
-    }
-}
-
-/// The HTTP methods a method router accepts.
-fn method_router(expr: &Expr) -> Result<BTreeSet<&'static str>, String> {
-    match expr {
-        Expr::Paren(expr) => method_router(&expr.expr),
-        Expr::Call(call) => match method_router_constructor(&call.func) {
-            Some(name) if name == "on" || name == "on_service" => method_filter(call.args.first()),
-            Some(name) => Ok(http_method(&name).into_iter().collect()),
-            None => Err("a method router the scan cannot read".to_owned()),
-        },
-        Expr::MethodCall(call) => {
-            let mut methods = method_router(&call.receiver)?;
-            match call.method.to_string().as_str() {
-                wrapper if METHOD_ROUTER_WRAPPERS.contains(&wrapper) => {}
-                "fallback" | "fallback_service" => {
-                    methods.insert("ANY");
-                }
-                "on" | "on_service" => methods.extend(method_filter(call.args.first())?),
-                name => match http_method(name) {
-                    Some(method) => {
-                        methods.insert(method);
-                    }
-                    None => return Err(format!("the method-router call `.{name}(..)`")),
-                },
-            }
-            Ok(methods)
-        }
-        _ => Err("a method router the scan cannot read".to_owned()),
-    }
+fn is_constructor(name: &str) -> bool {
+    http_method(name).is_some() || name == "on" || name == "on_service"
 }
 
 /// The HTTP methods a `MethodFilter` expression names.
@@ -920,6 +989,7 @@ fn chain_root(expr: &Expr) -> &Expr {
         Expr::MethodCall(call) => chain_root(&call.receiver),
         Expr::Call(call) => chain_root(&call.func),
         Expr::Paren(expr) => chain_root(&expr.expr),
+        Expr::Reference(expr) => chain_root(&expr.expr),
         _ => expr,
     }
 }
@@ -938,11 +1008,49 @@ fn calls_registration(tokens: TokenStream) -> bool {
     })
 }
 
+/// The `let` bindings in a function body, by the name each binds, leaving
+/// out test-only statements and the items nested in the body.
+#[derive(Default)]
+struct Lets(HashMap<String, Vec<Expr>>);
+
+impl<'ast> Visit<'ast> for Lets {
+    fn visit_item(&mut self, _: &'ast Item) {}
+
+    fn visit_stmt(&mut self, stmt: &'ast Stmt) {
+        if !test_only(stmt_attrs(stmt)) {
+            visit::visit_stmt(self, stmt);
+        }
+    }
+
+    fn visit_local(&mut self, local: &'ast syn::Local) {
+        let mut pattern: &syn::Pat = &local.pat;
+        if let syn::Pat::Type(typed) = pattern {
+            pattern = &typed.pat;
+        }
+        if let (syn::Pat::Ident(name), Some(init)) = (pattern, &local.init) {
+            self.0
+                .entry(name.ident.to_string())
+                .or_default()
+                .push((*init.expr).clone());
+        }
+        visit::visit_local(self, local);
+    }
+}
+
+/// A function the scan is inside, with its `let` bindings.
+struct Function {
+    name: String,
+    lets: HashMap<String, Vec<Expr>>,
+}
+
 /// Records the router calls in one gateway module.
 struct Registrations<'a> {
     workspace: &'a Workspace,
     module: &'a Module,
+    runtime_values: &'a [(&'a str, &'a str, &'a str)],
     scan: &'a mut Scan,
+    /// The functions being visited, innermost last.
+    functions: Vec<Function>,
 }
 
 impl Registrations<'_> {
@@ -952,8 +1060,82 @@ impl Registrations<'_> {
         self.scan.unresolved.push(format!("{file}:{line}: {what}"));
     }
 
+    fn enter(&mut self, name: &syn::Ident, body: &syn::Block) {
+        let mut lets = Lets::default();
+        lets.visit_block(body);
+        self.functions.push(Function {
+            name: name.to_string(),
+            lets: lets.0,
+        });
+    }
+
+    /// The Axum method-router constructor `func` names (`get`, `on`,
+    /// `any_service`, ..), identified by the path its name resolves to in
+    /// this module, so `use axum::routing::post as get` reads as `post`.
+    fn constructor(&self, func: &Expr) -> Option<String> {
+        let Expr::Path(path) = func else {
+            return None;
+        };
+        let segments = idents(&path.path);
+        let absolute = match segments.as_slice() {
+            [name] => self.workspace.import(self.module, name, 0)?,
+            _ => self.module.absolute(&segments),
+        };
+        match absolute.as_slice() {
+            [axum, routing, name]
+                if axum == "axum" && routing == "routing" && is_constructor(name) =>
+            {
+                Some(name.clone())
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether `expr` is a method-router chain: one that starts at an Axum
+    /// method-router constructor.
+    fn is_method_router(&self, expr: &Expr) -> bool {
+        match expr {
+            Expr::MethodCall(call) => self.is_method_router(&call.receiver),
+            Expr::Call(call) => self.constructor(&call.func).is_some(),
+            Expr::Paren(expr) => self.is_method_router(&expr.expr),
+            _ => false,
+        }
+    }
+
+    /// The HTTP methods a method router accepts.
+    fn method_router(&self, expr: &Expr) -> Result<BTreeSet<&'static str>, String> {
+        match expr {
+            Expr::Paren(expr) => self.method_router(&expr.expr),
+            Expr::Call(call) => match self.constructor(&call.func) {
+                Some(name) if name == "on" || name == "on_service" => {
+                    method_filter(call.args.first())
+                }
+                Some(name) => Ok(http_method(&name).into_iter().collect()),
+                None => Err("a method router the scan cannot read".to_owned()),
+            },
+            Expr::MethodCall(call) => {
+                let mut methods = self.method_router(&call.receiver)?;
+                match call.method.to_string().as_str() {
+                    wrapper if METHOD_ROUTER_WRAPPERS.contains(&wrapper) => {}
+                    "fallback" | "fallback_service" => {
+                        methods.insert("ANY");
+                    }
+                    "on" | "on_service" => methods.extend(method_filter(call.args.first())?),
+                    name => match http_method(name) {
+                        Some(method) => {
+                            methods.insert(method);
+                        }
+                        None => return Err(format!("the method-router call `.{name}(..)`")),
+                    },
+                }
+                Ok(methods)
+            }
+            _ => Err("a method router the scan cannot read".to_owned()),
+        }
+    }
+
     /// A route path argument, in [`ROUTES`]' notation.
-    fn path(&self, expr: &Expr) -> Result<String, String> {
+    fn path(&mut self, expr: &Expr) -> Result<String, String> {
         match expr {
             Expr::Lit(ExprLit {
                 lit: Lit::Str(value),
@@ -962,12 +1144,14 @@ impl Registrations<'_> {
             Expr::Reference(expr) => self.path(&expr.expr),
             Expr::Paren(expr) => self.path(&expr.expr),
             Expr::Path(path) if path.qself.is_none() => {
-                let segments: Vec<String> = path
-                    .path
-                    .segments
-                    .iter()
-                    .map(|s| s.ident.to_string())
-                    .collect();
+                let segments = idents(&path.path);
+                if let [name] = segments.as_slice()
+                    && self.module.ambiguous.contains(name)
+                {
+                    return Err(format!(
+                        "the path `{name}`, which is bound more than once in this module"
+                    ));
+                }
                 let constant = match segments.as_slice() {
                     [name] => self.workspace.lookup(self.module, name, 0),
                     _ => self.workspace.constant(&self.module.absolute(&segments), 0),
@@ -975,7 +1159,7 @@ impl Registrations<'_> {
                 match (constant, segments.as_slice()) {
                     (Some(value), _) => Ok(value),
                     (None, [name]) if name.starts_with(|c: char| c.is_ascii_lowercase()) => {
-                        Ok(format!("<{name}>"))
+                        self.runtime_value(name)
                     }
                     (None, _) => Err(format!(
                         "the path `{}`, which is not a string constant the scan can find",
@@ -988,8 +1172,33 @@ impl Registrations<'_> {
         }
     }
 
+    /// `<name>`, when [`RUNTIME_VALUES`] lists `name` for the function being
+    /// scanned.
+    fn runtime_value(&mut self, name: &str) -> Result<String, String> {
+        let file = self.workspace.sources.display(&self.module.file);
+        let function = self
+            .functions
+            .last()
+            .map(|function| function.name.clone())
+            .unwrap_or_default();
+        let listed = self
+            .runtime_values
+            .iter()
+            .any(|(f, func, variable)| *f == file && *func == function && *variable == name);
+        if !listed {
+            return Err(format!(
+                "the path `{name}`, which is neither a string constant the scan can find nor a \
+                 runtime value RUNTIME_VALUES lists for `{function}`"
+            ));
+        }
+        self.scan
+            .runtime_values
+            .insert((file, function, name.to_owned()));
+        Ok(format!("<{name}>"))
+    }
+
     /// A `format!` route path, with its arguments resolved as paths.
-    fn format_path(&self, mac: &syn::Macro) -> Result<String, String> {
+    fn format_path(&mut self, mac: &syn::Macro) -> Result<String, String> {
         let unreadable = || "a `format!` path the scan cannot read".to_owned();
         let args = mac
             .parse_body_with(Punctuated::<Expr, Token![,]>::parse_terminated)
@@ -1048,28 +1257,86 @@ impl Registrations<'_> {
         Ok(path)
     }
 
-    /// The crate a merged router is built in, when that is not the gateway.
-    fn foreign_router(&self, expr: &Expr) -> Option<String> {
-        let Expr::Path(path) = chain_root(expr) else {
-            return None;
+    /// Checks that a merged or nested router is one whose registrations the
+    /// scan reads: a chain built from `Router::new()`, a call to a gateway
+    /// function, or a local variable whose `let` bindings are such routers.
+    fn router_origin(&self, expr: &Expr, depth: usize) -> Result<(), String> {
+        if depth > 16 {
+            return Err("a router whose origin the scan cannot follow".to_owned());
+        }
+        match expr {
+            // Only a hop through a variable counts toward the limit: a router
+            // chain is as long as its route list.
+            Expr::MethodCall(call) => self.router_origin(&call.receiver, depth),
+            Expr::Paren(expr) => self.router_origin(&expr.expr, depth),
+            Expr::Reference(expr) => self.router_origin(&expr.expr, depth),
+            Expr::Call(call) => self.function_origin(&call.func),
+            Expr::Path(path) if path.path.get_ident().is_some() => {
+                let name = path.path.segments[0].ident.to_string();
+                let bindings = self
+                    .functions
+                    .last()
+                    .and_then(|function| function.lets.get(&name))
+                    .ok_or_else(|| {
+                        format!("the router `{name}`, which no `let` in this function binds")
+                    })?;
+                let mut based = false;
+                for init in bindings {
+                    // `let inner = inner.merge(..)` rebinds the variable; its
+                    // own merge is checked where it is registered.
+                    if matches!(chain_root(init), Expr::Path(root) if root.path.is_ident(&name)) {
+                        continue;
+                    }
+                    self.router_origin(init, depth + 1)?;
+                    based = true;
+                }
+                if based {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "the router `{name}`, which every `let` binds only to itself"
+                    ))
+                }
+            }
+            _ => Err("a router expression the scan cannot follow".to_owned()),
+        }
+    }
+
+    /// Checks that a function returning a router is `Router::new` or a
+    /// gateway function, whose registrations the scan reads.
+    fn function_origin(&self, func: &Expr) -> Result<(), String> {
+        let Expr::Path(path) = func else {
+            return Err("a router built by an expression the scan cannot follow".to_owned());
         };
-        let segments: Vec<String> = path
-            .path
-            .segments
-            .iter()
-            .map(|s| s.ident.to_string())
-            .collect();
-        if segments.len() >= 2 && segments[segments.len() - 2] == "Router" {
-            return None;
+        let segments = idents(&path.path);
+        if let [.., router, new] = segments.as_slice()
+            && router == "Router"
+            && new == "new"
+        {
+            return Ok(());
         }
         let absolute = match segments.as_slice() {
-            [name] => self.module.uses.get(name)?.clone(),
+            [first, ..] if first == "Self" => return Ok(()),
+            [name] => match self.workspace.import(self.module, name, 0) {
+                Some(target) => target,
+                None if self.module.fns.contains(name) && !self.module.ambiguous.contains(name) => {
+                    return Ok(());
+                }
+                None => {
+                    return Err(format!(
+                        "a router from `{name}()`, which the scan cannot find"
+                    ));
+                }
+            },
             _ => self.module.absolute(&segments),
         };
-        absolute
-            .first()
-            .filter(|krate| *krate != GATEWAY_CRATE)
-            .cloned()
+        match absolute.first() {
+            Some(krate) if krate == GATEWAY_CRATE => Ok(()),
+            Some(krate) => Err(format!(
+                "a router built in {krate}, where the scan does not look"
+            )),
+            None => Err("a router the scan cannot follow".to_owned()),
+        }
     }
 
     fn register(&mut self, call: &syn::ExprMethodCall) {
@@ -1078,35 +1345,34 @@ impl Registrations<'_> {
         let registered = match (name.as_str(), args.as_slice()) {
             ("route", [path, router]) => self
                 .path(path)
-                .and_then(|path| Ok((path, method_router(router)?))),
+                .and_then(|path| Ok((path, self.method_router(router)?))),
             ("route_service", [path, _]) => {
                 self.path(path).map(|path| (path, BTreeSet::from(["ANY"])))
             }
-            ("fallback", [handler]) if !is_method_router(&call.receiver) => {
-                if is_method_router(handler) {
-                    method_router(handler).map(|methods| (UNMATCHED.to_owned(), methods))
+            ("fallback", [handler]) if !self.is_method_router(&call.receiver) => {
+                if self.is_method_router(handler) {
+                    self.method_router(handler)
+                        .map(|methods| (UNMATCHED.to_owned(), methods))
                 } else {
                     Ok((UNMATCHED.to_owned(), BTreeSet::from(["ANY"])))
                 }
             }
-            ("fallback_service", [_]) if !is_method_router(&call.receiver) => {
+            ("fallback_service", [_]) if !self.is_method_router(&call.receiver) => {
                 Ok((UNMATCHED.to_owned(), BTreeSet::from(["ANY"])))
             }
-            ("nest", [path, _]) => match self.path(path) {
-                Ok(path) => {
+            ("nest", [path, router]) => match (self.path(path), self.router_origin(router, 0)) {
+                (Ok(path), Ok(())) => {
                     self.scan.mounts.insert(path);
                     return;
                 }
-                Err(why) => Err(why),
+                (Err(why), _) | (_, Err(why)) => Err(why),
             },
             ("nest_service", _) => {
                 Err("`.nest_service(..)`, which the scan does not model".to_owned())
             }
-            ("merge", [router]) => match self.foreign_router(router) {
-                Some(krate) => Err(format!(
-                    "a merged router built in {krate}, where the scan does not look"
-                )),
-                None => return,
+            ("merge", [router]) => match self.router_origin(router, 0) {
+                Ok(()) => return,
+                Err(why) => Err(format!("a merged router: {why}")),
             },
             _ => return,
         };
@@ -1128,10 +1394,22 @@ impl<'ast> Visit<'ast> for Registrations<'_> {
         }
     }
 
+    fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+        self.enter(&item.sig.ident, &item.block);
+        visit::visit_item_fn(self, item);
+        self.functions.pop();
+    }
+
     fn visit_impl_item(&mut self, item: &'ast ImplItem) {
         if !test_only(impl_item_attrs(item)) {
             visit::visit_impl_item(self, item);
         }
+    }
+
+    fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
+        self.enter(&item.sig.ident, &item.block);
+        visit::visit_impl_item_fn(self, item);
+        self.functions.pop();
     }
 
     fn visit_stmt(&mut self, stmt: &'ast Stmt) {
@@ -1163,16 +1441,16 @@ impl<'ast> Visit<'ast> for Registrations<'_> {
     }
 }
 
-/// What is wrong with the gateway's route inventory against [`ROUTES`] and
-/// [`MOUNTS`].
+/// What is wrong with the gateway's route inventory against [`ROUTES`],
+/// [`MOUNTS`] and [`RUNTIME_VALUES`].
 fn inventory_problems(sources: Sources) -> Vec<String> {
-    let scan = scan(sources);
+    let scan = scan(sources, RUNTIME_VALUES);
     let mut problems = Vec::new();
     if !scan.unresolved.is_empty() {
         problems.push(format!(
             "the scan cannot resolve these router calls; register them with a literal or \
-             string-constant path and an inline Axum method router, or teach the scan the \
-             new form: {:#?}",
+             string-constant path, an Axum method router built inline, and a router built in \
+             the gateway, or teach the scan the new form: {:#?}",
             scan.unresolved
         ));
     }
@@ -1214,6 +1492,21 @@ fn inventory_problems(sources: Sources) -> Vec<String> {
         problems.push(format!(
             "the gateway nests routers under {:?}, MOUNTS lists {mounts:?}",
             scan.mounts
+        ));
+    }
+    let stale: Vec<&(&str, &str, &str)> = RUNTIME_VALUES
+        .iter()
+        .filter(|(file, function, variable)| {
+            !scan.runtime_values.contains(&(
+                (*file).to_owned(),
+                (*function).to_owned(),
+                (*variable).to_owned(),
+            ))
+        })
+        .collect();
+    if !stale.is_empty() {
+        problems.push(format!(
+            "remove these RUNTIME_VALUES entries, which no route path uses: {stale:?}"
         ));
     }
     problems
@@ -1318,8 +1611,13 @@ fn the_coverage_document_matches_the_table() {
 #[test]
 fn the_scanner_resolves_every_router_call_or_reports_it() {
     let gateway_lib = r##"
+        use axum::Router;
+        use axum::routing::{any, get, on, patch, post, MethodFilter};
+
         mod card;
+        mod evasion;
         mod opaque;
+        mod renamed;
         #[cfg(not(test))]
         mod production;
         #[cfg(any(test, feature = "test-util"))]
@@ -1330,6 +1628,12 @@ fn the_scanner_resolves_every_router_call_or_reports_it() {
         mod unix_tests {
             fn t() { Router::new().route("/unix-test-only", get(t)); }
         }
+        #[cfg_attr(not(test), path = "selected_production.rs")]
+        mod selected;
+        #[cfg(windows)]
+        mod platform;
+        #[cfg(not(windows))]
+        mod platform;
 
         const CARD: &str = "/card";
         const QUOTE: char = '"';
@@ -1347,6 +1651,8 @@ fn the_scanner_resolves_every_router_call_or_reports_it() {
                 .route_service("/svc", service)
                 .merge(card::routes())
                 .fallback(get(spa));
+            let extra = Router::new().route("/extra", get(h));
+            let inner = inner.merge(extra);
             Router::new().nest(prefix, inner).route(&format!("{prefix}/"), get(redirect))
         }
 
@@ -1358,13 +1664,19 @@ fn the_scanner_resolves_every_router_call_or_reports_it() {
     // A route whose path constant lives in another crate and is re-exported
     // into the gateway module that registers it.
     let card = r#"
+        use axum::routing::get;
         pub use zeroclaw_runtime::a2a_card::{AgentCard, CATALOG_CARD_PATH};
         pub(crate) fn routes() -> Router {
             Router::new().route(CATALOG_CARD_PATH, get(card))
         }
     "#;
+    // A constructor imported under another method's name is that method.
+    let renamed = r#"
+        use axum::routing::post as get;
+        fn routes() -> Router { Router::new().route("/renamed", get(h)) }
+    "#;
     let opaque = r#"
-        use zeroclaw_channels::webhook_routes;
+        use zeroclaw_channels::webhook_routes; use axum::routing::get;
         fn routes(method_router: MethodRouter) -> Router {
             Router::new()
                 .route("/variable", method_router)
@@ -1374,36 +1686,63 @@ fn the_scanner_resolves_every_router_call_or_reports_it() {
                 .nest_service("/assets", files)
         }
     "#;
+    // Names that would otherwise resolve to something already classified.
+    let evasion = r#"
+        use axum::routing::get;
+        const REVIEW_PATH: &str = "/scoped";
+        fn scoped() -> Router { Router::new().route(REVIEW_PATH, get(h)) }
+        fn shadow() { const REVIEW_PATH: &str = "/card"; }
+        fn local_prefix() -> Router {
+            let prefix = "/review";
+            Router::new().route(&format!("{prefix}/"), get(h))
+        }
+        fn merged_variable(inner: Router) -> Router {
+            let extra = zeroclaw_channels::review_router();
+            let inner = inner.merge(extra);
+            Router::new().merge(inner)
+        }
+        fn unimported() -> Router { Router::new().route("/unimported", put(h)) }
+    "#;
     let root = PathBuf::from("/workspace");
     let gateway = root.join("crates/zeroclaw-gateway/src");
     let runtime = root.join("crates/zeroclaw-runtime/src");
+    let route_file = |path: &str, call: &str| {
+        format!(
+            "use axum::routing::{call};\n\
+             fn routes() -> Router {{ Router::new().route({path:?}, {call}(h)) }}"
+        )
+    };
     let files = HashMap::from([
         (gateway.join("lib.rs"), gateway_lib.to_owned()),
         (gateway.join("card.rs"), card.to_owned()),
+        (gateway.join("renamed.rs"), renamed.to_owned()),
         (gateway.join("opaque.rs"), opaque.to_owned()),
+        (gateway.join("evasion.rs"), evasion.to_owned()),
         (
             gateway.join("production.rs"),
-            r#"fn routes() -> Router { Router::new().route("/production-only", get(h)) }"#
-                .to_owned(),
+            route_file("/production-only", "get"),
         ),
+        (gateway.join("shared.rs"), route_file("/shared", "put")),
+        (gateway.join("tests.rs"), route_file("/test-only", "get")),
+        (gateway.join("selected.rs"), String::new()),
         (
-            gateway.join("shared.rs"),
-            r#"fn routes() -> Router { Router::new().route("/shared", put(h)) }"#.to_owned(),
+            gateway.join("selected_production.rs"),
+            route_file("/selected", "get"),
         ),
-        (
-            gateway.join("tests.rs"),
-            r#"fn t() { Router::new().route("/test-only", get(t)); }"#.to_owned(),
-        ),
+        (gateway.join("platform.rs"), route_file("/platform", "get")),
         (runtime.join("lib.rs"), "pub mod a2a_card;".to_owned()),
         (
             runtime.join("a2a_card.rs"),
             r#"pub const CATALOG_CARD_PATH: &str = "/.well-known/agents-card.json";"#.to_owned(),
         ),
     ]);
-    let found = scan(Sources {
-        root,
-        files: Some(files),
-    });
+    let found = scan(
+        Sources {
+            root,
+            files: Some(files),
+        },
+        &[("crates/zeroclaw-gateway/src/lib.rs", "router", "prefix")],
+    );
 
     let routes: Vec<String> = found
         .routes
@@ -1420,6 +1759,7 @@ fn the_scanner_resolves_every_router_call_or_reports_it() {
             "DELETE /on",
             "GET /.well-known/agents-card.json",
             "GET /a/{id}",
+            "GET /extra",
             "GET /p",
             "GET /production-only",
             "GET <prefix>/",
@@ -1427,21 +1767,44 @@ fn the_scanner_resolves_every_router_call_or_reports_it() {
             "HEAD /p",
             "PATCH /a/{id}",
             "POST /card",
+            "POST /renamed",
             "PUT /on",
             "PUT /shared",
         ]
     );
     assert_eq!(found.mounts, BTreeSet::from(["<prefix>".to_owned()]));
+    assert_eq!(
+        found.runtime_values,
+        BTreeSet::from([(
+            "crates/zeroclaw-gateway/src/lib.rs".to_owned(),
+            "router".to_owned(),
+            "prefix".to_owned()
+        )])
+    );
     let mut unresolved = found.unresolved.clone();
     unresolved.sort();
     assert_eq!(
         unresolved,
         [
+            "crates/zeroclaw-gateway/src/evasion.rs:12: a merged router: a router built in \
+             zeroclaw_channels, where the scan does not look",
+            "crates/zeroclaw-gateway/src/evasion.rs:13: a merged router: the router `inner`, \
+             which every `let` binds only to itself",
+            "crates/zeroclaw-gateway/src/evasion.rs:15: a method router the scan cannot read",
+            "crates/zeroclaw-gateway/src/evasion.rs:4: the path `REVIEW_PATH`, which is bound \
+             more than once in this module",
+            "crates/zeroclaw-gateway/src/evasion.rs:8: the path `prefix`, which is neither a \
+             string constant the scan can find nor a runtime value RUNTIME_VALUES lists for \
+             `local_prefix`",
+            "crates/zeroclaw-gateway/src/lib.rs: module `platform` is declared more than once \
+             under different conditions",
+            "crates/zeroclaw-gateway/src/lib.rs: module `selected` takes its file from a \
+             `cfg_attr` path",
             "crates/zeroclaw-gateway/src/opaque.rs:5: a method router the scan cannot read",
             "crates/zeroclaw-gateway/src/opaque.rs:6: the path `MISSING_PATH`, which is not a \
              string constant the scan can find",
             "crates/zeroclaw-gateway/src/opaque.rs:7: the method-router call `.frobnicate(..)`",
-            "crates/zeroclaw-gateway/src/opaque.rs:8: a merged router built in \
+            "crates/zeroclaw-gateway/src/opaque.rs:8: a merged router: a router built in \
              zeroclaw_channels, where the scan does not look",
             "crates/zeroclaw-gateway/src/opaque.rs:9: `.nest_service(..)`, which the scan does \
              not model",
