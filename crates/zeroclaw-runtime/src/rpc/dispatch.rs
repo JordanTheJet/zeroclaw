@@ -3738,13 +3738,8 @@ impl RpcDispatcher {
     /// caller. `bound_addr` is `null`, with no nonce, while no such listener
     /// accepts connections.
     fn handle_gateway_possession_challenge(&self, params: &Value) -> RpcResult {
-        #[derive(serde::Deserialize)]
-        struct ChallengeParams {
-            #[serde(default)]
-            addr: Option<String>,
-        }
-        let req: ChallengeParams = if params.is_null() {
-            ChallengeParams { addr: None }
+        let req: GatewayPossessionChallengeParams = if params.is_null() {
+            GatewayPossessionChallengeParams { addr: None }
         } else {
             parse_params(params)?
         };
@@ -3772,14 +3767,18 @@ impl RpcDispatcher {
             }
         };
         let Some(bound) = bound else {
-            return Ok(serde_json::json!({ "bound_addr": null }));
+            return to_result(GatewayPossessionChallengeResult {
+                bound_addr: None,
+                nonce: None,
+                proof: None,
+            });
         };
         let nonce = crate::daemon::possession::new_nonce();
-        Ok(serde_json::json!({
-            "bound_addr": bound.addr.to_string(),
-            "nonce": nonce,
-            "proof": bound.possession.proof(&nonce),
-        }))
+        to_result(GatewayPossessionChallengeResult {
+            bound_addr: Some(bound.addr.to_string()),
+            proof: Some(bound.possession.proof(&nonce)),
+            nonce: Some(nonce),
+        })
     }
 
     /// Admit an administrator on the local socket to an operation that
@@ -3844,13 +3843,8 @@ impl RpcDispatcher {
     /// `gateway/possession-challenge` vouch for that listener, so whoever
     /// registers is trusted with every credential sent to the address.
     async fn handle_gateway_register_listener(&self, method: Method, params: &Value) -> RpcResult {
-        #[derive(serde::Deserialize)]
-        struct RegisterParams {
-            addr: String,
-            possession: String,
-        }
         let (_authority, registrant) = self.admit_local_admin(method).await?;
-        let req: RegisterParams = parse_params(params)?;
+        let req: GatewayRegisterListenerParams = parse_params(params)?;
         let addr: std::net::SocketAddr = req.addr.parse().map_err(|_| {
             rpc_err(
                 INVALID_PARAMS,
@@ -3876,7 +3870,7 @@ impl RpcDispatcher {
                     ),
                 )
             })?;
-        Ok(serde_json::json!({ "registration_id": registration_id }))
+        to_result(GatewayRegisterListenerResult { registration_id })
     }
 
     /// `gateway/release-listener {registration_id}`: the registering gateway
@@ -3884,17 +3878,13 @@ impl RpcDispatcher {
     /// Only the connection that registered it can release it. Returns
     /// `{released}`.
     async fn handle_gateway_release_listener(&self, method: Method, params: &Value) -> RpcResult {
-        #[derive(serde::Deserialize)]
-        struct ReleaseParams {
-            registration_id: u64,
-        }
         let (_authority, _) = self.admit_local_admin(method).await?;
-        let req: ReleaseParams = parse_params(params)?;
+        let req: GatewayReleaseListenerParams = parse_params(params)?;
         let released = self
             .ctx
             .external_gateways
             .release(req.registration_id, &self.connection_token);
-        Ok(serde_json::json!({ "released": released }))
+        to_result(GatewayReleaseListenerResult { released })
     }
 
     /// `pairing/new-code`: issue a one-time pairing code, which the dashboard
@@ -3936,12 +3926,12 @@ impl RpcDispatcher {
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
             "new pairing code issued over the local RPC socket"
         );
-        Ok(serde_json::json!({
-            "success": true,
-            "pairing_required": true,
-            "pairing_code": code,
-            "message": "New pairing code generated — use this one-time code to pair",
-        }))
+        to_result(PairingNewCodeResult {
+            success: true,
+            pairing_required: true,
+            pairing_code: code,
+            message: "New pairing code generated — use this one-time code to pair".to_string(),
+        })
     }
 
     async fn handle_doctor_run(&self) -> RpcResult {

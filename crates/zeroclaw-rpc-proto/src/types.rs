@@ -160,6 +160,84 @@ rpc_type! {
 }
 
 // ══════════════════════════════════════════════════════════════════════
+// ── Gateway listeners and pairing ────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════
+
+rpc_type! {
+    /// `gateway/possession-challenge` params.
+    pub struct GatewayPossessionChallengeParams {
+        /// The address, as `ip:port`, of the listener to vouch for. Without
+        /// it, the daemon's own gateway, wherever it is bound.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub addr: Option<String>,
+    }
+}
+
+rpc_type! {
+    /// `gateway/possession-challenge` result: a fresh nonce and the proof the
+    /// listener the core vouches for answers it with. While no such listener
+    /// accepts connections, `bound_addr` is `null` and neither is present.
+    pub struct GatewayPossessionChallengeResult {
+        /// The address of the listener the core vouches for, or `null`.
+        #[serde(default)]
+        pub bound_addr: Option<String>,
+        /// The nonce to send that listener as `GET /health?challenge=`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub nonce: Option<String>,
+        /// The `challenge_proof` that listener answers the nonce with.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub proof: Option<String>,
+    }
+}
+
+rpc_type! {
+    /// `gateway/register-listener` params.
+    pub struct GatewayRegisterListenerParams {
+        /// The address, as `ip:port`, the registering gateway's listener bound.
+        pub addr: String,
+        /// The key that listener answers possession challenges with: 32 bytes
+        /// as hex.
+        pub possession: String,
+    }
+}
+
+rpc_type! {
+    /// `gateway/register-listener` result.
+    pub struct GatewayRegisterListenerResult {
+        /// The registration, for `gateway/release-listener`.
+        pub registration_id: u64,
+    }
+}
+
+rpc_type! {
+    /// `gateway/release-listener` params.
+    pub struct GatewayReleaseListenerParams {
+        /// A registration this connection made.
+        pub registration_id: u64,
+    }
+}
+
+rpc_type! {
+    /// `gateway/release-listener` result.
+    pub struct GatewayReleaseListenerResult {
+        /// Whether a registration of this connection ended.
+        pub released: bool,
+    }
+}
+
+rpc_type! {
+    /// `pairing/new-code` result, the body the gateway's
+    /// `/admin/paircode/new` answers.
+    pub struct PairingNewCodeResult {
+        pub success: bool,
+        pub pairing_required: bool,
+        /// The one-time code the dashboard redeems at `POST /pair`.
+        pub pairing_code: String,
+        pub message: String,
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════
 // ── TUI ──────────────────────────────────────────────────────────────
 // ══════════════════════════════════════════════════════════════════════
 

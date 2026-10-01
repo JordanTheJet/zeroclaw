@@ -36,6 +36,10 @@ macro_rules! catalog {
 catalog! {
     // Core
     InitializeParams, CommandDescriptor, InitializeResult, StatusResult, DoctorSummary,
+    // Gateway listeners and pairing
+    GatewayPossessionChallengeParams, GatewayPossessionChallengeResult,
+    GatewayRegisterListenerParams, GatewayRegisterListenerResult, GatewayReleaseListenerParams,
+    GatewayReleaseListenerResult, PairingNewCodeResult,
     // TUI
     TuiListEntry, TuiListResult,
     // Sessions

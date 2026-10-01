@@ -1309,6 +1309,108 @@
           }
         ]
       },
+      "GatewayPossessionChallengeParams": {
+        "description": "`gateway/possession-challenge` params.",
+        "properties": {
+          "addr": {
+            "description": "The address, as `ip:port`, of the listener to vouch for. Without\nit, the daemon's own gateway, wherever it is bound.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "GatewayPossessionChallengeResult": {
+        "description": "`gateway/possession-challenge` result: a fresh nonce and the proof the\nlistener the core vouches for answers it with. While no such listener\naccepts connections, `bound_addr` is `null` and neither is present.",
+        "properties": {
+          "bound_addr": {
+            "default": null,
+            "description": "The address of the listener the core vouches for, or `null`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "nonce": {
+            "description": "The nonce to send that listener as `GET /health?challenge=`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "proof": {
+            "description": "The `challenge_proof` that listener answers the nonce with.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "GatewayRegisterListenerParams": {
+        "description": "`gateway/register-listener` params.",
+        "properties": {
+          "addr": {
+            "description": "The address, as `ip:port`, the registering gateway's listener bound.",
+            "type": "string"
+          },
+          "possession": {
+            "description": "The key that listener answers possession challenges with: 32 bytes\nas hex.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "addr",
+          "possession"
+        ],
+        "type": "object"
+      },
+      "GatewayRegisterListenerResult": {
+        "description": "`gateway/register-listener` result.",
+        "properties": {
+          "registration_id": {
+            "description": "The registration, for `gateway/release-listener`.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "registration_id"
+        ],
+        "type": "object"
+      },
+      "GatewayReleaseListenerParams": {
+        "description": "`gateway/release-listener` params.",
+        "properties": {
+          "registration_id": {
+            "description": "A registration this connection made.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "registration_id"
+        ],
+        "type": "object"
+      },
+      "GatewayReleaseListenerResult": {
+        "description": "`gateway/release-listener` result.",
+        "properties": {
+          "released": {
+            "description": "Whether a registration of this connection ended.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "released"
+        ],
+        "type": "object"
+      },
       "GraphDiagnostic": {
         "description": "A validation finding anchored to a step. Errors block saving\n(`validate_sop_strict`); warnings render but do not block.",
         "properties": {
@@ -2329,6 +2431,31 @@
           "step",
           "col",
           "row"
+        ],
+        "type": "object"
+      },
+      "PairingNewCodeResult": {
+        "description": "`pairing/new-code` result, the body the gateway's\n`/admin/paircode/new` answers.",
+        "properties": {
+          "message": {
+            "type": "string"
+          },
+          "pairing_code": {
+            "description": "The one-time code the dashboard redeems at `POST /pair`.",
+            "type": "string"
+          },
+          "pairing_required": {
+            "type": "boolean"
+          },
+          "success": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "success",
+          "pairing_required",
+          "pairing_code",
+          "message"
         ],
         "type": "object"
       },
@@ -7582,13 +7709,25 @@
     {
       "name": "gateway/possession-challenge",
       "paramStructure": "by-name",
-      "params": [],
+      "params": [
+        {
+          "name": "addr",
+          "required": false,
+          "schema": {
+            "description": "The address, as `ip:port`, of the listener to vouch for. Without\nit, the daemon's own gateway, wherever it is bound.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      ],
       "result": {
         "name": "result",
         "schema": {
-          "description": "Free-form JSON shaped by the daemon at runtime."
+          "$ref": "#/components/schemas/GatewayPossessionChallengeResult"
         },
-        "x-zeroclaw-shape": "untyped"
+        "x-zeroclaw-shape": "typed"
       },
       "x-zeroclaw-authorization": {
         "kind": "grant",
@@ -7596,20 +7735,37 @@
         "verb": "read"
       },
       "x-zeroclaw-params": {
-        "description": "Free-form JSON object shaped by the daemon at runtime; keys are not enumerable here.",
-        "shape": "untyped"
+        "shape": "typed",
+        "type": "GatewayPossessionChallengeParams"
       }
     },
     {
       "name": "gateway/register-listener",
       "paramStructure": "by-name",
-      "params": [],
+      "params": [
+        {
+          "name": "addr",
+          "required": true,
+          "schema": {
+            "description": "The address, as `ip:port`, the registering gateway's listener bound.",
+            "type": "string"
+          }
+        },
+        {
+          "name": "possession",
+          "required": true,
+          "schema": {
+            "description": "The key that listener answers possession challenges with: 32 bytes\nas hex.",
+            "type": "string"
+          }
+        }
+      ],
       "result": {
         "name": "result",
         "schema": {
-          "description": "Free-form JSON shaped by the daemon at runtime."
+          "$ref": "#/components/schemas/GatewayRegisterListenerResult"
         },
-        "x-zeroclaw-shape": "untyped"
+        "x-zeroclaw-shape": "typed"
       },
       "x-zeroclaw-authorization": {
         "kind": "grant",
@@ -7617,20 +7773,31 @@
         "verb": "create"
       },
       "x-zeroclaw-params": {
-        "description": "Free-form JSON object shaped by the daemon at runtime; keys are not enumerable here.",
-        "shape": "untyped"
+        "shape": "typed",
+        "type": "GatewayRegisterListenerParams"
       }
     },
     {
       "name": "gateway/release-listener",
       "paramStructure": "by-name",
-      "params": [],
+      "params": [
+        {
+          "name": "registration_id",
+          "required": true,
+          "schema": {
+            "description": "A registration this connection made.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        }
+      ],
       "result": {
         "name": "result",
         "schema": {
-          "description": "Free-form JSON shaped by the daemon at runtime."
+          "$ref": "#/components/schemas/GatewayReleaseListenerResult"
         },
-        "x-zeroclaw-shape": "untyped"
+        "x-zeroclaw-shape": "typed"
       },
       "x-zeroclaw-authorization": {
         "kind": "grant",
@@ -7638,8 +7805,8 @@
         "verb": "delete"
       },
       "x-zeroclaw-params": {
-        "description": "Free-form JSON object shaped by the daemon at runtime; keys are not enumerable here.",
-        "shape": "untyped"
+        "shape": "typed",
+        "type": "GatewayReleaseListenerParams"
       }
     },
     {
@@ -7649,9 +7816,9 @@
       "result": {
         "name": "result",
         "schema": {
-          "description": "Free-form JSON shaped by the daemon at runtime."
+          "$ref": "#/components/schemas/PairingNewCodeResult"
         },
-        "x-zeroclaw-shape": "untyped"
+        "x-zeroclaw-shape": "typed"
       },
       "x-zeroclaw-authorization": {
         "kind": "grant",
@@ -7659,8 +7826,7 @@
         "verb": "create"
       },
       "x-zeroclaw-params": {
-        "description": "Free-form JSON object shaped by the daemon at runtime; keys are not enumerable here.",
-        "shape": "untyped"
+        "shape": "none"
       }
     }
   ],

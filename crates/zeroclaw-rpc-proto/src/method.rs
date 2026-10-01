@@ -477,10 +477,19 @@ impl Method {
             M::SopsGraphDraft => (Untyped, Typed("SopGraph")),
             M::SopsTriggerSources => (None, Typed("TriggerSourceRegistry")),
             M::ToolsParamOptions => (Untyped, Untyped),
-            M::GatewayPossessionChallenge => (Untyped, Untyped),
-            M::GatewayRegisterListener => (Untyped, Untyped),
-            M::GatewayReleaseListener => (Untyped, Untyped),
-            M::PairingNewCode => (Untyped, Untyped),
+            M::GatewayPossessionChallenge => (
+                Typed("GatewayPossessionChallengeParams"),
+                Typed("GatewayPossessionChallengeResult"),
+            ),
+            M::GatewayRegisterListener => (
+                Typed("GatewayRegisterListenerParams"),
+                Typed("GatewayRegisterListenerResult"),
+            ),
+            M::GatewayReleaseListener => (
+                Typed("GatewayReleaseListenerParams"),
+                Typed("GatewayReleaseListenerResult"),
+            ),
+            M::PairingNewCode => (None, Typed("PairingNewCodeResult")),
         };
         MethodContract { params, result }
     }
