@@ -41,7 +41,7 @@ use zeroclaw_rpc_client::{
 };
 
 use crate::api::{CostQuery, CronRunsQuery, MemoryDeleteQuery, MemoryQuery, MemoryStoreBody};
-use crate::core_rpc::{CoreAccess, CoreCall, CoreError, CoreRpc};
+use crate::core_rpc::{CoreAccess, CoreCall, CoreError, CoreRpc, DedicatedCoreAccess};
 
 /// Where the dashboard reaches when no `--listen` is given: the address the
 /// in-process gateway uses.
@@ -79,6 +79,9 @@ Options:
   --request-timeout SECS
                         answer 408 to a request not done within SECS
                         [default: 30, the in-process gateway's default]
+  --long-running-request-timeout SECS
+                        the same for a manual cron run, which waits for the
+                        job [default: 600, the in-process gateway's default]
   -h, --help            print this help
   -V, --version         print the version
 
@@ -95,6 +98,9 @@ pub struct Bootstrap {
     pub tls: Option<TlsFiles>,
     /// How long a request may take before it is answered `408`.
     pub request_timeout: Duration,
+    /// The same, for the routes that wait on long work (a manual cron run),
+    /// as the in-process gateway's long-running routes do.
+    pub long_running_request_timeout: Duration,
 }
 
 /// The PEM files for serving HTTPS.
@@ -125,6 +131,8 @@ pub fn parse_args(
     let mut tls_cert: Option<PathBuf> = None;
     let mut tls_key: Option<PathBuf> = None;
     let mut request_timeout = Duration::from_secs(crate::REQUEST_TIMEOUT_SECS);
+    let mut long_running_request_timeout =
+        Duration::from_secs(crate::LONG_RUNNING_REQUEST_TIMEOUT_SECS);
     let mut allow_public_bind = false;
 
     let mut args = args.into_iter();
@@ -144,15 +152,13 @@ pub fn parse_args(
             "--tls-cert" => tls_cert = Some(value("--tls-cert")?.into()),
             "--tls-key" => tls_key = Some(value("--tls-key")?.into()),
             "--request-timeout" => {
-                let secs = value("--request-timeout")?;
-                request_timeout = secs
-                    .parse::<u64>()
-                    .ok()
-                    .filter(|secs| *secs > 0)
-                    .map(Duration::from_secs)
-                    .ok_or_else(|| {
-                        format!("--request-timeout {secs:?} is not a positive number of seconds")
-                    })?;
+                request_timeout = positive_secs("--request-timeout", &value("--request-timeout")?)?;
+            }
+            "--long-running-request-timeout" => {
+                long_running_request_timeout = positive_secs(
+                    "--long-running-request-timeout",
+                    &value("--long-running-request-timeout")?,
+                )?;
             }
             "--allow-public-bind" => allow_public_bind = true,
             "--config" | "--config-dir" => {
@@ -201,7 +207,17 @@ pub fn parse_args(
         web_dist,
         tls,
         request_timeout,
+        long_running_request_timeout,
     }))
+}
+
+/// A flag's value as a positive number of seconds.
+fn positive_secs(flag: &str, secs: &str) -> Result<Duration, String> {
+    secs.parse::<u64>()
+        .ok()
+        .filter(|secs| *secs > 0)
+        .map(Duration::from_secs)
+        .ok_or_else(|| format!("{flag} {secs:?} is not a positive number of seconds"))
 }
 
 /// Why the preview refuses a route it does not serve.
@@ -544,6 +560,8 @@ struct PreviewState {
     web_dist: Option<Arc<PathBuf>>,
     /// Set by `POST /admin/shutdown` to stop this process.
     shutdown: watch::Sender<bool>,
+    /// The long-running routes' budget, which their core call gets too.
+    long_running_timeout: Duration,
 }
 
 /// The preview's router. `core` must be attached to the core's socket
@@ -553,18 +571,22 @@ struct PreviewState {
 /// the peer's address (`into_make_service_with_connect_info`), which that
 /// route checks. Every route answers `413` to a body over
 /// [`crate::MAX_BODY_SIZE`] and `408` to a request not done within
-/// `request_timeout`, as the in-process gateway's routes do.
+/// `request_timeout`, as the in-process gateway's routes do; a manual cron
+/// run has `long_running_timeout` instead, as on the in-process gateway's
+/// long-running router.
 pub fn router(
     core: CoreRpc,
     endpoint: PathBuf,
     web_dist: Option<PathBuf>,
     shutdown: watch::Sender<bool>,
     request_timeout: Duration,
+    long_running_timeout: Duration,
 ) -> Router {
     let state = PreviewState {
         endpoint: Arc::new(endpoint),
         web_dist: web_dist.map(Arc::new),
         shutdown,
+        long_running_timeout,
     };
     let mut router: Router<PreviewState> = Router::new()
         .route("/health", get(health))
@@ -585,7 +607,6 @@ pub fn router(
             get(api_cron_settings).patch(api_cron_settings_patch),
         )
         .route("/api/cron/{id}", axum::routing::delete(api_cron_delete))
-        .route("/api/cron/{id}/run", axum::routing::post(api_cron_run))
         .route("/api/cron/{id}/runs", get(api_cron_runs))
         .route("/api/memory", get(api_memory_list).post(api_memory_store))
         .route(
@@ -608,6 +629,20 @@ pub fn router(
     if let Some(dist) = &state.web_dist {
         router = router.nest_service("/_app", tower_http::services::ServeDir::new(dist.as_path()));
     }
+    // A manual cron run waits for the job, so it gets the long-running
+    // budget instead of the request timeout, as on the in-process gateway's
+    // long-running router. Merged after the request timeout's layer, which
+    // therefore does not wrap it.
+    let long_running: Router<PreviewState> = Router::new()
+        .route("/api/cron/{id}/run", post(api_cron_run))
+        .layer(axum::Extension(core.clone()))
+        .layer(tower_http::limit::RequestBodyLimitLayer::new(
+            crate::MAX_BODY_SIZE,
+        ))
+        .layer(tower_http::timeout::TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            long_running_timeout,
+        ));
     router
         .fallback(fallback)
         .layer(axum::Extension(core))
@@ -618,6 +653,7 @@ pub fn router(
             StatusCode::REQUEST_TIMEOUT,
             request_timeout,
         ))
+        .merge(long_running)
         .layer(axum::middleware::from_fn(crate::security_headers::apply))
         .with_state(state)
 }
@@ -910,14 +946,19 @@ async fn api_cron_delete(
     .await
 }
 
-/// `POST /api/cron/{id}/run`
+/// `POST /api/cron/{id}/run`, on a connection of its own and within the
+/// long-running budget, so the run is neither cut short nor holds the
+/// caller's other requests behind it.
 async fn api_cron_run(
+    State(state): State<PreviewState>,
     UrlPath(id): UrlPath<String>,
-    access: Result<CoreAccess, CoreError>,
+    access: Result<DedicatedCoreAccess, CoreError>,
 ) -> Response {
-    served(access, |call| async move {
-        crate::api::api_cron_run_through_core(&call, &id).await
-    })
+    let budget = state.long_running_timeout;
+    served(
+        access.map(|DedicatedCoreAccess(access)| access),
+        |call| async move { crate::api::api_cron_run_through_core(&call, &id, budget).await },
+    )
     .await
 }
 
@@ -1100,6 +1141,7 @@ pub async fn serve(bootstrap: Bootstrap) -> anyhow::Result<()> {
         bootstrap.web_dist.clone(),
         shutdown,
         bootstrap.request_timeout,
+        bootstrap.long_running_request_timeout,
     );
     if tls.is_some() {
         app = app.layer(axum::middleware::from_fn(

@@ -28,7 +28,7 @@ use crate::api::{
     handle_api_cron_settings_get, handle_api_cron_settings_patch, handle_api_health,
     handle_api_memory_delete, handle_api_memory_list, handle_api_memory_store, handle_api_tuis,
 };
-use crate::core_rpc::{CoreAccess, CoreRpc};
+use crate::core_rpc::{CoreAccess, CoreRpc, DedicatedCoreAccess};
 use crate::sse::{EventBuffer, handle_events_history};
 
 const TOKEN: &str = "zc_parity_operator";
@@ -142,6 +142,16 @@ impl Harness {
     async fn through_core(&self) -> CoreAccess {
         match self.core.access(&Self::headers()).await {
             Ok(access @ CoreAccess::Core(_)) => access,
+            Ok(CoreAccess::InProcess) => panic!("served in-process"),
+            Err(error) => panic!("no core access: {error:?}"),
+        }
+    }
+
+    /// The same, on a connection of the request's own, as a manual cron run
+    /// takes it.
+    async fn through_core_dedicated(&self) -> DedicatedCoreAccess {
+        match self.core.access_dedicated(&Self::headers()).await {
+            Ok(access @ CoreAccess::Core(_)) => DedicatedCoreAccess(access),
             Ok(CoreAccess::InProcess) => panic!("served in-process"),
             Err(error) => panic!("no core access: {error:?}"),
         }
@@ -673,7 +683,7 @@ async fn cron_run_through_the_core_matches_the_in_process_body() {
                 State(harness.state.clone()),
                 Harness::headers(),
                 Path(job.id.clone()),
-                CoreAccess::InProcess,
+                DedicatedCoreAccess(CoreAccess::InProcess),
             )
             .await
             .into_response(),
@@ -686,7 +696,7 @@ async fn cron_run_through_the_core_matches_the_in_process_body() {
                 State(harness.state.clone()),
                 Harness::headers(),
                 Path(job.id.clone()),
-                harness.through_core().await,
+                harness.through_core_dedicated().await,
             )
             .await
             .into_response(),

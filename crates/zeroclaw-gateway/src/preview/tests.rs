@@ -379,6 +379,7 @@ async fn the_gateway_local_routes_answer_as_the_in_process_gateway_does() {
         None,
         preview_stop,
         Duration::from_secs(crate::REQUEST_TIMEOUT_SECS),
+        Duration::from_secs(crate::LONG_RUNNING_REQUEST_TIMEOUT_SECS),
     );
     let state = crate::api::test_state(zeroclaw_config::schema::Config {
         data_dir: tmp.path().to_path_buf(),
@@ -451,6 +452,7 @@ async fn every_route_sits_behind_the_in_process_request_limits() {
         None,
         stop,
         Duration::from_millis(300),
+        Duration::from_secs(crate::LONG_RUNNING_REQUEST_TIMEOUT_SECS),
     );
     let loopback = ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40_000)));
 
@@ -702,6 +704,7 @@ mod against_a_core {
             Some(web_dist(tmp.path())),
             watch::channel(false).0,
             Duration::from_secs(crate::REQUEST_TIMEOUT_SECS),
+            Duration::from_secs(crate::LONG_RUNNING_REQUEST_TIMEOUT_SECS),
         );
 
         let (status, body) = get(&router, "/health", None).await;
@@ -894,6 +897,7 @@ mod against_a_core {
             None,
             watch::channel(false).0,
             Duration::from_secs(crate::REQUEST_TIMEOUT_SECS),
+            Duration::from_secs(crate::LONG_RUNNING_REQUEST_TIMEOUT_SECS),
         );
         let state = crate::api::tests::test_state_with_session_backend(config, backend);
 
@@ -1048,6 +1052,7 @@ mod against_a_core {
             None,
             watch::channel(false).0,
             Duration::from_secs(crate::REQUEST_TIMEOUT_SECS),
+            Duration::from_secs(crate::LONG_RUNNING_REQUEST_TIMEOUT_SECS),
         );
         for body in ["{not json", "{\"enabled\": tru"] {
             let served = send_raw(&preview, "PATCH", "/api/cron/settings", body).await;
@@ -1064,6 +1069,181 @@ mod against_a_core {
             let expected = json_rejection::<crate::api::MemoryStoreBody>(body).await;
             assert_eq!(served, expected, "POST /api/memory {body}");
         }
+        core.stop().await;
+    }
+
+    /// A manual run that takes longer than the core call's default deadline
+    /// (30 s) answers with its result, through the separate gateway and
+    /// through the in-process route's core path alike, within the
+    /// long-running budget. It holds nothing back meanwhile: it runs on a
+    /// connection of its own, so the same credential's other requests answer
+    /// at once. A run whose budget ends first is answered `504` without the
+    /// advice to retry, and goes on in the core all the same.
+    #[tokio::test]
+    async fn a_manual_run_past_the_default_deadline_answers_and_holds_nothing_back() {
+        use crate::api::handle_api_cron_run;
+        use crate::core_rpc::DedicatedCoreAccess;
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = Core::context(tmp.path());
+        {
+            let mut config = ctx.config.write();
+            config.providers.models.openrouter.insert(
+                "default".to_string(),
+                zeroclaw_config::schema::OpenRouterModelProviderConfig::default(),
+            );
+            config.risk_profiles.insert(
+                "slow-profile".to_string(),
+                zeroclaw_config::schema::RiskProfileConfig {
+                    allowed_commands: vec!["sleep".into()],
+                    ..Default::default()
+                },
+            );
+            config.agents.insert(
+                "slow-agent".to_string(),
+                zeroclaw_config::schema::AliasedAgentConfig {
+                    model_provider: "openrouter.default".into(),
+                    risk_profile: "slow-profile".into(),
+                    ..Default::default()
+                },
+            );
+        }
+        let config = ctx.config.read().clone();
+        let slow_job = |name: &str| {
+            zeroclaw_runtime::cron::add_shell_job(
+                &config,
+                "slow-agent",
+                Some(name.into()),
+                zeroclaw_runtime::cron::Schedule::Cron {
+                    expr: "*/5 * * * *".into(),
+                    tz: None,
+                },
+                "sleep 31",
+            )
+            .unwrap()
+        };
+        let through_preview = slow_job("slow-preview");
+        let through_route = slow_job("slow-route");
+        let past_its_budget = slow_job("slow-budget");
+        let core = Core::serve(ctx).await;
+        let rpc = CoreRpc::local(core.endpoint.clone(), EndpointOwner::SameAccount);
+        let preview = router(
+            rpc.clone(),
+            core.endpoint.clone(),
+            None,
+            watch::channel(false).0,
+            Duration::from_secs(crate::REQUEST_TIMEOUT_SECS),
+            Duration::from_secs(crate::LONG_RUNNING_REQUEST_TIMEOUT_SECS),
+        );
+        let state = crate::api::test_state(config.clone());
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {TOKEN}").parse().unwrap(),
+        );
+        let route_access = rpc
+            .access_dedicated(&headers)
+            .await
+            .expect("through the core");
+        let CoreAccess::Core(budget_call) = rpc
+            .access_dedicated(&headers)
+            .await
+            .expect("through the core")
+        else {
+            panic!("served in-process");
+        };
+
+        let started = std::time::Instant::now();
+        let preview_path = format!("/api/cron/{}/run", through_preview.id);
+        let preview_run = send(&preview, "POST", &preview_path, Some(TOKEN));
+        let route_run = async {
+            let response = handle_api_cron_run(
+                State(state.clone()),
+                headers.clone(),
+                axum::extract::Path(through_route.id.clone()),
+                DedicatedCoreAccess(route_access),
+            )
+            .await
+            .into_response();
+            let status = response.status();
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            (status, String::from_utf8_lossy(&body).into_owned())
+        };
+        let meanwhile = async {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let asked = std::time::Instant::now();
+            let (status, body) = get(&preview, "/api/cron", Some(TOKEN)).await;
+            (status, body, asked.elapsed())
+        };
+        let short_budget = async {
+            let response = crate::api::api_cron_run_through_core(
+                &budget_call,
+                &past_its_budget.id,
+                Duration::from_secs(1),
+            )
+            .await
+            .expect("a run past its budget is answered");
+            let status = response.status();
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            (
+                status,
+                String::from_utf8_lossy(&body).into_owned(),
+                started.elapsed(),
+            )
+        };
+        let ((preview_status, preview_body), (route_status, route_body), meanwhile, short) =
+            tokio::join!(preview_run, route_run, meanwhile, short_budget);
+
+        for (path, status, body, job) in [
+            (
+                "zeroclaw-gw",
+                preview_status,
+                preview_body,
+                &through_preview,
+            ),
+            ("in-process", route_status, route_body, &through_route),
+        ] {
+            assert_eq!(status, StatusCode::OK, "{path}: {body}");
+            let run = json_of(&body);
+            assert_eq!(run["job_id"], job.id.as_str(), "{path}: {body}");
+            assert_eq!(run["success"], true, "{path}: {body}");
+            assert!(
+                run["duration_ms"].as_u64().is_some_and(|ms| ms >= 31_000),
+                "{path}: {body}"
+            );
+        }
+        assert!(started.elapsed() >= Duration::from_secs(31));
+        let (status, body, waited) = meanwhile;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(
+            waited < Duration::from_secs(10),
+            "a request of the same credential waited {waited:?} behind the runs"
+        );
+
+        let (status, body, answered_after) = short;
+        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "{body}");
+        assert!(
+            answered_after < Duration::from_secs(10),
+            "{answered_after:?}"
+        );
+        let timed_out = json_of(&body);
+        assert_eq!(timed_out["code"], "core_timeout", "{body}");
+        let hint = timed_out["hint"].as_str().unwrap_or_default();
+        assert!(hint.contains("runs") && !hint.contains("retry"), "{body}");
+        // The run went on in the core: running it again would have run it
+        // twice.
+        let mut recorded = Vec::new();
+        for _ in 0..400 {
+            recorded = zeroclaw_runtime::cron::list_runs(&config, &past_its_budget.id, 10).unwrap();
+            if !recorded.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(recorded.len(), 1, "{recorded:?}");
+        assert!(
+            recorded[0].duration_ms.is_some_and(|ms| ms >= 31_000),
+            "{recorded:?}"
+        );
         core.stop().await;
     }
 
@@ -1124,6 +1304,7 @@ mod against_a_core {
             None,
             watch::channel(false).0,
             Duration::from_secs(crate::REQUEST_TIMEOUT_SECS),
+            Duration::from_secs(crate::LONG_RUNNING_REQUEST_TIMEOUT_SECS),
         );
         let mut state = crate::api::test_state(config.clone());
         state.mem = Arc::clone(&memory);
@@ -1237,6 +1418,7 @@ mod against_a_core {
             None,
             watch::channel(false).0,
             Duration::from_secs(crate::REQUEST_TIMEOUT_SECS),
+            Duration::from_secs(crate::LONG_RUNNING_REQUEST_TIMEOUT_SECS),
         );
         let private = tmp.path().display().to_string();
         let expected_sign_in = serde_json::json!({
@@ -1281,6 +1463,7 @@ mod against_a_core {
             Some(web_dist(tmp.path())),
             watch::channel(false).0,
             Duration::from_secs(crate::REQUEST_TIMEOUT_SECS),
+            Duration::from_secs(crate::LONG_RUNNING_REQUEST_TIMEOUT_SECS),
         );
 
         // The page loads; health says to sign in with a token, and where to
@@ -1316,6 +1499,7 @@ mod against_a_core {
             None,
             watch::channel(false).0,
             Duration::from_secs(crate::REQUEST_TIMEOUT_SECS),
+            Duration::from_secs(crate::LONG_RUNNING_REQUEST_TIMEOUT_SECS),
         );
 
         let (status, body) = get(&router, "/health", None).await;
@@ -1358,6 +1542,7 @@ mod against_a_core {
             None,
             watch::channel(false).0,
             Duration::from_secs(crate::REQUEST_TIMEOUT_SECS),
+            Duration::from_secs(crate::LONG_RUNNING_REQUEST_TIMEOUT_SECS),
         );
 
         let (status, body) = get(&router, "/health", None).await;
@@ -1389,6 +1574,7 @@ mod against_a_core {
             None,
             watch::channel(false).0,
             Duration::from_secs(crate::REQUEST_TIMEOUT_SECS),
+            Duration::from_secs(crate::LONG_RUNNING_REQUEST_TIMEOUT_SECS),
         );
         let (status, body) = get(&router, "/sessions", None).await;
         assert_eq!(status, StatusCode::NOT_FOUND, "{body}");

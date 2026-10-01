@@ -69,7 +69,8 @@ use zeroclaw_api::jsonrpc::error_codes::{
     SOP_NOT_FOUND, VERSION_MISMATCH,
 };
 use zeroclaw_rpc_client::{
-    ClientError, ConnectOptions, ConnectionState, EndpointOwner, Method, RpcClient,
+    ClientError, ConnectOptions, ConnectionState, DEFAULT_REQUEST_TIMEOUT, EndpointOwner, Method,
+    RpcClient,
 };
 use zeroclaw_rpc_proto::error_reasons::{RefusalData, RefusalReason};
 use zeroclaw_rpc_proto::types::CLIENT_KIND_GATEWAY;
@@ -79,6 +80,9 @@ use crate::principal_gate::AUTH_PROVIDER_HEADER;
 
 /// Core connections open at once, one per credential.
 const MAX_CREDENTIALS: usize = 64;
+/// Of those, the connections long-running calls hold on their own at once,
+/// so long calls never take every connection from other requests.
+const MAX_DEDICATED: usize = MAX_CREDENTIALS / 4;
 /// How long a request waits for capacity when every connection is in use.
 const CAPACITY_WAIT: Duration = Duration::from_secs(5);
 /// A credential's connection leaves the pool after this long unused.
@@ -183,22 +187,53 @@ impl CoreRpc {
     ///
     /// Every refusal here happens before a connection is opened or reused.
     pub async fn access(&self, headers: &HeaderMap) -> Result<CoreAccess, CoreError> {
-        let Some(seam) = &self.seam else {
+        let Some((seam, credential)) = self.credential(headers)? else {
             return Ok(CoreAccess::InProcess);
+        };
+        Arc::clone(&seam.pool)
+            .acquire(&credential)
+            .await
+            .map(CoreAccess::Core)
+    }
+
+    /// [`CoreRpc::access`], on a connection of the request's own instead of
+    /// the one its credential's other requests share, closed when the
+    /// request lets go of it.
+    ///
+    /// The core answers one connection's requests in order, so a call that
+    /// can run for minutes (a manual cron run) would hold every other
+    /// request with the same credential behind it. On its own connection it
+    /// holds nothing but itself, and a call abandoned before its answer
+    /// leaves no connection behind that the core is still busy on.
+    pub async fn access_dedicated(&self, headers: &HeaderMap) -> Result<CoreAccess, CoreError> {
+        let Some((seam, credential)) = self.credential(headers)? else {
+            return Ok(CoreAccess::InProcess);
+        };
+        Arc::clone(&seam.pool)
+            .acquire_dedicated(&credential)
+            .await
+            .map(CoreAccess::Core)
+    }
+
+    /// The seam and the credential a request presents, or `None` when it is
+    /// served in-process.
+    fn credential<'h>(
+        &self,
+        headers: &'h HeaderMap,
+    ) -> Result<Option<(&Seam, HttpCredential<'h>)>, CoreError> {
+        let Some(seam) = &self.seam else {
+            return Ok(None);
         };
         let provider = provider_selection(headers)?;
         if provider.is_none() && !(seam.pairing_required)() {
-            return Ok(CoreAccess::InProcess);
+            return Ok(None);
         }
         let provider = provider.unwrap_or(NATIVE_PROVIDER);
         let credential = HttpCredential {
             provider,
             token: bearer(headers, provider)?,
         };
-        Arc::clone(&seam.pool)
-            .acquire(&credential)
-            .await
-            .map(CoreAccess::Core)
+        Ok(Some((seam, credential)))
     }
 }
 
@@ -215,15 +250,32 @@ impl<S: Send + Sync> FromRequestParts<S> for CoreAccess {
     type Rejection = CoreError;
 
     async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
-        // The router always installs the handle; a route without it is a
-        // wiring fault, refused rather than served in-process.
-        let Some(core) = parts.extensions.get::<CoreRpc>().cloned() else {
-            return Err(CoreError::Unavailable(
-                "the core connection is not configured for this route".into(),
-            ));
-        };
-        core.access(&parts.headers).await
+        core_rpc_of(parts)?.access(&parts.headers).await
     }
+}
+
+/// [`CoreAccess`] on a connection of the request's own, for a route whose
+/// core call can outlast the other requests (see
+/// [`CoreRpc::access_dedicated`]).
+pub struct DedicatedCoreAccess(pub CoreAccess);
+
+impl<S: Send + Sync> FromRequestParts<S> for DedicatedCoreAccess {
+    type Rejection = CoreError;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        core_rpc_of(parts)?
+            .access_dedicated(&parts.headers)
+            .await
+            .map(Self)
+    }
+}
+
+/// The router's core handle. The router always installs it; a route without
+/// it is a wiring fault, refused rather than served in-process.
+fn core_rpc_of(parts: &Parts) -> Result<CoreRpc, CoreError> {
+    parts.extensions.get::<CoreRpc>().cloned().ok_or_else(|| {
+        CoreError::Unavailable("the core connection is not configured for this route".into())
+    })
 }
 
 /// Why a request could not be served through the core. Each case answers
@@ -443,6 +495,7 @@ struct PoolKey {
 #[derive(Clone, Copy, Debug)]
 struct PoolLimits {
     max_credentials: usize,
+    max_dedicated: usize,
     idle_timeout: Duration,
     sweep_interval: Duration,
     capacity_wait: Duration,
@@ -452,6 +505,7 @@ impl Default for PoolLimits {
     fn default() -> Self {
         Self {
             max_credentials: MAX_CREDENTIALS,
+            max_dedicated: MAX_DEDICATED,
             idle_timeout: IDLE_TIMEOUT,
             sweep_interval: SWEEP_INTERVAL,
             capacity_wait: CAPACITY_WAIT,
@@ -477,6 +531,8 @@ struct Pool {
     /// One permit per open core connection. A connection takes its permit
     /// before it is dialed and returns it when it closes.
     capacity: Arc<Semaphore>,
+    /// One permit per open dedicated connection, taken before its capacity.
+    dedicated: Arc<Semaphore>,
     /// Woken when a request lets go of its connection, which may leave that
     /// connection evictable for a request waiting for capacity.
     lease_released: Notify,
@@ -490,6 +546,8 @@ struct PooledClient {
     client: RpcClient,
     /// Released on drop, whoever drops the connection last.
     _capacity: OwnedSemaphorePermit,
+    /// A dedicated connection's share of the long-running calls' limit.
+    _dedicated: Option<OwnedSemaphorePermit>,
 }
 
 /// One credential's place in the pool.
@@ -551,6 +609,7 @@ impl Pool {
             connector,
             limits,
             capacity: Arc::new(Semaphore::new(limits.max_credentials)),
+            dedicated: Arc::new(Semaphore::new(limits.max_dedicated)),
             lease_released: Notify::new(),
             slots: Mutex::new(HashMap::new()),
         }
@@ -596,6 +655,7 @@ impl Pool {
                 let pooled = Arc::new(PooledClient {
                     client,
                     _capacity: capacity,
+                    _dedicated: None,
                 });
                 *lock(&slot.client) = Some(Arc::clone(&pooled));
                 Ok(self.call(key, slot, pooled))
@@ -605,6 +665,34 @@ impl Pool {
                 Err(error)
             }
         }
+    }
+
+    /// A connection for `credential` that only the calling request uses. It
+    /// takes capacity as any connection does, but is never registered under
+    /// the credential's key, so no other request finds it, and it closes when
+    /// the request lets go of it. At most `max_dedicated` are open at once;
+    /// past that, a request waits for one to close, as for capacity, and is
+    /// refused as busy before anything is sent.
+    async fn acquire_dedicated(
+        self: Arc<Self>,
+        credential: &HttpCredential<'_>,
+    ) -> Result<CoreCall, CoreError> {
+        let key = credential.key();
+        let dedicated = tokio::time::timeout(
+            self.limits.capacity_wait,
+            Arc::clone(&self.dedicated).acquire_owned(),
+        )
+        .await
+        .map_err(|_| CoreError::Busy)?
+        .map_err(|_| CoreError::Busy)?;
+        let capacity = self.reserve(&key).await?;
+        let client = self.dial(credential).await?;
+        let pooled = Arc::new(PooledClient {
+            client,
+            _capacity: capacity,
+            _dedicated: Some(dedicated),
+        });
+        Ok(self.call(key, Arc::new(Slot::new()), pooled))
     }
 
     /// Capacity for one more connection. When none is free, close the least
@@ -854,7 +942,23 @@ impl CoreCall {
     /// missing grant (`FORBIDDEN`) or a lost connection takes it out of the
     /// pool. Either way the next request dials again with the credential it
     /// presents. Nothing is retried here.
+    ///
+    /// The core has [`DEFAULT_REQUEST_TIMEOUT`] to answer; see
+    /// [`CoreCall::request_within`] for a route with a longer budget.
     pub async fn request(&self, method: Method, params: Value) -> Result<Value, CoreError> {
+        self.request_within(method, params, DEFAULT_REQUEST_TIMEOUT)
+            .await
+    }
+
+    /// [`CoreCall::request`], giving the core `deadline` to answer instead of
+    /// the default: a route whose own budget is longer than the default
+    /// passes that budget, so its call is not cut short underneath it.
+    pub async fn request_within(
+        &self,
+        method: Method,
+        params: Value,
+        deadline: Duration,
+    ) -> Result<Value, CoreError> {
         if method == Method::Initialize {
             return Err(CoreError::Rpc(JsonRpcError {
                 code: INVALID_REQUEST,
@@ -863,7 +967,10 @@ impl CoreCall {
             }));
         }
         let client = &self.pooled.client;
-        match client.request(method, params).await {
+        match client
+            .request_with_timeout(method.wire_name(), params, deadline)
+            .await
+        {
             Ok(value) => {
                 self.slot.touch();
                 Ok(value)

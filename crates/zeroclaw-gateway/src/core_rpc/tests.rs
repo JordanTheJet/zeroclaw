@@ -1340,3 +1340,131 @@ async fn an_unknown_oidc_alias_is_the_cores_call_and_is_never_pooled() {
     assert_eq!(pool_of(&core).open_connections(), 0);
     cancel.cancel();
 }
+
+// ── Long-running calls ───────────────────────────────────────────
+
+/// A route whose budget is longer than the default gives the core that
+/// long: the call times out at its own deadline, the default call at the
+/// default. (The fake core never answers `health`.)
+#[tokio::test(start_paused = true)]
+async fn a_call_waits_its_own_deadline_instead_of_the_default() {
+    let fake = FakeCore::accepting(&["zc_a"]);
+    let core = core_over(&fake, true, PoolLimits::default());
+
+    let call = call_for(&core, "zc_a").await;
+    let started = tokio::time::Instant::now();
+    let error = call
+        .request_within(Method::Health, json!({}), Duration::from_secs(600))
+        .await
+        .expect_err("health is never answered");
+    assert!(matches!(error, CoreError::Timeout), "{error:?}");
+    assert!(
+        started.elapsed() >= Duration::from_secs(600),
+        "{:?}",
+        started.elapsed()
+    );
+
+    let call = call_for(&core, "zc_a").await;
+    let started = tokio::time::Instant::now();
+    let error = call
+        .request(Method::Health, json!({}))
+        .await
+        .expect_err("health is never answered");
+    assert!(matches!(error, CoreError::Timeout), "{error:?}");
+    let waited = started.elapsed();
+    assert!(
+        waited >= DEFAULT_REQUEST_TIMEOUT && waited < Duration::from_secs(600),
+        "{waited:?}"
+    );
+}
+
+/// A dedicated call has a connection of its own: not the one its
+/// credential's other requests share, never registered in the pool, counted
+/// against the pool's capacity, and closed once the call ends, leaving the
+/// shared connection as it was.
+#[tokio::test]
+async fn a_dedicated_call_has_its_own_connection_and_closes_it() {
+    let fake = FakeCore::accepting(&["zc_a"]);
+    let core = core_over(&fake, true, PoolLimits::default());
+    let pool = pool_of(&core);
+
+    let shared = call_for(&core, "zc_a").await;
+    let shared_connection = connection_of(&shared).await;
+    let CoreAccess::Core(dedicated) = core
+        .access_dedicated(&headers(Some("zc_a"), None))
+        .await
+        .expect("a dedicated connection")
+    else {
+        panic!("served in-process");
+    };
+    let dedicated_connection = connection_of(&dedicated).await;
+    assert_ne!(dedicated_connection, shared_connection);
+    assert_eq!(pool.pooled(), 1, "only the shared connection is pooled");
+    assert_eq!(
+        pool.open_connections(),
+        2,
+        "the dedicated connection takes capacity"
+    );
+    assert_eq!(
+        connection_of(&call_for(&core, "zc_a").await).await,
+        shared_connection,
+        "the credential's next request still finds the shared connection"
+    );
+
+    drop(dedicated);
+    wait_until("the dedicated connection closes", || {
+        !fake.is_open(dedicated_connection as usize)
+    })
+    .await;
+    assert_eq!(pool.open_connections(), 1);
+    assert_eq!(connection_of(&shared).await, shared_connection);
+}
+
+/// Long-running calls hold at most their share of the pool's connections.
+/// Past it, one more waits as for capacity and is refused as busy before
+/// anything is dialed, while the credential's other requests are still
+/// served; once a long call ends, the next one gets a connection.
+#[tokio::test(start_paused = true)]
+async fn dedicated_calls_leave_connections_for_other_requests() {
+    let fake = FakeCore::accepting(&["zc_a"]);
+    let limits = PoolLimits {
+        max_dedicated: 1,
+        ..PoolLimits::default()
+    };
+    let core = core_over(&fake, true, limits);
+    let pool = pool_of(&core);
+    let alice = headers(Some("zc_a"), None);
+
+    let first = core
+        .access_dedicated(&alice)
+        .await
+        .expect("a dedicated connection");
+    let dials = fake.dials();
+    let started = tokio::time::Instant::now();
+    match core.access_dedicated(&alice).await {
+        Err(CoreError::Busy) => {}
+        Err(error) => panic!("refused otherwise: {error:?}"),
+        Ok(_) => panic!("a dedicated connection past the limit"),
+    }
+    assert!(
+        started.elapsed() >= CAPACITY_WAIT,
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(fake.dials(), dials, "nothing is dialed for a refused call");
+
+    let shared = call_for(&core, "zc_a").await;
+    connection_of(&shared).await;
+    assert_eq!(pool.open_connections(), 2);
+
+    drop(first);
+    let CoreAccess::Core(next) = core
+        .access_dedicated(&alice)
+        .await
+        .expect("the share a finished call left")
+    else {
+        panic!("served in-process");
+    };
+    connection_of(&next).await;
+    assert_eq!(pool.open_connections(), 2);
+}

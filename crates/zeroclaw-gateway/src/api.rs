@@ -18,7 +18,7 @@ use zeroclaw_rpc_proto::types::{
     CLIENT_KIND_GATEWAY, MemoryListResult, MemorySearchResult, SessionEntry, SessionListResult,
 };
 
-use crate::core_rpc::{CoreAccess, CoreCall, CoreError};
+use crate::core_rpc::{CoreAccess, CoreCall, CoreError, DedicatedCoreAccess};
 
 const MEMORY_API_CONTENT_MAX_CHARS: usize = 4096;
 
@@ -664,14 +664,20 @@ pub async fn handle_api_cron_runs(
 }
 
 /// POST /api/cron/:id/run — trigger a cron job manually
+///
+/// The route runs on the long-running router; through the core it waits as
+/// long as that router's budget, on a connection of its own.
 pub async fn handle_api_cron_run(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(id): Path<String>,
-    access: CoreAccess,
+    DedicatedCoreAccess(access): DedicatedCoreAccess,
 ) -> impl IntoResponse {
     if let CoreAccess::Core(core) = access {
-        return api_cron_run_through_core(&core, &id)
+        let budget = std::time::Duration::from_secs(
+            crate::gateway_long_running_request_timeout_secs(&state.config.read().gateway),
+        );
+        return api_cron_run_through_core(&core, &id, budget)
             .await
             .unwrap_or_else(IntoResponse::into_response);
     }
@@ -1264,13 +1270,34 @@ pub(crate) async fn api_cron_list_through_core(core: &CoreCall) -> Result<Respon
 
 /// `POST /api/cron/{id}/run` through the core. `cron/trigger` runs the job as
 /// this route does and reports the same fields, its id as `id`.
+///
+/// The core has `budget`, the route's long-running budget, to finish the
+/// run. If it does not answer in time, the run may still be going or may
+/// have finished, so the answer says so and does not suggest running the job
+/// again: that could run it twice.
 pub(crate) async fn api_cron_run_through_core(
     core: &CoreCall,
     id: &str,
+    budget: std::time::Duration,
 ) -> Result<Response, CoreError> {
-    let run = core
-        .request(Method::CronTrigger, serde_json::json!({ "id": id }))
-        .await?;
+    let run = match core
+        .request_within(Method::CronTrigger, serde_json::json!({ "id": id }), budget)
+        .await
+    {
+        Ok(run) => run,
+        Err(CoreError::Timeout) => {
+            return Ok((
+                StatusCode::GATEWAY_TIMEOUT,
+                Json(serde_json::json!({
+                    "error": "the core did not finish the run in time; it may still be running, or may have finished",
+                    "code": "core_timeout",
+                    "hint": "Check this job's runs before running it again: running it again now could run it twice.",
+                })),
+            )
+                .into_response());
+        }
+        Err(error) => return Err(error),
+    };
     Ok(Json(serde_json::json!({
         "status": run["status"],
         "job_id": run["id"],
@@ -5700,7 +5727,7 @@ pub(crate) mod tests {
             State(state.clone()),
             HeaderMap::new(),
             Path(job.id.clone()),
-            CoreAccess::InProcess,
+            DedicatedCoreAccess(CoreAccess::InProcess),
         )
         .await
         .into_response();
@@ -5988,7 +6015,7 @@ pub(crate) mod tests {
             State(state.clone()),
             HeaderMap::new(),
             Path(job.id.clone()),
-            CoreAccess::InProcess,
+            DedicatedCoreAccess(CoreAccess::InProcess),
         )
         .await
         .into_response();
@@ -6124,7 +6151,7 @@ pub(crate) mod tests {
             State(state.clone()),
             HeaderMap::new(),
             Path(job.id.clone()),
-            CoreAccess::InProcess,
+            DedicatedCoreAccess(CoreAccess::InProcess),
         )
         .await
         .into_response();
@@ -6178,7 +6205,7 @@ pub(crate) mod tests {
             State(state),
             HeaderMap::new(),
             Path("does-not-exist".to_string()),
-            CoreAccess::InProcess,
+            DedicatedCoreAccess(CoreAccess::InProcess),
         )
         .await
         .into_response();
@@ -6642,7 +6669,7 @@ pub(crate) mod tests {
             State(state.clone()),
             HeaderMap::new(),
             Path(job_id.clone()),
-            CoreAccess::InProcess,
+            DedicatedCoreAccess(CoreAccess::InProcess),
         )
         .await
         .into_response();
