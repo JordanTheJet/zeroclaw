@@ -361,7 +361,17 @@ fn principal_tool_ceiling(grants: &zeroclaw_api::grants::ResolvedGrants) -> Opti
 ///
 /// - `tui.client_kind`: `tui/list` reports the kind a connection declared
 ///   (`tui_list_labels_only_a_declared_gateway_connection`).
-pub const ADVERTISED_FEATURES: &[&str] = &[zeroclaw_rpc_proto::feature::TUI_CLIENT_KIND];
+/// - `config.patch_ops`: `config/set-many` applies a JSON Patch (`ops`, with
+///   `drift_guard`) and reports each operation and the warnings
+///   (`config_patch_needs_the_verb_each_effect_implies`).
+/// - `config.skill_bundle_dir`: `config/map-key-create` under `skill_bundles`
+///   creates the bundle's directory
+///   (`config_map_key_create_scaffolds_a_skill_bundle_directory`).
+pub const ADVERTISED_FEATURES: &[&str] = &[
+    zeroclaw_rpc_proto::feature::TUI_CLIENT_KIND,
+    zeroclaw_rpc_proto::feature::CONFIG_PATCH_OPS,
+    zeroclaw_rpc_proto::feature::CONFIG_SKILL_BUNDLE_DIR,
+];
 
 fn declared_client_kind(capabilities: Option<&Value>) -> Option<String> {
     capabilities?
@@ -39788,9 +39798,7 @@ mod tests {
                     &[Verb::Read, Verb::Update],
                 ));
                 let (alice, _rx) = roster_peer(&ctx, 4242).await;
-                let result = alice
-                    .handle_config_set_many(&json!({ "ops": [op] }))
-                    .await;
+                let result = alice.handle_config_set_many(&json!({ "ops": [op] })).await;
                 match refused_for {
                     None => {
                         let result = result.unwrap_or_else(|e| panic!("{case}: {e:?}"));
@@ -39807,6 +39815,28 @@ mod tests {
                     }
                 }
             }
+        });
+    }
+
+    #[test]
+    fn config_map_key_create_scaffolds_a_skill_bundle_directory() {
+        run_on_a_large_stack(|| async move {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let ctx = enforcement_ctx(config_write_roster_config(&tmp, 4242, &["skill_bundles.*"]));
+            let (alice, _rx) = roster_peer(&ctx, 4242).await;
+            let created = alice
+                .handle_config_map_key_create(&json!({"path": "skill_bundles", "key": "extra"}))
+                .await
+                .expect("a skill bundle is created");
+            assert_eq!(created["created"], true);
+            let config = ctx.config.read().clone();
+            let dir = zeroclaw_config::skill_bundles::resolve_directory(
+                &config,
+                &config.install_root_dir(),
+                "extra",
+            )
+            .expect("the bundle's directory");
+            assert!(dir.is_dir(), "{} was not created", dir.display());
         });
     }
 
