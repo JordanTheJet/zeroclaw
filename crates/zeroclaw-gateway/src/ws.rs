@@ -3417,7 +3417,6 @@ data: {{\"type\":\"message_stop\"}}\n\n"
 
         let response = crate::api::handle_api_session_delete(
             axum::extract::State(fixture.state.clone()),
-            crate::core_rpc::CoreAccess::InProcess,
             HeaderMap::new(),
             axum::extract::Path(session_id.to_string()),
         )
@@ -3489,7 +3488,6 @@ data: {{\"type\":\"message_stop\"}}\n\n"
 
         let response = crate::api::handle_api_session_delete(
             axum::extract::State(fixture.state.clone()),
-            crate::core_rpc::CoreAccess::InProcess,
             HeaderMap::new(),
             axum::extract::Path(session_id.to_string()),
         )

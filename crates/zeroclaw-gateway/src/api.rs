@@ -10,13 +10,10 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use zeroclaw_api::principal::PrincipalId;
 use zeroclaw_config::schema::{ChannelAliasInfo, Config};
 use zeroclaw_memory::MemoryEntry;
 use zeroclaw_rpc_client::Method;
-use zeroclaw_rpc_proto::types::{
-    SessionDeleteResult, SessionEntry, SessionListResult, SessionMessagesResult, SessionStateResult,
-};
+use zeroclaw_rpc_proto::types::{SessionEntry, SessionListResult};
 
 const MEMORY_API_CONTENT_MAX_CHARS: usize = 4096;
 
@@ -1705,16 +1702,17 @@ pub async fn handle_api_health(
 
 // ── Session API handlers ─────────────────────────────────────────
 //
-// `GET /api/sessions`, `GET /api/sessions/{id}/messages`,
-// `GET /api/sessions/{id}/state` and `DELETE /api/sessions/{id}` are served by
-// the core whenever the request reaches it (`CoreAccess::Core`): the core
-// authorizes each call for the caller's own principal and owns the reads and
-// the delete. The gateway still resolves a path id to its persisted key by
-// reading its handle on the shared store, so both paths address the same row,
-// and it builds the HTTP body with the same helpers either way. The
-// in-process arm serves a gateway with no core attached and, with pairing
-// disabled, a caller that presents no credential. Renaming, aborting,
-// appending and the running list stay in-process until the core serves them.
+// `GET /api/sessions` is served by the core whenever the request reaches it
+// (`CoreAccess::Core`): the core lists what the caller's principal may see.
+// Every route that addresses one session by id stays in-process for now:
+// - The core resolves a session id by trying `rpc_{id}`, `gw_{id}` and `{id}`
+//   in turn, so it cannot be told to act on exactly the row this gateway's
+//   resolver picked. A competing row with another prefix would be read or
+//   deleted instead. That needs an exact durable-row reference in the core.
+// - A delete must first cancel and wait for the gateway's own chat turn,
+//   which only the gateway can do, while only the core can authorize the
+//   delete. Until those turns run in the core, the two cannot be made one
+//   authorized step.
 
 /// GET /api/sessions — list gateway sessions
 pub async fn handle_api_sessions_list(
@@ -1859,13 +1857,10 @@ fn gateway_display_session_id(session_key: &str) -> &str {
 /// GET /api/sessions/{id}/messages — load persisted gateway WebSocket chat transcript
 pub async fn handle_api_session_messages(
     State(state): State<AppState>,
-    access: CoreAccess,
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    if matches!(access, CoreAccess::InProcess)
-        && let Err(e) = require_auth(&state, &headers)
-    {
+    if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
 
@@ -1879,35 +1874,17 @@ pub async fn handle_api_session_messages(
     };
 
     let session_key = resolve_gateway_session_key(&id, |key| backend.session_exists(key));
-    let messages: Vec<serde_json::Value> = match access {
-        CoreAccess::Core(core) => {
-            match core
-                .call::<SessionMessagesResult>(
-                    Method::SessionMessages,
-                    serde_json::json!({ "session_id": session_key }),
-                )
-                .await
-            {
-                Ok(page) => page
-                    .messages
-                    .into_iter()
-                    .map(|m| session_message_row(m.role, m.content, m.created_at))
-                    .collect(),
-                Err(e) => return e.into_response(),
-            }
-        }
-        CoreAccess::InProcess => backend
-            .load_with_timestamps(&session_key)
-            .into_iter()
-            .map(|m| {
-                session_message_row(
-                    m.message.role,
-                    m.message.content,
-                    m.created_at.map(|dt| dt.to_rfc3339()),
-                )
+    let msgs = backend.load_with_timestamps(&session_key);
+    let messages: Vec<serde_json::Value> = msgs
+        .into_iter()
+        .map(|m| {
+            serde_json::json!({
+                "role": m.message.role,
+                "content": m.message.content,
+                "created_at": m.created_at.map(|dt| dt.to_rfc3339()),
             })
-            .collect(),
-    };
+        })
+        .collect();
 
     Json(serde_json::json!({
         "session_id": id,
@@ -1915,19 +1892,6 @@ pub async fn handle_api_session_messages(
         "session_persistence": true,
     }))
     .into_response()
-}
-
-/// One transcript row of `GET /api/sessions/{id}/messages`.
-fn session_message_row(
-    role: String,
-    content: String,
-    created_at: Option<String>,
-) -> serde_json::Value {
-    serde_json::json!({
-        "role": role,
-        "content": content,
-        "created_at": created_at,
-    })
 }
 
 /// POST /api/sessions/{id}/messages — push a visible notification into a gateway session
@@ -2023,13 +1987,10 @@ pub async fn handle_api_session_message_post(
 /// DELETE /api/sessions/{id} — delete a gateway session
 pub async fn handle_api_session_delete(
     State(state): State<AppState>,
-    access: CoreAccess,
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    if matches!(access, CoreAccess::InProcess)
-        && let Err(e) = require_auth(&state, &headers)
-    {
+    if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
 
@@ -2043,96 +2004,67 @@ pub async fn handle_api_session_delete(
 
     let session_key = resolve_gateway_session_key(&id, |key| backend.session_exists(key));
 
-    // The gateway's own chat turns run here until the core serves chat, and
-    // only the shared operator starts them: the chat socket accepts pairing
-    // tokens alone, which the core binds to that principal. A delete bound to
-    // it cancels and waits for them exactly as before. Any other principal's
-    // delete leaves them alone, because the core, not the gateway, decides
-    // whether that caller may touch this session.
-    let settles_local_turns = match &access {
-        CoreAccess::Core(core) => core.principal_id() == Some(PrincipalId::SHARED_OPERATOR),
-        CoreAccess::InProcess => true,
+    let cancellation = {
+        let mut tokens = state
+            .cancel_tokens
+            .lock()
+            .expect("cancel_tokens lock poisoned");
+        resolve_gateway_cancel_key(&id, |key| tokens.contains_key(key))
+            .and_then(|cancel_key| tokens.remove(&cancel_key).map(|token| (cancel_key, token)))
     };
-    let mut session_guard = None;
-    if settles_local_turns {
-        let cancellation = {
-            let mut tokens = state
-                .cancel_tokens
-                .lock()
-                .expect("cancel_tokens lock poisoned");
-            resolve_gateway_cancel_key(&id, |key| tokens.contains_key(key))
-                .and_then(|cancel_key| tokens.remove(&cancel_key).map(|token| (cancel_key, token)))
-        };
-        if let Some((cancel_key, token)) = cancellation {
-            token.cancel();
-            ::zeroclaw_log::record!(
-                INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_attrs(::serde_json::json!({
-                        "session_key": session_key,
-                        "cancel_key": cancel_key,
-                    })),
-                "cancelled in-flight turn for deleted session"
-            );
-        }
-
-        // Take the same permit turns hold. The cancel above makes a running
-        // turn unwind; waiting here means neither a turn nor a reconnecting
-        // socket's history refresh can straddle the delete.
-        session_guard = match state.session_queue.acquire(&session_key).await {
-            Ok(guard) => Some(guard),
-            Err(crate::session_queue::SessionQueueError::QueueFull { .. }) => {
-                return (
-                    StatusCode::TOO_MANY_REQUESTS,
-                    Json(serde_json::json!({"error": "Session queue is full"})),
-                )
-                    .into_response();
-            }
-            Err(crate::session_queue::SessionQueueError::Timeout { .. }) => {
-                return (
-                    StatusCode::REQUEST_TIMEOUT,
-                    Json(serde_json::json!({"error": "Timed out waiting for session queue"})),
-                )
-                    .into_response();
-            }
-        };
+    if let Some((cancel_key, token)) = cancellation {
+        token.cancel();
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+                ::serde_json::json!({
+                    "session_key": session_key,
+                    "cancel_key": cancel_key,
+                })
+            ),
+            "cancelled in-flight turn for deleted session"
+        );
     }
 
-    let deleted = match access {
-        CoreAccess::Core(core) => match core
-            .call::<SessionDeleteResult>(
-                Method::SessionDelete,
-                serde_json::json!({ "session_id": session_key }),
+    // Take the same permit turns hold. The cancel above makes a running turn
+    // unwind; waiting here means neither a turn nor a reconnecting socket's
+    // history refresh can straddle the delete.
+    let _session_guard = match state.session_queue.acquire(&session_key).await {
+        Ok(guard) => guard,
+        Err(crate::session_queue::SessionQueueError::QueueFull { .. }) => {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({"error": "Session queue is full"})),
             )
-            .await
-        {
-            Ok(result) => result.deleted,
-            Err(e) => return e.into_response(),
-        },
-        CoreAccess::InProcess => match backend.delete_session(&session_key) {
-            Ok(deleted) => deleted,
-            Err(e) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({"error": format!("Failed to delete session: {e}")})),
-                )
-                    .into_response();
-            }
-        },
+                .into_response();
+        }
+        Err(crate::session_queue::SessionQueueError::Timeout { .. }) => {
+            return (
+                StatusCode::REQUEST_TIMEOUT,
+                Json(serde_json::json!({"error": "Timed out waiting for session queue"})),
+            )
+                .into_response();
+        }
     };
-    if !deleted {
-        return (
+
+    match backend.delete_session(&session_key) {
+        Ok(true) => {
+            // A connection still holding the deleted conversation must not
+            // mistake a recreation under the same key for its own history.
+            state.session_queue.advance_generation(&session_key);
+            Json(serde_json::json!({"deleted": true, "session_id": id})).into_response()
+        }
+        Ok(false) => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "Session not found"})),
         )
-            .into_response();
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to delete session: {e}")})),
+        )
+            .into_response(),
     }
-
-    // A connection still holding the deleted conversation must not mistake
-    // a recreation under the same key for its own history.
-    state.session_queue.advance_generation(&session_key);
-    drop(session_guard);
-    Json(serde_json::json!({"deleted": true, "session_id": id})).into_response()
 }
 
 /// PUT /api/sessions/{id} — rename a gateway session
@@ -2221,13 +2153,10 @@ pub async fn handle_api_sessions_running(
 /// GET /api/sessions/{id}/state — get session state
 pub async fn handle_api_session_state(
     State(state): State<AppState>,
-    access: CoreAccess,
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    if matches!(access, CoreAccess::InProcess)
-        && let Err(e) = require_auth(&state, &headers)
-    {
+    if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
 
@@ -2240,51 +2169,31 @@ pub async fn handle_api_session_state(
     };
 
     let session_key = resolve_gateway_session_key(&id, |key| backend.session_exists(key));
-    let (session_state, turn_id, turn_started_at) = match access {
-        CoreAccess::Core(core) => match core
-            .call::<SessionStateResult>(
-                Method::SessionState,
-                serde_json::json!({ "session_id": session_key }),
-            )
-            .await
-        {
-            Ok(ss) => (ss.state, ss.turn_id, ss.turn_started_at),
-            Err(e) => return e.into_response(),
-        },
-        CoreAccess::InProcess => match backend.get_session_state(&session_key) {
-            Ok(Some(ss)) => (
-                ss.state,
-                ss.turn_id,
-                ss.turn_started_at.map(|started| started.to_rfc3339()),
-            ),
-            Ok(None) => {
-                return (
-                    StatusCode::NOT_FOUND,
-                    Json(serde_json::json!({"error": "Session not found"})),
-                )
-                    .into_response();
+    match backend.get_session_state(&session_key) {
+        Ok(Some(ss)) => {
+            let mut resp = serde_json::json!({
+                "session_id": id,
+                "state": ss.state,
+            });
+            if let Some(turn_id) = ss.turn_id {
+                resp["turn_id"] = serde_json::Value::String(turn_id);
             }
-            Err(e) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({"error": format!("Failed to get session state: {e}")})),
-                )
-                    .into_response();
+            if let Some(started) = ss.turn_started_at {
+                resp["turn_started_at"] = serde_json::Value::String(started.to_rfc3339());
             }
-        },
-    };
-
-    let mut resp = serde_json::json!({
-        "session_id": id,
-        "state": session_state,
-    });
-    if let Some(turn_id) = turn_id {
-        resp["turn_id"] = serde_json::Value::String(turn_id);
+            Json(resp).into_response()
+        }
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Session not found"})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to get session state: {e}")})),
+        )
+            .into_response(),
     }
-    if let Some(started) = turn_started_at {
-        resp["turn_started_at"] = serde_json::Value::String(started);
-    }
-    Json(resp).into_response()
 }
 
 // ── Session abort endpoint ────────────────────────────────────────
@@ -4092,7 +4001,6 @@ pub(crate) mod tests {
 
         let response = handle_api_session_delete(
             State(state),
-            crate::core_rpc::CoreAccess::InProcess,
             HeaderMap::new(),
             Path("gw_team.alpha".to_string()),
         )
@@ -4137,7 +4045,6 @@ pub(crate) mod tests {
 
         let response = handle_api_session_delete(
             State(state),
-            crate::core_rpc::CoreAccess::InProcess,
             HeaderMap::new(),
             Path("team.alpha".to_string()),
         )
@@ -4347,7 +4254,6 @@ pub(crate) mod tests {
 
         let full_key_response = handle_api_session_state(
             State(state.clone()),
-            crate::core_rpc::CoreAccess::InProcess,
             HeaderMap::new(),
             Path("gw_team_alpha".to_string()),
         )
@@ -4360,7 +4266,6 @@ pub(crate) mod tests {
 
         let display_response = handle_api_session_state(
             State(state),
-            crate::core_rpc::CoreAccess::InProcess,
             HeaderMap::new(),
             Path("team_alpha".to_string()),
         )

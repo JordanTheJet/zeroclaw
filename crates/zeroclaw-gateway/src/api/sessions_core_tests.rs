@@ -1,25 +1,30 @@
-//! The ported sessions routes answer the same HTTP whether the core or the
-//! gateway's in-process body serves them.
+//! The sessions routes with a core attached.
 //!
-//! Parity runs against the daemon's real in-process connector over one
-//! session store, opened twice as in production: once by the core, once by
-//! the gateway. The delete gating and the persistence-off shortcut use a
-//! scripted core, because they are about which principal the core bound and
-//! whether the core is asked at all.
+//! `GET /api/sessions` answers the same HTTP whether the core or the
+//! gateway's in-process body serves it. Parity runs against the daemon's real
+//! in-process connector over one session store, opened twice as in
+//! production: once by the core, once by the gateway.
+//!
+//! The routes that address one session stay in-process. The rest of this
+//! module pins why, one test per hazard a core-backed version had: a revoked
+//! bearer cancelling a turn, the core acting on a competing row, a delete
+//! returning while the gateway's own turn still runs, and a transcript too
+//! large for one RPC frame.
 
 use super::tests::{response_json, test_state, test_state_with_session_backend};
 use super::*;
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use axum::http::HeaderValue;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream};
 use tokio_util::sync::CancellationToken;
-use zeroclaw_api::jsonrpc::error_codes::FORBIDDEN;
 use zeroclaw_config::schema::Config;
 use zeroclaw_infra::session_backend::{SessionBackend, SessionContext};
 use zeroclaw_providers::ChatMessage;
+use zeroclaw_runtime::rpc::context::RpcContext;
 use zeroclaw_runtime::rpc::inproc::InprocConnector;
 
 use crate::core_rpc::{CoreRpc, Dial, DialFuture};
@@ -29,6 +34,7 @@ const OPERATOR_TOKEN: &str = "zc_gw_operator";
 /// A core and a gateway over one store, with the gateway's own handle.
 struct Stores {
     _tmp: tempfile::TempDir,
+    ctx: Arc<RpcContext>,
     core: CoreRpc,
     stop: CancellationToken,
     state: AppState,
@@ -38,6 +44,15 @@ struct Stores {
 impl Drop for Stores {
     fn drop(&mut self) {
         self.stop.cancel();
+    }
+}
+
+impl Stores {
+    /// Share the core's live pairing authority with the gateway, as a
+    /// supervised gateway does: pairing required, revocation seen by both.
+    fn with_shared_pairing(mut self) -> Self {
+        self.state.pairing = Arc::clone(self.ctx.auth.pairing());
+        self
     }
 }
 
@@ -61,8 +76,7 @@ fn stores() -> Stores {
             4, 10, 60,
         )),
     ));
-    let mut ctx =
-        zeroclaw_runtime::rpc::context::RpcContext::for_live_test(config.clone(), sessions);
+    let mut ctx = RpcContext::for_live_test(config.clone(), sessions);
     Arc::get_mut(&mut ctx)
         .expect("a fresh context has one owner")
         .session_backend = Some(open_store(&config));
@@ -73,17 +87,12 @@ fn stores() -> Stores {
     let state = test_state_with_session_backend(config, Arc::clone(&backend));
     Stores {
         _tmp: tmp,
+        ctx,
         core: CoreRpc::inproc(connector, || true),
         stop,
         state,
         backend,
     }
-}
-
-/// The persisted key a WebSocket client's `ops.beta` lands under when the
-/// store sanitizes it.
-fn sanitized_ops_beta() -> String {
-    crate::gateway_session_key("ops.beta")
 }
 
 fn seed(backend: &dyn SessionBackend) {
@@ -98,19 +107,6 @@ fn seed(backend: &dyn SessionBackend) {
     backend.set_session_name("gw_alpha", "Alpha").unwrap();
     backend
         .set_session_state("gw_alpha", "running", Some("turn-7"))
-        .unwrap();
-    // A dotted id persisted raw, and one persisted under its sanitized key.
-    backend
-        .append("gw_team.alpha", &ChatMessage::user("raw dotted"))
-        .unwrap();
-    backend
-        .set_session_agent_alias("gw_team.alpha", "main")
-        .unwrap();
-    backend
-        .append(&sanitized_ops_beta(), &ChatMessage::user("sanitized"))
-        .unwrap();
-    backend
-        .set_session_agent_alias(&sanitized_ops_beta(), "main")
         .unwrap();
     // A channel session, attributable by its channel alone.
     backend
@@ -160,20 +156,17 @@ async fn answer(response: impl IntoResponse) -> (StatusCode, Value) {
     (status, response_json(response).await)
 }
 
-/// Same status; same body on success. A refusal carries the same message,
-/// and the core path adds its machine-readable `code`.
-fn assert_same_answer(what: &str, core: &(StatusCode, Value), local: &(StatusCode, Value)) {
-    assert_eq!(core.0, local.0, "{what}: status");
-    if core.0.is_success() {
-        assert_eq!(core.1, local.1, "{what}: body");
-    } else {
-        assert_eq!(core.1["error"], local.1["error"], "{what}: error message");
-        assert!(
-            core.1["code"].is_string(),
-            "{what}: the core path names a code"
-        );
-    }
+fn register_turn(state: &AppState, cancel_key: &str) -> CancellationToken {
+    let token = CancellationToken::new();
+    state
+        .cancel_tokens
+        .lock()
+        .expect("cancel_tokens lock")
+        .insert(cancel_key.to_string(), Arc::new(token.clone()));
+    token
 }
+
+// ── The listing, through the core ─────────────────────────────────
 
 #[tokio::test]
 async fn the_listing_is_the_same_through_the_core() {
@@ -194,7 +187,7 @@ async fn the_listing_is_the_same_through_the_core() {
         .await,
     )
     .await;
-    assert_same_answer("GET /api/sessions", &core, &local);
+    assert_eq!(core, local, "GET /api/sessions");
 
     let rows = core.1["sessions"].as_array().expect("a sessions array");
     let row = |key: &str| {
@@ -202,7 +195,7 @@ async fn the_listing_is_the_same_through_the_core() {
             .find(|row| row["session_key"] == key)
             .unwrap_or_else(|| panic!("{key} is listed"))
     };
-    assert_eq!(rows.len(), 5, "every attributable session, and no orphan");
+    assert_eq!(rows.len(), 3, "every attributable session, and no orphan");
     assert_eq!(row("gw_alpha")["session_id"], "alpha");
     assert_eq!(row("gw_alpha")["name"], "Alpha");
     assert_eq!(
@@ -214,190 +207,210 @@ async fn the_listing_is_the_same_through_the_core() {
     assert_eq!(row("discord.room_1")["agent_alias"], Value::Null);
 }
 
-#[tokio::test]
-async fn transcripts_are_the_same_through_the_core_timestamps_included() {
-    let stores = stores();
-    seed(&*stores.backend);
-    for id in [
-        "alpha",
-        "gw_alpha",
-        "team.alpha",
-        "gw_team.alpha",
-        "ops.beta",
-        "never-existed",
-    ] {
-        let access = through(&stores.core, OPERATOR_TOKEN).await;
-        let core = answer(
-            handle_api_session_messages(
-                State(stores.state.clone()),
-                access,
-                HeaderMap::new(),
-                Path(id.to_string()),
-            )
-            .await,
-        )
-        .await;
-        let local = answer(
-            handle_api_session_messages(
-                State(stores.state.clone()),
-                CoreAccess::InProcess,
-                HeaderMap::new(),
-                Path(id.to_string()),
-            )
-            .await,
-        )
-        .await;
-        assert_same_answer(&format!("GET messages for {id}"), &core, &local);
-    }
+// ── Why the per-session routes stay in-process ───────────────────
 
-    let access = through(&stores.core, OPERATOR_TOKEN).await;
-    let (_, body) = answer(
-        handle_api_session_messages(
+/// A revoked pairing token that still has a pooled core connection cannot
+/// cancel a turn through DELETE: the route checks the live pairing authority
+/// before it touches the gateway's turn.
+#[tokio::test]
+async fn a_revoked_bearer_with_a_pooled_connection_cancels_nothing() {
+    let stores = stores().with_shared_pairing();
+    seed(&*stores.backend);
+    let turn = register_turn(&stores.state, "gw_alpha");
+
+    // Warm the pool: a core-backed read with the operator's bearer.
+    let (status, _) = answer(
+        handle_api_sessions_list(
             State(stores.state.clone()),
-            access,
-            HeaderMap::new(),
+            through(&stores.core, OPERATOR_TOKEN).await,
+            bearer(OPERATOR_TOKEN),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    assert!(stores.ctx.auth.pairing().revoke_token(OPERATOR_TOKEN));
+    let (status, body) = answer(
+        handle_api_session_delete(
+            State(stores.state.clone()),
+            bearer(OPERATOR_TOKEN),
             Path("alpha".to_string()),
         )
         .await,
     )
     .await;
-    let messages = body["messages"].as_array().expect("a messages array");
-    assert_eq!(messages.len(), 2);
-    assert!(
-        messages.iter().all(|m| m["created_at"].is_string()),
-        "the core returns each row's persisted time: {body}"
-    );
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert!(!turn.is_cancelled(), "a refused caller cancels nothing");
+    assert!(stores.backend.session_exists("gw_alpha"));
 }
 
+/// With `gw_alpha` and a same-owner `rpc_gw_alpha`, the core resolves the
+/// id `gw_alpha` to the RPC row. The routes act on the row this gateway
+/// selected, because they do not ask the core to resolve it.
 #[tokio::test]
-async fn session_state_is_the_same_through_the_core() {
+async fn a_competing_rpc_row_never_answers_for_the_gateway_row() {
     let stores = stores();
     seed(&*stores.backend);
-    for id in [
-        "alpha",
-        "gw_alpha",
-        "team.alpha",
-        "ops.beta",
-        "never-existed",
-    ] {
-        let access = through(&stores.core, OPERATOR_TOKEN).await;
-        let core = answer(
-            handle_api_session_state(
-                State(stores.state.clone()),
-                access,
-                HeaderMap::new(),
-                Path(id.to_string()),
-            )
-            .await,
-        )
-        .await;
-        let local = answer(
-            handle_api_session_state(
-                State(stores.state.clone()),
-                CoreAccess::InProcess,
-                HeaderMap::new(),
-                Path(id.to_string()),
-            )
-            .await,
-        )
-        .await;
-        assert_same_answer(&format!("GET state for {id}"), &core, &local);
-    }
-}
-
-#[tokio::test]
-async fn deleting_is_the_same_through_the_core_and_the_core_is_the_writer() {
-    for id in ["alpha", "gw_team.alpha", "ops.beta", "never-existed"] {
-        let via_core = stores();
-        let in_process = stores();
-        seed(&*via_core.backend);
-        seed(&*in_process.backend);
-        let key = resolve_gateway_session_key(id, |k| via_core.backend.session_exists(k));
-
-        let access = through(&via_core.core, OPERATOR_TOKEN).await;
-        let core = answer(
-            handle_api_session_delete(
-                State(via_core.state.clone()),
-                access,
-                HeaderMap::new(),
-                Path(id.to_string()),
-            )
-            .await,
-        )
-        .await;
-        let local = answer(
-            handle_api_session_delete(
-                State(in_process.state.clone()),
-                CoreAccess::InProcess,
-                HeaderMap::new(),
-                Path(id.to_string()),
-            )
-            .await,
-        )
-        .await;
-        assert_same_answer(&format!("DELETE {id}"), &core, &local);
-        assert_eq!(
-            via_core.backend.session_exists(&key),
-            in_process.backend.session_exists(&key),
-            "{id}: the same row survives or goes"
-        );
-    }
-}
-
-#[tokio::test]
-async fn the_operators_delete_through_the_core_settles_the_gateways_own_turn_first() {
-    let stores = stores();
-    seed(&*stores.backend);
-    // A WebSocket turn registered under the raw dotted id, while the store
-    // holds the sanitized key: the two are resolved independently.
-    let token = CancellationToken::new();
     stores
-        .state
-        .cancel_tokens
-        .lock()
-        .expect("cancel_tokens lock")
-        .insert("gw_ops.beta".to_string(), Arc::new(token.clone()));
-    let before = stores.state.session_queue.generation(&sanitized_ops_beta());
+        .backend
+        .append(
+            "rpc_gw_alpha",
+            &ChatMessage::user("different RPC conversation"),
+        )
+        .unwrap();
 
-    let access = through(&stores.core, OPERATOR_TOKEN).await;
+    // The hazard is real: asked for `gw_alpha`, the core reads the RPC row.
+    let CoreAccess::Core(call) = through(&stores.core, OPERATOR_TOKEN).await else {
+        unreachable!()
+    };
+    let core_read = call
+        .request(Method::SessionMessages, json!({ "session_id": "gw_alpha" }))
+        .await
+        .expect("the core answers");
+    assert_eq!(
+        core_read["messages"][0]["content"], "different RPC conversation",
+        "the core's resolver prefers the rpc_ row"
+    );
+
     let (status, body) = answer(
-        handle_api_session_delete(
+        handle_api_session_messages(
             State(stores.state.clone()),
-            access,
-            HeaderMap::new(),
-            Path("ops.beta".to_string()),
+            bearer(OPERATOR_TOKEN),
+            Path("alpha".to_string()),
         )
         .await,
     )
     .await;
-
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body, json!({"deleted": true, "session_id": "ops.beta"}));
-    assert!(token.is_cancelled(), "the gateway's own turn is cancelled");
-    assert!(!stores.backend.session_exists(&sanitized_ops_beta()));
-    assert!(stores.state.session_queue.generation(&sanitized_ops_beta()) > before);
+    let contents: Vec<&str> = body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["content"].as_str().unwrap())
+        .collect();
+    assert_eq!(contents, ["hi", "hello"]);
+
+    let (status, body) = answer(
+        handle_api_session_state(
+            State(stores.state.clone()),
+            bearer(OPERATOR_TOKEN),
+            Path("alpha".to_string()),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["state"], "running");
+    assert_eq!(body["turn_id"], "turn-7");
+
+    let (status, body) = answer(
+        handle_api_session_delete(
+            State(stores.state.clone()),
+            bearer(OPERATOR_TOKEN),
+            Path("alpha".to_string()),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        !stores.backend.session_exists("gw_alpha"),
+        "the selected row goes"
+    );
+    assert!(
+        stores.backend.session_exists("rpc_gw_alpha"),
+        "the competing row stays"
+    );
 }
 
-// ── A scripted core: which principal it binds, what it answers ─────
-
-struct ScriptedCore {
-    principal: &'static str,
-    delete: Result<Value, (i32, &'static str)>,
-    methods: Mutex<Vec<String>>,
-}
-
-impl ScriptedCore {
-    fn new(principal: &'static str, delete: Result<Value, (i32, &'static str)>) -> Arc<Self> {
-        Arc::new(Self {
-            principal,
-            delete,
-            methods: Mutex::new(Vec::new()),
+/// A delete waits for the gateway's own turn on the session to finish
+/// before it answers, and a bearer the pairing authority does not know (an
+/// administrator's OIDC token, say) neither deletes nor touches that turn.
+#[tokio::test]
+async fn a_delete_answers_only_after_the_gateways_turn_has_settled() {
+    let stores = stores().with_shared_pairing();
+    seed(&*stores.backend);
+    let turn = register_turn(&stores.state, "gw_alpha");
+    let settled = Arc::new(AtomicBool::new(false));
+    let permit = stores
+        .state
+        .session_queue
+        .acquire("gw_alpha")
+        .await
+        .expect("the turn holds the session");
+    let worker = {
+        let turn = turn.clone();
+        let settled = Arc::clone(&settled);
+        zeroclaw_spawn::spawn!(async move {
+            turn.cancelled().await;
+            // Unwinding takes a moment; the permit is held throughout.
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            settled.store(true, Ordering::SeqCst);
+            drop(permit);
         })
-    }
+    };
 
-    fn methods(&self) -> Vec<String> {
-        self.methods.lock().expect("methods lock").clone()
+    let (status, _) = answer(
+        handle_api_session_delete(
+            State(stores.state.clone()),
+            bearer("zc_gw_admin_from_elsewhere"),
+            Path("alpha".to_string()),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert!(!turn.is_cancelled());
+    assert!(stores.backend.session_exists("gw_alpha"));
+
+    let (status, body) = answer(
+        handle_api_session_delete(
+            State(stores.state.clone()),
+            bearer(OPERATOR_TOKEN),
+            Path("alpha".to_string()),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        settled.load(Ordering::SeqCst),
+        "the delete answered while the turn was still running"
+    );
+    assert!(!stores.backend.session_exists("gw_alpha"));
+    worker.await.expect("worker");
+}
+
+/// A transcript larger than one RPC frame (8 MiB) is still served whole.
+#[tokio::test]
+async fn a_transcript_larger_than_an_rpc_frame_is_served_whole() {
+    let stores = stores();
+    let chunk = "x".repeat(60 * 1024);
+    for _ in 0..150 {
+        stores
+            .backend
+            .append("gw_big", &ChatMessage::user(&chunk))
+            .unwrap();
     }
+    let (status, body) = answer(
+        handle_api_session_messages(
+            State(stores.state.clone()),
+            bearer(OPERATOR_TOKEN),
+            Path("big".to_string()),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["messages"].as_array().unwrap().len(), 150);
+}
+
+// ── A scripted core: was it asked at all ─────────────────────────
+
+#[derive(Default)]
+struct ScriptedCore {
+    methods: Mutex<Vec<String>>,
 }
 
 struct Scripted(Arc<ScriptedCore>);
@@ -423,24 +436,11 @@ async fn serve_scripted(core: Arc<ScriptedCore>, stream: DuplexStream) {
         let answer = if method == "initialize" {
             json!({"jsonrpc": "2.0", "id": id, "result": {
                 "protocol_version": 1, "server_version": "scripted", "server_pid": 1,
-                "principal_id": core.principal,
+                "principal_id": "shared-operator",
             }})
         } else {
-            core.methods
-                .lock()
-                .expect("methods lock")
-                .push(method.clone());
-            match (&core.delete, method.as_str()) {
-                (Ok(result), "session/delete") => {
-                    json!({"jsonrpc": "2.0", "id": id, "result": result})
-                }
-                (Err((code, message)), "session/delete") => {
-                    json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}})
-                }
-                _ => {
-                    json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32601, "message": "unscripted"}})
-                }
-            }
+            core.methods.lock().expect("methods lock").push(method);
+            json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32601, "message": "unscripted"}})
         };
         if write
             .write_all(format!("{answer}\n").as_bytes())
@@ -452,103 +452,12 @@ async fn serve_scripted(core: Arc<ScriptedCore>, stream: DuplexStream) {
     }
 }
 
-/// A gateway with its own store seeded with `gw_alpha` and a running local
-/// turn on it.
-fn gateway_with_local_turn() -> (
-    tempfile::TempDir,
-    AppState,
-    Arc<dyn SessionBackend>,
-    CancellationToken,
-) {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let config = Config {
-        data_dir: tmp.path().to_path_buf(),
-        config_path: tmp.path().join("config.toml"),
-        ..Config::default()
-    };
-    let backend = open_store(&config);
-    seed(&*backend);
-    let state = test_state_with_session_backend(config, Arc::clone(&backend));
-    let token = CancellationToken::new();
-    state
-        .cancel_tokens
-        .lock()
-        .expect("cancel_tokens lock")
-        .insert("gw_alpha".to_string(), Arc::new(token.clone()));
-    (tmp, state, backend, token)
-}
-
-#[tokio::test]
-async fn a_delete_the_core_refuses_touches_no_local_turn() {
-    let (_tmp, state, backend, token) = gateway_with_local_turn();
-    let scripted = ScriptedCore::new(
-        "alice",
-        Err((
-            FORBIDDEN,
-            "Session not found or not owned by this principal",
-        )),
-    );
-    let core = CoreRpc::over_dialer(Scripted(Arc::clone(&scripted)));
-    let before = state.session_queue.generation("gw_alpha");
-
-    let (status, body) = answer(
-        handle_api_session_delete(
-            State(state.clone()),
-            through(&core, "zc_gw_alice").await,
-            HeaderMap::new(),
-            Path("alpha".to_string()),
-        )
-        .await,
-    )
-    .await;
-
-    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
-    assert!(!token.is_cancelled(), "a refused caller cancels nothing");
-    assert!(backend.session_exists("gw_alpha"), "and deletes nothing");
-    assert_eq!(state.session_queue.generation("gw_alpha"), before);
-    assert_eq!(scripted.methods(), vec!["session/delete"]);
-}
-
-#[tokio::test]
-async fn another_principals_delete_leaves_the_gateways_own_turn_alone() {
-    let (_tmp, state, backend, token) = gateway_with_local_turn();
-    let scripted = ScriptedCore::new(
-        "alice",
-        Ok(json!({"session_id": "gw_alpha", "deleted": true})),
-    );
-    let core = CoreRpc::over_dialer(Scripted(Arc::clone(&scripted)));
-    let before = state.session_queue.generation("gw_alpha");
-
-    let (status, body) = answer(
-        handle_api_session_delete(
-            State(state.clone()),
-            through(&core, "zc_gw_alice").await,
-            HeaderMap::new(),
-            Path("alpha".to_string()),
-        )
-        .await,
-    )
-    .await;
-
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert!(
-        !token.is_cancelled(),
-        "only the shared operator's delete cancels the gateway's own turn"
-    );
-    assert!(
-        backend.session_exists("gw_alpha"),
-        "the scripted core deleted nothing, and the gateway wrote nothing itself"
-    );
-    assert!(state.session_queue.generation("gw_alpha") > before);
-}
-
 #[tokio::test]
 async fn with_gateway_persistence_off_the_core_is_not_asked() {
-    let scripted = ScriptedCore::new("shared-operator", Ok(json!({})));
+    let scripted = Arc::new(ScriptedCore::default());
     let core = CoreRpc::over_dialer(Scripted(Arc::clone(&scripted)));
     let state = test_state(Config::default());
     assert!(state.session_backend.is_none());
-    let id = || Path("alpha".to_string());
 
     let list = answer(
         handle_api_sessions_list(
@@ -566,56 +475,8 @@ async fn with_gateway_persistence_off_the_core_is_not_asked() {
             json!({"sessions": [], "message": "Session persistence is disabled"})
         )
     );
-    let messages = answer(
-        handle_api_session_messages(
-            State(state.clone()),
-            through(&core, OPERATOR_TOKEN).await,
-            HeaderMap::new(),
-            id(),
-        )
-        .await,
-    )
-    .await;
-    assert_eq!(
-        messages,
-        (
-            StatusCode::OK,
-            json!({"session_id": "alpha", "messages": [], "session_persistence": false})
-        )
-    );
-    for response in [
-        answer(
-            handle_api_session_state(
-                State(state.clone()),
-                through(&core, OPERATOR_TOKEN).await,
-                HeaderMap::new(),
-                id(),
-            )
-            .await,
-        )
-        .await,
-        answer(
-            handle_api_session_delete(
-                State(state.clone()),
-                through(&core, OPERATOR_TOKEN).await,
-                HeaderMap::new(),
-                id(),
-            )
-            .await,
-        )
-        .await,
-    ] {
-        assert_eq!(
-            response,
-            (
-                StatusCode::NOT_FOUND,
-                json!({"error": "Session persistence is disabled"})
-            )
-        );
-    }
     assert!(
-        scripted.methods().is_empty(),
-        "no session method reached the core: {:?}",
-        scripted.methods()
+        scripted.methods.lock().unwrap().is_empty(),
+        "no session method reached the core"
     );
 }
