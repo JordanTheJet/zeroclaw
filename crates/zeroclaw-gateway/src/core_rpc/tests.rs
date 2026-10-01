@@ -88,6 +88,11 @@ impl Dial for FakeDialer {
     }
 }
 
+/// What the core answers a scoped principal that asks for a daemon-wide
+/// stream: every principal the fake core binds is scoped.
+const SCOPED_STREAM_DENIAL: &str =
+    "Scoped principals cannot read the daemon-wide log and event streams";
+
 fn reply(id: &Value, result: Value) -> String {
     format!(
         "{}\n",
@@ -148,6 +153,8 @@ async fn serve(core: Arc<FakeCore>, stream: DuplexStream, connection: usize) {
                 } else if method == Method::Health.wire_name() {
                     // Never answered: the request times out.
                     continue;
+                } else if method == Method::EventsHistory.wire_name() {
+                    refuse(&id, FORBIDDEN, SCOPED_STREAM_DENIAL)
                 } else {
                     reply(&id, json!({ "connection": connection, "principal": token }))
                 }
@@ -550,6 +557,42 @@ async fn the_pool_never_dials_on_its_own() {
         "a dropped connection was dialed again unasked"
     );
     assert_eq!(pool_of(&core).pooled(), 0);
+    fake.assert_no_credential_less_handshake();
+}
+
+#[tokio::test]
+async fn a_scoped_principal_is_refused_the_global_event_history() {
+    let fake = FakeCore::accepting(&["zc_scoped"]);
+    let core = core_over(&fake, true, PoolLimits::default());
+    let access = match core.access(&headers(Some("zc_scoped"), None)).await {
+        Ok(access @ CoreAccess::Core(_)) => access,
+        _ => panic!("a scoped bearer is served by the core"),
+    };
+    let state = crate::api::test_state(zeroclaw_config::schema::Config::default());
+    state
+        .event_buffer
+        .push(json!({ "source": "observability", "type": "agent_start" }));
+
+    let response = crate::sse::handle_events_history(
+        axum::extract::State(state),
+        headers(Some("zc_scoped"), None),
+        access,
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .expect("body")
+        .to_bytes();
+    let body: Value = serde_json::from_slice(&bytes).expect("JSON");
+    assert_eq!(body["code"], "forbidden");
+    assert_eq!(body["error"], SCOPED_STREAM_DENIAL);
+    // The gateway's own buffer is never served in place of the refusal.
+    assert!(body.get("events").is_none(), "{body}");
+    assert_eq!(fake.handshake_tokens(), ["zc_scoped"]);
     fake.assert_no_credential_less_handshake();
 }
 
