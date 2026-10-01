@@ -1924,10 +1924,13 @@ pub async fn handle_api_sessions_list(
 }
 
 /// `GET /api/sessions` through the core, as the standalone preview gateway
-/// serves it: the sessions the caller's principal may see. That gateway
-/// reaches the core over the daemon's local socket, a trusted local caller,
-/// so the core does not narrow the list to the connection's own sessions. A
-/// core with session persistence off answers the route's disabled body.
+/// serves it: the sessions the caller's principal may see. Over the daemon's
+/// local socket the core does not narrow the list to the sessions this
+/// connection opened; the principal still scopes it. A paired token is the
+/// shared operator and sees every attributable session, while an
+/// authenticated principal without the admin grant, such as an OIDC user,
+/// sees only its own. A core with session persistence off answers the
+/// route's disabled body.
 pub(crate) async fn api_sessions_list_through_core(core: &CoreCall) -> Result<Response, CoreError> {
     match core
         .call::<SessionListResult>(Method::SessionList, serde_json::json!({}))
