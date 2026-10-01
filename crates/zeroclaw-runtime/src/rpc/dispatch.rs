@@ -1,7 +1,7 @@
 //! JSON-RPC 2.0 method dispatch. Transport-agnostic.
 
 use super::context::{ConfigWriteGuard, RpcContext};
-use super::session::DurableSession;
+use super::session::{DurableSession, SessionAddress, SessionRecord};
 use super::transport::RpcTransport;
 use super::turn::{TurnAttribution, TurnOutcome, execute_turn};
 use super::types::*;
@@ -1894,7 +1894,6 @@ impl RpcDispatcher {
         session_id: &str,
         selected_mode: Option<&ChatMode>,
     ) -> Result<Option<super::session::SessionRecord>, JsonRpcError> {
-        use super::session::{DurableSession, SessionRecord};
         let mut owners: Vec<Option<String>> = Vec::new();
         let live = self
             .ctx
@@ -1947,27 +1946,7 @@ impl RpcDispatcher {
             return Ok(None);
         };
         if owners.iter().any(|owner| *owner != first) {
-            if self.scoped_principal_id().is_some() {
-                return Err(rpc_err(
-                    FORBIDDEN,
-                    "Session not found or not owned by this principal",
-                ));
-            }
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                    .with_category(::zeroclaw_log::EventCategory::System)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({
-                        "session_id": session_id,
-                        "records": owners.len(),
-                    })),
-                "session records under one id disagree about their owner; refusing the ambiguous id"
-            );
-            return Err(rpc_err(
-                INTERNAL_ERROR,
-                "Session records disagree about their owner; refusing to act on an ambiguous session id",
-            ));
+            return Err(self.refuse_disagreeing_owners(session_id, owners.len()));
         }
         // A live incarnation chooses its own durable domain. A reaped id
         // present in both stores has no canonical mode and must be reopened
@@ -2003,6 +1982,141 @@ impl RpcDispatcher {
         }))
     }
 
+    /// The refusal for records under one name that disagree about their
+    /// owner: the uniform ownership denial for a scoped caller, an audited
+    /// ambiguity error for an unscoped one.
+    fn refuse_disagreeing_owners(&self, name: &str, records: usize) -> JsonRpcError {
+        if self.scoped_principal_id().is_some() {
+            return rpc_err(
+                FORBIDDEN,
+                "Session not found or not owned by this principal",
+            );
+        }
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_category(::zeroclaw_log::EventCategory::System)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({
+                    "session_id": name,
+                    "records": records,
+                })),
+            "session records under one id disagree about their owner; refusing the ambiguous id"
+        );
+        rpc_err(
+            INTERNAL_ERROR,
+            "Session records disagree about their owner; refusing to act on an ambiguous session id",
+        )
+    }
+
+    /// Resolve exactly one chat-store row and, for an `rpc_<id>` key, the
+    /// live chat session `<id>` it belongs to. Nothing else is searched: no
+    /// prefix is added, and neither other keys nor the ACP store are read.
+    async fn resolve_chat_key(&self, key: &str) -> Result<Option<SessionRecord>, JsonRpcError> {
+        let address = SessionAddress::ChatKey(key.to_owned());
+        let live = match address.live_id() {
+            Some(id) => self
+                .ctx
+                .sessions
+                .owner_generation_and_mode(id)
+                .await
+                .filter(|(_, _, mode)| address.covers(mode)),
+            None => None,
+        };
+        let meta = self
+            .ctx
+            .session_backend
+            .as_ref()
+            .and_then(|backend| backend.get_session_metadata(key));
+        let owners: Vec<Option<String>> = live
+            .iter()
+            .map(|(owner, _, _)| owner.clone())
+            .chain(meta.iter().map(|meta| meta.principal_id.clone()))
+            .collect();
+        let Some(first) = owners.first().cloned() else {
+            return Ok(None);
+        };
+        if owners.iter().any(|owner| *owner != first) {
+            return Err(self.refuse_disagreeing_owners(key, owners.len()));
+        }
+        Ok(Some(SessionRecord {
+            live_generation: live.map(|(_, generation, _)| generation),
+            durable: meta.map(|_| DurableSession::Chat {
+                key: key.to_owned(),
+            }),
+            owner: first,
+        }))
+    }
+
+    async fn resolve_address(
+        &self,
+        address: &SessionAddress,
+        selected_mode: Option<&ChatMode>,
+    ) -> Result<Option<SessionRecord>, JsonRpcError> {
+        match address {
+            SessionAddress::Id(id) => {
+                self.resolve_session_record_for_mode(id, selected_mode)
+                    .await
+            }
+            SessionAddress::ChatKey(key) => self.resolve_chat_key(key).await,
+        }
+    }
+
+    /// What a call names: its `session_keys`, when given, else its
+    /// `session_id`.
+    ///
+    /// With keys, the first one naming a stored chat session this caller may
+    /// see wins. An unscoped caller sees every row; a scoped principal only
+    /// its own, so a key naming someone else's row is passed over exactly as
+    /// if it named nothing, and the answer cannot reveal that it exists. When
+    /// no key names a visible row, the last key is addressed and the
+    /// operation reports it as absent (or, for a scoped principal, gives the
+    /// uniform ownership denial).
+    async fn session_address(
+        &self,
+        session_id: &str,
+        session_keys: Option<&[String]>,
+    ) -> Result<SessionAddress, JsonRpcError> {
+        let Some(keys) = session_keys else {
+            return Ok(SessionAddress::Id(session_id.to_owned()));
+        };
+        if keys.is_empty() || keys.len() > MAX_SESSION_KEYS || keys.iter().any(String::is_empty) {
+            return Err(rpc_err(
+                INVALID_PARAMS,
+                format!("session_keys must list 1 to {MAX_SESSION_KEYS} non-empty keys"),
+            ));
+        }
+        let scope = self.scoped_principal_id();
+        for key in keys {
+            let record = match self.resolve_chat_key(key).await {
+                Ok(record) => record,
+                Err(error) if scope.is_some() && error.code == FORBIDDEN => continue,
+                Err(error) => return Err(error),
+            };
+            let visible = record
+                .as_ref()
+                .is_some_and(|record| match scope.as_deref() {
+                    Some(mine) => record.owner.as_deref() == Some(mine),
+                    None => true,
+                });
+            if visible {
+                return Ok(SessionAddress::ChatKey(key.clone()));
+            }
+        }
+        let last = keys.last().cloned().unwrap_or_default();
+        Ok(SessionAddress::ChatKey(last))
+    }
+
+    /// The live incarnation `address` covers: its generation and mode.
+    async fn live_identity(&self, address: &SessionAddress) -> Option<(u64, ChatMode)> {
+        let id = address.live_id()?;
+        self.ctx
+            .sessions
+            .generation_and_mode(id)
+            .await
+            .filter(|(_, mode)| address.covers(mode))
+    }
+
     /// Enforce principal ownership for one session-targeting operation and
     /// hand back the resolved record the operation must act on.
     ///
@@ -2028,9 +2142,22 @@ impl RpcDispatcher {
         method: Method,
         selected_mode: Option<&ChatMode>,
     ) -> Result<Option<super::session::SessionRecord>, JsonRpcError> {
-        let record = self
-            .resolve_session_record_for_mode(session_id, selected_mode)
-            .await?;
+        self.authorize_address(
+            &SessionAddress::Id(session_id.to_owned()),
+            method,
+            selected_mode,
+        )
+        .await
+    }
+
+    /// [`Self::authorize_session_owner_for_mode`] for any address.
+    async fn authorize_address(
+        &self,
+        address: &SessionAddress,
+        method: Method,
+        selected_mode: Option<&ChatMode>,
+    ) -> Result<Option<SessionRecord>, JsonRpcError> {
+        let record = self.resolve_address(address, selected_mode).await?;
         match self.scoped_principal_id() {
             Some(mine) => match &record {
                 Some(rec) if rec.owner.as_deref() == Some(mine.as_str()) => Ok(record),
@@ -2056,7 +2183,7 @@ impl RpcDispatcher {
                             .with_category(::zeroclaw_log::EventCategory::System)
                             .with_attrs(::serde_json::json!({
                                 "method": method.wire_name(),
-                                "session_id": session_id,
+                                "session_id": address.name(),
                                 "owner_principal": other,
                                 "principal_id": actor,
                             })),
@@ -2086,6 +2213,16 @@ impl RpcDispatcher {
         session_id: &str,
         authorized: Option<&super::session::SessionRecord>,
     ) -> Result<Option<super::session::SessionRecord>, JsonRpcError> {
+        self.revalidate_admitted_address(&SessionAddress::Id(session_id.to_owned()), authorized)
+            .await
+    }
+
+    /// [`Self::revalidate_admitted_session`] for any address.
+    async fn revalidate_admitted_address(
+        &self,
+        address: &SessionAddress,
+        authorized: Option<&SessionRecord>,
+    ) -> Result<Option<SessionRecord>, JsonRpcError> {
         let selected_mode = authorized
             .filter(|record| record.live_generation.is_some())
             .and_then(|record| match record.durable.as_ref() {
@@ -2094,7 +2231,7 @@ impl RpcDispatcher {
                 None => None,
             });
         let current = self
-            .resolve_session_record_for_mode(session_id, selected_mode.as_ref())
+            .resolve_address(address, selected_mode.as_ref())
             .await?;
         let scope = self.scoped_principal_id();
         if let Some(mine) = scope.as_deref()
@@ -2859,7 +2996,7 @@ impl RpcDispatcher {
 
         match result {
             Ok(v) => self.send_result(req_id, v).await,
-            Err(e) => self.send_error(req_id, e.code, &e.message).await,
+            Err(e) => self.send_rpc_error(req_id, e).await,
         }
     }
 
@@ -6583,8 +6720,11 @@ impl RpcDispatcher {
     async fn handle_session_messages(&self, params: &Value) -> RpcResult {
         let req: SessionMessagesParams = parse_params(params)?;
         let cursor_mode = params.get("cursor").is_some();
+        let address = self
+            .session_address(&req.session_id, req.session_keys.as_deref())
+            .await?;
         let authorized = self
-            .authorize_session_owner(&req.session_id, Method::SessionMessages)
+            .authorize_address(&address, Method::SessionMessages, None)
             .await?;
         if cursor_mode && req.before_index.is_some() {
             return Err(rpc_err(
@@ -6592,7 +6732,7 @@ impl RpcDispatcher {
                 "cursor pagination cannot be combined with before_index",
             ));
         }
-        let initial_identity = self.ctx.sessions.generation_and_mode(&req.session_id).await;
+        let initial_identity = self.live_identity(&address).await;
         // Live reads do not queue behind a running turn. Reaped reads need
         // admission because checkpoint recovery changes durable history.
         let mut session_guard = if initial_identity.is_none() {
@@ -6600,31 +6740,35 @@ impl RpcDispatcher {
                 self.ctx
                     .sessions
                     .session_queue
-                    .acquire(&req.session_id)
+                    .acquire(address.queue_id())
                     .await
                     .map_err(|error| rpc_err(SESSION_BUSY, format!("Session busy: {error}")))?,
             )
         } else {
             None
         };
-        let mut live_identity = self.ctx.sessions.generation_and_mode(&req.session_id).await;
+        let mut live_identity = self.live_identity(&address).await;
         if live_identity.is_none() && session_guard.is_none() {
             session_guard = Some(
                 self.ctx
                     .sessions
                     .session_queue
-                    .acquire(&req.session_id)
+                    .acquire(address.queue_id())
                     .await
                     .map_err(|error| rpc_err(SESSION_BUSY, format!("Session busy: {error}")))?,
             );
-            live_identity = self.ctx.sessions.generation_and_mode(&req.session_id).await;
+            live_identity = self.live_identity(&address).await;
         }
         let record = if session_guard.is_some() {
-            self.revalidate_admitted_session(&req.session_id, authorized.as_ref())
+            self.revalidate_admitted_address(&address, authorized.as_ref())
                 .await?
         } else {
             authorized
         };
+        // The caller's credential may have been revoked while this read
+        // waited for admission; check it again before anything is read or
+        // recovered.
+        self.recheck_authority_after_admission(Method::SessionMessages)?;
         let durable = record.as_ref().and_then(|record| record.durable.clone());
         let expected_owner = record.as_ref().and_then(|record| record.owner.clone());
         let mut cursor_result = None;
@@ -6777,7 +6921,7 @@ impl RpcDispatcher {
             && !self
                 .ctx
                 .sessions
-                .matches_generation_and_mode(&req.session_id, identity)
+                .matches_generation_and_mode(address.queue_id(), identity)
                 .await
         {
             return Err(rpc_err(
@@ -6801,7 +6945,23 @@ impl RpcDispatcher {
         let total = messages.len();
         let limit = req.limit.unwrap_or(total);
         let end = req.before_index.map(|i| i.min(total)).unwrap_or(total);
-        let start = end.saturating_sub(limit);
+        let mut start = end.saturating_sub(limit);
+        if let Some(max_bytes) = req.max_bytes {
+            start = newest_entries_within(&messages[start..end], max_bytes)
+                .map(|kept| end - kept)
+                .map_err(|(index, bytes)| JsonRpcError {
+                    code: INVALID_PARAMS,
+                    message: format!(
+                        "message {} is {bytes} bytes, more than max_bytes {max_bytes}",
+                        start + index
+                    ),
+                    data: Some(serde_json::json!({
+                        "reason": "entry_exceeds_max_bytes",
+                        "index": start + index,
+                        "bytes": bytes,
+                    })),
+                })?;
+        }
         let messages = messages[start..end].to_vec();
 
         to_result(SessionMessagesResult {
@@ -6815,20 +6975,23 @@ impl RpcDispatcher {
     }
 
     async fn handle_session_state(&self, params: &Value) -> RpcResult {
-        let req: SessionIdParams = parse_params(params)?;
-        let record = self
-            .authorize_session_owner(&req.session_id, Method::SessionState)
+        let req: SessionTargetParams = parse_params(params)?;
+        let address = self
+            .session_address(&req.session_id, req.session_keys.as_deref())
             .await?;
-        if self.ctx.sessions.get_agent(&req.session_id).await.is_some() {
-            let turn_generation = self.ctx.sessions.inflight_turn_generation(&req.session_id);
-            let plan = self.ctx.sessions.get_plan(&req.session_id).await;
-            let queued = self
-                .ctx
-                .sessions
-                .session_queue
-                .queue_depth(&req.session_id)
-                .await
-                > 0;
+        let record = self
+            .authorize_address(&address, Method::SessionState, None)
+            .await?;
+        let live_id = match &address {
+            SessionAddress::Id(id) => Some(id.as_str()),
+            SessionAddress::ChatKey(_) => self.live_identity(&address).await.and(address.live_id()),
+        };
+        if let Some(live_id) = live_id
+            && self.ctx.sessions.get_agent(live_id).await.is_some()
+        {
+            let turn_generation = self.ctx.sessions.inflight_turn_generation(live_id);
+            let plan = self.ctx.sessions.get_plan(live_id).await;
+            let queued = self.ctx.sessions.session_queue.queue_depth(live_id).await > 0;
             return to_result(SessionStateResult {
                 session_id: req.session_id,
                 state: if turn_generation.is_some() || queued {
@@ -6876,11 +7039,14 @@ impl RpcDispatcher {
     }
 
     async fn handle_session_delete(&self, params: &Value) -> RpcResult {
-        let req: SessionIdParams = parse_params(params)?;
-        let authorized = self
-            .authorize_session_owner(&req.session_id, Method::SessionDelete)
+        let req: SessionTargetParams = parse_params(params)?;
+        let address = self
+            .session_address(&req.session_id, req.session_keys.as_deref())
             .await?;
-        let requested_identity = self.ctx.sessions.generation_and_mode(&req.session_id).await;
+        let authorized = self
+            .authorize_address(&address, Method::SessionDelete, None)
+            .await?;
+        let requested_identity = self.live_identity(&address).await;
         let requested_generation = requested_identity
             .as_ref()
             .map(|(generation, _)| *generation);
@@ -6895,20 +7061,24 @@ impl RpcDispatcher {
             ));
         }
         self.ctx.sessions.wait_test_removal_signal_pause().await;
-        self.ctx
-            .sessions
-            .signal_session_removal_for_generation(&req.session_id, requested_generation);
+        // A chat key other than `rpc_<id>` covers no live session, so it
+        // must not signal one that merely shares its spelling.
+        if let Some(live_id) = address.live_id() {
+            self.ctx
+                .sessions
+                .signal_session_removal_for_generation(live_id, requested_generation);
+        }
         self.ctx.sessions.notify_test_removal_signal_attempted();
         let _guard = self
             .ctx
             .sessions
             .session_queue
-            .acquire(&req.session_id)
+            .acquire(address.queue_id())
             .await
             .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?;
 
         let record = match self
-            .revalidate_admitted_session(&req.session_id, authorized.as_ref())
+            .revalidate_admitted_address(&address, authorized.as_ref())
             .await
         {
             Ok(record) => record,
@@ -6917,10 +7087,7 @@ impl RpcDispatcher {
                 // before admission. Its durable row is still the authorized
                 // target only if the owner and storage domain are unchanged.
                 let current = self
-                    .resolve_session_record_for_mode(
-                        &req.session_id,
-                        requested_identity.as_ref().map(|(_, mode)| mode),
-                    )
+                    .resolve_address(&address, requested_identity.as_ref().map(|(_, mode)| mode))
                     .await?;
                 if current.as_ref().is_some_and(|record| {
                     record.live_generation.is_none()
@@ -6951,6 +7118,10 @@ impl RpcDispatcher {
                 "Session was replaced before delete",
             ));
         }
+
+        // The caller's credential may have been revoked while the delete
+        // waited for admission; it must still hold at the effect.
+        self.recheck_authority_after_admission(Method::SessionDelete)?;
 
         // Delete the durable record first. A storage failure must leave the
         // live session available rather than silently dropping its owner.
@@ -6991,9 +7162,12 @@ impl RpcDispatcher {
             }
             None => false,
         };
+        // A live generation is only ever resolved for an address that can
+        // have one, so `queue_id` is its live id here.
+        let live_id = address.queue_id();
         let live_removed = match record.as_ref().and_then(|r| r.live_generation) {
             Some(generation) => {
-                if let Some(agent) = self.ctx.sessions.get_agent(&req.session_id).await {
+                if let Some(agent) = self.ctx.sessions.get_agent(live_id).await {
                     agent
                         .lock()
                         .await
@@ -7002,13 +7176,13 @@ impl RpcDispatcher {
                 }
                 self.ctx
                     .sessions
-                    .remove_generation(&req.session_id, generation)
+                    .remove_generation(live_id, generation)
                     .await
             }
             None => false,
         };
         if live_removed && let Some(ref hooks) = self.ctx.hooks {
-            hooks.fire_session_end(&req.session_id, "rpc").await;
+            hooks.fire_session_end(live_id, "rpc").await;
         }
         if !live_removed && !durable_deleted {
             return Err(rpc_err(SESSION_NOT_FOUND, "Session not found"));
@@ -9558,14 +9732,15 @@ impl RpcDispatcher {
     }
 
     async fn send_error(&self, id: Value, code: i32, message: &str) {
+        self.send_rpc_error(id, rpc_err(code, message)).await;
+    }
+
+    /// Answer `id` with a method's refusal, including any `data` it carries.
+    async fn send_rpc_error(&self, id: Value, error: JsonRpcError) {
         let resp = JsonRpcResponse {
             jsonrpc: JSONRPC_VERSION,
             result: None,
-            error: Some(JsonRpcError {
-                code,
-                message: message.to_string(),
-                data: None,
-            }),
+            error: Some(error),
             id,
         };
         if let Ok(json) = serde_json::to_string(&resp) {
@@ -10449,6 +10624,27 @@ impl RpcDispatcher {
         );
         self.schedule_daemon_reload(crate::quickstart::Surface::Tui.as_str())
     }
+}
+
+/// How many of the newest `entries` fit in `max_bytes` of serialized JSON
+/// (each entry as it appears in the result, plus its separating comma).
+/// `Err((index, bytes))` names the newest entry that does not fit even alone.
+fn newest_entries_within(
+    entries: &[MessageEntry],
+    max_bytes: usize,
+) -> Result<usize, (usize, usize)> {
+    let mut used = 0usize;
+    for (kept, (index, entry)) in entries.iter().enumerate().rev().enumerate() {
+        let bytes = serde_json::to_vec(entry).map_or(usize::MAX, |encoded| encoded.len()) + 1;
+        if used + bytes > max_bytes {
+            if kept == 0 {
+                return Err((index, bytes - 1));
+            }
+            return Ok(kept);
+        }
+        used += bytes;
+    }
+    Ok(entries.len())
 }
 
 fn conversation_message_entries(messages: &[ConversationMessage]) -> Vec<MessageEntry> {
@@ -38611,5 +38807,379 @@ mod tests {
             .await
             .expect("an aborted shutdown must still end the prompt it was joining")
             .expect_err("the prompt must be aborted rather than run to completion");
+    }
+
+    // ── Exact chat-row addressing (`session_keys`) ───────────────────
+
+    fn seed_chat_row(
+        backend: &zeroclaw_infra::session_sqlite::SqliteSessionBackend,
+        key: &str,
+        lines: &[&str],
+        owner: Option<&str>,
+    ) {
+        use zeroclaw_infra::session_backend::SessionBackend as _;
+        for line in lines {
+            backend
+                .append(key, &zeroclaw_providers::ChatMessage::user(*line))
+                .expect("seed the chat row");
+        }
+        if let Some(owner) = owner {
+            backend
+                .set_session_principal(key, owner)
+                .expect("stamp the row's owner");
+        }
+    }
+
+    fn contents(result: &Value) -> Vec<String> {
+        result["messages"]
+            .as_array()
+            .expect("a messages array")
+            .iter()
+            .map(|m| m["content"].as_str().unwrap_or_default().to_owned())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn session_keys_address_exactly_the_named_chat_row() {
+        use zeroclaw_infra::session_backend::SessionBackend as _;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, _sessions, chat, _acp) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        seed_chat_row(&chat, "gw_alpha", &["hi", "hello"], None);
+        seed_chat_row(&chat, "rpc_gw_alpha", &["different RPC conversation"], None);
+        chat.set_session_state("gw_alpha", "running", Some("turn-7"))
+            .unwrap();
+
+        // The id path is unchanged: `gw_alpha` resolves to the RPC row first.
+        let by_id = dispatcher
+            .handle_session_messages_for_test(&json!({"session_id": "gw_alpha"}))
+            .await
+            .unwrap();
+        assert_eq!(contents(&by_id), ["different RPC conversation"]);
+
+        // Exact keys reach exactly the gateway row, whatever else exists.
+        let keys = json!(["alpha", "gw_alpha"]);
+        let exact = dispatcher
+            .handle_session_messages_for_test(&json!({"session_id": "alpha", "session_keys": keys}))
+            .await
+            .unwrap();
+        assert_eq!(contents(&exact), ["hi", "hello"]);
+        assert_eq!(exact["session_id"], "alpha", "the session id is echoed");
+        let state = dispatcher
+            .handle_session_state(&json!({"session_id": "alpha", "session_keys": keys}))
+            .await
+            .unwrap();
+        assert_eq!(state["state"], "running");
+        assert_eq!(state["turn_id"], "turn-7");
+        let deleted = dispatcher
+            .handle_session_delete(&json!({"session_id": "alpha", "session_keys": keys}))
+            .await
+            .unwrap();
+        assert_eq!(deleted["deleted"], true);
+        assert!(!chat.session_exists("gw_alpha"), "the named row goes");
+        assert!(
+            chat.session_exists("rpc_gw_alpha"),
+            "the competing row stays"
+        );
+
+        // Keys that name nothing: an empty transcript, and not-found for
+        // state and delete, as for an unknown id.
+        let none = json!({"session_id": "alpha", "session_keys": ["gw_alpha"]});
+        let empty = dispatcher
+            .handle_session_messages_for_test(&none)
+            .await
+            .unwrap();
+        assert!(contents(&empty).is_empty());
+        for result in [
+            dispatcher.handle_session_state(&none).await,
+            dispatcher.handle_session_delete(&none).await,
+        ] {
+            assert_eq!(result.unwrap_err().code, SESSION_NOT_FOUND);
+        }
+
+        for bad in [json!([]), json!(["a", "b", "c", "d", "e"]), json!([""])] {
+            let error = dispatcher
+                .handle_session_state(&json!({"session_id": "alpha", "session_keys": bad}))
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, INVALID_PARAMS, "{bad}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_chat_key_covers_only_its_own_live_session() {
+        use zeroclaw_infra::session_backend::SessionBackend as _;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, sessions, chat, _acp) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        // A live RPC session that a client named `gw_alpha`, and the gateway's
+        // own stored `gw_alpha` row: same spelling, different sessions.
+        dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "session_id": "gw_alpha",
+            }))
+            .await
+            .expect("the live session starts");
+        seed_chat_row(&chat, "gw_alpha", &["gateway row"], None);
+        chat.set_session_state("gw_alpha", "running", Some("turn-7"))
+            .unwrap();
+
+        let gateway_row = json!({"session_id": "alpha", "session_keys": ["gw_alpha"]});
+        let state = dispatcher.handle_session_state(&gateway_row).await.unwrap();
+        assert_eq!(
+            state["turn_id"], "turn-7",
+            "the gateway row's stored state, not the live session's"
+        );
+        let rpc_row = json!({"session_id": "gw_alpha", "session_keys": ["rpc_gw_alpha"]});
+        let live = dispatcher.handle_session_state(&rpc_row).await.unwrap();
+        assert_eq!(
+            live["state"], "idle",
+            "rpc_<id> covers the live session <id>"
+        );
+
+        dispatcher
+            .handle_session_delete(&gateway_row)
+            .await
+            .expect("the gateway row is deleted");
+        assert!(!chat.session_exists("gw_alpha"));
+        assert!(
+            sessions.get_agent("gw_alpha").await.is_some(),
+            "the live session sharing the spelling is untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_keys_never_show_a_scoped_principal_another_principals_row() {
+        use zeroclaw_infra::session_backend::SessionBackend as _;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = two_user_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (fixture, _sessions, chat, _acp) = make_persistence_test_dispatcher(config, &data_dir);
+        let ctx = Arc::clone(&fixture.ctx);
+        let alice = scoped_dispatcher(&ctx, 4242).await;
+        seed_chat_row(&chat, "gw_shared", &["bob's"], Some("user:bob"));
+        seed_chat_row(&chat, "gw_alice", &["alice's"], Some("user:alice"));
+
+        let bobs = json!({"session_id": "shared", "session_keys": ["gw_shared"]});
+        let nothing = json!({"session_id": "shared", "session_keys": ["gw_nothing"]});
+        for params in [&bobs, &nothing] {
+            let read = alice
+                .handle_session_messages_for_test(params)
+                .await
+                .unwrap_err();
+            let state = alice.handle_session_state(params).await.unwrap_err();
+            let delete = alice.handle_session_delete(params).await.unwrap_err();
+            for error in [&read, &state, &delete] {
+                assert_eq!(error.code, FORBIDDEN, "{params}");
+                assert_eq!(
+                    error.message, "Session not found or not owned by this principal",
+                    "another's row and no row are indistinguishable"
+                );
+            }
+        }
+        assert!(chat.session_exists("gw_shared"), "bob's row survives");
+
+        // Bob's row is passed over as if absent; alice reaches her own.
+        let both = json!({"session_id": "x", "session_keys": ["gw_shared", "gw_alice"]});
+        let mine = alice.handle_session_messages_for_test(&both).await.unwrap();
+        assert_eq!(contents(&mine), ["alice's"]);
+        alice
+            .handle_session_delete(&both)
+            .await
+            .expect("alice deletes her own row");
+        assert!(!chat.session_exists("gw_alice"));
+        assert!(chat.session_exists("gw_shared"));
+    }
+
+    #[tokio::test]
+    async fn max_bytes_pages_newest_first_and_refuses_an_oversized_entry() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, _sessions, chat, _acp) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        let lines: Vec<String> = (0..10)
+            .map(|n| format!("{n}:{}", "x".repeat(900)))
+            .collect();
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        seed_chat_row(&chat, "gw_big", &refs, None);
+
+        let mut collected: Vec<String> = Vec::new();
+        let mut before: Option<usize> = None;
+        let mut pages = 0;
+        loop {
+            let page = dispatcher
+                .handle_session_messages_for_test(&json!({
+                    "session_id": "big",
+                    "session_keys": ["gw_big"],
+                    "max_bytes": 3500,
+                    "before_index": before,
+                }))
+                .await
+                .unwrap();
+            let encoded = serde_json::to_vec(&page["messages"]).unwrap().len();
+            assert!(encoded <= 3500 + 2, "page of {encoded} bytes");
+            assert_eq!(page["total"], 10);
+            let mut batch = contents(&page);
+            batch.append(&mut collected);
+            collected = batch;
+            pages += 1;
+            let start = page["start"].as_u64().unwrap() as usize;
+            if start == 0 {
+                break;
+            }
+            before = Some(start);
+        }
+        assert!(pages > 1, "a small bound takes several pages");
+        assert_eq!(collected, lines, "every message, in order");
+
+        seed_chat_row(&chat, "gw_huge", &[&"y".repeat(5000)], None);
+        let error = dispatcher
+            .handle_session_messages_for_test(&json!({
+                "session_id": "huge",
+                "session_keys": ["gw_huge"],
+                "max_bytes": 3000,
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, INVALID_PARAMS);
+        let data = error.data.expect("the refusal says why");
+        assert_eq!(data["reason"], "entry_exceeds_max_bytes");
+        assert_eq!(data["index"], 0);
+    }
+
+    /// A dispatcher authenticated with a native pairing token, over a store
+    /// holding `gw_alpha`.
+    async fn paired_dispatcher_over_alpha(
+        tmp: &tempfile::TempDir,
+    ) -> (
+        RpcDispatcher,
+        Arc<RpcContext>,
+        Arc<zeroclaw_infra::session_sqlite::SqliteSessionBackend>,
+    ) {
+        let mut config = make_acp_test_config(tmp);
+        config.gateway.paired_tokens = vec!["zc_tok".to_string()];
+        let chat = Arc::new(
+            zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(&config.data_dir).unwrap(),
+        );
+        seed_chat_row(&chat, "gw_alpha", &["kept"], None);
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(
+            16,
+            Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
+                4, 10, 60,
+            )),
+        ));
+        let ctx = RpcContext::for_persistence_tests(
+            config,
+            sessions,
+            Some(chat.clone() as Arc<dyn zeroclaw_infra::session_backend::SessionBackend>),
+            None,
+        );
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let mut dispatcher = RpcDispatcher::new(Arc::clone(&ctx), tx, "wss:test".into())
+            .with_transport(
+                crate::rpc::transport::TransportKind::Wss,
+                crate::security::auth_provider::Credential::None,
+            );
+        dispatcher
+            .handle_initialize(&json!({"auth_token": "zc_tok"}))
+            .await
+            .expect("the paired token authenticates");
+        (dispatcher, ctx, chat)
+    }
+
+    /// A pairing token revoked while a delete or a stored-transcript read
+    /// waits for the session's admission is refused at the effect: nothing
+    /// is deleted or read under a credential that no longer holds.
+    #[tokio::test]
+    async fn a_credential_revoked_during_admission_is_refused_at_the_effect() {
+        let params = json!({"session_id": "alpha", "session_keys": ["gw_alpha"]});
+        for method in [Method::SessionDelete, Method::SessionMessages] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let (dispatcher, ctx, chat) = paired_dispatcher_over_alpha(&tmp).await;
+            let held = ctx
+                .sessions
+                .session_queue
+                .acquire("gw_alpha")
+                .await
+                .expect("the test holds the session's admission");
+            let operation = async {
+                match method {
+                    Method::SessionDelete => dispatcher.handle_session_delete(&params).await,
+                    _ => dispatcher.handle_session_messages(&params).await,
+                }
+            };
+            let mut operation = Box::pin(operation);
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(100), &mut operation)
+                    .await
+                    .is_err(),
+                "{method:?} waits for admission"
+            );
+            assert!(ctx.auth.pairing().revoke_token("zc_tok"));
+            drop(held);
+            let refused = tokio::time::timeout(std::time::Duration::from_secs(5), operation)
+                .await
+                .expect("the operation finishes once admitted")
+                .expect_err("a revoked credential is refused at the effect");
+            assert_eq!(refused.code, AUTH_REQUIRED, "{method:?}: {refused:?}");
+            assert!(
+                chat.session_exists("gw_alpha"),
+                "{method:?} deleted nothing"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refusals_data_reaches_the_wire() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let chat = Arc::new(
+            zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(&config.data_dir).unwrap(),
+        );
+        seed_chat_row(&chat, "gw_huge", &[&"y".repeat(5000)], None);
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(
+            16,
+            Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
+                4, 10, 60,
+            )),
+        ));
+        let ctx = RpcContext::for_persistence_tests(
+            config,
+            sessions,
+            Some(chat as Arc<dyn zeroclaw_infra::session_backend::SessionBackend>),
+            None,
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let mut dispatcher = RpcDispatcher::new(ctx, tx, "test-peer".into());
+        dispatcher.set_authenticated_for_test();
+
+        let messages_call = |params: Value| {
+            json!({
+                "jsonrpc": "2.0", "id": 7, "method": "session/messages", "params": params,
+            })
+            .to_string()
+        };
+        let line = messages_call(json!({
+            "session_id": "huge", "session_keys": ["gw_huge"], "max_bytes": 3000,
+        }));
+        Box::pin(dispatcher.process_line_for_test(&line)).await;
+        let frame: Value = serde_json::from_str(&rx.try_recv().expect("a response")).unwrap();
+        assert_eq!(frame["id"], 7);
+        assert_eq!(frame["error"]["code"], INVALID_PARAMS);
+        assert_eq!(frame["error"]["data"]["reason"], "entry_exceeds_max_bytes");
+        assert_eq!(frame["error"]["data"]["index"], 0);
+
+        // A refusal without data has none on the wire, as before.
+        let line = messages_call(json!({"session_id": "huge", "session_keys": []}));
+        Box::pin(dispatcher.process_line_for_test(&line)).await;
+        let frame: Value = serde_json::from_str(&rx.try_recv().expect("a response")).unwrap();
+        assert_eq!(frame["error"]["code"], INVALID_PARAMS);
+        assert!(frame["error"].get("data").is_none(), "{frame}");
     }
 }

@@ -148,6 +148,52 @@ pub struct SessionRecord {
     pub owner: Option<String>,
 }
 
+/// What a session-targeting call names.
+///
+/// A plain session id names the live session with that id and every chat
+/// key it can be stored under (`rpc_<id>`, `gw_<id>`, the raw id); the
+/// resolver picks among them. A chat key names exactly one chat-store row:
+/// `rpc_<id>` also covers the live chat session `<id>` (its own live
+/// incarnation), and any other key covers no live session at all, whatever
+/// ids the live map holds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum SessionAddress {
+    Id(String),
+    ChatKey(String),
+}
+
+impl SessionAddress {
+    /// The id the live session map knows this session by, when it can have
+    /// a live incarnation.
+    pub(crate) fn live_id(&self) -> Option<&str> {
+        match self {
+            Self::Id(id) => Some(id),
+            Self::ChatKey(key) => key.strip_prefix("rpc_"),
+        }
+    }
+
+    /// The key admission queues on: the live id, or the chat key itself.
+    pub(crate) fn queue_id(&self) -> &str {
+        match self {
+            Self::Id(id) => id,
+            Self::ChatKey(key) => key.strip_prefix("rpc_").unwrap_or(key),
+        }
+    }
+
+    /// The name logs and errors use: the id or the key as given.
+    pub(crate) fn name(&self) -> &str {
+        match self {
+            Self::Id(id) | Self::ChatKey(id) => id,
+        }
+    }
+
+    /// Whether a live session in `mode` is this address's incarnation. An id
+    /// covers either mode; a chat key covers only a chat-mode session.
+    pub(crate) fn covers(&self, mode: &crate::rpc::types::ChatMode) -> bool {
+        matches!(self, Self::Id(_)) || matches!(mode, crate::rpc::types::ChatMode::Chat)
+    }
+}
+
 /// Canonical live-session data returned when `session/new` reattaches to an
 /// ID that is already present in the process-local session store.
 pub struct ResumedRpcSession {

@@ -204,10 +204,31 @@ rpc_type! {
 
 rpc_type! {
     /// Shared param for methods that only need a session ID:
-    /// `session/close`, `session/cancel`, `session/messages`,
-    /// `session/state`, `session/delete`.
+    /// `session/close`, `session/cancel`, `session/git-branch`.
     pub struct SessionIdParams {
         pub session_id: String,
+    }
+}
+
+/// The most `session_keys` one call may list.
+pub const MAX_SESSION_KEYS: usize = 4;
+
+rpc_type! {
+    /// Params for `session/state` and `session/delete`: a session id, and
+    /// optionally the exact stored row to act on.
+    pub struct SessionTargetParams {
+        /// The session id. Echoed in the result; resolved as before when
+        /// `session_keys` is absent.
+        pub session_id: String,
+        /// Exact chat-store keys (`rpc_<id>`, `gw_<id>`, a channel key), most
+        /// preferred first, at most [`MAX_SESSION_KEYS`]. When present, the
+        /// core acts on the first key that names a stored chat session the
+        /// caller may see, and on nothing else: it adds no prefix and never
+        /// falls back to `session_id`. An `rpc_<id>` key also covers the live
+        /// chat session `<id>`; any other key covers no live session. For a
+        /// scoped principal another principal's row counts as absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub session_keys: Option<Vec<String>>,
     }
 }
 
@@ -367,6 +388,17 @@ rpc_type! {
         /// `null` requests the newest page; a string continues a walk.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub cursor: Option<String>,
+        /// Exact chat-store keys to read, as for `session/state`
+        /// ([`SessionTargetParams::session_keys`]).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub session_keys: Option<Vec<String>>,
+        /// Upper bound, in bytes, on the serialized `messages` of the result.
+        /// The page keeps the newest entries of its window that fit, and
+        /// `start` says where it begins, so a caller can page backwards with
+        /// `before_index`. A single entry larger than the bound is refused
+        /// with `INVALID_PARAMS` and `data.reason = "entry_exceeds_max_bytes"`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub max_bytes: Option<usize>,
     }
 }
 
@@ -2072,8 +2104,23 @@ mod tests {
             limit: None,
             before_index: None,
             cursor: None,
+            session_keys: None,
+            max_bytes: None,
         };
         let wire = serde_json::to_value(params).unwrap();
         assert!(wire.get("cursor").is_none());
+        // An older core never sees the exact-row fields unless they are set.
+        assert!(wire.get("session_keys").is_none());
+        assert!(wire.get("max_bytes").is_none());
+    }
+
+    #[test]
+    fn session_target_params_read_the_older_session_id_form() {
+        let params: SessionTargetParams =
+            serde_json::from_value(json!({"session_id": "s"})).unwrap();
+        assert_eq!(params.session_id, "s");
+        assert_eq!(params.session_keys, None);
+        let wire = serde_json::to_value(&params).unwrap();
+        assert_eq!(wire, json!({"session_id": "s"}));
     }
 }

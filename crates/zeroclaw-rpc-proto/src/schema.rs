@@ -39,7 +39,7 @@ catalog! {
     // TUI
     TuiListEntry, TuiListResult,
     // Sessions
-    SessionIdParams, ChatMode, SessionNewResult, SessionCloseResult, SessionKillParams,
+    SessionIdParams, SessionTargetParams, ChatMode, SessionNewResult, SessionCloseResult, SessionKillParams,
     SessionKillResult, SessionPromptParams, SessionPromptResult, SessionConfigureParams,
     SessionConfigureResult, SessionCancelResult, SessionGitBranchResult, SessionListParams,
     SessionListResult, SessionEntry, SessionMessagesResult, SessionMessagesParams,

@@ -3104,7 +3104,7 @@
         "type": "object"
       },
       "SessionIdParams": {
-        "description": "Shared param for methods that only need a session ID:\n`session/close`, `session/cancel`, `session/messages`,\n`session/state`, `session/delete`.",
+        "description": "Shared param for methods that only need a session ID:\n`session/close`, `session/cancel`, `session/git-branch`.",
         "properties": {
           "session_id": {
             "type": "string"
@@ -3202,8 +3202,27 @@
               "null"
             ]
           },
+          "max_bytes": {
+            "description": "Upper bound, in bytes, on the serialized `messages` of the result.\nThe page keeps the newest entries of its window that fit, and\n`start` says where it begins, so a caller can page backwards with\n`before_index`. A single entry larger than the bound is refused\nwith `INVALID_PARAMS` and `data.reason = \"entry_exceeds_max_bytes\"`.",
+            "format": "uint",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "session_id": {
             "type": "string"
+          },
+          "session_keys": {
+            "description": "Exact chat-store keys to read, as for `session/state`\n([`SessionTargetParams::session_keys`]).",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
           }
         },
         "required": [
@@ -3389,6 +3408,29 @@
         "required": [
           "session_id",
           "state"
+        ],
+        "type": "object"
+      },
+      "SessionTargetParams": {
+        "description": "Params for `session/state` and `session/delete`: a session id, and\noptionally the exact stored row to act on.",
+        "properties": {
+          "session_id": {
+            "description": "The session id. Echoed in the result; resolved as before when\n`session_keys` is absent.",
+            "type": "string"
+          },
+          "session_keys": {
+            "description": "Exact chat-store keys (`rpc_<id>`, `gw_<id>`, a channel key), most\npreferred first, at most [`MAX_SESSION_KEYS`]. When present, the\ncore acts on the first key that names a stored chat session the\ncaller may see, and on nothing else: it adds no prefix and never\nfalls back to `session_id`. An `rpc_<id>` key also covers the live\nchat session `<id>`; any other key covers no live session. For a\nscoped principal another principal's row counts as absent.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "session_id"
         ],
         "type": "object"
       },
@@ -4623,6 +4665,33 @@
               "null"
             ]
           }
+        },
+        {
+          "name": "max_bytes",
+          "required": false,
+          "schema": {
+            "description": "Upper bound, in bytes, on the serialized `messages` of the result.\nThe page keeps the newest entries of its window that fit, and\n`start` says where it begins, so a caller can page backwards with\n`before_index`. A single entry larger than the bound is refused\nwith `INVALID_PARAMS` and `data.reason = \"entry_exceeds_max_bytes\"`.",
+            "format": "uint",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "session_keys",
+          "required": false,
+          "schema": {
+            "description": "Exact chat-store keys to read, as for `session/state`\n([`SessionTargetParams::session_keys`]).",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          }
         }
       ],
       "result": {
@@ -4650,7 +4719,22 @@
           "name": "session_id",
           "required": true,
           "schema": {
+            "description": "The session id. Echoed in the result; resolved as before when\n`session_keys` is absent.",
             "type": "string"
+          }
+        },
+        {
+          "name": "session_keys",
+          "required": false,
+          "schema": {
+            "description": "Exact chat-store keys (`rpc_<id>`, `gw_<id>`, a channel key), most\npreferred first, at most [`MAX_SESSION_KEYS`]. When present, the\ncore acts on the first key that names a stored chat session the\ncaller may see, and on nothing else: it adds no prefix and never\nfalls back to `session_id`. An `rpc_<id>` key also covers the live\nchat session `<id>`; any other key covers no live session. For a\nscoped principal another principal's row counts as absent.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
           }
         }
       ],
@@ -4668,7 +4752,7 @@
       },
       "x-zeroclaw-params": {
         "shape": "typed",
-        "type": "SessionIdParams"
+        "type": "SessionTargetParams"
       }
     },
     {
@@ -4679,7 +4763,22 @@
           "name": "session_id",
           "required": true,
           "schema": {
+            "description": "The session id. Echoed in the result; resolved as before when\n`session_keys` is absent.",
             "type": "string"
+          }
+        },
+        {
+          "name": "session_keys",
+          "required": false,
+          "schema": {
+            "description": "Exact chat-store keys (`rpc_<id>`, `gw_<id>`, a channel key), most\npreferred first, at most [`MAX_SESSION_KEYS`]. When present, the\ncore acts on the first key that names a stored chat session the\ncaller may see, and on nothing else: it adds no prefix and never\nfalls back to `session_id`. An `rpc_<id>` key also covers the live\nchat session `<id>`; any other key covers no live session. For a\nscoped principal another principal's row counts as absent.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
           }
         }
       ],
@@ -4697,7 +4796,7 @@
       },
       "x-zeroclaw-params": {
         "shape": "typed",
-        "type": "SessionIdParams"
+        "type": "SessionTargetParams"
       }
     },
     {
