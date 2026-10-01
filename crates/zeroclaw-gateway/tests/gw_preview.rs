@@ -6,8 +6,8 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::Value;
@@ -96,6 +96,27 @@ struct Gateway {
 
 impl Gateway {
     async fn spawn(endpoint: &Path, extra: &[&str]) -> Self {
+        Self::start(endpoint, extra, Stdio::inherit()).await
+    }
+
+    /// [`Gateway::spawn`], collecting the lines it writes on stderr, its log.
+    async fn spawn_logged(endpoint: &Path, extra: &[&str]) -> (Self, Arc<Mutex<Vec<String>>>) {
+        let mut gateway = Self::start(endpoint, extra, Stdio::piped()).await;
+        let stderr = gateway.child.stderr.take().expect("piped stderr");
+        let log = Arc::new(Mutex::new(Vec::new()));
+        {
+            let log = Arc::clone(&log);
+            zeroclaw_spawn::spawn!(async move {
+                let mut lines = BufReader::new(stderr).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    log.lock().unwrap().push(line);
+                }
+            });
+        }
+        (gateway, log)
+    }
+
+    async fn start(endpoint: &Path, extra: &[&str], stderr: Stdio) -> Self {
         let mut child = Command::new(env!("CARGO_BIN_EXE_zeroclaw-gw"))
             .arg("--listen")
             .arg("127.0.0.1:0")
@@ -104,7 +125,7 @@ impl Gateway {
             .args(extra)
             .env_remove("ZEROCLAW_SOCKET")
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
+            .stderr(stderr)
             .kill_on_drop(true)
             .spawn()
             .expect("spawn zeroclaw-gw");
@@ -253,6 +274,116 @@ async fn the_separate_gateway_follows_the_core_through_restarts_of_either() {
 
     gateway.kill().await;
     core.stop().await;
+}
+
+/// A core of `version` that answers the handshake and `status` and nothing
+/// else, counting the requests past the handshake it is sent.
+fn scripted_core(endpoint: &Path, version: &'static str) -> Arc<AtomicUsize> {
+    use std::sync::atomic::Ordering;
+    let listener = tokio::net::UnixListener::bind(endpoint).expect("bind the scripted core");
+    let past_handshake = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&past_handshake);
+    zeroclaw_spawn::spawn!(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let counter = Arc::clone(&counter);
+            zeroclaw_spawn::spawn!(async move {
+                let (read, mut write) = tokio::io::split(stream);
+                let mut lines = BufReader::new(read).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    let frame: Value = serde_json::from_str(&line).expect("a JSON frame");
+                    let result = if frame["method"] == "initialize" {
+                        serde_json::json!({
+                            "protocol_version": 1, "server_version": version,
+                            "server_pid": 1, "principal_id": "shared-operator",
+                        })
+                    } else {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        serde_json::json!({ "server_version": version, "protocol_version": 1 })
+                    };
+                    let answer = serde_json::json!({ "jsonrpc": "2.0", "id": frame["id"], "result": result });
+                    if write
+                        .write_all(format!("{answer}\n").as_bytes())
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+    past_handshake
+}
+
+/// Wait until `log` holds a line containing `needle`; return how many do.
+async fn logged(log: &Mutex<Vec<String>>, needle: &str) -> usize {
+    let count = || {
+        log.lock()
+            .unwrap()
+            .iter()
+            .filter(|line| line.contains(needle))
+            .count()
+    };
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while count() == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "zeroclaw-gw never logged {needle:?}: {:?}",
+            log.lock().unwrap()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // Lines written alongside the first one have had time to arrive.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    count()
+}
+
+#[tokio::test]
+async fn the_separate_gateway_refuses_a_core_of_another_version_unless_skew_is_allowed() {
+    use std::sync::atomic::Ordering;
+    const SKEWED: &str = "0.0.0-skewed";
+    let tmp = tempfile::tempdir().unwrap();
+    let endpoint = tmp.path().join("daemon.sock");
+    let past_handshake = scripted_core(&endpoint, SKEWED);
+
+    // By default: refused, with both versions named, logged once.
+    let (gateway, log) = Gateway::spawn_logged(&endpoint, &[]).await;
+    let (status, health) = get(&gateway.address, "/health", None).await;
+    assert_eq!(
+        status, 200,
+        "the gateway's own health still answers: {health}"
+    );
+    for path in ["/api/gateway/core", "/api/health", "/api/gateway/core"] {
+        let (status, refused) = get(&gateway.address, path, Some(TOKEN)).await;
+        assert_eq!(status, 503, "{path}: {refused}");
+        assert_eq!(refused["code"], "core_version_mismatch", "{path}");
+        assert_eq!(refused["versions"]["core"], SKEWED, "{path}");
+        assert_eq!(
+            refused["versions"]["gateway"],
+            env!("CARGO_PKG_VERSION"),
+            "{path}"
+        );
+    }
+    assert_eq!(
+        past_handshake.load(Ordering::SeqCst),
+        0,
+        "nothing past the handshake reached the refused core"
+    );
+    assert_eq!(
+        logged(&log, "core_version_mismatch").await,
+        1,
+        "one log line per refused core version, not one per request"
+    );
+    gateway.kill().await;
+
+    // With the development flag: served, and the flag is announced.
+    let (gateway, log) = Gateway::spawn_logged(&endpoint, &["--allow-version-skew"]).await;
+    let (status, link) = get(&gateway.address, "/api/gateway/core", Some(TOKEN)).await;
+    assert_eq!(status, 200, "{link}");
+    assert_eq!(link["core"]["server_version"], SKEWED);
+    assert!(past_handshake.load(Ordering::SeqCst) > 0);
+    assert_eq!(logged(&log, "--allow-version-skew").await, 1);
+    gateway.kill().await;
 }
 
 #[tokio::test]
