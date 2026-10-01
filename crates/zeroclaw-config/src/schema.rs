@@ -353,6 +353,12 @@ pub struct Config {
     #[nested]
     pub wss: WssConfig,
 
+    /// Local IPC endpoint limits for the RPC socket or named pipe (`[rpc]`).
+    #[serde(default)]
+    #[nested]
+    #[group = "Network"]
+    pub rpc: RpcConfig,
+
     /// Nominated-relay client for reaching this daemon through a relay (`[relay]`).
     #[serde(default)]
     #[nested]
@@ -8311,6 +8317,36 @@ fn default_wss_max_sessions_per_client() -> usize {
 
 fn default_wss_incomplete_message_timeout_secs() -> u64 {
     60
+}
+
+/// Local IPC endpoint limits (`[rpc]`).
+///
+/// Applies to the Unix socket or Windows named pipe that local clients such as
+/// zerocode connect to. The remote WSS plane has its own limits under `[wss]`.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "rpc"]
+pub struct RpcConfig {
+    /// Ceiling on concurrently open local IPC connections (default: 512).
+    /// A connection past the ceiling receives one error frame naming this
+    /// setting and is closed. Values below 1 are treated as 1, and values
+    /// above the runtime's semaphore ceiling are clamped to it. Read when the
+    /// local listener starts, so a change applies at the next daemon restart
+    /// or reload.
+    #[serde(default = "default_rpc_max_local_connections")]
+    pub max_local_connections: usize,
+}
+
+impl Default for RpcConfig {
+    fn default() -> Self {
+        Self {
+            max_local_connections: default_rpc_max_local_connections(),
+        }
+    }
+}
+
+fn default_rpc_max_local_connections() -> usize {
+    512
 }
 
 fn default_enroll_bind() -> String {
@@ -21022,6 +21058,7 @@ impl Default for Config {
             gateway: GatewayConfig::default(),
             a2a: crate::multi_agent::A2aServerSection::default(),
             wss: WssConfig::default(),
+            rpc: RpcConfig::default(),
             relay: RelayConfig::default(),
             enroll: EnrollConfig::default(),
             composio: ComposioConfig::default(),
@@ -21882,6 +21919,176 @@ enum PeerGroupChannelRef {
         /// that pick between candidates are deterministic.
         known_aliases: Vec<String>,
     },
+}
+
+/// Test-only coordination for the config save's post-atomic-rename
+/// visibility window (see the pause call inside the save path). `arm(target)`
+/// returns a handle whose `wait_paused` resolves once a save of that exact
+/// config path is holding inside the window — after the new config is visible
+/// on disk, before permission hardening and directory sync finish — and whose
+/// `release` lets that save proceed and disarms the gate. Path-scoping keeps
+/// parallel tests (each with its own config root) from consuming each other's
+/// gates. Dropping the handle disarms. Compiled only under
+/// `test`/`test-helpers`.
+#[cfg(any(test, feature = "test-helpers"))]
+pub mod test_post_replace_pause_gate {
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use tokio::sync::Notify;
+
+    struct Gate {
+        target: PathBuf,
+        reached: Notify,
+        release: Notify,
+        claimed: AtomicBool,
+        released: AtomicBool,
+    }
+
+    static GATES: Mutex<Vec<Arc<Gate>>> = Mutex::new(Vec::new());
+
+    fn disarm(gate: &Arc<Gate>) {
+        gate.released.store(true, Ordering::Release);
+        gate.release.notify_waiters();
+        GATES
+            .lock()
+            .unwrap()
+            .retain(|registered| !Arc::ptr_eq(registered, gate));
+    }
+
+    /// Handle for one armed gate. Dropping it disarms, so a failed test
+    /// cannot leave later saves paused forever.
+    pub struct GateHandle {
+        gate: Arc<Gate>,
+    }
+
+    impl GateHandle {
+        /// Resolve once the armed save is paused inside the post-rename
+        /// window.
+        pub async fn wait_paused(&self) {
+            self.gate.reached.notified().await;
+        }
+
+        /// Let the paused save proceed and disarm the gate.
+        pub fn release(&self) {
+            disarm(&self.gate);
+        }
+    }
+
+    impl Drop for GateHandle {
+        fn drop(&mut self) {
+            disarm(&self.gate);
+        }
+    }
+
+    /// Arm the gate for the next save of `target` that reaches the
+    /// post-rename window.
+    pub fn arm(target: PathBuf) -> GateHandle {
+        let gate = Arc::new(Gate {
+            target,
+            reached: Notify::new(),
+            release: Notify::new(),
+            claimed: AtomicBool::new(false),
+            released: AtomicBool::new(false),
+        });
+        let displaced = {
+            let mut gates = GATES.lock().unwrap();
+            let displaced = gates
+                .iter()
+                .position(|registered| registered.target == gate.target)
+                .map(|index| gates.remove(index));
+            gates.push(Arc::clone(&gate));
+            displaced
+        };
+        if let Some(displaced) = displaced {
+            displaced.released.store(true, Ordering::Release);
+            displaced.release.notify_waiters();
+        }
+        GateHandle { gate }
+    }
+
+    /// Save-side hook: notify waiters and block while the gate is armed for
+    /// this config path. The std lock is never held across the await.
+    pub(crate) async fn pause(config_path: &Path) {
+        let gate = {
+            GATES
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|gate| gate.target == config_path)
+                .cloned()
+        };
+        if let Some(gate) = gate {
+            if gate
+                .claimed
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                return;
+            }
+            gate.reached.notify_one();
+            let released = gate.release.notified();
+            tokio::pin!(released);
+            released.as_mut().enable();
+            if !gate.released.load(Ordering::Acquire) {
+                released.await;
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::time::Duration;
+
+        #[tokio::test]
+        async fn dropped_handle_releases_only_its_path() {
+            let first_path = PathBuf::from("test-post-replace-first.toml");
+            let second_path = PathBuf::from("test-post-replace-second.toml");
+            let first = arm(first_path.clone());
+            let second = arm(second_path.clone());
+
+            let first_save = ::zeroclaw_spawn::spawn!(async move { pause(&first_path).await });
+            let second_save = ::zeroclaw_spawn::spawn!(async move { pause(&second_path).await });
+            first.wait_paused().await;
+            second.wait_paused().await;
+
+            drop(first);
+            tokio::time::timeout(Duration::from_secs(1), first_save)
+                .await
+                .expect("dropping a gate must release its paused save")
+                .expect("first pause task must not panic");
+            assert!(
+                !second_save.is_finished(),
+                "dropping one path must not release another path"
+            );
+
+            second.release();
+            tokio::time::timeout(Duration::from_secs(1), second_save)
+                .await
+                .expect("releasing a gate must release its paused save")
+                .expect("second pause task must not panic");
+        }
+
+        #[tokio::test]
+        async fn gate_pauses_only_the_next_matching_save() {
+            let path = PathBuf::from("test-post-replace-next-save.toml");
+            let gate = arm(path.clone());
+            let first_path = path.clone();
+            let first_save = ::zeroclaw_spawn::spawn!(async move { pause(&first_path).await });
+            gate.wait_paused().await;
+
+            tokio::time::timeout(Duration::from_secs(1), pause(&path))
+                .await
+                .expect("a second matching save must not consume the armed gate");
+
+            gate.release();
+            tokio::time::timeout(Duration::from_secs(1), first_save)
+                .await
+                .expect("releasing the gate must release the first save")
+                .expect("first pause task must not panic");
+        }
+    }
 }
 
 impl Config {
@@ -26111,6 +26318,16 @@ async fn write_config_atomically_with_sync(
         }
         anyhow::bail!("Failed to atomically replace config file: {e}");
     }
+
+    // Test-only pause gate: the atomic rename above is the point where the
+    // new config becomes externally visible, while `save_dirty` continues
+    // with permission hardening, directory synchronization, and backup
+    // handling before returning. Tests use this gate to hold the save inside
+    // that visibility window (e.g. to prove a cancelled caller cannot strand
+    // a committed disk config without its live swap and cleanup), then let
+    // the save proceed. Inert unless armed.
+    #[cfg(any(test, feature = "test-helpers"))]
+    test_post_replace_pause_gate::pause(config_path).await;
 
     #[cfg(unix)]
     {
@@ -32584,6 +32801,7 @@ auto_save = true
             gateway: GatewayConfig::default(),
             a2a: crate::multi_agent::A2aServerSection::default(),
             wss: WssConfig::default(),
+            rpc: RpcConfig::default(),
             relay: RelayConfig::default(),
             enroll: EnrollConfig::default(),
             composio: ComposioConfig::default(),
@@ -33776,6 +33994,7 @@ default_temperature = 0.7
             gateway: GatewayConfig::default(),
             a2a: crate::multi_agent::A2aServerSection::default(),
             wss: WssConfig::default(),
+            rpc: RpcConfig::default(),
             relay: RelayConfig::default(),
             enroll: EnrollConfig::default(),
             composio: ComposioConfig::default(),
