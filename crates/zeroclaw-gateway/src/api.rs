@@ -1311,13 +1311,31 @@ pub(crate) async fn api_cron_run_through_core(
 }
 
 /// `DELETE /api/cron/{id}` through the core.
+///
+/// For an id with neither a job nor retained runs the in-process route
+/// answers a failed removal, `500` with the store's words, where the core
+/// refuses the id as not found; this answers that refusal as the route does.
 pub(crate) async fn api_cron_delete_through_core(
     core: &CoreCall,
     id: &str,
 ) -> Result<Response, CoreError> {
-    core.request(Method::CronDelete, serde_json::json!({ "id": id }))
-        .await?;
-    Ok(Json(serde_json::json!({ "status": "ok" })).into_response())
+    match core
+        .request(Method::CronDelete, serde_json::json!({ "id": id }))
+        .await
+    {
+        Ok(_) => Ok(Json(serde_json::json!({ "status": "ok" })).into_response()),
+        Err(error) if error.reason() == Some(RefusalReason::NotFound) => Ok((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": format!(
+                    "Failed to remove cron job: {}",
+                    zeroclaw_runtime::cron::job_not_found(id)
+                ),
+            })),
+        )
+            .into_response()),
+        Err(error) => Err(error),
+    }
 }
 
 /// `GET /api/cron/{id}/runs` through the core, with the route's default and

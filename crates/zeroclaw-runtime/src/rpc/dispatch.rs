@@ -8096,7 +8096,19 @@ impl RpcDispatcher {
             let job = self.authorize_cron_job(Method::CronDelete, &config, &req.id)?;
             crate::cron::remove_job_for_agent(&config, &req.id, &job.agent_alias)
         }
-        .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Cron delete failed: {e}")))?;
+        .map_err(|e| {
+            // An id with nothing to remove is refused as a missing job has
+            // always been, invalid params; only a storage failure is internal.
+            if e.downcast_ref::<crate::cron::JobNotFound>().is_some() {
+                refused(
+                    INVALID_PARAMS,
+                    RefusalReason::NotFound,
+                    format!("Cron job not found: {e}"),
+                )
+            } else {
+                rpc_err(INTERNAL_ERROR, format!("Cron delete failed: {e}"))
+            }
+        })?;
         to_result(CronDeleteResult {
             id: req.id,
             deleted: true,
@@ -8115,8 +8127,9 @@ impl RpcDispatcher {
                 let retained =
                     crate::cron::list_runs(&config, &req.id, 1).is_ok_and(|runs| !runs.is_empty());
                 if !retained {
-                    return Err(rpc_err(
+                    return Err(refused(
                         INVALID_PARAMS,
+                        RefusalReason::NotFound,
                         format!("Cron job not found: {error}"),
                     ));
                 }
@@ -13918,6 +13931,173 @@ mod tests {
                 MethodAuthz::Requires(_, _) => {}
             }
         }
+    }
+
+    /// A job owned by `alias` whose row is gone while one run is kept, as a
+    /// completed one-shot leaves it. Returns its id.
+    fn retained_only_cron_job(
+        config: &zeroclaw_config::schema::Config,
+        alias: &str,
+        name: &str,
+    ) -> String {
+        let job = seed_cron_job(config, alias, name);
+        let now = chrono::Utc::now();
+        crate::cron::record_run(
+            config,
+            &job.id,
+            now,
+            now,
+            "ok",
+            crate::cron::RunOutcomes {
+                execution: "ok",
+                delivery: "not_required",
+                persistence: "not_bound",
+            },
+            crate::cron::RunProvenance {
+                principal: None,
+                executing_agent: Some(alias),
+                job_source: Some("imperative"),
+            },
+            Some("done"),
+            5,
+        )
+        .expect("the fixture run is recorded");
+        let db = rusqlite::Connection::open(config.data_dir.join("cron").join("jobs.db"))
+            .expect("the cron store opens");
+        db.execute("DELETE FROM cron_jobs WHERE id = ?1", [&job.id])
+            .expect("the job row is dropped");
+        job.id
+    }
+
+    /// `cron/delete` for each caller and target. The administrator removes a
+    /// live job with its history, and the retained history of a job whose row
+    /// is gone. A scoped principal removes its own live job, and neither a
+    /// foreign job nor a retained-only history, which it cannot authorize
+    /// against an owner. An id with nothing to remove is refused as a missing
+    /// job always was, invalid params with the `not_found` reason, for both;
+    /// never as an internal failure. `cron/runs` refuses it the same way.
+    #[tokio::test]
+    async fn cron_delete_answers_each_caller_and_target() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = cron_roster_config_in(&tmp, 4242);
+        let admin_live = seed_cron_job(&config, "beta", "admin-live");
+        let admin_retained = retained_only_cron_job(&config, "beta", "admin-retained");
+        let own = seed_cron_job(&config, "alpha", "own-live");
+        let foreign = seed_cron_job(&config, "beta", "foreign-live");
+        let own_retained = retained_only_cron_job(&config, "alpha", "own-retained");
+        let absent = "00000000-0000-4000-8000-000000000000";
+        let ctx = enforcement_ctx(config.clone());
+        let (mut operator, mut operator_rx) = local_operator(&ctx).await;
+        let (mut alice, mut alice_rx) = roster_peer(&ctx, 4242).await;
+        let not_found = |response: &Value, id: &str| {
+            assert_eq!(
+                response["error"]["code"],
+                json!(INVALID_PARAMS),
+                "{response}"
+            );
+            assert_eq!(
+                response["error"]["data"]["reason"],
+                json!("not_found"),
+                "{response}"
+            );
+            assert_eq!(
+                response["error"]["message"],
+                json!(format!("Cron job not found: Cron job '{id}' not found")),
+                "{response}"
+            );
+        };
+
+        for (n, id) in [(1u64, admin_live.id.as_str()), (2, admin_retained.as_str())] {
+            let response = rpc(
+                &mut operator,
+                &mut operator_rx,
+                n,
+                "cron/delete",
+                json!({"id": id}),
+            )
+            .await;
+            assert_eq!(
+                response["result"]["deleted"],
+                json!(true),
+                "{id}: {response}"
+            );
+            assert!(
+                crate::cron::get_job(&config, id).is_err(),
+                "{id}: row removed"
+            );
+            assert!(
+                crate::cron::list_runs(&config, id, 10)
+                    .expect("runs")
+                    .is_empty(),
+                "{id}: history removed"
+            );
+        }
+        let response = rpc(
+            &mut operator,
+            &mut operator_rx,
+            3,
+            "cron/delete",
+            json!({"id": absent}),
+        )
+        .await;
+        not_found(&response, absent);
+        let response = rpc(
+            &mut operator,
+            &mut operator_rx,
+            4,
+            "cron/runs",
+            json!({"id": absent}),
+        )
+        .await;
+        not_found(&response, absent);
+
+        let response = rpc(
+            &mut alice,
+            &mut alice_rx,
+            5,
+            "cron/delete",
+            json!({"id": own.id}),
+        )
+        .await;
+        assert_eq!(response["result"]["deleted"], json!(true), "{response}");
+        let response = rpc(
+            &mut alice,
+            &mut alice_rx,
+            6,
+            "cron/delete",
+            json!({"id": foreign.id}),
+        )
+        .await;
+        not_found(&response, &foreign.id);
+        assert!(
+            crate::cron::get_job(&config, &foreign.id).is_ok(),
+            "the foreign job survives"
+        );
+        let response = rpc(
+            &mut alice,
+            &mut alice_rx,
+            7,
+            "cron/delete",
+            json!({"id": own_retained}),
+        )
+        .await;
+        not_found(&response, &own_retained);
+        assert_eq!(
+            crate::cron::list_runs(&config, &own_retained, 10)
+                .expect("runs")
+                .len(),
+            1,
+            "the retained history survives"
+        );
+        let response = rpc(
+            &mut alice,
+            &mut alice_rx,
+            8,
+            "cron/delete",
+            json!({"id": absent}),
+        )
+        .await;
+        not_found(&response, absent);
     }
 
     fn enforcement_ctx(config: zeroclaw_config::schema::Config) -> Arc<RpcContext> {

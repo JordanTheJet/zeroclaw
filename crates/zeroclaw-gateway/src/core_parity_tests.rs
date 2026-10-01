@@ -746,8 +746,8 @@ async fn cron_delete_through_the_core_matches_the_in_process_body() {
         );
     }
 
-    // Neither a job nor history: a failed removal either way. The core
-    // words it differently, so only the status is the route's.
+    // Neither a job nor history: the route answers a failed removal, and the
+    // core path answers the core's not-found refusal the same way.
     let in_process = delete("no-such-job".to_string(), CoreAccess::InProcess).await;
     let core = delete("no-such-job".to_string(), harness.through_core().await).await;
     assert_eq!(
@@ -756,7 +756,66 @@ async fn cron_delete_through_the_core_matches_the_in_process_body() {
         "{}",
         in_process.1
     );
-    assert_eq!(core.0, in_process.0, "{}", core.1);
+    assert_eq!(core, in_process, "an id with nothing to remove fails alike");
+}
+
+/// A run, or the runs, of a job that does not exist: refused as not found by
+/// the in-process route, by the in-process route's core path, and by both
+/// routers' rendering of the core's refusal, with the same body.
+#[tokio::test]
+async fn an_unknown_job_is_not_found_alike() {
+    use crate::refusal_parity::{assert_refusal_parity, core_refusal};
+    use zeroclaw_rpc_client::Method;
+    let harness = Harness::new(None);
+    let id = "no-such-job";
+    let CoreAccess::Core(call) = harness.through_core().await else {
+        panic!("served in-process");
+    };
+
+    let in_process = handle_api_cron_run(
+        State(harness.state.clone()),
+        Harness::headers(),
+        Path(id.to_string()),
+        DedicatedCoreAccess(CoreAccess::InProcess),
+    )
+    .await
+    .into_response();
+    let route = handle_api_cron_run(
+        State(harness.state.clone()),
+        Harness::headers(),
+        Path(id.to_string()),
+        harness.through_core_dedicated().await,
+    )
+    .await
+    .into_response();
+    let refused = core_refusal(&call, Method::CronTrigger, json!({ "id": id })).await;
+    assert_refusal_parity(
+        "POST /api/cron/{id}/run",
+        StatusCode::NOT_FOUND,
+        in_process,
+        refused.into_iter().chain([route]),
+    )
+    .await;
+
+    let runs = |access| {
+        handle_api_cron_runs(
+            State(harness.state.clone()),
+            Harness::headers(),
+            Path(id.to_string()),
+            Query(CronRunsQuery { limit: None }),
+            access,
+        )
+    };
+    let in_process = runs(CoreAccess::InProcess).await.into_response();
+    let route = runs(harness.through_core().await).await.into_response();
+    let refused = core_refusal(&call, Method::CronRuns, json!({ "id": id, "limit": 20 })).await;
+    assert_refusal_parity(
+        "GET /api/cron/{id}/runs",
+        StatusCode::NOT_FOUND,
+        in_process,
+        refused.into_iter().chain([route]),
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -1004,6 +1063,7 @@ async fn memory_routes_through_the_core_match_the_in_process_bodies() {
         .await;
     let body = assert_same(in_process, core);
     assert_eq!(body["deleted"], true);
+    // A key with no entry is no failure: `deleted: false` either way.
     let in_process = harness
         .memory_delete("parity-a", None, CoreAccess::InProcess)
         .await;
@@ -1012,4 +1072,180 @@ async fn memory_routes_through_the_core_match_the_in_process_bodies() {
         .await;
     let body = assert_same(in_process, core);
     assert_eq!(body["deleted"], false);
+}
+
+/// A memory store whose every call fails, as a broken backend does.
+struct FailingMemory;
+
+const STORE_DOWN: &str = "the store is down";
+
+#[async_trait::async_trait]
+impl zeroclaw_memory::Memory for FailingMemory {
+    fn name(&self) -> &str {
+        "failing"
+    }
+
+    async fn store(
+        &self,
+        _key: &str,
+        _content: &str,
+        _category: zeroclaw_memory::MemoryCategory,
+        _session_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!(STORE_DOWN)
+    }
+
+    async fn recall(
+        &self,
+        _query: &str,
+        _limit: usize,
+        _session_id: Option<&str>,
+        _since: Option<&str>,
+        _until: Option<&str>,
+    ) -> anyhow::Result<Vec<zeroclaw_memory::MemoryEntry>> {
+        anyhow::bail!(STORE_DOWN)
+    }
+
+    async fn get(&self, _key: &str) -> anyhow::Result<Option<zeroclaw_memory::MemoryEntry>> {
+        anyhow::bail!(STORE_DOWN)
+    }
+
+    async fn list(
+        &self,
+        _category: Option<&zeroclaw_memory::MemoryCategory>,
+        _session_id: Option<&str>,
+    ) -> anyhow::Result<Vec<zeroclaw_memory::MemoryEntry>> {
+        anyhow::bail!(STORE_DOWN)
+    }
+
+    async fn forget(&self, _key: &str) -> anyhow::Result<bool> {
+        anyhow::bail!(STORE_DOWN)
+    }
+
+    async fn forget_for_agent(&self, _key: &str, _agent_id: &str) -> anyhow::Result<bool> {
+        anyhow::bail!(STORE_DOWN)
+    }
+
+    async fn count(&self) -> anyhow::Result<usize> {
+        anyhow::bail!(STORE_DOWN)
+    }
+
+    async fn health_check(&self) -> bool {
+        false
+    }
+
+    async fn store_with_agent(
+        &self,
+        _key: &str,
+        _content: &str,
+        _category: zeroclaw_memory::MemoryCategory,
+        _session_id: Option<&str>,
+        _namespace: Option<&str>,
+        _importance: Option<f64>,
+        _agent_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!(STORE_DOWN)
+    }
+
+    async fn recall_for_agents(
+        &self,
+        _allowed_agent_ids: &[&str],
+        _query: &str,
+        _limit: usize,
+        _session_id: Option<&str>,
+        _since: Option<&str>,
+        _until: Option<&str>,
+    ) -> anyhow::Result<Vec<zeroclaw_memory::MemoryEntry>> {
+        anyhow::bail!(STORE_DOWN)
+    }
+}
+
+impl zeroclaw_api::attribution::Attributable for FailingMemory {
+    fn role(&self) -> zeroclaw_api::attribution::Role {
+        zeroclaw_api::attribution::Role::Memory(zeroclaw_api::attribution::MemoryKind::InMemory)
+    }
+
+    fn alias(&self) -> &str {
+        "failing"
+    }
+}
+
+impl Harness {
+    /// The in-process route, or the route through the core.
+    async fn access(&self, through_core: bool) -> CoreAccess {
+        if through_core {
+            self.through_core().await
+        } else {
+            CoreAccess::InProcess
+        }
+    }
+}
+
+/// A store that fails answers `500` on both paths, with the store's own
+/// error in each body. Only the wording around it can differ: an internal
+/// failure names no refusal reason, so the core path's body is the core's
+/// message and error code.
+#[tokio::test]
+async fn a_failing_store_answers_500_on_both_paths() {
+    let harness = Harness::with_memory(Arc::new(FailingMemory));
+    let fails_with = |what: &str, (status, body): (StatusCode, Value), cause: &str| {
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{what}: {body}");
+        let error = body["error"].as_str().unwrap_or_default();
+        assert!(error.contains(cause), "{what}: {body}");
+    };
+
+    for through_core in [false, true] {
+        let path = if through_core { "core" } else { "in-process" };
+        for query in [None, Some("parity")] {
+            let answer = harness
+                .memory_list(
+                    memory_query(query, None, None),
+                    harness.access(through_core).await,
+                )
+                .await;
+            fails_with(
+                &format!("{path}: GET /api/memory {query:?}"),
+                answer,
+                STORE_DOWN,
+            );
+        }
+        let answer = harness
+            .memory_store(
+                json!({ "key": "parity", "content": "parity" }),
+                harness.access(through_core).await,
+            )
+            .await;
+        fails_with(&format!("{path}: POST /api/memory"), answer, STORE_DOWN);
+        let answer = harness
+            .memory_delete("parity", None, harness.access(through_core).await)
+            .await;
+        fails_with(
+            &format!("{path}: DELETE /api/memory/parity"),
+            answer,
+            STORE_DOWN,
+        );
+    }
+
+    // A cron store that is not a database.
+    let config = harness.config();
+    let cron_dir = config.data_dir.join("cron");
+    std::fs::create_dir_all(&cron_dir).expect("a cron directory");
+    std::fs::write(cron_dir.join("jobs.db"), "not a database").expect("a broken cron store");
+    let cause = zeroclaw_runtime::cron::list_jobs(&config)
+        .expect_err("the broken store fails")
+        .to_string();
+    for through_core in [false, true] {
+        let path = if through_core { "core" } else { "in-process" };
+        let answer = body_of(
+            handle_api_cron_list(
+                State(harness.state.clone()),
+                Harness::headers(),
+                harness.access(through_core).await,
+            )
+            .await
+            .into_response(),
+        )
+        .await;
+        fails_with(&format!("{path}: GET /api/cron"), answer, &cause);
+    }
 }
