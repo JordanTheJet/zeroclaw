@@ -71,6 +71,7 @@ use zeroclaw_api::jsonrpc::error_codes::{
 use zeroclaw_rpc_client::{
     ClientError, ConnectOptions, ConnectionState, EndpointOwner, Method, RpcClient,
 };
+use zeroclaw_rpc_proto::error_reasons::{RefusalData, RefusalReason};
 use zeroclaw_rpc_proto::types::CLIENT_KIND_GATEWAY;
 use zeroclaw_runtime::rpc::inproc::InprocConnector;
 
@@ -234,7 +235,7 @@ impl<S: Send + Sync> FromRequestParts<S> for CoreAccess {
 /// Why a request could not be served through the core. Each case answers
 /// with its own status, so a refused credential (`401`) is never reported
 /// as an unreachable core (`503`) or the reverse.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum CoreError {
     /// The caller presented no usable credential, or the core refused it.
     AuthRequired(String),
@@ -249,7 +250,8 @@ pub enum CoreError {
     Busy,
     /// The core did not answer in time.
     Timeout,
-    /// Any other refusal from the core, mapped by its code.
+    /// Any other refusal from the core: mapped by its refusal reason when
+    /// it carries one, otherwise by its code.
     Rpc(JsonRpcError),
 }
 
@@ -257,8 +259,20 @@ impl CoreError {
     fn from_rpc(error: JsonRpcError) -> Self {
         match error.code {
             AUTH_REQUIRED => Self::AuthRequired(error.message),
-            FORBIDDEN => Self::Forbidden(error.message),
+            // A classified refusal keeps its reason, so it answers with the
+            // route's own refusal body rather than the gateway's.
+            FORBIDDEN if RefusalReason::of(&error).is_none() => Self::Forbidden(error.message),
             _ => Self::Rpc(error),
+        }
+    }
+
+    /// The refusal reason the core attached, or `None` for an error it did
+    /// not classify (including every error from a core that predates
+    /// reasons) and for the gateway's own failures.
+    pub fn reason(&self) -> Option<RefusalReason> {
+        match self {
+            Self::Rpc(error) => RefusalReason::of(error),
+            _ => None,
         }
     }
 
@@ -273,8 +287,28 @@ impl CoreError {
             }
             Self::Busy => (StatusCode::SERVICE_UNAVAILABLE, "core_busy"),
             Self::Timeout => (StatusCode::GATEWAY_TIMEOUT, "core_timeout"),
-            Self::Rpc(error) => rpc_status(error.code),
+            Self::Rpc(error) => RefusalReason::of(error).map_or_else(
+                || rpc_status(error.code),
+                |reason| (refusal_status(reason), reason.as_str()),
+            ),
         }
+    }
+}
+
+/// The status the in-process routes answer each refusal reason with.
+pub(crate) fn refusal_status(reason: RefusalReason) -> StatusCode {
+    match reason {
+        RefusalReason::NotFound => StatusCode::NOT_FOUND,
+        RefusalReason::Unowned | RefusalReason::Blocked | RefusalReason::Malformed => {
+            StatusCode::UNPROCESSABLE_ENTITY
+        }
+        RefusalReason::Conflict => StatusCode::CONFLICT,
+        RefusalReason::Disabled | RefusalReason::Deferred => StatusCode::SERVICE_UNAVAILABLE,
+        RefusalReason::Capacity => StatusCode::TOO_MANY_REQUESTS,
+        RefusalReason::Forbidden => StatusCode::FORBIDDEN,
+        // A per-session read handles an oversized entry itself; anywhere
+        // else it is the caller's bound that cannot be met.
+        RefusalReason::Invalid | RefusalReason::EntryExceedsMaxBytes => StatusCode::BAD_REQUEST,
     }
 }
 
@@ -297,8 +331,23 @@ fn rpc_status(code: i32) -> (StatusCode, &'static str) {
 }
 
 impl IntoResponse for CoreError {
+    /// A refusal the core classified answers as the in-process route does:
+    /// a refused config operation with the config error it carries, at that
+    /// error's status, as the config routes do; any other with the reason's
+    /// status and `{"error": <message>}`. Everything else answers
+    /// `{"error", "code"}`, the code naming the gateway's mapping.
     fn into_response(self) -> Response {
         let (status, code) = self.status();
+        if self.reason().is_some()
+            && let Self::Rpc(error) = self
+        {
+            if let Some(config_error) = RefusalData::config_error_of(&error) {
+                let status =
+                    StatusCode::from_u16(config_error.code.http_status()).unwrap_or(status);
+                return (status, Json(config_error)).into_response();
+            }
+            return (status, Json(serde_json::json!({ "error": error.message }))).into_response();
+        }
         let message = match self {
             Self::AuthRequired(message)
             | Self::Forbidden(message)

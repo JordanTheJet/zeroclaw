@@ -215,6 +215,12 @@ pub fn render() -> anyhow::Result<String> {
         .map(|(name, code)| (code.to_string(), json!(name)))
         .collect();
 
+    // The optional `data` of a refused method call's error. No method names
+    // it as a params or result shape, so it is registered on its own.
+    let error_data = schema::subschema_for_named(&mut generator, "RefusalData")
+        .map(Value::from)
+        .context("RefusalData is missing from the proto schema catalog")?;
+
     let schemas = generator.take_definitions(true);
 
     let methods: Vec<Value> = registered
@@ -250,6 +256,7 @@ pub fn render() -> anyhow::Result<String> {
         "methods": methods,
         "x-notifications": notifications,
         "x-error-codes": error_table,
+        "x-error-data": error_data,
         "components": { "schemas": schemas },
     });
 
@@ -490,5 +497,32 @@ mod tests {
                 .unwrap_or_else(|| panic!("unexpected $ref target {r}"));
             assert!(schemas.contains_key(name), "dangling $ref {r}");
         }
+    }
+
+    #[test]
+    fn error_data_lists_every_refusal_reason() {
+        use zeroclaw_rpc_proto::error_reasons::RefusalReason;
+
+        let doc: Value = serde_json::from_str(&render().expect("render")).expect("valid JSON");
+        assert_eq!(
+            doc["x-error-data"]["$ref"],
+            json!(format!("{DEFINITIONS_PATH}RefusalData"))
+        );
+        let reason = &doc["components"]["schemas"]["RefusalReason"];
+        let listed: Vec<&str> = reason["oneOf"]
+            .as_array()
+            .or_else(|| reason["enum"].as_array())
+            .expect("RefusalReason is an enumeration")
+            .iter()
+            .map(|variant| {
+                variant["const"]
+                    .as_str()
+                    .or_else(|| variant["enum"][0].as_str())
+                    .or_else(|| variant.as_str())
+                    .expect("a string value")
+            })
+            .collect();
+        let expected: Vec<&str> = RefusalReason::ALL.iter().map(|r| r.as_str()).collect();
+        assert_eq!(listed, expected);
     }
 }

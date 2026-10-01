@@ -11,10 +11,10 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use zeroclaw_api::jsonrpc::JsonRpcError;
-use zeroclaw_api::jsonrpc::error_codes::INTERNAL_ERROR;
 use zeroclaw_config::schema::{ChannelAliasInfo, Config};
 use zeroclaw_memory::MemoryEntry;
 use zeroclaw_rpc_client::Method;
+use zeroclaw_rpc_proto::error_reasons::RefusalReason;
 use zeroclaw_rpc_proto::types::{CLIENT_KIND_GATEWAY, SessionEntry, SessionListResult};
 
 use crate::core_rpc::{CoreCall, CoreError};
@@ -1289,11 +1289,10 @@ fn empty_cost_response() -> serde_json::Value {
 /// Lower bound that selects every cost record. No record predates it.
 const ALL_TIME_FROM: &str = "0000-01-01T00:00:00Z";
 
-/// The core's refusal when this daemon has no cost tracker.
-const COST_TRACKING_UNAVAILABLE: &str = "Cost tracking is not available";
-
+/// Whether the core refused because cost tracking is off, which it says
+/// with the `disabled` reason rather than in words.
 fn cost_tracking_disabled(error: &JsonRpcError) -> bool {
-    error.code == INTERNAL_ERROR && error.message == COST_TRACKING_UNAVAILABLE
+    RefusalReason::of(error) == Some(RefusalReason::Disabled)
 }
 
 /// The `cost/query` params that reproduce this route's summary.
@@ -1863,11 +1862,7 @@ pub async fn handle_api_sessions_list(
     }
 
     let Some(ref backend) = state.session_backend else {
-        return Json(serde_json::json!({
-            "sessions": [],
-            "message": "Session persistence is disabled"
-        }))
-        .into_response();
+        return sessions_disabled_response();
     };
 
     if let CoreAccess::Core(core) = access {
@@ -1911,12 +1906,28 @@ pub async fn handle_api_sessions_list(
 }
 
 /// `GET /api/sessions` through the core, the body every router serves for
-/// it: the sessions the caller's principal may see.
+/// it: the sessions the caller's principal may see. A core with session
+/// persistence off answers the route's disabled body.
 pub(crate) async fn api_sessions_list_through_core(core: &CoreCall) -> Result<Response, CoreError> {
-    let listed: SessionListResult = core
-        .call(Method::SessionList, serde_json::json!({}))
-        .await?;
-    Ok(sessions_list_response(listed.sessions))
+    match core
+        .call::<SessionListResult>(Method::SessionList, serde_json::json!({}))
+        .await
+    {
+        Ok(listed) => Ok(sessions_list_response(listed.sessions)),
+        Err(error) if error.reason() == Some(RefusalReason::Disabled) => {
+            Ok(sessions_disabled_response())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// The body this route answers with when session persistence is disabled.
+fn sessions_disabled_response() -> Response {
+    Json(serde_json::json!({
+        "sessions": [],
+        "message": "Session persistence is disabled"
+    }))
+    .into_response()
 }
 
 fn sessions_list_response(entries: Vec<SessionEntry>) -> Response {
