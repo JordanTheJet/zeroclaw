@@ -157,12 +157,6 @@ impl CoreRpc {
         Self::with_dialer(connector, pairing_required, PoolLimits::default())
     }
 
-    /// A handle over any dialer, for route tests outside this module.
-    #[cfg(test)]
-    pub(crate) fn over_dialer(dialer: impl Dial) -> Self {
-        Self::with_dialer(dialer, || true, PoolLimits::default())
-    }
-
     /// Serve RPC-backed routes through the daemon's local socket at
     /// `endpoint`, which `owner` must serve: every dial verifies that
     /// through the kernel before the caller's credential is written. A
