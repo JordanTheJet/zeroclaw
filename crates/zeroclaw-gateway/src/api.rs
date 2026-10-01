@@ -2091,26 +2091,37 @@ enum TranscriptReadError {
     Changed,
 }
 
-/// Read a whole transcript newest page first, each page named by the index it
-/// ends before (`None` for the newest). Indices count from the oldest entry,
-/// so messages appended during the walk leave the older pages in place. A
-/// page that reports fewer entries than the first one did means history was
-/// rewritten underneath the walk, so it starts over.
+/// Read a whole transcript newest page first. `page(row, before_index)`
+/// fetches one page: `row` is `None` for the newest page, which the core
+/// resolves from the candidate keys, and afterwards the exact key that page
+/// read, so every later page comes from the same row; `before_index` is the
+/// index the page ends before. Indices count from the oldest entry, so
+/// messages appended during the walk leave the older pages in place. A later
+/// page from a different row (recreated under the key) or with fewer entries
+/// than the first (history rewritten) starts the walk over.
 async fn read_transcript_pages<F, Fut>(
     mut page: F,
 ) -> Result<Vec<MessageEntry>, TranscriptReadError>
 where
-    F: FnMut(Option<usize>) -> Fut,
+    F: FnMut(Option<String>, Option<usize>) -> Fut,
     Fut: std::future::Future<Output = Result<SessionMessagesResult, CoreError>>,
 {
     'attempt: for _ in 0..CORE_MESSAGE_READ_ATTEMPTS {
-        let newest = page(None).await.map_err(page_error)?;
+        let newest = page(None, None).await.map_err(page_error)?;
         let first_total = newest.total;
         let mut start = newest.start;
+        let row = (newest.session_key, newest.session_created_at);
         let mut pages = vec![newest.messages];
         while start > 0 {
-            let older = page(Some(start)).await.map_err(page_error)?;
-            if older.total < first_total {
+            let Some(key) = row.0.clone() else {
+                return Err(TranscriptReadError::Core(CoreError::Rpc(JsonRpcError {
+                    code: INTERNAL_ERROR,
+                    message: "session/messages did not name the row it read".to_owned(),
+                    data: None,
+                })));
+            };
+            let older = page(Some(key), Some(start)).await.map_err(page_error)?;
+            if older.total < first_total || (older.session_key, older.session_created_at) != row {
                 continue 'attempt;
             }
             if older.start >= start {
@@ -2144,19 +2155,19 @@ fn page_error(error: CoreError) -> TranscriptReadError {
 
 /// `GET /api/sessions/{id}/messages` through the core: the transcript of the
 /// stored row this gateway's resolution names, read in pages that each fit
-/// one RPC frame.
+/// one RPC frame and all come from that one row.
 pub(crate) async fn api_session_messages_through_core(
     core: &CoreCall,
     id: &str,
 ) -> Result<Response, CoreError> {
-    let keys = gateway_session_key_candidates(id);
-    let read = read_transcript_pages(|before_index| {
+    let candidates = gateway_session_key_candidates(id);
+    let read = read_transcript_pages(|row: Option<String>, before_index| {
         let params = SessionMessagesParams {
             session_id: id.to_owned(),
             limit: None,
             before_index,
             cursor: None,
-            session_keys: Some(keys.clone()),
+            session_keys: Some(row.map_or_else(|| candidates.clone(), |key| vec![key])),
             max_bytes: Some(CORE_MESSAGE_PAGE_BYTES),
         };
         async move {

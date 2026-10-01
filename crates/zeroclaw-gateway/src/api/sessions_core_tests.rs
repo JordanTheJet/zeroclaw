@@ -507,15 +507,25 @@ async fn with_gateway_persistence_off_the_core_is_not_asked() {
 
 // ── zeroclaw-gw's transcript read: pages, oldest first ───────────
 
-/// A `session/messages` page of `total` entries starting at `start`.
-fn transcript_page(total: usize, start: usize, contents: &[&str]) -> Value {
+/// The row the scripted pages come from, and when it was created.
+const ROW: (&str, &str) = ("gw_alpha", "2026-10-01T00:00:00+00:00");
+
+/// A `session/messages` page of `total` entries starting at `start`, read
+/// from `row`.
+fn page_of(row: (&str, &str), total: usize, start: usize, contents: &[&str]) -> Value {
     let messages: Vec<Value> = contents
         .iter()
         .map(|content| json!({"role": "user", "content": content, "kind": "message"}))
         .collect();
     json!({"result": {
         "session_id": "alpha", "messages": messages, "total": total, "start": start,
+        "session_key": row.0, "session_created_at": row.1,
     }})
+}
+
+/// A page of [`ROW`].
+fn transcript_page(total: usize, start: usize, contents: &[&str]) -> Value {
+    page_of(ROW, total, start, contents)
 }
 
 /// `GET /api/sessions/alpha/messages` as zeroclaw-gw reads it from a core
@@ -563,15 +573,58 @@ async fn a_paged_transcript_is_asked_for_by_exact_key_and_served_oldest_first() 
     let params = scripted.params.lock().unwrap().clone();
     let before: Vec<Value> = params.iter().map(|p| p["before_index"].clone()).collect();
     assert_eq!(before, [Value::Null, json!(3), json!(1)]);
+    // The newest page is resolved from the candidates; every later page names
+    // only the row the newest page read.
+    let keys: Vec<Value> = params.iter().map(|p| p["session_keys"].clone()).collect();
+    assert_eq!(
+        keys,
+        [
+            json!(["alpha", "gw_alpha"]),
+            json!(["gw_alpha"]),
+            json!(["gw_alpha"])
+        ]
+    );
     for sent in &params {
         assert_eq!(sent["session_id"], "alpha");
-        assert_eq!(sent["session_keys"], json!(["alpha", "gw_alpha"]));
         assert_eq!(sent["max_bytes"], json!(CORE_MESSAGE_PAGE_BYTES));
         assert!(
             sent.get("cursor").is_none(),
             "never ACP cursor mode: {sent}"
         );
     }
+}
+
+#[tokio::test]
+async fn a_page_from_another_row_starts_the_read_over_rather_than_mixing_rows() {
+    let recreated = (ROW.0, "2026-10-01T00:00:09+00:00");
+    let (scripted, (status, body)) = read_scripted(vec![
+        transcript_page(4, 2, &["c", "d"]),
+        // The row was removed and recreated under the same key, with as many
+        // entries: only its creation time tells it apart.
+        page_of(recreated, 4, 0, &["new-a", "new-b"]),
+        page_of(recreated, 2, 0, &["new-a", "new-b"]),
+    ])
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(contents(&body), ["new-a", "new-b"]);
+    assert_eq!(scripted.params.lock().unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn a_core_that_does_not_name_its_row_is_not_paged_blind() {
+    let mut nameless = transcript_page(4, 2, &["c", "d"]);
+    nameless["result"]
+        .as_object_mut()
+        .expect("a result")
+        .remove("session_key");
+    let (scripted, (status, body)) = read_scripted(vec![nameless]).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    assert_eq!(body["code"], "core_error");
+    assert_eq!(
+        scripted.params.lock().unwrap().len(),
+        1,
+        "no later page is asked for without a row to bind it to"
+    );
 }
 
 #[tokio::test]

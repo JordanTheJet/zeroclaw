@@ -374,6 +374,17 @@ rpc_type! {
         pub next_cursor: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub has_older: Option<bool>,
+        /// The exact chat-store key read, when the call named
+        /// `session_keys`. A caller paging back through one transcript sends
+        /// only this key for the following pages, so a preferred key that
+        /// appears meanwhile cannot switch rows under it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub session_key: Option<String>,
+        /// When the row read was created (RFC 3339). A row removed and
+        /// recreated under the same key has a new one, so a change between
+        /// pages means the pages came from different rows.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub session_created_at: Option<String>,
     }
 }
 
@@ -395,8 +406,11 @@ rpc_type! {
         /// Upper bound, in bytes, on the serialized `messages` of the result.
         /// The page keeps the newest entries of its window that fit, and
         /// `start` says where it begins, so a caller can page backwards with
-        /// `before_index`. A single entry larger than the bound is refused
-        /// with `INVALID_PARAMS` and `data.reason = "entry_exceeds_max_bytes"`.
+        /// `before_index`. The bound covers the array exactly, brackets and
+        /// commas included, so it must be at least 2; a single entry larger
+        /// than the bound is refused with `INVALID_PARAMS` and
+        /// `data.reason = "entry_exceeds_max_bytes"`. Not combinable with
+        /// `cursor`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub max_bytes: Option<usize>,
     }

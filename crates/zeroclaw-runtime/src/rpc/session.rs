@@ -148,6 +148,10 @@ pub struct SessionRecord {
     pub owner: Option<String>,
 }
 
+/// Prefix of the admission-queue name of a stored chat row that no live
+/// session can cover.
+const STORED_ROW_QUEUE_PREFIX: &str = "\0row:";
+
 /// What a session-targeting call names.
 ///
 /// A plain session id names the live session with that id and every chat
@@ -172,11 +176,17 @@ impl SessionAddress {
         }
     }
 
-    /// The key admission queues on: the live id, or the chat key itself.
-    pub(crate) fn queue_id(&self) -> &str {
+    /// The name admission queues on. A session that can be live queues on
+    /// its live id; a stored row no live session can cover queues under a
+    /// reserved prefix, so it never waits behind, or answers busy for, a live
+    /// session that merely shares its spelling.
+    pub(crate) fn queue_id(&self) -> std::borrow::Cow<'_, str> {
         match self {
-            Self::Id(id) => id,
-            Self::ChatKey(key) => key.strip_prefix("rpc_").unwrap_or(key),
+            Self::Id(id) => std::borrow::Cow::Borrowed(id),
+            Self::ChatKey(key) => match key.strip_prefix("rpc_") {
+                Some(id) => std::borrow::Cow::Borrowed(id),
+                None => std::borrow::Cow::Owned(format!("{STORED_ROW_QUEUE_PREFIX}{key}")),
+            },
         }
     }
 
@@ -316,6 +326,10 @@ pub struct SessionStore {
     /// but before it signals an in-flight turn.
     #[cfg(test)]
     test_removal_signal_pause: std::sync::Mutex<Option<RemovalSignalPause>>,
+    /// Test-only pause after `session/state` authorizes its target and
+    /// before it reads the live session.
+    #[cfg(test)]
+    test_state_read_pause: std::sync::Mutex<Option<PromptRehydrationPause>>,
     #[cfg(test)]
     test_prompt_admission_hook: std::sync::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     /// Test-only pause between a rehydration's publication and its history
@@ -397,6 +411,8 @@ impl SessionStore {
             test_prompt_rehydration_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
             test_removal_signal_pause: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            test_state_read_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
             test_prompt_admission_hook: std::sync::Mutex::new(None),
             #[cfg(test)]
@@ -1672,6 +1688,30 @@ impl SessionStore {
         let entered = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(tokio::sync::Notify::new());
         *self.test_prompt_rehydration_pause.lock().unwrap() =
+            Some((Arc::clone(&entered), Arc::clone(&release)));
+        (entered, release)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn wait_test_state_read_pause(&self) {
+        let pause = self.test_state_read_pause.lock().unwrap().clone();
+        if let Some((entered, release)) = pause {
+            entered.notify_one();
+            release.notified().await;
+        }
+    }
+
+    #[cfg(not(test))]
+    #[inline(always)]
+    pub(crate) async fn wait_test_state_read_pause(&self) {}
+
+    /// Arm [`Self::wait_test_state_read_pause`]: returns the notify that
+    /// fires when a state read reaches it and the one that releases it.
+    #[cfg(test)]
+    pub(crate) fn set_test_state_read_pause(&self) -> PromptRehydrationPause {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        *self.test_state_read_pause.lock().unwrap() =
             Some((Arc::clone(&entered), Arc::clone(&release)));
         (entered, release)
     }
