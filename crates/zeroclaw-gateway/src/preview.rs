@@ -3,12 +3,17 @@
 //!
 //! This is a stretch preview, not a supported deployment. It serves the
 //! static dashboard, the OpenAPI document, its own health, a core-link
-//! diagnostic, and the dashboard routes ported onto the core's RPC surface,
-//! with the same bodies the in-process gateway answers when a request
-//! reaches the core. Every other route the in-process gateway serves
+//! diagnostic, its own shutdown, the Claude Code hook, and the dashboard
+//! routes ported onto the core's RPC surface, with the same bodies the
+//! in-process gateway answers when a request reaches the core. Every other route the in-process gateway serves
 //! answers a distinct JSON refusal naming the route; nothing falls through
 //! to in-process state or to the dashboard's page fallback. Routes join as
 //! they are ported.
+//!
+//! Every route sits behind the in-process gateway's request limits: a body
+//! of at most [`crate::MAX_BODY_SIZE`] bytes (`413` beyond it) and an answer
+//! within the request timeout (`408` after it), so a slow or oversized
+//! request is bounded here as it is there, shutdown included.
 //!
 //! It is configured from flags and the environment only and never reads
 //! `config.toml`. It runs as the same OS account as the core: every
@@ -21,15 +26,17 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::Json;
 use axum::Router;
 use axum::extract::rejection::{JsonRejection, PathRejection, QueryRejection};
-use axum::extract::{Path as UrlPath, Query, State};
+use axum::extract::{ConnectInfo, Path as UrlPath, Query, State};
 use axum::http::{Method as HttpMethod, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{MethodFilter, MethodRouter, get, on};
+use axum::routing::{MethodFilter, MethodRouter, get, on, post};
 use serde_json::json;
+use tokio::sync::watch;
 use zeroclaw_rpc_client::{
     ClientError, EndpointOwner, EndpointRejection, Method, RPC_PROTOCOL_VERSION, RpcClient,
 };
@@ -48,7 +55,7 @@ pub const DEFAULT_LISTEN: &str = "127.0.0.1:42617";
 pub const CORE_LINK_PATH: &str = "/api/gateway/core";
 
 /// How long the health probe waits to reach the core's endpoint.
-const HEALTH_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// What to do when the core is down or busy.
 const HINT_START_CORE: &str =
@@ -72,11 +79,15 @@ Options:
   --web-dist DIR        serve the dashboard from DIR (must hold index.html)
   --tls-cert PEM        serve HTTPS with this certificate (needs --tls-key)
   --tls-key PEM         the certificate's private key (needs --tls-cert)
+  --request-timeout SECS
+                        answer 408 to a request not done within SECS
+                        [default: 30, the in-process gateway's default]
   -h, --help            print this help
   -V, --version         print the version
 
 Runs as the same OS account as the core, on Unix. On start it prints
-`READY <url>` on stdout once it is serving.";
+`READY <url>` on stdout once it is serving. It stops on SIGINT or SIGTERM,
+or on `POST /admin/shutdown` from this machine.";
 
 /// Everything the preview needs to start, from flags and the environment.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,6 +96,8 @@ pub struct Bootstrap {
     pub endpoint: PathBuf,
     pub web_dist: Option<PathBuf>,
     pub tls: Option<TlsFiles>,
+    /// How long a request may take before it is answered `408`.
+    pub request_timeout: Duration,
 }
 
 /// The PEM files for serving HTTPS.
@@ -114,6 +127,7 @@ pub fn parse_args(
     let mut web_dist: Option<PathBuf> = None;
     let mut tls_cert: Option<PathBuf> = None;
     let mut tls_key: Option<PathBuf> = None;
+    let mut request_timeout = Duration::from_secs(crate::REQUEST_TIMEOUT_SECS);
     let mut allow_public_bind = false;
 
     let mut args = args.into_iter();
@@ -132,6 +146,17 @@ pub fn parse_args(
             "--web-dist" => web_dist = Some(value("--web-dist")?.into()),
             "--tls-cert" => tls_cert = Some(value("--tls-cert")?.into()),
             "--tls-key" => tls_key = Some(value("--tls-key")?.into()),
+            "--request-timeout" => {
+                let secs = value("--request-timeout")?;
+                request_timeout = secs
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|secs| *secs > 0)
+                    .map(Duration::from_secs)
+                    .ok_or_else(|| {
+                        format!("--request-timeout {secs:?} is not a positive number of seconds")
+                    })?;
+            }
             "--allow-public-bind" => allow_public_bind = true,
             "--config" | "--config-dir" => {
                 return Err(format!(
@@ -178,6 +203,7 @@ pub fn parse_args(
         endpoint,
         web_dist,
         tls,
+        request_timeout,
     }))
 }
 
@@ -190,7 +216,7 @@ enum Refusal {
     /// missing.
     NotPorted,
     /// A route the preview defers by design (pairing exchange, OIDC,
-    /// WebAuthn, ACP, nodes, webhook ingress, admin and hook endpoints).
+    /// WebAuthn, ACP, nodes, webhook ingress, admin endpoints).
     /// These carry no bearer by nature, so no credential is asked for.
     Deferred(&'static str),
 }
@@ -312,8 +338,7 @@ const REFUSED: &[(&str, &str, Refusal)] = &[
         "GET",
         Refusal::Deferred("a2a"),
     ),
-    // Local administration and hooks: use the zeroclaw CLI against the core.
-    ("/admin/shutdown", "POST", Refusal::Deferred("admin")),
+    // Local administration of the core: use the zeroclaw CLI against it.
     ("/admin/reload", "POST", Refusal::Deferred("admin")),
     ("/admin/sop/pending", "GET", Refusal::Deferred("admin")),
     ("/admin/sop/logs", "GET", Refusal::Deferred("admin")),
@@ -321,7 +346,6 @@ const REFUSED: &[(&str, &str, Refusal)] = &[
     ("/admin/sop/deny", "POST", Refusal::Deferred("admin")),
     ("/admin/paircode", "GET", Refusal::Deferred("admin")),
     ("/admin/paircode/new", "POST", Refusal::Deferred("admin")),
-    ("/hooks/claude-code", "POST", Refusal::Deferred("hooks")),
     ("/metrics", "GET", Refusal::Deferred("metrics")),
     // Dashboard routes not yet served through the core.
     ("/api/status", "GET", Refusal::NotPorted),
@@ -517,15 +541,29 @@ fn method_filter(methods: &str) -> MethodFilter {
 struct PreviewState {
     endpoint: Arc<PathBuf>,
     web_dist: Option<Arc<PathBuf>>,
+    /// Set by `POST /admin/shutdown` to stop this process.
+    shutdown: watch::Sender<bool>,
 }
 
 /// The preview's router. `core` must be attached to the core's socket
 /// (see [`CoreRpc::local`]); `endpoint` is that socket, for the health
-/// probe; `web_dist` holds the built dashboard.
-pub fn router(core: CoreRpc, endpoint: PathBuf, web_dist: Option<PathBuf>) -> Router {
+/// probe; `web_dist` holds the built dashboard. `POST /admin/shutdown` sets
+/// `shutdown`, which the caller serving the router stops on. Serve it with
+/// the peer's address (`into_make_service_with_connect_info`), which that
+/// route checks. Every route answers `413` to a body over
+/// [`crate::MAX_BODY_SIZE`] and `408` to a request not done within
+/// `request_timeout`, as the in-process gateway's routes do.
+pub fn router(
+    core: CoreRpc,
+    endpoint: PathBuf,
+    web_dist: Option<PathBuf>,
+    shutdown: watch::Sender<bool>,
+    request_timeout: Duration,
+) -> Router {
     let state = PreviewState {
         endpoint: Arc::new(endpoint),
         web_dist: web_dist.map(Arc::new),
+        shutdown,
     };
     let mut router: Router<PreviewState> = Router::new()
         .route("/health", get(health))
@@ -551,7 +589,9 @@ pub fn router(core: CoreRpc, endpoint: PathBuf, web_dist: Option<PathBuf>) -> Ro
         .route(
             "/api/personality/{filename}",
             get(personality_get).put(personality_put),
-        );
+        )
+        .route("/admin/shutdown", post(admin_shutdown))
+        .route("/hooks/claude-code", post(claude_code_hook));
     for &(path, methods, refusal) in REFUSED {
         let handler: MethodRouter<PreviewState> = on(
             method_filter(methods),
@@ -569,6 +609,13 @@ pub fn router(core: CoreRpc, endpoint: PathBuf, web_dist: Option<PathBuf>) -> Ro
     router
         .fallback(fallback)
         .layer(axum::Extension(core))
+        .layer(tower_http::limit::RequestBodyLimitLayer::new(
+            crate::MAX_BODY_SIZE,
+        ))
+        .layer(tower_http::timeout::TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            request_timeout,
+        ))
         .layer(axum::middleware::from_fn(crate::security_headers::apply))
         .with_state(state)
 }
@@ -980,6 +1027,24 @@ async fn personality_put(
     .await
 }
 
+/// `POST /admin/shutdown`: stop this process, for a caller on loopback, as
+/// the in-process route stops the in-process gateway. No core call: the
+/// core keeps running.
+async fn admin_shutdown(
+    State(state): State<PreviewState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+) -> Response {
+    crate::admin_shutdown(&peer, &state.shutdown)
+}
+
+/// `POST /hooks/claude-code`: log the event and acknowledge it, as the
+/// in-process route does. No core call.
+async fn claude_code_hook(
+    Json(payload): Json<zeroclaw_tools::claude_code_runner::ClaudeCodeHookEvent>,
+) -> Json<serde_json::Value> {
+    crate::api::claude_code_hook(&payload)
+}
+
 /// `GET /api/gateway/core`: which principal the caller's credential binds
 /// and which core answers, over the caller's own core connection.
 async fn core_link(access: Result<CoreAccess, CoreError>) -> Response {
@@ -1088,7 +1153,14 @@ pub async fn serve(bootstrap: Bootstrap) -> anyhow::Result<()> {
     };
 
     let core = CoreRpc::local(bootstrap.endpoint.clone(), EndpointOwner::SameAccount);
-    let mut app = router(core, bootstrap.endpoint.clone(), bootstrap.web_dist.clone());
+    let (shutdown, shutdown_requested) = watch::channel(false);
+    let mut app = router(
+        core,
+        bootstrap.endpoint.clone(),
+        bootstrap.web_dist.clone(),
+        shutdown,
+        bootstrap.request_timeout,
+    );
     if tls.is_some() {
         app = app.layer(axum::middleware::from_fn(
             crate::security_headers::apply_with_hsts,
@@ -1105,41 +1177,75 @@ pub async fn serve(bootstrap: Bootstrap) -> anyhow::Result<()> {
 
     match tls {
         None => {
-            axum::serve(listener, app)
-                .with_graceful_shutdown(shutdown_signal())
-                .await?;
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown(stop_requested(shutdown_requested))
+            .await?;
         }
-        Some(acceptor) => serve_tls(listener, acceptor, app).await?,
+        Some(acceptor) => {
+            serve_tls(
+                listener,
+                acceptor,
+                app,
+                shutdown_requested,
+                bootstrap.request_timeout,
+            )
+            .await?;
+        }
     }
     Ok(())
 }
 
+/// Serve HTTPS until asked to stop, then let the requests in flight finish
+/// and their answers (the shutdown acknowledgement among them) reach the
+/// caller, as the plain listener does: each connection closes once its
+/// request is answered. A connection that does not finish within
+/// `request_timeout` is dropped, so stopping stays bounded.
 async fn serve_tls(
     listener: tokio::net::TcpListener,
     acceptor: tokio_rustls::TlsAcceptor,
     app: Router,
+    shutdown_requested: watch::Receiver<bool>,
+    request_timeout: Duration,
 ) -> anyhow::Result<()> {
-    let shutdown = shutdown_signal();
+    let shutdown = stop_requested(shutdown_requested);
     tokio::pin!(shutdown);
+    let connections = hyper_util::server::graceful::GracefulShutdown::new();
     loop {
-        let (tcp, _) = tokio::select! {
+        let (tcp, peer) = tokio::select! {
             accepted = listener.accept() => accepted?,
-            () = &mut shutdown => return Ok(()),
+            () = &mut shutdown => break,
         };
         let acceptor = acceptor.clone();
         let app = app.clone();
+        let watcher = connections.watcher();
         zeroclaw_spawn::spawn!(async move {
             let Ok(stream) = acceptor.accept(tcp).await else {
                 return;
             };
-            let service = hyper::service::service_fn(move |request| {
+            let service = hyper::service::service_fn(move |mut request: hyper::Request<_>| {
+                request.extensions_mut().insert(ConnectInfo(peer));
                 tower::ServiceExt::oneshot(app.clone(), request)
             });
-            let _ =
-                hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
-                    .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
-                    .await;
+            let builder =
+                hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
+            let _ = watcher
+                .watch(builder.serve_connection(hyper_util::rt::TokioIo::new(stream), service))
+                .await;
         });
+    }
+    let _ = tokio::time::timeout(request_timeout, connections.shutdown()).await;
+    Ok(())
+}
+
+/// Resolves when this process should stop: on a signal, or once
+/// `POST /admin/shutdown` asks.
+async fn stop_requested(mut requested: watch::Receiver<bool>) {
+    tokio::select! {
+        () = shutdown_signal() => {}
+        _ = requested.wait_for(|stop| *stop) => {}
     }
 }
 

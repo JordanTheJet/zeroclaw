@@ -4751,8 +4751,20 @@ fn require_gateway_admin_token(
 async fn handle_admin_shutdown(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
-) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
-    require_localhost(&peer)?;
+) -> Response {
+    admin_shutdown(&peer, &state.shutdown_tx)
+}
+
+/// The `/admin/shutdown` answer to a caller at `peer`: refused unless it is
+/// on loopback, otherwise a stop request on `shutdown`. The separate
+/// gateway answers with this too, so both stop the same way.
+pub(crate) fn admin_shutdown(
+    peer: &SocketAddr,
+    shutdown: &tokio::sync::watch::Sender<bool>,
+) -> Response {
+    if let Err(refusal) = require_localhost(peer) {
+        return refusal.into_response();
+    }
     ::zeroclaw_log::record!(
         INFO,
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
@@ -4764,9 +4776,9 @@ async fn handle_admin_shutdown(
         message: "Gateway shutdown initiated".to_string(),
     };
 
-    let _ = state.shutdown_tx.send(true);
+    let _ = shutdown.send(true);
 
-    Ok((StatusCode::OK, Json(body)))
+    (StatusCode::OK, Json(body)).into_response()
 }
 
 /// Authorization decision for `POST /admin/reload`, derived purely from the
