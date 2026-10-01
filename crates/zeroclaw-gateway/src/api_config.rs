@@ -911,6 +911,21 @@ pub(crate) async fn try_compute_drift(
             .map(|p| (p.name.clone(), p))
             .collect();
 
+    // Display values intentionally discard URL credentials. Compare the
+    // canonical serialized values internally when display masking obscures
+    // a change, and retain the redacted displays in the returned diagnostics.
+    let raw_memory = toml::Value::try_from(in_memory).map_err(|_| {
+        ConfigApiError::new(
+            ConfigApiCode::ConfigChangedExternally,
+            "cannot serialize in-memory config for comparison",
+        )
+    })?;
+    let raw_disk = toml::Value::try_from(&on_disk).map_err(|_| {
+        ConfigApiError::new(
+            ConfigApiCode::ConfigChangedExternally,
+            "cannot serialize on-disk config for comparison",
+        )
+    })?;
     let mut drift: Vec<DriftEntry> = Vec::new();
     let mut all_names: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
     all_names.extend(in_memory_props.keys().map(String::as_str));
@@ -933,7 +948,21 @@ pub(crate) async fn try_compute_drift(
             .map(|p| p.display_value.as_str())
             .unwrap_or(zeroclaw_config::traits::UNSET_DISPLAY);
         if mem_display == disk_display {
-            continue;
+            if !zeroclaw_config::url_credentials::carries_mask(mem_display) {
+                continue;
+            }
+            let mem_raw = zeroclaw_config::schema::url_prop_value_for_comparison(&raw_memory, name);
+            let disk_raw = zeroclaw_config::schema::url_prop_value_for_comparison(&raw_disk, name);
+            if mem_raw.is_none() || disk_raw.is_none() {
+                return Err(ConfigApiError::new(
+                    ConfigApiCode::ConfigChangedExternally,
+                    "cannot resolve a masked config property for comparison",
+                )
+                .with_path(name));
+            }
+            if mem_raw == disk_raw {
+                continue;
+            }
         }
         let is_sensitive = mem
             .or(disk)
@@ -2417,7 +2446,7 @@ pub async fn handle_refresh_context_window(
     // for the duration -- a self-inflicted availability bottleneck.
     let provider_config = {
         let snapshot = state.config.read();
-        if snapshot.get_prop(&format!("{path}.model")).is_err() {
+        let Some(provider) = snapshot.providers.models.find(&provider_type, &alias) else {
             return error_response(
                 ConfigApiError::new(
                     ConfigApiCode::PathNotFound,
@@ -2425,27 +2454,8 @@ pub async fn handle_refresh_context_window(
                 )
                 .with_path(&path),
             );
-        }
-        let model = snapshot
-            .get_prop(&format!("{path}.model"))
-            .ok()
-            .unwrap_or_default();
-        let uri = snapshot.get_prop(&format!("{path}.uri")).ok();
-        // Read api_key via JSON serialization to bypass #[secret] masking in get_prop.
-        let api_key = serde_json::to_value(&snapshot.providers)
-            .ok()
-            .and_then(|v| {
-                v.pointer(&format!("/models/{provider_type}/{alias}/api_key"))
-                    .and_then(|v| v.as_str())
-                    .filter(|s| !s.is_empty() && *s != "<unset>")
-                    .map(String::from)
-            });
-        zeroclaw_config::schema::ModelProviderConfig {
-            model: Some(model),
-            uri,
-            api_key,
-            ..Default::default()
-        }
+        };
+        provider.clone()
     };
 
     // Fetch context window from provider. No lock -- neither `config` nor
@@ -2551,7 +2561,10 @@ pub async fn handle_patch(
         .map(|v| v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
     if !override_drift {
-        let drifted = compute_drift(&working).await;
+        let drifted = match try_compute_drift(&working).await {
+            Ok(drifted) => drifted,
+            Err(error) => return error_response(error),
+        };
         if !drifted.is_empty() {
             let touched: std::collections::HashSet<String> = ops
                 .iter()
@@ -3654,6 +3667,122 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
         assert_eq!(json["code"], "validation_failed", "{json}");
         assert_eq!(uri().as_deref(), Some(stored));
+    }
+
+    #[tokio::test]
+    async fn patch_refuses_credential_only_disk_drift_and_keeps_rotated_credentials() {
+        const PROP: &str = "providers.models.custom.credential_url.uri";
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = temp_config(&tmp);
+        config
+            .create_map_key("providers.models.custom", "credential_url")
+            .unwrap();
+        config
+            .set_prop_persistent(
+                PROP,
+                "https://reader:old-password@example.invalid/v1?token=old-query",
+            )
+            .unwrap();
+        config.save_dirty().await.unwrap();
+        assert!(try_compute_drift(&config).await.unwrap().is_empty());
+        let mut disk = config.clone();
+        disk.set_prop_persistent(
+            PROP,
+            "https://reader:rotated-password@example.invalid/v1?token=rotated-query",
+        )
+        .unwrap();
+        disk.save_dirty().await.unwrap();
+        let disk_before = tokio::fs::read(&config.config_path).await.unwrap();
+        let drift = try_compute_drift(&config).await.unwrap();
+        assert!(drift.iter().any(|entry| entry.path == PROP));
+        let diagnostic = serde_json::to_string(&drift).unwrap();
+        for secret in [
+            "old-password",
+            "old-query",
+            "rotated-password",
+            "rotated-query",
+        ] {
+            assert!(!diagnostic.contains(secret), "{diagnostic}");
+        }
+        let state = test_state(config);
+        let (status, body) = response_json(
+            handle_patch(
+                State(state.clone()),
+                None,
+                HeaderMap::new(),
+                axum::Json(serde_json::json!([{
+                    "op": "replace", "path": "/providers/models/custom/credential_url/uri",
+                    "value": "https://***MASKED***@example.invalid/v2?***MASKED***"
+                }])),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["code"], "config_changed_externally");
+        assert_eq!(
+            tokio::fs::read(&disk.config_path).await.unwrap(),
+            disk_before
+        );
+        assert!(
+            state
+                .config
+                .read()
+                .providers
+                .models
+                .find("custom", "credential_url")
+                .unwrap()
+                .uri
+                .as_ref()
+                .unwrap()
+                .contains("old-password")
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_context_window_uses_stored_url_credentials() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .and(query_param("token", "refresh-url-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{"id": "credential-model", "context_length": 12345}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = temp_config(&tmp);
+        config
+            .create_map_key("providers.models.openrouter", "credential_url")
+            .unwrap();
+        config
+            .set_prop_persistent(
+                "providers.models.openrouter.credential_url.model",
+                "credential-model",
+            )
+            .unwrap();
+        config
+            .set_prop_persistent(
+                "providers.models.openrouter.credential_url.uri",
+                &format!("{}/models?token=refresh-url-token", server.uri()),
+            )
+            .unwrap();
+        let state = test_state(config);
+        let (status, body) = response_json(
+            handle_refresh_context_window(
+                State(state),
+                None,
+                axum::extract::Path(("openrouter".into(), "credential_url".into())),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["context_window"], 12345);
+        server.verify().await;
     }
 
     #[tokio::test]
@@ -5083,6 +5212,46 @@ mod tests {
         assert!(entry.drifted);
         assert!(entry.in_memory_value.is_some());
         assert!(entry.on_disk_value.is_some());
+    }
+
+    #[tokio::test]
+    async fn drift_detects_url_rotation_in_named_lists_without_secret_encryption_noise() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = temp_config(&tmp);
+        config.create_map_key("mcp.servers", "search").unwrap();
+        config
+            .set_prop_persistent("mcp.servers.search.transport", "http")
+            .unwrap();
+        config
+            .set_prop_persistent(
+                "mcp.servers.search.url",
+                "https://search.example.invalid/mcp?token=original-token",
+            )
+            .unwrap();
+        config.mcp.servers[0]
+            .headers
+            .insert("Authorization".into(), "ordinary-header-secret".into());
+        config.mark_dirty("mcp.servers.search");
+        config.save_dirty().await.unwrap();
+        assert!(try_compute_drift(&config).await.unwrap().is_empty());
+        let raw = tokio::fs::read_to_string(&config.config_path)
+            .await
+            .unwrap();
+        assert!(!raw.contains("ordinary-header-secret"));
+        let rotated = raw.replace("original-token", "rotated-token");
+        tokio::fs::write(&config.config_path, rotated)
+            .await
+            .unwrap();
+        let drift = try_compute_drift(&config).await.unwrap();
+        assert!(
+            drift
+                .iter()
+                .any(|entry| entry.path == "mcp.servers.search.url")
+        );
+        let json = serde_json::to_string(&drift).unwrap();
+        for secret in ["ordinary-header-secret", "original-token", "rotated-token"] {
+            assert!(!json.contains(secret), "{json}");
+        }
     }
 
     #[tokio::test]

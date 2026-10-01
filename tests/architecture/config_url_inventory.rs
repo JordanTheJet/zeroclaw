@@ -67,11 +67,6 @@ const NOT_CREDENTIAL_BEARING: &[(&str, &str, &str)] = &[
         "rp_origin",
         "the relying party's public origin, which WebAuthn compares exactly",
     ),
-    (
-        "NostrConfig",
-        "relays",
-        "public relay addresses; a relay authenticates a client by challenge, not in its URL",
-    ),
 ];
 
 /// A URL-named, string-typed field of a struct in the config sources.

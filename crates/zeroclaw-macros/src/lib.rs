@@ -2053,6 +2053,23 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
         prop_credential_url_flags.push(is_credential_url);
 
         if is_vec {
+            let vector_display = if is_credential_url {
+                quote! {
+                    let mut masked = v.clone();
+                    crate::traits::CredentialUrlField::mask_url_credentials(&mut masked);
+                    match toml::Value::try_from(&masked) {
+                        Ok(tv) => tv.to_string(),
+                        Err(_) => "[]".to_string(),
+                    }
+                }
+            } else {
+                quote! {
+                    match toml::Value::try_from(v) {
+                        Ok(tv) => tv.to_string(),
+                        Err(_) => "[]".to_string(),
+                    }
+                }
+            };
             let inner_value_expr = if is_option {
                 quote! { self.#field_ident.as_ref() }
             } else {
@@ -2071,10 +2088,7 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                                     &<#inner_ty as crate::config::HasPropKind>::display_credential_url_terminals(),
                                 )
                             }
-                            _ => match toml::Value::try_from(v) {
-                                Ok(tv) => tv.to_string(),
-                                Err(_) => "[]".to_string(),
-                            },
+                            _ => { #vector_display },
                         },
                     };
                     crate::config::PropFieldInfo {

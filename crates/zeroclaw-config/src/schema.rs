@@ -20647,6 +20647,7 @@ pub struct NostrConfig {
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub private_key: String,
     /// Relay URLs (wss://). Defaults to popular public relays if omitted.
+    #[credential_url]
     #[tab(Advanced)]
     #[serde(default = "default_nostr_relays")]
     pub relays: Vec<String>,
@@ -27229,6 +27230,41 @@ fn prune_empty_leaves(value: &mut toml::Value) {
         }
         _ => {}
     }
+}
+
+/// Resolve a property for internal URL drift comparison using the same
+/// dotted-key and natural-key routing as configuration writes. Ordinary
+/// secret members are redacted within the resolved property, so ciphertext
+/// does not create false URL drift. Never display or log this value: URL
+/// credentials remain raw for equality checks.
+pub fn url_prop_value_for_comparison(root: &toml::Value, path: &str) -> Option<toml::Value> {
+    let mut value = serialized_prop_value(root, path)?.clone();
+    crate::helpers::redact_toml_display_secrets(&mut value, &Config::secret_field_terminals(), &[]);
+    Some(value)
+}
+
+fn serialized_prop_value<'a>(root: &'a toml::Value, path: &str) -> Option<&'a toml::Value> {
+    let table = root.as_table()?;
+    if let Some(section) = find_natural_key_section_for_path(path) {
+        let section_segments: Vec<&str> = section.section_path.split('.').collect();
+        let entries = lookup_path_in_table(table, &section_segments)?.as_array()?;
+        let keys = entries.iter().enumerate().filter_map(|(index, entry)| {
+            entry
+                .get(section.natural_key_field)?
+                .as_str()
+                .map(|key| (index, key))
+        });
+        return match crate::helpers::route_vec_path(path, "", section.section_path, "", keys) {
+            crate::helpers::VecRoute::Hit { index, inner_name } => {
+                serialized_prop_value(entries.get(index)?, &inner_name)
+            }
+            _ => None,
+        };
+    }
+    let raw: Vec<&str> = path.split('.').collect();
+    let segments = resolve_dirty_segments(table, &raw);
+    let segments: Vec<&str> = segments.iter().map(String::as_str).collect();
+    lookup_path_in_table(table, &segments)
 }
 
 fn resolve_dirty_segments(root: &toml::Table, raw: &[&str]) -> Vec<String> {
@@ -42877,6 +42913,128 @@ stream_tool_arguments = [
         .unwrap();
         masked.restore_secrets_from(&original);
         assert_eq!(custom_uri(&masked), Some(stored));
+    }
+
+    #[::core::prelude::v1::test]
+    fn relay_url_lists_mask_every_read_and_restore_by_endpoint() {
+        use crate::traits::MaskSecrets;
+        let original: Config = toml::from_str(r#"
+            [channels.nostr.review]
+            private_key = ""
+            relays = ["wss://reader:relay-password@relay.example.invalid/events?token=relay-query#relay-fragment", "wss://public.example.invalid/events"]
+        "#).unwrap();
+        let path = "channels.nostr.review.relays";
+        let mut config = original.clone();
+        let mut masked = original.clone();
+        masked.mask_secrets();
+        let whole = serde_json::to_string(&masked).unwrap();
+        let shown = original.get_prop(path).unwrap();
+        let listed = original
+            .prop_fields()
+            .into_iter()
+            .find(|p| p.name == path)
+            .unwrap()
+            .display_value;
+        for read in [&whole, &shown, &listed] {
+            for marker in ["relay-password", "relay-query", "relay-fragment"] {
+                assert!(!read.contains(marker), "{read}");
+            }
+        }
+        config.set_prop(path, &shown).unwrap();
+        assert_eq!(
+            config.channels.nostr["review"].relays,
+            original.channels.nostr["review"].relays
+        );
+        let mut reordered = masked.channels.nostr["review"].relays.clone();
+        reordered.reverse();
+        config
+            .set_prop(path, &serde_json::to_string(&reordered).unwrap())
+            .unwrap();
+        let mut expected = original.channels.nostr["review"].relays.clone();
+        expected.reverse();
+        assert_eq!(config.channels.nostr["review"].relays, expected);
+        reordered[1] = reordered[1].replace("relay.example.invalid", "different.example.invalid");
+        assert!(
+            config
+                .set_prop(path, &serde_json::to_string(&reordered).unwrap())
+                .is_err()
+        );
+        assert_eq!(config.channels.nostr["review"].relays, expected);
+        masked.restore_secrets_from(&original);
+        assert_eq!(
+            masked.channels.nostr["review"].relays,
+            original.channels.nostr["review"].relays
+        );
+
+        // Two stored credentials behind the same displayed endpoint have no
+        // stable identity; neither may be chosen when the list is echoed.
+        let mut ambiguous = original.clone();
+        ambiguous
+            .channels
+            .nostr
+            .get_mut("review")
+            .unwrap()
+            .relays
+            .push(
+                original.channels.nostr["review"].relays[0]
+                    .replace("relay-password", "other-password"),
+            );
+        let shown = ambiguous.get_prop(path).unwrap();
+        assert!(ambiguous.set_prop(path, &shown).is_err());
+        let mut empty = original.clone();
+        empty
+            .channels
+            .nostr
+            .get_mut("review")
+            .unwrap()
+            .relays
+            .clear();
+        assert!(
+            empty
+                .set_prop(path, &original.get_prop(path).unwrap())
+                .is_err()
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn wrapped_embedding_url_controls_do_not_escape_config_reads() {
+        use crate::traits::MaskSecrets;
+        let mut config = Config::default();
+        let stored = "custom:\thttp://reader:embedding-password@example.invalid/v1";
+        config.memory.embedding_provider = stored.to_string();
+        let shown = config.get_prop("memory.embedding_provider").unwrap();
+        assert!(!shown.contains("embedding-password"));
+        let mut masked = config.clone();
+        masked.mask_secrets();
+        assert!(
+            !serde_json::to_string(&masked)
+                .unwrap()
+                .contains("embedding-password")
+        );
+        config
+            .set_prop("memory.embedding_provider", &shown)
+            .unwrap();
+        assert_eq!(config.memory.embedding_provider, stored);
+    }
+
+    #[::core::prelude::v1::test]
+    fn url_comparison_resolves_credential_named_aliases() {
+        let mut config = Config::default();
+        config
+            .create_map_key("providers.models.custom", "api_key")
+            .unwrap();
+        let path = "providers.models.custom.api_key.uri";
+        config
+            .set_prop(
+                path,
+                "https://reader:comparison-password@example.invalid/v1?token=comparison-query",
+            )
+            .unwrap();
+        let root = toml::Value::try_from(&config).unwrap();
+        assert_eq!(
+            url_prop_value_for_comparison(&root, path).unwrap().as_str(),
+            Some("https://reader:comparison-password@example.invalid/v1?token=comparison-query")
+        );
     }
 
     /// The credential URLs declared outside this module: the A2A server's

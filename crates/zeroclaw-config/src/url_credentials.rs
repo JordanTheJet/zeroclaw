@@ -195,7 +195,15 @@ pub fn endpoint(url: &str) -> String {
 /// host is read again with `http://` in front, as reqwest reads a proxy
 /// written without a scheme.
 fn parser_finds_credentials(url: &str) -> bool {
-    let candidate = &url[locate(url).scheme..];
+    // The embedding factory strips this wrapper before the WHATWG parser
+    // normalizes controls. Do not reuse the display splitter's offset here:
+    // an inner scheme containing a tab can be valid to the parser alone.
+    let candidate = url.strip_prefix("custom:").unwrap_or(url);
+    let candidate = if url.starts_with("custom:") {
+        candidate
+    } else {
+        &candidate[locate(candidate).scheme..]
+    };
     let parsed = match reqwest::Url::parse(candidate) {
         Ok(parsed) if parsed.has_host() => Some(parsed),
         _ => reqwest::Url::parse(&format!("http://{candidate}")).ok(),
@@ -238,13 +246,21 @@ pub fn carries_mask(value: &str) -> bool {
 ///
 /// # Errors
 ///
+/// An exact whole-value placeholder restores the nonempty stored value,
+/// including a URL masked whole by the parser safety check.
 /// [`UnresolvedMask`] when the placeholder appears anywhere but as a whole
-/// userinfo, query or fragment, or stands for a component `current` does not
+/// value, userinfo, query or fragment, or stands for a component `current` does not
 /// have: there is then no stored value to restore, and writing the
 /// placeholder would store it as if it were real.
 pub fn restore(edited: &str, current: Option<&str>) -> Result<String, UnresolvedMask> {
     if !carries_mask(edited) {
         return Ok(edited.to_string());
+    }
+    if edited == MASKED_SECRET {
+        return current
+            .filter(|stored| !stored.is_empty() && !carries_mask(stored))
+            .map(str::to_owned)
+            .ok_or_else(UnresolvedMask::url);
     }
     let edited_parts = split(edited);
     if carries_mask(edited_parts.scheme) || carries_mask(edited_parts.location) {
@@ -264,6 +280,28 @@ pub fn restore(edited: &str, current: Option<&str>) -> Result<String, Unresolved
         current_parts.and_then(|parts| parts.fragment),
     )?;
     Ok(edited_parts.join(userinfo, query, fragment))
+}
+
+/// Restore a URL list by its displayed endpoints, so reordering cannot
+/// transfer a credential to a different relay. An endpoint edited while its
+/// credentials remain masked needs the full URL; there is no stable list key
+/// identifying which stored credential that edit should inherit.
+pub fn restore_list(edited: &mut [String], current: &[String]) -> Result<(), UnresolvedMask> {
+    for value in edited {
+        if !carries_mask(value) {
+            continue;
+        }
+        let sources: Vec<&str> = current
+            .iter()
+            .filter(|stored| mask(stored) == *value)
+            .map(String::as_str)
+            .collect();
+        let [source] = sources.as_slice() else {
+            return Err(UnresolvedMask::entry(sources.len()));
+        };
+        *value = restore(value, Some(source))?;
+    }
+    Ok(())
 }
 
 /// A component as written back: the stored one in place of an exact
@@ -496,6 +534,45 @@ mod tests {
         );
         // A value without the placeholder is written as it is.
         assert_eq!(restore("https://h/v1", None).unwrap(), "https://h/v1");
+    }
+
+    #[test]
+    fn combined_custom_prefix_and_parser_controls_are_masked_and_restored() {
+        for inner in [
+            "\thttp",
+            "\nhttp",
+            "\rhttp",
+            "\0http",
+            " \x01http",
+            "\x01http",
+            "\x0bhttp",
+            " \r\nhttp",
+            "ht\ntps",
+            "h\tttp",
+            "ht\ntp",
+            "htt\rp",
+        ] {
+            let url = format!(
+                "custom:{inner}://reader:combined-password@example.invalid/v1?token=combined-query"
+            );
+            let parsed = reqwest::Url::parse(url.strip_prefix("custom:").unwrap()).unwrap();
+            assert_eq!(parsed.password(), Some("combined-password"));
+            let shown = mask(&url);
+            for marker in ["combined-password", "combined-query"] {
+                assert!(!shown.contains(marker), "masked: {shown:?}");
+                assert!(
+                    !endpoint(&url).contains(marker),
+                    "endpoint: {:?}",
+                    endpoint(&url)
+                );
+            }
+            assert_eq!(restore(&shown, Some(&url)).unwrap(), url);
+        }
+        let stored = "h\tttp://reader:whole-password@example.invalid/v1";
+        assert_eq!(mask(stored), MASKED_SECRET);
+        assert_eq!(restore(MASKED_SECRET, Some(stored)).unwrap(), stored);
+        assert!(restore(MASKED_SECRET, None).is_err());
+        assert!(restore(MASKED_SECRET, Some(MASKED_SECRET)).is_err());
     }
 
     #[test]

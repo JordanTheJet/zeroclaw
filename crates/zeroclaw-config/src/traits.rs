@@ -456,6 +456,9 @@ impl std::fmt::Debug for PropFieldInfo {
 
 pub trait MaskSecrets {
     fn mask_secrets(&mut self);
+    /// Best-effort restoration for a masked projection. Unresolvable URL
+    /// placeholders remain masked; this is not a persistence validator.
+    /// Writes must use `Config::set_prop_persistent`, which rejects them.
     fn restore_secrets_from(&mut self, current: &Self);
 }
 
@@ -511,6 +514,22 @@ impl CredentialUrlField for String {
         // This only fills in what it can: a placeholder that cannot be
         // resolved stays as it is. `set_prop`, the write path, refuses one.
         if let Ok(restored) = crate::url_credentials::restore(self, Some(current)) {
+            *self = restored;
+        }
+    }
+}
+
+impl CredentialUrlField for Vec<String> {
+    fn mask_url_credentials(&mut self) {
+        for value in self {
+            value.mask_url_credentials();
+        }
+    }
+
+    fn restore_url_credentials(&mut self, current: &Self) {
+        // Preserve the original projection if any list entry is ambiguous.
+        let mut restored = self.clone();
+        if crate::url_credentials::restore_list(&mut restored, current).is_ok() {
             *self = restored;
         }
     }
