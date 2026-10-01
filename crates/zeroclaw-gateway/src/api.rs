@@ -2,7 +2,6 @@
 //! All `/api/*` routes require bearer token authentication (PairingGuard).
 
 use super::{AppState, GW_SESSION_PREFIX, gateway_cancel_key, gateway_session_key};
-use crate::core_rpc::CoreAccess;
 use axum::{
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode, header},
@@ -17,7 +16,7 @@ use zeroclaw_memory::MemoryEntry;
 use zeroclaw_rpc_client::Method;
 use zeroclaw_rpc_proto::types::{CLIENT_KIND_GATEWAY, SessionEntry, SessionListResult};
 
-use crate::core_rpc::{CoreCall, CoreError};
+use crate::core_rpc::{CoreAccess, CoreCall, CoreError};
 
 const MEMORY_API_CONTENT_MAX_CHARS: usize = 4096;
 
@@ -488,6 +487,21 @@ pub async fn handle_api_cron_add(
         shell_output_format,
     } = body;
 
+    let _reservation = match state
+        .agent_lifecycle
+        .reserve_config_mutation(agent_alias.trim())
+    {
+        Ok(reservation) => reservation,
+        Err(error) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": error.to_string()
+                })),
+            )
+                .into_response();
+        }
+    };
     let config = state.config.read().clone();
     if config.agent(&agent_alias).is_none() {
         return (
@@ -666,6 +680,11 @@ pub async fn handle_api_cron_run(
         return e.into_response();
     }
 
+    let selection = zeroclaw_runtime::live_config_authority::AgentExecutionCapability::from_parts(
+        std::sync::Arc::clone(&state.config),
+        state.agent_lifecycle.clone(),
+    )
+    .capture_selection();
     let config = state.config.read().clone();
 
     let job = match zeroclaw_runtime::cron::get_job(&config, &id) {
@@ -680,11 +699,12 @@ pub async fn handle_api_cron_run(
     };
 
     let event_tx = Some(state.event_tx.clone());
-    let result = zeroclaw_runtime::cron::scheduler::run_manual_job(
+    let result = zeroclaw_runtime::cron::scheduler::run_manual_job_with_selection(
         &config,
         &job,
         zeroclaw_runtime::cron::scheduler::CronDeliveryContext::GatewayManual,
         &event_tx,
+        Some(selection),
     )
     .await;
 
@@ -1838,13 +1858,20 @@ fn health_response(mut health: serde_json::Value) -> serde_json::Value {
 
 // ── Session API handlers ─────────────────────────────────────────
 //
-// `GET /api/sessions` is served by the core whenever the request reaches it
-// (`CoreAccess::Core`): the core lists what the caller's principal may see.
-// Every route that addresses one session by id stays in-process for now:
-// - The core resolves a session id by trying `rpc_{id}`, `gw_{id}` and `{id}`
-//   in turn, so it cannot be told to act on exactly the row this gateway's
-//   resolver picked. A competing row with another prefix would be read or
-//   deleted instead. That needs an exact durable-row reference in the core.
+// Every session route stays in-process for now.
+// - `GET /api/sessions`: the core lists, for a non-local caller, only the
+//   sessions that caller's own connection opened, so the gateway's
+//   credential-bound connection would list none of the dashboard's sessions.
+//   The listing moves to the core once the core scopes such a connection's
+//   view by its principal. The rows already take the core's `SessionEntry`
+//   shape, so that move changes only where they come from. The standalone
+//   preview gateway serves it through the core already
+//   (`api_sessions_list_through_core`).
+// - The routes that address one session by id: the core resolves a session
+//   id by trying `rpc_{id}`, `gw_{id}` and `{id}` in turn, so it cannot be
+//   told to act on exactly the row this gateway's resolver picked. A
+//   competing row with another prefix would be read or deleted instead. That
+//   needs an exact durable-row reference in the core.
 // - A delete must first cancel and wait for the gateway's own chat turn,
 //   which only the gateway can do, while only the core can authorize the
 //   delete. Until those turns run in the core, the two cannot be made one
@@ -1853,12 +1880,9 @@ fn health_response(mut health: serde_json::Value) -> serde_json::Value {
 /// GET /api/sessions — list gateway sessions
 pub async fn handle_api_sessions_list(
     State(state): State<AppState>,
-    access: CoreAccess,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    if matches!(access, CoreAccess::InProcess)
-        && let Err(e) = require_auth(&state, &headers)
-    {
+    if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
 
@@ -1869,12 +1893,6 @@ pub async fn handle_api_sessions_list(
         }))
         .into_response();
     };
-
-    if let CoreAccess::Core(core) = access {
-        return api_sessions_list_through_core(&core)
-            .await
-            .unwrap_or_else(IntoResponse::into_response);
-    }
 
     // Include every session that's attributable (agent_alias stamped,
     // or a channel_id that resolves to an owning agent).
@@ -1910,8 +1928,10 @@ pub async fn handle_api_sessions_list(
     sessions_list_response(entries)
 }
 
-/// `GET /api/sessions` through the core, the body every router serves for
-/// it: the sessions the caller's principal may see.
+/// `GET /api/sessions` through the core, as the standalone preview gateway
+/// serves it: the sessions the caller's principal may see. That gateway
+/// reaches the core over the daemon's local socket, a trusted local caller,
+/// so the core does not narrow the list to the connection's own sessions.
 pub(crate) async fn api_sessions_list_through_core(core: &CoreCall) -> Result<Response, CoreError> {
     let listed: SessionListResult = core
         .call(Method::SessionList, serde_json::json!({}))
@@ -2585,6 +2605,7 @@ pub(crate) mod tests {
         AppState {
             config: Arc::new(RwLock::new(config)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            agent_lifecycle: Default::default(),
             model_provider: Arc::new(MockModelProvider),
             model: "test-model".into(),
             temperature: None,
@@ -4420,6 +4441,44 @@ pub(crate) mod tests {
             "state handler must accept underscore display ids from the sessions list"
         );
         assert_eq!(display_json["turn_id"], "turn-1");
+    }
+
+    #[tokio::test]
+    async fn cron_add_refuses_alias_during_destructive_cleanup() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = with_test_agent(zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Default::default()
+        });
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let state = test_state(config.clone());
+        let mut cleanup = state.agent_lifecycle.begin_delete("test-agent").unwrap();
+        cleanup.commit_destructive_mutation();
+        let body = || {
+            Json(
+                serde_json::from_value::<CronAddBody>(serde_json::json!({
+                    "agent": "test-agent", "schedule": "*/5 * * * *", "command": "echo hello"
+                }))
+                .unwrap(),
+            )
+        };
+        let response = handle_api_cron_add(State(state.clone()), HeaderMap::new(), body())
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(
+            zeroclaw_runtime::cron::list_jobs(&config)
+                .unwrap()
+                .is_empty()
+        );
+        drop(cleanup);
+        let response = handle_api_cron_add(State(state), HeaderMap::new(), body())
+            .await
+            .into_response();
+        let result = response_json(response).await;
+        assert_eq!(result["status"], "ok", "{result}");
+        assert_eq!(zeroclaw_runtime::cron::list_jobs(&config).unwrap().len(), 1);
     }
 
     #[tokio::test]
