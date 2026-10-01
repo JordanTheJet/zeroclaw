@@ -1255,6 +1255,11 @@ cli-gateway-restart-hint-process = restart the `zeroclaw daemon` process
 # Written to stderr once the preview listens; {$url} is where it serves and
 # {$endpoint} is the daemon's RPC socket it reaches the core through.
 cli-gw-preview-serving = zeroclaw-gw preview serving {$url}; core endpoint {$endpoint}
+# Written to stderr once per core version the preview refuses to serve
+# through: {$core} is the core's version, {$gateway} this binary's.
+cli-gw-core-version-refused = zeroclaw-gw: refusing to serve through the core: it is version {$core}, this gateway is version {$gateway} (core_version_mismatch)
+# Written to stderr at start when --allow-version-skew is given.
+cli-gw-version-skew-allowed = zeroclaw-gw: --allow-version-skew: serving through a core of any version; for development only, answers may silently lack what was asked for
 
 # ── daemon gateway bind pre-flight — zeroclaw daemon (#7895) ──
 # Emitted by the daemon startup guard in src/main.rs when the configured gateway
@@ -1440,8 +1445,3 @@ cron-agent-job-failed = The scheduled task could not be completed. Please try ag
 rpc-config-set-many-empty = config/set-many requires at least one entry in `sets`
 rpc-config-set-many-limit = config/set-many accepts at most { $limit } entries in `sets`; got { $count }
 rpc-config-set-many-entry-rejected = config/set-many entry { $index } (`{ $prop }`) rejected; nothing was saved: { $reason }
-
-# The standalone gateway (`zeroclaw-gw`) on stderr, its log. It serves only
-# through a core of its own version unless started with --allow-version-skew.
-gw-core-version-refused = zeroclaw-gw: refusing to serve through the core: it is version { $core }, this gateway is version { $gateway } (core_version_mismatch)
-gw-version-skew-allowed = zeroclaw-gw: --allow-version-skew: serving through a core of any version; for development only, answers may silently lack what was asked for

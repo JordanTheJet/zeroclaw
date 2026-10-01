@@ -678,16 +678,22 @@ fn report_refused_core(core: &str, gateway: &str) {
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     if reported.as_deref() != Some(core) {
         // Written so that a closed stderr cannot panic the request handler.
-        let _ = writeln!(
-            std::io::stderr(),
-            "{}",
-            zeroclaw_runtime::i18n::get_required_cli_string_with_args(
-                "gw-core-version-refused",
-                &[("core", core), ("gateway", gateway)],
-            )
-        );
+        let _ = writeln!(std::io::stderr(), "{}", refused_core_notice(core, gateway));
         *reported = Some(core.to_owned());
     }
+}
+
+/// The operator's note on stderr when a core of another version is refused.
+fn refused_core_notice(core: &str, gateway: &str) -> String {
+    zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+        "cli-gw-core-version-refused",
+        &[("core", core), ("gateway", gateway)],
+    )
+}
+
+/// The operator's note on stderr at start under `--allow-version-skew`.
+fn version_skew_notice() -> String {
+    zeroclaw_runtime::i18n::get_required_cli_string("cli-gw-version-skew-allowed")
 }
 
 /// Why the health probe could not vouch for the core's endpoint.
@@ -1000,11 +1006,7 @@ pub async fn serve(bootstrap: Bootstrap) -> anyhow::Result<()> {
         serving_notice(&format!("{scheme}://{address}"), &bootstrap.endpoint)
     );
     if bootstrap.version_skew == VersionSkew::Allow {
-        let _ = writeln!(
-            std::io::stderr(),
-            "{}",
-            zeroclaw_runtime::i18n::get_required_cli_string("gw-version-skew-allowed")
-        );
+        let _ = writeln!(std::io::stderr(), "{}", version_skew_notice());
     }
 
     match tls {
