@@ -1481,6 +1481,7 @@ fn proxied_core() -> (
     };
     config.gateway.require_pairing = true;
     config.gateway.paired_tokens = vec!["zc_sub".into()];
+    with_daemon_signing_key(&config);
     let sessions = Arc::new(zeroclaw_runtime::rpc::session::SessionStore::new(
         16,
         Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
@@ -1488,6 +1489,7 @@ fn proxied_core() -> (
         )),
     ));
     let mut ctx = zeroclaw_runtime::rpc::context::RpcContext::for_live_test(config, sessions);
+    assert!(ctx.tui_registry.signing_is_enabled());
     Arc::get_mut(&mut ctx)
         .expect("a fresh context has one owner")
         .event_tx = Some(tokio::sync::broadcast::channel(64).0);
