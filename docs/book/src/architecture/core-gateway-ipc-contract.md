@@ -31,11 +31,11 @@
 4. **Identity.** The gateway forwards each end user's own credential on a connection dedicated to that credential; there is no on-behalf-of parameter anywhere (§5.3). Ingress that carries its own credential (generic `/webhook`, `/sop/*`, plugin and vendor webhooks) is forwarded as *evidence* that the core verifies (§12). Public routes (health, metrics, A2A cards, the config schema, pairing redemption and posture) are served through the gateway's service connection by one allowlisted method each (DEC-25). The gateway's own service identity is **OPEN D1**; pairing-disabled installs are **OPEN D2**, with D2-A fully specified if chosen (DEC-30).
 5. **Server endpoint verification before any credential.** A client MUST verify the operating-system identity of the endpoint it connected to before it sends a reusable credential, on every connection (§5.5). This replaces the custom `server_proof` HMAC of the earlier design. A gateway under a separate OS account needs the IPC-directory layout of §5.5.1; which boundaries v0.9.0 supports is **OPEN D11**.
 6. **Discovery.** Resolution order is fixed and shared by all clients through one implementation (§4). Two current divergences are defects the contract requires fixed: zerocode ignores `ZEROCLAW_DATA_DIR`, `ZEROCLAW_WORKSPACE` and the Homebrew data directory, and the Windows pipe name is derived with `std`'s unstable `DefaultHasher`.
-7. **Versioning.** Protocol version 1 is additive-only, except that security corrections (fail-closed narrowing with a stable refusal signal) and conformance corrections ship inside it and are registered (V-5, V-6, Appendix D classifies all 27 changed methods); method-level capability detection uses the `capabilities` list `initialize` already returns; a disjoint protocol refuses with structured data; product-version skew policy is **OPEN D6** (§7).
+7. **Versioning.** Protocol version 1 is additive-only, except that security corrections (fail-closed narrowing with a stable refusal signal) and conformance corrections ship inside it and are registered (V-5, V-6; Appendix D classifies every changed method: the original parity PRs' 27 and the gateway route ports' changes, C.6); method-level capability detection uses the `capabilities` list `initialize` already returns; a disjoint protocol refuses with structured data; product-version skew policy is **OPEN D6** (§7).
 8. **Turn lifetime.** On master an RPC disconnect cancels the turns that connection started (§9.2). A separate gateway needs session-owned turns (#11185) before its restarts can leave agent work healthy. Every turn gets a core-assigned random-UUID `turn_id`, and the new, capability-advertised `session/cancel-turn` targets it, so a retried cancel never stops a later turn, on an older core or after a core restart (DEC-22). The detached-approval policy is **OPEN D4**.
 9. **Webhooks.** Plugin webhooks cross as raw bounded requests into the core's `PluginWebhookRegistry` (native vendor routes join them only if D7 chooses option (b), §12.9); verification and parsing stay in the owning channel or plugin (§12). Concurrent ingress calls on one connection are correlated and cancelled by a gateway-chosen `delivery_id` (DEC-23); generic ingress keys commit at admission and never on a refusal (DEC-24). **Settled here:** webhook deduplication/idempotency is **core-owned** (§12.6), and `gateway.webhook_secret` is **verified in the core** from the forwarded header (§12.7). These keys keep their `gateway.*` names; the core becomes their canonical owner and only reader, and the gateway never reads them (§13).
 10. **"No HTTP server in the core"** is defined precisely in §14.3, including three existing core listeners that need a ruling (**OPEN D8**).
-11. **Completeness.** The operation catalog (§8) covers all 97 master methods, the 49 the open PRs add and every proposed method. Appendix C gives the wire shape of every payload the OpenRPC document leaves untyped: the master methods (C.1, C.2), every proposed method (C.3) and every method the open PRs add, at the heads in §15.1 (C.4). Appendix E gives every method's error codes. A PR that changes one of its shapes before it merges updates C.4 in the same review cycle (SCH-6). The two methods master gained after the baseline (#10621: `agents/delete-preview`, `agents/delete`) are in C.5 and E.4; every other count in this document is at the baseline.
+11. **Completeness.** The operation catalog (§8) covers all 97 master methods, the 49 the original parity PRs add, the two the gateway route ports add and every proposed method. Appendix C gives the wire shape of every payload the OpenRPC document leaves untyped: the master methods (C.1, C.2), every proposed method (C.3), every method the original parity PRs add, at the heads in §15.1 (C.4), and what the gateway route ports add and change (C.6). Appendix E gives every method's error codes. A PR that changes one of its shapes before it merges updates C.4 in the same review cycle (SCH-6). The two methods master gained after the baseline (#10621: `agents/delete-preview`, `agents/delete`) are in C.5 and E.4; every other count in this document is at the baseline.
 
 ---
 
@@ -54,7 +54,7 @@ Out of scope: the remote WSS plane's own policy (`[wss]`, `rt/rpc/wss.rs`) excep
 
 This contract does not by itself approve a new transport, auth model, authority boundary or rename (#11000 risk note). Where it proposes one, the ADR records it as proposed and names the decision.
 
-Typed scope (DEC-28): the contract gives wire shapes and error lists for all 97 master methods, every method it proposes, and the 49 methods the open PRs add, the last pinned to the PR heads in §15.1 (§8, Appendices C and E).
+Typed scope (DEC-28): the contract gives wire shapes and error lists for all 97 master methods, every method it proposes, the 49 methods the original parity PRs add and the two the gateway route ports add, the last two pinned to the PR heads in §15.1 (§8, Appendices C, including C.6, and E).
 
 ## 2. The three documents: framing spec, OpenRPC, OpenAPI 3.1
 
@@ -466,9 +466,9 @@ Schema requirements for the split `[proposed]` (#11001 / #11165):
 | Method | Authz | Params | Result | OpenRPC P/R | Retry | Status | Dispatcher tests (`rt/rpc/dispatch.rs`) |
 |---|---|---|---|---|---|---|---|
 | `initialize` | Handshake | {protocol_version?, auth_token?, auth_provider?, clientCapabilities?, tui_id?, tui_sig?, env?} | {protocol_version, server_version, server_pid, tui_id?, tui_sig?, capabilities?, auth_methods?, principal_id?, commands?} | T/T | N | `[master]` `dispatch.rs:3126` | 28: `a_reconnect_survives_the_displaced_connections_teardown` |
-| `status` | System:Read | none | {server_version, protocol_version, active_sessions, session_ids, config_dir?, config_file?, config_kind?, local_ipc_endpoint?, shell_profile?} | –/T | R | `[master]` `dispatch.rs:3453` | 10: `cron_runs_serves_a_scoped_principal_its_own_jobs_history` |
+| `status` | System:Read | none; `[PR #11382]` `{overview?, agent?}` | {server_version, protocol_version, active_sessions, session_ids, config_dir?, config_file?, config_kind?, local_ipc_endpoint?, shell_profile?}; `[PR #11382]` `overview?` (C.6) | –/T | R | `[master]` `dispatch.rs:3453` | 10: `cron_runs_serves_a_scoped_principal_its_own_jobs_history` |
 | `health` | System:Read | none | `HealthSnapshot` + `process: ProcessStats` (Appendix C); `[PR #11345]` adds `components.gateway.bound_addr?` (C.6) | –/U | R | `[master]` `dispatch.rs:3483` | none at the baseline; #11345 adds `health_reports_the_gateway_bound_address_only_once_bound` |
-| `doctor/run` | System:Execute | none | {results, summary{ok,warnings,errors}, log_path?, timed_out_phase?} | –/X | R | `[master]` `dispatch.rs:3495` | 4: `doctor_omits_log_path_after_config_set_to_rolling_without_reload_when_writer_disabled` |
+| `doctor/run` | System:Execute | none; `[PR #11382]` `{static_only?}` (C.6) | {results, summary{ok,warnings,errors}, log_path?, timed_out_phase?} | –/X | R | `[master]` `dispatch.rs:3495` | 4: `doctor_omits_log_path_after_config_set_to_rolling_without_reload_when_writer_disabled` |
 | `cert/renew` | Handshake | {csr_pem} | {cert_pem, ca_chain_pem, device_id, not_after, relay_profile} | U/U | N | `[master]` `dispatch.rs:3273` | 10: `cert_renew_gates_on_ledger_status` |
 | `metrics/scrape` | System:Read | none | {content_type, text} | n/a | R | `[PR #11182]` | P+GP: `metrics_scrape_equals_the_metrics_route_without_prometheus` |
 | `system/restart` | System:Execute | {component} | {component: "daemon", restarting: true}: a daemon **reload**, which drops every connection | n/a | N | `[PR #11182]` | admin-only; `system_restart_restarts_only_the_daemon_and_needs_a_supervisor` |
@@ -485,15 +485,15 @@ Schema requirements for the split `[proposed]` (#11001 / #11165):
 | `session/prompt` | Sessions:Execute | {session_id, prompt, client_turn_generation?, attachments?} | `{}` on turn end (**not** `SessionPromptResult`; SCH-2) | T/T | N | `[master]` `dispatch.rs:5504` | 40: `acp_cancel_retains_provider_safe_live_history_for_follow_up` |
 | `session/cancel` | Sessions:Update | {session_id} | {session_id, cancelled} | T/T | N | `[master]` `dispatch.rs:6652` | 5: `acp_cancel_retains_provider_safe_live_history_for_follow_up` |
 | `session/approve` | Sessions:Update | {session_id, request_id, decision, replacement?} | {session_id, request_id, acknowledged} | T/T | N | `[master]` `dispatch.rs:7276` | 3: `approvals_authorize_against_the_bound_session_owner` |
-| `session/state` | Sessions:Read | {session_id} | {session_id, state, turn_id?, turn_started_at?, plan?} | T/T | R | `[master]` `dispatch.rs:7071` | 3: `acp_mode_session_prompt_leaves_chat_backend_state_absent` |
-| `session/messages` | Sessions:Read | {session_id, limit?, before_index?, cursor?} | {session_id, messages, total?, start?, next_cursor?, has_older?} | T/T | R | `[master]` `dispatch.rs:6838` | 2: `live_acp_messages_do_not_wait_for_turn_queue_or_promote_checkpoint` |
+| `session/state` | Sessions:Read | {session_id}; `[PR #11381]` `session_keys?` (C.6) | {session_id, state, turn_id?, turn_started_at?, plan?} | T/T | R | `[master]` `dispatch.rs:7071` | 3: `acp_mode_session_prompt_leaves_chat_backend_state_absent` |
+| `session/messages` | Sessions:Read | {session_id, limit?, before_index?, cursor?}; `[PR #11381]` `session_keys?`, `max_bytes?` (C.6) | {session_id, messages, total?, start?, next_cursor?, has_older?} | T/T | R | `[master]` `dispatch.rs:6838` | 2: `live_acp_messages_do_not_wait_for_turn_queue_or_promote_checkpoint` |
 | `session/list` | Sessions:Read | {query?, limit?} | {sessions} | T/T | R | `[master]` `dispatch.rs:6735` | 2: `can_list_sessions` |
 | `session/list-acp` | Sessions:Read | none (ignored) | {sessions} | –/T | R | `[master]` `dispatch.rs:6801` | 1: `acp_turn_complete_and_list_acp_report_the_same_projected_count` |
 | `session/git_branch` | Sessions:Read | {session_id} | {session_id, branch?, hash?} | T/T | R | `[master]` `dispatch.rs:6717` | none found |
 | `session/configure` | Sessions:Update | {session_id, overrides?} | {session_id, overrides} | T/T | N | `[master]` `dispatch.rs:6464` | 12: `configure_refuses_an_incarnation_replaced_under_the_lock` |
 | `session/close` | Sessions:Update | {session_id} | {session_id, closed} | T/T | N | `[master]` `dispatch.rs:4583` | 11: `acp_persistence_removals_cancel_after_admission_before_fallible_setup` |
 | `session/kill` | Sessions:Delete | {session_id} | {session_id, killed} | T/T | N | `[master]` `dispatch.rs:4720` | 12: `acp_persistence_removals_cancel_after_admission_before_fallible_setup` |
-| `session/delete` | Sessions:Delete | {session_id} | {session_id, deleted} | T/T | N | `[master]` `dispatch.rs:7132` | 15: `acp_persistence_removals_cancel_after_admission_before_fallible_setup` |
+| `session/delete` | Sessions:Delete | {session_id}; `[PR #11381]` `session_keys?` (C.6) | {session_id, deleted} | T/T | N | `[master]` `dispatch.rs:7132` | 15: `acp_persistence_removals_cancel_after_admission_before_fallible_setup` |
 | `session/steer` | Sessions:Execute | {session_id, content} | {session_id, accepted} | n/a | N | `[PR #11132]` | 12: `session_steer_reaches_the_running_turn_and_turn_complete_carries_totals` |
 | `session/abort` | Sessions:Delete | {session_id} | {session_id, cancelled} | n/a | N | `[PR #11132]` | 4: `session_abort_interrupts_a_turn_another_client_started` |
 | `session/append` | Sessions:Update | {session_id, content} | {session_id, message_count} | n/a | N | `[PR #11132]` | 8: `session_append_and_rename_write_the_durable_and_live_session` |
@@ -539,7 +539,7 @@ Schema requirements for the split `[proposed]` (#11001 / #11165):
 | `cron/get` | Cron:Read | {id} | CronJob | T/X | R | `[master]` `dispatch.rs:7534` | 2: `cron_admin_still_reaches_ownerless_legacy_rows` |
 | `cron/add` | Cron:Create | {agent, schedule, tz?, command?, prompt?, name?, job_type?, delivery?, session_target?, model?, allowed_tools?, delete_after_run?} | CronJob | X/X | N | `[master]` `dispatch.rs:7541` | 1: `cron_add_requires_the_agent_selector` |
 | `cron/patch` | Cron:Update | {id, agent, name?, schedule?, tz?, clear_tz?, command?, prompt?} | CronJob | T/X | W | `[master]` `dispatch.rs:7562` | 2: `cron_patch_and_delete_cannot_reach_a_foreign_job` |
-| `cron/delete` | Cron:Delete | {id} | {id, deleted}; `[PR #11376]` for the administrator grant, also the retained run history of a job whose row is gone, as the HTTP route removes it | T/T | W | `[master]` `dispatch.rs:7604` | 1: `cron_patch_and_delete_cannot_reach_a_foreign_job` |
+| `cron/delete` | Cron:Delete | {id} | {id, deleted}; `[PR #11376]` for the administrator grant, also the retained run history of a job whose row is gone, as the HTTP route removes it; at that head an administrator's id with neither answers `-32603`, not `-32602` `[pending fix round]` (C.6) | T/T | W | `[master]` `dispatch.rs:7604` | 1: `cron_patch_and_delete_cannot_reach_a_foreign_job` |
 | `cron/runs` | Cron:Read | {id, limit?} | {runs}; `[PR #11376]` for the administrator grant, also the retained history of a job whose row is gone, as the HTTP route lists it | T/X | R | `[master]` `dispatch.rs:7622` | 2: `cron_get_runs_and_trigger_refuse_a_foreign_job_as_not_found` |
 | `cron/trigger` | Cron:Execute | {id} | {id, success, status, output, duration_ms, started_at, finished_at} | T/T | N | `[master]` `dispatch.rs:7640` | 4: `authz_classification_spot_checks` |
 | `cron/settings` | Cron:Read | `{}` | `SchedulerConfig` {enabled, max_tasks, max_concurrent, catch_up_on_startup, max_run_history} (Appendix C) | U/U | R | `[master]` `dispatch.rs:7663` | none found. The handler's `{patch}` branch answers not-implemented (`dispatch.rs:7670-7672`) and is **not** part of the contract; clients MUST NOT send `patch` |
@@ -638,11 +638,11 @@ Rules: `pairing/new-code` and anything that returns a code are never in the gate
 | `skills/list` | Skills:Read | {bundle?} | {skills} | T/X | R | `[master]` `dispatch.rs:8873` | none found |
 | `skills/read` | Skills:Read | {bundle, name} | {bundle, name, frontmatter, body} | T/X | R | `[master]` `dispatch.rs:8892` | 1: `skills_surfaces_refuse_a_name_outside_the_bundle` |
 | `skills/write` | Skills:Update | {bundle, name, frontmatter, body?} | {bundle, name, written} | X/T | W | `[master]` `dispatch.rs:8909` | 2: `authz_classification_spot_checks` |
-| `skills/delete` | Skills:Delete | {bundle, name} | {bundle, name, deleted} | T/T | W | `[master]` `dispatch.rs:8928` | 1: `skills_surfaces_refuse_a_name_outside_the_bundle` |
-| `personality/list` | Personality:Read | {agent?} | {files, max_chars} | T/T | R | `[master]` `dispatch.rs:8945` | 3: `a_wildcard_agent_selector_cannot_address_an_unconfigured_alias_path` |
-| `personality/get` | Personality:Read | {agent, filename} | {filename, content?, exists, truncated?, mtime_ms?} | T/T | R | `[master]` `dispatch.rs:8994` | 3: `a_wildcard_agent_selector_cannot_address_an_unconfigured_alias_path` |
-| `personality/put` | Personality:Update | {agent, filename, content} | {bytes_written, mtime_ms?} | T/T | W | `[master]` `dispatch.rs:9033` | 3: `a_wildcard_agent_selector_cannot_address_an_unconfigured_alias_path` |
-| `personality/templates` | Personality:Read | {agent?} | {preset, files} | T/T | R | `[master]` `dispatch.rs:9065` | 3: `a_wildcard_agent_selector_cannot_address_an_unconfigured_alias_path` |
+| `skills/delete` | Skills:Delete | {bundle, name}; `[PR #11384]` `purge?` (C.6) | {bundle, name, deleted} | T/T | W | `[master]` `dispatch.rs:8928` | 1: `skills_surfaces_refuse_a_name_outside_the_bundle` |
+| `personality/list` | Personality:Read | {agent?}; `[PR #11384]` `require_configured_agent?` (C.6) | {files, max_chars} | T/T | R | `[master]` `dispatch.rs:8945` | 3: `a_wildcard_agent_selector_cannot_address_an_unconfigured_alias_path` |
+| `personality/get` | Personality:Read | {agent, filename}; `[PR #11384]` `require_configured_agent?` (C.6) | {filename, content?, exists, truncated?, mtime_ms?} | T/T | R | `[master]` `dispatch.rs:8994` | 3: `a_wildcard_agent_selector_cannot_address_an_unconfigured_alias_path` |
+| `personality/put` | Personality:Update | {agent, filename, content}; `[PR #11176, #11384]` `expected_mtime_ms?`; `[PR #11384]` `require_configured_agent?` (C.4, C.6) | {bytes_written, mtime_ms?} | T/T | W | `[master]` `dispatch.rs:9033` | 3: `a_wildcard_agent_selector_cannot_address_an_unconfigured_alias_path` |
+| `personality/templates` | Personality:Read | {agent?}; `[PR #11384]` `preset?`, `agent_name?`, `user_name?`, `timezone?`, `communication_style?`, `include_memory?`, `defaults?` (C.6) | {preset, files} | T/T | R | `[master]` `dispatch.rs:9065` | 3: `a_wildcard_agent_selector_cannot_address_an_unconfigured_alias_path` |
 | `quickstart/state` | Quickstart:Read | none | QuickstartStateResult | –/T | R | `[master]` `dispatch.rs:9830` | none found |
 | `quickstart/fields` | Quickstart:Read | {section, type_key} | {fields} | X/X | R | `[master]` `dispatch.rs:9835` | none found |
 | `quickstart/validate` | Quickstart:Read | {submission} | QuickstartValidateResult (tagged `kind`) | T/X | R | `[master]` `dispatch.rs:9843` | none found |
@@ -664,7 +664,7 @@ Rules: `pairing/new-code` and anything that returns a code are never in the gate
 | `events/subscribe` | Logs:Read | {since_seq?, epoch?} | {subscribed, subscription_id, seq, epoch} | T/T | R* | `[master]` `dispatch.rs:9290` | 4: `events_subscribe_requires_logs_read` |
 | `subscription/cancel` | Logs:Read today (`dispatch.rs:441`); **own connection** `[proposed]` (DEC-31) | {subscription_id} | {cancelled} | T/T | W | `[master]` `dispatch.rs:9299` | 2: `a_logs_reader_can_cancel_its_own_subscription` |
 | `events/history` | Logs:Read | none | {events} | –/T | R | `[master]` `dispatch.rs:9411` | 3: `assert_fixture_turn_reaches_subscriber_and_history` |
-| `logs/query` | Logs:Read | {since_ts?, until_ts?, until_id?, until_line_offset?, until_segment_cursor?, severity_min?, q?, category?, action?, outcome?, trace_id?, sop_run_id?, hide_internal?, limit?} | {events, log_path?, next_cursor?, next_cursor_line_offset?, next_segment_cursor?, at_end, incomplete} | T/T | R | `[master]` `dispatch.rs:9424` | none found |
+| `logs/query` | Logs:Read | {since_ts?, until_ts?, until_id?, until_line_offset?, until_segment_cursor?, severity_min?, q?, category?, action?, outcome?, trace_id?, sop_run_id?, hide_internal?, limit?}; `[PR #11382]` `field_eq?`, `report_disabled?` | {events, log_path?, next_cursor?, next_cursor_line_offset?, next_segment_cursor?, at_end, incomplete}; `[PR #11382]` `persistence_enabled`, `daemon_started_at?`, `attribution_keys?` (C.6) | T/T | R | `[master]` `dispatch.rs:9424` | none found |
 | `logs/get` | Logs:Read | {id} | {event} | T/T | R | `[master]` `dispatch.rs:9497` | none found |
 
 ### 8.12 Workspace, catalog, tools, plugins, canvas, channels
@@ -777,7 +777,7 @@ The returned access token goes to the browser that ran the flow and is not retai
 | -32002 | SESSION_BUSY | | 409 |
 | -32003 | SESSION_NOT_OWNED | | 403 |
 | -32004 | CONNECTION_LIMIT_REACHED | `data: {reason: "connection_limit", limit}`, then EOF | 503, back off |
-| -32005 | PRECONDITION_FAILED `[PR #11176]` (`personality/put` with a stale `expected_mtime_ms`; `data.error: "personality_disk_drift"`) | the caller's copy is stale | 409 (the HTTP twin answers 409) |
+| -32005 | PRECONDITION_FAILED `[PR #11176, #11384]` (`personality/put` with a stale `expected_mtime_ms`; `data.error: "personality_disk_drift"`; #11384 takes #11176's guard over unchanged) | the caller's copy is stale | 409 (the HTTP twin answers 409) |
 | -32010 | AUTH_REQUIRED | credential missing, rejected, expired, revoked, or re-verification due | 401 |
 | -32011 | VERSION_MISMATCH | protocol disjoint | 503 with the V-4 diagnostic |
 | -32012 | FORBIDDEN | principal lacks the grant or selector | 403 |
@@ -997,9 +997,22 @@ Direction client→core, request. Authz `(Channels, Execute)` under `Method::aut
 | `cancelled` | 503 | new: the delivery was cancelled by `ingress/cancel` or by its connection's close; the gateway's own caller is usually gone by then |
 | RPC transport error, connection lost, core down | 503 `webhook unavailable` | new: "core unavailable" |
 | `-32012` on the call | 503, and a gateway ERROR log (a deployment error, not the caller's) | new |
-| `-32602` on the call (an oversize or undecodable `body_b64`) | 500, and a gateway ERROR log: the gateway's body layer refuses 64 KiB first, so this is the gateway's bug | new |
+| `-32602` on the call (an oversize or undecodable `body_b64`) | 500, and a gateway ERROR log: the gateway's body layer refuses 64 KiB first, so this is the gateway's bug | new; `[proposed]`: #11322's forwarder answers 503 today (Implementation status below) |
 
-**Implementation.** The plugin webhook series #11319, #11320 and #11322 implements this method, reconciled to this section; until it is renamed its wire names differ (`plugin-webhook/dispatch`, `plugin-webhook/cancel`, `plugin-webhook/routes`, `request_id`). The header objects, the `cancelled` outcome, `-32602` for an oversize or undecodable body and the `webhook/routes` rows are its choices, which the contract takes (`crates/zeroclaw-rpc-proto/src/types.rs:1661-1663`, `:1692-1716`, `:1749-1768`; `rt/rpc/dispatch.rs:12002-12022` @7962184961).
+**Implementation status.** The plugin webhook series #11319, #11320 and #11322 (drafts, heads in §15.1) is the intended implementation of this method. It does not conform yet, and the method stays `[proposed]` until it does.
+
+- **Contract choices taken from the series.** Each revises this section's earlier proposal, which no release shipped; they are revisions of a proposal, not additions to a published method:
+  - headers are `{name, value}` objects, replacing ordered `[name, value]` pairs (`crates/zeroclaw-rpc-proto/src/types.rs:1661-1663` @7962184961);
+  - `cancelled` joins the `reject` reasons (the series' outcome, `:1714`);
+  - an oversize or undecodable `body_b64` is `-32602`, replacing the `payload_too_large` reason;
+  - `webhook/routes` answers `{generation, routes: [{path, plugin, channel_alias}]}` under `Channels:Read`, replacing `{generation, paths}` under `System:Read` (`:1749-1768`; `rt/rpc/dispatch.rs:12002-12022` @7962184961).
+- **Remaining wire differences in the series.** The shape above stays the target; each is work the series does before it conforms:
+  - **names:** `plugin-webhook/dispatch`, `plugin-webhook/cancel`, `plugin-webhook/routes` and `request_id` stand for `webhook/deliver`, `ingress/cancel`, `webhook/routes` and `delivery_id`;
+  - **result shape:** the series answers a flat outcome (`{"outcome":"cancelled"}`, `{"outcome":"not_found"}`, …) where this section has `{"outcome":"reject","reason":…}` (`crates/zeroclaw-rpc-proto/src/types.rs:1692-1726` @7962184961). Renaming does not reconcile the two; the series normalizes its result to the `reject`/`reason` union;
+  - **`-32602` at the gateway:** #11322's forwarder treats it as an unexpected core error, logs ERROR and answers the shared 503 (`crates/zeroclaw-gateway/src/plugin_webhook/forward.rs:236-249`, `:147-160` @d15729ebff), where the table above answers 500. It also logs a `-32010`/`-32012` refusal at WARN, where the table asks for ERROR (`:120-132`). Owner: #11322, with a forwarder change and a test;
+  - **deadline:** the request has no `deadline_ms` (`types.rs:1670-1685`); the core waits a fixed 10 s counted from enqueue (`crates/zeroclaw-api/src/webhook.rs:171`; `crates/zeroclaw-infra/src/plugin_webhook.rs:60-61`, `:108` @7962184961);
+  - **cap:** 1024 in-flight deliveries per connection (`rt/rpc/dispatch.rs:16` @7962184961), where **Execution** below caps at the route queue depth, 64.
+- **Still open; the series does not settle them:** the ingress connection's identity (D1: the series admits it as the shared operator); the cap and deadline alignment (64 and an optional clamped `deadline_ms`, as here, or the series' 1024 and fixed deadline); and process-scope deduplication (§12.6, DEC-12: the series' reservation store is created per daemon generation).
 
 No diagnostic text crosses the boundary: guest details stay in core logs, matching today's rule that the gateway drops them (`gw/plugin_webhook.rs:158-196`). The plugin WIT reply has no plugin-controlled status or headers (`wit/v0/channel.wit` `webhook-response::reply`), so "response headers" in #11003 AC1 is satisfied by: none, beyond the content type.
 
@@ -1262,23 +1275,26 @@ Recommendation: D8-a and D8-b as documented exceptions (opt-in, off by default, 
 | #11373 SOP authoring routes through the core (draft) | cec2b83bd1 | `sops/decide`: `pending_quorum?`, the authenticated approver, `-32012` for approval refusals; `sops/run` refuses an unowned `execute` step before dispatch (C.6, Appendix D) |
 | #11376 cron and memory routes through the core (draft) | e503e5cb8e | `memory/list` and `memory/search` `content_max_chars?`; a truthful `memory/delete`; `cron/delete` and `cron/runs` reach retained history for the administrator grant (C.6) |
 | #11377 SOP run feed and version check through the core (draft) | 8b2ed4ef5c | `sops/subscribe-runs`, `sops/run-changed`, `system/version-check`; a handler error's `data` on the wire (C.6) |
-| #11319, #11320, #11322 plugin webhook ingress series (draft) | 765dc026d7, 7962184961, d15729ebff | the implementation of §12.3, reconciled to it; the contract takes its header encoding, `cancelled` outcome, body refusal and `webhook/routes` rows |
+| #11381 session messages, state and delete by exact row (draft) | a3b5f3920a | `session/messages`, `session/state`, `session/delete`: `session_keys?`, `SessionTargetParams`; `session/messages`: `max_bytes?` and the `entry_exceeds_max_bytes` refusal; a handler error's `data` on the wire (C.6, Appendix D; pending fix round) |
+| #11382 status, logs, doctor and the event stream through the core (draft) | 967865aeae | `status {overview?, agent?}` and `StatusOverview`; `logs/query` `field_eq?`, `report_disabled?` and three result fields; `doctor/run {static_only?}` (C.6; pending fix round) |
+| #11384 skills and personality through the core (draft) | 00a5c1ae52 | `skills/delete` `purge?`; `personality/list`, `get`, `put` `require_configured_agent?`; `personality/put` `expected_mtime_ms?` and `-32005`, as #11176; `personality/templates` overrides and `defaults?` (C.6; pending fix round) |
+| #11319, #11320, #11322 plugin webhook ingress series (draft) | 765dc026d7, 7962184961, d15729ebff | the intended implementation of §12.3, not yet conforming. The contract revised its proposal to four of the series' choices (header encoding, `cancelled` reason, body refusal, `webhook/routes` rows); the series' result shape, `-32602` status, deadline, cap and names still differ (§12.3) |
 | #11234, #11220, #11205 (draft) | acd370b321 (later head d5df4214ca not re-read), ec5fc1c287, 517c363f18 | no new methods; admission-time ownership recheck, `tools:execute` for SOP run/approve, authority-recheck foundation |
 
-Totals across these heads: **49 methods added** (27 in #11182, 9 in #11172, 5 in #11132, 4 in #11169, 3 in #11176, 1 unique in #11185) and **27 existing methods changed**. Ten change the shape of their params, result or notification payload: `initialize`, `session/list`, `session/prompt` (through `turn_complete` and ring frames), `cron/add`, `cron/patch`, `personality/put`, `quickstart/validate`, `quickstart/apply`, `sops/decide`, `config/map-key-delete`. Seventeen change only semantics, authorization or error behaviour: `session/new`, `session/cancel`, `session/close`, `session/kill`, `session/delete`, `session/configure`, `session/messages`, `logs/subscribe`, `events/subscribe`, `subscription/cancel`, `cron/trigger`, `sops/run`, `config/set`, `config/set-many`, `config/delete`, `config/map-key-create`, `config/map-key-rename`. No head adds a notification method or a `SessionUpdateEvent` variant; #11172 and #11176 each make handler `error.data` reach the wire (DEC-17).
+Totals across the original parity PRs, which are every row above except the gateway route ports (#11345, #11373, #11376, #11377, #11381, #11382, #11384) and the plugin webhook series: **49 methods added** (27 in #11182, 9 in #11172, 5 in #11132, 4 in #11169, 3 in #11176, 1 unique in #11185) and **27 existing methods changed**. Ten change the shape of their params, result or notification payload: `initialize`, `session/list`, `session/prompt` (through `turn_complete` and ring frames), `cron/add`, `cron/patch`, `personality/put`, `quickstart/validate`, `quickstart/apply`, `sops/decide`, `config/map-key-delete`. Seventeen change only semantics, authorization or error behaviour: `session/new`, `session/cancel`, `session/close`, `session/kill`, `session/delete`, `session/configure`, `session/messages`, `logs/subscribe`, `events/subscribe`, `subscription/cancel`, `cron/trigger`, `sops/run`, `config/set`, `config/set-many`, `config/delete`, `config/map-key-create`, `config/map-key-rename`. No head of that set adds a notification method or a `SessionUpdateEvent` variant; #11172 and #11176 each make handler `error.data` reach the wire (DEC-17).
 
-The gateway route ports (#11345, #11373, #11376, #11377) add two methods and the first new notification method, `sops/run-changed` (#11377), and change eight existing methods: `health`, `memory/list`, `memory/search`, `memory/delete`, `cron/delete`, `cron/runs`, `sops/decide` and `sops/run` (C.6, Appendix D).
+The gateway route ports (#11345, #11373, #11376, #11377, #11381, #11382, #11384) add two methods and the first new notification method, `sops/run-changed` (#11377), and change nineteen existing methods: `health`, `memory/list`, `memory/search`, `memory/delete`, `cron/delete`, `cron/runs`, `sops/decide`, `sops/run`, `status`, `logs/query`, `doctor/run`, `session/messages`, `session/state`, `session/delete`, `skills/delete`, `personality/list`, `personality/get`, `personality/put` and `personality/templates` (C.6, Appendix D). Not all of these changes are additive (C.6).
 
 Cross-PR facts the contract depends on (from a pairwise `git merge-tree` of the heads above; nothing compiled):
 
 - **Agent deletion has two cascades.** #10621 (on master after the baseline) adds `agents/delete` with its own cascade and lifecycle lease, while #11172's `config/map-key-delete` on `agents` runs another agent cascade with its own authorization (Appendix D). One of them must own agent deletion when #11172 rebases; this contract does not choose.
 - **Duplicate methods.** #11185 carries a pre-rebase copy of #11132, so both add `session/steer`, `session/abort`, `session/append`, `session/rename`, `session/run-once` with text-identical wire shapes but different handler behaviour (steer checks, which rows `append` may write, whether `run-once` is create-only, prompt admission rechecks). They conflict in 25-27 blocks of `dispatch.rs`. The contract's semantics for those five methods are #11132's, the owning PR; #11185 must rebase onto it.
-- **Error `data`.** #11172 and #11176 each add an identical `send_rpc_error`; both merged define it twice (expected E0201) and use different `data` keys (`code` vs `error`). DEC-17 decides `reason`. #11377 adds a third copy, keyed `reason`; one of the three must survive.
+- **Error `data`.** #11172 and #11176 each add an identical `send_rpc_error`; both merged define it twice (expected E0201) and use different `data` keys (`code` vs `error`). DEC-17 decides `reason`. #11377 and #11381 add a third and a fourth copy, keyed `reason`; one of the four must survive. #11384 sets `data` on its `-32005` refusal but has no such helper, so at its head the refusal reaches the client without `data` (`rt/rpc/dispatch.rs:2883` @00a5c1ae52).
 - **Pairing revocation.** #11182 changes `PairingGuard::revoke_*` to require the config-write guard; #11149/#11176's one-argument call and six new #11172 tests then fail to compile. Three revocation-ordering designs are in flight (#11149, #11172, #11182); §8.8's core-owned pairing authority needs one.
 - **SOP authorization.** #11169 and #11220 rewrite the SOP tool-ceiling check differently; if #11169's predicate (`admin || allowed_tools ∋ "*"`) wins the merge, #11220's `tools:execute` requirement is undone for `sops/run`, `sops/decide` and `sops/dispatch-event`. The contract takes #11220's rule: SOP execution needs `tools:execute` (`principal_tool_ceiling(grants).is_none()`).
 - **Writer reservation.** #11185 (`RpcOutbound::reserve`) and #11234 (`reserve_frame`) add near-duplicate helpers; one should survive.
 - **Protocol version.** Still 1 at every head, including #11185's `turn_lifetime` capability, which is opt-in and therefore V-1-compatible.
-- **Grant vocabulary.** #11182 adds `Resource::Canvas`, the only new resource; operators' permission profiles need it to use canvas methods. #11176 adds the only new error code, `-32005`.
+- **Grant vocabulary.** #11182 adds `Resource::Canvas`, the only new resource; operators' permission profiles need it to use canvas methods. #11176 adds the only new error code, `-32005`; #11384 defines the same constant (`crates/zeroclaw-api/src/jsonrpc.rs:276` @00a5c1ae52), so one definition survives the merge.
 - **Handler authorization stricter than `authz()`.** `pairing/*`, `system/upgrade`, `system/restart` are admin-only in the handler; `pairing/new-code` and `pairing/revoke-all` are local-transport-only (see §5.8.1); canvas methods and the shared workspace need access to every agent; `session/run-once` also needs `sessions:create`; agent cron jobs are shared-operator only (#11149, #11176).
 - **Transport tests.** None of the seven parity PRs, #11165 or #11186 tests over a real Unix socket, a named pipe or golden frames. #11273 is the daemon-side real-transport harness (§15.2); #11274 adds real dials through `zeroclaw-rpc-client`'s production path over Unix sockets and a Windows pipe (`client.rs:1124`, `:1170`, `:1210`, `:1283` @9a17ecf8e1); Windows SID verification and its required-CI proof are still to come. The gateway calls no RPC method in any head.
 
@@ -1308,8 +1324,8 @@ Source: a route-by-route read of `crates/zeroclaw-gateway/src` at f0ae8c8bd8 (17
 
 | Closed by | Rows |
 |---|---:|
-| master, exact | 39 |
-| master, partial (the remaining difference is in the Gap column; several have a PR that claims to close it) | 38 |
+| master, exact | 36 |
+| master, partial (the remaining difference is in the Gap column; several have a PR that claims to close it) | 41 |
 | an open PR only | 54 |
 | a method this contract proposes (§8.7, §8.8, §8.12, §8.13, §12) | 12 |
 | no method and no PR yet | 0 |
@@ -1322,11 +1338,11 @@ Source: a route-by-route read of `crates/zeroclaw-gateway/src` at f0ae8c8bd8 (17
 | 2 | WS `/ws/chat` | partial | `session/new`, `session/prompt`, `session/steer`, `session/attach`, `session/approve`, `session/cancel`/`abort`; SOP approval frames → `sops/decide` | PR #11132, #11185; master | frame-protocol translation in the gateway; steering and attach are PR-only; D4 for approvals with no viewer |
 | 3 | GET `/api/sessions` | yes | `session/list` | master |  |
 | 4 | GET `/api/sessions/running` | none | `session/list {running: true}` | PR #11132 |  |
-| 5 | GET `/api/sessions/{id}/messages` | partial | `session/messages` | master (partial) | no per-message `created_at` |
+| 5 | GET `/api/sessions/{id}/messages` | partial | `session/messages` (`session_keys`, `max_bytes`) | master (partial); PR #11381 | the id fallback can read another row (`rpc_<id>` before `gw_<id>`), and a transcript larger than one frame fails; per-message `created_at` comes from #11331, which #11351 and #11381 carry. `[pending fix round]` |
 | 6 | POST `/api/sessions/{id}/messages` | none | `session/append` | PR #11132 |  |
-| 7 | DELETE `/api/sessions/{id}` | partial | `session/delete` | master (partial) | closes once gateway-run turns move to the core (no gateway cancel tokens left) |
+| 7 | DELETE `/api/sessions/{id}` | partial | `session/delete` (`session_keys`) | master (partial); PR #11381 | the id fallback can delete another row (`session_keys` closes it); closes fully once gateway-run turns move to the core (no gateway cancel tokens left). `[pending fix round]`: a delete through `zeroclaw-gw` does not yet settle a turn the in-process gateway owns |
 | 8 | PUT `/api/sessions/{id}` | none | `session/rename` | PR #11132 |  |
-| 9 | GET `/api/sessions/{id}/state` | yes | `session/state` | master |  |
+| 9 | GET `/api/sessions/{id}/state` | partial | `session/state` (`session_keys`) | master (partial); PR #11381 | the id fallback can answer another row's state (`rpc_<id>` before `gw_<id>`), found by #11381. `[pending fix round]` |
 | 10 | POST `/api/sessions/{id}/abort` | partial | `session/abort` | PR #11132/#11185 | operator path; owner cancel must be principal-scoped (TL-3) |
 | 11 | GET `/api/memory` | partial | `memory/list`, `memory/search` | master (partial); PR #11176, #11376 | category filter on search, preview length (`content_max_chars`, #11376), plane default |
 | 12 | POST `/api/memory` | partial | `memory/store` | master (partial); PR #11176 | default category differs (`Core` vs `Custom("user")`) |
@@ -1406,11 +1422,11 @@ Source: a route-by-route read of `crates/zeroclaw-gateway/src` at f0ae8c8bd8 (17
 | 86 | POST `/api/skills/bundles/{alias}/skills` | none | `skills/create` | PR #11176 |  |
 | 87 | GET `/api/skills/bundles/{alias}/skills/{name}` | yes | `skills/read` | master |  |
 | 88 | PUT `/api/skills/bundles/{alias}/skills/{name}` | yes | `skills/write` | master |  |
-| 89 | DELETE `/api/skills/bundles/{alias}/skills/{name}` | partial | `skills/delete` | master (partial); PR #11176 (verify) | purge mode |
-| 90 | GET `/api/personality` | yes | `personality/list` | master |  |
-| 91 | GET `/api/personality/templates` | partial | `personality/templates` | master (partial); PR #11176 | template override params |
-| 92 | GET `/api/personality/{filename}` | yes | `personality/get` | master |  |
-| 93 | PUT `/api/personality/{filename}` | partial | `personality/put` | master (partial); PR #11176 | `expected_mtime` conflict guard |
+| 89 | DELETE `/api/skills/bundles/{alias}/skills/{name}` | partial | `skills/delete` (`purge`) | master (partial); PR #11384 | purge mode (#11384; #11176 does not add it); a missing skill's failure status still differs `[pending fix round]` |
+| 90 | GET `/api/personality` | partial | `personality/list` (`require_configured_agent`) | master (partial); PR #11384 | the route refuses an agent `[agents]` does not configure, which the core lists for the operator, found by #11384 |
+| 91 | GET `/api/personality/templates` | partial | `personality/templates` (overrides, `defaults`) | master (partial); PR #11384 | template override params and the editor's defaults (#11384; #11176 adds none of them) |
+| 92 | GET `/api/personality/{filename}` | partial | `personality/get` (`require_configured_agent`) | master (partial); PR #11384 | as row 90 |
+| 93 | PUT `/api/personality/{filename}` | partial | `personality/put` (`expected_mtime_ms`, `require_configured_agent`) | master (partial); PR #11176, #11384 | `expected_mtime` conflict guard (both PRs; #11384 takes #11176's over) and the unconfigured-agent refusal; the 409's current state `[pending fix round]` |
 | 94 | GET `/api/browse` | partial | `fs/list_dir` / `workspace/list` | master (partial); PR #11182 | root differs (install `shared/` vs absolute path) |
 | 95 | POST `/api/browse/mkdir` | none | `fs/mkdir` | PR #11182 |  |
 | 96 | DELETE `/api/browse/rmdir` | none | `fs/rmdir` | PR #11182 |  |
@@ -1420,11 +1436,11 @@ Source: a route-by-route read of `crates/zeroclaw-gateway/src` at f0ae8c8bd8 (17
 | 100 | POST `/api/agents/{alias}/workspace/move` | none | `fs/move` | PR #11182 |  |
 | 101 | POST `/api/agents/{alias}/workspace/mkdir` | none | `fs/mkdir` | PR #11182 |  |
 | 102 | POST `/api/upload` | partial | `file/attach` or `file/upload/*` | master (partial) | chunked upload is refused on WSS and on #11186's in-process transport; the route needs the real socket or an explicit grant for the gateway transport; image-only check and marker differ |
-| 103 | GET `/api/logs` | partial | `logs/query` | master (partial) | attribution filters, persistence metadata |
-| 104 | SSE `/api/events` | partial | `events/subscribe` / `logs/subscribe` | master (partial) | unscoped principals only; the gateway's public-frame filter has no RPC twin; pairing frames never delivered |
+| 103 | GET `/api/logs` | partial | `logs/query` (`field_eq`, `report_disabled`) | master (partial); PR #11382 | attribution filters and persistence metadata (#11382) `[pending fix round]` |
+| 104 | SSE `/api/events` | partial | `events/subscribe` / `logs/subscribe` | master (partial); PR #11382 | #11382 serves it through `logs/subscribe` with the route's public-frame filter at the edge; unscoped principals only; pairing frames never delivered. `[pending fix round]`: cleanup of the subscription while its subscribe call is in flight |
 | 105 | GET `/api/events/history` | yes | `events/history` | master |  |
 | 106 | GET `/api/cost` | partial | `cost/query` | master (partial) | bounds semantics; errors without a tracker |
-| 107 | GET `/api/status` | partial | `status` + `agents/status` (+ nodes, D10) | master (partial) | payload differs |
+| 107 | GET `/api/status` | partial | `status {overview, agent}` (+ nodes, D10) | master (partial); PR #11382 | payload differs (#11382 adds `overview`); nodes wait on D10. `[pending fix round]` |
 | 108 | GET `/api/tuis` | yes | `tui/list` | master |  |
 | 109 | GET `/health` | partial | gateway liveness + `health` + `PairingPosture` | master (partial) | public; the pairing fields come from `PairingPosture` (§8.13) |
 | 110 | GET `/metrics` | none | `metrics/scrape` | PR #11182 | must be in the service allowlist; `/metrics` stays unauthenticated at the edge or becomes authenticated (edge decision) |
@@ -1434,8 +1450,8 @@ Source: a route-by-route read of `crates/zeroclaw-gateway/src` at f0ae8c8bd8 (17
 | 114 | GET `/api/version/check` | none | `system/version-check` | PR #11377 | the core checks its own version |
 | 115 | POST `/api/version/upgrade` | none | `system/upgrade` | PR #11182 | two-binary upgrade semantics are G5's |
 | 116 | GET `/api/version/upgrade/status` | none | `system/upgrade-status` | PR #11182 |  |
-| 117 | GET `/api/doctor` | partial | `doctor/run` | master (partial) | result set differs |
-| 118 | POST `/api/doctor` | partial | `doctor/run` | master (partial) | as row 117 |
+| 117 | GET `/api/doctor` | partial | `doctor/run {static_only}` | master (partial); PR #11382 | result set differs (#11382 adds `static_only`). `[pending fix round]`: an older core ignores it and runs live probes |
+| 118 | POST `/api/doctor` | partial | `doctor/run {static_only}` | master (partial); PR #11382 | as row 117 |
 | 119 | GET `/admin/paircode` | none | `pairing/code` (CLI over the core socket) | proposed §8.8 | the route leaves `zeroclaw-gw`: `zeroclaw gateway get-paircode` calls the core instead (D13) |
 | 120 | POST `/admin/paircode/new` | none | `pairing/new-code` + `pairing/revoke`/`revoke-all` | PR #11182 | admin-token file and loopback gate become core grants |
 | 121 | POST `/pair` | none | `pairing/redeem` | proposed §8.8 | D1 |
@@ -2589,9 +2605,9 @@ GatewayEdgeSettings = { host: string, port: integer, path_prefix: string | null,
 GatewaySettingsNotification = { effective_settings: GatewayEdgeSettings, pairing: PairingPosture, config_generation: integer }
 GatewayStatusResult = { gateways: { instance_id: string, product_version: string, registered_at: string /* RFC 3339 */, listen: GatewayRegisterParams["listen"] }[],
   ingress: "reachable" | "gateway_absent", public_base_url?: string }
-WebhookRoutesResult = { generation: integer, routes: { path: string, plugin: string, channel_alias: string }[] }   // sorted by path
+WebhookRoutesResult = { generation: integer, routes: { path: string, plugin: string, channel_alias: string }[] }   // sorted by path; revises the earlier proposal's `paths: string[]` (§12.3)
 
-// §12.3, §12.5, ING-4
+// §12.3, §12.5, ING-4. `headers` revises the earlier proposal's `[name, value]` pairs; the plugin webhook series still answers a flat outcome instead of `reject`/`reason` (§12.3)
 WebhookDeliverParams = { path: string, method: "GET" | "POST", query: string, headers: { name: string, value: string }[], body_b64: string, deadline_ms: integer, delivery_id: string }
 WebhookDeliverResult =
   | { outcome: "ack" }
@@ -2640,7 +2656,7 @@ InitializeParamsD2 = { anonymous_http?: boolean }                    // accepted
 InitializeResultD2 = { binding?: "service" | "anonymous", pairing_generation?: integer }
 ```
 
-**Scope of this appendix.** It covers every method on master (C.1, C.2), every method this contract proposes (C.3), and every method the open PRs add, with the existing payloads they extend (C.4). That is the whole operation set of §8. SCH-6 keeps C.4 in step with the PRs until they merge (DEC-28).
+**Scope of this appendix.** It covers every method on master (C.1, C.2), every method this contract proposes (C.3), every method the original parity PRs add, with the existing payloads they extend (C.4), and what the gateway route ports add and change (C.6). That is the whole operation set of §8. SCH-6 keeps C.4 in step with the PRs until they merge (DEC-28).
 
 ### C.4 Methods added by open PRs
 
@@ -3812,7 +3828,14 @@ ConfigMapKeyRenameResult += { rewritten: integer }   // input optional (default 
 
 ### C.6 Additions from the gateway route ports
 
-Four open PRs that move dashboard routes onto the core add two methods and one notification method (#11377) and extend eight existing methods (#11345, #11373, #11376), typed at the heads in §15.1: #11345 @a59d3c0f42, #11373 @cec2b83bd1, #11376 @e503e5cb8e, #11377 @8b2ed4ef5c. Every change is additive except the `sops/decide` refusal code; Appendix D classifies each. The error codes of the two new methods are in E.3.
+Seven open PRs that move dashboard routes onto the core add two methods and one notification method (#11377) and change nineteen existing methods (#11345, #11373, #11376, #11381, #11382, #11384), typed at the heads in §15.1: #11345 @a59d3c0f42, #11373 @cec2b83bd1, #11376 @e503e5cb8e, #11377 @8b2ed4ef5c, #11381 @a3b5f3920a, #11382 @967865aeae, #11384 @00a5c1ae52.
+
+Not every change here is additive. The V-1 additions are the new methods and notification, and the optional params and result fields below. The rest are exceptions that protocol 1 admits only as registered entries (V-5, V-6, Appendix D): conformance corrections (F), such as a truthful `memory/delete` and the `sops/run` pre-check; a widening under an accepted rule (W), the administrator's retained cron history; security corrections (S), the authenticated approver and #11381's authority recheck at the effect; and two changed refusal codes, which are not additive at all:
+
+- `sops/decide`: an approval-group or approval-mode refusal is `-32012`, not `-32010` (#11373).
+- `cron/delete`: at #11376's head, an administrator's id with neither a job nor retained history answers `-32603`, where the baseline answered `-32602`. This is an implementation gap, not accepted behaviour: the administrator path skips the job lookup that answered `-32602` and maps every removal failure to `INTERNAL_ERROR` (`rt/rpc/dispatch.rs:7354-7367` @e503e5cb8e). `[pending fix round]`: #11376 restores `-32602`.
+
+`[pending fix round]` marks an entry whose PR's review asked for a change that can still alter it; each PR's open points are listed under the table. E.3 gives the error codes of the two new methods and of the refusals these additions introduce.
 
 | Method | PR @head | Params | Result | Handler |
 |---|---|---|---|---|
@@ -3820,11 +3843,21 @@ Four open PRs that move dashboard routes onto the core add two methods and one n
 | `sops/subscribe-runs` | #11377 @8b2ed4ef5c | `SopRunsRequest` (`{}`: every SOP) | `SopsSubscribeRunsResult`: `runs` is what `sops/runs` lists for the same `sop`, read under the engine lock that arms the change feed. Then `sops/run-changed` on this connection until `subscription/cancel` or the connection ends; a change can reach the connection before this result | rt/rpc/dispatch.rs:10018 @8b2ed4ef5c (delivery :10856-10935; per-delivery recheck :10992-11026) |
 | `sops/run-changed` (notification) | #11377 @8b2ed4ef5c | n/a (server to client) | `SopRunChanged`. `seq` counts this subscription's changes from 1. A lag of n changes on the engine's feed sends `subscription/lagged {from_seq: next, resume_seq: next + n, epoch_changed: false}`, and the next change carries `resume_seq`; with `sop` set, n counts every SOP's lost changes. No replay | rt/rpc/dispatch.rs:10856 @8b2ed4ef5c |
 | `health` (addition) | #11345 @a59d3c0f42 | unchanged | `components.gateway.bound_addr?: string` (`ip:port`): the address the daemon's own gateway listener bound in its current gateway generation; absent before it binds and after that generation ends | rt/rpc/dispatch.rs:3214 @a59d3c0f42 (inserted :3222-3242; `GatewayBinding` rt/rpc/context.rs:124-139) |
-| `memory/list`, `memory/search` (addition) | #11376 @e503e5cb8e | `content_max_chars?: integer`: each entry's `content` is cut to at most that many characters, ending in `...` when cut, instead of the default 200-byte preview | unchanged | rt/rpc/dispatch.rs:10851-10875 @e503e5cb8e (applied :7143, :7177) |
+| `memory/list`, `memory/search` (addition) | #11376 @e503e5cb8e | `content_max_chars?: integer`, instead of the default 200-byte preview: content longer than that many characters keeps its first `content_max_chars − 3` characters followed by `...`, so at most `content_max_chars` characters for a budget of 3 or more. A budget of 0, 1 or 2 still yields `...`, three characters: the subtraction saturates at 0, the ellipsis is always appended, and the params accept any unsigned value. A client that needs the bound sends at least 3 (the gateway's memory routes send 4096, `gw/api.rs:24` @e503e5cb8e) | unchanged | rt/rpc/dispatch.rs:10851-10875 @e503e5cb8e (applied :7143, :7177) |
 | `memory/delete` (behaviour) | #11376 @e503e5cb8e | unchanged | `deleted` reports whether an entry under the key was removed; on master it is always `true` | rt/rpc/dispatch.rs:7243-7264 @e503e5cb8e |
-| `cron/delete`, `cron/runs` (behaviour) | #11376 @e503e5cb8e | unchanged | for a caller with the administrator grant, an id whose job row is gone but whose run history remains (a completed one-shot) is served as the HTTP routes serve it: `cron/delete` removes the history, `cron/runs` lists it. An id with neither is refused as before; scoped principals are unchanged | rt/rpc/dispatch.rs:7351-7372, :7374-7404 @e503e5cb8e |
+| `cron/delete`, `cron/runs` (behaviour) | #11376 @e503e5cb8e | unchanged | for a caller with the administrator grant, an id whose job row is gone but whose run history remains (a completed one-shot) is served as the HTTP routes serve it: `cron/delete` removes the history, `cron/runs` lists it. An id with neither is refused: a scoped principal as before, `-32602` from the job lookup; the administrator gets `-32603` at this head, because its path skips that lookup and maps every removal failure to `INTERNAL_ERROR` (`[pending fix round]`; not additive while it stands, Appendix D) | rt/rpc/dispatch.rs:7351-7372 (administrator path :7354-7359, mapping :7367), :7374-7404 @e503e5cb8e |
 | `sops/decide` (addition and behaviour) | #11373 @cec2b83bd1 | unchanged | `pending_quorum?: true` when the vote counted and the gate still waits for its quorum; absent otherwise. The approver is the connection's authenticated identity, never the claimed `tui_id`. An approval-group or approval-mode refusal is `-32012`, no longer `-32010` (not additive, Appendix D) | rt/rpc/dispatch.rs:10021 @cec2b83bd1 (refusal :10119-10128; marker :10171-10176; approver :10180-10198) |
 | `sops/run` (behaviour) | #11373 @cec2b83bd1 | unchanged | a procedure with an `execute` step no agent owns is refused before dispatch with `-32602` and the reason; on master such a run started and failed its first step | rt/rpc/dispatch.rs:9820-9825 @cec2b83bd1 |
+| `status` (addition) | #11382 @967865aeae | `StatusParams` gains `overview?: boolean` (default false) and `agent?: string`. With `overview`, the overview is resolved install-wide or for `agent`, whose selector the caller must pass (`-32012`), checked after the method's awaits; if the core cannot describe its runtime, an `overview` request still answers, without the runtime fields | `StatusResult += { overview?: StatusOverview }`. A core that predates the params ignores them and answers without `overview` | rt/rpc/dispatch.rs:3197-3240 @967865aeae |
+| `logs/query` (addition) | #11382 @967865aeae | `LogsQueryParams` gains `field_eq?: {key: value}`, exact matches on attribution fields (any other key is `-32602`; `sop_run_id` is shorthand and wins on conflict), and `report_disabled?: boolean`: with persistence off, an empty page instead of the `-32603` refusal | `LogsQueryResult += { persistence_enabled, daemon_started_at?, attribution_keys? }`. An older core ignores both params: it does not filter by `field_eq` and still refuses when persistence is off | rt/rpc/dispatch.rs:9266-9294 @967865aeae |
+| `doctor/run` (addition) | #11382 @967865aeae | `DoctorRunParams { static_only?: boolean }`: only the static checks, with no provider auth check and no live model probes | unchanged. A core that predates it ignores it and runs the full suite, live probes included, and the result does not say which ran | rt/rpc/dispatch.rs:3321-3339 @967865aeae |
+| `session/messages`, `session/state`, `session/delete` (addition) | #11381 @a3b5f3920a | `session_keys?: string[]`: 1 to 4 (`MAX_SESSION_KEYS`) non-empty exact chat-store keys, most preferred first, else `-32602`. The core acts on the first key that names a stored row the caller may see, adds no prefix and never falls back to `session_id`; with no visible row it addresses the last key. For a scoped principal another principal's row counts as absent. An `rpc_<id>` key covers the live session `<id>`; no other key covers a live session. `session/state` and `session/delete` take `SessionTargetParams { session_id, session_keys? }`, a superset of `SessionIdParams` on the wire | unchanged. An older core ignores `session_keys` and resolves the id with its fallback, which can address another row | rt/rpc/dispatch.rs:2073-2108 (keys), :6720, :6977, :7041 @a3b5f3920a |
+| `session/messages` (addition) | #11381 @a3b5f3920a | `max_bytes?: integer`: a bound on the serialized `messages`. The page keeps the newest entries of its window that fit, and the existing `start` gives its first index for paging back with `before_index` | a single entry over the bound is `-32602` with `data: {reason: "entry_exceeds_max_bytes", index, bytes}` | rt/rpc/dispatch.rs:6949-6963 @a3b5f3920a |
+| `session/messages`, `session/delete` (behaviour) | #11381 @a3b5f3920a | unchanged | a stored-transcript read and a delete re-check the caller's authority after the session-queue wait, before the read or delete (S) | rt/rpc/dispatch.rs:6720, :7041 @a3b5f3920a |
+| `skills/delete` (addition) | #11384 @00a5c1ae52 | `purge?: boolean`: the skill's directory is removed instead of archived; omitted or `false` archives, as before | unchanged | rt/rpc/dispatch.rs:8695 (purge branch :8701) @00a5c1ae52 |
+| `personality/list`, `personality/get`, `personality/put` (addition) | #11384 @00a5c1ae52 | `require_configured_agent?: boolean`: an agent that `[agents]` does not configure, or none, is `-32602` before anything is read or written, even for the operator | unchanged | rt/rpc/dispatch.rs:10893-10909 @00a5c1ae52 (applied :8723, :8781, :8831) |
+| `personality/put` (addition) | #11384 @00a5c1ae52 | `expected_mtime_ms?: integer` and `-32005` when it is stale, exactly as #11176 (C.4, §8.16), taken over unchanged so the two merge as one | the refusal's `data` is keyed `error: "personality_disk_drift"` (DEC-17 would key it `reason`) and carries `current_content` and `current_mtime_ms` only for a caller that also holds `personality:read`. At this head method errors are sent without `data` (§15.1, "Error `data`"), so the client receives the code alone | rt/rpc/dispatch.rs:8842-8869 @00a5c1ae52 |
+| `personality/templates` (addition) | #11384 @00a5c1ae52 | overrides `preset?`, `agent_name?`, `user_name?`, `timezone?`, `communication_style?`, `include_memory?`, and `defaults?: "quickstart" \| "editor"` (`PersonalityTemplateDefaults`; omitted is `quickstart`, as before). `editor` names the agent by its alias only when it is configured (otherwise `ZeroClaw`) and includes memory unless the backend is `none` | unchanged | rt/rpc/dispatch.rs:8883 @00a5c1ae52 |
 
 ```ts
 // crates/zeroclaw-rpc-proto/src/types.rs:175 @8b2ed4ef5c
@@ -3840,13 +3873,43 @@ MemoryListParams += { content_max_chars?: integer }     // #11376 crates/zerocla
 MemorySearchParams += { content_max_chars?: integer }   // :481
 RunOverlay += { pending_quorum?: true }                 // as the sops/decide result only; #11373 crates/zeroclaw-rpc-proto/src/types.rs:103 @cec2b83bd1
 HealthSnapshot.components.gateway += { bound_addr?: string /* "ip:port" */ }   // #11345
+// #11382 crates/zeroclaw-rpc-proto/src/types.rs:146-155, :161-196, :215-217, :227-232 @967865aeae
+StatusParams = { overview?: boolean /* default false */, agent?: string }
+StatusOverview = { agent_alias: string | null, model_provider: string | null /* "<type>.<alias>" */, model: string, temperature: number | null,
+  memory_backend: string, uptime_seconds: integer, daemon_started_at: string /* RFC 3339 UTC */, gateway_port: integer, locale: string,
+  paired: boolean, channels: { [type_alias: string]: boolean }, health: any /* the health snapshot without process */, process: any,
+  check_updates: boolean, allow_self_upgrade: boolean, restart_mode: string /* desktop_supervised | supervised | self_respawn | manual */, restart_hint: string }
+StatusResult += { overview?: StatusOverview }
+DoctorRunParams = { static_only?: boolean /* default false */ }
+// :1471-1517, :1521-1565
+LogsQueryParams += { field_eq?: { [attribution_key: string]: string }, report_disabled?: boolean }
+LogsQueryResult += { persistence_enabled: boolean /* omitted by an older core: read as true */, daemon_started_at?: string, attribution_keys?: string[] }
+// #11381 crates/zeroclaw-rpc-proto/src/types.rs:214-233, :381-402 @a3b5f3920a
+SessionTargetParams = { session_id: string, session_keys?: string[] /* 1..=4 */ }   // session/state, session/delete
+SessionMessagesParams += { session_keys?: string[], max_bytes?: integer }
+// error.data of session/messages' -32602 when one entry exceeds max_bytes: rt/rpc/dispatch.rs:6958-6962 @a3b5f3920a
+{ reason: "entry_exceeds_max_bytes", index: integer, bytes: integer }
+// #11384 crates/zeroclaw-rpc-proto/src/types.rs:967-975, :990-998, :1022-1028, :1046-1060, :1074-1112 @00a5c1ae52
+SkillsDeleteParams += { purge?: boolean }
+PersonalityListParams += { require_configured_agent?: boolean }
+PersonalityGetParams += { require_configured_agent?: boolean }
+PersonalityPutParams += { expected_mtime_ms?: integer /* as #11176 */, require_configured_agent?: boolean }
+PersonalityTemplatesParams += { preset?: string, agent_name?: string, user_name?: string, timezone?: string,
+  communication_style?: string, include_memory?: boolean, defaults?: "quickstart" | "editor" }
 ```
+
+**Open review points that can still change these entries** (the `[pending fix round]` marks):
+
+- #11376: restore `-32602` for an administrator's `cron/delete` of an id with neither a job nor history.
+- #11382: guard `doctor/run {static_only}` against an older core, which runs live probes instead; resolve the `status` agent check on fresh grants after its waits; own the `/api/events` subscription's cleanup during the `logs/subscribe` round trip; treat an older core's refusal of a disabled log as a capability gap.
+- #11381: an explicit capability for `session_keys` and `max_bytes` (an older core ignores them); a stable cursor that binds a page walk to one row; an exact `max_bytes` bound that counts the array's own bytes; ownership decided on the fresh grants after the wait; a `zeroclaw-gw` delete that settles a turn the in-process gateway owns.
+- #11384: proof of support for the new write semantics before an older core is asked (it would ignore `purge`, `require_configured_agent` and `expected_mtime_ms`); the 409's current file state, which needs `data` on the wire; a bound on personality content across the RPC; the remaining failure-status differences.
 
 `VersionCheckResponse` moves into `zeroclaw-rpc-proto` with its fields and serde attributes unchanged, so the gateway's OpenAPI schema for `GET /api/version/check` keeps its shape. Two names differ from the proposal text in §8.9 and C.3, and the contract takes the PR's: the subscribe params are `SopRunsRequest` (the `sops/runs` type, not a new `SopsSubscribeRunsParams`), and the notification payload is `SopRunChanged` (not `SopRunChangedNotification`).
 
 ## Appendix D. Compatibility register (V-1, V-2, V-5, V-6)
 
-Every change the open PRs, and this contract itself, make to an existing method, classified. `A` additive (V-1); `C` behind an opt-in capability (V-2); `S` security correction (V-5); `F` conformance correction (V-6); `W` widening under an accepted rule (V-6). The `data.reason` values are proposed (DEC-17); today these refusals carry only a code and a message. The refusal-signal column gives the code each PR head returns today; where the contract wants a different code, the row says so, marks the remap `[proposed]` and names its owner. PR heads as in §15.1.
+Every change the open PRs, and this contract itself, make to an existing method, classified. `A` additive (V-1); `C` behind an opt-in capability (V-2); `S` security correction (V-5); `F` conformance correction (V-6); `W` widening under an accepted rule (V-6); *gap* a change at a PR head that the contract does not accept, which that PR's fix round removes. The `data.reason` values are proposed (DEC-17); today these refusals carry only a code and a message. The refusal-signal column gives the code each PR head returns today; where the contract wants a different code, the row says so, marks the remap `[proposed]` and names its owner. PR heads as in §15.1.
 
 | Method(s) | PR | Change | Class | Refusal signal | Who is affected; migration |
 |---|---|---|---|---|---|
@@ -3882,11 +3945,23 @@ Every change the open PRs, and this contract itself, make to an existing method,
 | `memory/list`, `memory/search` | #11376 | optional `content_max_chars` | A | none | none |
 | `memory/delete` | #11376 | `deleted` reports whether an entry was removed (always `true` on master) | F | none | a client that treated `deleted` as constant (none known) |
 | `cron/delete`, `cron/runs` | #11376 | for the administrator grant, a job whose row is gone but whose run history remains is served as the HTTP routes serve it, instead of refused | W, F | none | none; scoped principals are unchanged |
+| `cron/delete` | #11376 | an administrator's id with neither a job nor retained history: `-32602` becomes `-32603` | gap, **not additive**: the refusal code changes; `[pending fix round]` #11376 restores `-32602` | `-32603` ("Cron delete failed…", `rt/rpc/dispatch.rs:7354-7367` @e503e5cb8e); the baseline answered `-32602` from `authorize_cron_job` (`dispatch.rs:7607`, `:1531` @f0ae8c8bd8) | an administrator's client that read `-32602` as "no such job" sees an internal error; scoped principals are unchanged |
 | `sops/decide` | #11373 | optional `pending_quorum: true`; the approver is the authenticated identity, as in #11169's row | A, S | none | as #11169's row |
 | `sops/decide` | #11373 | an approval-group or approval-mode refusal is `-32012`, not `-32010` | F, **not additive**: the refusal code changes | `-32012` (`rt/rpc/dispatch.rs:10119-10128` @cec2b83bd1) | a client that read `-32010` from this method as a credential problem (none known: zerocode shows the message); #11169 keeps `-32010` and must take this change when the two merge |
 | `sops/run` | #11373 | a procedure with an `execute` step no agent owns is refused before dispatch | F | `-32602` with the reason | none; such a run failed its first step before |
 | `sops/subscribe-runs`, `sops/run-changed`, `system/version-check` | #11377 | new methods and notification | A | `-32603`, `data.reason: "sop_disabled"` | none |
 | every method | #11377 | a handler error's `data` reaches the wire | A (DEC-17) | the error's own code | none; older clients ignore `data` |
+| `status` | #11382 | optional `overview`, `agent`; result `overview?` | A | `-32012` when the caller cannot pass the agent's selector (only with `agent`) | none; an older core answers without `overview` `[pending fix round]` |
+| `logs/query` | #11382 | optional `field_eq`, `report_disabled`; result `persistence_enabled`, `daemon_started_at?`, `attribution_keys?` | A | `-32602` for a `field_eq` key that is not an attribution field | none; an older core ignores both params `[pending fix round]` |
+| `doctor/run` | #11382 | optional `static_only` | A | none | none; an older core runs the full suite, live probes included `[pending fix round]` |
+| `session/messages`, `session/state`, `session/delete` | #11381 | optional `session_keys`; `SessionTargetParams` for state and delete | A | `-32602` for a malformed list | none; an older core ignores the keys and resolves the id with its fallback `[pending fix round]` |
+| `session/messages` | #11381 | optional `max_bytes` | A | `-32602`, `data.reason: "entry_exceeds_max_bytes"` | none `[pending fix round]` |
+| `session/messages`, `session/delete` | #11381 | the caller's authority re-checked after the session-queue wait, before the read or delete | S | the authority decision's code (`-32010` or `-32012`) | a caller whose credential is revoked while its request waits `[pending fix round]` (ownership on the fresh grants) |
+| every method | #11381 | a handler error's `data` reaches the wire | A (DEC-17) | the error's own code | none; as #11377's row |
+| `skills/delete` | #11384 | optional `purge` | A | none | none |
+| `personality/list`, `personality/get`, `personality/put` | #11384 | optional `require_configured_agent` | A | `-32602` for an agent `[agents]` does not configure | none |
+| `personality/put` | #11384 | optional `expected_mtime_ms`; `-32005` when it is sent and stale, as #11176's row | A | `-32005`, `data.error: "personality_disk_drift"`; at this head the error reaches the client without `data` | none unless the client opts in `[pending fix round]` |
+| `personality/templates` | #11384 | optional overrides and `defaults` | A | none | none |
 | `subscription/cancel` | this contract (DEC-31) | classified *own connection* instead of `Logs:Read` | W (DEC-31) | none | callers that hold a subscription but not `Logs:Read` can now end it; nobody gains access to another connection's subscriptions |
 | `session/state` | this contract (DEC-22) | `turn_id` becomes the turn's random UUID instead of the turn-generation counter string | F | none | clients that parsed the counter (none known; it is documented as opaque) |
 
@@ -3997,6 +4072,10 @@ Codes each handler and the helpers it calls can return, beyond the gate, at the 
 | `system/restart` | #11182 @b0ad81bfd2 | `-32010` (unbound, `require_admin`); `-32012` (not admin); `-32602` (params; `component` other than `"daemon"`); `-32600` (`"no daemon supervisor is attached; restart the process instead"`: no `reload_tx` in the context) |
 | `system/version-check` | #11377 @8b2ed4ef5c | gate (system:read): -32010, -32012. handler: -32602 (params); after the check the caller's authority is resolved again: -32010 (credential expired, revoked or due for revalidation), -32012 (grant withdrawn). A failed check is a result with `error`, not an error |
 | `sops/subscribe-runs` | #11377 @8b2ed4ef5c | gate (sops:read): -32010, -32012. handler: -32602 (params); -32603 (`sop_disabled` in `data.reason`; "engine lock poisoned" without `data`; result serialization) |
+| `status` (addition) | #11382 @967865aeae | handler, with `overview` and `agent`: -32012 when the caller cannot pass the agent's selector. Without `overview` the method answers as on master |
+| `logs/query` (addition) | #11382 @967865aeae | handler: -32602 (a `field_eq` key that is not an attribution field); -32603 when persistence is off, unless `report_disabled` |
+| `session/messages`, `session/state`, `session/delete` (addition) | #11381 @a3b5f3920a | handler: -32602 (`session_keys` empty, over 4 or holding an empty key); `session/messages`: -32602 with `data.reason: "entry_exceeds_max_bytes"`; a stored-transcript read or a delete re-checks authority after its queue wait: -32010, -32012 |
+| `personality/list`, `personality/get`, `personality/put` (addition) | #11384 @00a5c1ae52 | handler: -32602 (`require_configured_agent` with an agent `[agents]` does not configure, or none); `personality/put`: -32005 as #11176's row |
 
 ### E.4 Methods added on master after the baseline
 
