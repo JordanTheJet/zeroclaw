@@ -1,6 +1,6 @@
 # Gateway route coverage
 
-The gateway is moving out of the daemon: each HTTP, WebSocket and SSE route it serves will reach the core over the local RPC socket instead of calling into the runtime directly ([RPC socket transport](./rpc-socket.md)). This page classifies every route the gateway registers today by how the split serves it. The architecture test `tests/architecture/gateway_route_coverage.rs` holds the same table and fails the build when the two disagree, when the gateway registers a route neither classifies, when a classified route is no longer registered, or when an `rpc` entry names a method the core does not serve.
+The gateway is moving out of the daemon: each HTTP, WebSocket and SSE route it serves will reach the core over the local RPC socket instead of calling into the runtime directly ([RPC socket transport](./rpc-socket.md)). This page classifies every route the gateway registers today by how the split serves it. The architecture test `tests/architecture/gateway_route_coverage.rs` holds the same table. It parses the gateway's source for every route, fallback and nested router, and fails the build when one cannot be resolved, when the gateway registers a route the table does not classify, when a classified route is no longer registered, when an `rpc` entry names a method the core does not serve, or when this page's table or counts differ from the test's in any cell.
 
 The classification follows the coverage table of the core-to-gateway IPC contract (pull request #11300), which also records, route by route, what a partial match is missing. That contract is still under review; until it merges, this page is the checked copy.
 
@@ -22,9 +22,11 @@ A route whose method lands on `master` moves from `deferred` to `rpc` in both th
 | `rpc` | 78 |
 | `deferred` | 74 |
 | `ingress` | 13 |
-| `gateway-local` | 9 |
+| `gateway-local` | 10 |
 
-Routes are counted per HTTP method: `GET /api/cron` and `POST /api/cron` are two rows. `ANY` is a method router's fallback. WebSocket and server-sent-event routes are `GET`.
+Routes are counted per HTTP method: `GET /api/cron` and `POST /api/cron` are two rows. `ANY` is every method: `any(..)`, or a method router's fallback. WebSocket and server-sent-event routes are `GET`. A path in angle brackets is decided at runtime: `<unmatched>` is the router's fallback, which serves the dashboard for any path no route matches, and `<prefix>/` is the redirect added when `gateway.path_prefix` is set.
+
+The contract's table counts differently in one place: it gives the plugin route's `HEAD` answer and its fallback one row, which this page splits into `HEAD` and `ANY`. Its total therefore equals this page's although the rows differ.
 
 ## Routes
 
@@ -203,7 +205,8 @@ Routes are counted per HTTP method: `GET /api/cron` and `POST /api/cron` are two
 | POST `/hooks/claude-code` | gateway-local | served by the gateway itself |
 | HEAD `/plugin/{path}` | gateway-local | 405 for unsupported methods |
 | ANY `/plugin/{path}` | gateway-local | 405 for unsupported methods |
-| GET `{path_prefix}/` | gateway-local | redirect from the configured `gateway.path_prefix` |
+| GET `<unmatched>` | gateway-local | SPA fallback: the dashboard for unmatched paths |
+| GET `<prefix>/` | gateway-local | redirect from the configured `gateway.path_prefix` |
 
 ## Updating this page
 
