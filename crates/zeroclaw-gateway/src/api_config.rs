@@ -292,7 +292,14 @@ fn error_response(err: ConfigApiError) -> Response {
 /// else falls through to ValidationFailed.
 fn map_prop_error(err: anyhow::Error, path: &str) -> ConfigApiError {
     let msg = err.to_string();
-    if msg.starts_with("Unknown property") {
+    if err
+        .downcast_ref::<zeroclaw_config::url_credentials::UnresolvedMask>()
+        .is_some()
+    {
+        // A masked placeholder no stored value can resolve: the caller has
+        // to send the full URL.
+        ConfigApiError::new(ConfigApiCode::ValidationFailed, msg).with_path(path)
+    } else if msg.starts_with("Unknown property") {
         ConfigApiError::path_not_found(path)
     } else {
         ConfigApiError::from_validation(err).with_path(path)
@@ -3545,6 +3552,109 @@ mod tests {
     // tests below fall through into real persistence (`persist_and_swap` ->
     // `save_dirty`), and a bare `Config::default()` would write the developer's
     // live `~/.zeroclaw/config.toml`.
+
+    /// A provider URI's password and query credential reach neither the
+    /// whole-config read nor the property read: the shared config projection
+    /// masks them before any HTTP body is built.
+    #[tokio::test]
+    async fn config_reads_withhold_a_provider_uris_embedded_credentials() {
+        const PASSWORD: &str = "uri-password-654738";
+        const QUERY: &str = "uri-query-938472";
+        let config: zeroclaw_config::schema::Config = toml::from_str(&format!(
+            "[providers.models.custom.credential_url]\nuri = \"http://review-user:{PASSWORD}@127.0.0.1:9/v1?credential={QUERY}\"\n"
+        ))
+        .unwrap();
+        let state = test_state(config);
+
+        let whole = handle_config_get(State(state.clone())).await;
+        assert_eq!(whole.status(), StatusCode::OK);
+        let whole = String::from_utf8(
+            whole
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .to_vec(),
+        )
+        .unwrap();
+        let (status, prop) = response_json(
+            handle_prop_get(
+                State(state),
+                Query(PropQuery {
+                    path: "providers.models.custom.credential_url.uri".to_string(),
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let prop = prop.to_string();
+
+        assert_eq!(
+            [
+                whole.contains(PASSWORD),
+                whole.contains(QUERY),
+                prop.contains(PASSWORD),
+                prop.contains(QUERY),
+            ],
+            [false; 4],
+            "userinfo and query secrets must be withheld: {whole}\n{prop}"
+        );
+        assert!(
+            prop.contains("http://***MASKED***@127.0.0.1:9/v1?***MASKED***"),
+            "{prop}"
+        );
+    }
+
+    /// A provider URI written back through the property route as reads show
+    /// it keeps the stored credentials. A placeholder that no stored value
+    /// can resolve is refused as `validation_failed` and stores nothing.
+    #[tokio::test]
+    async fn prop_put_restores_a_masked_uri_and_refuses_an_unresolvable_one() {
+        const PATH: &str = "providers.models.custom.credential_url.uri";
+        let stored =
+            "http://review-user:uri-password-654738@127.0.0.1:9/v1?credential=uri-query-938472";
+        let tmp = tempfile::tempdir().unwrap();
+        let base = temp_config(&tmp);
+        let mut config: zeroclaw_config::schema::Config = toml::from_str(&format!(
+            "[providers.models.custom.credential_url]\nuri = \"{stored}\"\n"
+        ))
+        .unwrap();
+        config.config_path = base.config_path;
+        config.data_dir = base.data_dir;
+        let state = test_state(config);
+        let uri = || {
+            state
+                .config
+                .read()
+                .providers
+                .models
+                .find("custom", "credential_url")
+                .and_then(|provider| provider.uri.clone())
+        };
+        let put = |value: &str| {
+            handle_prop_put(
+                State(state.clone()),
+                None,
+                axum::Json(PropPutBody {
+                    path: PATH.to_string(),
+                    value: serde_json::json!(value),
+                    comment: None,
+                }),
+            )
+        };
+
+        let (status, json) =
+            response_json(put("http://***MASKED***@127.0.0.1:9/v1?***MASKED***").await).await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(uri().as_deref(), Some(stored));
+
+        let (status, json) = response_json(put("http://***MASKED***.example/v1").await).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+        assert_eq!(json["code"], "validation_failed", "{json}");
+        assert_eq!(uri().as_deref(), Some(stored));
+    }
 
     #[tokio::test]
     async fn prop_get_surfaces_disabled_audit_warning() {
