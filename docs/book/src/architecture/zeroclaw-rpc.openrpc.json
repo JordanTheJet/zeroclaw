@@ -221,6 +221,79 @@
         ],
         "type": "object"
       },
+      "ApprovalDecision": {
+        "description": "Approve or deny a waiting SOP gate.",
+        "oneOf": [
+          {
+            "enum": [
+              "approve"
+            ],
+            "type": "string"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "deny": {
+                "properties": {
+                  "reason": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  }
+                },
+                "type": "object"
+              }
+            },
+            "required": [
+              "deny"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "Approve a deterministic checkpoint WITH an operator amendment: `text`\nreplaces the step's declared editable field (`- edit:` bullet) in the\npiped value before the run resumes. Checkpoint-only; an approval gate\n(broker-owned `WaitingApproval`) refuses it fail-closed.",
+            "properties": {
+              "amend": {
+                "properties": {
+                  "text": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "text"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "amend"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "Ask for a re-draft: re-run the checkpoint's predecessor `llm.generate`\nstep with `guidance` framed as reviewer feedback, then re-present the\ngate (revision + 1). Checkpoint-only, same as `Amend`.",
+            "properties": {
+              "revise": {
+                "properties": {
+                  "guidance": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "guidance"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "revise"
+            ],
+            "type": "object"
+          }
+        ]
+      },
       "BoundTriggerSource": {
         "description": "A non-channel trigger source and the fields needed to configure it.",
         "properties": {
@@ -1673,7 +1746,9 @@
       "CronSettingsParams": {
         "description": "Params for `cron/settings`. Without a `patch` key, or with no params\nat all, the call reads the scheduler settings. The daemon treats any\n`patch` key as a write request, which it does not implement yet.",
         "properties": {
-          "patch": true
+          "patch": {
+            "description": "A present `null` stays `Some(Value::Null)`: the key's presence,\nnot its value, is what asks for a write."
+          }
         },
         "type": "object"
       },
@@ -6188,7 +6263,9 @@
       "SopDecideRequest": {
         "description": "Request payload for `sops/decide`: resolve a paused checkpoint. `name` and\n`run_id` select the run; `decision` is the raw `ApprovalDecision` wire value\n(`\"approve\"` or `{\"deny\": {\"reason\": \"...\"}}`), deserialized into the\ncanonical runtime enum by the handler so no parallel decision enum exists\nhere to drift from it.",
         "properties": {
-          "decision": true,
+          "decision": {
+            "$ref": "#/components/schemas/ApprovalDecision"
+          },
           "name": {
             "type": "string"
           },
@@ -6279,7 +6356,9 @@
       "SopDraftParams": {
         "description": "Params for `sops/graph-draft`: project an unsaved SOP (the `sops/save`\nwire form) onto its graph without persisting it.",
         "properties": {
-          "sop": true
+          "sop": {
+            "$ref": "#/components/schemas/Sop"
+          }
         },
         "required": [
           "sop"
@@ -6676,7 +6755,9 @@
               "null"
             ]
           },
-          "sop": true
+          "sop": {
+            "$ref": "#/components/schemas/Sop"
+          }
         },
         "required": [
           "sop"
@@ -7232,13 +7313,35 @@
       "SopValidateParams": {
         "anyOf": [
           {
-            "$ref": "#/components/schemas/SopSaveRequest"
+            "required": [
+              "sop"
+            ]
           },
           {
-            "$ref": "#/components/schemas/SopSelectRequest"
+            "required": [
+              "name"
+            ]
           }
         ],
-        "description": "Params for `sops/validate`: an unsaved draft in the `sops/save` form, or\na stored SOP selected by name. A request carrying a `sop` key is always\nvalidated as a draft."
+        "description": "Params for `sops/validate`: an unsaved draft in the `sops/save` form\n(`sop`, optionally with `original_name`), or a stored SOP selected by\n`name`. A request carrying a `sop` key is always validated as a draft,\nand its `name` is then ignored.",
+        "properties": {
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "original_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "sop": {
+            "$ref": "#/components/schemas/Sop"
+          }
+        },
+        "type": "object"
       },
       "SopValidateResult": {
         "description": "Result of `sops/validate`. `ok` is true when nothing blocks the SOP;\nwarnings never block it.",
@@ -7272,7 +7375,9 @@
           "edit": {
             "$ref": "#/components/schemas/WireEdit"
           },
-          "sop": true
+          "sop": {
+            "$ref": "#/components/schemas/Sop"
+          }
         },
         "required": [
           "sop",
@@ -9405,7 +9510,9 @@
         {
           "name": "patch",
           "required": false,
-          "schema": true
+          "schema": {
+            "description": "A present `null` stays `Some(Value::Null)`: the key's presence,\nnot its value, is what asks for a write."
+          }
         }
       ],
       "result": {
@@ -11429,7 +11536,35 @@
     {
       "name": "sops/validate",
       "paramStructure": "by-name",
-      "params": [],
+      "params": [
+        {
+          "name": "name",
+          "required": false,
+          "schema": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "original_name",
+          "required": false,
+          "schema": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "sop",
+          "required": false,
+          "schema": {
+            "$ref": "#/components/schemas/Sop"
+          }
+        }
+      ],
       "result": {
         "name": "result",
         "schema": {
@@ -11443,7 +11578,6 @@
         "verb": "execute"
       },
       "x-zeroclaw-params": {
-        "description": "`SopValidateParams` is not a plain object; its schema is in components.",
         "shape": "typed",
         "type": "SopValidateParams"
       }
@@ -11455,7 +11589,9 @@
         {
           "name": "sop",
           "required": true,
-          "schema": true
+          "schema": {
+            "$ref": "#/components/schemas/Sop"
+          }
         },
         {
           "name": "original_name",
@@ -11492,7 +11628,9 @@
         {
           "name": "sop",
           "required": true,
-          "schema": true
+          "schema": {
+            "$ref": "#/components/schemas/Sop"
+          }
         },
         {
           "name": "original_name",
@@ -11596,7 +11734,9 @@
         {
           "name": "decision",
           "required": true,
-          "schema": true
+          "schema": {
+            "$ref": "#/components/schemas/ApprovalDecision"
+          }
         },
         {
           "name": "name",
@@ -11645,7 +11785,9 @@
         {
           "name": "sop",
           "required": true,
-          "schema": true
+          "schema": {
+            "$ref": "#/components/schemas/Sop"
+          }
         }
       ],
       "result": {
@@ -11674,7 +11816,9 @@
         {
           "name": "sop",
           "required": true,
-          "schema": true
+          "schema": {
+            "$ref": "#/components/schemas/Sop"
+          }
         }
       ],
       "result": {

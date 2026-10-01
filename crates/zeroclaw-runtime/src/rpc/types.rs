@@ -251,6 +251,10 @@ rpc_type! {
     /// error; this type is their declared contract.
     #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
     pub struct SopWireDraftParams {
+        #[cfg_attr(
+            feature = "schema-export",
+            schemars(schema_with = "zeroclaw_api::jsonrpc::sop_document_schema")
+        )]
         pub sop: serde_json::Value,
         pub edit: crate::sop::WireEdit,
     }

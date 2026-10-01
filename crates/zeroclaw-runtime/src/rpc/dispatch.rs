@@ -10148,20 +10148,16 @@ impl RpcDispatcher {
     }
 
     fn handle_sops_validate(&self, params: &Value) -> RpcResult {
-        // Choose the variant by the `sop` key rather than by untagged
-        // deserialization, so a malformed draft reports its own field error.
-        let req = if params.get("sop").is_some() {
-            SopValidateParams::Draft(parse_params(params)?)
+        // A present `sop` key selects the draft form, so a malformed draft
+        // reports its own error instead of falling back to `name`.
+        let sop = if params.get("sop").is_some() {
+            let req: SopSaveRequest = parse_params(params)?;
+            Self::parse_sop(&req.sop)?
         } else {
-            SopValidateParams::Stored(parse_params(params)?)
-        };
-        let sop = match req {
-            SopValidateParams::Draft(draft) => Self::parse_sop(&draft.sop)?,
-            SopValidateParams::Stored(stored) => {
-                let (dir, mode) = self.sops_dir_and_mode();
-                crate::sop::load_sop_by_name(&dir, &stored.name, mode)
-                    .map_err(|e| rpc_err(INVALID_PARAMS, format!("SOP '{}': {e}", stored.name)))?
-            }
+            let req: SopSelectRequest = parse_params(params)?;
+            let (dir, mode) = self.sops_dir_and_mode();
+            crate::sop::load_sop_by_name(&dir, &req.name, mode)
+                .map_err(|e| rpc_err(INVALID_PARAMS, format!("SOP '{}': {e}", req.name)))?
         };
         let v = crate::sop::validate_sop_strict(&sop);
         to_result(SopValidateResult {
@@ -16092,6 +16088,17 @@ mod tests {
         )
         .await;
         assert_eq!(draft["error"]["code"], json!(INVALID_PARAMS), "{draft}");
+        // A present `sop` selects the draft even when a valid `name` is
+        // also sent: the malformed draft is refused, not replaced by `name`.
+        let both = rpc(
+            &mut operator,
+            &mut rx,
+            15,
+            "sops/validate",
+            json!({"sop": 7, "name": "alpha-sop"}),
+        )
+        .await;
+        assert_eq!(both["error"]["code"], json!(INVALID_PARAMS), "{both}");
 
         let options = rpc(
             &mut operator,
