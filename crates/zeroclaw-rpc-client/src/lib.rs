@@ -12,7 +12,9 @@
 //! [`RpcClient::connect_over`] accepts any byte stream, so the same client
 //! serves the gateway's in-process seam today and the separate gateway
 //! process later; [`RpcClient::connect_local`] dials the daemon endpoint
-//! that [`endpoint::resolve_socket_path`] names.
+//! that [`endpoint::resolve_socket_path`] names, and
+//! [`RpcClient::connect_local_endpoints`] also falls back to the older
+//! Windows pipe name that [`endpoint::client_endpoints`] lists.
 
 // Like `apps/zerocode`, this is a standalone RPC client: it must not link
 // `zeroclaw-log`, so it cannot use `::zeroclaw_spawn::spawn!`, and its two

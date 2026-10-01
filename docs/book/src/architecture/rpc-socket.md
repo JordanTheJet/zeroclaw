@@ -15,9 +15,18 @@ same machine do not collide. The data dir is derived from the config dir
 |---|---|
 | Linux | `<data_dir>/daemon.sock` (Unix domain socket) |
 | macOS | `<data_dir>/daemon.sock` (Unix domain socket) |
-| Windows | `\\.\pipe\zeroclaw-<hash>` where `<hash>` is derived from `data_dir` |
+| Windows | `\\.\pipe\zeroclaw-daemon-<hash>`, where `<hash>` is the 64-bit FNV-1a hash of `data_dir` with ASCII letters lower-cased |
 
-Override with the `ZEROCLAW_SOCKET` environment variable on either platform:
+The daemon and every client resolve the endpoint with the same function, so
+they always agree. The Windows hash is a fixed function, so the name is the same
+for every release and toolchain. Releases before it named the pipe
+`\\.\pipe\zeroclaw-<hash>` from Rust's `DefaultHasher`, which is not stable
+across toolchains. For one release, clients also try that older name when
+nothing listens at the new one, so they still reach a daemon an earlier release
+started. The daemon binds only the new name.
+
+Override with the `ZEROCLAW_SOCKET` environment variable on either platform. A
+blank value is ignored, and surrounding whitespace is trimmed:
 
 <div class="os-tabs-src">
 

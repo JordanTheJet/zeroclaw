@@ -341,6 +341,32 @@ impl RpcClient {
         Self::connect_over(stream, options).await
     }
 
+    /// Dial the first of `endpoints` that has a daemon behind it, primary
+    /// first, and complete the handshake. A missing endpoint moves on to the
+    /// next one; any other failure is returned as it is. When every endpoint
+    /// is missing, the primary's error is the one reported.
+    pub async fn connect_local_endpoints(
+        endpoints: &crate::endpoint::ClientEndpoints,
+        options: ConnectOptions,
+    ) -> Result<Self, ClientError> {
+        let mut missing = None;
+        for path in endpoints.iter() {
+            match open_local_stream(path).await {
+                Ok(stream) => return Self::connect_over(stream, options).await,
+                Err(ClientError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                    missing.get_or_insert(ClientError::Io(error));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(missing.unwrap_or_else(|| {
+            ClientError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "no daemon endpoint to dial",
+            ))
+        }))
+    }
+
     /// Run the handshake over an already-open byte stream: a socket, a pipe,
     /// or the daemon's in-process duplex.
     pub async fn connect_over<S>(stream: S, options: ConnectOptions) -> Result<Self, ClientError>
@@ -714,6 +740,95 @@ mod tests {
             }
         });
         seen_rx
+    }
+
+    /// A fresh directory for a test's sockets, removed when dropped.
+    #[cfg(unix)]
+    struct SocketDir(std::path::PathBuf);
+
+    #[cfg(unix)]
+    impl SocketDir {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("zc-rpcc-{}-{name}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("create the socket directory");
+            Self(dir)
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for SocketDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Serve the scripted daemon on a Unix socket at `path`.
+    #[cfg(unix)]
+    fn fake_daemon_at(path: &std::path::Path) {
+        let listener = tokio::net::UnixListener::bind(path).expect("bind the test socket");
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept the client");
+            let (mut client_half, server_half) = tokio::io::duplex(64 * 1024);
+            let _seen = fake_daemon(server_half, None);
+            let _ = tokio::io::copy_bidirectional(&mut stream, &mut client_half).await;
+        });
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_endpoints_fall_through_a_missing_primary() {
+        let dir = SocketDir::new("fallback");
+        let legacy = dir.0.join("legacy.sock");
+        fake_daemon_at(&legacy);
+        let endpoints = crate::endpoint::ClientEndpoints {
+            primary: dir.0.join("primary.sock"),
+            legacy: Some(legacy),
+        };
+        let client = RpcClient::connect_local_endpoints(&endpoints, ConnectOptions::default())
+            .await
+            .expect("the legacy endpoint answers when nothing listens at the primary");
+        assert_eq!(client.handshake().server_version, "test");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_endpoints_do_not_fall_back_past_a_present_primary() {
+        // Something sits at the primary but refuses connections: that is a
+        // daemon problem to surface, not a reason to talk to an older one.
+        let dir = SocketDir::new("present");
+        let primary = dir.0.join("primary.sock");
+        std::fs::write(&primary, b"not a socket").unwrap();
+        let legacy = dir.0.join("legacy.sock");
+        fake_daemon_at(&legacy);
+        let endpoints = crate::endpoint::ClientEndpoints {
+            primary,
+            legacy: Some(legacy),
+        };
+        match RpcClient::connect_local_endpoints(&endpoints, ConnectOptions::default()).await {
+            Err(ClientError::Io(error)) => {
+                assert_ne!(error.kind(), std::io::ErrorKind::NotFound, "{error}");
+            }
+            Err(other) => panic!("expected the primary's I/O error, got {other}"),
+            Ok(_) => panic!("a present primary must not fall back to the legacy endpoint"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_endpoints_report_a_missing_daemon() {
+        let dir = SocketDir::new("missing");
+        let endpoints = crate::endpoint::ClientEndpoints {
+            primary: dir.0.join("primary.sock"),
+            legacy: None,
+        };
+        match RpcClient::connect_local_endpoints(&endpoints, ConnectOptions::default()).await {
+            Err(ClientError::Io(error)) => {
+                assert_eq!(error.kind(), std::io::ErrorKind::NotFound, "{error}");
+            }
+            Err(other) => panic!("expected NotFound, got {other}"),
+            Ok(_) => panic!("nothing listens, so nothing connects"),
+        }
     }
 
     #[tokio::test]

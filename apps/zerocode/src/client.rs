@@ -14,6 +14,7 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{Notify, broadcast, mpsc, oneshot};
+use zeroclaw_api::rpc_endpoint;
 
 use crate::jsonrpc::{self, JsonRpcError, RpcOutbound, field};
 use crate::wire::{ConfigFieldEntry, DoctorRunResult, FsListDirResponse, SectionShape};
@@ -80,6 +81,15 @@ async fn open_local_stream(path: &Path) -> Result<LocalStream> {
         }
     }
     anyhow::bail!("named pipe {name} never became available")
+}
+
+/// Whether `error` means nothing is listening at the endpoint at all, as
+/// opposed to a daemon that refused or failed the connection.
+fn is_missing_endpoint(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
+        .any(|io| io.kind() == std::io::ErrorKind::NotFound)
 }
 
 // ── Wire method names used by the TUI ────────────────────────────
@@ -163,32 +173,12 @@ pub mod method {
 
 // ── Socket path resolution ───────────────────────────────────────
 
-/// Resolve the daemon's local IPC endpoint path.
-/// CLI flag > `$ZEROCLAW_SOCKET` > `<config_dir>/data/daemon.sock` on Unix
-/// or a `\\.\pipe\zeroclaw-<hash>` derived name on Windows.
-pub fn resolve_socket_path(config_dir: &Path) -> Result<PathBuf> {
-    if let Ok(p) = std::env::var("ZEROCLAW_SOCKET") {
-        let p = p.trim();
-        if !p.is_empty() {
-            return Ok(PathBuf::from(p));
-        }
-    }
-    #[cfg(unix)]
-    {
-        Ok(config_dir.join("data").join("daemon.sock"))
-    }
-    #[cfg(windows)]
-    {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-        let data_dir = config_dir.join("data");
-        let mut hasher = DefaultHasher::new();
-        data_dir.hash(&mut hasher);
-        Ok(PathBuf::from(format!(
-            r"\\.\pipe\zeroclaw-{:x}",
-            hasher.finish()
-        )))
-    }
+/// The daemon endpoints to dial for `config_dir`, resolved by the resolver
+/// the daemon itself uses: a non-blank `$ZEROCLAW_SOCKET`, else
+/// `<config_dir>/data/daemon.sock` on Unix or the data directory's stable
+/// pipe name on Windows, with the pre-stable-hash pipe name as a fallback.
+pub fn resolve_socket_endpoints(config_dir: &Path) -> rpc_endpoint::ClientEndpoints {
+    rpc_endpoint::client_endpoints(&config_dir.join("data"))
 }
 
 /// Resolve config dir: CLI flag > `$ZEROCLAW_CONFIG_DIR` > home directory.
@@ -1641,6 +1631,29 @@ pub async fn dial_enrollment_through_relay(relay: &RelayDial) -> Result<Enrollme
 }
 
 impl RpcClient {
+    /// Connect to the first of `endpoints` that has a daemon behind it and
+    /// complete the handshake. The legacy endpoint is tried only when nothing
+    /// is listening at the primary; when neither is, the primary's error is
+    /// the one reported.
+    pub async fn connect_endpoints(
+        endpoints: &rpc_endpoint::ClientEndpoints,
+        prev_tui_id: Option<&str>,
+        prev_tui_sig: Option<&str>,
+    ) -> Result<Self> {
+        match Self::connect(&endpoints.primary, prev_tui_id, prev_tui_sig).await {
+            Err(primary_error) if is_missing_endpoint(&primary_error) => {
+                let Some(legacy) = endpoints.legacy.as_deref() else {
+                    return Err(primary_error);
+                };
+                match Self::connect(legacy, prev_tui_id, prev_tui_sig).await {
+                    Err(legacy_error) if is_missing_endpoint(&legacy_error) => Err(primary_error),
+                    result => result,
+                }
+            }
+            result => result,
+        }
+    }
+
     /// Connect to the daemon's local IPC endpoint and complete the
     /// `initialize` handshake.
     ///
@@ -3162,6 +3175,37 @@ pub struct ConfigListResult {
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct ConfigSetResult {}
+
+#[cfg(test)]
+mod endpoint_tests {
+    use super::*;
+
+    #[test]
+    fn resolves_the_shared_endpoints_for_the_config_dirs_data_dir() {
+        for dir in rpc_endpoint::AGREEMENT_DATA_DIRS {
+            let config_dir = Path::new(dir);
+            let data_dir = config_dir.join("data");
+            let endpoints = resolve_socket_endpoints(config_dir);
+            assert_eq!(
+                endpoints,
+                rpc_endpoint::client_endpoints(&data_dir),
+                "{dir}"
+            );
+            assert_eq!(endpoints.primary, rpc_endpoint::resolve_endpoint(&data_dir));
+        }
+    }
+
+    #[test]
+    fn a_missing_endpoint_is_told_apart_from_a_refused_one() {
+        let missing = anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::NotFound))
+            .context("connecting to the daemon");
+        assert!(is_missing_endpoint(&missing));
+        let refused =
+            anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::ConnectionRefused))
+                .context("connecting to the daemon");
+        assert!(!is_missing_endpoint(&refused));
+    }
+}
 
 #[cfg(test)]
 mod initialize_version_tests {
