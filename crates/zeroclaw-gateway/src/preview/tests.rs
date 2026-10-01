@@ -120,6 +120,9 @@ const SERVED: &[&str] = &[
     "/api/cost",
     "/api/events/history",
     "/api/sessions",
+    "/api/sessions/{id}/messages",
+    "/api/sessions/{id}/state",
+    "/api/sessions/{id}",
 ];
 
 /// Route paths the in-process gateway registers with a string literal, from
@@ -314,6 +317,14 @@ mod against_a_core {
         }
 
         fn context(dir: &Path) -> Arc<zeroclaw_runtime::rpc::context::RpcContext> {
+            Self::context_with(dir, |_| {})
+        }
+
+        /// [`Self::context`] with `adjust` applied to the core's config.
+        fn context_with(
+            dir: &Path,
+            adjust: impl FnOnce(&mut zeroclaw_config::schema::Config),
+        ) -> Arc<zeroclaw_runtime::rpc::context::RpcContext> {
             assert!(
                 std::env::var_os("ZEROCLAW_SOCKET").is_none(),
                 "ZEROCLAW_SOCKET must be unset for these tests"
@@ -324,6 +335,7 @@ mod against_a_core {
                 ..Default::default()
             };
             config.gateway.paired_tokens = vec![TOKEN.into()];
+            adjust(&mut config);
             let sessions = Arc::new(zeroclaw_runtime::rpc::session::SessionStore::new(
                 16,
                 Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
@@ -521,8 +533,19 @@ mod against_a_core {
         assert_eq!(refused["code"], "capability_missing");
         assert_eq!(refused["route"], "GET /api/cron");
         assert_eq!(refused["deferred"], false);
-        let (_, body) = get(&router, "/api/sessions/abc/state", Some(TOKEN)).await;
-        assert_eq!(json_of(&body)["route"], "GET /api/sessions/{id}/state");
+        // A path the preview serves for some methods still refuses the rest.
+        for (method, path, route) in [
+            ("PUT", "/api/sessions/abc", "PUT /api/sessions/{id}"),
+            (
+                "POST",
+                "/api/sessions/abc/messages",
+                "POST /api/sessions/{id}/messages",
+            ),
+        ] {
+            let (status, body) = send(&router, method, path, Some(TOKEN)).await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{path}: {body}");
+            assert_eq!(json_of(&body)["route"], route);
+        }
 
         // A deferred route carries no bearer by nature and is refused as is.
         for (method, path, route) in [
@@ -750,6 +773,479 @@ mod against_a_core {
         assert_eq!(json_of(&body)["events"][0]["type"], "agent_start", "{body}");
 
         drop(terminal);
+        core.stop().await;
+    }
+
+    // ── Per-session routes ───────────────────────────────────────
+
+    /// The in-process gateway's answer to one per-session request.
+    async fn in_process_session(
+        state: &crate::AppState,
+        method: &str,
+        path: &str,
+    ) -> (StatusCode, String) {
+        use crate::api::{
+            handle_api_session_delete, handle_api_session_messages, handle_api_session_state,
+        };
+        use axum::extract::Path as UrlPath;
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {TOKEN}").parse().unwrap(),
+        );
+        let rest = path.strip_prefix("/api/sessions/").expect("a session path");
+        let state = State(state.clone());
+        let response = match (method, rest.split_once('/')) {
+            ("GET", Some((id, "messages"))) => {
+                handle_api_session_messages(state, headers, UrlPath(id.to_owned()))
+                    .await
+                    .into_response()
+            }
+            ("GET", Some((id, "state"))) => {
+                handle_api_session_state(state, headers, UrlPath(id.to_owned()))
+                    .await
+                    .into_response()
+            }
+            ("DELETE", None) => handle_api_session_delete(state, headers, UrlPath(rest.to_owned()))
+                .await
+                .into_response(),
+            other => panic!("no in-process handler for {method} {path}: {other:?}"),
+        };
+        let status = response.status();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    /// The preview and the in-process gateway answer `method path` alike:
+    /// the same status, the same body on success, the same error otherwise.
+    async fn assert_same_answer(
+        preview: &Router,
+        state: &crate::AppState,
+        method: &str,
+        path: &str,
+    ) -> serde_json::Value {
+        let (status, served) = send(preview, method, path, Some(TOKEN)).await;
+        let (in_process_status, in_process) = in_process_session(state, method, path).await;
+        assert_eq!(
+            status, in_process_status,
+            "{method} {path}: the preview answered {served}, the in-process gateway {in_process}"
+        );
+        let (served, in_process) = (json_of(&served), json_of(&in_process));
+        if status.is_success() {
+            assert_eq!(served, in_process, "{method} {path}");
+        } else {
+            assert_eq!(served["error"], in_process["error"], "{method} {path}");
+        }
+        served
+    }
+
+    /// A core and the in-process gateway over one store, and a preview
+    /// gateway attached to that core.
+    async fn sessions_fixture(
+        dir: &Path,
+        adjust: impl FnOnce(&mut zeroclaw_config::schema::Config),
+    ) -> (
+        Core,
+        Router,
+        crate::AppState,
+        Arc<dyn zeroclaw_infra::session_backend::SessionBackend>,
+    ) {
+        let mut ctx = Core::context_with(dir, adjust);
+        let config = ctx.config.read().clone();
+        let backend = zeroclaw_infra::make_session_backend(
+            &config.data_dir,
+            &config.channels.session_backend,
+        )
+        .expect("open the session store");
+        Arc::get_mut(&mut ctx)
+            .expect("a fresh context has one owner")
+            .session_backend = Some(Arc::clone(&backend));
+        let core = Core::serve(ctx).await;
+        let preview = router(
+            CoreRpc::local(core.endpoint.clone(), EndpointOwner::SameAccount),
+            core.endpoint.clone(),
+            None,
+        );
+        let state =
+            crate::api::tests::test_state_with_session_backend(config, Arc::clone(&backend));
+        (core, preview, state, backend)
+    }
+
+    fn append(
+        backend: &Arc<dyn zeroclaw_infra::session_backend::SessionBackend>,
+        key: &str,
+        contents: &[&str],
+    ) {
+        for content in contents {
+            backend
+                .append(key, &zeroclaw_providers::ChatMessage::user(*content))
+                .unwrap();
+        }
+    }
+
+    fn transcript(body: &serde_json::Value) -> Vec<String> {
+        body["messages"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no messages: {body}"))
+            .iter()
+            .map(|row| row["content"].as_str().expect("content").to_owned())
+            .collect()
+    }
+
+    /// Messages, state and delete answer through the preview exactly as the
+    /// in-process gateway answers for the same store, and act on the row the
+    /// in-process gateway selects even where the core's own id resolution
+    /// would pick another.
+    #[tokio::test]
+    async fn the_session_routes_answer_as_the_in_process_gateway_does() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (core, preview, state, backend) = sessions_fixture(tmp.path(), |_| {}).await;
+        append(
+            &backend,
+            "gw_alpha",
+            &["gateway question", "gateway answer"],
+        );
+        backend
+            .set_session_state("gw_alpha", "running", Some("turn-7"))
+            .unwrap();
+        // The core resolves a plain id `alpha` as `rpc_alpha` first, and the
+        // gateway key `gw_alpha` as `rpc_gw_alpha` first.
+        append(&backend, "rpc_alpha", &["rpc conversation"]);
+        append(
+            &backend,
+            "rpc_gw_alpha",
+            &["rpc conversation under the gateway's key"],
+        );
+        // A dotted id lives under its sanitized key.
+        append(&backend, "gw_team_alpha", &["dotted"]);
+
+        for path in [
+            "/api/sessions/alpha/messages",
+            "/api/sessions/alpha/state",
+            "/api/sessions/team.alpha/messages",
+        ] {
+            let (status, body) = get(&preview, path, None).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{path}: {body}");
+        }
+        let (status, _) = send(&preview, "DELETE", "/api/sessions/alpha", None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        for id in [
+            "alpha",
+            "gw_alpha",
+            "team.alpha",
+            "gw_team_alpha",
+            "missing",
+        ] {
+            assert_same_answer(
+                &preview,
+                &state,
+                "GET",
+                &format!("/api/sessions/{id}/messages"),
+            )
+            .await;
+            assert_same_answer(
+                &preview,
+                &state,
+                "GET",
+                &format!("/api/sessions/{id}/state"),
+            )
+            .await;
+        }
+        let messages =
+            assert_same_answer(&preview, &state, "GET", "/api/sessions/alpha/messages").await;
+        assert_eq!(
+            transcript(&messages),
+            ["gateway question", "gateway answer"]
+        );
+        assert!(
+            messages["messages"][0]["created_at"].is_string(),
+            "{messages}"
+        );
+        let state_body =
+            assert_same_answer(&preview, &state, "GET", "/api/sessions/gw_alpha/state").await;
+        assert_eq!(state_body["state"], "running");
+        assert_eq!(state_body["turn_id"], "turn-7");
+        let dotted =
+            assert_same_answer(&preview, &state, "GET", "/api/sessions/team.alpha/messages").await;
+        assert_eq!(transcript(&dotted), ["dotted"]);
+        let (status, _) = get(&preview, "/api/sessions/missing/state", Some(TOKEN)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // Delete through the preview, then the same state again for the
+        // in-process gateway: the same answer and the same row removed.
+        let (status, served) = send(&preview, "DELETE", "/api/sessions/alpha", Some(TOKEN)).await;
+        assert_eq!(status, StatusCode::OK, "{served}");
+        assert!(!backend.session_exists("gw_alpha"));
+        append(&backend, "gw_alpha", &["gateway question"]);
+        let (status, in_process) =
+            in_process_session(&state, "DELETE", "/api/sessions/alpha").await;
+        assert_eq!(status, StatusCode::OK, "{in_process}");
+        assert_eq!(json_of(&served), json_of(&in_process));
+        assert!(!backend.session_exists("gw_alpha"));
+        for kept in ["rpc_alpha", "rpc_gw_alpha", "gw_team_alpha"] {
+            assert!(backend.session_exists(kept), "{kept} was not the row named");
+        }
+        // Nothing left under that id: both say so.
+        assert_same_answer(&preview, &state, "DELETE", "/api/sessions/alpha").await;
+        let (status, _) = send(&preview, "DELETE", "/api/sessions/alpha", Some(TOKEN)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let (status, body) =
+            send(&preview, "DELETE", "/api/sessions/team.alpha", Some(TOKEN)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(!backend.session_exists("gw_team_alpha"));
+        assert!(backend.session_exists("rpc_alpha"));
+        core.stop().await;
+    }
+
+    /// A bearer revoked after the preview pooled a connection for it is
+    /// refused by the core at the operation itself: the delete removes
+    /// nothing and the transcript is no longer served.
+    #[tokio::test]
+    async fn a_revoked_bearer_with_a_pooled_connection_deletes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (core, preview, _, backend) = sessions_fixture(tmp.path(), |_| {}).await;
+        append(&backend, "gw_alpha", &["kept"]);
+        let (status, body) = get(&preview, "/api/sessions/alpha/messages", Some(TOKEN)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        assert!(core.ctx.auth.pairing().revoke_token(TOKEN));
+        let (status, body) = send(&preview, "DELETE", "/api/sessions/alpha", Some(TOKEN)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+        assert_eq!(json_of(&body)["code"], "auth_required");
+        assert!(
+            backend.session_exists("gw_alpha"),
+            "a refused caller deletes nothing"
+        );
+        for path in ["/api/sessions/alpha/messages", "/api/sessions/alpha/state"] {
+            let (status, body) = get(&preview, path, Some(TOKEN)).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{path}: {body}");
+        }
+        core.stop().await;
+    }
+
+    /// A transcript larger than one RPC frame is served whole, as the
+    /// in-process gateway serves it; one message no frame can carry is named.
+    #[tokio::test]
+    async fn a_transcript_larger_than_an_rpc_frame_is_served_whole() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (core, preview, state, backend) = sessions_fixture(tmp.path(), |_| {}).await;
+        let chunk = "x".repeat(60 * 1024);
+        let contents: Vec<String> = (0..150).map(|i| format!("{i:03}{chunk}")).collect();
+        for content in &contents {
+            backend
+                .append(
+                    "gw_big",
+                    &zeroclaw_providers::ChatMessage::user(content.as_str()),
+                )
+                .unwrap();
+        }
+        let body = assert_same_answer(&preview, &state, "GET", "/api/sessions/big/messages").await;
+        assert_eq!(transcript(&body), contents);
+
+        backend
+            .append(
+                "gw_huge",
+                &zeroclaw_providers::ChatMessage::user("y".repeat(7 * 1024 * 1024 + 1)),
+            )
+            .unwrap();
+        let (status, body) = get(&preview, "/api/sessions/huge/messages", Some(TOKEN)).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_GATEWAY,
+            "{}",
+            &body[..body.len().min(300)]
+        );
+        assert_eq!(json_of(&body)["code"], "message_too_large");
+        core.stop().await;
+    }
+
+    /// An identity provider that introspects `<user>-token` as `<user>`, in
+    /// the group the fixture maps to session read and delete grants.
+    async fn session_users_idp(users: &[&str]) -> wiremock::MockServer {
+        use wiremock::matchers::{body_string_contains, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        // Owned, not pooled: the issuer's port stays this test's.
+        let server = MockServer::builder().start().await;
+        let issuer = server.uri();
+        Mock::given(method("GET"))
+            .and(path("/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "issuer": issuer,
+                "introspection_endpoint": format!("{issuer}/introspect"),
+            })))
+            .mount(&server)
+            .await;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        for user in users {
+            Mock::given(method("POST"))
+                .and(path("/introspect"))
+                .and(body_string_contains(format!("token={user}-token")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "active": true,
+                    "token_type": "Bearer",
+                    "client_id": "gw",
+                    "iss": issuer,
+                    "sub": user,
+                    "aud": "zeroclaw",
+                    "exp": now + 600,
+                    "groups": ["sessions"],
+                })))
+                .mount(&server)
+                .await;
+        }
+        server
+    }
+
+    fn scoped_session_users(issuer: String) -> impl FnOnce(&mut zeroclaw_config::schema::Config) {
+        use std::collections::HashMap;
+        use zeroclaw_api::grants::{Resource, Verb};
+        use zeroclaw_config::schema::{OidcConfig, OidcValidation, PermissionProfileConfig};
+        move |config| {
+            config.oidc.insert(
+                "test".into(),
+                OidcConfig {
+                    issuer,
+                    audience: "zeroclaw".into(),
+                    client_id: "gw".into(),
+                    client_secret: Some("s3cret".into()),
+                    validation: OidcValidation::Introspection,
+                    claim_path: "groups".into(),
+                    profile_map: HashMap::from([(
+                        "sessions".to_string(),
+                        "session-user".to_string(),
+                    )]),
+                    interactive_clients: vec!["gw".into()],
+                    ..OidcConfig::default()
+                },
+            );
+            config.permission_profiles.insert(
+                "session-user".into(),
+                PermissionProfileConfig {
+                    // System:Read is what the core-link check asks for.
+                    grants: HashMap::from([
+                        (Resource::Sessions, vec![Verb::Read, Verb::Delete]),
+                        (Resource::System, vec![Verb::Read]),
+                    ]),
+                    ..PermissionProfileConfig::default()
+                },
+            );
+        }
+    }
+
+    /// `method path` as an OIDC user of the fixture's provider.
+    async fn send_as(
+        router: &Router,
+        method: &str,
+        path: &str,
+        user: &str,
+    ) -> (StatusCode, serde_json::Value) {
+        let request = Request::builder()
+            .method(method)
+            .uri(path)
+            .header("authorization", format!("Bearer {user}-token"))
+            .header(crate::principal_gate::AUTH_PROVIDER_HEADER, "oidc.test")
+            .body(Body::empty())
+            .unwrap();
+        let response = router.clone().oneshot(request).await.unwrap();
+        let status = response.status();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        (status, json_of(&String::from_utf8_lossy(&body)))
+    }
+
+    /// A scoped principal can neither read, inspect nor delete another
+    /// principal's session through the preview, cannot tell it from a
+    /// session that does not exist, and is never handed someone else's row
+    /// in place of its own.
+    #[tokio::test]
+    async fn another_principals_session_is_refused_and_left_in_place() {
+        let tmp = tempfile::tempdir().unwrap();
+        let idp = session_users_idp(&["alice", "bob"]).await;
+        let (core, preview, _, backend) =
+            sessions_fixture(tmp.path(), scoped_session_users(idp.uri())).await;
+        let mut principal = std::collections::HashMap::new();
+        for user in ["alice", "bob"] {
+            let (status, link) = send_as(&preview, "GET", CORE_LINK_PATH, user).await;
+            assert_eq!(status, StatusCode::OK, "{user}: {link}");
+            let id = link["principal_id"]
+                .as_str()
+                .expect("a principal")
+                .to_owned();
+            assert_ne!(id, "shared-operator", "{user} is a scoped principal");
+            principal.insert(user, id);
+        }
+        append(&backend, "gw_bob_notes", &["bob's secret"]);
+        backend
+            .set_session_principal("gw_bob_notes", &principal["bob"])
+            .unwrap();
+        append(&backend, "gw_alice_notes", &["alice's notes"]);
+        backend
+            .set_session_principal("gw_alice_notes", &principal["alice"])
+            .unwrap();
+
+        // The owner reads it: the grants are not what refuses alice below.
+        let (status, body) =
+            send_as(&preview, "GET", "/api/sessions/bob_notes/messages", "bob").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(transcript(&body), ["bob's secret"]);
+
+        let (_, nothing) = send_as(&preview, "GET", "/api/sessions/nobody/messages", "alice").await;
+        for (method, path) in [
+            ("GET", "/api/sessions/bob_notes/messages"),
+            ("GET", "/api/sessions/gw_bob_notes/messages"),
+            ("GET", "/api/sessions/bob_notes/state"),
+            ("DELETE", "/api/sessions/bob_notes"),
+            ("DELETE", "/api/sessions/gw_bob_notes"),
+        ] {
+            let (status, body) = send_as(&preview, method, path, "alice").await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{method} {path}: {body}");
+            assert_eq!(body["code"], "forbidden", "{method} {path}");
+            assert_eq!(
+                body["error"], nothing["error"],
+                "{method} {path}: another's session looks like no session"
+            );
+            assert!(!body.to_string().contains("secret"), "{body}");
+        }
+        assert!(
+            backend.session_exists("gw_bob_notes"),
+            "bob's row is untouched"
+        );
+        assert_eq!(backend.load("gw_bob_notes").len(), 1);
+
+        // Where both a raw key and a gateway key match the path, each
+        // principal is served its own row, never the other's.
+        append(&backend, "shared", &["bob's raw-key row"]);
+        backend
+            .set_session_principal("shared", &principal["bob"])
+            .unwrap();
+        append(&backend, "gw_shared", &["alice's gateway row"]);
+        backend
+            .set_session_principal("gw_shared", &principal["alice"])
+            .unwrap();
+        let (status, body) =
+            send_as(&preview, "GET", "/api/sessions/shared/messages", "alice").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(transcript(&body), ["alice's gateway row"]);
+        let (status, body) = send_as(&preview, "GET", "/api/sessions/shared/messages", "bob").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(transcript(&body), ["bob's raw-key row"]);
+        let (status, body) = send_as(&preview, "DELETE", "/api/sessions/shared", "alice").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(!backend.session_exists("gw_shared"));
+        assert!(
+            backend.session_exists("shared"),
+            "bob's row survives alice's delete"
+        );
+
+        // Her own session she may delete.
+        let (status, body) =
+            send_as(&preview, "DELETE", "/api/sessions/alice_notes", "alice").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(!backend.session_exists("gw_alice_notes"));
         core.stop().await;
     }
 

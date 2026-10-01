@@ -24,10 +24,10 @@ use std::sync::Arc;
 
 use axum::Json;
 use axum::Router;
-use axum::extract::{Query, State};
+use axum::extract::{Path as UrlPath, Query, State};
 use axum::http::{Method as HttpMethod, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{MethodFilter, MethodRouter, get, on};
+use axum::routing::{MethodFilter, MethodRouter, delete, get, on};
 use serde_json::json;
 use zeroclaw_rpc_client::{
     ClientError, EndpointOwner, EndpointRejection, Method, RPC_PROTOCOL_VERSION, RpcClient,
@@ -329,13 +329,8 @@ const REFUSED: &[(&str, &str, Refusal)] = &[
     ("/api/version/upgrade", "POST", Refusal::NotPorted),
     ("/api/version/upgrade/status", "GET", Refusal::NotPorted),
     ("/api/sessions/running", "GET", Refusal::NotPorted),
-    ("/api/sessions/{id}", "DELETE,PUT", Refusal::NotPorted),
-    (
-        "/api/sessions/{id}/messages",
-        "GET,POST",
-        Refusal::NotPorted,
-    ),
-    ("/api/sessions/{id}/state", "GET", Refusal::NotPorted),
+    ("/api/sessions/{id}", "PUT", Refusal::NotPorted),
+    ("/api/sessions/{id}/messages", "POST", Refusal::NotPorted),
     ("/api/sessions/{id}/abort", "POST", Refusal::NotPorted),
     ("/ws/chat", "GET", Refusal::NotPorted),
     ("/ws/sops/runs", "GET", Refusal::NotPorted),
@@ -542,7 +537,10 @@ pub fn router(core: CoreRpc, endpoint: PathBuf, web_dist: Option<PathBuf>) -> Ro
         .route("/api/tuis", get(api_tuis))
         .route("/api/cost", get(api_cost))
         .route("/api/events/history", get(api_events_history))
-        .route("/api/sessions", get(api_sessions_list));
+        .route("/api/sessions", get(api_sessions_list))
+        .route("/api/sessions/{id}/messages", get(api_session_messages))
+        .route("/api/sessions/{id}/state", get(api_session_state))
+        .route("/api/sessions/{id}", delete(api_session_delete));
     for &(path, methods, refusal) in REFUSED {
         let handler: MethodRouter<PreviewState> = on(
             method_filter(methods),
@@ -805,6 +803,40 @@ async fn api_events_history(access: Result<CoreAccess, CoreError>) -> Response {
 async fn api_sessions_list(access: Result<CoreAccess, CoreError>) -> Response {
     served(access, |call| async move {
         crate::api::api_sessions_list_through_core(&call).await
+    })
+    .await
+}
+
+/// `GET /api/sessions/{id}/messages`
+async fn api_session_messages(
+    UrlPath(id): UrlPath<String>,
+    access: Result<CoreAccess, CoreError>,
+) -> Response {
+    served(access, |call| async move {
+        crate::api::api_session_messages_through_core(&call, &id).await
+    })
+    .await
+}
+
+/// `GET /api/sessions/{id}/state`
+async fn api_session_state(
+    UrlPath(id): UrlPath<String>,
+    access: Result<CoreAccess, CoreError>,
+) -> Response {
+    served(access, |call| async move {
+        crate::api::api_session_state_through_core(&call, &id).await
+    })
+    .await
+}
+
+/// `DELETE /api/sessions/{id}`. The core deletes the row; this gateway runs
+/// no chat turns, so there is no turn of its own to settle first.
+async fn api_session_delete(
+    UrlPath(id): UrlPath<String>,
+    access: Result<CoreAccess, CoreError>,
+) -> Response {
+    served(access, |call| async move {
+        crate::api::api_session_delete_through_core(&call, &id).await
     })
     .await
 }

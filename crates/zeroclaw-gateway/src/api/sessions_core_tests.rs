@@ -5,11 +5,16 @@
 //! in-process connector over one session store, opened twice as in
 //! production: once by the core, once by the gateway.
 //!
-//! The routes that address one session stay in-process. The rest of this
-//! module pins why, one test per hazard a core-backed version had: a revoked
-//! bearer cancelling a turn, the core acting on a competing row, a delete
-//! returning while the gateway's own turn still runs, and a transcript too
-//! large for one RPC frame.
+//! In the in-process gateway, the routes that address one session keep their
+//! in-process bodies, because that gateway runs chat turns a delete must
+//! settle first. One test per hazard a core-backed version had pins them: a
+//! revoked bearer cancelling a turn, the core acting on a competing row, a
+//! delete returning while the gateway's own turn still runs, and a transcript
+//! too large for one RPC frame.
+//!
+//! The separate zeroclaw-gw, which runs no turns, serves those routes through
+//! the core by exact stored key. The last section pins how it reads a
+//! transcript across pages; the preview's tests hold its parity.
 
 use super::tests::{response_json, test_state, test_state_with_session_backend};
 use super::*;
@@ -406,11 +411,16 @@ async fn a_transcript_larger_than_an_rpc_frame_is_served_whole() {
     assert_eq!(body["messages"].as_array().unwrap().len(), 150);
 }
 
-// ── A scripted core: was it asked at all ─────────────────────────
+// ── A scripted core: what it was asked, and what it answers ──────
 
 #[derive(Default)]
 struct ScriptedCore {
     methods: Mutex<Vec<String>>,
+    /// The params of each call after `initialize`, in order.
+    params: Mutex<Vec<Value>>,
+    /// What each call after `initialize` answers, in order: an object with a
+    /// `result` or an `error`. A call with no answer left is refused.
+    answers: Mutex<std::collections::VecDeque<Value>>,
 }
 
 struct Scripted(Arc<ScriptedCore>);
@@ -440,7 +450,21 @@ async fn serve_scripted(core: Arc<ScriptedCore>, stream: DuplexStream) {
             }})
         } else {
             core.methods.lock().expect("methods lock").push(method);
-            json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32601, "message": "unscripted"}})
+            core.params
+                .lock()
+                .expect("params lock")
+                .push(frame["params"].clone());
+            match core.answers.lock().expect("answers lock").pop_front() {
+                Some(Value::Object(mut scripted)) => {
+                    scripted.insert("jsonrpc".into(), json!("2.0"));
+                    scripted.insert("id".into(), id);
+                    Value::Object(scripted)
+                }
+                _ => json!({
+                    "jsonrpc": "2.0", "id": id,
+                    "error": {"code": -32601, "message": "unscripted"},
+                }),
+            }
         };
         if write
             .write_all(format!("{answer}\n").as_bytes())
@@ -479,4 +503,142 @@ async fn with_gateway_persistence_off_the_core_is_not_asked() {
         scripted.methods.lock().unwrap().is_empty(),
         "no session method reached the core"
     );
+}
+
+// ── zeroclaw-gw's transcript read: pages, oldest first ───────────
+
+/// A `session/messages` page of `total` entries starting at `start`.
+fn transcript_page(total: usize, start: usize, contents: &[&str]) -> Value {
+    let messages: Vec<Value> = contents
+        .iter()
+        .map(|content| json!({"role": "user", "content": content, "kind": "message"}))
+        .collect();
+    json!({"result": {
+        "session_id": "alpha", "messages": messages, "total": total, "start": start,
+    }})
+}
+
+/// `GET /api/sessions/alpha/messages` as zeroclaw-gw reads it from a core
+/// that gives `answers`.
+async fn read_scripted(answers: Vec<Value>) -> (Arc<ScriptedCore>, (StatusCode, Value)) {
+    let scripted = Arc::new(ScriptedCore::default());
+    scripted.answers.lock().unwrap().extend(answers);
+    let core = CoreRpc::over_dialer(Scripted(Arc::clone(&scripted)));
+    let CoreAccess::Core(call) = through(&core, OPERATOR_TOKEN).await else {
+        unreachable!("through() asserts a core connection")
+    };
+    let response = match api_session_messages_through_core(&call, "alpha").await {
+        Ok(response) => response,
+        Err(error) => error.into_response(),
+    };
+    (scripted, answer(response).await)
+}
+
+fn contents(body: &Value) -> Vec<&str> {
+    body["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .map(|row| row["content"].as_str().expect("content"))
+        .collect()
+}
+
+#[tokio::test]
+async fn a_paged_transcript_is_asked_for_by_exact_key_and_served_oldest_first() {
+    let (scripted, (status, body)) = read_scripted(vec![
+        transcript_page(5, 3, &["d", "e"]),
+        transcript_page(5, 1, &["b", "c"]),
+        transcript_page(5, 0, &["a"]),
+    ])
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(contents(&body), ["a", "b", "c", "d", "e"]);
+    assert_eq!(body["session_id"], "alpha");
+    assert_eq!(body["session_persistence"], true);
+    assert_eq!(
+        body["messages"][0],
+        json!({"role": "user", "content": "a", "created_at": null})
+    );
+
+    let params = scripted.params.lock().unwrap().clone();
+    let before: Vec<Value> = params.iter().map(|p| p["before_index"].clone()).collect();
+    assert_eq!(before, [Value::Null, json!(3), json!(1)]);
+    for sent in &params {
+        assert_eq!(sent["session_id"], "alpha");
+        assert_eq!(sent["session_keys"], json!(["alpha", "gw_alpha"]));
+        assert_eq!(sent["max_bytes"], json!(CORE_MESSAGE_PAGE_BYTES));
+        assert!(
+            sent.get("cursor").is_none(),
+            "never ACP cursor mode: {sent}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_transcript_rewritten_between_pages_is_read_again_from_the_newest() {
+    let (scripted, (status, body)) = read_scripted(vec![
+        transcript_page(5, 3, &["d", "e"]),
+        // Compacted underneath the walk: fewer entries than the first page saw.
+        transcript_page(2, 0, &["summary"]),
+        transcript_page(2, 0, &["summary", "f"]),
+    ])
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(contents(&body), ["summary", "f"]);
+    assert_eq!(scripted.params.lock().unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn a_transcript_that_keeps_changing_is_a_conflict_not_a_mix() {
+    let mut answers = Vec::new();
+    for _ in 0..CORE_MESSAGE_READ_ATTEMPTS {
+        answers.push(transcript_page(5, 3, &["d", "e"]));
+        answers.push(transcript_page(2, 0, &["summary"]));
+    }
+    let (scripted, (status, body)) = read_scripted(answers).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "conflict");
+    assert_eq!(
+        scripted.params.lock().unwrap().len(),
+        2 * CORE_MESSAGE_READ_ATTEMPTS
+    );
+}
+
+#[tokio::test]
+async fn a_core_page_that_makes_no_progress_is_not_asked_again() {
+    let (scripted, (status, body)) = read_scripted(vec![
+        transcript_page(5, 3, &["d", "e"]),
+        transcript_page(5, 3, &["d", "e"]),
+    ])
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    assert_eq!(body["code"], "core_error");
+    assert_eq!(scripted.params.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn a_message_no_page_can_carry_is_named_as_a_bad_gateway() {
+    let (_, (status, body)) = read_scripted(vec![json!({"error": {
+        "code": zeroclaw_api::jsonrpc::error_codes::INVALID_PARAMS,
+        "message": "message 4 is 9000000 bytes, more than max_bytes",
+        "data": {"reason": "entry_exceeds_max_bytes", "index": 4, "bytes": 9_000_000},
+    }})])
+    .await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    assert_eq!(body["code"], "message_too_large");
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|error| error.starts_with("message 4 is 9000000 bytes")),
+        "{body}"
+    );
+
+    // Any other invalid-params refusal is the core's, passed on as such.
+    let (_, (status, body)) = read_scripted(vec![json!({"error": {
+        "code": zeroclaw_api::jsonrpc::error_codes::INVALID_PARAMS,
+        "message": "session_keys must list 1 to 4 non-empty keys",
+    }})])
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["code"], "invalid_params");
 }

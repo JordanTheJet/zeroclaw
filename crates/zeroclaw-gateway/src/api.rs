@@ -15,7 +15,10 @@ use zeroclaw_api::jsonrpc::error_codes::INTERNAL_ERROR;
 use zeroclaw_config::schema::{ChannelAliasInfo, Config};
 use zeroclaw_memory::MemoryEntry;
 use zeroclaw_rpc_client::Method;
-use zeroclaw_rpc_proto::types::{CLIENT_KIND_GATEWAY, SessionEntry, SessionListResult};
+use zeroclaw_rpc_proto::types::{
+    CLIENT_KIND_GATEWAY, MessageEntry, SessionDeleteResult, SessionEntry, SessionListResult,
+    SessionMessagesParams, SessionMessagesResult, SessionStateResult, SessionTargetParams,
+};
 
 use crate::core_rpc::{CoreCall, CoreError};
 
@@ -1959,18 +1962,30 @@ fn session_list_row(entry: SessionEntry) -> serde_json::Value {
 /// 3. the canonical sanitized gateway key
 /// 4. namespace fallback: keep a `gw_`-prefixed id as-is; otherwise use the
 ///    canonical sanitized gateway key
+///
+/// The candidates, in that order, are [`gateway_session_key_candidates`].
 fn resolve_gateway_session_key(id: &str, exists: impl Fn(&str) -> bool) -> String {
-    if exists(id) {
-        return id.to_string();
+    let mut keys = gateway_session_key_candidates(id);
+    match keys.iter().position(|key| exists(key)) {
+        Some(found) => keys.swap_remove(found),
+        None => keys.pop().unwrap_or_else(|| id.to_string()),
     }
-    if !id.starts_with("gw_") {
-        let legacy_key = format!("{GW_SESSION_PREFIX}{id}");
-        if exists(&legacy_key) {
-            return legacy_key;
-        }
-        return gateway_session_key(id);
+}
+
+/// The persisted keys a path `{id}` may name, in the order
+/// [`resolve_gateway_session_key`] tries them: the first that exists is the
+/// session, and the last is the key used when none does. Sent to the core as
+/// `session_keys`, so the core acts on the row this gateway would.
+pub(crate) fn gateway_session_key_candidates(id: &str) -> Vec<String> {
+    if id.starts_with(GW_SESSION_PREFIX) {
+        return vec![id.to_string()];
     }
-    id.to_string()
+    let mut keys = vec![id.to_string(), format!("{GW_SESSION_PREFIX}{id}")];
+    let canonical = gateway_session_key(id);
+    if !keys.contains(&canonical) {
+        keys.push(canonical);
+    }
+    keys
 }
 
 /// Resolve an API session id to a live process-local cancellation key.
@@ -2020,20 +2035,230 @@ pub async fn handle_api_session_messages(
     let messages: Vec<serde_json::Value> = msgs
         .into_iter()
         .map(|m| {
-            serde_json::json!({
-                "role": m.message.role,
-                "content": m.message.content,
-                "created_at": m.created_at.map(|dt| dt.to_rfc3339()),
-            })
+            session_message_row(
+                m.message.role,
+                m.message.content,
+                m.created_at.map(|dt| dt.to_rfc3339()),
+            )
         })
         .collect();
 
+    session_messages_response(&id, messages)
+}
+
+/// The body of `GET /api/sessions/{id}/messages`, whichever path read it.
+fn session_messages_response(id: &str, messages: Vec<serde_json::Value>) -> Response {
     Json(serde_json::json!({
         "session_id": id,
         "messages": messages,
         "session_persistence": true,
     }))
     .into_response()
+}
+
+/// One transcript row of `GET /api/sessions/{id}/messages`.
+fn session_message_row(
+    role: String,
+    content: String,
+    created_at: Option<String>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "role": role,
+        "content": content,
+        "created_at": created_at,
+    })
+}
+
+/// The most transcript bytes the gateway asks the core for in one
+/// `session/messages` call. It leaves room under the RPC client's 8 MiB frame
+/// for the envelope and the echoed session id.
+const CORE_MESSAGE_PAGE_BYTES: usize = 7 * 1024 * 1024;
+
+/// How many times a transcript read starts over after the core reports it
+/// changed between pages, before the gateway gives up with a conflict.
+const CORE_MESSAGE_READ_ATTEMPTS: usize = 3;
+
+/// Why a paged transcript read through the core did not complete.
+#[derive(Debug)]
+enum TranscriptReadError {
+    Core(CoreError),
+    /// One stored message is larger than a page can carry.
+    MessageTooLarge {
+        index: u64,
+        bytes: u64,
+    },
+    /// The transcript kept shrinking between pages.
+    Changed,
+}
+
+/// Read a whole transcript newest page first, each page named by the index it
+/// ends before (`None` for the newest). Indices count from the oldest entry,
+/// so messages appended during the walk leave the older pages in place. A
+/// page that reports fewer entries than the first one did means history was
+/// rewritten underneath the walk, so it starts over.
+async fn read_transcript_pages<F, Fut>(
+    mut page: F,
+) -> Result<Vec<MessageEntry>, TranscriptReadError>
+where
+    F: FnMut(Option<usize>) -> Fut,
+    Fut: std::future::Future<Output = Result<SessionMessagesResult, CoreError>>,
+{
+    'attempt: for _ in 0..CORE_MESSAGE_READ_ATTEMPTS {
+        let newest = page(None).await.map_err(page_error)?;
+        let first_total = newest.total;
+        let mut start = newest.start;
+        let mut pages = vec![newest.messages];
+        while start > 0 {
+            let older = page(Some(start)).await.map_err(page_error)?;
+            if older.total < first_total {
+                continue 'attempt;
+            }
+            if older.start >= start {
+                // The core made no progress; never loop on it.
+                return Err(TranscriptReadError::Core(CoreError::Rpc(JsonRpcError {
+                    code: INTERNAL_ERROR,
+                    message: "session/messages returned no older entries".to_owned(),
+                    data: None,
+                })));
+            }
+            start = older.start;
+            pages.push(older.messages);
+        }
+        return Ok(pages.into_iter().rev().flatten().collect());
+    }
+    Err(TranscriptReadError::Changed)
+}
+
+fn page_error(error: CoreError) -> TranscriptReadError {
+    if let CoreError::Rpc(refusal) = &error
+        && let Some(data) = &refusal.data
+        && data["reason"] == "entry_exceeds_max_bytes"
+    {
+        return TranscriptReadError::MessageTooLarge {
+            index: data["index"].as_u64().unwrap_or_default(),
+            bytes: data["bytes"].as_u64().unwrap_or_default(),
+        };
+    }
+    TranscriptReadError::Core(error)
+}
+
+/// `GET /api/sessions/{id}/messages` through the core: the transcript of the
+/// stored row this gateway's resolution names, read in pages that each fit
+/// one RPC frame.
+pub(crate) async fn api_session_messages_through_core(
+    core: &CoreCall,
+    id: &str,
+) -> Result<Response, CoreError> {
+    let keys = gateway_session_key_candidates(id);
+    let read = read_transcript_pages(|before_index| {
+        let params = SessionMessagesParams {
+            session_id: id.to_owned(),
+            limit: None,
+            before_index,
+            cursor: None,
+            session_keys: Some(keys.clone()),
+            max_bytes: Some(CORE_MESSAGE_PAGE_BYTES),
+        };
+        async move {
+            core.call(
+                Method::SessionMessages,
+                serde_json::to_value(params).unwrap_or_default(),
+            )
+            .await
+        }
+    })
+    .await;
+    let entries = match read {
+        Ok(entries) => entries,
+        Err(TranscriptReadError::Core(error)) => return Err(error),
+        Err(TranscriptReadError::MessageTooLarge { index, bytes }) => {
+            return Ok((
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({
+                    "error": format!(
+                        "message {index} is {bytes} bytes, more than the gateway can \
+                         carry from the core ({CORE_MESSAGE_PAGE_BYTES} bytes)"
+                    ),
+                    "code": "message_too_large",
+                })),
+            )
+                .into_response());
+        }
+        Err(TranscriptReadError::Changed) => {
+            return Ok((
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "The session changed while its messages were read; retry",
+                    "code": "conflict",
+                })),
+            )
+                .into_response());
+        }
+    };
+    let messages = entries
+        .into_iter()
+        .map(|entry| session_message_row(entry.role, entry.content, entry.created_at))
+        .collect();
+    Ok(session_messages_response(id, messages))
+}
+
+/// `GET /api/sessions/{id}/state` through the core, for the stored row this
+/// gateway's resolution names.
+pub(crate) async fn api_session_state_through_core(
+    core: &CoreCall,
+    id: &str,
+) -> Result<Response, CoreError> {
+    let state: SessionStateResult = core
+        .call(Method::SessionState, session_target_params(id))
+        .await?;
+    Ok(Json(session_state_body(
+        id,
+        state.state,
+        state.turn_id,
+        state.turn_started_at,
+    ))
+    .into_response())
+}
+
+/// `DELETE /api/sessions/{id}` through the core, for the stored row this
+/// gateway's resolution names. Only a gateway that runs no chat turns of its
+/// own may serve it this way: the core cannot settle such a turn.
+pub(crate) async fn api_session_delete_through_core(
+    core: &CoreCall,
+    id: &str,
+) -> Result<Response, CoreError> {
+    let _: SessionDeleteResult = core
+        .call(Method::SessionDelete, session_target_params(id))
+        .await?;
+    Ok(Json(serde_json::json!({"deleted": true, "session_id": id})).into_response())
+}
+
+fn session_target_params(id: &str) -> serde_json::Value {
+    serde_json::to_value(SessionTargetParams {
+        session_id: id.to_owned(),
+        session_keys: Some(gateway_session_key_candidates(id)),
+    })
+    .unwrap_or_default()
+}
+
+/// The body of `GET /api/sessions/{id}/state`, whichever path read it.
+fn session_state_body(
+    id: &str,
+    state: String,
+    turn_id: Option<String>,
+    turn_started_at: Option<String>,
+) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "session_id": id,
+        "state": state,
+    });
+    if let Some(turn_id) = turn_id {
+        body["turn_id"] = serde_json::Value::String(turn_id);
+    }
+    if let Some(started) = turn_started_at {
+        body["turn_started_at"] = serde_json::Value::String(started);
+    }
+    body
 }
 
 /// POST /api/sessions/{id}/messages — push a visible notification into a gateway session
@@ -2312,19 +2537,13 @@ pub async fn handle_api_session_state(
 
     let session_key = resolve_gateway_session_key(&id, |key| backend.session_exists(key));
     match backend.get_session_state(&session_key) {
-        Ok(Some(ss)) => {
-            let mut resp = serde_json::json!({
-                "session_id": id,
-                "state": ss.state,
-            });
-            if let Some(turn_id) = ss.turn_id {
-                resp["turn_id"] = serde_json::Value::String(turn_id);
-            }
-            if let Some(started) = ss.turn_started_at {
-                resp["turn_started_at"] = serde_json::Value::String(started.to_rfc3339());
-            }
-            Json(resp).into_response()
-        }
+        Ok(Some(ss)) => Json(session_state_body(
+            &id,
+            ss.state,
+            ss.turn_id,
+            ss.turn_started_at.map(|started| started.to_rfc3339()),
+        ))
+        .into_response(),
         Ok(None) => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "Session not found"})),
