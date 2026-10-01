@@ -324,6 +324,10 @@ jobs:
         run: |
           bash scripts/ci/comment_hygiene_gate.test.sh
           bash scripts/ci/comment_hygiene_gate.sh
+      - name: Container build inputs gate (root build.rs reaches every source build)
+        run: |
+          bash scripts/ci/container_build_inputs_gate.test.sh
+          bash scripts/ci/container_build_inputs_gate.sh
       - name: act-local artifact compatibility tests
         run: bash scripts/dev/act-local.test.sh
 
