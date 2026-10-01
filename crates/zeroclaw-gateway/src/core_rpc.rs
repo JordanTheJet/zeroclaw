@@ -65,8 +65,8 @@ use zeroclaw_api::jsonrpc::JsonRpcError;
 use zeroclaw_api::jsonrpc::error_codes::{
     AUTH_REQUIRED, CONNECTION_LIMIT_REACHED, FORBIDDEN, FS_INVALID_PATH, FS_NOT_FOUND,
     FS_PERMISSION_DENIED, INTERNAL_ERROR, INVALID_PARAMS, INVALID_REQUEST, METHOD_NOT_FOUND,
-    SESSION_BUSY, SESSION_LIMIT_REACHED, SESSION_NOT_FOUND, SESSION_NOT_OWNED, SOP_ALREADY_EXISTS,
-    SOP_NOT_FOUND, VERSION_MISMATCH,
+    PRECONDITION_FAILED, SESSION_BUSY, SESSION_LIMIT_REACHED, SESSION_NOT_FOUND, SESSION_NOT_OWNED,
+    SOP_ALREADY_EXISTS, SOP_NOT_FOUND, VERSION_MISMATCH,
 };
 use zeroclaw_rpc_client::{
     ClientError, ConnectOptions, ConnectionState, EndpointOwner, Method, RpcClient,
@@ -322,7 +322,9 @@ fn rpc_status(code: i32) -> (StatusCode, &'static str) {
         INVALID_PARAMS | FS_INVALID_PATH => (StatusCode::BAD_REQUEST, "invalid_params"),
         SESSION_NOT_FOUND | SOP_NOT_FOUND | FS_NOT_FOUND => (StatusCode::NOT_FOUND, "not_found"),
         SESSION_LIMIT_REACHED => (StatusCode::TOO_MANY_REQUESTS, "session_limit_reached"),
-        SESSION_BUSY | SOP_ALREADY_EXISTS => (StatusCode::CONFLICT, "conflict"),
+        SESSION_BUSY | SOP_ALREADY_EXISTS | PRECONDITION_FAILED => {
+            (StatusCode::CONFLICT, "conflict")
+        }
         METHOD_NOT_FOUND => (StatusCode::SERVICE_UNAVAILABLE, "core_capability_missing"),
         VERSION_MISMATCH => (StatusCode::SERVICE_UNAVAILABLE, "core_incompatible"),
         CONNECTION_LIMIT_REACHED => (StatusCode::SERVICE_UNAVAILABLE, "core_unavailable"),

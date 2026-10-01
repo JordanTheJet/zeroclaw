@@ -870,6 +870,26 @@ async fn api_sessions_list(access: Result<CoreAccess, CoreError>) -> Response {
     .await
 }
 
+/// The caller's core connection, for a route that reads a request body. A
+/// refused credential is answered while the request's head is extracted,
+/// before the body is awaited, as the in-process gateway's authentication
+/// answers before anything it parses.
+struct BodyRouteCall(CoreCall);
+
+impl<S: Send + Sync> axum::extract::FromRequestParts<S> for BodyRouteCall {
+    type Rejection = Response;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        let access =
+            <CoreAccess as axum::extract::FromRequestParts<S>>::from_request_parts(parts, state)
+                .await;
+        attached(access).map(Self).map_err(explain)
+    }
+}
+
 /// A dashboard route the core serves whose input the request carries (path,
 /// query or body). The credential is checked before the input, as the
 /// in-process gateway's authentication runs before anything it parses is
@@ -931,19 +951,18 @@ async fn skill_read(
 
 /// `PUT /api/skills/bundles/{alias}/skills/{name}`
 async fn skill_write(
-    access: Result<CoreAccess, CoreError>,
+    BodyRouteCall(call): BodyRouteCall,
     path: Result<UrlPath<(String, String)>, PathRejection>,
     body: Result<Json<SkillWriteBody>, JsonRejection>,
 ) -> Response {
-    let input = match (path, body) {
-        (Ok(UrlPath(path)), Ok(Json(body))) => Ok((path, body)),
-        (Err(rejection), _) => Err(rejection.into_response()),
-        (_, Err(rejection)) => Err(rejection.into_response()),
+    let ((alias, name), body) = match (path, body) {
+        (Ok(UrlPath(path)), Ok(Json(body))) => (path, body),
+        (Err(rejection), _) => return rejection.into_response(),
+        (_, Err(rejection)) => return rejection.into_response(),
     };
-    served_with(access, input, |call, ((alias, name), body)| async move {
-        crate::api_skills::write_skill_through_core(&call, &alias, &name, &body).await
-    })
-    .await
+    crate::api_skills::write_skill_through_core(&call, &alias, &name, &body)
+        .await
+        .unwrap_or_else(explain)
 }
 
 /// `DELETE /api/skills/bundles/{alias}/skills/{name}`
@@ -1010,21 +1029,20 @@ async fn personality_get(
 
 /// `PUT /api/personality/{filename}`
 async fn personality_put(
-    access: Result<CoreAccess, CoreError>,
+    BodyRouteCall(call): BodyRouteCall,
     path: Result<UrlPath<String>, PathRejection>,
     query: Result<Query<AgentQuery>, QueryRejection>,
     body: Result<Json<PersonalityPutBody>, JsonRejection>,
 ) -> Response {
-    let input = match (path, query, body) {
-        (Ok(UrlPath(filename)), Ok(Query(query)), Ok(Json(body))) => Ok((filename, query, body)),
-        (Err(rejection), _, _) => Err(rejection.into_response()),
-        (_, Err(rejection), _) => Err(rejection.into_response()),
-        (_, _, Err(rejection)) => Err(rejection.into_response()),
+    let (filename, query, body) = match (path, query, body) {
+        (Ok(UrlPath(filename)), Ok(Query(query)), Ok(Json(body))) => (filename, query, body),
+        (Err(rejection), _, _) => return rejection.into_response(),
+        (_, Err(rejection), _) => return rejection.into_response(),
+        (_, _, Err(rejection)) => return rejection.into_response(),
     };
-    served_with(access, input, |call, (filename, query, body)| async move {
-        crate::api_personality::put_through_core(&call, &filename, &query, &body).await
-    })
-    .await
+    crate::api_personality::put_through_core(&call, &filename, &query, &body)
+        .await
+        .unwrap_or_else(explain)
 }
 
 /// `POST /admin/shutdown`: stop this process, for a caller on loopback, as

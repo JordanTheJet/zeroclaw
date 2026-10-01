@@ -23,6 +23,7 @@ use super::api::require_auth;
 use crate::core_rpc::{CoreAccess, CoreCall, CoreError};
 use zeroclaw_api::jsonrpc::error_codes::PRECONDITION_FAILED;
 use zeroclaw_rpc_client::Method;
+use zeroclaw_rpc_proto::error_reasons::RefusalReason;
 
 // ── HTTP-specific request/response shapes (not shared) ──────────────
 
@@ -438,8 +439,30 @@ pub(crate) async fn index_through_core(
         Err(refusal) => return Ok(refusal.into_response()),
     };
     let params = serde_json::json!({ "agent": agent, "require_configured_agent": true });
-    let listing = core.request(Method::PersonalityList, params).await?;
-    Ok(Json(listing).into_response())
+    match core.request(Method::PersonalityList, params).await {
+        Ok(listing) => Ok(Json(listing).into_response()),
+        Err(error) => refused_for_agent(error, agent),
+    }
+}
+
+/// A personality refusal from the core, answered as the in-process route
+/// answers an agent `[agents]` does not configure, which the core names
+/// `not_found`. Any other refusal is the core's own.
+fn refused_for_agent(error: CoreError, agent: &str) -> Result<Response, CoreError> {
+    if error.reason() == Some(RefusalReason::NotFound) {
+        Ok(unknown_agent(agent).into_response())
+    } else {
+        Err(error)
+    }
+}
+
+/// What the core's drift refusal carries about the file now. The content
+/// and mtime are present only for a caller allowed to read the file.
+#[derive(Deserialize)]
+struct DriftData {
+    current_content: Option<String>,
+    #[serde(default)]
+    current_mtime_ms: Option<i64>,
 }
 
 /// `GET /api/personality/{filename}` through the core. The core returns a
@@ -458,17 +481,25 @@ pub(crate) async fn get_through_core(
         Ok(agent) => agent,
         Err(refusal) => return Ok(refusal.into_response()),
     };
+    // The core cuts the file to the editor's view before it is serialized,
+    // so a file of any size answers within one frame.
     let params = serde_json::json!({
         "agent": agent,
         "filename": allowed,
         "require_configured_agent": true,
+        "max_chars": MAX_FILE_CHARS,
     });
-    let read = core.request(Method::PersonalityGet, params).await?;
+    let read = match core.request(Method::PersonalityGet, params).await {
+        Ok(read) => read,
+        Err(error) => return refused_for_agent(error, agent),
+    };
     let read: PersonalityGetResult = serde_json::from_value(read).map_err(|e| {
         CoreError::Unavailable(format!(
             "the core's personality/get result is malformed: {e}"
         ))
     })?;
+    // A core that predates `max_chars` sends the whole file; cutting it here
+    // too keeps the view the same (a no-op on a bounded answer).
     let content = read
         .content
         .map(|content| truncate_to_chars(&content, MAX_FILE_CHARS).0)
@@ -509,16 +540,40 @@ pub(crate) async fn put_through_core(
     }
     match core.request(Method::PersonalityPut, params).await {
         Ok(written) => Ok(Json(written).into_response()),
-        // The file moved on disk since the editor read it. The core's `data`
-        // is this route's conflict body; a reply without it still says which
-        // file drifted.
+        // The file moved on disk since the editor read it. A caller allowed
+        // to read it gets what is on disk now, in the in-process route's
+        // conflict body; any other caller learns only which file drifted.
         Err(CoreError::Rpc(refusal)) if refusal.code == PRECONDITION_FAILED => {
-            let body = refusal.data.unwrap_or_else(
-                || serde_json::json!({ "error": "personality_disk_drift", "filename": allowed }),
-            );
-            Ok((StatusCode::CONFLICT, Json(body)).into_response())
+            let current = refusal
+                .data
+                .and_then(|data| serde_json::from_value::<DriftData>(data).ok())
+                .and_then(|drift| {
+                    drift
+                        .current_content
+                        .map(|content| (content, drift.current_mtime_ms))
+                });
+            Ok(match current {
+                Some((current_content, current_mtime_ms)) => (
+                    StatusCode::CONFLICT,
+                    Json(PersonalityConflict {
+                        error: "personality_disk_drift",
+                        filename: allowed.to_string(),
+                        current_content,
+                        current_mtime_ms,
+                    }),
+                )
+                    .into_response(),
+                None => (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({
+                        "error": "personality_disk_drift",
+                        "filename": allowed,
+                    })),
+                )
+                    .into_response(),
+            })
         }
-        Err(error) => Err(error),
+        Err(error) => refused_for_agent(error, agent),
     }
 }
 
