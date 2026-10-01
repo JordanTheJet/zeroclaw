@@ -11993,19 +11993,18 @@ async fn deliver_subscription(delivery: SubscriptionDelivery) {
         .ok()
     };
     let mut checked_generation = binding.as_ref().map(|auth| auth.generation);
+    let mut authorized =
+        || still_authorized(&inbound, binding.as_ref(), method, &mut checked_generation);
 
     'deliver: {
         // The client's numbers belong to another epoch: nothing it saw can be
         // matched here. Everything before `cursor` in this epoch is gone; from
         // `cursor` on, every buffered frame is replayed.
         if epoch_changed {
-            if !still_authorized(&inbound, binding.as_ref(), method, &mut checked_generation) {
-                break 'deliver;
-            }
             let Some(json) = lagged(1, cursor, true) else {
                 break 'deliver;
             };
-            if !rpc.send_raw(json).await {
+            if !deliver_frame(&rpc, &cancel, &mut authorized, json).await {
                 break 'deliver;
             }
         }
@@ -12019,18 +12018,10 @@ async fn deliver_subscription(delivery: SubscriptionDelivery) {
                     from_seq,
                     resume_seq,
                 } => {
-                    if !still_authorized(
-                        &inbound,
-                        binding.as_ref(),
-                        method,
-                        &mut checked_generation,
-                    ) {
-                        break 'deliver;
-                    }
                     let Some(json) = lagged(from_seq, resume_seq, false) else {
                         break 'deliver;
                     };
-                    if !rpc.send_raw(json).await {
+                    if !deliver_frame(&rpc, &cancel, &mut authorized, json).await {
                         break 'deliver;
                     }
                     cursor = resume_seq;
@@ -12038,16 +12029,6 @@ async fn deliver_subscription(delivery: SubscriptionDelivery) {
                 }
                 Read::Frames(frames) if !frames.is_empty() => {
                     for (seq, frame) in frames {
-                        if cancel.is_cancelled()
-                            || !still_authorized(
-                                &inbound,
-                                binding.as_ref(),
-                                method,
-                                &mut checked_generation,
-                            )
-                        {
-                            break 'deliver;
-                        }
                         let mut params = (*frame).clone();
                         if let Some(object) = params.as_object_mut() {
                             object.insert(
@@ -12060,7 +12041,7 @@ async fn deliver_subscription(delivery: SubscriptionDelivery) {
                         let Ok(json) = serde_json::to_string(&notification) else {
                             break 'deliver;
                         };
-                        if !rpc.send_raw(json).await {
+                        if !deliver_frame(&rpc, &cancel, &mut authorized, json).await {
                             break 'deliver;
                         }
                         cursor = seq + 1;
@@ -12079,6 +12060,39 @@ async fn deliver_subscription(delivery: SubscriptionDelivery) {
         }
     }
     registry.lock().remove(&subscription_id);
+}
+
+/// Enqueue one subscription line, unless the feed was cancelled or the caller
+/// lost its authority while the writer was full. Every subscription forwarder
+/// sends through this, in this order:
+///
+/// 1. Wait for room on the writer. This is the only wait, and a cancel or a
+///    closed writer ends it, so a feed blocked on a slow reader is still
+///    released at once.
+/// 2. Check `still_allowed` at the enqueue boundary, after that wait, so a
+///    grant withdrawn while the writer was full stops the line.
+/// 3. Enqueue in the reserved room, which cannot wait again.
+///
+/// `false` ends the feed.
+async fn deliver_frame(
+    rpc: &RpcOutbound,
+    cancel: &CancellationToken,
+    still_allowed: impl FnOnce() -> bool,
+    json: String,
+) -> bool {
+    let slot = tokio::select! {
+        biased;
+        () = cancel.cancelled() => return false,
+        slot = rpc.reserve() => slot,
+    };
+    let Some(slot) = slot else {
+        return false;
+    };
+    if !still_allowed() {
+        return false;
+    }
+    slot.send(json);
+    true
 }
 
 /// The daemon-wide log and event streams, and the event history, carry
@@ -23417,6 +23431,164 @@ mod tests {
             .await,
             "a principal that lost Logs:Read must stop receiving log frames"
         );
+    }
+
+    /// The global streams, each with the hub source that feeds it.
+    const GLOBAL_STREAMS: [(&str, crate::rpc::subscription::Source); 2] = [
+        ("logs/subscribe", crate::rpc::subscription::Source::Logs),
+        ("events/subscribe", crate::rpc::subscription::Source::Events),
+    ];
+
+    /// A subscriber to `method` whose writer has room for one line: an
+    /// administrator with `Logs:Read` on a roster connection, its subscribe
+    /// reply already read. Returns the context (for policy changes), the
+    /// policy it started with, the connection, its writer, the hub and the
+    /// subscription id.
+    async fn subscriber_on_a_one_line_writer(
+        method: &str,
+    ) -> (
+        Arc<RpcContext>,
+        zeroclaw_config::schema::Config,
+        RpcDispatcher,
+        tokio::sync::mpsc::Receiver<String>,
+        Arc<crate::rpc::subscription::SubscriptionHub>,
+        String,
+    ) {
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+        let mut config = roster_config(4242);
+        grant_global_log_reads(&mut config);
+        let hub = Arc::new(crate::rpc::subscription::SubscriptionHub::new());
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let (event_tx, _rx) = tokio::sync::broadcast::channel(16);
+        let ctx = RpcContext::minimal_with_subscription_hub(
+            config.clone(),
+            sessions,
+            event_tx,
+            Arc::clone(&hub),
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let mut dispatcher = RpcDispatcher::new(Arc::clone(&ctx), tx, "unix:uid=4242".into())
+            .with_transport(
+                crate::rpc::transport::TransportKind::Local,
+                crate::security::auth_provider::Credential::Peercred { uid: 4242 },
+            );
+        dispatcher
+            .handle_initialize(&json!({}))
+            .await
+            .expect("roster uid authenticates");
+        let opened = rpc(&mut dispatcher, &mut rx, 1, method, json!({})).await;
+        let id = opened["result"]["subscription_id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{method} opens: {opened}"))
+            .to_string();
+        (ctx, config, dispatcher, rx, hub, id)
+    }
+
+    /// Publish a frame that takes the writer's only room and one more, and
+    /// return once the first is enqueued and delivery of the second is
+    /// waiting for room.
+    async fn block_delivery_on_a_full_writer(
+        hub: &crate::rpc::subscription::SubscriptionHub,
+        source: crate::rpc::subscription::Source,
+        rx: &tokio::sync::mpsc::Receiver<String>,
+    ) {
+        hub.publish(
+            source,
+            json!({"source": "observability", "tool": "SENTINEL-FILL"}),
+        );
+        hub.publish(
+            source,
+            json!({"source": "observability", "tool": "SENTINEL-PENDING"}),
+        );
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while rx.is_empty() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the first frame takes the room"
+            );
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    /// A grant withdrawn while delivery waits for writer room ends the
+    /// stream before the waiting frame is enqueued: authority is checked at
+    /// the enqueue boundary, after the wait, not before it.
+    #[tokio::test]
+    async fn a_grant_withdrawn_while_the_writer_is_full_delivers_nothing_more() {
+        use zeroclaw_api::grants::Resource;
+        for (method, source) in GLOBAL_STREAMS {
+            let (ctx, config, dispatcher, mut rx, hub, id) =
+                subscriber_on_a_one_line_writer(method).await;
+            block_delivery_on_a_full_writer(&hub, source, &rx).await;
+
+            let mut narrowed = config;
+            let reader = narrowed
+                .permission_profiles
+                .get_mut("reader")
+                .expect("the fixture profile exists");
+            reader.grants.remove(&Resource::Logs);
+            reader.admin = false;
+            ctx.auth
+                .refresh_from_config(&narrowed)
+                .expect("the narrowed policy compiles");
+            let fill = rx.recv().await.expect("the frame that took the room");
+            assert!(fill.contains("SENTINEL-FILL"), "{method}: {fill}");
+
+            assert!(
+                !next_frame_containing(
+                    &mut rx,
+                    "SENTINEL-PENDING",
+                    std::time::Duration::from_millis(500)
+                )
+                .await,
+                "{method}: a frame waiting for room must not be enqueued after the grant is gone"
+            );
+            assert!(
+                !dispatcher.subscriptions.lock().contains_key(&id),
+                "{method}: the refused stream ends"
+            );
+        }
+    }
+
+    /// Cancelling a subscription whose delivery waits for writer room
+    /// releases the feed at once. It does not wait for the reader to drain,
+    /// and the waiting frame is never enqueued.
+    #[tokio::test]
+    async fn a_cancel_releases_a_feed_blocked_on_a_full_writer() {
+        for (method, source) in GLOBAL_STREAMS {
+            let (_ctx, _config, dispatcher, mut rx, hub, id) =
+                subscriber_on_a_one_line_writer(method).await;
+            // The delivery task holds the connection's writer while it runs.
+            let delivering = Arc::strong_count(&dispatcher.rpc);
+            block_delivery_on_a_full_writer(&hub, source, &rx).await;
+
+            let cancelled = dispatcher
+                .handle_subscription_cancel(&json!({"subscription_id": id}))
+                .expect("cancel");
+            assert_eq!(cancelled["cancelled"], json!(true), "{method}");
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+            while Arc::strong_count(&dispatcher.rpc) == delivering {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "{method}: a cancelled feed is released while the writer is still full"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+
+            let fill = rx.recv().await.expect("the frame that took the room");
+            assert!(fill.contains("SENTINEL-FILL"), "{method}: {fill}");
+            assert!(
+                !next_frame_containing(
+                    &mut rx,
+                    "SENTINEL-PENDING",
+                    std::time::Duration::from_millis(500)
+                )
+                .await,
+                "{method}: a cancelled feed enqueues nothing more"
+            );
+        }
     }
 
     fn make_cost_query_test_dispatcher(data_dir: &std::path::Path) -> RpcDispatcher {
