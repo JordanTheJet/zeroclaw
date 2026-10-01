@@ -655,9 +655,74 @@ rpc_type! {
     /// the same prop wins), and the result is saved and installed once, or
     /// not at all. Must contain at least one entry and at most the
     /// dispatcher's batch cap (256); either bound violated is `INVALID_PARAMS`.
+    ///
+    /// The batch is either `sets` or `ops`, never both. `ops` is a JSON
+    /// Patch, applied as the dashboard's config routes apply one: values are
+    /// checked against each field's declared kind, the resulting
+    /// configuration is validated, and the result reports each operation and
+    /// any validation warnings.
     pub struct ConfigSetManyParams {
+        #[serde(default)]
         pub sets: Vec<ConfigSetParams>,
+        /// JSON Patch operations (RFC 6902 `add`, `replace`, `remove` and
+        /// `test`, plus `comment`), applied in order; the first that fails
+        /// refuses the whole batch, naming its index. Present but empty, the
+        /// batch writes nothing and reports the configuration's warnings.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub ops: Option<Vec<ConfigPatchOp>>,
+        /// Refuse the batch when the config file on disk differs from the
+        /// running configuration at any path the batch names, as an edit
+        /// made outside the daemon would leave it.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        pub drift_guard: bool,
     }
+}
+
+rpc_type! {
+    /// One JSON Patch operation of `config/set-many`'s `ops`. `path` is a
+    /// JSON Pointer (`/agents/main/model_provider`) or a dotted property path.
+    /// `add`, `replace` and `test` need `value`; `comment` needs `comment`
+    /// and writes only the comment above the property.
+    pub struct ConfigPatchOp {
+        pub op: String,
+        pub path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub value: Option<Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub comment: Option<String>,
+    }
+}
+
+rpc_type! {
+    /// What one applied JSON Patch operation did, by dotted property path.
+    pub struct ConfigPatchOpResult {
+        pub op: String,
+        pub path: String,
+        /// The value at the path after the operation: the stored form for an
+        /// `add` or `replace`, the value compared for a `test`, `null` for a
+        /// `remove`. Absent for a secret and for a `comment`.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "present_value"
+        )]
+        pub value: Option<Value>,
+        /// For a secret, whether it holds a value after the operation.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub populated: Option<bool>,
+        /// The comment written with the operation, if any.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub comment: Option<String>,
+    }
+}
+
+/// A field that is `null` when present, as `ConfigPatchOpResult::value` is
+/// for a `remove`, kept as `Some(Value::Null)` rather than read as absent.
+fn present_value<'de, D>(deserializer: D) -> Result<Option<Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Value::deserialize(deserializer).map(Some)
 }
 
 rpc_type! {
@@ -665,6 +730,12 @@ rpc_type! {
         /// The props written, in request order.
         pub props: Vec<String>,
         pub set: bool,
+        /// One entry per operation of an `ops` batch, in order.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub results: Vec<ConfigPatchOpResult>,
+        /// Validation warnings against the saved configuration (`ops` only).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub warnings: Vec<zeroclaw_config::validation_warnings::ValidationWarning>,
     }
 }
 
@@ -1924,6 +1995,24 @@ mod tests {
         // to `1` so the handshake succeeds without an explicit version.
         let p: InitializeParams = serde_json::from_value(json!({})).unwrap();
         assert_eq!(p.protocol_version, 1);
+    }
+
+    #[test]
+    fn a_removed_value_stays_null_through_the_wire() {
+        let results: Vec<ConfigPatchOpResult> = serde_json::from_value(json!([
+            {"op": "remove", "path": "memory.backend", "value": null},
+            {"op": "comment", "path": "memory.backend", "comment": "why"}
+        ]))
+        .unwrap();
+        assert_eq!(results[0].value, Some(Value::Null));
+        assert_eq!(results[1].value, None);
+        assert_eq!(
+            serde_json::to_value(&results).unwrap(),
+            json!([
+                {"op": "remove", "path": "memory.backend", "value": null},
+                {"op": "comment", "path": "memory.backend", "comment": "why"}
+            ])
+        );
     }
 
     #[test]

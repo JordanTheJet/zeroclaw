@@ -264,6 +264,17 @@ fn config_refused(code: i32, msg: impl Into<String>, error: ConfigApiError) -> J
     RefusalData::config_error(code, msg, error)
 }
 
+/// A refused `config/set-many` `ops` batch: invalid params carrying the
+/// config error the dashboard's config routes answer with (an internal
+/// failure keeps the internal-error code).
+fn config_patch_refused(error: ConfigApiError) -> JsonRpcError {
+    let code = match error.code {
+        ConfigApiCode::InternalError | ConfigApiCode::ReloadFailed => INTERNAL_ERROR,
+        _ => INVALID_PARAMS,
+    };
+    config_refused(code, error.message.clone(), error)
+}
+
 /// `error` re-worded as `msg`, keeping its code and its data.
 fn reworded(error: JsonRpcError, msg: impl Into<String>) -> JsonRpcError {
     JsonRpcError {
@@ -8298,6 +8309,21 @@ impl RpcDispatcher {
     /// worth of fields; an over-long batch is a caller error like an empty one.
     async fn handle_config_set_many(&self, params: &Value) -> RpcResult {
         let req: ConfigSetManyParams = parse_params(params)?;
+        if let Some(ops) = req.ops {
+            if !req.sets.is_empty() {
+                return Err(rpc_err(
+                    INVALID_PARAMS,
+                    "config/set-many takes `sets` or `ops`, not both",
+                ));
+            }
+            return self.handle_config_patch(ops, req.drift_guard).await;
+        }
+        if req.drift_guard {
+            return Err(rpc_err(
+                INVALID_PARAMS,
+                "config/set-many `drift_guard` applies to an `ops` batch",
+            ));
+        }
         if req.sets.is_empty() {
             return Err(rpc_err(
                 INVALID_PARAMS,
@@ -8423,7 +8449,210 @@ impl RpcDispatcher {
         for provider in providers {
             self.refresh_memory_embedder_for_model_provider(&provider);
         }
-        to_result(ConfigSetManyResult { props, set: true })
+        to_result(ConfigSetManyResult {
+            props,
+            set: true,
+            results: Vec::new(),
+            warnings: Vec::new(),
+        })
+    }
+
+    /// `config/set-many` with `ops`: a JSON Patch staged as the dashboard's
+    /// `PATCH /api/config` stages one (`crate::config_ops::patch`), then
+    /// committed once through this dispatcher's config-write path, like a
+    /// `sets` batch.
+    ///
+    /// Each step follows the route, in its order, so the two refuse the same
+    /// patch the same way: the drift guard, the operations, the validation of
+    /// the result, the authorization of its write set, the agents' lifecycle
+    /// reservations. The write set is authorized by effect on grants
+    /// re-resolved after the last await, under the config write lock: each
+    /// path needs the Config verb its effect implies (a new map entry is a
+    /// create, a `remove` a delete) and a matching path selector.
+    ///
+    /// Boxed where it is built, so its large state never sits in the frame
+    /// of `config/set-many`, which every `sets` batch also runs through.
+    fn handle_config_patch(&self, ops: Vec<ConfigPatchOp>, drift_guard: bool) -> BoxRpcFuture<'_> {
+        Box::pin(async move { self.config_patch(ops, drift_guard).await })
+    }
+
+    async fn config_patch(&self, ops: Vec<ConfigPatchOp>, drift_guard: bool) -> RpcResult {
+        use crate::config_ops::patch;
+
+        if ops.len() > Self::CONFIG_SET_MANY_MAX_ENTRIES {
+            return Err(rpc_err(
+                INVALID_PARAMS,
+                crate::i18n::get_required_cli_string_with_args(
+                    "rpc-config-set-many-limit",
+                    &[
+                        ("limit", &Self::CONFIG_SET_MANY_MAX_ENTRIES.to_string()),
+                        ("count", &ops.len().to_string()),
+                    ],
+                ),
+            ));
+        }
+        let config_write_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
+        let old_config = self.ctx.config.read().clone();
+        if drift_guard {
+            let drifted = crate::config_ops::drift::compute_drift(&old_config).await;
+            if let Some(conflict) =
+                patch::drift_conflict(drifted.iter().map(|entry| entry.path.as_str()), &ops)
+            {
+                return Err(config_patch_refused(conflict));
+            }
+        }
+        // Boxed for the same stack-frame reason as in `handle_config_set`.
+        let mut working = Box::new(old_config.clone());
+        let results = patch::apply_patch_ops(&mut working, &ops).map_err(config_patch_refused)?;
+        let scoped_validation_warnings =
+            patch::scoped_validate(&working).map_err(config_patch_refused)?;
+        let annotations = patch::annotations(&ops, &results);
+        let config_path = working.config_path.clone();
+        let mut warnings = working.collect_warnings();
+        warnings.extend(scoped_validation_warnings);
+        self.authorize_config_write_effects(
+            Method::ConfigSetMany,
+            &old_config,
+            &working,
+            &patch::removed_paths(&ops),
+        )?;
+        let _agent_config_reservations: Vec<_> = patch::agent_aliases(&ops)
+            .into_iter()
+            .map(|alias| {
+                self.ctx
+                    .agent_lifecycle
+                    .reserve_config_mutation(&alias)
+                    .map_err(|error| {
+                        config_patch_refused(
+                            ConfigApiError::new(ConfigApiCode::ValidationFailed, error.to_string())
+                                .with_path(format!("agents.{alias}")),
+                        )
+                    })
+            })
+            .collect::<Result<_, _>>()?;
+
+        let props: Vec<String> = results
+            .iter()
+            .filter(|result| matches!(result.op.as_str(), "add" | "replace" | "remove"))
+            .map(|result| result.path.clone())
+            .collect();
+        let channel_generation_revocation = self.prepare_channel_generation_revocation(
+            props.iter().any(|prop| is_channel_generation_prop(prop)),
+            &old_config,
+        )?;
+        let scopes: Vec<_> = props
+            .iter()
+            .filter_map(|prop| LiveSessionRefreshScope::for_prop(prop))
+            .collect();
+        if scopes.is_empty() {
+            self.save_and_swap_config(*working, &config_write_guard)
+                .await?;
+        } else {
+            Box::pin(self.commit_config_with_live_session_refresh(
+                *working,
+                &config_write_guard,
+                &LiveSessionRefreshScope::Batch(scopes),
+            ))
+            .await?;
+        }
+        let _config_write_guard = self
+            .finish_channel_generation_mutation(channel_generation_revocation, config_write_guard)
+            .await?;
+        if !annotations.is_empty()
+            && let Err(error) =
+                zeroclaw_config::comment_writer::apply_comments(&config_path, &annotations).await
+        {
+            // Comments are decoration: the patch itself is saved.
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"error": error.to_string()})),
+                "failed to apply config/set-many op comments to config.toml"
+            );
+        }
+        let new_config = self.ctx.config.read().clone();
+        let channel_agents: std::collections::BTreeSet<_> = props
+            .iter()
+            .filter_map(|prop| agent_alias_from_channel_auth_prop(prop))
+            .collect();
+        for alias in channel_agents {
+            self.refresh_live_channel_handles_between_configs(&old_config, &new_config, &alias)
+                .await;
+        }
+        let providers: std::collections::BTreeSet<_> = props
+            .iter()
+            .filter_map(|prop| model_provider_ref_from_provider_profile_prop(prop))
+            .collect();
+        for provider in providers {
+            self.refresh_memory_embedder_for_model_provider(&provider);
+        }
+        to_result(ConfigSetManyResult {
+            props,
+            set: true,
+            results,
+            warnings,
+        })
+    }
+
+    /// Authorize a staged config write by its effect, as the gateway's
+    /// principal gate authorizes the dashboard's config routes: every dirty
+    /// path of `working`, classified against `before` (plus each of
+    /// `deleted`, pinned as a deletion), needs the Config verb its effect
+    /// implies and a matching config path selector. Checked on grants
+    /// re-resolved now, so the caller runs it after its last await, under
+    /// the config write lock.
+    fn authorize_config_write_effects(
+        &self,
+        method: Method,
+        before: &Config,
+        working: &Config,
+        deleted: &[String],
+    ) -> Result<(), JsonRpcError> {
+        use crate::config_ops::write_set;
+        use crate::rpc::auth::AuthDenied;
+        use zeroclaw_api::grants::{Resource, Verb};
+
+        let refuse = |denied: AuthDenied| -> JsonRpcError {
+            self.audit_auth_denial(method, &denied);
+            rpc_err(denied.code, denied.message)
+        };
+        let Some(grants) = self.recheck_authority_after_admission(method)? else {
+            return Err(refuse(AuthDenied::auth_required(
+                crate::i18n::get_required_cli_string("rpc-auth-first-call-initialize"),
+            )));
+        };
+        if grants.admin {
+            return Ok(());
+        }
+        let mut writes = write_set::classify_by_effect(
+            before,
+            working,
+            working.dirty_paths.iter().map(String::as_str),
+        );
+        for path in deleted {
+            write_set::pin(&mut writes, path.clone(), Verb::Delete);
+        }
+        for (path, verb) in &writes {
+            if !grants.permits(Resource::Config, *verb) {
+                let verb = match verb {
+                    Verb::Create => "create",
+                    Verb::Read => "read",
+                    Verb::Update => "update",
+                    Verb::Delete => "delete",
+                    Verb::Execute => "execute",
+                };
+                return Err(refuse(AuthDenied::forbidden(format!(
+                    "Principal lacks the config `{verb}` grant this mutation needs for `{path}`"
+                ))));
+            }
+            if !grants.may_write_config(path) {
+                return Err(refuse(AuthDenied::forbidden(format!(
+                    "Principal's config path selectors do not cover `{path}`"
+                ))));
+            }
+        }
+        Ok(())
     }
 
     /// Stage one `config/set` entry on a working copy of the config:
@@ -8963,6 +9192,9 @@ impl RpcDispatcher {
             let mut working = self.ctx.config.read().clone();
             let created = create(&mut working)?;
             if created {
+                if req.path == "skill_bundles" {
+                    Self::scaffold_skill_bundle_dir(&working, &req.key).await;
+                }
                 self.save_and_swap_config(working, &config_write_guard)
                     .await?;
             }
@@ -8973,6 +9205,27 @@ impl RpcDispatcher {
             key: req.key,
             created,
         })
+    }
+
+    /// Create a new skill bundle's directory before the configuration naming
+    /// it is saved, so its skills have a home at once, as the dashboard's
+    /// create route does. A failure is logged and the bundle still created.
+    async fn scaffold_skill_bundle_dir(config: &Config, alias: &str) {
+        let install_root = config.install_root_dir();
+        if let Ok(dir) =
+            zeroclaw_config::skill_bundles::resolve_directory(config, &install_root, alias)
+            && let Err(e) = tokio::fs::create_dir_all(&dir).await
+        {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                &format!(
+                    "skill-bundle '{alias}' directory creation failed at {}: {e}",
+                    dir.display()
+                )
+            );
+        }
     }
 
     async fn handle_config_map_key_delete(&self, params: &Value) -> RpcResult {
@@ -39241,8 +39494,24 @@ mod tests {
         uid: u32,
         write_paths: &[&str],
     ) -> zeroclaw_config::schema::Config {
+        use zeroclaw_api::grants::Verb;
+        config_write_roster_config_with(
+            tmp,
+            uid,
+            write_paths,
+            &[Verb::Create, Verb::Read, Verb::Update, Verb::Delete],
+        )
+    }
+
+    /// [`config_write_roster_config`] granting `alice` only `verbs` on Config.
+    fn config_write_roster_config_with(
+        tmp: &tempfile::TempDir,
+        uid: u32,
+        write_paths: &[&str],
+        verbs: &[zeroclaw_api::grants::Verb],
+    ) -> zeroclaw_config::schema::Config {
         use std::collections::HashMap;
-        use zeroclaw_api::grants::{Resource, Verb};
+        use zeroclaw_api::grants::Resource;
         use zeroclaw_config::schema::{PermissionProfileConfig, UserConfig};
 
         let mut config = make_two_provider_test_config(tmp);
@@ -39250,10 +39519,7 @@ mod tests {
             "config-writer".into(),
             PermissionProfileConfig {
                 config_write_paths: write_paths.iter().map(|p| (*p).to_string()).collect(),
-                grants: HashMap::from([(
-                    Resource::Config,
-                    vec![Verb::Create, Verb::Read, Verb::Update, Verb::Delete],
-                )]),
+                grants: HashMap::from([(Resource::Config, verbs.to_vec())]),
                 ..PermissionProfileConfig::default()
             },
         );
@@ -39447,6 +39713,113 @@ mod tests {
                 );
             }
         });
+    }
+
+    #[test]
+    fn config_patch_revoked_while_queued_on_the_write_lock_is_refused() {
+        run_on_a_large_stack(|| async move {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config_path = tmp.path().join("config.toml");
+            let ctx = enforcement_ctx(config_write_roster_config(&tmp, 4242, &["providers.*"]));
+            let (alice, _rx) = roster_peer(&ctx, 4242).await;
+            let before = std::fs::read_to_string(&config_path).unwrap_or_default();
+
+            let params = json!({"ops": [{
+                "op": "replace",
+                "path": "/providers/models/anthropic/default/model",
+                "value": "revoked-value"
+            }]});
+            let result = rpc_result_after_midwait_policy_change(
+                Arc::clone(&ctx),
+                async move { alice.handle_config_set_many(&params).await },
+                revoke_alice_config_writes,
+            )
+            .await;
+
+            let err = result.expect_err("a revoked writer must not commit");
+            assert_eq!(err.code, FORBIDDEN, "{err:?}");
+            assert_eq!(
+                std::fs::read_to_string(&config_path).unwrap_or_default(),
+                before,
+                "the refused patch must not reach disk"
+            );
+        });
+    }
+
+    /// A patch's write set is authorized by effect, as the dashboard's config
+    /// routes authorize it: replacing a field needs `update`, clearing one
+    /// `delete`, and writing under a new alias `create`.
+    #[test]
+    fn config_patch_needs_the_verb_each_effect_implies() {
+        use zeroclaw_api::grants::Verb;
+        run_on_a_large_stack(|| async move {
+            for (case, op, refused_for) in [
+                (
+                    "a replace",
+                    json!({"op": "replace", "path": "/providers/models/anthropic/default/model", "value": "m"}),
+                    None,
+                ),
+                (
+                    "a remove",
+                    json!({"op": "remove", "path": "/providers/models/anthropic/default/model"}),
+                    Some("delete"),
+                ),
+                (
+                    "a write under a new alias",
+                    json!({"op": "add", "path": "/providers/models/openai/fresh/model", "value": "m"}),
+                    Some("create"),
+                ),
+            ] {
+                let tmp = tempfile::TempDir::new().unwrap();
+                let ctx = enforcement_ctx(config_write_roster_config_with(
+                    &tmp,
+                    4242,
+                    &["providers.*"],
+                    &[Verb::Read, Verb::Update],
+                ));
+                let (alice, _rx) = roster_peer(&ctx, 4242).await;
+                let result = alice
+                    .handle_config_set_many(&json!({ "ops": [op] }))
+                    .await;
+                match refused_for {
+                    None => {
+                        let result = result.unwrap_or_else(|e| panic!("{case}: {e:?}"));
+                        assert_eq!(result["results"][0]["op"], "replace", "{case}");
+                    }
+                    Some(verb) => {
+                        let err = result.expect_err(case);
+                        assert_eq!(err.code, FORBIDDEN, "{case}: {err:?}");
+                        assert!(
+                            err.message.contains(&format!("`{verb}`")),
+                            "{case}: {}",
+                            err.message
+                        );
+                    }
+                }
+            }
+        });
+    }
+
+    #[tokio::test]
+    async fn config_set_many_takes_sets_or_ops_and_guards_drift_only_for_ops() {
+        let (dispatcher, _sessions) =
+            make_acp_test_dispatcher(zeroclaw_config::schema::Config::default());
+        let both = dispatcher
+            .handle_config_set_many(&json!({
+                "sets": [{"prop": "memory.backend", "value": "none"}],
+                "ops": [{"op": "replace", "path": "/memory/backend", "value": "none"}],
+            }))
+            .await
+            .expect_err("sets and ops together are refused");
+        assert_eq!(both.code, INVALID_PARAMS);
+        let guarded_sets = dispatcher
+            .handle_config_set_many(&json!({
+                "sets": [{"prop": "memory.backend", "value": "none"}],
+                "drift_guard": true,
+            }))
+            .await
+            .expect_err("the drift guard needs an ops batch");
+        assert_eq!(guarded_sets.code, INVALID_PARAMS);
     }
 
     // ── session/new rechecks the agent selector after config-lock admission ──

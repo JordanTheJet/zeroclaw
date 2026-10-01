@@ -51,7 +51,7 @@ catalog! {
     // Cron
     CronIdParams, CronPatchParams, CronDeleteResult, CronRunsParams, CronTriggerResult,
     // Config
-    ConfigGetParams, ConfigGetPropResult, ConfigSetParams, ConfigSetResult, ConfigSetManyParams, ConfigSetManyResult, ConfigValidateResult,
+    ConfigGetParams, ConfigGetPropResult, ConfigSetParams, ConfigSetResult, ConfigSetManyParams, ConfigPatchOp, ConfigPatchOpResult, ConfigSetManyResult, ConfigValidateResult,
     ConfigReloadResult, ConfigListParams, ConfigListResult, ConfigDeleteParams, ConfigDeleteResult,
     ConfigMapKeysParams, ConfigMapKeysResult, ConfigResolveAliasSourceParams,
     ConfigResolveAliasSourceResult, ConfigMapKeyCreateParams, ConfigMapKeyCreateResult,

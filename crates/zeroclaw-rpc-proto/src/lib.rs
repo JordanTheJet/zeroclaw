@@ -99,8 +99,16 @@ pub mod feature {
     /// client declared on `initialize`.
     pub const TUI_CLIENT_KIND: &str = "tui.client_kind";
 
+    /// `config/set-many` takes a JSON Patch (`ops`) and a `drift_guard`, and
+    /// reports each operation's result and the validation warnings.
+    pub const CONFIG_PATCH_OPS: &str = "config.patch_ops";
+
+    /// `config/map-key-create` under `skill_bundles` also creates the
+    /// bundle's directory.
+    pub const CONFIG_SKILL_BUNDLE_DIR: &str = "config.skill_bundle_dir";
+
     /// Every extension this build's core supports.
-    pub const ALL: &[&str] = &[TUI_CLIENT_KIND];
+    pub const ALL: &[&str] = &[TUI_CLIENT_KIND, CONFIG_PATCH_OPS, CONFIG_SKILL_BUNDLE_DIR];
 
     #[cfg(test)]
     mod tests {
