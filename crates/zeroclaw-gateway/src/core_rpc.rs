@@ -107,7 +107,7 @@ const OIDC_BEARER_MESSAGE: &str =
 /// unchanged from the config route layer's.
 const INVALID_PROVIDER_MESSAGE: &str = "Invalid auth_provider selection";
 
-type DialFuture<'a> = Pin<Box<dyn Future<Output = Option<DuplexStream>> + Send + 'a>>;
+pub(crate) type DialFuture<'a> = Pin<Box<dyn Future<Output = Option<DuplexStream>> + Send + 'a>>;
 
 /// Opens a transport to the core. The in-process connector implements it;
 /// tests substitute their own.
