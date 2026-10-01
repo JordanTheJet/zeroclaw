@@ -179,8 +179,7 @@ async fn patch_both(pair: &Pair, headers: HeaderMap, body: Value) -> (Response, 
     )
     .await;
     let call = pair.call().await;
-    let through_core =
-        served(crate::api_config::patch_through_core(&call, &headers, body).await);
+    let through_core = served(crate::api_config::patch_through_core(&call, &headers, body).await);
     (in_process, through_core)
 }
 
@@ -301,7 +300,10 @@ async fn a_patch_of_a_drifted_path_is_refused_unless_overridden() {
     .await;
 
     let mut overriding = HeaderMap::new();
-    overriding.insert("x-zeroclaw-override-drift", HeaderValue::from_static("true"));
+    overriding.insert(
+        "x-zeroclaw-override-drift",
+        HeaderValue::from_static("true"),
+    );
     let (in_process, through_core) = patch_both(&pair, overriding, body).await;
     assert_parity(
         "a drifted path, overridden",
@@ -417,7 +419,12 @@ async fn a_map_key_create_answers_saves_and_scaffolds_alike() {
             "no_such_section",
             "x",
         ),
-        ("the reserved agent", StatusCode::BAD_REQUEST, "agents", "default"),
+        (
+            "the reserved agent",
+            StatusCode::BAD_REQUEST,
+            "agents",
+            "default",
+        ),
     ] {
         let pair = Pair::new(|_| {}).await;
         let query = || MapKeyQuery {
@@ -489,7 +496,9 @@ async fn the_quickstart_reads_answer_alike() {
     assert_parity(
         "the state",
         StatusCode::OK,
-        handle_state(State(pair.state.clone())).await.into_response(),
+        handle_state(State(pair.state.clone()))
+            .await
+            .into_response(),
         served(crate::api_quickstart::state_through_core(&call).await),
     )
     .await;
