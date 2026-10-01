@@ -258,6 +258,12 @@ pub struct ConnectOptions {
     /// [`RpcClient::connect_local`] sends it a credential (a token, a TUI
     /// signature, or forwarded environment), checked on every dial.
     pub endpoint_owner: EndpointOwner,
+    /// Check `endpoint_owner` even when this dial presents no credential:
+    /// for a launcher confirming that the daemon it started under its own
+    /// account, not some other account's listener, serves the endpoint.
+    /// Windows cannot verify the pipe server's account yet, so such a dial is
+    /// refused there.
+    pub verify_endpoint_owner: bool,
 }
 
 impl ConnectOptions {
@@ -382,7 +388,7 @@ impl RpcClient {
     /// handshake over an arbitrary socket or pipe is not public.
     pub async fn connect_local(path: &Path, options: ConnectOptions) -> Result<Self, ClientError> {
         let stream = open_local_stream(path).await?;
-        if options.carries_credential() {
+        if options.carries_credential() || options.verify_endpoint_owner {
             verify_local_endpoint(&stream, path, options.endpoint_owner)
                 .await
                 .map_err(|rejection| ClientError::UntrustedEndpoint {
@@ -1261,6 +1267,41 @@ mod tests {
             }
             assert!(bytes_seen(peer).await.is_empty(), "mode {mode:o}");
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_launcher_can_require_the_owner_check_without_a_credential() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("daemon.sock");
+        let other = own_uid(dir.path()).wrapping_add(1);
+
+        // Without the opt-in a credential-free dial is not gated.
+        let peer = listen_once(&path);
+        let unchecked = ConnectOptions {
+            endpoint_owner: EndpointOwner::Uid(other),
+            ..ConnectOptions::default()
+        };
+        RpcClient::connect_local(&path, unchecked.clone())
+            .await
+            .expect("a credential-free dial is not gated by default");
+        assert!(!bytes_seen(peer).await.is_empty());
+
+        // With it, the same dial must prove the endpoint's account first.
+        std::fs::remove_file(&path).expect("remove the first socket");
+        let peer = listen_once(&path);
+        let checked = ConnectOptions {
+            verify_endpoint_owner: true,
+            ..unchecked
+        };
+        match RpcClient::connect_local(&path, checked).await {
+            Err(ClientError::UntrustedEndpoint { rejection, .. }) => {
+                assert!(matches!(rejection, EndpointRejection::PeerUid { .. }));
+            }
+            Err(other) => panic!("expected UntrustedEndpoint, got {other}"),
+            Ok(_) => panic!("the opted-in dial must be refused"),
+        }
+        assert!(bytes_seen(peer).await.is_empty());
     }
 
     #[cfg(unix)]

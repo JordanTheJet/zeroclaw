@@ -36,4 +36,4 @@ pub use client::{
     DEFAULT_REQUEST_TIMEOUT, InboundRequest, Notification, RpcClient,
 };
 pub use verify::{EndpointOwner, EndpointRejection};
-pub use zeroclaw_rpc_proto::{Method, RPC_PROTOCOL_VERSION};
+pub use zeroclaw_rpc_proto::{Method, RPC_PROTOCOL_VERSION, error_codes};
