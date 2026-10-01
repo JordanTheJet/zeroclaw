@@ -23776,7 +23776,7 @@ mod tests {
                 .expect("the subscription listens");
         }
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-        while rx.len() < 1 || !changes.is_empty() {
+        while rx.is_empty() || !changes.is_empty() {
             assert!(
                 tokio::time::Instant::now() < deadline,
                 "the first change takes the room and the second is taken off the feed"
