@@ -45,6 +45,8 @@ pub mod preview;
 pub mod principal_gate;
 #[cfg(test)]
 mod refusal_parity;
+#[cfg(test)]
+mod config_write_parity;
 pub mod security_headers;
 pub mod session_queue;
 pub mod sse;
@@ -4874,6 +4876,76 @@ enum AdminReloadGate {
     ForbiddenNoPairing,
 }
 
+/// `/admin/reload`'s refusal of a remote caller the operator did not opt in.
+const REMOTE_ADMIN_RELOAD_DISABLED: &str = "Remote admin reload is disabled. Call from localhost, \
+     or set gateway.allow_remote_admin = true (with pairing \
+     enabled, then pair) to allow authenticated remote reloads.";
+
+/// `/admin/reload`'s answer when no daemon supervisor can reload.
+const NO_DAEMON_SUPERVISOR: &str = "no daemon supervisor — running as standalone gateway. \
+     Restart the process to pick up config changes.";
+
+/// `POST /admin/reload` through the core, for the standalone gateway: the
+/// core reloads, as the in-process route reloads the daemon. The route's
+/// admission stays at this edge (`admin_reload_gate`); a remote caller is
+/// admitted only when the core's `gateway.allow_remote_admin` is on, read on
+/// the caller's own connection. That gateway authenticates every caller, so
+/// pairing counts as on and a caller always presents a credential, which the
+/// core authorizes for the reload.
+pub(crate) async fn admin_reload_through_core(
+    core: &crate::core_rpc::CoreCall,
+    is_loopback: bool,
+) -> Result<axum::response::Response, crate::core_rpc::CoreError> {
+    let allow_remote_admin = if is_loopback {
+        false
+    } else {
+        let read: zeroclaw_rpc_proto::types::ConfigGetPropResult = core
+            .call(
+                zeroclaw_rpc_client::Method::ConfigGet,
+                serde_json::json!({ "prop": "gateway.allow_remote_admin" }),
+            )
+            .await?;
+        read.value.trim().eq_ignore_ascii_case("true")
+    };
+    match admin_reload_gate(is_loopback, allow_remote_admin, true) {
+        AdminReloadGate::Allow | AdminReloadGate::RequireAuth => {}
+        AdminReloadGate::Forbidden | AdminReloadGate::ForbiddenNoPairing => {
+            return Ok((
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({ "error": REMOTE_ADMIN_RELOAD_DISABLED })),
+            )
+                .into_response());
+        }
+    }
+    match core
+        .request(
+            zeroclaw_rpc_client::Method::ConfigReload,
+            serde_json::json!({}),
+        )
+        .await
+    {
+        Ok(_) => Ok((
+            StatusCode::OK,
+            Json(AdminResponse {
+                success: true,
+                message: "Daemon reload initiated".to_string(),
+            }),
+        )
+            .into_response()),
+        Err(error)
+            if error.reason()
+                == Some(zeroclaw_rpc_proto::error_reasons::RefusalReason::Disabled) =>
+        {
+            Ok((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({ "error": NO_DAEMON_SUPERVISOR })),
+            )
+                .into_response())
+        }
+        Err(error) => Err(error),
+    }
+}
+
 fn admin_reload_gate(
     is_loopback: bool,
     allow_remote_admin: bool,
@@ -4910,11 +4982,7 @@ async fn handle_admin_reload(
         AdminReloadGate::Forbidden => {
             return Err((
                 StatusCode::FORBIDDEN,
-                Json(serde_json::json!({
-                    "error": "Remote admin reload is disabled. Call from localhost, \
-                              or set gateway.allow_remote_admin = true (with pairing \
-                              enabled, then pair) to allow authenticated remote reloads."
-                })),
+                Json(serde_json::json!({ "error": REMOTE_ADMIN_RELOAD_DISABLED })),
             ));
         }
         AdminReloadGate::ForbiddenNoPairing => {
@@ -4934,10 +5002,7 @@ async fn handle_admin_reload(
     let Some(reload_tx) = state.reload_tx.clone() else {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({
-                "error": "no daemon supervisor — running as standalone gateway. \
-                          Restart the process to pick up config changes."
-            })),
+            Json(serde_json::json!({ "error": NO_DAEMON_SUPERVISOR })),
         ));
     };
 

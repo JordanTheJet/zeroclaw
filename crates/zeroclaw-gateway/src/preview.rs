@@ -36,10 +36,11 @@ use std::time::Duration;
 
 use axum::Json;
 use axum::Router;
+use axum::extract::rejection::{JsonRejection, QueryRejection};
 use axum::extract::{ConnectInfo, Query, State};
-use axum::http::{Method as HttpMethod, StatusCode, Uri};
+use axum::http::{HeaderMap, Method as HttpMethod, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{MethodFilter, MethodRouter, get, on, post};
+use axum::routing::{MethodFilter, MethodRouter, get, on, patch, post, put};
 use serde_json::json;
 use tokio::sync::watch;
 use zeroclaw_rpc_client::{
@@ -350,7 +351,6 @@ const REFUSED: &[(&str, &str, Refusal)] = &[
         Refusal::Deferred("a2a"),
     ),
     // Local administration of the core: use the zeroclaw CLI against it.
-    ("/admin/reload", "POST", Refusal::Deferred("admin")),
     ("/admin/sop/pending", "GET", Refusal::Deferred("admin")),
     ("/admin/sop/logs", "GET", Refusal::Deferred("admin")),
     ("/admin/sop/approve", "POST", Refusal::Deferred("admin")),
@@ -378,12 +378,8 @@ const REFUSED: &[(&str, &str, Refusal)] = &[
     ("/ws/chat", "GET", Refusal::NotPorted),
     ("/ws/sops/runs", "GET", Refusal::NotPorted),
     ("/ws/canvas/{id}", "GET", Refusal::NotPorted),
-    ("/api/config", "GET,PATCH,OPTIONS", Refusal::NotPorted),
-    (
-        "/api/config/prop",
-        "GET,PUT,DELETE,OPTIONS",
-        Refusal::NotPorted,
-    ),
+    ("/api/config", "GET,OPTIONS", Refusal::NotPorted),
+    ("/api/config/prop", "GET,OPTIONS", Refusal::NotPorted),
     ("/api/config/list", "GET", Refusal::NotPorted),
     ("/api/config/drift", "GET", Refusal::NotPorted),
     ("/api/config/reload-status", "GET", Refusal::NotPorted),
@@ -394,8 +390,9 @@ const REFUSED: &[(&str, &str, Refusal)] = &[
         "GET",
         Refusal::NotPorted,
     ),
-    ("/api/config/map-key", "POST,DELETE", Refusal::NotPorted),
-    ("/api/config/rename-map-key", "POST", Refusal::NotPorted),
+    // An alias delete waits on the core's owned-state cascade (an agent's
+    // memory, cron jobs, sessions and workspace) and its live-ACP refusal.
+    ("/api/config/map-key", "DELETE", Refusal::NotPorted),
     (
         "/api/config/model-providers/{type}/{alias}/refresh-context-window",
         "POST",
@@ -415,11 +412,6 @@ const REFUSED: &[(&str, &str, Refusal)] = &[
     ),
     ("/api/config/init", "POST", Refusal::NotPorted),
     ("/api/config/migrate", "POST", Refusal::NotPorted),
-    ("/api/quickstart/state", "GET", Refusal::NotPorted),
-    ("/api/quickstart/fields", "POST", Refusal::NotPorted),
-    ("/api/quickstart/validate", "POST", Refusal::NotPorted),
-    ("/api/quickstart/apply", "POST", Refusal::NotPorted),
-    ("/api/quickstart/dismiss", "POST", Refusal::NotPorted),
     ("/api/channels", "GET", Refusal::NotPorted),
     ("/api/channels/bind", "POST", Refusal::NotPorted),
     ("/api/channels/{channel}/relink", "POST", Refusal::NotPorted),
@@ -596,7 +588,23 @@ pub fn router(
         .route("/api/events/history", get(api_events_history))
         .route("/api/sessions", get(api_sessions_list))
         .route("/admin/shutdown", post(admin_shutdown))
-        .route("/hooks/claude-code", post(claude_code_hook));
+        .route("/admin/reload", post(admin_reload))
+        .route("/hooks/claude-code", post(claude_code_hook))
+        .route("/api/config", patch(api_config_patch))
+        .route(
+            "/api/config/prop",
+            put(api_config_prop_put).delete(api_config_prop_delete),
+        )
+        .route("/api/config/map-key", post(api_config_map_key_create))
+        .route(
+            "/api/config/rename-map-key",
+            post(api_config_rename_map_key),
+        )
+        .route("/api/quickstart/state", get(api_quickstart_state))
+        .route("/api/quickstart/fields", post(api_quickstart_fields))
+        .route("/api/quickstart/validate", post(api_quickstart_validate))
+        .route("/api/quickstart/apply", post(api_quickstart_apply))
+        .route("/api/quickstart/dismiss", post(api_quickstart_dismiss));
     for &(path, methods, refusal) in REFUSED {
         let handler: MethodRouter<PreviewState> = on(
             method_filter(methods),
@@ -924,6 +932,166 @@ async fn claude_code_hook(
     Json(payload): Json<zeroclaw_tools::claude_code_runner::ClaudeCodeHookEvent>,
 ) -> Json<serde_json::Value> {
     crate::api::claude_code_hook(&payload)
+}
+
+/// A request's query or JSON body, or the answer its rejection gets. Taken
+/// as a `Result` so a route checks the caller's credential first, as the
+/// in-process routes do behind their auth layer, and only then answers a
+/// malformed query or body exactly as their extractor rejects it.
+fn accepted<T>(extracted: Result<T, impl IntoResponse>) -> Result<T, Response> {
+    extracted.map_err(IntoResponse::into_response)
+}
+
+/// `PATCH /api/config`
+async fn api_config_patch(
+    access: Result<CoreAccess, CoreError>,
+    headers: HeaderMap,
+    body: Result<Json<serde_json::Value>, JsonRejection>,
+) -> Response {
+    served(access, |call| async move {
+        match accepted(body) {
+            Ok(Json(body)) => crate::api_config::patch_through_core(&call, &headers, body).await,
+            Err(rejected) => Ok(rejected),
+        }
+    })
+    .await
+}
+
+/// `PUT /api/config/prop`
+async fn api_config_prop_put(
+    access: Result<CoreAccess, CoreError>,
+    body: Result<Json<crate::api_config::PropPutBody>, JsonRejection>,
+) -> Response {
+    served(access, |call| async move {
+        match accepted(body) {
+            Ok(Json(body)) => crate::api_config::prop_put_through_core(&call, body).await,
+            Err(rejected) => Ok(rejected),
+        }
+    })
+    .await
+}
+
+/// `DELETE /api/config/prop`
+async fn api_config_prop_delete(
+    access: Result<CoreAccess, CoreError>,
+    query: Result<Query<crate::api_config::PropQuery>, QueryRejection>,
+) -> Response {
+    served(access, |call| async move {
+        match accepted(query) {
+            Ok(Query(q)) => crate::api_config::prop_delete_through_core(&call, q).await,
+            Err(rejected) => Ok(rejected),
+        }
+    })
+    .await
+}
+
+/// `POST /api/config/map-key`
+async fn api_config_map_key_create(
+    access: Result<CoreAccess, CoreError>,
+    query: Result<Query<crate::api_config::MapKeyQuery>, QueryRejection>,
+) -> Response {
+    served(access, |call| async move {
+        match accepted(query) {
+            Ok(Query(q)) => crate::api_config::map_key_create_through_core(&call, q).await,
+            Err(rejected) => Ok(rejected),
+        }
+    })
+    .await
+}
+
+/// `POST /api/config/rename-map-key`
+async fn api_config_rename_map_key(
+    access: Result<CoreAccess, CoreError>,
+    body: Result<Json<crate::api_config::RenameMapKeyBody>, JsonRejection>,
+) -> Response {
+    served(access, |call| async move {
+        match accepted(body) {
+            Ok(Json(body)) => crate::api_config::rename_map_key_through_core(&call, body).await,
+            Err(rejected) => Ok(rejected),
+        }
+    })
+    .await
+}
+
+/// `GET /api/quickstart/state`
+async fn api_quickstart_state(access: Result<CoreAccess, CoreError>) -> Response {
+    served(access, |call| async move {
+        crate::api_quickstart::state_through_core(&call).await
+    })
+    .await
+}
+
+/// `POST /api/quickstart/fields`
+async fn api_quickstart_fields(
+    access: Result<CoreAccess, CoreError>,
+    body: Result<Json<crate::api_quickstart::FieldsRequest>, JsonRejection>,
+) -> Response {
+    served(access, |call| async move {
+        match accepted(body) {
+            Ok(Json(req)) => crate::api_quickstart::fields_through_core(&call, req).await,
+            Err(rejected) => Ok(rejected),
+        }
+    })
+    .await
+}
+
+/// `POST /api/quickstart/validate`
+async fn api_quickstart_validate(
+    access: Result<CoreAccess, CoreError>,
+    body: Result<Json<zeroclaw_config::presets::BuilderSubmission>, JsonRejection>,
+) -> Response {
+    served(access, |call| async move {
+        match accepted(body) {
+            Ok(Json(submission)) => {
+                crate::api_quickstart::validate_through_core(&call, submission).await
+            }
+            Err(rejected) => Ok(rejected),
+        }
+    })
+    .await
+}
+
+/// `POST /api/quickstart/apply`
+async fn api_quickstart_apply(
+    access: Result<CoreAccess, CoreError>,
+    body: Result<Json<zeroclaw_config::presets::BuilderSubmission>, JsonRejection>,
+) -> Response {
+    served(access, |call| async move {
+        match accepted(body) {
+            Ok(Json(submission)) => {
+                crate::api_quickstart::apply_through_core(&call, submission).await
+            }
+            Err(rejected) => Ok(rejected),
+        }
+    })
+    .await
+}
+
+/// `POST /api/quickstart/dismiss`
+async fn api_quickstart_dismiss(
+    access: Result<CoreAccess, CoreError>,
+    body: Result<Json<crate::api_quickstart::DismissRequest>, JsonRejection>,
+) -> Response {
+    served(access, |call| async move {
+        match accepted(body) {
+            Ok(Json(req)) => crate::api_quickstart::dismiss_through_core(&call, req).await,
+            Err(rejected) => Ok(rejected),
+        }
+    })
+    .await
+}
+
+/// `POST /admin/reload`: the core reloads. A caller on loopback is admitted;
+/// one from elsewhere only when the core allows remote admin. Every caller
+/// presents its own credential, which the core authorizes for the reload.
+async fn admin_reload(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    access: Result<CoreAccess, CoreError>,
+) -> Response {
+    served(access, |call| async move {
+        crate::admin_reload_through_core(&call, peer.ip().is_loopback()).await
+    })
+    .await
 }
 
 /// `GET /api/gateway/core`: which principal the caller's credential binds,

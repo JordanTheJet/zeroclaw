@@ -147,7 +147,17 @@ const SERVED: &[&str] = &[
     "/api/events/history",
     "/api/sessions",
     "/admin/shutdown",
+    "/admin/reload",
     "/hooks/claude-code",
+    "/api/config",
+    "/api/config/prop",
+    "/api/config/map-key",
+    "/api/config/rename-map-key",
+    "/api/quickstart/state",
+    "/api/quickstart/fields",
+    "/api/quickstart/validate",
+    "/api/quickstart/apply",
+    "/api/quickstart/dismiss",
 ];
 
 /// Route paths the in-process gateway registers with a string literal, from
