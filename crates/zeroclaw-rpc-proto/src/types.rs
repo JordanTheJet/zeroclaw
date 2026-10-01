@@ -442,8 +442,8 @@ rpc_type! {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub plane: Option<String>,
         /// When set, each entry's `content` is cut to at most this many
-        /// characters, ending in `...` when cut, instead of the default
-        /// 200-byte preview.
+        /// characters instead of the default 200-byte preview, ending in
+        /// `...` when cut and the bound has room for it (3 or more).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub content_max_chars: Option<usize>,
     }
@@ -475,8 +475,8 @@ rpc_type! {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub plane: Option<String>,
         /// When set, each entry's `content` is cut to at most this many
-        /// characters, ending in `...` when cut, instead of the default
-        /// 200-byte preview; see `MemoryListParams::content_max_chars`.
+        /// characters instead of the default 200-byte preview; see
+        /// `MemoryListParams::content_max_chars`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub content_max_chars: Option<usize>,
     }

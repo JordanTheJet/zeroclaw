@@ -821,10 +821,13 @@ async fn an_unknown_job_is_not_found_alike() {
 #[tokio::test]
 async fn cron_runs_through_the_core_match_the_in_process_body() {
     let harness = Harness::new(None);
-    let config = harness.config();
+    // More runs than the route lists at most (100), kept past the default
+    // history cap, so the upper clamp shows.
+    let mut config = harness.config();
+    config.scheduler.max_run_history = 200;
     let job = harness.add_job("parity-runs");
     let started = chrono::Utc::now();
-    for index in 0..3_i64 {
+    for index in 0..101_i64 {
         zeroclaw_runtime::cron::record_run(
             &config,
             &job.id,
@@ -866,10 +869,10 @@ async fn cron_runs_through_the_core_match_the_in_process_body() {
     };
     // The default, the clamp at both ends, and a job whose row is gone.
     for (id, limit, listed) in [
-        (job.id.clone(), None, 3),
+        (job.id.clone(), None, 20),
         (job.id.clone(), Some(0), 1),
         (job.id.clone(), Some(2), 2),
-        (job.id.clone(), Some(500), 3),
+        (job.id.clone(), Some(500), 100),
         (retained.clone(), None, 1),
     ] {
         let in_process = runs(id.clone(), limit, CoreAccess::InProcess).await;
@@ -1028,16 +1031,20 @@ async fn memory_routes_through_the_core_match_the_in_process_bodies() {
     let content = long_entry["content"].as_str().expect("content");
     assert_eq!(content.chars().count(), 4096);
     assert!(content.ends_with("..."));
-    let core_entry = body["entries"]
-        .as_array()
-        .expect("entries")
-        .iter()
-        .find(|entry| entry["key"] == "parity-a")
-        .expect("stored without a category");
-    assert_eq!(core_entry["category"], "core", "{body}");
+    // Stored without a category, in-process (`parity-a`) or through the core
+    // (`parity-b`), an entry files under `core` either way.
+    for key in ["parity-a", "parity-b"] {
+        let entry = body["entries"]
+            .as_array()
+            .expect("entries")
+            .iter()
+            .find(|entry| entry["key"] == key)
+            .unwrap_or_else(|| panic!("{key} stored: {body}"));
+        assert_eq!(entry["category"], "core", "{key}: {body}");
+    }
 
     // An agent that does not exist: refused as a bad request either way, with
-    // the same message. (The core's body adds its error code.)
+    // the same body.
     let in_process = harness
         .memory_list(
             memory_query(None, None, Some("no-such-agent")),
@@ -1051,8 +1058,7 @@ async fn memory_routes_through_the_core_match_the_in_process_bodies() {
         )
         .await;
     assert_eq!(in_process.0, StatusCode::BAD_REQUEST, "{}", in_process.1);
-    assert_eq!(core.0, in_process.0, "{}", core.1);
-    assert_eq!(core.1["error"], in_process.1["error"]);
+    assert_eq!(core, in_process, "an unknown agent is refused alike");
 
     // Deleting reports whether an entry was there.
     let in_process = harness

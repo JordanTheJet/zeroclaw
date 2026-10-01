@@ -2119,7 +2119,7 @@
             ]
           },
           "content_max_chars": {
-            "description": "When set, each entry's `content` is cut to at most this many\ncharacters, ending in `...` when cut, instead of the default\n200-byte preview.",
+            "description": "When set, each entry's `content` is cut to at most this many\ncharacters instead of the default 200-byte preview, ending in\n`...` when cut and the bound has room for it (3 or more).",
             "format": "uint",
             "minimum": 0,
             "type": [
@@ -2171,7 +2171,7 @@
             ]
           },
           "content_max_chars": {
-            "description": "When set, each entry's `content` is cut to at most this many\ncharacters, ending in `...` when cut, instead of the default\n200-byte preview; see `MemoryListParams::content_max_chars`.",
+            "description": "When set, each entry's `content` is cut to at most this many\ncharacters instead of the default 200-byte preview; see\n`MemoryListParams::content_max_chars`.",
             "format": "uint",
             "minimum": 0,
             "type": [
@@ -5130,7 +5130,7 @@
           "name": "content_max_chars",
           "required": false,
           "schema": {
-            "description": "When set, each entry's `content` is cut to at most this many\ncharacters, ending in `...` when cut, instead of the default\n200-byte preview.",
+            "description": "When set, each entry's `content` is cut to at most this many\ncharacters instead of the default 200-byte preview, ending in\n`...` when cut and the bound has room for it (3 or more).",
             "format": "uint",
             "minimum": 0,
             "type": [
@@ -5203,7 +5203,7 @@
           "name": "content_max_chars",
           "required": false,
           "schema": {
-            "description": "When set, each entry's `content` is cut to at most this many\ncharacters, ending in `...` when cut, instead of the default\n200-byte preview; see `MemoryListParams::content_max_chars`.",
+            "description": "When set, each entry's `content` is cut to at most this many\ncharacters instead of the default 200-byte preview; see\n`MemoryListParams::content_max_chars`.",
             "format": "uint",
             "minimum": 0,
             "type": [

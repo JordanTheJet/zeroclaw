@@ -12166,11 +12166,10 @@ fn to_result<T: Serialize>(val: T) -> RpcResult {
 
 const MEMORY_PREVIEW_CONTENT_BYTES: usize = 200;
 
-/// Truncate each entry's `content` to the preview budget. Operates
-/// in place to avoid a second allocation per entry.
 /// Each entry's `content` for a memory listing: the default 200-byte preview,
 /// or, when the caller asks for a character bound, at most that many
-/// characters, ending in `...` when cut.
+/// characters. A cut entry ends in `...` when the bound has room for it;
+/// below 3 it keeps that many characters of the content.
 fn truncate_memory_contents(
     entries: Vec<zeroclaw_api::memory_traits::MemoryEntry>,
     content_max_chars: Option<usize>,
@@ -12178,24 +12177,29 @@ fn truncate_memory_contents(
     let Some(max_chars) = content_max_chars else {
         return truncate_memory_previews(entries);
     };
+    let (keep, ellipsis) = match max_chars.checked_sub(3) {
+        Some(keep) => (keep, "..."),
+        None => (max_chars, ""),
+    };
     entries
         .into_iter()
         .map(|mut entry| {
             if entry.content.char_indices().nth(max_chars).is_some() {
-                let keep = max_chars.saturating_sub(3);
                 let cut = entry
                     .content
                     .char_indices()
                     .nth(keep)
                     .map_or(entry.content.len(), |(index, _)| index);
                 entry.content.truncate(cut);
-                entry.content.push_str("...");
+                entry.content.push_str(ellipsis);
             }
             entry
         })
         .collect()
 }
 
+/// Truncate each entry's `content` to the preview budget. Operates
+/// in place to avoid a second allocation per entry.
 fn truncate_memory_previews(
     mut entries: Vec<zeroclaw_api::memory_traits::MemoryEntry>,
 ) -> Vec<zeroclaw_api::memory_traits::MemoryEntry> {
@@ -14098,6 +14102,39 @@ mod tests {
         )
         .await;
         not_found(&response, absent);
+    }
+
+    /// A memory listing's `content_max_chars` bounds each entry's content: a
+    /// cut entry ends in `...` when the bound has room for it, and below
+    /// that keeps as many characters as the bound allows.
+    #[test]
+    fn memory_content_bounds_hold_below_the_ellipsis() {
+        let entry = |content: &str| -> zeroclaw_api::memory_traits::MemoryEntry {
+            serde_json::from_value(json!({
+                "id": "1",
+                "key": "note",
+                "content": content,
+                "category": "core",
+                "timestamp": "2026-10-01T00:00:00Z",
+                "session_id": null,
+                "score": null,
+            }))
+            .expect("a memory entry")
+        };
+        for (bound, expected) in [
+            (0, ""),
+            (1, "a"),
+            (2, "ab"),
+            (3, "..."),
+            (4, "a..."),
+            (5, "ab..."),
+            (6, "abcdef"),
+            (7, "abcdef"),
+        ] {
+            let cut = truncate_memory_contents(vec![entry("abcdef")], Some(bound));
+            assert_eq!(cut[0].content, expected, "bound {bound}");
+            assert!(cut[0].content.chars().count() <= bound, "bound {bound}");
+        }
     }
 
     fn enforcement_ctx(config: zeroclaw_config::schema::Config) -> Arc<RpcContext> {

@@ -1150,6 +1150,38 @@ mod against_a_core {
         core.stop().await;
     }
 
+    /// Without a credential, a malformed body on either write is refused for
+    /// the credential, `401`, as the in-process gateway's authentication
+    /// answers before any handler reads the body.
+    #[tokio::test]
+    async fn a_bad_body_without_a_credential_is_refused_for_the_credential() {
+        let tmp = tempfile::tempdir().unwrap();
+        let core = Core::start(tmp.path()).await;
+        let preview = router(
+            CoreRpc::local(core.endpoint.clone(), EndpointOwner::SameAccount),
+            core.endpoint.clone(),
+            None,
+            watch::channel(false).0,
+            Duration::from_secs(crate::REQUEST_TIMEOUT_SECS),
+            Duration::from_secs(crate::LONG_RUNNING_REQUEST_TIMEOUT_SECS),
+        );
+        for (method, path) in [("PATCH", "/api/cron/settings"), ("POST", "/api/memory")] {
+            let request = Request::builder()
+                .method(method)
+                .uri(path)
+                .header("content-type", "application/json")
+                .body(Body::from("{not json"))
+                .unwrap();
+            let response = preview.clone().oneshot(request).await.unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{method} {path}"
+            );
+        }
+        core.stop().await;
+    }
+
     /// A manual run that takes longer than the core call's default deadline
     /// (30 s) answers with its result, through the separate gateway and
     /// through the in-process route's core path alike, within the

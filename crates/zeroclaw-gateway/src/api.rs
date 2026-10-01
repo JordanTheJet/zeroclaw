@@ -654,7 +654,7 @@ pub async fn handle_api_cron_runs(
     }
 
     match zeroclaw_runtime::cron::list_runs(&config, &id, limit) {
-        Ok(runs) => cron_runs_response(&runs),
+        Ok(runs) => cron_runs_response(runs.iter().map(CronRunRow::from).collect()),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": format!("Failed to list cron runs: {e}")})),
@@ -1351,13 +1351,60 @@ pub(crate) async fn api_cron_runs_through_core(
             serde_json::json!({ "id": id, "limit": cron_runs_limit(params) }),
         )
         .await?;
-    Ok(cron_runs_response(&listed.runs))
+    Ok(cron_runs_response(listed.runs))
 }
 
-/// The `cron/runs` result, read back into the runtime's own run records.
+/// The `cron/runs` result, read from its wire form alone.
 #[derive(Deserialize)]
 struct CronRunsListed {
-    runs: Vec<zeroclaw_runtime::cron::CronRun>,
+    runs: Vec<CronRunRow>,
+}
+
+/// One run as `cron/runs` puts it on the wire, which is what this route
+/// lists. Read without the runtime's own run record, so the core path needs
+/// only the wire format; the in-process path converts its records into it.
+#[derive(Deserialize)]
+struct CronRunRow {
+    id: i64,
+    job_id: String,
+    started_at: chrono::DateTime<chrono::Utc>,
+    finished_at: chrono::DateTime<chrono::Utc>,
+    status: String,
+    output: Option<String>,
+    duration_ms: Option<i64>,
+    #[serde(default)]
+    execution: Option<String>,
+    #[serde(default)]
+    delivery: Option<String>,
+    #[serde(default)]
+    persistence: Option<String>,
+    /// The initiating principal, as the core serializes it.
+    #[serde(default)]
+    principal: Option<serde_json::Value>,
+    #[serde(default)]
+    executing_agent: Option<String>,
+}
+
+impl From<&zeroclaw_runtime::cron::CronRun> for CronRunRow {
+    fn from(run: &zeroclaw_runtime::cron::CronRun) -> Self {
+        Self {
+            id: run.id,
+            job_id: run.job_id.clone(),
+            started_at: run.started_at,
+            finished_at: run.finished_at,
+            status: run.status.clone(),
+            output: run.output.clone(),
+            duration_ms: run.duration_ms,
+            execution: run.execution.clone(),
+            delivery: run.delivery.clone(),
+            persistence: run.persistence.clone(),
+            principal: run
+                .principal
+                .as_ref()
+                .and_then(|principal| serde_json::to_value(principal).ok()),
+            executing_agent: run.executing_agent.clone(),
+        }
+    }
 }
 
 /// How many runs `GET /api/cron/{id}/runs` lists: 20 by default, between 1
@@ -1367,9 +1414,9 @@ fn cron_runs_limit(params: &CronRunsQuery) -> u32 {
 }
 
 /// The route's body for a job's runs, whichever path read them.
-fn cron_runs_response(runs: &[zeroclaw_runtime::cron::CronRun]) -> Response {
+fn cron_runs_response(runs: Vec<CronRunRow>) -> Response {
     let runs: Vec<serde_json::Value> = runs
-        .iter()
+        .into_iter()
         .map(|run| {
             serde_json::json!({
                 "id": run.id,

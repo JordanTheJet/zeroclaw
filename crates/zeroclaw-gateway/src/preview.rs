@@ -30,6 +30,7 @@ use std::time::Duration;
 
 use axum::Json;
 use axum::Router;
+use axum::extract::rejection::JsonRejection;
 use axum::extract::{ConnectInfo, Path as UrlPath, Query, State};
 use axum::http::{Method as HttpMethod, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
@@ -924,13 +925,17 @@ async fn api_cron_settings(access: Result<CoreAccess, CoreError>) -> Response {
     .await
 }
 
-/// `PATCH /api/cron/settings`
+/// `PATCH /api/cron/settings`. A malformed body is answered only after the
+/// credential, as the in-process gateway's authentication runs first.
 async fn api_cron_settings_patch(
     access: Result<CoreAccess, CoreError>,
-    Json(body): Json<serde_json::Value>,
+    body: Result<Json<serde_json::Value>, JsonRejection>,
 ) -> Response {
     served(access, |call| async move {
-        crate::api::api_cron_settings_patch_through_core(&call, &body).await
+        match body {
+            Ok(Json(body)) => crate::api::api_cron_settings_patch_through_core(&call, &body).await,
+            Err(rejection) => Ok(rejection.into_response()),
+        }
     })
     .await
 }
@@ -985,13 +990,17 @@ async fn api_memory_list(
     .await
 }
 
-/// `POST /api/memory`
+/// `POST /api/memory`. A malformed body is answered only after the
+/// credential, as on `PATCH /api/cron/settings`.
 async fn api_memory_store(
     access: Result<CoreAccess, CoreError>,
-    Json(body): Json<MemoryStoreBody>,
+    body: Result<Json<MemoryStoreBody>, JsonRejection>,
 ) -> Response {
     served(access, |call| async move {
-        crate::api::api_memory_store_through_core(&call, &body).await
+        match body {
+            Ok(Json(body)) => crate::api::api_memory_store_through_core(&call, &body).await,
+            Err(rejection) => Ok(rejection.into_response()),
+        }
     })
     .await
 }
