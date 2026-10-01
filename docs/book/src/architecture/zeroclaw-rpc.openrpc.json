@@ -224,13 +224,6 @@
       },
       "CatalogModelsParams": {
         "properties": {
-          "alias": {
-            "description": "A configured alias of `model_provider`. When given, the catalog is\nlisted through the `<model_provider>.<alias>` profile, with that\nprofile's endpoint and credential; the result still names the bare\n`model_provider`. Omitted or blank lists the provider family.",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
           "model_provider": {
             "description": "Accepts `model_provider` or aliased `provider` (gateway compat).",
             "type": "string"
@@ -6279,17 +6272,6 @@
           "schema": {
             "description": "Accepts `model_provider` or aliased `provider` (gateway compat).",
             "type": "string"
-          }
-        },
-        {
-          "name": "alias",
-          "required": false,
-          "schema": {
-            "description": "A configured alias of `model_provider`. When given, the catalog is\nlisted through the `<model_provider>.<alias>` profile, with that\nprofile's endpoint and credential; the result still names the bare\n`model_provider`. Omitted or blank lists the provider family.",
-            "type": [
-              "string",
-              "null"
-            ]
           }
         }
       ],

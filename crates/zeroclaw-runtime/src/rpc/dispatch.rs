@@ -9003,18 +9003,12 @@ impl RpcDispatcher {
     async fn handle_config_catalog_models(&self, params: &Value) -> RpcResult {
         let req: CatalogModelsParams = parse_params(params)?;
         let local = crate::quickstart::model_provider_is_local(&req.model_provider);
-        // A selected alias lists through its own profile (endpoint, credential,
-        // headers), as the gateway's catalog route does.
-        let catalog_ref = match req.alias.as_deref().map(str::trim) {
-            Some(alias) if !alias.is_empty() => format!("{}.{alias}", req.model_provider),
-            _ => req.model_provider.clone(),
-        };
         // Snapshot config so the catalog can resolve the alias credential and
         // reach the native /models endpoint (surfacing new native-only models
         // that models.dev may not carry yet) rather than silently falling back.
         let config = self.ctx.config.read().clone();
         let (models, pricing, live) =
-            crate::quickstart::model_catalog_with_config_result(Some(&config), &catalog_ref)
+            crate::quickstart::model_catalog_with_config_result(Some(&config), &req.model_provider)
                 .await
                 .map_err(|error| rpc_err(INVALID_PARAMS, error.to_string()))?;
         to_result(CatalogModelsResult {
