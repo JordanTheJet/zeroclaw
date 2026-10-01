@@ -22,9 +22,14 @@ same function, so for the same data directory they agree. The Windows hash
 input is fixed, so the name is the same for every release and toolchain:
 
 - `data_dir` as UTF-16 code units, read without loss.
-- Spellings of one directory made equal: `\` and `/` both separate, repeated
-  and trailing separators and `.` components are dropped. Verbatim `\\?\`
-  paths separate only on `\` and keep `.`. `..` is not resolved.
+- The Windows prefix read first, keeping its kind: a drive (`C:`), UNC
+  (`\\server\share`), device namespace (`\\.\name`) or verbatim (`\\?\...`).
+  So `C:\` (the drive's root) and `C:` (its current directory) differ, a
+  device path never reads as UNC, and a verbatim path differs from its plain
+  spelling, because Windows does not normalize verbatim paths.
+- After the prefix, spellings of one directory made equal: `\` and `/` both
+  separate, repeated and trailing separators and `.` components are dropped.
+  Verbatim paths separate only on `\` and keep `.`. `..` is not resolved.
 - ASCII letters lower-cased. Other letters keep their case, because Windows
   folds them per volume and a directory can be case-sensitive.
 - Each unit hashed as two little-endian bytes.
