@@ -1728,10 +1728,11 @@ pub async fn handle_api_health(
 //   The listing moves to the core once the core scopes such a connection's
 //   view by its principal. The rows already take the core's `SessionEntry`
 //   shape, so that move changes only where they come from.
-// - The routes that address one session by id: the core resolves a session id by trying `rpc_{id}`, `gw_{id}` and `{id}`
-//   in turn, so it cannot be told to act on exactly the row this gateway's
-//   resolver picked. A competing row with another prefix would be read or
-//   deleted instead. That needs an exact durable-row reference in the core.
+// - The routes that address one session by id: the core resolves a session
+//   id by trying `rpc_{id}`, `gw_{id}` and `{id}` in turn, so it cannot be
+//   told to act on exactly the row this gateway's resolver picked. A
+//   competing row with another prefix would be read or deleted instead. That
+//   needs an exact durable-row reference in the core.
 // - A delete must first cancel and wait for the gateway's own chat turn,
 //   which only the gateway can do, while only the core can authorize the
 //   delete. Until those turns run in the core, the two cannot be made one
