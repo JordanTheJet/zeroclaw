@@ -22,14 +22,20 @@ same function, so for the same data directory they agree. The Windows hash
 input is fixed, so the name is the same for every release and toolchain:
 
 - `data_dir` as UTF-16 code units, read without loss.
-- The Windows prefix read first, keeping its kind: a drive (`C:`), UNC
-  (`\\server\share`), device namespace (`\\.\name`) or verbatim (`\\?\...`).
-  So `C:\` (the drive's root) and `C:` (its current directory) differ, a
-  device path never reads as UNC, and a verbatim path differs from its plain
-  spelling, because Windows does not normalize verbatim paths.
+- The Windows prefix read first: a drive (`C:`), UNC (`\\server\share`),
+  device namespace (`\\.\name`) or verbatim (`\\?\...`, only with exactly
+  that spelling; `//?/C:/x` is UNC with the server `?`). `C:\` (the drive's
+  root) and `C:` (its current directory) differ.
 - After the prefix, spellings of one directory made equal: `\` and `/` both
   separate, repeated and trailing separators and `.` components are dropped.
   Verbatim paths separate only on `\` and keep `.`. `..` is not resolved.
+  Trailing dots and spaces are kept, although Windows trims them from plain
+  paths, so `C:\x.` gets its own pipe rather than sharing `C:\x`'s.
+- The prefix's kind recorded in the key: device and verbatim paths are keyed
+  with their kind, so a device path never shares a pipe with a UNC path, and
+  a verbatim path never shares one with a plain spelling. Windows does not
+  normalize verbatim paths, so `\\?\C:\x.` and `C:\x.` are different
+  directories.
 - ASCII letters lower-cased. Other letters keep their case, because Windows
   folds them per volume and a directory can be case-sensitive.
 - Each unit hashed as two little-endian bytes.

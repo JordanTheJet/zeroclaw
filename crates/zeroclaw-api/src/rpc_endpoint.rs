@@ -71,26 +71,32 @@ pub fn default_endpoint(data_dir: &Path) -> PathBuf {
 /// 2. The Windows prefix is read first, by the kinds `std::path::Prefix`
 ///    distinguishes: verbatim (`\\?\C:`, `\\?\UNC\server\share`,
 ///    `\\?\name`), device namespace (`\\.\name`), UNC (`\\server\share`) or
-///    a drive (`C:`). It keeps its kind and its structure, so `\\.\name`
-///    never reads as a UNC path, and `C:\` (the drive's root) stays apart
-///    from `C:` (the drive's current directory). Verbatim, device and UNC
+///    a drive (`C:`). Only the exact `\\?\` spelling is verbatim; as in std,
+///    `//?/C:/x` is UNC with the server `?`. The `UNC` of a verbatim UNC
+///    path matches in any case, as on Windows. Verbatim, device and UNC
 ///    prefixes root the path; after a drive or with no prefix, a separator
-///    does. Two separators without a share (`\\server`) are no prefix, as
+///    does, so `C:\` (the drive's root) and `C:` (its current directory)
+///    differ. Two separators without a share (`\\server`) are no prefix, as
 ///    in std, and only root the path.
 /// 3. The components after the prefix are made equal across spellings
 ///    Windows treats as one directory: `\` and `/` both separate, and empty
 ///    and `.` components are dropped, which covers repeated and trailing
 ///    separators. A verbatim path separates only on `\` and keeps `.`,
-///    because Windows takes it as written. For the same reason a verbatim
-///    path and its plain spelling (`\\?\C:\x` and `C:\x`) stay distinct:
-///    the verbatim form skips Windows' own normalization, so the two do not
-///    always name one directory (`\\?\C:\x.` keeps the trailing dot that
-///    `C:\x.` loses).
-/// 4. ASCII letters are lower-cased, so drive letters and ASCII names match
+///    because Windows takes it as written. Trailing dots and spaces, which
+///    Windows trims from a plain path's components, are kept: `C:\x.` and
+///    `C:\x` get different pipes although Windows opens one directory for
+///    both, which errs toward a missed daemon rather than a shared pipe.
+/// 4. The key records the prefix's kind. A plain path (relative, rooted,
+///    drive or UNC) is keyed by its canonical spelling; a device or verbatim
+///    path's key starts with `/` and the kind's name, which no plain key can.
+///    So `\\.\name` never shares a key with a UNC path, and a verbatim path
+///    (which skips Windows' normalization: `\\?\C:\x.` keeps the trailing
+///    dot that `C:\x.` loses) never shares one with a plain spelling.
+/// 5. ASCII letters are lower-cased, so drive letters and ASCII names match
 ///    in either case. Other letters are left alone: Windows folds them with a
 ///    per-volume table that cannot be reproduced stably, and a directory can
 ///    be case-sensitive.
-/// 5. Each unit is hashed as two little-endian bytes.
+/// 6. Each unit is hashed as two little-endian bytes.
 ///
 /// `..` is not resolved and links are not followed; both need the
 /// filesystem. The function is defined on every platform so its values can
@@ -124,83 +130,157 @@ const DOT: u16 = b'.' as u16;
 const COLON: u16 = b':' as u16;
 const QUESTION: u16 = b'?' as u16;
 
-/// Steps 2 to 4 of [`pipe_name`]: one spelling per directory. The key is the
-/// prefix in its canonical spelling, a `\` when the path is rooted, and the
-/// remaining components joined by `\`.
+/// Steps 2 to 5 of [`pipe_name`]: one key per directory, and a different key
+/// for a different kind of path, by construction.
+///
+/// A plain path (relative, rooted, drive or UNC) is keyed by its canonical
+/// spelling: the prefix, a `\` when the path is rooted, and the components
+/// joined by `\`. That spelling never contains `/`: every plain component,
+/// and a UNC server and share, is split at `/`.
+///
+/// A device-namespace or verbatim path is keyed as `/`, its kind, `/`, and
+/// then its prefix fields and components joined by `\`. No plain key starts
+/// with `/`, and no kind contains one, so keys of different kinds never
+/// meet, whatever text the components hold. Within a kind, the fields and
+/// components contain no `\`, so the key reads back to one path.
 fn pipe_key(units: &[u16]) -> Vec<u16> {
     let Prefixed {
         prefix,
         rest,
         rooted,
-        verbatim,
     } = split_prefix(units);
-    let mut key = prefix;
-    if rooted {
-        key.push(BACKSLASH);
-    }
+    let verbatim = prefix.is_verbatim();
     let components = rest
         .split(|unit| is_separator(*unit, verbatim))
         .filter(|component| !component.is_empty() && (verbatim || component[..] != [DOT]));
-    for (index, component) in components.enumerate() {
+
+    let drive_field: [u16; 2];
+    let mut key = Vec::new();
+    let mut fields: Vec<&[u16]> = Vec::new();
+    let kind = match prefix {
+        Prefix::None => None,
+        Prefix::Disk(letter) => {
+            key.extend([letter, COLON]);
+            None
+        }
+        Prefix::Unc(server, share) => {
+            key.extend([BACKSLASH, BACKSLASH]);
+            key.extend_from_slice(server);
+            key.push(BACKSLASH);
+            key.extend_from_slice(share);
+            None
+        }
+        Prefix::DeviceNs(name) => {
+            fields.push(name);
+            Some("device")
+        }
+        Prefix::Verbatim(name) => {
+            fields.push(name);
+            Some("verbatim")
+        }
+        Prefix::VerbatimDisk(letter) => {
+            drive_field = [letter, COLON];
+            fields.push(&drive_field);
+            Some("verbatim-disk")
+        }
+        Prefix::VerbatimUnc(server, share) => {
+            fields.extend([server, share]);
+            Some("verbatim-unc")
+        }
+    };
+    match kind {
+        None => {
+            if rooted {
+                key.push(BACKSLASH);
+            }
+        }
+        Some(kind) => {
+            key.push(SLASH);
+            key.extend(kind.bytes().map(u16::from));
+            key.push(SLASH);
+        }
+    }
+    for (index, part) in fields.into_iter().chain(components).enumerate() {
         if index > 0 {
             key.push(BACKSLASH);
         }
-        key.extend_from_slice(component);
+        key.extend_from_slice(part);
     }
     key.into_iter().map(fold_ascii).collect()
 }
 
+/// A path's Windows prefix, by the kinds `std::path::Prefix` distinguishes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Prefix<'a> {
+    /// No prefix: a relative path, or one rooted by a leading separator.
+    None,
+    /// `C:`
+    Disk(u16),
+    /// `\\server\share`
+    Unc(&'a [u16], &'a [u16]),
+    /// `\\.\name`
+    DeviceNs(&'a [u16]),
+    /// `\\?\name`
+    Verbatim(&'a [u16]),
+    /// `\\?\C:`
+    VerbatimDisk(u16),
+    /// `\\?\UNC\server\share`
+    VerbatimUnc(&'a [u16], &'a [u16]),
+}
+
+impl Prefix<'_> {
+    /// Whether only `\` separates and `.` components stay: Windows takes a
+    /// verbatim path as written.
+    fn is_verbatim(self) -> bool {
+        matches!(
+            self,
+            Self::Verbatim(_) | Self::VerbatimDisk(_) | Self::VerbatimUnc(..)
+        )
+    }
+}
+
 /// A path split after its Windows prefix.
 struct Prefixed<'a> {
-    /// The prefix in canonical spelling: `\` separators, `UNC` and drive
-    /// letters as written (the key folds case afterwards). Empty when the
-    /// path has none.
-    prefix: Vec<u16>,
+    prefix: Prefix<'a>,
     /// Everything after the prefix and the separator that ends it.
     rest: &'a [u16],
+    /// Always for verbatim, device and UNC prefixes; after a drive or with no
+    /// prefix, when a separator comes next.
     rooted: bool,
-    /// Whether only `\` separates and `.` components stay.
-    verbatim: bool,
 }
 
 /// Read the prefix the way `std::path::Prefix` does on Windows, on any host.
+/// Only the exact `\\?\` spelling is verbatim; `//?/` and mixed spellings
+/// read as UNC with the server `?`, as in std.
 fn split_prefix(units: &[u16]) -> Prefixed<'_> {
     const VERBATIM: [u16; 4] = [BACKSLASH, BACKSLASH, QUESTION, BACKSLASH];
     const UNC: [u8; 4] = *b"UNC\\";
 
     if let Some(after) = units.strip_prefix(&VERBATIM[..]) {
-        let mut prefix = VERBATIM.to_vec();
-        let rest = if after.len() >= UNC.len()
+        let (prefix, rest) = if after.len() >= UNC.len()
             && after
                 .iter()
                 .zip(UNC)
                 .all(|(&unit, byte)| fold_ascii(unit) == fold_ascii(u16::from(byte)))
         {
-            // \\?\UNC\server\share
             let (server, after_server) = next_component(&after[UNC.len()..], true);
             let (share, rest) = next_component(after_server, true);
-            prefix.extend(UNC.map(u16::from));
-            prefix.extend_from_slice(server);
-            prefix.push(BACKSLASH);
-            prefix.extend_from_slice(share);
-            rest
+            (Prefix::VerbatimUnc(server, share), rest)
         } else if let Some(letter) = drive(after)
             && after.get(2).is_none_or(|&unit| unit == BACKSLASH)
         {
-            // \\?\C:
-            prefix.extend([letter, COLON]);
-            after.get(3..).unwrap_or_default()
+            (
+                Prefix::VerbatimDisk(letter),
+                after.get(3..).unwrap_or_default(),
+            )
         } else {
-            // \\?\name
             let (name, rest) = next_component(after, true);
-            prefix.extend_from_slice(name);
-            rest
+            (Prefix::Verbatim(name), rest)
         };
         return Prefixed {
             prefix,
             rest,
             rooted: true,
-            verbatim: true,
         };
     }
 
@@ -211,44 +291,33 @@ fn split_prefix(units: &[u16]) -> Prefixed<'_> {
         if let [DOT, separator, after_dot @ ..] = after
             && is_separator(*separator, false)
         {
-            // \\.\name
             let (name, rest) = next_component(after_dot, false);
-            let mut prefix = vec![BACKSLASH, BACKSLASH, DOT, BACKSLASH];
-            prefix.extend_from_slice(name);
             return Prefixed {
-                prefix,
+                prefix: Prefix::DeviceNs(name),
                 rest,
                 rooted: true,
-                verbatim: false,
             };
         }
         let (server, after_server) = next_component(after, false);
         let (share, rest) = next_component(after_server, false);
         if !server.is_empty() && !share.is_empty() {
-            // \\server\share
-            let mut prefix = vec![BACKSLASH, BACKSLASH];
-            prefix.extend_from_slice(server);
-            prefix.push(BACKSLASH);
-            prefix.extend_from_slice(share);
             return Prefixed {
-                prefix,
+                prefix: Prefix::Unc(server, share),
                 rest,
                 rooted: true,
-                verbatim: false,
             };
         }
         // Not a valid UNC prefix: an ordinary rooted path, as std reads it.
     }
 
     let (prefix, rest) = match drive(units) {
-        Some(letter) => (vec![letter, COLON], &units[2..]),
-        None => (Vec::new(), units),
+        Some(letter) => (Prefix::Disk(letter), &units[2..]),
+        None => (Prefix::None, units),
     };
     Prefixed {
         prefix,
         rest,
         rooted: rest.first().is_some_and(|&unit| is_separator(unit, false)),
-        verbatim: false,
     }
 }
 
@@ -474,10 +543,9 @@ mod tests {
 
     #[test]
     fn prefixes_are_read_by_kind() {
-        // The canonical spelling each kind of path hashes to.
-        let key = |path: &str| {
-            String::from_utf16(&pipe_key(&path.encode_utf16().collect::<Vec<_>>())).unwrap()
-        };
+        // The key each kind of path hashes to. Plain paths keep their
+        // canonical spelling; device and verbatim paths carry their kind.
+        let key = |path: &str| String::from_utf16(&pipe_key(&units(path))).unwrap();
         assert_eq!(key(r"C:\Users\Alice"), r"c:\users\alice");
         assert_eq!(key("C:"), "c:");
         assert_eq!(key(r"C:\"), r"c:\");
@@ -486,11 +554,175 @@ mod tests {
         assert_eq!(key("relative/data"), r"relative\data");
         assert_eq!(key("//Server/Share/x"), r"\\server\share\x");
         assert_eq!(key(r"\\server"), r"\server", "no share: not a UNC prefix");
-        assert_eq!(key("//./COM1"), r"\\.\com1\");
-        assert_eq!(key(r"\\?\C:"), r"\\?\c:\");
-        assert_eq!(key(r"\\?\C:\a\.\b"), r"\\?\c:\a\.\b");
-        assert_eq!(key(r"\\?\UNC\Server\Share\x"), r"\\?\unc\server\share\x");
-        assert_eq!(key(r"\\?\Volume{0}\x/y"), r"\\?\volume{0}\x/y");
+        assert_eq!(
+            key("//?/C:/data."),
+            r"\\?\c:\data.",
+            "UNC with the server ?"
+        );
+        assert_eq!(key("//./COM1"), "/device/com1");
+        assert_eq!(
+            key(r"\\.\GLOBALROOT\Device\x"),
+            r"/device/globalroot\device\x"
+        );
+        assert_eq!(key(r"\\?\C:"), "/verbatim-disk/c:");
+        assert_eq!(key(r"\\?\C:\a\.\b"), r"/verbatim-disk/c:\a\.\b");
+        assert_eq!(
+            key(r"\\?\UNC\Server\Share\x"),
+            r"/verbatim-unc/server\share\x"
+        );
+        assert_eq!(key(r"\\?\Volume{0}\x/y"), r"/verbatim/volume{0}\x/y");
+    }
+
+    #[test]
+    fn a_normalizing_spelling_never_takes_a_verbatim_key() {
+        // Only the exact `\\?\` spelling is verbatim. Windows normalizes the
+        // others, which trims the trailing dot or space a verbatim path keeps,
+        // so the two must not share a pipe even when their text lines up.
+        for tail in ["data.", "data ", "data"] {
+            let verbatim = format!(r"\\?\C:\{tail}");
+            assert!(split_prefix(&units(&verbatim)).prefix.is_verbatim());
+            for spelling in [
+                format!("//?/C:/{tail}"),
+                format!(r"\\?/C:/{tail}"),
+                format!(r"/\?\C:\{tail}"),
+            ] {
+                assert!(
+                    !split_prefix(&units(&spelling)).prefix.is_verbatim(),
+                    "{spelling:?}"
+                );
+                assert_ne!(
+                    pipe_name(Path::new(&verbatim)),
+                    pipe_name(Path::new(&spelling)),
+                    "{verbatim:?} and {spelling:?}"
+                );
+            }
+        }
+    }
+
+    /// Prefix families for the corpus: a name, the prefix as first written,
+    /// and whether components after it are read verbatim.
+    const CORPUS_FAMILIES: &[(&str, &str, bool)] = &[
+        ("relative", "", false),
+        ("root", r"\", false),
+        ("c-relative", "C:", false),
+        ("c-root", r"C:\", false),
+        ("d-root", r"D:\", false),
+        ("unc1", r"\\server\share\", false),
+        ("unc2", r"\\server\other\", false),
+        ("device-global", r"\\.\GLOBALROOT\", false),
+        ("device-volume", r"\\.\Volume{0}\", false),
+        ("verbatim-c", r"\\?\C:\", true),
+        ("verbatim-d", r"\\?\D:\", true),
+        ("verbatim-unc1", r"\\?\UNC\server\share\", true),
+        ("verbatim-unc2", r"\\?\UNC\server\other\", true),
+        ("verbatim-volume", r"\\?\Volume{0}\", true),
+        ("verbatim-global", r"\\?\GLOBALROOT\", true),
+    ];
+
+    /// Other spellings of a family's prefix, and families only these reach.
+    const CORPUS_ALTERNATE_PREFIXES: &[(&str, &str, bool)] = &[
+        ("root", "/", false),
+        ("c-relative", "c:", false),
+        ("c-root", "C:/", false),
+        ("c-root", r"c:\\", false),
+        ("unc1", "//server/share/", false),
+        ("unc1", r"\\SERVER\Share\", false),
+        ("unc1", r"\/server/share\", false),
+        ("device-global", "//./GLOBALROOT/", false),
+        ("device-global", r"\/.\globalroot\", false),
+        ("verbatim-c", r"\\?\c:\", true),
+        ("verbatim-unc1", r"\\?\unc\server\share\", true),
+        // Not verbatim: UNC with the server `?`, normalized like any UNC path.
+        ("unc-question-c", "//?/C:/", false),
+        ("unc-question-c", r"\\?/C:/", false),
+        ("unc-question-c", r"/\?\C:\", false),
+    ];
+
+    const CORPUS_TAILS: &[&str] = &[
+        "",
+        "data",
+        r"data\child",
+        "data/child",
+        r"data\\child",
+        r"data\.\child",
+        ".",
+        "..",
+        r"data\..\child",
+        "data.",
+        "data ",
+    ];
+
+    /// The directory a corpus path names: its family and its components as
+    /// that family reads them, ASCII-folded.
+    fn corpus_identity(
+        family: &'static str,
+        tail: &str,
+        verbatim: bool,
+    ) -> (&'static str, Vec<String>) {
+        let parts = tail
+            .split(|c| c == '\\' || (!verbatim && c == '/'))
+            .filter(|part| !part.is_empty() && (verbatim || *part != "."))
+            .map(str::to_ascii_lowercase)
+            .collect();
+        (family, parts)
+    }
+
+    type Identity = (&'static str, Vec<String>);
+
+    /// Every corpus path seen so far, by key, by pipe name and by the
+    /// directory it names.
+    #[derive(Default)]
+    struct Corpus {
+        by_key: std::collections::HashMap<Vec<u16>, Identity>,
+        by_name: std::collections::HashMap<String, Identity>,
+        by_identity: std::collections::HashMap<Identity, Vec<u16>>,
+    }
+
+    impl Corpus {
+        fn add(&mut self, families: &[(&'static str, &str, bool)]) -> usize {
+            let mut paths = 0;
+            for &(family, prefix, verbatim) in families {
+                for tail in CORPUS_TAILS {
+                    let path = format!("{prefix}{tail}");
+                    let identity = corpus_identity(family, tail, verbatim);
+                    let key = pipe_key(&units(&path));
+                    let name = pipe_name(Path::new(&path));
+                    if let Some(other) = self.by_key.insert(key.clone(), identity.clone()) {
+                        assert_eq!(other, identity, "two directories share the key of {path:?}");
+                    }
+                    if let Some(other) = self.by_name.insert(name, identity.clone()) {
+                        assert_eq!(
+                            other, identity,
+                            "two directories share the pipe of {path:?}"
+                        );
+                    }
+                    if let Some(other) = self.by_identity.insert(identity, key.clone()) {
+                        assert_eq!(
+                            other, key,
+                            "{path:?} is keyed apart from its other spellings"
+                        );
+                    }
+                    paths += 1;
+                }
+            }
+            paths
+        }
+    }
+
+    #[test]
+    fn the_prefix_corpus_keys_each_directory_once() {
+        // Different directories never share a key or a pipe, and every
+        // spelling of one directory gets the same key.
+        let mut corpus = Corpus::default();
+        let paths = corpus.add(CORPUS_FAMILIES);
+        assert_eq!((paths, corpus.by_identity.len()), (165, 123));
+        corpus.add(CORPUS_ALTERNATE_PREFIXES);
+        assert_eq!(corpus.by_key.len(), corpus.by_identity.len());
+        assert_eq!(corpus.by_name.len(), corpus.by_identity.len());
+    }
+
+    fn units(path: &str) -> Vec<u16> {
+        path.encode_utf16().collect()
     }
 
     #[test]
