@@ -1417,16 +1417,6 @@ fn audit_denial(
     );
 }
 
-/// Whether the credential behind `auth` is still live: not expired, not
-/// past its revalidation deadline, and, for a native pairing token, still
-/// paired.
-fn credential_is_live(
-    inbound: &crate::rpc::auth::RpcInboundAuth,
-    auth: &crate::rpc::auth::ConnectionAuth,
-) -> Result<(), crate::rpc::auth::AuthDenied> {
-    inbound.credential_is_live(auth)
-}
-
 /// The authority `auth` holds for `method` under the accepted policy in force
 /// now: a live credential, a fresh resolution, a generation that did not move
 /// underneath that resolution, and the method's coarse grant.
@@ -11993,8 +11983,9 @@ async fn deliver_subscription(delivery: SubscriptionDelivery) {
         .ok()
     };
     let mut checked_generation = binding.as_ref().map(|auth| auth.generation);
-    let mut authorized =
-        || still_authorized(&inbound, binding.as_ref(), method, &mut checked_generation);
+    let mut authorized = |lease: &crate::rpc::auth::AuthorityLease<'_>| {
+        still_authorized_under(lease, binding.as_ref(), method, &mut checked_generation)
+    };
 
     'deliver: {
         // The client's numbers belong to another epoch: nothing it saw can be
@@ -12004,7 +11995,7 @@ async fn deliver_subscription(delivery: SubscriptionDelivery) {
             let Some(json) = lagged(1, cursor, true) else {
                 break 'deliver;
             };
-            if !deliver_frame(&rpc, &cancel, &mut authorized, json).await {
+            if !deliver_frame(&rpc, &cancel, &inbound, &mut authorized, json).await {
                 break 'deliver;
             }
         }
@@ -12021,7 +12012,7 @@ async fn deliver_subscription(delivery: SubscriptionDelivery) {
                     let Some(json) = lagged(from_seq, resume_seq, false) else {
                         break 'deliver;
                     };
-                    if !deliver_frame(&rpc, &cancel, &mut authorized, json).await {
+                    if !deliver_frame(&rpc, &cancel, &inbound, &mut authorized, json).await {
                         break 'deliver;
                     }
                     cursor = resume_seq;
@@ -12041,7 +12032,7 @@ async fn deliver_subscription(delivery: SubscriptionDelivery) {
                         let Ok(json) = serde_json::to_string(&notification) else {
                             break 'deliver;
                         };
-                        if !deliver_frame(&rpc, &cancel, &mut authorized, json).await {
+                        if !deliver_frame(&rpc, &cancel, &inbound, &mut authorized, json).await {
                             break 'deliver;
                         }
                         cursor = seq + 1;
@@ -12068,16 +12059,28 @@ async fn deliver_subscription(delivery: SubscriptionDelivery) {
 ///
 /// 1. Wait for room on the writer. This is the only wait, and a cancel or a
 ///    closed writer ends it, so a feed blocked on a slow reader is still
-///    released at once.
-/// 2. Check `still_allowed` at the enqueue boundary, after that wait, so a
-///    grant withdrawn while the writer was full stops the line.
-/// 3. Enqueue in the reserved room, which cannot wait again.
+///    released at once. Nothing is held during the wait, so a policy
+///    publication never waits on a slow reader.
+/// 2. Hold the connection's authority still
+///    ([`RpcInboundAuth::hold_authority`]) and check `still_allowed` against
+///    the held state, so a grant withdrawn while the writer was full stops
+///    the line.
+/// 3. Enqueue in the reserved room, which cannot wait, then release the
+///    hold. A withdrawal that arrives after the check completes after the
+///    enqueue, so no line is enqueued once a withdrawal has completed.
 ///
-/// `false` ends the feed.
+/// `still_allowed` runs while both the writer room and the hold are taken,
+/// so it must stay synchronous and cheap. It answers from the lease it is
+/// given and must not call [`RpcInboundAuth`]'s own accessors, which would
+/// wait behind a publication queued on that lease. `false` ends the feed.
+///
+/// [`RpcInboundAuth`]: crate::rpc::auth::RpcInboundAuth
+/// [`RpcInboundAuth::hold_authority`]: crate::rpc::auth::RpcInboundAuth::hold_authority
 async fn deliver_frame(
     rpc: &RpcOutbound,
     cancel: &CancellationToken,
-    still_allowed: impl FnOnce() -> bool,
+    authority: &crate::rpc::auth::RpcInboundAuth,
+    still_allowed: impl FnOnce(&crate::rpc::auth::AuthorityLease<'_>) -> bool,
     json: String,
 ) -> bool {
     let slot = tokio::select! {
@@ -12088,10 +12091,12 @@ async fn deliver_frame(
     let Some(slot) = slot else {
         return false;
     };
-    if !still_allowed() {
+    let lease = authority.hold_authority();
+    if !still_allowed(&lease) {
         return false;
     }
     slot.send(json);
+    drop(lease);
     true
 }
 
@@ -12115,12 +12120,12 @@ const GLOBAL_STREAM_SCOPED_DENIAL: &str = "Scoped principals cannot read the dae
      streams and the event history are limited to administrators and the shared operator";
 
 /// Hold one delivery (a frame or a `lagged` notice) to the connection's
-/// authority. The credential must still be live, and whenever the accepted
-/// policy generation has moved, the principal is resolved again against
-/// `method`. A refusal is audited. An unbound dispatcher (the direct
-/// unit-test handlers) has nothing to recheck.
-fn still_authorized(
-    inbound: &crate::rpc::auth::RpcInboundAuth,
+/// authority, answered from `lease`. The credential must still be live, and
+/// whenever the accepted policy generation has moved, the principal is
+/// resolved again against `method`. A refusal is audited. An unbound
+/// dispatcher (the direct unit-test handlers) has nothing to recheck.
+fn still_authorized_under(
+    lease: &crate::rpc::auth::AuthorityLease<'_>,
     binding: Option<&crate::rpc::auth::ConnectionAuth>,
     method: Method,
     checked_generation: &mut Option<u64>,
@@ -12128,14 +12133,14 @@ fn still_authorized(
     let Some(auth) = binding else {
         return true;
     };
-    let generation = inbound.generation();
+    let generation = lease.generation();
     // A moved policy generation re-resolves the principal: it must still
     // hold `method`'s grant and still see every principal, so narrowing or
     // demoting a principal ends its stream.
     let authority = if *checked_generation == Some(generation) {
-        credential_is_live(inbound, auth)
+        lease.credential_is_live(auth)
     } else {
-        current_authority(inbound, auth, method).and_then(|grants| {
+        current_authority_under(lease, auth, method).and_then(|grants| {
             if sees_every_principal(auth, &grants) {
                 Ok(())
             } else {
@@ -23501,6 +23506,10 @@ mod tests {
             source,
             json!({"source": "observability", "tool": "SENTINEL-PENDING"}),
         );
+        // Both frames are published before the forwarder runs, so it reads
+        // them in one batch. On the test's single-threaded runtime it then
+        // enqueues the first and reaches the wait for room for the second in
+        // the same poll: once the first is visible, the second is waiting.
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         while rx.is_empty() {
             assert!(
@@ -23509,7 +23518,6 @@ mod tests {
             );
             tokio::task::yield_now().await;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 
     /// A grant withdrawn while delivery waits for writer room ends the
@@ -42910,5 +42918,487 @@ mod tests {
             .await
             .expect("an aborted shutdown must still end the prompt it was joining")
             .expect_err("the prompt must be aborted rather than run to completion");
+    }
+
+    /// [`subscriber_on_a_one_line_writer`] with its own subscription's
+    /// delivery stopped, so a test can drive one delivery itself.
+    async fn idle_subscriber_on_a_one_line_writer(
+        method: &str,
+    ) -> (
+        Arc<RpcContext>,
+        zeroclaw_config::schema::Config,
+        RpcDispatcher,
+        tokio::sync::mpsc::Receiver<String>,
+        Arc<crate::rpc::subscription::SubscriptionHub>,
+    ) {
+        let (ctx, config, dispatcher, rx, hub, original) =
+            subscriber_on_a_one_line_writer(method).await;
+        let remaining = Arc::strong_count(&dispatcher.rpc) - 1;
+        dispatcher
+            .handle_subscription_cancel(&json!({"subscription_id": original}))
+            .expect("cancel the subscription the fixture opened");
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while Arc::strong_count(&dispatcher.rpc) > remaining {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the fixture's own delivery stops");
+        (ctx, config, dispatcher, rx, hub)
+    }
+
+    /// A delivery of `source` on `dispatcher`'s connection from `cursor`,
+    /// registered as `test-subscription`.
+    fn delivery_from(
+        dispatcher: &RpcDispatcher,
+        hub: Arc<crate::rpc::subscription::SubscriptionHub>,
+        source: crate::rpc::subscription::Source,
+        cursor: u64,
+        epoch_changed: bool,
+    ) -> SubscriptionDelivery {
+        let (method, notification_method) = match source {
+            crate::rpc::subscription::Source::Logs => {
+                (Method::LogsSubscribe, notification::LOGS_EVENT)
+            }
+            crate::rpc::subscription::Source::Events => {
+                (Method::EventsSubscribe, notification::EVENTS_EVENT)
+            }
+        };
+        let subscription_id = "test-subscription".to_string();
+        let cancel = CancellationToken::new();
+        dispatcher
+            .subscriptions
+            .lock()
+            .insert(subscription_id.clone(), cancel.clone());
+        SubscriptionDelivery {
+            hub,
+            source,
+            subscription_id,
+            cursor,
+            epoch_changed,
+            rpc: Arc::clone(&dispatcher.rpc),
+            cancel,
+            notification_method,
+            method,
+            inbound: Arc::clone(&dispatcher.ctx.auth),
+            binding: dispatcher.auth.clone(),
+            registry: Arc::clone(&dispatcher.subscriptions),
+        }
+    }
+
+    /// Poll `future` once and require it to be waiting.
+    fn assert_waiting<F: std::future::Future>(future: std::pin::Pin<&mut F>, what: &str) {
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(future.poll(&mut cx).is_pending(), "{what} must be waiting");
+    }
+
+    /// Withdraw the reader profile's log grant and administrator role.
+    fn withdraw_reader_grant(config: &mut zeroclaw_config::schema::Config) {
+        let reader = config
+            .permission_profiles
+            .get_mut("reader")
+            .expect("the fixture profile exists");
+        reader.grants.remove(&zeroclaw_api::grants::Resource::Logs);
+        reader.admin = false;
+    }
+
+    /// Every line a feed sends (a frame, a ring-gap notice, an epoch-change
+    /// notice) waits for writer room, then stops if the grant was withdrawn
+    /// or the feed cancelled meanwhile: nothing is enqueued, the feed ends,
+    /// and the room is handed back.
+    #[tokio::test]
+    async fn every_line_a_feed_sends_stops_on_a_withdrawal_or_cancel_while_the_writer_is_full() {
+        for (method, source) in GLOBAL_STREAMS {
+            for path in ["data", "ring-gap", "epoch-gap"] {
+                for action in ["withdraw", "cancel"] {
+                    let case = format!("{method}/{path}/{action}");
+                    let (ctx, mut config, dispatcher, mut rx, hub) =
+                        idle_subscriber_on_a_one_line_writer(method).await;
+                    if path == "ring-gap" {
+                        hub.note_loss(source, 2);
+                    }
+                    hub.publish(source, json!({"test_payload": "must-not-enqueue"}));
+                    let delivery = delivery_from(&dispatcher, hub, source, 1, path == "epoch-gap");
+                    let cancel = delivery.cancel.clone();
+                    assert!(dispatcher.rpc.send_raw("writer-occupied".into()).await);
+                    let mut pending = Box::pin(deliver_subscription(delivery));
+                    assert_waiting(pending.as_mut(), &case);
+                    if action == "withdraw" {
+                        withdraw_reader_grant(&mut config);
+                        ctx.auth
+                            .refresh_from_config(&config)
+                            .expect("the narrowed policy compiles");
+                        assert_eq!(rx.recv().await.as_deref(), Some("writer-occupied"));
+                    } else {
+                        cancel.cancel();
+                    }
+                    tokio::time::timeout(std::time::Duration::from_secs(1), pending)
+                        .await
+                        .unwrap_or_else(|_| panic!("{case}: the feed stayed attached"));
+                    assert!(
+                        !dispatcher
+                            .subscriptions
+                            .lock()
+                            .contains_key("test-subscription"),
+                        "{case}: the feed ends"
+                    );
+                    if action == "cancel" {
+                        assert_eq!(rx.recv().await.as_deref(), Some("writer-occupied"));
+                    }
+                    assert!(rx.try_recv().is_err(), "{case}: a line was enqueued");
+                    let room = tokio::time::timeout(
+                        std::time::Duration::from_millis(100),
+                        dispatcher.rpc.reserve(),
+                    )
+                    .await
+                    .unwrap_or_else(|_| panic!("{case}: the room is handed back"))
+                    .expect("the writer is open");
+                    drop(room);
+                }
+            }
+        }
+    }
+
+    /// Authority is checked once there is room, not before the wait, and a
+    /// refusal hands the room back.
+    #[tokio::test]
+    async fn authority_is_checked_once_there_is_room_and_a_refusal_returns_it() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let authority = crate::rpc::auth::RpcInboundAuth::for_tests(
+            &zeroclaw_config::schema::Config::default(),
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let rpc = RpcOutbound::new(tx);
+        let cancel = CancellationToken::new();
+        let calls = AtomicUsize::new(0);
+        let allowed = AtomicBool::new(true);
+        assert!(rpc.send_raw("occupied".into()).await);
+        let mut pending = Box::pin(deliver_frame(
+            &rpc,
+            &cancel,
+            &authority,
+            |_lease| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                allowed.load(Ordering::SeqCst)
+            },
+            "pending".into(),
+        ));
+        assert_waiting(pending.as_mut(), "a frame on a full writer");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "nothing is checked before there is room"
+        );
+        allowed.store(false, Ordering::SeqCst);
+        assert_eq!(rx.recv().await.as_deref(), Some("occupied"));
+        assert!(!pending.await);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(rx.try_recv().is_err());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), rpc.reserve())
+                .await
+                .expect("the refused frame hands its room back")
+                .is_some()
+        );
+    }
+
+    /// A cancel and room that arrive together end the feed without a check
+    /// or a send.
+    #[tokio::test]
+    async fn a_cancel_wins_over_room_that_arrives_with_it() {
+        let authority = crate::rpc::auth::RpcInboundAuth::for_tests(
+            &zeroclaw_config::schema::Config::default(),
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let rpc = RpcOutbound::new(tx);
+        let cancel = CancellationToken::new();
+        assert!(rpc.send_raw("occupied".into()).await);
+        let mut pending = Box::pin(deliver_frame(
+            &rpc,
+            &cancel,
+            &authority,
+            |_lease| panic!("a cancelled feed checks nothing"),
+            "pending".into(),
+        ));
+        assert_waiting(pending.as_mut(), "a frame on a full writer");
+        cancel.cancel();
+        assert_eq!(rx.recv().await.as_deref(), Some("occupied"));
+        assert!(!pending.await);
+        assert!(rx.try_recv().is_err());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), rpc.reserve())
+                .await
+                .expect("the cancelled frame takes no room")
+                .is_some()
+        );
+    }
+
+    /// A writer that closes while a line waits for room ends the feed, on
+    /// every send path.
+    #[tokio::test]
+    async fn a_closed_writer_ends_the_feed_on_every_send_path() {
+        for (method, source) in GLOBAL_STREAMS {
+            for path in ["data", "ring-gap", "epoch-gap"] {
+                let case = format!("{method}/{path}");
+                let (_ctx, _config, dispatcher, rx, hub) =
+                    idle_subscriber_on_a_one_line_writer(method).await;
+                if path == "ring-gap" {
+                    hub.note_loss(source, 2);
+                }
+                hub.publish(source, json!({"test_payload": "pending"}));
+                let delivery = delivery_from(&dispatcher, hub, source, 1, path == "epoch-gap");
+                assert!(dispatcher.rpc.send_raw("occupied".into()).await);
+                let mut pending = Box::pin(deliver_subscription(delivery));
+                assert_waiting(pending.as_mut(), &case);
+                drop(rx);
+                tokio::time::timeout(std::time::Duration::from_secs(1), pending)
+                    .await
+                    .unwrap_or_else(|_| panic!("{case}: the feed stayed attached"));
+                assert!(
+                    !dispatcher
+                        .subscriptions
+                        .lock()
+                        .contains_key("test-subscription"),
+                    "{case}: the feed ends"
+                );
+            }
+        }
+    }
+
+    /// Frames reach the writer in order and numbered, across several read
+    /// batches.
+    #[tokio::test]
+    async fn a_feed_keeps_its_order_across_read_batches() {
+        for (method, source) in GLOBAL_STREAMS {
+            let (_ctx, _config, dispatcher, mut rx, hub) =
+                idle_subscriber_on_a_one_line_writer(method).await;
+            for i in 1..=160 {
+                assert_eq!(hub.publish(source, json!({"test_index": i})), i);
+            }
+            let delivery = delivery_from(&dispatcher, hub, source, 1, false);
+            let expected_method = delivery.notification_method;
+            let cancel = delivery.cancel.clone();
+            let pending = zeroclaw_spawn::spawn!(deliver_subscription(delivery));
+            for expected in 1..=160 {
+                let line = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+                    .await
+                    .unwrap_or_else(|_| panic!("{method}: frame {expected} arrives"))
+                    .expect("the writer is open");
+                let frame: Value = serde_json::from_str(&line).expect("a JSON line");
+                assert_eq!(frame["method"], expected_method, "{method}");
+                assert_eq!(frame["params"]["subscription_id"], "test-subscription");
+                assert_eq!(frame["params"]["seq"], expected, "{method}");
+                assert_eq!(frame["params"]["test_index"], expected, "{method}");
+            }
+            cancel.cancel();
+            pending.await.expect("the delivery task ends");
+            assert!(rx.try_recv().is_err(), "{method}");
+            assert!(
+                !dispatcher
+                    .subscriptions
+                    .lock()
+                    .contains_key("test-subscription"),
+                "{method}"
+            );
+        }
+    }
+
+    /// An epoch-change notice, then the replay, then a ring-gap notice and
+    /// the frame after it, in that order on the wire, each numbered where the
+    /// client resumes.
+    #[tokio::test]
+    async fn lag_notices_keep_their_wire_order_and_resume_point() {
+        use crate::rpc::subscription::{RingLimits, SubscriptionHub};
+        for (method, source) in GLOBAL_STREAMS {
+            let (_ctx, _config, dispatcher, mut rx, _fixture_hub) =
+                idle_subscriber_on_a_one_line_writer(method).await;
+            let hub = Arc::new(SubscriptionHub::with_limits(
+                RingLimits {
+                    max_frames: 2,
+                    max_bytes: 1024 * 1024,
+                },
+                2 * 1024 * 1024,
+            ));
+            for i in 1..=4 {
+                hub.publish(source, json!({"test_index": i}));
+            }
+            let delivery = delivery_from(&dispatcher, Arc::clone(&hub), source, 3, true);
+            let expected_method = delivery.notification_method;
+            let cancel = delivery.cancel.clone();
+            let pending = zeroclaw_spawn::spawn!(deliver_subscription(delivery));
+            let first: Value =
+                serde_json::from_str(&rx.recv().await.expect("a line")).expect("a JSON line");
+            assert_eq!(
+                first["method"],
+                notification::SUBSCRIPTION_LAGGED,
+                "{method}"
+            );
+            assert_eq!(
+                first["params"],
+                json!({"subscription_id": "test-subscription", "from_seq": 1, "resume_seq": 3, "epoch_changed": true}),
+                "{method}"
+            );
+            for seq in [3, 4] {
+                let frame: Value =
+                    serde_json::from_str(&rx.recv().await.expect("a line")).expect("a JSON line");
+                assert_eq!(frame["method"], expected_method, "{method}");
+                assert_eq!(frame["params"]["seq"], seq, "{method}");
+                assert_eq!(frame["params"]["test_index"], seq, "{method}");
+            }
+            hub.note_loss(source, 2);
+            assert_eq!(hub.publish(source, json!({"test_index": 7})), 7);
+            let gap: Value =
+                serde_json::from_str(&rx.recv().await.expect("a line")).expect("a JSON line");
+            assert_eq!(gap["method"], notification::SUBSCRIPTION_LAGGED, "{method}");
+            assert_eq!(
+                gap["params"],
+                json!({"subscription_id": "test-subscription", "from_seq": 5, "resume_seq": 7, "epoch_changed": false}),
+                "{method}"
+            );
+            let resumed: Value =
+                serde_json::from_str(&rx.recv().await.expect("a line")).expect("a JSON line");
+            assert_eq!(resumed["method"], expected_method, "{method}");
+            assert_eq!(resumed["params"]["seq"], 7, "{method}");
+            cancel.cancel();
+            pending.await.expect("the delivery task ends");
+            assert!(rx.try_recv().is_err(), "{method}");
+        }
+    }
+
+    /// A grant withdrawal that starts after the final check, while the line
+    /// is between that check and the enqueue, completes only after the
+    /// enqueue. Before the authority was held from the check through the
+    /// send, the withdrawal could complete first and the line was enqueued
+    /// after it.
+    #[tokio::test]
+    async fn a_withdrawal_after_the_final_check_completes_only_after_the_enqueue() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        for (wire, _source) in GLOBAL_STREAMS {
+            let (ctx, mut config, dispatcher, mut rx, _hub) =
+                idle_subscriber_on_a_one_line_writer(wire).await;
+            let method = if wire == "logs/subscribe" {
+                Method::LogsSubscribe
+            } else {
+                Method::EventsSubscribe
+            };
+            withdraw_reader_grant(&mut config);
+            let (start_tx, start_rx) = std::sync::mpsc::channel();
+            let finished = Arc::new(AtomicBool::new(false));
+            let publishing = Arc::clone(&ctx.auth);
+            let published = Arc::clone(&finished);
+            let publisher = std::thread::spawn(move || {
+                start_rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .expect("the check starts the withdrawal");
+                publishing
+                    .refresh_from_config(&config)
+                    .expect("the narrowed policy compiles");
+                published.store(true, Ordering::SeqCst);
+            });
+            let binding = dispatcher.auth.as_ref().expect("a bound subscriber");
+            let mut generation = Some(binding.generation);
+            let cancel = CancellationToken::new();
+            assert!(dispatcher.rpc.send_raw("occupied".into()).await);
+            let line = json!({
+                "jsonrpc": "2.0",
+                "method": if wire == "logs/subscribe" { "logs/event" } else { "events/event" },
+                "params": {"subscription_id": "test-subscription", "seq": 1, "test": "checked-before-the-withdrawal"},
+            })
+            .to_string();
+            let mut pending = Box::pin(deliver_frame(
+                &dispatcher.rpc,
+                &cancel,
+                &ctx.auth,
+                |lease| {
+                    let allowed =
+                        still_authorized_under(lease, Some(binding), method, &mut generation);
+                    assert!(allowed, "{wire}: the grant is in force at the final check");
+                    // The withdrawal starts now, between the final check and
+                    // the enqueue, and gets as far as it can.
+                    start_tx.send(()).expect("the publisher waits");
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                    while !ctx.auth.publication_queued_behind_a_lease() {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "{wire}: the withdrawal queues behind the hold"
+                        );
+                        std::thread::yield_now();
+                    }
+                    assert!(
+                        !finished.load(Ordering::SeqCst),
+                        "{wire}: the withdrawal cannot complete before the enqueue"
+                    );
+                    allowed
+                },
+                line,
+            ));
+            assert_waiting(pending.as_mut(), wire);
+            assert_eq!(rx.recv().await.as_deref(), Some("occupied"));
+            assert!(
+                pending.await,
+                "{wire}: the line checked under the grant is enqueued"
+            );
+            publisher.join().expect("the publisher finishes");
+            assert!(finished.load(Ordering::SeqCst), "{wire}");
+            assert!(
+                current_authority(&ctx.auth, binding, method).is_err(),
+                "{wire}: the withdrawal really happened"
+            );
+            let enqueued = rx.try_recv().expect("the line was enqueued");
+            assert!(
+                enqueued.contains("checked-before-the-withdrawal"),
+                "{wire}: {enqueued}"
+            );
+        }
+    }
+
+    /// The authority lease orders a publication after an effect performed
+    /// under it: the publication queues, and completes once the lease is
+    /// dropped.
+    #[tokio::test]
+    async fn an_authority_lease_orders_a_publication_after_the_enqueue() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        for (wire, _source) in GLOBAL_STREAMS {
+            let (ctx, mut config, dispatcher, mut rx, _hub) =
+                idle_subscriber_on_a_one_line_writer(wire).await;
+            let method = if wire == "logs/subscribe" {
+                Method::LogsSubscribe
+            } else {
+                Method::EventsSubscribe
+            };
+            withdraw_reader_grant(&mut config);
+            let slot = dispatcher.rpc.reserve().await.expect("the writer is open");
+            let finished = Arc::new(AtomicBool::new(false));
+            let publishing = Arc::clone(&ctx.auth);
+            let published = Arc::clone(&finished);
+            let lease = ctx.auth.hold_authority();
+            let binding = dispatcher.auth.as_ref().expect("a bound subscriber");
+            let grants = current_authority_under(&lease, binding, method).expect("in force");
+            assert!(sees_every_principal(binding, &grants), "{wire}");
+            let publisher = std::thread::spawn(move || {
+                publishing
+                    .refresh_from_config(&config)
+                    .expect("the narrowed policy compiles");
+                published.store(true, Ordering::SeqCst);
+            });
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while !ctx.auth.publication_queued_behind_a_lease() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "{wire}: the publication queues"
+                );
+                std::thread::yield_now();
+            }
+            assert!(!finished.load(Ordering::SeqCst), "{wire}");
+            slot.send("enqueued-before-the-withdrawal".into());
+            assert!(!finished.load(Ordering::SeqCst), "{wire}");
+            drop(lease);
+            publisher.join().expect("the publisher finishes");
+            assert!(finished.load(Ordering::SeqCst), "{wire}");
+            assert_eq!(
+                rx.recv().await.as_deref(),
+                Some("enqueued-before-the-withdrawal")
+            );
+        }
     }
 }

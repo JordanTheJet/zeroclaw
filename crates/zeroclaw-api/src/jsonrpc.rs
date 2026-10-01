@@ -337,6 +337,11 @@ impl RpcOutbound {
     }
 
     /// Send a raw pre-serialized JSON line. Returns `true` on success.
+    ///
+    /// Not for a stream a revocable grant gates: it waits for writer room
+    /// after any check the caller made. Such a stream reserves room with
+    /// [`Self::reserve`], then checks and sends in the reserved slot (the
+    /// runtime's subscription forwarders do this through one helper).
     pub async fn send_raw(&self, json: String) -> bool {
         self.writer_tx.send(json).await.is_ok()
     }
