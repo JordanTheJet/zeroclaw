@@ -10,8 +10,11 @@ pub mod util_helpers;
 pub mod a2a_client;
 pub mod ask_user;
 pub mod backup_tool;
+#[cfg(feature = "tools-external")]
 pub mod browser;
+#[cfg(feature = "tools-external")]
 pub mod browser_delegate;
+#[cfg(feature = "tools-external")]
 pub mod browser_open;
 pub mod calculator;
 pub mod canvas;
@@ -32,7 +35,9 @@ pub mod content_search;
 pub mod data_management;
 pub mod discord_search;
 pub mod email_imap;
+#[cfg(feature = "tools-external")]
 pub mod email_read;
+#[cfg(feature = "tools-external")]
 pub mod email_search;
 pub mod embedded_resource;
 pub mod escalate;
@@ -53,6 +58,7 @@ pub mod hardware_memory_map;
 pub mod hardware_memory_read;
 mod http_decode;
 pub mod http_request;
+#[cfg(feature = "tools-external")]
 pub mod image_gen;
 pub mod image_info;
 #[cfg(feature = "tool-jira")]
@@ -89,20 +95,25 @@ pub mod poll;
 #[cfg(feature = "tool-project-intel")]
 pub mod project_intel;
 pub mod proxy_config;
+#[cfg(feature = "tools-external")]
 pub mod pushover;
 pub mod reaction;
 #[cfg(feature = "tool-project-intel")]
 pub mod report_template_tool;
 #[cfg(feature = "tool-project-intel")]
 pub mod report_templates;
+#[cfg(feature = "tools-external")]
 pub mod screenshot;
 pub mod send_via;
 pub mod sessions;
+#[cfg(feature = "tools-external")]
 pub mod text_browser;
 pub mod tool_search;
+#[cfg(feature = "tools-external")]
 pub mod weather_tool;
 pub mod web_fetch;
 pub mod web_search_provider_routing;
+#[cfg(feature = "tools-external")]
 pub mod web_search_tool;
 pub mod wrappers;
 

@@ -44,6 +44,12 @@ fn tag_specs() -> Vec<TagSpec> {
             platforms: MULTI_ARCH,
         },
         TagSpec {
+            stem: "compat-tools",
+            selection: Selection::DistCompat,
+            dockerfile: "Dockerfile",
+            platforms: MULTI_ARCH,
+        },
+        TagSpec {
             stem: "all-features",
             selection: Selection::All,
             dockerfile: "Containerfile",

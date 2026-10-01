@@ -27032,6 +27032,19 @@ mod tests {
         risk_profiles.insert("test-profile".to_string(), RiskProfileConfig::default());
 
         zeroclaw_config::schema::Config {
+            tools: zeroclaw_config::builtin_tools::BuiltinToolsConfig {
+                optional: vec![
+                    "calculator",
+                    "delegate",
+                    "sessions_list",
+                    "sessions_history",
+                    "sessions_current",
+                    "sessions_send",
+                ]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            },
             data_dir: workspace_dir,
             config_path: tmp.path().join("config.toml"),
             providers,

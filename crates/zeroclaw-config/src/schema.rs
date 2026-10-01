@@ -210,6 +210,13 @@ pub struct Config {
     #[group = "Operations"]
     pub security: SecurityConfig,
 
+    /// Optional model-visible built-ins (`[tools]`). The default is eleven core
+    /// tools; selection never grants execution permission. Reload after edits.
+    #[serde(default)]
+    #[nested]
+    #[group = "Tools"]
+    pub tools: crate::builtin_tools::BuiltinToolsConfig,
+
     /// Backup tool configuration (`[backup]`).
     #[serde(default)]
     #[nested]
@@ -21035,6 +21042,7 @@ impl Default for Config {
             embedding_routes: Vec::new(),
             observability: ObservabilityConfig::default(),
             trust: crate::scattered_types::TrustConfig::default(),
+            tools: crate::builtin_tools::BuiltinToolsConfig::default(),
             backup: BackupConfig::default(),
             data_retention: DataRetentionConfig::default(),
             cloud_ops: CloudOpsConfig::default(),
@@ -23115,6 +23123,21 @@ impl Config {
         &self,
         warnings: &mut Vec<crate::validation_warnings::ValidationWarning>,
     ) {
+        if !cfg!(feature = "tools-external") {
+            for name in crate::builtin_tools::EXTERNAL_TOOL_NAMES {
+                if self.tools.is_enabled(name) {
+                    warnings.push(crate::validation_warnings::ValidationWarning::new(
+                        crate::validation_warnings::TOOL_COMPILED_OUT,
+                        format!(
+                            "{name} was selected in tools.optional, but this build lacks \
+                                 `tools-external`. Use the compatibility archive or build with \
+                                 `tools-compat`; runtime config cannot add compiled-out code."
+                        ),
+                        "tools.optional".to_string(),
+                    ));
+                }
+            }
+        }
         for tool in crate::opt_in_tools::OptInTool::ALL {
             if tool.compiled() || !tool.enabled_in(self) {
                 continue;
@@ -32701,6 +32724,7 @@ auto_save = true
             },
             decision_models: HashMap::new(),
             trust: crate::scattered_types::TrustConfig::default(),
+            tools: crate::builtin_tools::BuiltinToolsConfig::default(),
             backup: BackupConfig::default(),
             data_retention: DataRetentionConfig::default(),
             cloud_ops: CloudOpsConfig::default(),
@@ -33972,6 +33996,7 @@ default_temperature = 0.7
             config_path: config_path.clone(),
             observability: ObservabilityConfig::default(),
             trust: crate::scattered_types::TrustConfig::default(),
+            tools: crate::builtin_tools::BuiltinToolsConfig::default(),
             backup: BackupConfig::default(),
             data_retention: DataRetentionConfig::default(),
             cloud_ops: CloudOpsConfig::default(),

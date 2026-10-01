@@ -8,8 +8,11 @@ use zeroclaw_api::tool_attribution;
 
 use crate::ask_user::AskUserTool;
 use crate::backup_tool::BackupTool;
+#[cfg(feature = "tools-external")]
 use crate::browser::BrowserTool;
+#[cfg(feature = "tools-external")]
 use crate::browser_delegate::BrowserDelegateTool;
+#[cfg(feature = "tools-external")]
 use crate::browser_open::BrowserOpenTool;
 use crate::calculator::CalculatorTool;
 use crate::canvas::CanvasTool;
@@ -44,6 +47,7 @@ use crate::hardware_board_info::HardwareBoardInfoTool;
 use crate::hardware_memory_map::HardwareMemoryMapTool;
 use crate::hardware_memory_read::HardwareMemoryReadTool;
 use crate::http_request::HttpRequestTool;
+#[cfg(feature = "tools-external")]
 use crate::image_gen::ImageGenTool;
 use crate::image_info::ImageInfoTool;
 #[cfg(feature = "tool-jira")]
@@ -70,26 +74,34 @@ use crate::poll::PollTool;
 #[cfg(feature = "tool-project-intel")]
 use crate::project_intel::ProjectIntelTool;
 use crate::proxy_config::ProxyConfigTool;
+#[cfg(feature = "tools-external")]
 use crate::pushover::PushoverTool;
 use crate::reaction::ReactionTool;
 #[cfg(feature = "tool-project-intel")]
 use crate::report_template_tool::ReportTemplateTool;
+#[cfg(feature = "tools-external")]
 use crate::screenshot::ScreenshotTool;
 use crate::send_via::SendViaTool;
 use crate::sessions::{
     SessionDeleteTool, SessionResetTool, SessionsCurrentTool, SessionsHistoryTool,
     SessionsListTool, SessionsSendTool,
 };
+#[cfg(feature = "tools-external")]
 use crate::text_browser::TextBrowserTool;
 use crate::tool_search::ToolSearchTool;
+#[cfg(feature = "tools-external")]
 use crate::weather_tool::WeatherTool;
 use crate::web_fetch::WebFetchTool;
+#[cfg(feature = "tools-external")]
 use crate::web_search_tool::WebSearchTool;
 
 tool_attribution!(AskUserTool, ToolKind::Wait);
 tool_attribution!(BackupTool, ToolKind::Plugin);
+#[cfg(feature = "tools-external")]
 tool_attribution!(BrowserTool, ToolKind::Plugin);
+#[cfg(feature = "tools-external")]
 tool_attribution!(BrowserDelegateTool, ToolKind::Plugin);
+#[cfg(feature = "tools-external")]
 tool_attribution!(BrowserOpenTool, ToolKind::Plugin);
 tool_attribution!(CalculatorTool, ToolKind::Plugin);
 tool_attribution!(CanvasTool, ToolKind::Plugin);
@@ -124,6 +136,7 @@ tool_attribution!(HardwareBoardInfoTool, ToolKind::Plugin);
 tool_attribution!(HardwareMemoryMapTool, ToolKind::Plugin);
 tool_attribution!(HardwareMemoryReadTool, ToolKind::Plugin);
 tool_attribution!(HttpRequestTool, ToolKind::HttpRequest);
+#[cfg(feature = "tools-external")]
 tool_attribution!(ImageGenTool, ToolKind::Plugin);
 tool_attribution!(ImageInfoTool, ToolKind::Plugin);
 #[cfg(feature = "tool-jira")]
@@ -150,10 +163,12 @@ tool_attribution!(PollTool, ToolKind::Wait);
 #[cfg(feature = "tool-project-intel")]
 tool_attribution!(ProjectIntelTool, ToolKind::Plugin);
 tool_attribution!(ProxyConfigTool, ToolKind::Plugin);
+#[cfg(feature = "tools-external")]
 tool_attribution!(PushoverTool, ToolKind::Plugin);
 tool_attribution!(ReactionTool, ToolKind::Plugin);
 #[cfg(feature = "tool-project-intel")]
 tool_attribution!(ReportTemplateTool, ToolKind::Plugin);
+#[cfg(feature = "tools-external")]
 tool_attribution!(ScreenshotTool, ToolKind::Plugin);
 tool_attribution!(SendViaTool, ToolKind::Plugin);
 tool_attribution!(SessionDeleteTool, ToolKind::Plugin);
@@ -162,10 +177,13 @@ tool_attribution!(SessionsCurrentTool, ToolKind::Plugin);
 tool_attribution!(SessionsHistoryTool, ToolKind::Plugin);
 tool_attribution!(SessionsListTool, ToolKind::Plugin);
 tool_attribution!(SessionsSendTool, ToolKind::Plugin);
+#[cfg(feature = "tools-external")]
 tool_attribution!(TextBrowserTool, ToolKind::Plugin);
 tool_attribution!(ToolSearchTool, ToolKind::Search);
+#[cfg(feature = "tools-external")]
 tool_attribution!(WeatherTool, ToolKind::Plugin);
 tool_attribution!(WebFetchTool, ToolKind::FetchUrl);
+#[cfg(feature = "tools-external")]
 tool_attribution!(WebSearchTool, ToolKind::Search);
 
 #[cfg(test)]

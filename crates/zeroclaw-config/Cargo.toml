@@ -82,6 +82,7 @@ ws-transport = [
 # feature of the same name, never directly: the sections parse in every build,
 # and validation checks a tool's own settings only when the tool is compiled
 # in, reporting the section as compiled out otherwise.
+tools-external = []
 tool-jira = []
 tool-notion = []
 tool-linkedin = []

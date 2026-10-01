@@ -311,7 +311,9 @@ impl ScopedToolRegistry {
             .filter(|tool| tool_allowed_in_context(tool.name(), exclude_memory, acp_delivery))
             .cloned()
             .collect();
-        let pipeline_tool = config.pipeline.enabled.then(|| {
+        let pipeline_tool = (config.pipeline.enabled
+            && config.tools.is_enabled(tools::PipelineTool::NAME))
+        .then(|| {
             Arc::new(tools::PipelineTool::with_access_policy(
                 config.pipeline.clone(),
                 context_filtered_tool_arcs.clone(),
@@ -834,6 +836,10 @@ mod tests {
     ) -> ScopedAssembled {
         let mut config = Config::default();
         config.pipeline.enabled = true;
+        config
+            .tools
+            .optional
+            .push(tools::PipelineTool::NAME.to_string());
         config.pipeline.max_steps = 20;
         config.pipeline.allowed_tools = vec!["shell".to_string(), "file_write".to_string()];
         ScopedToolRegistry::assemble(ScopedAssembly {
@@ -1030,6 +1036,10 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let mut config = Config::default();
         config.pipeline.enabled = true;
+        config
+            .tools
+            .optional
+            .push(tools::PipelineTool::NAME.to_string());
         config.pipeline.allowed_tools = vec!["shell".to_string(), child_name.to_string()];
         let security = Arc::new(SecurityPolicy {
             allowed_tools: Some(vec![

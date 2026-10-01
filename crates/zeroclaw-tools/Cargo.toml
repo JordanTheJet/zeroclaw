@@ -73,7 +73,8 @@ libc = "0.2"
 
 [features]
 default = []
-browser-native = ["dep:fantoccini"]
+browser-native = ["tools-external", "dep:fantoccini"]
+tools-external = ["zeroclaw-config/tools-external"]
 probe = ["dep:probe-rs"]
 # SaaS and coding-CLI integrations. Each is opt-in; the root crate forwards
 # one `tool-*` feature per integration and bundles them as `tools-saas` and

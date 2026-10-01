@@ -1040,8 +1040,8 @@ jobs:
 
   # The SaaS and coding-CLI tools are out of Cargo `default`, so `test` no
   # longer builds them, and `lint` compiles them under `ci-all` without running
-  # a test. This lane runs their tests with the bundles standard artifacts
-  # ship: the tool modules, the coding-CLI executor, adapter and action-budget
+  # a test. This lane runs their tests with the compatibility bundle:
+  # the tool modules, the coding-CLI executor, adapter and action-budget
   # suites, config validation with the tools compiled in, the runner's gateway
   # hook, and the root report-template tests.
   test-tool-features:
@@ -1071,7 +1071,7 @@ jobs:
         run: >-
           cargo nextest run --locked --no-fail-fast
           -p zeroclaw -p zeroclaw-config -p zeroclaw-tools -p zeroclaw-runtime -p zeroclaw-gateway
-          --features tools-saas,tools-coding-cli
+          --features tools-compat
           --lib --test integration
           -E 'not binary(integration) or test(/^report_template_tool_test::/)'
         env:

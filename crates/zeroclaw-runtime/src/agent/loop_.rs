@@ -19270,6 +19270,7 @@ Let me check the result."#;
             },
             ..zeroclaw_config::schema::Config::default()
         };
+        config.tools.optional = vec!["file_download".into()];
         let provider = config
             .providers
             .models
@@ -19357,7 +19358,8 @@ Let me check the result."#;
 
     #[tokio::test]
     async fn process_message_seam_narrows_safe_defaults_outside_allowed_tools() {
-        let config = zeroclaw_config::schema::Config::default();
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.tools.optional = vec!["calculator".into()];
         let security = Arc::new(TestPolicy {
             workspace_dir: std::env::temp_dir(),
             ..TestPolicy::default()
@@ -19390,8 +19392,8 @@ Let me check the result."#;
 
         let before = tool_names(&built.tools);
         assert!(
-            before.contains(&"web_search_tool"),
-            "precondition: web_search_tool in the eager registry, got {before:?}"
+            before.contains(&"calculator"),
+            "precondition: calculator in the eager registry, got {before:?}"
         );
         assert!(
             before.contains(&"shell"),
@@ -19429,8 +19431,8 @@ Let me check the result."#;
 
         let filtered: Vec<&str> = assembled.registry.iter().map(|t| t.name()).collect();
         assert!(
-            !filtered.contains(&"web_search_tool"),
-            "unified filter must DROP a read-only default outside allowed_tools \
+            !filtered.contains(&"calculator"),
+            "unified filter must DROP a selected optional tool outside allowed_tools \
              (the removed safe-defaults admit retained it), got {filtered:?}"
         );
         assert!(
@@ -22087,6 +22089,7 @@ Let me check the result."#;
         });
 
         let (_tmp, mut config) = isolated_run_test_config();
+        config.tools.optional = vec!["model_switch".into()];
         for alias in ["default", "switched"] {
             config.providers.models.ollama.insert(
                 alias.to_string(),

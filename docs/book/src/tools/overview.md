@@ -19,11 +19,70 @@ recorded in the inventory's
 [Replacement-First Policy](../developing/tool-inventory.md#replacement-first-policy)
 section.
 
-> **Build note:** the SaaS integration tools (`jira`, `notion`, `linkedin`, `composio`, `google_workspace`, `microsoft365`, `project_intel` with `report_template`) and the coding-CLI tools (`claude_code`, `claude_code_runner`, `codex_cli`, `gemini_cli`, `opencode_cli`) are not in the lean Cargo default build. Release binaries and container images include them. From source, build with `--features tools-saas`, `--features tools-coding-cli`, or a single `tool-<name>` feature such as `tool-jira`. A build without a tool's feature skips it and logs a warning if its config section is enabled.
+## Selecting optional tools
+
+New and existing schema-3 configurations expose eleven built-ins by default:
+`shell`, `file_read`, `file_write`, `file_edit`, `glob_search`, `content_search`,
+`memory_recall`, `memory_store`, `memory_forget`, `web_fetch`, and
+`git_operations`. The canonical set is `CORE_TOOL_NAMES` in
+`zeroclaw-config/src/builtin_tools.rs`. Existing policy can narrow this set.
+
+Select additional built-ins by their callable names:
+
+```toml
+[tools]
+optional = ["calculator", "cron_list", "sessions_history"]
+```
+
+Selection happens before constructors run. An unselected tool contributes no
+schema or tool-catalog prompt text. Selection does not grant permissions:
+the tool's own settings, runtime capabilities, risk profile, caller narrowing,
+approval, path/network policy and receipts still apply. Reload the daemon
+after changing selection. Config schema remains version 3.
+
+Explicitly configured MCP servers, skills, plugins and peripherals keep their
+existing activation and permission paths; they are not selected through this
+built-in list. No replacement plugin is required or claimed here.
+
+### Builds and upgrade path
+
+| Channel | Standard build | Recovering optional native adapters |
+| --- | --- | --- |
+| Release archive | `dist`: eleven defaults; vendor/CLI/external adapters compiled out | Download `zeroclaw-<target>-compat.tar.gz` (Windows: `.zip`), which uses `dist-compat`, then select the tools |
+| Desktop sidecar | `dist`, resolved for each target, plus requested desktop features | Prepare a compatibility sidecar with `scripts/desktop/prepare-kernel.sh --distribution dist-compat`; users can run a downloaded compatibility daemon and connect the desktop to it |
+| Homebrew source build | Cargo defaults: the same eleven-tool policy; optional external adapters compiled out | Use the platform compatibility archive alongside the package-managed binary; adding config cannot change a bottle's compiled features |
+| Docker | `dist`: the same eleven-tool policy | Use the `compat-tools` image tag, then select the tools and configure their dependencies |
+
+`dist-compat` adds the `tools-compat` Cargo bundle: `tools-saas`,
+`tools-coding-cli`, and `tools-external`. Source users can select an individual
+existing `tool-*` feature or the bundle. The compatibility build does not
+install vendor CLIs, browsers or credentials. Existing integration `enabled`
+settings and dependencies remain necessary. First-party extras such as cron,
+sessions and calculator are compiled into both builds and need only runtime
+selection plus their existing prerequisites.
+
+The default change is intentional for desktop and Homebrew as well as archives
+and Docker. Existing users who need the previous built-ins can select them
+individually, or explicitly request the previous selection:
+
+```toml
+[tools]
+optional = ["*"]
+```
+
+Use a compatibility build for vendor/CLI/external adapters. A lean build reports
+selected but compiled-out adapters through config validation warnings; it cannot
+activate code it does not contain. The wildcard restores availability according
+to the previous config and runtime gates, including caller-specific exceptions;
+it does not enable disabled integrations, grant permissions, or expose withheld
+tools. For ACP attachment delivery, select `deliver_file`; for compact skills,
+select `read_skill`; for model-driven scheduling/SOP/delegation, select the
+corresponding tool names. Operator scheduling, SOP and approval services retain
+their existing lifecycle independently of model-visible selection.
 
 ## Built-in tools
 
-A minimal build ships with:
+The following capabilities are available when compiled and selected; the eleven-tool default is listed above:
 
 | Tool | What it does |
 |---|---|
@@ -60,7 +119,7 @@ ZeroClaw sends it only as a Bearer authorization header; without a key, no
 queries to a third-party service even in anonymous mode. It does not change the
 default provider and is not used as an automatic fallback.
 
-Always registered alongside the built-ins:
+Additional first-party built-ins require selection:
 
 | Tool | Notes |
 |---|---|
@@ -69,7 +128,7 @@ Always registered alongside the built-ins:
 | `memory_forget`, `memory_export`, `memory_purge` | Long-term memory management |
 | `spawn_subagent`, `delegate` | Run a subtask in a child agent |
 
-Conditionally registered:
+Selected tools also retain these prerequisites:
 
 | Tool | Enabled by |
 |---|---|

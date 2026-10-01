@@ -216,6 +216,7 @@ non_row_features = [
     "channels-full",
     "tools-saas",
     "tools-coding-cli",
+    "tools-compat",
     "ci-all",
     "fantoccini",
     "landlock",
@@ -230,20 +231,6 @@ dist_extra_features = [
     "channel-lark",
     "channel-git",
     "whatsapp-web",
-    # The SaaS and coding-CLI tools left Cargo `default` but still ship in
-    # standard artifacts until each has a plugin replacement.
-    "tool-jira",
-    "tool-notion",
-    "tool-linkedin",
-    "tool-composio",
-    "tool-google-workspace",
-    "tool-microsoft365",
-    "tool-project-intel",
-    "tool-claude-code",
-    "tool-claude-code-runner",
-    "tool-codex-cli",
-    "tool-gemini-cli",
-    "tool-opencode-cli",
 ]
 
 # Features whose build needs system C libraries or tooling the minimal static
@@ -308,8 +295,11 @@ channels-full = [
     "channel-whatsapp-cloud", "channel-voice-call",
 ]
 
-# Opt-in SaaS integration tools. Not in `default`; standard distribution
-# artifacts include them through `dist_extra_features`.
+# Opt-in native adapters. Standard distributions omit external integrations;
+# the compatibility bundle keeps them available for explicit selection.
+tools-external = ["zeroclaw-runtime/tools-external", "zeroclaw-tools/tools-external"]
+# An explicit compatibility artifact; registration still requires [tools].optional.
+tools-compat = ["tools-saas", "tools-coding-cli", "tools-external"]
 tools-saas = [
     "tool-jira",
     "tool-notion",
@@ -409,7 +399,7 @@ peripheral-rpi = ["dep:zeroclaw-hardware", "zeroclaw-hardware/peripheral-rpi"]
 dev-sim = ["dep:zeroclaw-hardware", "zeroclaw-hardware/dev-sim"]
 sandbox-landlock = ["zeroclaw-runtime/sandbox-landlock"]
 sandbox-bubblewrap = ["zeroclaw-runtime/sandbox-bubblewrap"]
-browser-native = ["zeroclaw-tools/browser-native"]
+browser-native = ["tools-external", "zeroclaw-tools/browser-native"]
 plugins-wasm = [
     "dep:zeroclaw-plugins",
     "zeroclaw-runtime/plugins-wasm",
@@ -462,7 +452,7 @@ ci-all = [
     "browser-native", "probe",
     "plugins-wasm", "plugins-wasm-cranelift",
     "webauthn", "memory-postgres",
-    "tools-saas", "tools-coding-cli",
+    "tools-saas", "tools-coding-cli", "tools-external",
 ]
 
 [profile.dev]
