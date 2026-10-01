@@ -827,6 +827,7 @@ mod tests {
     use super::*;
 
     /// Launch `binary` the way the app does, into a fresh owned registry.
+    #[cfg(unix)]
     fn launch(binary: &Path) -> std::io::Result<()> {
         crate::ownership::OwnedProcesses::default().launch(binary, 0)
     }
