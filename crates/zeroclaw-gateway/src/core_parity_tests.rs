@@ -1002,3 +1002,259 @@ async fn sop_decide_through_the_core_matches_the_in_process_answers() {
         );
     }
 }
+
+// ── Run admission at the commit ──────────────────────────────────
+
+/// A decision model that parks every question until the test releases it, so
+/// a test can change the caller's authority or the procedure while a run waits
+/// on it.
+struct ParkedDecision {
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[async_trait::async_trait]
+impl zeroclaw_runtime::sop::decision::DecisionModel for ParkedDecision {
+    fn id(&self) -> &str {
+        "parked"
+    }
+
+    async fn ask(
+        &self,
+        _: Value,
+        _: std::collections::BTreeMap<String, zeroclaw_runtime::sop::decision::Question>,
+    ) -> anyhow::Result<zeroclaw_runtime::sop::decision::Answers> {
+        self.entered.notify_one();
+        self.release.notified().await;
+        serde_json::from_value(
+            json!({ "answers": { "start_sop": { "type": "noul", "noul": 1.0 } } }),
+        )
+        .map_err(Into::into)
+    }
+}
+
+impl Harness {
+    /// Load `deploy` behind a decision gate answered by a [`ParkedDecision`].
+    fn park_decisions(&self) -> Arc<ParkedDecision> {
+        let model = Arc::new(ParkedDecision {
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let mut procedure = gated_sop();
+        procedure.decision =
+            Some(serde_json::from_value(json!({ "model": "parked", "gate": "start?" })).unwrap());
+        let mut engine = SopEngine::new(self.state.config.read().sop.clone()).with_decision_models(
+            HashMap::from([(
+                "parked".to_string(),
+                Arc::clone(&model) as Arc<dyn zeroclaw_runtime::sop::decision::DecisionModel>,
+            )]),
+        );
+        engine.set_sops_for_test(vec![procedure]);
+        *self.engine().lock().unwrap() = engine;
+        model
+    }
+
+    /// A request's access: through the core, or the in-process body.
+    async fn access(&self, through_core: bool) -> CoreAccess {
+        if through_core {
+            self.through_core().await
+        } else {
+            CoreAccess::InProcess
+        }
+    }
+
+    fn active_runs(&self) -> usize {
+        self.engine().lock().unwrap().active_runs().len()
+    }
+
+    /// Start `POST /api/sops/deploy/run` on its own task, and return once it
+    /// is parked in the decision model.
+    async fn run_parked(
+        &self,
+        model: &ParkedDecision,
+        access: CoreAccess,
+        dedup_key: Option<&str>,
+    ) -> tokio::task::JoinHandle<(StatusCode, Value)> {
+        let state = self.state.clone();
+        let body = SopRunBody {
+            payload: None,
+            dedup_key: dedup_key.map(str::to_string),
+        };
+        let task = zeroclaw_spawn::spawn!(async move {
+            body_of(
+                handle_sop_run(
+                    State(state),
+                    Harness::headers(),
+                    Path("deploy".into()),
+                    access,
+                    Json(body),
+                )
+                .await,
+            )
+            .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), model.entered.notified())
+            .await
+            .expect("the run reaches the decision model");
+        task
+    }
+}
+
+/// The procedure is reloaded, while a run waits on the decision model, into
+/// one the headless driver cannot run. The run is refused at its commit on
+/// either path, and starts nothing.
+#[tokio::test]
+async fn a_run_is_refused_when_its_procedure_changes_during_the_decision_wait() {
+    for through_core in [false, true] {
+        let harness = Harness::with_sops(vec![gated_sop()], approval(1, &[TOKEN]));
+        let model = harness.park_decisions();
+        let task = harness
+            .run_parked(&model, harness.access(through_core).await, None)
+            .await;
+        assert_eq!(harness.active_runs(), 0, "parked before the commit");
+
+        let mut unowned = gated_sop();
+        unowned.agent = None;
+        let dir =
+            std::path::PathBuf::from(harness.state.config.read().sop.sops_dir.clone().unwrap());
+        zeroclaw_runtime::sop::save_existing_sop_typed(&dir, &unowned).unwrap();
+        harness.engine().lock().unwrap().reload(harness._dir.path());
+        assert!(
+            zeroclaw_runtime::sop::headless_ownership_refusal(
+                harness.engine().lock().unwrap().get_sop("deploy").unwrap()
+            )
+            .is_some()
+        );
+
+        model.release.notify_one();
+        let (status, body) = task.await.unwrap();
+        assert!(!status.is_success(), "core={through_core}: {status} {body}");
+        if !through_core {
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        }
+        assert_eq!(
+            harness.active_runs(),
+            0,
+            "core={through_core}: nothing started"
+        );
+    }
+}
+
+/// The caller's pairing is revoked while its run waits on the decision model.
+/// The run is refused at its commit on either path, and so is a second run
+/// that would otherwise coalesce onto an active one.
+#[tokio::test]
+async fn a_run_is_refused_when_the_credential_is_revoked_during_the_decision_wait() {
+    for through_core in [false, true] {
+        let harness = Harness::with_sops(vec![gated_sop()], approval(1, &[TOKEN]));
+        let model = harness.park_decisions();
+        // A run that starts, and keeps a shared producer key active.
+        let task = harness
+            .run_parked(&model, harness.access(through_core).await, Some("shared"))
+            .await;
+        model.release.notify_one();
+        let (status, body) = task.await.unwrap();
+        assert_eq!(status, StatusCode::OK, "core={through_core}: {body}");
+        assert_eq!(harness.active_runs(), 1);
+
+        // The same key again: it would coalesce onto that run.
+        let task = harness
+            .run_parked(&model, harness.access(through_core).await, Some("shared"))
+            .await;
+        assert!(harness.ctx.auth.pairing().revoke_token(TOKEN));
+        model.release.notify_one();
+        let (status, body) = task.await.unwrap();
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "core={through_core}: a revoked credential must not coalesce: {body}"
+        );
+        assert_eq!(harness.active_runs(), 1, "core={through_core}");
+    }
+}
+
+/// A principal whose agent selector names only `alpha` may not delete a
+/// procedure that runs as `beta`, and may not rename it either.
+#[tokio::test]
+async fn rename_holds_the_existing_procedure_to_the_agent_selector() {
+    use zeroclaw_api::grants::{Resource, Verb};
+    use zeroclaw_config::schema::{PermissionProfileConfig, UserConfig};
+    use zeroclaw_runtime::rpc::{
+        dispatch::RpcDispatcher,
+        inproc::InprocTransport,
+        transport::{RpcTransport, TransportKind},
+    };
+    let mut foreign = gated_sop();
+    foreign.name = "foreign".into();
+    foreign.agent = Some("beta".into());
+    let harness = Harness::with_sops(vec![foreign], approval(1, &[TOKEN]));
+    {
+        let mut config = harness.ctx.config.write();
+        config.security.trust_daemon_uid = false;
+        config.agents.insert("alpha".into(), Default::default());
+        config.agents.insert("beta".into(), Default::default());
+        config.permission_profiles.insert(
+            "only-alpha".into(),
+            PermissionProfileConfig {
+                allowed_agents: vec!["alpha".into()],
+                allowed_tools: vec!["*".into()],
+                grants: HashMap::from([(
+                    Resource::Sops,
+                    vec![Verb::Read, Verb::Update, Verb::Delete],
+                )]),
+                ..Default::default()
+            },
+        );
+        config.users.insert(
+            "alice".into(),
+            UserConfig {
+                principal_id: None,
+                uid: Some(4242),
+                permission_profiles: vec!["only-alpha".into()],
+            },
+        );
+        harness.ctx.auth.refresh_from_config(&config).unwrap();
+    }
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let mut transport = InprocTransport::new(server, harness.cancel.clone());
+    let mut dispatcher = RpcDispatcher::new(
+        harness.ctx.clone(),
+        transport.writer(),
+        "local:fixture".into(),
+    )
+    .with_transport(
+        TransportKind::Local,
+        zeroclaw_runtime::security::auth_provider::Credential::Peercred { uid: 4242 },
+    );
+    let task = zeroclaw_spawn::spawn!(async move { dispatcher.run(&mut transport).await });
+    let client = zeroclaw_rpc_client::RpcClient::connect_over(client, Default::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        client.handshake().principal_id.as_deref(),
+        Some("user:alice")
+    );
+
+    let forbidden = |result: &Result<Value, zeroclaw_rpc_client::ClientError>| {
+        matches!(result, Err(zeroclaw_rpc_client::ClientError::Rpc(error))
+            if error.code == zeroclaw_api::jsonrpc::error_codes::FORBIDDEN)
+    };
+    let deleted = client
+        .request(
+            zeroclaw_rpc_client::Method::SopsDelete,
+            json!({ "name": "foreign" }),
+        )
+        .await;
+    assert!(forbidden(&deleted), "{deleted:?}");
+    let renamed = client
+        .request(
+            zeroclaw_rpc_client::Method::SopsRename,
+            json!({ "from": "foreign", "to": "stolen" }),
+        )
+        .await;
+    client.shutdown();
+    task.abort();
+    assert!(forbidden(&renamed), "{renamed:?}");
+    let dir = std::path::PathBuf::from(harness.ctx.config.read().sop.sops_dir.clone().unwrap());
+    assert!(dir.join("foreign").exists() && !dir.join("stolen").exists());
+}

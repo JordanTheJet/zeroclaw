@@ -452,7 +452,7 @@ impl Method {
             M::SopsCreate => (Typed("SopSaveRequest"), Untyped),
             M::SopsDelete => (Typed("SopSelectRequest"), Untyped),
             M::SopsRename => (Typed("SopRenameRequest"), Untyped),
-            M::SopsDecide => (Typed("SopDecideRequest"), Typed("RunOverlay")),
+            M::SopsDecide => (Typed("SopDecideRequest"), Typed("SopDecideResult")),
             M::SopsWireDraft => (Untyped, Untyped),
             M::SopsGraphDraft => (Untyped, Typed("SopGraph")),
             M::SopsTriggerSources => (None, Typed("TriggerSourceRegistry")),

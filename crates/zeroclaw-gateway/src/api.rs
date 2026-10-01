@@ -59,23 +59,23 @@ pub(crate) fn require_auth(
     // Defense-in-depth: reject empty tokens explicitly so a future
     // refactor of is_authenticated cannot accidentally treat "" as valid.
     if token.is_empty() {
-        return Err((
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({
-                "error": "Unauthorized — pair first via POST /pair, then send Authorization: Bearer <token>"
-            })),
-        ));
+        return Err(pairing_required());
     }
     if state.pairing.is_authenticated(token) {
         Ok(())
     } else {
-        Err((
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({
-                "error": "Unauthorized — pair first via POST /pair, then send Authorization: Bearer <token>"
-            })),
-        ))
+        Err(pairing_required())
     }
+}
+
+/// The refusal [`require_auth`] answers a caller without a paired bearer.
+pub(crate) fn pairing_required() -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(serde_json::json!({
+            "error": "Unauthorized — pair first via POST /pair, then send Authorization: Bearer <token>"
+        })),
+    )
 }
 
 // ── Query parameters ─────────────────────────────────────────────

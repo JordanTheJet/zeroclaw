@@ -76,6 +76,8 @@ catalog! {
     FileUploadCommitParams,
     // Approval
     SessionApproveParams, SessionApproveResult,
+    // SOP decisions
+    SopDecideResult,
     // Logs
     SubscribeParams, LogsSubscribeResult, LogsQueryParams, LogsQueryResult, LogsGetParams,
     LogsGetResult, EventsHistoryResult, SubscriptionCancelParams, SubscriptionCancelResult,

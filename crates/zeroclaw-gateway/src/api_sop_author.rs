@@ -365,14 +365,23 @@ pub async fn handle_sop_run(
         timestamp: zeroclaw_runtime::sop::engine::now_iso8601(),
     };
 
-    let results = if let Some(dedup_key) = dedup_key {
-        zeroclaw_runtime::sop::dispatch::dispatch_sop_event_to_deduplicated(
-            engine, audit, event, &name, dedup_key,
-        )
-        .await
-    } else {
-        zeroclaw_runtime::sop::dispatch::dispatch_sop_event_to(engine, audit, event, &name).await
+    // The checks above refuse early. The run itself is admitted where it is
+    // committed, after the decision model's wait, against the caller's
+    // bearer and the procedure as they are then.
+    let admission = InProcessRunAdmission {
+        state: &state,
+        token: super::api::extract_bearer_token(&headers)
+            .unwrap_or("")
+            .to_string(),
+        refusal: parking_lot::Mutex::new(None),
     };
+    let results = zeroclaw_runtime::sop::dispatch::dispatch_sop_event_to_admitted(
+        engine, audit, event, &name, dedup_key, &admission,
+    )
+    .await;
+    if let Some(refusal) = admission.refusal.into_inner() {
+        return refusal;
+    }
     zeroclaw_runtime::sop::dispatch::process_headless_results(&results);
 
     for result in &results {
@@ -449,6 +458,46 @@ pub async fn handle_sop_run(
         })),
     )
         .into_response()
+}
+
+/// The in-process run route's admission, checked by the SOP dispatcher where
+/// the run is committed: the bearer is still paired, with the paired-token
+/// set held until the run is committed so an unpairing waits for it, and the
+/// procedure the engine holds now can run headless. A refusal is kept here
+/// for the route to answer.
+struct InProcessRunAdmission<'s> {
+    state: &'s AppState,
+    token: String,
+    refusal: parking_lot::Mutex<Option<Response>>,
+}
+
+impl zeroclaw_runtime::sop::dispatch::SopRunAdmission for InProcessRunAdmission<'_> {
+    fn admit<'a>(
+        &'a self,
+        sop: &zeroclaw_runtime::sop::Sop,
+    ) -> Option<Box<dyn zeroclaw_runtime::sop::dispatch::HeldPermit + 'a>> {
+        let held = if self.state.pairing.require_pairing() {
+            let held = self.state.pairing.hold_paired_tokens();
+            if self.token.is_empty() || !held.contains_token(&self.token) {
+                *self.refusal.lock() = Some(super::api::pairing_required().into_response());
+                return None;
+            }
+            Some(held)
+        } else {
+            None
+        };
+        if let Some(refusal) = zeroclaw_runtime::sop::headless_ownership_refusal(sop) {
+            *self.refusal.lock() = Some(
+                (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(serde_json::json!({ "error": refusal })),
+                )
+                    .into_response(),
+            );
+            return None;
+        }
+        Some(Box::new(held))
+    }
 }
 
 /// `POST /api/sops/{name}/run` through the core, which applies the same

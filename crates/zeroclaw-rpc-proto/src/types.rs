@@ -99,8 +99,25 @@ pub const CLIENT_KIND_GATEWAY: &str = "gateway";
 
 /// The member a `sops/decide` result carries, set to `true`, when the decision
 /// counted as one vote and the gate still waits for the rest of its quorum.
-/// Absent otherwise, so the result is the run overlay it always was.
+/// Absent otherwise, so the result is the run overlay it always was. The
+/// member is [`SopDecideResult::pending_quorum`].
 pub const SOP_DECIDE_PENDING_QUORUM: &str = "pending_quorum";
+
+rpc_type! {
+    /// The `sops/decide` result: the run's overlay after the decision, its
+    /// members as `sops/run-overlay` returns them, plus
+    /// [`SOP_DECIDE_PENDING_QUORUM`] while the gate still waits for more
+    /// votes.
+    pub struct SopDecideResult {
+        /// The run overlay's members.
+        #[serde(flatten)]
+        pub overlay: serde_json::Map<String, Value>,
+        /// `true` when the decision counted as one vote and the gate still
+        /// waits for the rest of its quorum; absent otherwise.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub pending_quorum: Option<bool>,
+    }
+}
 
 rpc_type! {
     /// Command identity and accepted tokens advertised to an RPC client.

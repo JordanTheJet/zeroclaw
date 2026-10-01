@@ -1009,6 +1009,29 @@ fn current_authority_under(
     Ok(grants)
 }
 
+/// A `sops/run` caller's admission, checked by the SOP dispatcher where the
+/// run is committed ([`RpcDispatcher::admit_sop_run`]). A refusal is kept
+/// here for the handler to return.
+struct SopRunAdmission<'d> {
+    dispatcher: &'d RpcDispatcher,
+    refusal: parking_lot::Mutex<Option<JsonRpcError>>,
+}
+
+impl crate::sop::dispatch::SopRunAdmission for SopRunAdmission<'_> {
+    fn admit<'a>(
+        &'a self,
+        sop: &crate::sop::Sop,
+    ) -> Option<Box<dyn crate::sop::dispatch::HeldPermit + 'a>> {
+        match self.dispatcher.admit_sop_run(sop) {
+            Ok(lease) => Some(Box::new(lease)),
+            Err(refusal) => {
+                *self.refusal.lock() = Some(refusal);
+                None
+            }
+        }
+    }
+}
+
 impl RpcDispatcher {
     /// Fine-grained config-path selector. Composes with the coarse
     /// `Config` grant the gate already enforced: both are required.
@@ -9673,9 +9696,18 @@ impl RpcDispatcher {
         let Some(auth) = self.auth.as_ref() else {
             return Ok(());
         };
-        if auth.grants.admin
-            || auth
-                .grants
+        self.refuse_constrained_tool_selector_with(method, &auth.grants)
+    }
+
+    /// [`Self::refuse_constrained_tool_selector_for_sop`] against `grants`,
+    /// such as the ones a commit re-resolved.
+    fn refuse_constrained_tool_selector_with(
+        &self,
+        method: Method,
+        grants: &zeroclaw_api::grants::ResolvedGrants,
+    ) -> Result<(), JsonRpcError> {
+        if grants.admin
+            || grants
                 .allowed_tools
                 .iter()
                 .any(|tool| tool == zeroclaw_api::grants::WILDCARD)
@@ -9707,6 +9739,47 @@ impl RpcDispatcher {
         let mut loaded = sop.clone();
         loaded.steps = crate::sop::parse_steps(&crate::sop::render_steps(&sop.steps));
         loaded
+    }
+
+    /// Admit a `sops/run` of `sop` where the run is committed (see
+    /// [`SopRunAdmission`]).
+    ///
+    /// The caller's authority is re-resolved from a held [`AuthorityLease`],
+    /// so a revocation or policy change that landed during the wait refuses
+    /// the run, and one that arrives now waits for the lease, which the
+    /// dispatcher holds until the run is committed. The procedure is the one
+    /// the engine holds now, so its agents and its headless ownership are
+    /// checked as they will run, not as they were before the wait.
+    ///
+    /// The configured agents are read before the lease is taken: a
+    /// publication may hold the config while it waits for the authority
+    /// state, so the config is never reached under the lease.
+    ///
+    /// [`AuthorityLease`]: crate::rpc::auth::AuthorityLease
+    fn admit_sop_run(
+        &self,
+        sop: &crate::sop::Sop,
+    ) -> Result<crate::rpc::auth::AuthorityLease<'_>, JsonRpcError> {
+        let method = Method::SopsRun;
+        let agents = {
+            let config = self.ctx.config.read();
+            Self::sop_executing_agents(sop, &config)
+        };
+        let lease = self.ctx.auth.hold_authority();
+        if let Some(auth) = self.auth.as_ref() {
+            let grants = current_authority_under(&lease, auth, method).map_err(|denied| {
+                self.audit_auth_denial(method, &denied);
+                rpc_err(denied.code, denied.message)
+            })?;
+            self.refuse_constrained_tool_selector_with(method, &grants)?;
+            for alias in &agents {
+                self.selector_session_agent_with_grants(method, &grants, alias)?;
+            }
+        }
+        if let Some(refusal) = crate::sop::headless_ownership_refusal(sop) {
+            return Err(rpc_err(INVALID_PARAMS, refusal));
+        }
+        Ok(lease)
     }
 
     /// Hold a procedure a principal is about to write to its agent selector,
@@ -9859,14 +9932,20 @@ impl RpcDispatcher {
             timestamp: crate::sop::engine::now_iso8601(),
         };
 
-        let results = if let Some(dedup_key) = dedup_key {
-            crate::sop::dispatch::dispatch_sop_event_to_deduplicated(
-                engine, audit, event, &req.name, dedup_key,
-            )
-            .await
-        } else {
-            crate::sop::dispatch::dispatch_sop_event_to(engine, audit, event, &req.name).await
+        // The checks above refuse early. The run itself is admitted where it is
+        // committed, after the decision model's wait, against the caller's
+        // authority and the procedure as they are then.
+        let admission = SopRunAdmission {
+            dispatcher: self,
+            refusal: parking_lot::Mutex::new(None),
         };
+        let results = crate::sop::dispatch::dispatch_sop_event_to_admitted(
+            engine, audit, event, &req.name, dedup_key, &admission,
+        )
+        .await;
+        if let Some(refusal) = admission.refusal.into_inner() {
+            return Err(refusal);
+        }
         crate::sop::dispatch::process_headless_results(&results);
 
         for result in &results {
@@ -10167,14 +10246,13 @@ impl RpcDispatcher {
             };
             rpc_err(code, msg)
         })?;
-        let mut result = to_result(overlay)?;
-        if pending_quorum && let Some(fields) = result.as_object_mut() {
-            fields.insert(
-                zeroclaw_rpc_proto::types::SOP_DECIDE_PENDING_QUORUM.to_owned(),
-                Value::Bool(true),
-            );
-        }
-        Ok(result)
+        let Value::Object(overlay) = to_result(overlay)? else {
+            return Err(rpc_err(INTERNAL_ERROR, "run overlay is not an object"));
+        };
+        to_result(zeroclaw_rpc_proto::types::SopDecideResult {
+            overlay,
+            pending_quorum: pending_quorum.then_some(true),
+        })
     }
 
     /// The approval principal this connection decides as, derived from its
@@ -10286,13 +10364,12 @@ impl RpcDispatcher {
     /// overwrite the SOP it was loaded from. Renaming is collision-checked
     /// and moves the definition; it never copies it.
     fn handle_sops_rename(&self, params: &Value) -> RpcResult {
-        // Local transports only, for the reason `sops/run-detail` gives: a
-        // remote WSS caller that has completed `initialize` has not
-        // established a principal this dispatcher can authorize a SOP
-        // identity change against, while local IPC is owner-scoped by the
-        // socket itself. Checked before the params are parsed so a refused
-        // caller learns nothing about which SOPs exist. Replace this with a
-        // principal check once there is one, rather than removing it.
+        // Not over remote WSS, for the reason `sops/run-detail` gives. A local
+        // transport is not ownership proof either: the gateway reaches the
+        // core over one on behalf of every HTTP user, so the procedure being
+        // moved is held to the caller's agent selector below, as save and
+        // delete hold it. Checked before the params are parsed so a refused
+        // caller learns nothing about which SOPs exist.
         if self.peer_label.starts_with("wss:") {
             return Err(rpc_err(
                 AUTH_REQUIRED,
@@ -10302,6 +10379,7 @@ impl RpcDispatcher {
         }
         let req: SopRenameRequest = parse_params(params)?;
         let (dir, mode) = self.sops_dir_and_mode();
+        self.authorize_existing_sop(Method::SopsRename, &dir, &req.from, mode)?;
         crate::sop::rename_sop_typed(&dir, &req.from, &req.to, mode).map_err(|e| {
             let code = match e {
                 crate::sop::SopAuthorError::NotFound(_) => SOP_NOT_FOUND,

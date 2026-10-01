@@ -3852,6 +3852,20 @@
         ],
         "type": "object"
       },
+      "SopDecideResult": {
+        "additionalProperties": true,
+        "description": "The `sops/decide` result: the run's overlay after the decision, its\nmembers as `sops/run-overlay` returns them, plus\n[`SOP_DECIDE_PENDING_QUORUM`] while the gate still waits for more\nvotes.",
+        "properties": {
+          "pending_quorum": {
+            "description": "`true` when the decision counted as one vote and the gate still\nwaits for the rest of its quorum; absent otherwise.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "SopGraph": {
         "description": "The full projected graph: nodes, wires, validation diagnostics, and a\nprecomputed layout. Serialized as-is over RPC (`sops/graph`) and HTTP.",
         "properties": {
@@ -7335,10 +7349,9 @@
       "result": {
         "name": "result",
         "schema": {
-          "description": "`RunOverlay`, defined in `zeroclaw-runtime`; no schema is exported yet."
+          "$ref": "#/components/schemas/SopDecideResult"
         },
-        "x-zeroclaw-owner": "zeroclaw-runtime",
-        "x-zeroclaw-shape": "external"
+        "x-zeroclaw-shape": "typed"
       },
       "x-zeroclaw-authorization": {
         "kind": "grant",
