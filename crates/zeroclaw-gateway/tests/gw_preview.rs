@@ -484,11 +484,8 @@ impl InProcess {
         drop(probe);
         let (shutdown_tx, _) = tokio::sync::watch::channel(false);
         let (reload_tx, _) = tokio::sync::watch::channel(false);
-        let controls = zeroclaw_runtime::daemon::GatewayReloadControls {
-            shutdown_tx,
-            reload_tx,
-            inproc: None,
-        };
+        let controls =
+            zeroclaw_runtime::daemon::GatewayReloadControls::standalone(shutdown_tx, reload_tx);
         let (ready_tx, mut ready_rx) = tokio::sync::watch::channel(None);
         let readiness = zeroclaw_runtime::daemon::GatewayReadinessReporter::new(move |addr| {
             let _ = ready_tx.send(Some(addr));

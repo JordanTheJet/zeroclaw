@@ -790,6 +790,15 @@ impl Dial for CountingDial {
     }
 }
 
+/// Give the daemon directory behind `config` a TUI identity signing key, as
+/// an installed daemon has. The in-process duplex is a non-local caller, and
+/// the core refuses its `initialize` while signing is off, so a test of the
+/// credential layer needs signing on to reach it.
+fn with_daemon_signing_key(config: &zeroclaw_config::schema::Config) {
+    let dir = config.config_path.parent().expect("config dir");
+    std::fs::write(dir.join(".secret_key"), "42".repeat(32)).expect("signing key");
+}
+
 #[tokio::test]
 async fn the_real_core_binds_each_bearer_and_revocation_ends_its_connection() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -800,6 +809,7 @@ async fn the_real_core_binds_each_bearer_and_revocation_ends_its_connection() {
     };
     config.gateway.require_pairing = true;
     config.gateway.paired_tokens = vec!["zc_gw_alice".into(), "zc_gw_bob".into()];
+    with_daemon_signing_key(&config);
     let sessions = Arc::new(zeroclaw_runtime::rpc::session::SessionStore::new(
         16,
         Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
@@ -807,6 +817,7 @@ async fn the_real_core_binds_each_bearer_and_revocation_ends_its_connection() {
         )),
     ));
     let ctx = zeroclaw_runtime::rpc::context::RpcContext::for_live_test(config, sessions);
+    assert!(ctx.tui_registry.signing_is_enabled());
     let cancel = tokio_util::sync::CancellationToken::new();
     let connector = InprocConnector::new(cancel.clone());
     connector.bind(Arc::clone(&ctx));
@@ -881,6 +892,7 @@ fn real_pool() -> (
     };
     config.gateway.require_pairing = true;
     config.gateway.paired_tokens = vec!["zc_real_a".into(), "zc_real_b".into()];
+    with_daemon_signing_key(&config);
     let sessions = Arc::new(zeroclaw_runtime::rpc::session::SessionStore::new(
         16,
         Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
@@ -888,6 +900,7 @@ fn real_pool() -> (
         )),
     ));
     let ctx = zeroclaw_runtime::rpc::context::RpcContext::for_live_test(config, sessions);
+    assert!(ctx.tui_registry.signing_is_enabled());
     let cancel = tokio_util::sync::CancellationToken::new();
     let connector = InprocConnector::new(cancel.clone());
     connector.bind(Arc::clone(&ctx));
@@ -1468,6 +1481,7 @@ fn proxied_core() -> (
     };
     config.gateway.require_pairing = true;
     config.gateway.paired_tokens = vec!["zc_sub".into()];
+    with_daemon_signing_key(&config);
     let sessions = Arc::new(zeroclaw_runtime::rpc::session::SessionStore::new(
         16,
         Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
@@ -1582,6 +1596,40 @@ async fn a_caller_that_stops_waiting_leaves_no_subscription_behind() {
         leaked.is_empty(),
         "the abandoned subscription delivered {leaked:?}"
     );
+    assert!(!faults.closed_by_gateway.load(Ordering::SeqCst));
+    cancel.cancel();
+}
+
+/// `/api/events` through the core opens its subscription with
+/// [`CoreCall::subscribe`]: a client that leaves while the core's reply is
+/// in flight leaves nothing behind, though another request keeps the same
+/// connection open.
+#[tokio::test]
+async fn the_event_stream_abandoned_during_setup_leaves_no_subscription() {
+    let (_tmp, _ctx, cancel, _connector, core, faults, dials) = proxied_core();
+    let keeper = call_for(&core, "zc_sub").await;
+    *lock(&faults.hold) = Some("logs/subscribe");
+    let opening = zeroclaw_spawn::spawn!(crate::sse::events_stream_through_core(
+        call_for(&core, "zc_sub").await
+    ));
+    tokio::time::timeout(Duration::from_secs(5), faults.held_ready.notified())
+        .await
+        .expect("the core replied");
+    let abandoned = lock(&faults.held).clone().expect("the reply names it");
+    opening.abort();
+    assert!(opening.await.unwrap_err().is_cancelled());
+    faults.release.notify_one();
+
+    wait_for_cancel(&faults, &abandoned).await;
+    assert_eq!(dials.load(Ordering::SeqCst), 1, "the same connection");
+    let again = keeper
+        .request(
+            Method::SubscriptionCancel,
+            json!({ "subscription_id": abandoned }),
+        )
+        .await
+        .expect("the connection still serves");
+    assert_eq!(again["cancelled"], json!(false), "nothing left to cancel");
     assert!(!faults.closed_by_gateway.load(Ordering::SeqCst));
     cancel.cancel();
 }

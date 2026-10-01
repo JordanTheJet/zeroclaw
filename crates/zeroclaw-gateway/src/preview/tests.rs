@@ -810,7 +810,8 @@ mod against_a_core {
             "/api/events/history" => crate::sse::handle_events_history(state, headers, access)
                 .await
                 .into_response(),
-            "/api/sessions" => handle_api_sessions_list(state, access, headers)
+            // Served from the gateway's own store even with a core attached.
+            "/api/sessions" => handle_api_sessions_list(state, headers)
                 .await
                 .into_response(),
             "/api/status" => crate::api::handle_api_status(
