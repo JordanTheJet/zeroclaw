@@ -333,6 +333,114 @@
         ],
         "type": "object"
       },
+      "ConfigApiCode": {
+        "description": "Stable error code consumed by HTTP / CLI / dashboard. Add codes here as new\nfailure cases land — never invent codes ad-hoc at call sites.",
+        "oneOf": [
+          {
+            "const": "path_not_found",
+            "description": "The supplied property path is not defined in the schema.",
+            "type": "string"
+          },
+          {
+            "const": "validation_failed",
+            "description": "Generic schema validation failure (catch-all wrapping `Config::validate()` bails).",
+            "type": "string"
+          },
+          {
+            "const": "config_changed_externally",
+            "description": "On-disk config differs from in-memory state (an out-of-band file edit\nhappened despite the daemon-running rule). Caller should reload.",
+            "type": "string"
+          },
+          {
+            "const": "reload_failed",
+            "description": "The daemon-reload step after a successful save failed; on-disk config\nhas been reverted to the pre-write snapshot to keep state consistent.",
+            "type": "string"
+          },
+          {
+            "const": "op_not_supported",
+            "description": "JSON Patch operation type is not supported (`move` / `copy`).",
+            "type": "string"
+          },
+          {
+            "const": "secret_test_forbidden",
+            "description": "JSON Patch `test` operation targeted a secret or derived-from-secret\npath; rejected to prevent differential value inference.",
+            "type": "string"
+          },
+          {
+            "const": "value_type_mismatch",
+            "description": "The supplied JSON value does not match the field's declared type\n(e.g. an array passed where a scalar was expected, or a non-string\nelement in a `Vec<String>`).",
+            "type": "string"
+          },
+          {
+            "const": "required_field_empty",
+            "description": "A required scalar field was empty / missing / blank.\nPath identifies which one (e.g. `gateway.host`,\n`tunnel.openvpn.config_file`).",
+            "type": "string"
+          },
+          {
+            "const": "invalid_numeric_range",
+            "description": "A numeric field was out of its allowed range (zero, negative, or\nabove an upper bound). Path identifies which one.",
+            "type": "string"
+          },
+          {
+            "const": "invalid_format",
+            "description": "A string did not match its allowed format — invalid URL, bad\nscheme, invalid path prefix, characters outside the allowed set.",
+            "type": "string"
+          },
+          {
+            "const": "invalid_enum_variant",
+            "description": "An enum / discriminator field carried a value not in the allowed\nset (e.g. `tunnel.tunnel_provider` with an unknown name).",
+            "type": "string"
+          },
+          {
+            "const": "dangling_reference",
+            "description": "A reference to another config entry pointed at something that\ndoesn't exist (e.g. `agents.<x>.delegate_to` naming a missing agent).",
+            "type": "string"
+          },
+          {
+            "const": "internal_error",
+            "description": "Catch-all server failure not classified above. Avoid in code; log the\noriginal error and convert to a more specific code where possible.",
+            "type": "string"
+          }
+        ]
+      },
+      "ConfigApiError": {
+        "description": "Structured error returned by the new HTTP CRUD endpoints and the `zeroclaw config`\nsubcommands they share infrastructure with.",
+        "properties": {
+          "code": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ConfigApiCode"
+              }
+            ],
+            "description": "Stable error code for programmatic matching."
+          },
+          "message": {
+            "description": "Human-readable message. Safe to render directly in dashboards / terminals.",
+            "type": "string"
+          },
+          "op_index": {
+            "description": "Index into the JSON Patch operation array, when the error originated\nfrom a specific op in a `PATCH /api/config` batch.",
+            "format": "uint",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "path": {
+            "description": "Property path the error pertains to, when applicable. Empty when the\nerror is whole-config (e.g. `ReloadFailed`).",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ],
+        "type": "object"
+      },
       "ConfigDeleteParams": {
         "properties": {
           "prop": {
@@ -2715,6 +2823,107 @@
           "submission"
         ],
         "type": "object"
+      },
+      "RefusalData": {
+        "description": "The `data` member of a refused method call's error. Optional: a core that\npredates it, and every error it does not classify, sends no `data`.\nMembers may be added; a client ignores those it does not know.",
+        "properties": {
+          "bytes": {
+            "description": "With `entry_exceeds_max_bytes`: that entry's serialized size.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "config_error": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ConfigApiError"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The structured error a refused config operation carries, exactly as\nthe config surfaces report it (`code`, `message`, `path`)."
+          },
+          "index": {
+            "description": "With `entry_exceeds_max_bytes`: the position of the entry too large\nfor the bound.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "reason": {
+            "$ref": "#/components/schemas/RefusalReason"
+          }
+        },
+        "required": [
+          "reason"
+        ],
+        "type": "object"
+      },
+      "RefusalReason": {
+        "description": "Why the core refused a method call, carried in the JSON-RPC error's\n`data.reason`.",
+        "oneOf": [
+          {
+            "const": "not_found",
+            "description": "The named resource does not exist.",
+            "type": "string"
+          },
+          {
+            "const": "unowned",
+            "description": "The resource exists, but nothing the request names owns it, so the\ncore cannot act on the caller's behalf (a SOP with no agent owner,\nfor example).",
+            "type": "string"
+          },
+          {
+            "const": "conflict",
+            "description": "The request conflicts with the resource's current state (it already\nexists, or changed since the caller read it).",
+            "type": "string"
+          },
+          {
+            "const": "disabled",
+            "description": "The subsystem that serves the method is not enabled.",
+            "type": "string"
+          },
+          {
+            "const": "deferred",
+            "description": "The request was accepted but not acted on yet; retrying later can\nsucceed without any change on the caller's side.",
+            "type": "string"
+          },
+          {
+            "const": "capacity",
+            "description": "A concurrency or size limit refused the request.",
+            "type": "string"
+          },
+          {
+            "const": "forbidden",
+            "description": "The caller's principal may not perform this operation.",
+            "type": "string"
+          },
+          {
+            "const": "invalid",
+            "description": "The request itself is malformed or names an invalid value.",
+            "type": "string"
+          },
+          {
+            "const": "blocked",
+            "description": "A safety screen refused the request's content (untrusted input it\nwill not act on), however well-formed the request is.",
+            "type": "string"
+          },
+          {
+            "const": "malformed",
+            "description": "The named resource exists, but what is stored for it does not parse\n(a skill document with no frontmatter, for example).",
+            "type": "string"
+          },
+          {
+            "const": "entry_exceeds_max_bytes",
+            "description": "One entry alone is larger than the size bound the caller set\n(`session/messages` with `max_bytes`); `data` names its `index` and\n`bytes`, so the caller can tell the bound cannot be met.",
+            "type": "string"
+          }
+        ]
       },
       "RuntimeConfigKind": {
         "enum": [
@@ -7500,6 +7709,9 @@
     "4001": "FS_NOT_FOUND",
     "4002": "FS_PERMISSION_DENIED",
     "4003": "FS_INVALID_PATH"
+  },
+  "x-error-data": {
+    "$ref": "#/components/schemas/RefusalData"
   },
   "x-notifications": [
     {
