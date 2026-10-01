@@ -336,22 +336,43 @@ fn personality_template_context(
     config: &zeroclaw_config::schema::Config,
     req: &PersonalityTemplatesParams,
 ) -> crate::agent::personality_templates::TemplateContext {
-    let agent_requested = req.agent.is_some();
-    let requested_agent = req
-        .agent
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
-    let agent_alias = requested_agent.unwrap_or("default");
-    let configured_agent_exists = config.agent(agent_alias).is_some();
+    let defaults = crate::agent::personality_templates::TemplateContext::default();
+    let (agent, include_memory) = match req.defaults.unwrap_or_default() {
+        PersonalityTemplateDefaults::Quickstart => {
+            let agent_requested = req.agent.is_some();
+            let requested_agent = req
+                .agent
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let agent_alias = requested_agent.unwrap_or("default");
+            let configured_agent_exists = config.agent(agent_alias).is_some();
+            (
+                requested_agent
+                    .map(str::to_string)
+                    .or_else(|| configured_agent_exists.then(|| agent_alias.to_string()))
+                    .unwrap_or_else(|| "ZeroClaw".to_string()),
+                configured_agent_exists || agent_requested,
+            )
+        }
+        PersonalityTemplateDefaults::Editor => (
+            req.agent
+                .as_deref()
+                .filter(|alias| config.agents.contains_key(*alias))
+                .map_or_else(|| defaults.agent.clone(), str::to_string),
+            config.memory.backend.as_str() != "none",
+        ),
+    };
 
     crate::agent::personality_templates::TemplateContext {
-        agent: requested_agent
-            .map(str::to_string)
-            .or_else(|| configured_agent_exists.then(|| agent_alias.to_string()))
-            .unwrap_or_else(|| "ZeroClaw".to_string()),
-        include_memory: configured_agent_exists || agent_requested,
-        ..Default::default()
+        agent: req.agent_name.clone().unwrap_or(agent),
+        user: req.user_name.clone().unwrap_or(defaults.user),
+        timezone: req.timezone.clone().unwrap_or(defaults.timezone),
+        communication_style: req
+            .communication_style
+            .clone()
+            .unwrap_or(defaults.communication_style),
+        include_memory: req.include_memory.unwrap_or(include_memory),
     }
 }
 
@@ -8677,7 +8698,12 @@ impl RpcDispatcher {
         let root = config.install_root_dir();
         let svc = crate::skills::service::SkillsService::new(&config, &root);
         let skill_ref = resolve_skill_ref(&svc, &req.name, &req.bundle)?;
-        svc.remove_skill(&skill_ref, crate::skills::service::RemoveMode::Archive)
+        let mode = if req.purge {
+            crate::skills::service::RemoveMode::Purge
+        } else {
+            crate::skills::service::RemoveMode::Archive
+        };
+        svc.remove_skill(&skill_ref, mode)
             .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Skill delete failed: {e}")))?;
         to_result(SkillsDeleteResult {
             bundle: req.bundle,
@@ -8694,6 +8720,9 @@ impl RpcDispatcher {
             self.selector_agent(Method::PersonalityList, agent)?;
         }
         let config = self.ctx.config.read().clone();
+        if req.require_configured_agent {
+            require_configured_agent(&config, req.agent.as_deref())?;
+        }
         let workspace = req.agent.as_deref().map(|a| config.agent_workspace_dir(a));
         let files: Vec<PersonalityFileEntry> =
             crate::agent::personality::EDITABLE_PERSONALITY_FILES
@@ -8749,6 +8778,9 @@ impl RpcDispatcher {
                 format!("Not an editable file: {}", req.filename),
             ));
         }
+        if req.require_configured_agent {
+            require_configured_agent(&config, Some(&req.agent))?;
+        }
         let workspace = config.agent_workspace_dir(&req.agent);
         // Read beneath a handle on the entitled agent's workspace, without
         // following a link out of it. Joining the pathname and reading it would
@@ -8796,7 +8828,47 @@ impl RpcDispatcher {
                 ),
             ));
         }
+        if req.require_configured_agent {
+            require_configured_agent(&config, Some(&req.agent))?;
+        }
         let workspace = config.agent_workspace_dir(&req.agent);
+        // Disk-drift guard, as on `PUT /api/personality/{filename}`: when the
+        // editor says which mtime it saw, refuse the write if the file has
+        // moved since, and hand back what is on disk now. Read through the
+        // same no-follow handle as every other personality read. This method
+        // needs only `personality:update`; what is on disk (content and mtime)
+        // is `personality:read` data, so it rides along only for a caller that
+        // holds that grant too.
+        if let Some(expected) = req.expected_mtime_ms {
+            let (current_content, current_mtime_ms) =
+                match read_personality_file(&workspace, &req.filename) {
+                    Ok((content, mtime)) => (content, mtime),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => (String::new(), None),
+                    Err(e) => return Err(rpc_err(INTERNAL_ERROR, format!("Read failed: {e}"))),
+                };
+            if current_mtime_ms != Some(expected) {
+                let mut err = rpc_err(
+                    PRECONDITION_FAILED,
+                    format!("{} changed on disk since it was read", req.filename),
+                );
+                let mut data = serde_json::json!({
+                    "error": "personality_disk_drift",
+                    "filename": req.filename,
+                });
+                let may_read = self.auth.as_ref().is_some_and(|auth| {
+                    auth.grants.permits(
+                        zeroclaw_api::grants::Resource::Personality,
+                        zeroclaw_api::grants::Verb::Read,
+                    )
+                });
+                if may_read {
+                    data["current_content"] = Value::String(current_content);
+                    data["current_mtime_ms"] = serde_json::json!(current_mtime_ms);
+                }
+                err.data = Some(data);
+                return Err(err);
+            }
+        }
         // Write beneath a handle on the entitled agent's workspace, without
         // following a link out of it, for the same reason the read side does.
         let mtime_ms = write_personality_file(&workspace, &req.filename, &req.content)
@@ -10817,6 +10889,23 @@ fn resolve_skill_ref(
     }
     svc.resolve_ref(name, Some(bundle))
         .map_err(|e| rpc_err(INVALID_PARAMS, format!("Invalid skill ref: {e}")))
+}
+
+/// Refuse, as invalid params, an agent `[agents]` does not configure, for a
+/// caller that asked (`require_configured_agent`), before anything is read
+/// or written for it.
+fn require_configured_agent(
+    config: &zeroclaw_config::schema::Config,
+    agent: Option<&str>,
+) -> Result<(), JsonRpcError> {
+    let Some(alias) = agent.map(str::trim).filter(|alias| !alias.is_empty()) else {
+        return Err(rpc_err(INVALID_PARAMS, "An agent is required"));
+    };
+    if config.agents.contains_key(alias) {
+        Ok(())
+    } else {
+        Err(rpc_err(INVALID_PARAMS, format!("Unknown agent {alias:?}")))
+    }
 }
 
 fn to_result<T: Serialize>(val: T) -> RpcResult {
@@ -23860,6 +23949,7 @@ mod tests {
     fn personality_templates_use_requested_agent_name_before_config_exists() {
         let req = PersonalityTemplatesParams {
             agent: Some(" bob ".to_string()),
+            ..Default::default()
         };
         let ctx = personality_template_context(&zeroclaw_config::schema::Config::default(), &req);
 
@@ -23869,11 +23959,62 @@ mod tests {
 
     #[test]
     fn personality_templates_without_agent_stay_generic_and_memoryless() {
-        let req = PersonalityTemplatesParams { agent: None };
+        let req = PersonalityTemplatesParams::default();
         let ctx = personality_template_context(&zeroclaw_config::schema::Config::default(), &req);
 
         assert_eq!(ctx.agent, "ZeroClaw");
         assert!(!ctx.include_memory);
+    }
+
+    /// The editor's defaults: the agent's alias names it only when it is
+    /// configured, and memory follows the memory backend, not the request.
+    #[test]
+    fn personality_templates_editor_defaults_follow_the_dashboard_editor() {
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.agents.insert("main".into(), Default::default());
+        let editor = |agent: Option<&str>| PersonalityTemplatesParams {
+            agent: agent.map(Into::into),
+            defaults: Some(PersonalityTemplateDefaults::Editor),
+            ..Default::default()
+        };
+
+        let configured = personality_template_context(&config, &editor(Some("main")));
+        assert_eq!(configured.agent, "main");
+        let unknown = personality_template_context(&config, &editor(Some("ghost")));
+        assert_eq!(unknown.agent, "ZeroClaw", "an unknown alias is not a name");
+        let backend_on = config.memory.backend.as_str() != "none";
+        assert_eq!(configured.include_memory, backend_on);
+
+        config.memory.backend = "none".into();
+        let no_memory = personality_template_context(&config, &editor(Some("main")));
+        assert!(!no_memory.include_memory);
+    }
+
+    #[test]
+    fn personality_templates_overrides_win_over_either_defaults() {
+        let config = zeroclaw_config::schema::Config::default();
+        for defaults in [
+            None,
+            Some(PersonalityTemplateDefaults::Quickstart),
+            Some(PersonalityTemplateDefaults::Editor),
+        ] {
+            let req = PersonalityTemplatesParams {
+                agent: Some("bob".into()),
+                agent_name: Some("Ada".into()),
+                user_name: Some("Lin".into()),
+                timezone: Some("Asia/Tokyo".into()),
+                communication_style: Some("terse".into()),
+                include_memory: Some(false),
+                defaults,
+                ..Default::default()
+            };
+            let ctx = personality_template_context(&config, &req);
+            assert_eq!(ctx.agent, "Ada", "{defaults:?}");
+            assert_eq!(ctx.user, "Lin", "{defaults:?}");
+            assert_eq!(ctx.timezone, "Asia/Tokyo", "{defaults:?}");
+            assert_eq!(ctx.communication_style, "terse", "{defaults:?}");
+            assert!(!ctx.include_memory, "{defaults:?}");
+        }
     }
 
     #[test]

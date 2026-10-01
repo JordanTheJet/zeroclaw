@@ -967,6 +967,10 @@ rpc_type! {
     pub struct SkillsDeleteParams {
         pub bundle: String,
         pub name: String,
+        /// Delete the skill's directory outright instead of archiving it.
+        /// Omitted or `false` archives, as before.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        pub purge: bool,
     }
 }
 
@@ -986,6 +990,11 @@ rpc_type! {
     pub struct PersonalityListParams {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub agent: Option<String>,
+        /// Refuse, as invalid params, an `agent` that is not configured in
+        /// `[agents]`, even for an operator who could otherwise name any
+        /// alias. Omitted or `false` lists as before.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        pub require_configured_agent: bool,
     }
 }
 
@@ -1013,6 +1022,9 @@ rpc_type! {
     pub struct PersonalityGetParams {
         pub agent: String,
         pub filename: String,
+        /// As on `personality/list`.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        pub require_configured_agent: bool,
     }
 }
 
@@ -1035,6 +1047,16 @@ rpc_type! {
         pub agent: String,
         pub filename: String,
         pub content: String,
+        /// The mtime the editor last saw. When set, the write is refused
+        /// with `PRECONDITION_FAILED` if the file on disk has changed since.
+        /// The error's `current_content` and `current_mtime_ms` are included
+        /// only for a caller that also holds `personality:read`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub expected_mtime_ms: Option<i64>,
+        /// As on `personality/list`: an unknown agent is refused before
+        /// anything is written.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        pub require_configured_agent: bool,
     }
 }
 
@@ -1048,9 +1070,47 @@ rpc_type! {
 }
 
 rpc_type! {
+    #[derive(Default)]
     pub struct PersonalityTemplatesParams {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub agent: Option<String>,
+        /// The preset to render. `default` is the only one; any other value
+        /// renders it too, as the gateway's templates route does.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub preset: Option<String>,
+        /// The name the templates call the agent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub agent_name: Option<String>,
+        /// The name the templates call the user.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub user_name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub timezone: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub communication_style: Option<String>,
+        /// Render `MEMORY.md` and the memory variant of `AGENTS.md`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub include_memory: Option<bool>,
+        /// How the fields above default when omitted. Omitted is
+        /// `quickstart`, as before.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub defaults: Option<PersonalityTemplateDefaults>,
+    }
+}
+
+rpc_type! {
+    /// How `personality/templates` fills the fields its caller omits.
+    #[derive(Copy, PartialEq, Eq, Default)]
+    pub enum PersonalityTemplateDefaults {
+        /// For an agent Quickstart is about to create: the requested alias
+        /// names the agent, configured or not, and memory is included when
+        /// an agent is requested or the default agent is configured.
+        #[default]
+        Quickstart,
+        /// For an existing agent's editor: the agent's own alias names it
+        /// only when it is configured (otherwise "ZeroClaw"), and memory is
+        /// included unless the memory backend is `none`.
+        Editor,
     }
 }
 

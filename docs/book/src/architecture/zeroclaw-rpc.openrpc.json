@@ -2284,6 +2284,10 @@
           },
           "filename": {
             "type": "string"
+          },
+          "require_configured_agent": {
+            "description": "As on `personality/list`.",
+            "type": "boolean"
           }
         },
         "required": [
@@ -2333,6 +2337,10 @@
               "string",
               "null"
             ]
+          },
+          "require_configured_agent": {
+            "description": "Refuse, as invalid params, an `agent` that is not configured in\n`[agents]`, even for an operator who could otherwise name any\nalias. Omitted or `false` lists as before.",
+            "type": "boolean"
           }
         },
         "type": "object"
@@ -2366,8 +2374,20 @@
           "content": {
             "type": "string"
           },
+          "expected_mtime_ms": {
+            "description": "The mtime the editor last saw. When set, the write is refused\nwith `PRECONDITION_FAILED` if the file on disk has changed since.\nThe error's `current_content` and `current_mtime_ms` are included\nonly for a caller that also holds `personality:read`.",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "filename": {
             "type": "string"
+          },
+          "require_configured_agent": {
+            "description": "As on `personality/list`: an unknown agent is refused before\nanything is written.",
+            "type": "boolean"
           }
         },
         "required": [
@@ -2398,9 +2418,75 @@
         ],
         "type": "object"
       },
+      "PersonalityTemplateDefaults": {
+        "description": "How `personality/templates` fills the fields its caller omits.",
+        "oneOf": [
+          {
+            "const": "quickstart",
+            "description": "For an agent Quickstart is about to create: the requested alias\nnames the agent, configured or not, and memory is included when\nan agent is requested or the default agent is configured.",
+            "type": "string"
+          },
+          {
+            "const": "editor",
+            "description": "For an existing agent's editor: the agent's own alias names it\nonly when it is configured (otherwise \"ZeroClaw\"), and memory is\nincluded unless the memory backend is `none`.",
+            "type": "string"
+          }
+        ]
+      },
       "PersonalityTemplatesParams": {
         "properties": {
           "agent": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "agent_name": {
+            "description": "The name the templates call the agent.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "communication_style": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "defaults": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PersonalityTemplateDefaults"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "How the fields above default when omitted. Omitted is\n`quickstart`, as before."
+          },
+          "include_memory": {
+            "description": "Render `MEMORY.md` and the memory variant of `AGENTS.md`.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "preset": {
+            "description": "The preset to render. `default` is the only one; any other value\nrenders it too, as the gateway's templates route does.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "timezone": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "user_name": {
+            "description": "The name the templates call the user.",
             "type": [
               "string",
               "null"
@@ -3780,6 +3866,10 @@
           },
           "name": {
             "type": "string"
+          },
+          "purge": {
+            "description": "Delete the skill's directory outright instead of archiving it.\nOmitted or `false` archives, as before.",
+            "type": "boolean"
           }
         },
         "required": [
@@ -6040,6 +6130,14 @@
           "schema": {
             "type": "string"
           }
+        },
+        {
+          "name": "purge",
+          "required": false,
+          "schema": {
+            "description": "Delete the skill's directory outright instead of archiving it.\nOmitted or `false` archives, as before.",
+            "type": "boolean"
+          }
         }
       ],
       "result": {
@@ -6071,6 +6169,14 @@
               "string",
               "null"
             ]
+          }
+        },
+        {
+          "name": "require_configured_agent",
+          "required": false,
+          "schema": {
+            "description": "Refuse, as invalid params, an `agent` that is not configured in\n`[agents]`, even for an operator who could otherwise name any\nalias. Omitted or `false` lists as before.",
+            "type": "boolean"
           }
         }
       ],
@@ -6107,6 +6213,14 @@
           "required": true,
           "schema": {
             "type": "string"
+          }
+        },
+        {
+          "name": "require_configured_agent",
+          "required": false,
+          "schema": {
+            "description": "As on `personality/list`.",
+            "type": "boolean"
           }
         }
       ],
@@ -6151,6 +6265,26 @@
           "schema": {
             "type": "string"
           }
+        },
+        {
+          "name": "expected_mtime_ms",
+          "required": false,
+          "schema": {
+            "description": "The mtime the editor last saw. When set, the write is refused\nwith `PRECONDITION_FAILED` if the file on disk has changed since.\nThe error's `current_content` and `current_mtime_ms` are included\nonly for a caller that also holds `personality:read`.",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "require_configured_agent",
+          "required": false,
+          "schema": {
+            "description": "As on `personality/list`: an unknown agent is refused before\nanything is written.",
+            "type": "boolean"
+          }
         }
       ],
       "result": {
@@ -6178,6 +6312,85 @@
           "name": "agent",
           "required": false,
           "schema": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "agent_name",
+          "required": false,
+          "schema": {
+            "description": "The name the templates call the agent.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "communication_style",
+          "required": false,
+          "schema": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "defaults",
+          "required": false,
+          "schema": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PersonalityTemplateDefaults"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "How the fields above default when omitted. Omitted is\n`quickstart`, as before."
+          }
+        },
+        {
+          "name": "include_memory",
+          "required": false,
+          "schema": {
+            "description": "Render `MEMORY.md` and the memory variant of `AGENTS.md`.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "preset",
+          "required": false,
+          "schema": {
+            "description": "The preset to render. `default` is the only one; any other value\nrenders it too, as the gateway's templates route does.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "timezone",
+          "required": false,
+          "schema": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "user_name",
+          "required": false,
+          "schema": {
+            "description": "The name the templates call the user.",
             "type": [
               "string",
               "null"

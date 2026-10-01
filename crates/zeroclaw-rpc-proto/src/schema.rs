@@ -65,7 +65,7 @@ catalog! {
     // Personality
     PersonalityListParams, PersonalityFileEntry, PersonalityListResult, PersonalityGetParams,
     PersonalityGetResult, PersonalityPutParams, PersonalityPutResult, PersonalityTemplatesParams,
-    TemplateFileEntry, PersonalityTemplatesResult,
+    PersonalityTemplateDefaults, TemplateFileEntry, PersonalityTemplatesResult,
     // Config introspection
     CatalogModelProvider, CatalogResponse, CatalogModelsParams, CatalogModelsResult,
     ConfigSectionEntry, ConfigSectionsResult, ConfigStatusResult, PickerItem, PickerResponse,
