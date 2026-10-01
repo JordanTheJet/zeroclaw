@@ -1684,6 +1684,13 @@
             },
             "type": "array"
           },
+          "features": {
+            "description": "Additive extensions this core supports, by name (e.g.\n`tui.client_kind`). An older core omits the field, which reads as\nnone.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
           "principal_id": {
             "description": "Canonical principal id this connection is bound to.",
             "type": [
