@@ -74,7 +74,7 @@ use axum::body::Bytes;
 use axum::extract::Path;
 use axum::{
     Router,
-    extract::{ConnectInfo, Query, State},
+    extract::{ConnectInfo, Query, RawQuery, State},
     http::{HeaderMap, StatusCode, header},
     response::{
         IntoResponse, Json, Response,
@@ -2732,12 +2732,14 @@ impl Drop for ListenerPublication {
 #[derive(Clone)]
 struct HealthProver(Option<zeroclaw_runtime::daemon::possession::GatewayProver>);
 
-/// `GET /health` query: a possession challenge from a client holding a
-/// nonce the core issued over its RPC socket.
-#[derive(Debug, Default, serde::Deserialize)]
-struct HealthQuery {
-    #[serde(default)]
-    challenge: Option<String>,
+/// The possession challenge a `GET /health` query carries: the nonce a
+/// client holds from the core's RPC socket, as `challenge=<nonce>`. Read by
+/// hand, so no query fails: whatever a monitoring probe adds, `/health`
+/// answers it.
+fn health_challenge(query: Option<&str>) -> Option<&str> {
+    query?
+        .split('&')
+        .find_map(|pair| pair.strip_prefix("challenge="))
 }
 
 /// GET /health — always public (no secrets leaked). With `?challenge=<nonce>`
@@ -2747,7 +2749,7 @@ struct HealthQuery {
 /// proves nothing to anyone.
 async fn handle_health(
     State(state): State<AppState>,
-    Query(query): Query<HealthQuery>,
+    RawQuery(query): RawQuery,
     prover: Option<axum::Extension<HealthProver>>,
 ) -> impl IntoResponse {
     let mut body = serde_json::json!({
@@ -2757,7 +2759,7 @@ async fn handle_health(
         "runtime": public_health_snapshot(),
     });
     if let (Some(challenge), Some(axum::Extension(HealthProver(Some(prover))))) =
-        (query.challenge.as_deref(), prover)
+        (health_challenge(query.as_deref()), prover)
         && let Some(proof) = prover.prove(challenge)
     {
         body["challenge_proof"] = serde_json::Value::String(proof);
@@ -5605,7 +5607,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let response = handle_health(
             State(admin_paircode_state(&tmp, false, false)),
-            Query(HealthQuery::default()),
+            RawQuery(None),
             None,
         )
         .await
@@ -5628,6 +5630,30 @@ mod tests {
                 .as_deref(),
             Some(sensitive_error)
         );
+    }
+
+    /// `/health` answers `200` whatever query a monitoring probe adds: a
+    /// query it cannot read counts as one without a challenge.
+    #[tokio::test]
+    async fn health_answers_whatever_query_it_is_sent() {
+        use tower::ServiceExt as _;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let app = Router::new()
+            .route("/health", get(handle_health))
+            .with_state(admin_paircode_state(&tmp, false, false));
+        for query in [
+            "challenge=a&challenge=b",
+            "%zz=%",
+            "challenge",
+            "=&&=x",
+            "challenge=%E0%A4%A",
+        ] {
+            let request = axum::http::Request::get(format!("/health?{query}"))
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "/health?{query}");
+        }
     }
 
     #[test]
