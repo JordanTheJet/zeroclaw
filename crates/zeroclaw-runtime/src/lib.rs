@@ -49,4 +49,5 @@ pub mod subagent;
 pub mod tools;
 pub mod trust;
 pub mod tunnel;
+pub mod update_check;
 pub mod verifiable_intent;

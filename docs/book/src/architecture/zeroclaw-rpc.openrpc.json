@@ -3898,6 +3898,47 @@
         },
         "type": "object"
       },
+      "SopRunChanged": {
+        "description": "`sops/run-changed`: one run's new summary, pushed on the connection\nthat opened the `sops/subscribe-runs` subscription.",
+        "properties": {
+          "run": {
+            "description": "The run's summary, in the shape `sops/runs` lists."
+          },
+          "seq": {
+            "description": "Numbers this subscription's changes from 1. Changes lost to a lag\nare reported first with `subscription/lagged`, and the next change\ncarries its `resume_seq`. Run summaries are state, so there is no\nreplay: subscribe again for a fresh snapshot.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "subscription_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "subscription_id",
+          "seq",
+          "run"
+        ],
+        "type": "object"
+      },
+      "SopsSubscribeRunsResult": {
+        "description": "`sops/subscribe-runs` result: the runs as of the moment the change\nfeed was armed, then every later change as `sops/run-changed`.",
+        "properties": {
+          "runs": {
+            "description": "The run summaries `sops/runs` lists for the same `sop`, read in\nthe same step that armed the feed, so no transition falls\nbetween the two.",
+            "items": true,
+            "type": "array"
+          },
+          "subscription_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "subscription_id",
+          "runs"
+        ],
+        "type": "object"
+      },
       "StatusResult": {
         "properties": {
           "active_sessions": {
@@ -4042,6 +4083,24 @@
         ],
         "type": "object"
       },
+      "SystemVersionCheckParams": {
+        "description": "`system/version-check` params. With none, the core reports the\nlatest release, reusing a check it made within the last hour.",
+        "properties": {
+          "force": {
+            "default": false,
+            "description": "Skip the one-hour cache and ask again.",
+            "type": "boolean"
+          },
+          "version": {
+            "description": "Check this release tag instead of the latest release. Never\ncached.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "TemplateFileEntry": {
         "description": "Consolidates gateway `TemplateFile`.",
         "properties": {
@@ -4138,6 +4197,55 @@
           "failed"
         ],
         "type": "string"
+      },
+      "VersionCheckResponse": {
+        "description": "`system/version-check` result, and the body of the gateway's\n`GET /api/version/check`. On success every field except `error` is\npopulated; when the check fails the result is `{ current_version,\nlatest_version: null, is_newer: false, error }`, so the dashboard\nversion badge degrades gracefully. A failed check is this result with\n`error` set, never an RPC error.",
+        "properties": {
+          "current_version": {
+            "type": "string"
+          },
+          "error": {
+            "description": "Set only when the check failed; absent on success.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "is_newer": {
+            "type": "boolean"
+          },
+          "latest_version": {
+            "description": "Latest release version, or `null` when the check could not complete.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "published_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "release_notes": {
+            "description": "Release notes body (Markdown).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "release_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "current_version",
+          "is_newer"
+        ],
+        "type": "object"
       }
     }
   },
@@ -4298,6 +4406,48 @@
       },
       "x-zeroclaw-params": {
         "shape": "none"
+      }
+    },
+    {
+      "name": "system/version-check",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "force",
+          "required": false,
+          "schema": {
+            "default": false,
+            "description": "Skip the one-hour cache and ask again.",
+            "type": "boolean"
+          }
+        },
+        {
+          "name": "version",
+          "required": false,
+          "schema": {
+            "description": "Check this release tag instead of the latest release. Never\ncached.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/VersionCheckResponse"
+        },
+        "x-zeroclaw-shape": "typed"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "system",
+        "verb": "read"
+      },
+      "x-zeroclaw-params": {
+        "shape": "typed",
+        "type": "SystemVersionCheckParams"
       }
     },
     {
@@ -7416,6 +7566,29 @@
       }
     },
     {
+      "name": "sops/subscribe-runs",
+      "paramStructure": "by-name",
+      "params": [],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/SopsSubscribeRunsResult"
+        },
+        "x-zeroclaw-shape": "typed"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "sops",
+        "verb": "read"
+      },
+      "x-zeroclaw-params": {
+        "description": "`SopRunsRequest`, defined in `zeroclaw-api`; no schema is exported yet, so its keys are not enumerable here.",
+        "owner": "zeroclaw-api",
+        "shape": "external",
+        "type": "SopRunsRequest"
+      }
+    },
+    {
       "name": "tools/param-options",
       "paramStructure": "by-name",
       "params": [],
@@ -7493,6 +7666,15 @@
         "name": "params",
         "schema": {
           "$ref": "#/components/schemas/SubscriptionLagged"
+        }
+      }
+    },
+    {
+      "name": "sops/run-changed",
+      "params": {
+        "name": "params",
+        "schema": {
+          "$ref": "#/components/schemas/SopRunChanged"
         }
       }
     }

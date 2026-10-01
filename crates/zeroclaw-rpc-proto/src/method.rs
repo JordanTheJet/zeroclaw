@@ -20,6 +20,7 @@ pub enum Method {
     Status,
     Health,
     DoctorRun,
+    SystemVersionCheck,
 
     // Sessions (agent chat lives here — session/prompt + session/update
     // notifications is the RPC equivalent of the gateway's ws/chat)
@@ -144,6 +145,7 @@ pub enum Method {
     SopsWireDraft,
     SopsGraphDraft,
     SopsTriggerSources,
+    SopsSubscribeRuns,
     ToolsParamOptions,
 }
 
@@ -154,6 +156,7 @@ impl Method {
         (Method::Status, "status"),
         (Method::Health, "health"),
         (Method::DoctorRun, "doctor/run"),
+        (Method::SystemVersionCheck, "system/version-check"),
         // Sessions
         (Method::SessionNew, "session/new"),
         (Method::SessionClose, "session/close"),
@@ -263,6 +266,7 @@ impl Method {
         (Method::SopsWireDraft, "sops/wire-draft"),
         (Method::SopsGraphDraft, "sops/graph-draft"),
         (Method::SopsTriggerSources, "sops/trigger-sources"),
+        (Method::SopsSubscribeRuns, "sops/subscribe-runs"),
         (Method::ToolsParamOptions, "tools/param-options"),
     ];
 
@@ -299,6 +303,10 @@ impl Method {
             M::Status => (None, Typed("StatusResult")),
             M::Health => (None, Untyped),
             M::DoctorRun => (None, Typed("DoctorRunResult")),
+            M::SystemVersionCheck => (
+                Typed("SystemVersionCheckParams"),
+                Typed("VersionCheckResponse"),
+            ),
 
             // Sessions
             M::SessionNew => (Typed("SessionNewParams"), Typed("SessionNewResult")),
@@ -456,6 +464,7 @@ impl Method {
             M::SopsWireDraft => (Untyped, Untyped),
             M::SopsGraphDraft => (Untyped, Typed("SopGraph")),
             M::SopsTriggerSources => (None, Typed("TriggerSourceRegistry")),
+            M::SopsSubscribeRuns => (Typed("SopRunsRequest"), Typed("SopsSubscribeRunsResult")),
             M::ToolsParamOptions => (Untyped, Untyped),
         };
         MethodContract { params, result }

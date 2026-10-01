@@ -36,6 +36,7 @@ macro_rules! catalog {
 catalog! {
     // Core
     InitializeParams, CommandDescriptor, InitializeResult, StatusResult, DoctorSummary,
+    SystemVersionCheckParams, VersionCheckResponse,
     // TUI
     TuiListEntry, TuiListResult,
     // Sessions
@@ -87,6 +88,8 @@ catalog! {
     QuickstartDismissResult,
     // SOP graph projection
     SopGraph, GraphLegend,
+    // SOP runs
+    SopsSubscribeRunsResult, SopRunChanged,
 }
 
 use crate::sop::{GraphLegend, SopGraph};

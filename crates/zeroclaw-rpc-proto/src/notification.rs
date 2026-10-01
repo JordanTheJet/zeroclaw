@@ -20,6 +20,10 @@ pub const EVENTS_EVENT: &str = "events/event";
 /// [`crate::types::SubscriptionLagged`].
 pub const SUBSCRIPTION_LAGGED: &str = "subscription/lagged";
 
+/// One SOP run's new summary, delivered to a `sops/subscribe-runs`
+/// subscriber. Payload: [`crate::types::SopRunChanged`].
+pub const SOPS_RUN_CHANGED: &str = "sops/run-changed";
+
 /// Every notification with the name of its payload type, or `None` when the
 /// payload is an untyped JSON object.
 pub const ALL: &[(&str, Option<&str>)] = &[
@@ -27,6 +31,7 @@ pub const ALL: &[(&str, Option<&str>)] = &[
     (LOGS_EVENT, None),
     (EVENTS_EVENT, None),
     (SUBSCRIPTION_LAGGED, Some("SubscriptionLagged")),
+    (SOPS_RUN_CHANGED, Some("SopRunChanged")),
 ];
 
 #[cfg(test)]

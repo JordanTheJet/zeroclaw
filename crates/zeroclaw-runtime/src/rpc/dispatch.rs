@@ -104,7 +104,7 @@ impl MethodAuthzExt for Method {
             // like initialize.
             M::CertRenew => return MethodAuthz::Handshake,
 
-            M::Status | M::Health => (Resource::System, Verb::Read),
+            M::Status | M::Health | M::SystemVersionCheck => (Resource::System, Verb::Read),
             M::DoctorRun => (Resource::System, Verb::Execute),
 
             M::SessionNew => (Resource::Sessions, Verb::Create),
@@ -161,9 +161,12 @@ impl MethodAuthzExt for Method {
 
             // `subscription/cancel` ends only a subscription this connection
             // opened (the id is looked up in the connection's own registry).
-            // It takes the same grant as the subscribe methods that create
-            // subscriptions, so whoever could open one can end it. A future
-            // source under a different grant must revisit this arm.
+            // It takes the same grant as the logs and events subscribe
+            // methods, so whoever could open one of those can end it.
+            // `sops/subscribe-runs` opens one under `Sops:Read`: a caller
+            // without `Logs:Read` cannot cancel that here, and it ends with
+            // the connection instead. Another source under a different grant
+            // must revisit this arm.
             M::LogsSubscribe
             | M::LogsQuery
             | M::LogsGet
@@ -192,7 +195,8 @@ impl MethodAuthzExt for Method {
             | M::SopsRuns
             | M::SopsRunDetail
             | M::SopsRunOverlay
-            | M::SopsTriggerSources => (Resource::Sops, Verb::Read),
+            | M::SopsTriggerSources
+            | M::SopsSubscribeRuns => (Resource::Sops, Verb::Read),
             M::SopsCreate => (Resource::Sops, Verb::Create),
             M::SopsSave | M::SopsRename => (Resource::Sops, Verb::Update),
             M::SopsDelete => (Resource::Sops, Verb::Delete),
@@ -2681,6 +2685,10 @@ impl RpcDispatcher {
             Method::Health => self.handle_health(),
             // Heap-pinned for the same reason as `ConfigSet` below.
             Method::DoctorRun => Box::pin(self.handle_doctor_run()).await,
+            // Heap-pinned for the same reason as `ConfigSet` below.
+            Method::SystemVersionCheck => {
+                Box::pin(self.handle_system_version_check(&req.params)).await
+            }
 
             // Sessions
             Method::SessionNew => Box::pin(self.handle_session_new(&req.params)).await,
@@ -2850,6 +2858,7 @@ impl RpcDispatcher {
             Method::SopsWireDraft => self.handle_sops_wire_draft(&req.params),
             Method::SopsGraphDraft => self.handle_sops_graph_draft(&req.params),
             Method::SopsTriggerSources => self.handle_sops_trigger_sources(),
+            Method::SopsSubscribeRuns => self.handle_sops_subscribe_runs(&req.params),
             Method::ToolsParamOptions => self.handle_tools_param_options(&req.params),
         };
 
@@ -2859,7 +2868,7 @@ impl RpcDispatcher {
 
         match result {
             Ok(v) => self.send_result(req_id, v).await,
-            Err(e) => self.send_error(req_id, e.code, &e.message).await,
+            Err(e) => self.send_rpc_error(req_id, e).await,
         }
     }
 
@@ -3240,6 +3249,40 @@ impl RpcDispatcher {
         let config = self.ctx.config.read().clone();
         self.run_doctor(Box::pin(crate::doctor::probe_models(&config)))
             .await
+    }
+
+    /// Whether a newer release than this daemon exists. The daemon runs its
+    /// own `update --check`, so the answer is about the core's binary
+    /// whichever process asks. A check that fails is a result with `error`
+    /// set, never an RPC error.
+    ///
+    /// The check can take seconds, so the caller's authority is resolved
+    /// again once it finishes: a credential revoked or a grant withdrawn in
+    /// the meantime gets the refusal, not the result.
+    async fn handle_system_version_check(&self, params: &Value) -> RpcResult {
+        let p: SystemVersionCheckParams = if params.is_null() {
+            SystemVersionCheckParams::default()
+        } else {
+            parse_params(params)?
+        };
+        let checked = crate::update_check::check(p.force, p.version.as_deref()).await;
+        self.still_holds(Method::SystemVersionCheck)?;
+        to_result(checked)
+    }
+
+    /// The caller's authority for `method` resolved again now, for a handler
+    /// whose answer is ready only after an await. An unbound dispatcher (the
+    /// direct unit-test handlers) has nothing to recheck.
+    fn still_holds(&self, method: Method) -> Result<(), JsonRpcError> {
+        let Some(auth) = self.auth.as_ref() else {
+            return Ok(());
+        };
+        current_authority(&self.ctx.auth, auth, method)
+            .map(|_| ())
+            .map_err(|denied| {
+                audit_denial(Some(auth), method, &denied);
+                rpc_err(denied.code, denied.message)
+            })
     }
 
     /// Serialize a Doctor run into the `doctor/run` response. The probe future
@@ -9558,14 +9601,23 @@ impl RpcDispatcher {
     }
 
     async fn send_error(&self, id: Value, code: i32, message: &str) {
-        let resp = JsonRpcResponse {
-            jsonrpc: JSONRPC_VERSION,
-            result: None,
-            error: Some(JsonRpcError {
+        self.send_rpc_error(
+            id,
+            JsonRpcError {
                 code,
                 message: message.to_string(),
                 data: None,
-            }),
+            },
+        )
+        .await;
+    }
+
+    /// Send a handler's error as it stands, its `data` included.
+    async fn send_rpc_error(&self, id: Value, error: JsonRpcError) {
+        let resp = JsonRpcResponse {
+            jsonrpc: JSONRPC_VERSION,
+            result: None,
+            error: Some(error),
             id,
         };
         if let Ok(json) = serde_json::to_string(&resp) {
@@ -9948,6 +10000,71 @@ impl RpcDispatcher {
         let runs = crate::sop::run_summaries_for(engine, req.sop.as_deref())
             .map_err(|e| rpc_err(INTERNAL_ERROR, e.to_string()))?;
         to_result(serde_json::json!({ "runs": runs }))
+    }
+
+    /// The runs `sops/runs` lists, then every change to them as
+    /// `sops/run-changed` on this connection, until `subscription/cancel` or
+    /// the connection ends.
+    ///
+    /// The snapshot and the change feed are taken under one engine lock, so
+    /// a transition shows in one or the other. A change can reach the
+    /// connection before this result does, so a client listens for
+    /// notifications before it subscribes. A lag is reported with
+    /// `subscription/lagged` and is not replayed: run summaries are state,
+    /// and subscribing again gives a fresh snapshot. Every delivery is held
+    /// to the connection's authority: a live credential and, whenever the
+    /// accepted policy moves, the `Sops:Read` grant again. Any holder of that
+    /// grant sees every run, as with `sops/runs`.
+    fn handle_sops_subscribe_runs(&self, params: &Value) -> RpcResult {
+        let req: SopRunsRequest = if params.is_null() {
+            SopRunsRequest::default()
+        } else {
+            parse_params(params)?
+        };
+        let Some(engine) = self.ctx.sop_engine.as_ref() else {
+            return Err(JsonRpcError {
+                code: INTERNAL_ERROR,
+                message: "SOP subsystem not enabled".into(),
+                data: Some(
+                    serde_json::json!({ "reason": zeroclaw_rpc_proto::error_reasons::SOP_DISABLED }),
+                ),
+            });
+        };
+        let (runs, changes) = {
+            let engine = engine
+                .lock()
+                .map_err(|_| rpc_err(INTERNAL_ERROR, "engine lock poisoned"))?;
+            (
+                engine.run_summaries(req.sop.as_deref()),
+                engine.subscribe_run_changes(),
+            )
+        };
+        let runs = runs
+            .iter()
+            .map(serde_json::to_value)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| rpc_err(INTERNAL_ERROR, e.to_string()))?;
+
+        let subscription_id = uuid::Uuid::new_v4().to_string();
+        let cancel = self.connection_cancel.child_token();
+        self.subscriptions
+            .lock()
+            .insert(subscription_id.clone(), cancel.clone());
+        let delivery = SopRunsDelivery {
+            subscription_id: subscription_id.clone(),
+            sop: req.sop,
+            changes,
+            rpc: self.rpc.clone(),
+            cancel,
+            inbound: Arc::clone(&self.ctx.auth),
+            binding: self.auth.clone(),
+            registry: Arc::clone(&self.subscriptions),
+        };
+        zeroclaw_spawn::spawn!(deliver_sop_run_changes(delivery));
+        to_result(SopsSubscribeRunsResult {
+            subscription_id,
+            runs,
+        })
     }
 
     /// Full detail for one run: step results with status, timings, failure
@@ -10713,6 +10830,112 @@ async fn deliver_subscription(delivery: SubscriptionDelivery) {
     registry.lock().remove(&subscription_id);
 }
 
+/// Everything one `sops/subscribe-runs` delivery task owns.
+struct SopRunsDelivery {
+    subscription_id: String,
+    /// Only this SOP's runs, when the subscriber named one.
+    sop: Option<String>,
+    /// The engine's change feed; `None` when the engine has no notifier, and
+    /// the snapshot is all there is.
+    changes: Option<tokio::sync::broadcast::Receiver<crate::sop::SopRunSummary>>,
+    rpc: Arc<RpcOutbound>,
+    cancel: CancellationToken,
+    inbound: Arc<crate::rpc::auth::RpcInboundAuth>,
+    binding: Option<crate::rpc::auth::ConnectionAuth>,
+    registry: Arc<parking_lot::Mutex<std::collections::HashMap<String, CancellationToken>>>,
+}
+
+/// Forward run changes to one subscriber until it is cancelled, the
+/// connection closes, a write fails, the feed ends, or the caller loses its
+/// authority.
+///
+/// `seq` numbers the changes this subscription delivers. A lag on the feed
+/// advances it by the number of changes the feed lost, after a
+/// `subscription/lagged` naming the gap; with `sop` set, that count covers
+/// every SOP's changes, not only that one's.
+async fn deliver_sop_run_changes(delivery: SopRunsDelivery) {
+    use tokio::sync::broadcast::error::RecvError;
+    let SopRunsDelivery {
+        subscription_id,
+        sop,
+        changes,
+        rpc,
+        cancel,
+        inbound,
+        binding,
+        registry,
+    } = delivery;
+    let mut checked_generation = binding.as_ref().map(|auth| auth.generation);
+    let mut next_seq: u64 = 1;
+
+    'deliver: {
+        let Some(mut changes) = changes else {
+            tokio::select! {
+                () = cancel.cancelled() => {}
+                () = rpc.closed() => {}
+            }
+            break 'deliver;
+        };
+        loop {
+            let received = tokio::select! {
+                biased;
+                () = cancel.cancelled() => break 'deliver,
+                () = rpc.closed() => break 'deliver,
+                received = changes.recv() => received,
+            };
+            let notification = match received {
+                Ok(run) => {
+                    if sop.as_deref().is_some_and(|name| run.sop_name != name) {
+                        continue;
+                    }
+                    let Ok(run) = serde_json::to_value(&run) else {
+                        break 'deliver;
+                    };
+                    let seq = next_seq;
+                    next_seq += 1;
+                    JsonRpcNotification::new(
+                        notification::SOPS_RUN_CHANGED,
+                        serde_json::json!(SopRunChanged {
+                            subscription_id: subscription_id.clone(),
+                            seq,
+                            run,
+                        }),
+                    )
+                }
+                Err(RecvError::Lagged(missed)) => {
+                    let from_seq = next_seq;
+                    next_seq += missed;
+                    JsonRpcNotification::new(
+                        notification::SUBSCRIPTION_LAGGED,
+                        serde_json::json!(SubscriptionLagged {
+                            subscription_id: subscription_id.clone(),
+                            from_seq,
+                            resume_seq: next_seq,
+                            epoch_changed: false,
+                        }),
+                    )
+                }
+                Err(RecvError::Closed) => break 'deliver,
+            };
+            if !still_granted(
+                &inbound,
+                binding.as_ref(),
+                Method::SopsSubscribeRuns,
+                &mut checked_generation,
+            ) {
+                break 'deliver;
+            }
+            let Ok(json) = serde_json::to_string(&notification) else {
+                break 'deliver;
+            };
+            if !rpc.send_raw(json).await {
+                break 'deliver;
+            }
+        }
+    }
+    registry.lock().remove(&subscription_id);
+}
+
 /// The daemon-wide log and event streams, and the event history, carry
 /// frames from every principal's work: session messages, cron results, log
 /// lines. Many name no owner, so they cannot be filtered per principal. Until
@@ -10743,25 +10966,59 @@ fn still_authorized(
     method: Method,
     checked_generation: &mut Option<u64>,
 ) -> bool {
-    let Some(auth) = binding else {
-        return true;
-    };
-    let generation = inbound.generation();
     // A moved policy generation re-resolves the principal: it must still
     // hold `method`'s grant and still see every principal, so narrowing or
     // demoting a principal ends its stream.
-    let authority = if *checked_generation == Some(generation) {
-        credential_is_live(inbound, auth)
-    } else {
-        current_authority(inbound, auth, method).and_then(|grants| {
-            if sees_every_principal(auth, &grants) {
+    recheck_delivery(
+        inbound,
+        binding,
+        method,
+        checked_generation,
+        |auth, grants| {
+            if sees_every_principal(auth, grants) {
                 Ok(())
             } else {
                 Err(crate::rpc::auth::AuthDenied::forbidden(
                     GLOBAL_STREAM_SCOPED_DENIAL,
                 ))
             }
-        })
+        },
+    )
+}
+
+/// [`still_authorized`] for a stream every holder of `method`'s grant may
+/// read (`sops/subscribe-runs`): a moved policy generation only requires
+/// the principal to still hold that grant.
+fn still_granted(
+    inbound: &crate::rpc::auth::RpcInboundAuth,
+    binding: Option<&crate::rpc::auth::ConnectionAuth>,
+    method: Method,
+    checked_generation: &mut Option<u64>,
+) -> bool {
+    recheck_delivery(inbound, binding, method, checked_generation, |_, _| Ok(()))
+}
+
+/// The shared body of [`still_authorized`] and [`still_granted`]: a live
+/// credential on every delivery and, when the policy generation has moved,
+/// `method`'s grant and then `audience` on the re-resolved grants.
+fn recheck_delivery(
+    inbound: &crate::rpc::auth::RpcInboundAuth,
+    binding: Option<&crate::rpc::auth::ConnectionAuth>,
+    method: Method,
+    checked_generation: &mut Option<u64>,
+    audience: impl FnOnce(
+        &crate::rpc::auth::ConnectionAuth,
+        &zeroclaw_api::grants::ResolvedGrants,
+    ) -> Result<(), crate::rpc::auth::AuthDenied>,
+) -> bool {
+    let Some(auth) = binding else {
+        return true;
+    };
+    let generation = inbound.generation();
+    let authority = if *checked_generation == Some(generation) {
+        credential_is_live(inbound, auth)
+    } else {
+        current_authority(inbound, auth, method).and_then(|grants| audience(auth, &grants))
     };
     if let Err(denied) = authority {
         audit_denial(Some(auth), method, &denied);
@@ -21675,6 +21932,389 @@ mod tests {
             )
             .await,
             "a principal that lost Logs:Read must stop receiving log frames"
+        );
+    }
+
+    // ── sops/subscribe-runs and system/version-check ─────────────
+
+    /// A run summary as the engine publishes it on its change feed.
+    fn run_change(
+        run_id: &str,
+        sop: &str,
+        status: crate::sop::SopRunStatus,
+    ) -> crate::sop::SopRunSummary {
+        crate::sop::SopRunSummary {
+            run_id: run_id.into(),
+            sop_name: sop.into(),
+            status,
+            current_step: 1,
+            total_steps: 1,
+            started_at: "2026-10-01T00:00:00Z".into(),
+            completed_at: None,
+            trigger_source: "manual".into(),
+            active: true,
+        }
+    }
+
+    /// An engine holding one parked `alpha-sop` run, publishing its run
+    /// changes on the returned sender, `capacity` deep.
+    fn sop_runs_engine(
+        tmp: &tempfile::TempDir,
+        capacity: usize,
+    ) -> (
+        Arc<std::sync::Mutex<crate::sop::SopEngine>>,
+        tokio::sync::broadcast::Sender<crate::sop::SopRunSummary>,
+        zeroclaw_config::schema::SopConfig,
+    ) {
+        let sops_dir = tmp.path().join("sops");
+        let sop_config = zeroclaw_config::schema::SopConfig {
+            sops_dir: Some(sops_dir.to_string_lossy().into_owned()),
+            ..zeroclaw_config::schema::SopConfig::default()
+        };
+        crate::sop::save_sop(&sops_dir, &gated_sop("alpha-sop", "alpha"))
+            .expect("save the fixture SOP");
+        let (changes, _) = tokio::sync::broadcast::channel(capacity);
+        let mut engine =
+            crate::sop::SopEngine::new(sop_config.clone()).with_run_notifier(changes.clone());
+        engine.reload(tmp.path());
+        let engine = Arc::new(std::sync::Mutex::new(engine));
+        park_sop_run(&engine, "alpha-sop");
+        (engine, changes, sop_config)
+    }
+
+    fn sop_runs_ctx(
+        config: zeroclaw_config::schema::Config,
+        engine: &Arc<std::sync::Mutex<crate::sop::SopEngine>>,
+    ) -> Arc<RpcContext> {
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        RpcContext::minimal_with_sop_engine(config, sessions, Arc::clone(engine))
+    }
+
+    fn sop_runs_dispatcher(
+        engine: &Arc<std::sync::Mutex<crate::sop::SopEngine>>,
+    ) -> (RpcDispatcher, tokio::sync::mpsc::Receiver<String>) {
+        let ctx = sop_runs_ctx(zeroclaw_config::schema::Config::default(), engine);
+        let (tx, rx) = tokio::sync::mpsc::channel::<String>(256);
+        (RpcDispatcher::new(ctx, tx, "local:uid=0".into()), rx)
+    }
+
+    #[test]
+    fn the_new_methods_are_a_sops_read_and_a_system_read() {
+        use zeroclaw_api::grants::{Resource, Verb};
+        assert_eq!(
+            Method::SopsSubscribeRuns.authz(),
+            MethodAuthz::Requires(Resource::Sops, Verb::Read)
+        );
+        assert_eq!(
+            Method::SystemVersionCheck.authz(),
+            MethodAuthz::Requires(Resource::System, Verb::Read)
+        );
+    }
+
+    /// The snapshot is what `sops/runs` lists, taken with the feed armed;
+    /// each later change reaches each subscription whose `sop` it matches,
+    /// numbered from 1, and a cancelled subscription hears nothing more.
+    #[tokio::test]
+    async fn sops_subscribe_runs_snapshots_then_streams_each_change() {
+        use crate::sop::SopRunStatus;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (engine, changes, _) = sop_runs_engine(&tmp, 16);
+        let (d, mut rx) = sop_runs_dispatcher(&engine);
+
+        let every = d
+            .handle_sops_subscribe_runs(&Value::Null)
+            .expect("subscribe to every SOP");
+        let listed = d
+            .handle_sops_runs(&json!({}))
+            .expect("sops/runs lists the same runs");
+        assert_eq!(every["runs"], listed["runs"]);
+        assert_eq!(every["runs"].as_array().map(Vec::len), Some(1), "{every}");
+        let beta = d
+            .handle_sops_subscribe_runs(&json!({"sop": "beta-sop"}))
+            .expect("subscribe to one SOP");
+        assert_eq!(beta["runs"], json!([]));
+
+        let alpha_change = run_change("r1", "alpha-sop", SopRunStatus::Running);
+        let beta_change = run_change("r2", "beta-sop", SopRunStatus::Completed);
+        changes.send(alpha_change.clone()).unwrap();
+        changes.send(beta_change.clone()).unwrap();
+        let frames = notifications(&mut rx, 3).await;
+        assert_eq!(frames.len(), 3, "{frames:?}");
+        let mut to_every = Vec::new();
+        let mut to_beta = Vec::new();
+        for frame in &frames {
+            assert_eq!(frame["method"], json!(notification::SOPS_RUN_CHANGED));
+            if frame["params"]["subscription_id"] == every["subscription_id"] {
+                to_every.push(frame["params"].clone());
+            } else {
+                assert_eq!(frame["params"]["subscription_id"], beta["subscription_id"]);
+                to_beta.push(frame["params"].clone());
+            }
+        }
+        assert_eq!(
+            to_every,
+            [
+                json!({"subscription_id": every["subscription_id"], "seq": 1, "run": alpha_change}),
+                json!({"subscription_id": every["subscription_id"], "seq": 2, "run": beta_change}),
+            ]
+        );
+        assert_eq!(
+            to_beta,
+            [json!({"subscription_id": beta["subscription_id"], "seq": 1, "run": beta_change})]
+        );
+
+        for opened in [&every, &beta] {
+            let cancelled = d
+                .handle_subscription_cancel(&json!({"subscription_id": opened["subscription_id"]}))
+                .expect("cancel");
+            assert_eq!(cancelled["cancelled"], json!(true));
+        }
+        changes
+            .send(run_change("r3", "beta-sop", SopRunStatus::Failed))
+            .unwrap();
+        assert_quiet(&mut rx).await;
+    }
+
+    /// Changes the feed dropped are reported once, with the numbers they
+    /// would have had, and the next change carries the resume number.
+    #[tokio::test]
+    async fn sops_subscribe_runs_reports_a_lag_and_numbers_past_it() {
+        use crate::sop::SopRunStatus;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (engine, changes, _) = sop_runs_engine(&tmp, 1);
+        let (d, mut rx) = sop_runs_dispatcher(&engine);
+        let opened = d.handle_sops_subscribe_runs(&json!({})).expect("subscribe");
+
+        // Three changes before the delivery task runs: a one-deep feed keeps
+        // only the last.
+        for n in 1..=3 {
+            changes
+                .send(run_change(
+                    &format!("r{n}"),
+                    "alpha-sop",
+                    SopRunStatus::Running,
+                ))
+                .unwrap();
+        }
+        let frames = notifications(&mut rx, 2).await;
+        assert_eq!(frames.len(), 2, "{frames:?}");
+        assert_eq!(
+            frames[0]["method"],
+            json!(notification::SUBSCRIPTION_LAGGED)
+        );
+        assert_eq!(
+            frames[0]["params"],
+            json!({
+                "subscription_id": opened["subscription_id"],
+                "from_seq": 1,
+                "resume_seq": 3,
+                "epoch_changed": false,
+            })
+        );
+        assert_eq!(frames[1]["method"], json!(notification::SOPS_RUN_CHANGED));
+        assert_eq!(frames[1]["params"]["seq"], json!(3));
+        assert_eq!(frames[1]["params"]["run"]["run_id"], json!("r3"));
+    }
+
+    /// With the SOP subsystem disabled the refusal names why in `data`, so a
+    /// gateway can answer the socket's `disabled` frame.
+    #[tokio::test]
+    async fn sops_subscribe_runs_without_the_sop_subsystem_says_so_in_data() {
+        let ctx = enforcement_ctx(zeroclaw_config::schema::Config::default());
+        let (mut operator, mut rx) = local_operator(&ctx).await;
+        let refused = rpc(&mut operator, &mut rx, 1, "sops/subscribe-runs", json!({})).await;
+        assert_eq!(refused["error"]["code"], json!(INTERNAL_ERROR), "{refused}");
+        assert_eq!(
+            refused["error"]["data"],
+            json!({"reason": zeroclaw_rpc_proto::error_reasons::SOP_DISABLED}),
+            "{refused}"
+        );
+        // Every other refusal still carries no `data`.
+        let unknown = rpc(
+            &mut operator,
+            &mut rx,
+            2,
+            "subscription/cancel",
+            json!({"nope": true}),
+        )
+        .await;
+        assert_eq!(unknown["error"]["code"], json!(INVALID_PARAMS), "{unknown}");
+        assert!(unknown["error"].get("data").is_none(), "{unknown}");
+    }
+
+    /// `Sops:Read` alone opens the feed and shows every run, as `sops/runs`
+    /// does; losing it ends the feed at the next delivery.
+    #[tokio::test]
+    async fn sops_subscribe_runs_needs_sops_read_and_stops_once_it_is_revoked() {
+        use crate::sop::SopRunStatus;
+        use zeroclaw_api::grants::{Resource, Verb};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (engine, changes, sop_config) = sop_runs_engine(&tmp, 16);
+        let mut config = roster_config(4242);
+        config.sop = sop_config;
+        let ctx = sop_runs_ctx(config.clone(), &engine);
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+
+        let refused = rpc(&mut alice, &mut rx, 1, "sops/subscribe-runs", json!({})).await;
+        assert_eq!(refused["error"]["code"], json!(FORBIDDEN), "{refused}");
+
+        let mut granted = config.clone();
+        granted
+            .permission_profiles
+            .get_mut("reader")
+            .expect("the fixture profile exists")
+            .grants
+            .insert(Resource::Sops, vec![Verb::Read]);
+        ctx.auth
+            .refresh_from_config(&granted)
+            .expect("the granting policy compiles");
+        let opened = rpc(&mut alice, &mut rx, 2, "sops/subscribe-runs", json!({})).await;
+        assert_eq!(
+            opened["result"]["runs"].as_array().map(Vec::len),
+            Some(1),
+            "{opened}"
+        );
+        changes
+            .send(run_change(
+                "SENTINEL-GRANTED",
+                "alpha-sop",
+                SopRunStatus::Running,
+            ))
+            .unwrap();
+        assert!(
+            next_frame_containing(
+                &mut rx,
+                "SENTINEL-GRANTED",
+                std::time::Duration::from_secs(2)
+            )
+            .await,
+            "a Sops:Read holder receives run changes"
+        );
+
+        ctx.auth
+            .refresh_from_config(&config)
+            .expect("the narrowed policy compiles");
+        changes
+            .send(run_change(
+                "SENTINEL-REVOKED",
+                "alpha-sop",
+                SopRunStatus::Running,
+            ))
+            .unwrap();
+        assert!(
+            !next_frame_containing(
+                &mut rx,
+                "SENTINEL-REVOKED",
+                std::time::Duration::from_millis(500)
+            )
+            .await,
+            "a principal that lost Sops:Read must stop receiving run changes"
+        );
+    }
+
+    /// The release every test here records as the core's cached check, so
+    /// tests that read the process-wide cache in parallel agree.
+    fn cached_release() -> VersionCheckResponse {
+        VersionCheckResponse {
+            current_version: "0.8.5".into(),
+            latest_version: Some("0.9.0".into()),
+            is_newer: true,
+            release_url: Some("https://example.com/release".into()),
+            release_notes: Some("- notes".into()),
+            published_at: Some("2026-10-01T00:00:00Z".into()),
+            error: None,
+        }
+    }
+
+    /// A caller that lost `System:Read` while the check ran gets the refusal,
+    /// not the result: the handler resolves the authority again after its
+    /// await, not only at the gate before it.
+    #[tokio::test]
+    async fn system_version_check_rechecks_the_caller_after_the_check() {
+        use zeroclaw_api::grants::{Resource, Verb};
+        crate::update_check::remember_latest_check(cached_release());
+        let mut config = roster_config(4242);
+        config
+            .permission_profiles
+            .get_mut("reader")
+            .expect("the fixture profile exists")
+            .grants
+            .insert(Resource::System, vec![Verb::Read]);
+        let ctx = enforcement_ctx(config.clone());
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+        let answered = rpc(&mut alice, &mut rx, 1, "system/version-check", json!({})).await;
+        assert_eq!(
+            answered["result"]["latest_version"],
+            json!("0.9.0"),
+            "{answered}"
+        );
+
+        // The grant is withdrawn after the gate has passed: the handler
+        // itself must refuse.
+        let mut narrowed = config;
+        narrowed
+            .permission_profiles
+            .get_mut("reader")
+            .expect("the fixture profile exists")
+            .grants
+            .remove(&Resource::System);
+        ctx.auth
+            .refresh_from_config(&narrowed)
+            .expect("the narrowed policy compiles");
+        let refused = alice
+            .handle_system_version_check(&json!({}))
+            .await
+            .expect_err("the caller no longer holds System:Read");
+        assert_eq!(refused.code, FORBIDDEN, "{refused:?}");
+    }
+
+    /// An unforced check is answered from the core's cache of its last
+    /// latest-release check, with or without params.
+    #[tokio::test]
+    async fn system_version_check_answers_from_the_core_cache() {
+        let cached = cached_release();
+        crate::update_check::remember_latest_check(cached.clone());
+        let ctx = enforcement_ctx(zeroclaw_config::schema::Config::default());
+        let (mut operator, mut rx) = local_operator(&ctx).await;
+        for (id, params) in [(1, json!({})), (2, json!({"force": false}))] {
+            let answered = rpc(&mut operator, &mut rx, id, "system/version-check", params).await;
+            assert_eq!(
+                answered["result"],
+                serde_json::to_value(&cached).unwrap(),
+                "{answered}"
+            );
+        }
+        // A request with no params at all is the default check.
+        operator
+            .process_line(
+                &json!({"jsonrpc": "2.0", "id": 3, "method": "system/version-check"}).to_string(),
+            )
+            .await;
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+            .await
+            .expect("a response within 10s")
+            .expect("writer channel open");
+        let answered: Value = serde_json::from_str(&frame).expect("a JSON-RPC frame");
+        assert_eq!(answered["id"], json!(3), "{answered}");
+        assert_eq!(
+            answered["result"],
+            serde_json::to_value(&cached).unwrap(),
+            "{answered}"
+        );
+        let malformed = rpc(
+            &mut operator,
+            &mut rx,
+            4,
+            "system/version-check",
+            json!({"force": "yes"}),
+        )
+        .await;
+        assert_eq!(
+            malformed["error"]["code"],
+            json!(INVALID_PARAMS),
+            "{malformed}"
         );
     }
 

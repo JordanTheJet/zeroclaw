@@ -9,7 +9,8 @@
 //! - [`notification`]: the server-to-client notification names;
 //! - [`types`]: every wire-stable request, response and notification
 //!   payload type;
-//! - [`error_codes`]: the JSON-RPC error codes the daemon returns;
+//! - [`error_codes`]: the JSON-RPC error codes the daemon returns, and
+//!   [`error_reasons`] for the `data.reason` some errors carry;
 //! - [`sop`]: the SOP graph projection types the `sops/*` methods return.
 //!
 //! The runtime depends on this crate and re-exports it from
@@ -68,6 +69,13 @@ pub mod error_codes {
             assert_eq!(codes.len(), ALL.len(), "duplicate numeric error code");
         }
     }
+}
+
+/// `data.reason` values the daemon sets on an error when its code alone does
+/// not say why.
+pub mod error_reasons {
+    /// `sops/subscribe-runs`: the SOP subsystem is disabled.
+    pub const SOP_DISABLED: &str = "sop_disabled";
 }
 
 /// SOP graph projection types returned by `sops/graph` and `sops/graph-draft`.

@@ -168,6 +168,46 @@ rpc_type! {
     }
 }
 
+rpc_type! {
+    /// `system/version-check` params. With none, the core reports the
+    /// latest release, reusing a check it made within the last hour.
+    #[derive(Default)]
+    pub struct SystemVersionCheckParams {
+        /// Skip the one-hour cache and ask again.
+        #[serde(default)]
+        pub force: bool,
+        /// Check this release tag instead of the latest release. Never
+        /// cached.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub version: Option<String>,
+    }
+}
+
+rpc_type! {
+    /// `system/version-check` result, and the body of the gateway's
+    /// `GET /api/version/check`. On success every field except `error` is
+    /// populated; when the check fails the result is `{ current_version,
+    /// latest_version: null, is_newer: false, error }`, so the dashboard
+    /// version badge degrades gracefully. A failed check is this result with
+    /// `error` set, never an RPC error.
+    pub struct VersionCheckResponse {
+        pub current_version: String,
+        /// Latest release version, or `null` when the check could not complete.
+        pub latest_version: Option<String>,
+        pub is_newer: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub release_url: Option<String>,
+        /// Release notes body (Markdown).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub release_notes: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub published_at: Option<String>,
+        /// Set only when the check failed; absent on success.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub error: Option<String>,
+    }
+}
+
 // ══════════════════════════════════════════════════════════════════════
 // ── TUI ──────────────────────────────────────────────────────────────
 // ══════════════════════════════════════════════════════════════════════
@@ -1709,6 +1749,37 @@ rpc_type! {
 rpc_type! {
     pub struct QuickstartDismissResult {
         pub recorded: bool,
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// ── SOP runs ─────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════
+
+rpc_type! {
+    /// `sops/subscribe-runs` result: the runs as of the moment the change
+    /// feed was armed, then every later change as `sops/run-changed`.
+    pub struct SopsSubscribeRunsResult {
+        pub subscription_id: String,
+        /// The run summaries `sops/runs` lists for the same `sop`, read in
+        /// the same step that armed the feed, so no transition falls
+        /// between the two.
+        pub runs: Vec<serde_json::Value>,
+    }
+}
+
+rpc_type! {
+    /// `sops/run-changed`: one run's new summary, pushed on the connection
+    /// that opened the `sops/subscribe-runs` subscription.
+    pub struct SopRunChanged {
+        pub subscription_id: String,
+        /// Numbers this subscription's changes from 1. Changes lost to a lag
+        /// are reported first with `subscription/lagged`, and the next change
+        /// carries its `resume_seq`. Run summaries are state, so there is no
+        /// replay: subscribe again for a fresh snapshot.
+        pub seq: u64,
+        /// The run's summary, in the shape `sops/runs` lists.
+        pub run: serde_json::Value,
     }
 }
 
