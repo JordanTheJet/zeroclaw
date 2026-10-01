@@ -2,7 +2,6 @@
 //! All `/api/*` routes require bearer token authentication (PairingGuard).
 
 use super::{AppState, GW_SESSION_PREFIX, gateway_cancel_key, gateway_session_key};
-use crate::core_rpc::CoreAccess;
 use axum::{
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode, header},
@@ -17,7 +16,7 @@ use zeroclaw_memory::MemoryEntry;
 use zeroclaw_rpc_client::Method;
 use zeroclaw_rpc_proto::types::{CLIENT_KIND_GATEWAY, SessionEntry, SessionListResult};
 
-use crate::core_rpc::{CoreCall, CoreError};
+use crate::core_rpc::{CoreAccess, CoreCall, CoreError};
 
 const MEMORY_API_CONTENT_MAX_CHARS: usize = 4096;
 
@@ -1859,13 +1858,20 @@ fn health_response(mut health: serde_json::Value) -> serde_json::Value {
 
 // ── Session API handlers ─────────────────────────────────────────
 //
-// `GET /api/sessions` is served by the core whenever the request reaches it
-// (`CoreAccess::Core`): the core lists what the caller's principal may see.
-// Every route that addresses one session by id stays in-process for now:
-// - The core resolves a session id by trying `rpc_{id}`, `gw_{id}` and `{id}`
-//   in turn, so it cannot be told to act on exactly the row this gateway's
-//   resolver picked. A competing row with another prefix would be read or
-//   deleted instead. That needs an exact durable-row reference in the core.
+// Every session route stays in-process for now.
+// - `GET /api/sessions`: the core lists, for a non-local caller, only the
+//   sessions that caller's own connection opened, so the gateway's
+//   credential-bound connection would list none of the dashboard's sessions.
+//   The listing moves to the core once the core scopes such a connection's
+//   view by its principal. The rows already take the core's `SessionEntry`
+//   shape, so that move changes only where they come from. The standalone
+//   preview gateway serves it through the core already
+//   (`api_sessions_list_through_core`).
+// - The routes that address one session by id: the core resolves a session
+//   id by trying `rpc_{id}`, `gw_{id}` and `{id}` in turn, so it cannot be
+//   told to act on exactly the row this gateway's resolver picked. A
+//   competing row with another prefix would be read or deleted instead. That
+//   needs an exact durable-row reference in the core.
 // - A delete must first cancel and wait for the gateway's own chat turn,
 //   which only the gateway can do, while only the core can authorize the
 //   delete. Until those turns run in the core, the two cannot be made one
@@ -1874,12 +1880,9 @@ fn health_response(mut health: serde_json::Value) -> serde_json::Value {
 /// GET /api/sessions — list gateway sessions
 pub async fn handle_api_sessions_list(
     State(state): State<AppState>,
-    access: CoreAccess,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    if matches!(access, CoreAccess::InProcess)
-        && let Err(e) = require_auth(&state, &headers)
-    {
+    if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
 
@@ -1890,12 +1893,6 @@ pub async fn handle_api_sessions_list(
         }))
         .into_response();
     };
-
-    if let CoreAccess::Core(core) = access {
-        return api_sessions_list_through_core(&core)
-            .await
-            .unwrap_or_else(IntoResponse::into_response);
-    }
 
     // Include every session that's attributable (agent_alias stamped,
     // or a channel_id that resolves to an owning agent).
@@ -1931,8 +1928,10 @@ pub async fn handle_api_sessions_list(
     sessions_list_response(entries)
 }
 
-/// `GET /api/sessions` through the core, the body every router serves for
-/// it: the sessions the caller's principal may see.
+/// `GET /api/sessions` through the core, as the standalone preview gateway
+/// serves it: the sessions the caller's principal may see. That gateway
+/// reaches the core over the daemon's local socket, a trusted local caller,
+/// so the core does not narrow the list to the connection's own sessions.
 pub(crate) async fn api_sessions_list_through_core(core: &CoreCall) -> Result<Response, CoreError> {
     let listed: SessionListResult = core
         .call(Method::SessionList, serde_json::json!({}))
