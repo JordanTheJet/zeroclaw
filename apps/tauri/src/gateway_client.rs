@@ -46,6 +46,22 @@ impl GatewayClient {
         }
     }
 
+    /// The `/health` body when the address answers with a success status:
+    /// its JSON, or `Null` when the body is not JSON. `None` when nothing
+    /// answers successfully.
+    pub async fn health_report(&self) -> Option<serde_json::Value> {
+        let resp = self
+            .client
+            .get(format!("{}/health", self.base_url))
+            .send()
+            .await
+            .ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        Some(resp.json().await.unwrap_or(serde_json::Value::Null))
+    }
+
     pub async fn get_devices(&self) -> Result<serde_json::Value> {
         let mut req = self.client.get(format!("{}/api/devices", self.base_url));
         if let Some(auth) = self.auth_header() {

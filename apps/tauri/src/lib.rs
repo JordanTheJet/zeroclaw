@@ -11,28 +11,31 @@ pub mod state;
 pub mod tray;
 
 use gateway_client::GatewayClient;
-use state::shared_state;
+use state::{Startup, shared_state};
 use tauri::{Emitter, Manager, RunEvent, WebviewUrl, WebviewWindowBuilder};
 
 /// Loopback port the desktop app expects the gateway/daemon on. Matches the
 /// port baked into [`state::AppState::default`]'s `gateway_url`.
 const GATEWAY_PORT: u16 = 42617;
 
-/// Status the splash listens for (`zeroclaw://splash-status`). Drives the
-/// splash copy when we're starting our own daemon or hit a problem; the happy
-/// path is covered by the splash's own health polling, so a missed event is
-/// harmless.
-#[derive(Clone, serde::Serialize)]
-struct SplashStatus {
-    /// `starting` | `error` | `missing` | `timeout` | `incompatible` |
-    /// `endpoint_held` | `port_held`.
-    kind: &'static str,
-    message: String,
+/// The event the splash listens on for startup changes. It only prompts the
+/// splash to re-read [`get_startup`], so a missed event costs a poll interval.
+const STARTUP_EVENT: &str = "zeroclaw://startup";
+
+/// Record where startup stands, then tell the splash.
+async fn publish_startup(app: &tauri::AppHandle, state: &state::SharedState, startup: Startup) {
+    state.write().await.startup = startup.clone();
+    let _ = app.emit(STARTUP_EVENT, startup);
+}
+
+fn startup_failed(kind: &'static str, message: String) -> Startup {
+    Startup::Failed { kind, message }
 }
 
 /// Ensure a gateway/daemon is reachable: reuse one if it already answers,
-/// otherwise launch a fresh `zeroclaw daemon`. The splash window's health
-/// polling takes over once the daemon is up and opens the dashboard.
+/// otherwise launch a fresh `zeroclaw daemon` and check it. The outcome is
+/// recorded as [`Startup`]; the splash opens the dashboard only once it is
+/// ready.
 async fn ensure_daemon(app: tauri::AppHandle, state: state::SharedState) {
     let url = {
         let s = state.read().await;
@@ -44,7 +47,9 @@ async fn ensure_daemon(app: tauri::AppHandle, state: state::SharedState) {
     // decide nothing is there — avoids racing a daemon that's mid-startup.
     for _ in 0..3 {
         if client.get_health().await.unwrap_or(false) {
-            return; // Reuse the existing instance.
+            // Reuse the existing instance.
+            publish_startup(&app, &state, Startup::Ready).await;
+            return;
         }
         tokio::time::sleep(std::time::Duration::from_millis(700)).await;
     }
@@ -52,33 +57,34 @@ async fn ensure_daemon(app: tauri::AppHandle, state: state::SharedState) {
     // Nothing listening — start our own daemon.
     match daemon::find_zeroclaw_binary() {
         Some(bin) => {
-            let _ = app.emit(
-                "zeroclaw://splash-status",
-                SplashStatus {
-                    kind: "starting",
+            publish_startup(
+                &app,
+                &state,
+                Startup::Pending {
                     message: "Starting the ZeroClaw daemon…".to_string(),
                 },
-            );
+            )
+            .await;
             let bundled = daemon::is_bundled_kernel(&bin);
             match daemon::spawn_daemon(&bin, GATEWAY_PORT) {
                 Err(e) => {
-                    let status = match daemon::ReadinessFailure::from_launch_error(&e) {
-                        Some(failure) if failure.reason == "endpoint_held" => SplashStatus {
-                            kind: "endpoint_held",
-                            message: format!(
+                    let failed = match daemon::ReadinessFailure::from_launch_error(&e) {
+                        Some(failure) if failure.reason == "endpoint_held" => startup_failed(
+                            "endpoint_held",
+                            format!(
                                 "Couldn't start the ZeroClaw daemon: {failure}. Stop the other ZeroClaw and reopen the app."
                             ),
-                        },
-                        _ if e.kind() == std::io::ErrorKind::TimedOut => SplashStatus {
-                            kind: "timeout",
-                            message: format!("Couldn't start the ZeroClaw daemon in time: {e}"),
-                        },
-                        _ => SplashStatus {
-                            kind: "error",
-                            message: format!("Couldn't start the ZeroClaw daemon: {e}"),
-                        },
+                        ),
+                        _ if e.kind() == std::io::ErrorKind::TimedOut => startup_failed(
+                            "timeout",
+                            format!("Couldn't start the ZeroClaw daemon in time: {e}"),
+                        ),
+                        _ => startup_failed(
+                            "error",
+                            format!("Couldn't start the ZeroClaw daemon: {e}"),
+                        ),
                     };
-                    let _ = app.emit("zeroclaw://splash-status", status);
+                    publish_startup(&app, &state, failed).await;
                 }
                 Ok(mut launched) => {
                     let outcome = match &launched.readiness {
@@ -102,33 +108,35 @@ async fn ensure_daemon(app: tauri::AppHandle, state: state::SharedState) {
                                 .await
                         }
                     };
-                    if let Err(failure) = outcome {
-                        let _ = app.emit(
-                            "zeroclaw://splash-status",
-                            SplashStatus {
-                                kind: failure.kind(),
-                                message: failure.message().to_string(),
-                            },
-                        );
-                        if failure.is_final() {
-                            let _ = daemon::terminate_supervisor_tree(&mut launched.child);
+                    match outcome {
+                        Ok(()) => publish_startup(&app, &state, Startup::Ready).await,
+                        Err(failure) => {
+                            publish_startup(
+                                &app,
+                                &state,
+                                startup_failed(failure.kind(), failure.message().to_string()),
+                            )
+                            .await;
+                            if failure.is_final() {
+                                let _ = daemon::terminate_supervisor_tree(&mut launched.child);
+                            }
                         }
                     }
-                    // On success the splash's health poll detects the gateway
-                    // and calls `open_dashboard`.
                 }
             }
         }
         None => {
-            let _ = app.emit(
-                "zeroclaw://splash-status",
-                SplashStatus {
-                    kind: "missing",
-                    message: "Couldn't find the `zeroclaw` binary. Install ZeroClaw \
-                              (or start a daemon yourself) and reopen the app."
+            publish_startup(
+                &app,
+                &state,
+                startup_failed(
+                    "missing",
+                    "Couldn't find the `zeroclaw` binary. Install ZeroClaw \
+                     (or start a daemon yourself) and reopen the app."
                         .to_string(),
-                },
-            );
+                ),
+            )
+            .await;
         }
     }
 }
@@ -179,6 +187,12 @@ async fn auto_pair(state: &state::SharedState) -> Option<String> {
     }
 }
 
+/// Where startup stands, for the splash.
+#[tauri::command]
+async fn get_startup(state: tauri::State<'_, state::SharedState>) -> Result<Startup, String> {
+    Ok(state.read().await.startup.clone())
+}
+
 #[tauri::command]
 async fn open_dashboard(
     app: tauri::AppHandle,
@@ -190,11 +204,15 @@ async fn open_dashboard(
         return Ok(());
     }
 
+    // Only a ready startup may open the dashboard or pair with its gateway,
+    // whatever the splash believed when it asked.
     let base = {
         let s = state.read().await;
+        s.startup.dashboard_gate()?;
         s.gateway_url.clone()
     };
     let token = auto_pair(state.inner()).await;
+    state.read().await.startup.dashboard_gate()?;
 
     let dashboard_url = format!("{}/", base.trim_end_matches('/'));
     let parsed = tauri::Url::parse(&dashboard_url).map_err(|e| e.to_string())?;
@@ -262,6 +280,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::gateway::get_status,
             commands::gateway::get_health,
+            get_startup,
             commands::channels::list_channels,
             commands::pairing::initiate_pairing,
             commands::pairing::get_devices,
@@ -278,10 +297,11 @@ pub fn run() {
             // Set up the system tray.
             let _ = tray::setup_tray(app);
 
-            // Show the splash window on launch. It polls the gateway for
-            // readiness and then asks the backend to open the dashboard
-            // (`open_dashboard`) pointed at the running web gateway — which
-            // takes a first-time user straight into the Quickstart.
+            // Show the splash window on launch. It polls the startup state
+            // (`get_startup`) and, once it is ready, asks the backend to open
+            // the dashboard (`open_dashboard`) pointed at the running web
+            // gateway — which takes a first-time user straight into the
+            // Quickstart.
             if let Some(splash) = app.get_webview_window("splash") {
                 let _ = splash.show();
                 let _ = splash.set_focus();

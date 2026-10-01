@@ -42,20 +42,30 @@ The app then dials that endpoint. On Unix it first checks that the endpoint is
 served by the app's own OS account. It completes the RPC handshake and checks
 the protocol version. For a kernel bundled beside the app, it also checks that
 the kernel's version equals the app's. Only then does it wait, up to 60
-seconds, for the dashboard's `/health`.
+seconds in all, for the dashboard's gateway. The core must report that its
+gateway bound the dashboard port, and the dashboard address must answer
+`/health` as the core's own process. An HTTP answer alone is never enough,
+since any program can hold the port.
 
-Each way this can fail shows its own message on the splash:
+The app records the outcome as its startup state. The splash polls that state
+and opens the dashboard only once it is ready, and `open_dashboard` itself
+refuses, before and after pairing, unless it is. An app that finds a gateway
+already running when it starts reuses it, as before.
+
+Each way this can fail shows its own message on the splash, and the dashboard
+does not open:
 
 | Splash kind | Cause |
 |---|---|
 | `endpoint_held` | Another process already serves the endpoint, or serves it as another account. |
 | `incompatible` | The protocol differs, or a bundled kernel's version differs from the app's. |
-| `port_held` | The core reports that its gateway could not bind the dashboard port. |
+| `port_held` | The core reports that its gateway could not bind the dashboard port, or another program answers on the dashboard address. |
+| `core_unavailable` | The core stopped answering before its gateway was ready. |
 | `timeout` | A deadline passed: the kernel's capability check, the supervisor's readiness report (60 seconds with `--rpc-readiness`, 10 without), or the dashboard's `/health` after it. |
 
-The app stops the daemon it started on every failure except a `/health`
-timeout, where the daemon may still finish starting. A supervisor that never
-reports readiness is stopped.
+The app stops the daemon it started on every failure except a gateway
+timeout, where the daemon may still finish starting; reopening the app then
+reuses it. A supervisor that never reports readiness is stopped.
 
 A kernel without `--rpc-readiness` rejects the flag in that check. The app then
 uses the original `READY` line and waits for `/health` with the same deadline.

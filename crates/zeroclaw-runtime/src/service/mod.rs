@@ -50,9 +50,6 @@ const DESKTOP_PIPE_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 const DESKTOP_READINESS_FRAME_MAX_BYTES: usize = 4096;
 /// How often RPC readiness retries the daemon endpoint while it starts.
 const DESKTOP_ENDPOINT_POLL: Duration = Duration::from_millis(100);
-/// Upper bound on the message carried in a structured readiness failure, so
-/// the JSON frame stays within [`DESKTOP_READINESS_FRAME_MAX_BYTES`].
-const DESKTOP_FAILURE_MESSAGE_MAX_CHARS: usize = 1024;
 const SERVICE_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(any(target_os = "macos", test))]
 const LAUNCHD_PIPE_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
@@ -1364,14 +1361,35 @@ fn desktop_rpc_ready_frame(endpoint: &Path, pid: Option<u32>) -> String {
     desktop_handshake_frame("READY", Some(&body.to_string()))
 }
 
+/// The structured `ERROR {"reason":…,"message":…}` frame. When it would
+/// exceed [`DESKTOP_READINESS_FRAME_MAX_BYTES`], the message is shortened and
+/// the body serialized again until the frame fits, so the reader always gets
+/// valid JSON with its reason. Cutting the serialized bytes instead could
+/// split an escape sequence or drop the closing brace.
 fn desktop_failure_frame(failure: &DesktopReadinessFailure) -> String {
-    let message: String = failure
-        .message
-        .chars()
-        .take(DESKTOP_FAILURE_MESSAGE_MAX_CHARS)
-        .collect();
-    let body = serde_json::json!({ "reason": failure.reason, "message": message });
-    desktop_handshake_frame("ERROR", Some(&body.to_string()))
+    // `ERROR `, the body, and the newline must fit the frame.
+    let budget = DESKTOP_READINESS_FRAME_MAX_BYTES - "ERROR ".len() - 1;
+    // Every character serializes to at least one byte, so no more than
+    // `budget` of them can ever fit.
+    let mut message: String = failure.message.chars().take(budget).collect();
+    let mut shortened = message.len() < failure.message.len();
+    loop {
+        let text = if shortened {
+            format!("{message}...")
+        } else {
+            message.clone()
+        };
+        let body = serde_json::json!({ "reason": failure.reason, "message": text }).to_string();
+        if body.len() <= budget {
+            return desktop_handshake_frame("ERROR", Some(&body));
+        }
+        // A character serializes to at most six bytes (`\u001f`), so dropping
+        // this many removes at most a few bytes more than the excess.
+        let excess_chars = (body.len() - budget).div_ceil(6);
+        let keep = message.chars().count().saturating_sub(excess_chars);
+        message = message.chars().take(keep).collect();
+        shortened = true;
+    }
 }
 
 /// The frame reporting `error`: structured for a readiness failure, the
@@ -4250,15 +4268,57 @@ mod bounded_service_log_tests {
     }
 
     #[test]
-    fn desktop_failure_frame_stays_within_the_frame_limit() {
-        let failure = DesktopReadinessFailure {
-            reason: "daemon_exited",
-            message: "界".repeat(DESKTOP_READINESS_FRAME_MAX_BYTES),
-        };
-        let frame = desktop_failure_frame(&failure);
-        assert!(frame.len() <= DESKTOP_READINESS_FRAME_MAX_BYTES);
+    fn desktop_failure_frame_stays_valid_json_within_the_frame_limit() {
+        for (label, original) in [
+            (
+                "three-byte characters",
+                "界".repeat(DESKTOP_READINESS_FRAME_MAX_BYTES),
+            ),
+            ("four-byte characters", "🦀".repeat(1024)),
+            ("JSON escapes", "\u{0001}".repeat(1024)),
+            ("quotes and backslashes", "\"\\".repeat(2048)),
+            ("ASCII", "x".repeat(5000)),
+        ] {
+            let frame = desktop_failure_frame(&DesktopReadinessFailure {
+                reason: "daemon_exited",
+                message: original.clone(),
+            });
+            assert!(
+                frame.len() <= DESKTOP_READINESS_FRAME_MAX_BYTES,
+                "{label}: {} bytes",
+                frame.len()
+            );
+            assert!(
+                frame.ends_with('\n') && !frame.ends_with("...\n"),
+                "{label}"
+            );
+            let body = frame_json(&frame, "ERROR");
+            assert_eq!(body["reason"], "daemon_exited", "{label}");
+            let message = body["message"].as_str().expect("message");
+            let kept = message
+                .strip_suffix("...")
+                .expect("a shortened message says so");
+            assert!(!kept.is_empty() && original.starts_with(kept), "{label}");
+            // Shortened only as far as the limit needs.
+            assert!(
+                frame.len() + 8 > DESKTOP_READINESS_FRAME_MAX_BYTES,
+                "{label}: {} bytes",
+                frame.len()
+            );
+        }
+    }
+
+    #[test]
+    fn desktop_failure_frame_keeps_a_short_message_whole() {
+        let frame = desktop_failure_frame(&DesktopReadinessFailure {
+            reason: "endpoint_held",
+            message: "another process (pid 7) already serves \"d.sock\"".to_string(),
+        });
         let body = frame_json(&frame, "ERROR");
-        assert_eq!(body["reason"], "daemon_exited");
+        assert_eq!(
+            body["message"],
+            "another process (pid 7) already serves \"d.sock\""
+        );
     }
 
     #[tokio::test]

@@ -10,7 +10,7 @@
 use crate::gateway_client::GatewayClient;
 use serde_json::Value;
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use zeroclaw_rpc_client::{
     ClientError, ConnectOptions, Method, RPC_PROTOCOL_VERSION, RpcClient, error_codes,
 };
@@ -34,6 +34,8 @@ pub enum StartupFailure {
     EndpointHeld(String),
     /// Another process holds the dashboard's port.
     PortHeld(String),
+    /// The launched core stopped answering before its gateway was ready.
+    CoreUnavailable(String),
 }
 
 impl StartupFailure {
@@ -44,6 +46,7 @@ impl StartupFailure {
             Self::Incompatible(_) => "incompatible",
             Self::EndpointHeld(_) => "endpoint_held",
             Self::PortHeld(_) => "port_held",
+            Self::CoreUnavailable(_) => "core_unavailable",
         }
     }
 
@@ -53,7 +56,8 @@ impl StartupFailure {
             Self::Timeout(message)
             | Self::Incompatible(message)
             | Self::EndpointHeld(message)
-            | Self::PortHeld(message) => message,
+            | Self::PortHeld(message)
+            | Self::CoreUnavailable(message) => message,
         }
     }
 
@@ -120,9 +124,21 @@ pub async fn verify_core(
         verify_endpoint_owner: cfg!(unix),
         ..ConnectOptions::default()
     };
-    let client = RpcClient::connect_local(endpoint, options)
-        .await
-        .map_err(|error| classify_dial_error(endpoint, error))?;
+    // The handshake timeout starts only after the endpoint check; bound the
+    // whole dial so a stalled connect or check cannot hold startup either.
+    let client = tokio::time::timeout(
+        HANDSHAKE_TIMEOUT,
+        RpcClient::connect_local(endpoint, options),
+    )
+    .await
+    .map_err(|_| {
+        StartupFailure::Timeout(format!(
+            "The ZeroClaw core at {} did not complete its handshake within {} seconds.",
+            endpoint.display(),
+            HANDSHAKE_TIMEOUT.as_secs()
+        ))
+    })?
+    .map_err(|error| classify_dial_error(endpoint, error))?;
     let handshake = client.handshake();
     check_handshake(
         &CoreHandshake {
@@ -169,35 +185,92 @@ pub fn gateway_port_held(health: &Value) -> Option<String> {
     in_use.then(|| error.to_string())
 }
 
-/// Wait until the dashboard's gateway answers `/health`. With a connection to
-/// the launched core, a gateway that lost its port to another process is
-/// reported as such instead of waiting out the deadline.
+/// Wait, within `budget` overall, until the dashboard's gateway is ready.
+///
+/// For the daemon this app launched, `core` is its verified RPC connection.
+/// The core must then report that its own gateway bound its port, and the
+/// dashboard address must answer as that same process. An HTTP answer alone
+/// proves nothing about who serves it: any program can hold the port, and a
+/// gateway that lost the port to one is reported as such. Without a core (an
+/// older kernel), a successful `/health` is all there is to go on.
 pub async fn await_gateway(
     gateway_url: &str,
     core: Option<&RpcClient>,
-    deadline: Duration,
+    budget: Duration,
 ) -> Result<(), StartupFailure> {
     let client = GatewayClient::new(gateway_url, None);
-    let started = Instant::now();
-    loop {
-        if client.get_health().await.unwrap_or(false) {
-            return Ok(());
+    let mut last_gateway_error = None;
+    let wait = async {
+        loop {
+            let ready = match core {
+                Some(core) => {
+                    launched_gateway_ready(&client, core, gateway_url, &mut last_gateway_error)
+                        .await?
+                }
+                None => client.get_health().await.unwrap_or(false),
+            };
+            if ready {
+                return Ok(());
+            }
+            tokio::time::sleep(GATEWAY_POLL).await;
         }
-        if let Some(core) = core
-            && let Ok(health) = core.request(Method::Health, Value::Null).await
-            && let Some(error) = gateway_port_held(&health)
-        {
-            return Err(StartupFailure::PortHeld(format!(
-                "Another program is using the dashboard's address {gateway_url}: {error}. Close it and reopen ZeroClaw."
-            )));
-        }
-        if started.elapsed() >= deadline {
-            return Err(StartupFailure::Timeout(format!(
-                "ZeroClaw did not finish starting within {} seconds. Its log is in the ZeroClaw config directory under logs/zeroclaw-desktop-daemon.log.",
-                deadline.as_secs()
-            )));
-        }
-        tokio::time::sleep(GATEWAY_POLL).await;
+    };
+    let outcome = tokio::time::timeout(budget, wait).await;
+    outcome.unwrap_or_else(|_| {
+        let reported = last_gateway_error
+            .map(|error| format!(" Its gateway last reported: {error}."))
+            .unwrap_or_default();
+        Err(StartupFailure::Timeout(format!(
+            "ZeroClaw did not finish starting within {} seconds.{reported} Its log is in the ZeroClaw config directory under logs/zeroclaw-desktop-daemon.log.",
+            budget.as_secs()
+        )))
+    })
+}
+
+/// One check of the launched daemon's gateway: `Ok(true)` once the core
+/// reports it bound and the dashboard address answers as the core's process.
+async fn launched_gateway_ready(
+    client: &GatewayClient,
+    core: &RpcClient,
+    gateway_url: &str,
+    last_gateway_error: &mut Option<String>,
+) -> Result<bool, StartupFailure> {
+    // The daemon rejects `"params": null`; an empty object is the no-argument
+    // form it accepts.
+    let health = core
+        .request(Method::Health, Value::Object(serde_json::Map::new()))
+        .await
+        .map_err(|error| {
+            StartupFailure::CoreUnavailable(format!(
+                "The ZeroClaw core stopped answering while it started: {error}. Its log is in the ZeroClaw config directory under logs/zeroclaw-desktop-daemon.log."
+            ))
+        })?;
+    if let Some(error) = gateway_port_held(&health) {
+        return Err(StartupFailure::PortHeld(format!(
+            "Another program is using the dashboard's address {gateway_url}: {error}. Close it and reopen ZeroClaw."
+        )));
+    }
+    let gateway = &health["components"]["gateway"];
+    if gateway["status"].as_str() != Some("ok") {
+        *last_gateway_error = gateway["last_error"].as_str().map(str::to_string);
+        return Ok(false);
+    }
+    // The core's gateway is bound and serving. A program bound to a more
+    // specific address on the same port would still take loopback
+    // connections, so the address must answer as the core's own process.
+    let Some(report) = client.health_report().await else {
+        return Ok(false);
+    };
+    let core_pid = core.handshake().server_pid;
+    match report["runtime"]["pid"].as_u64() {
+        Some(pid) if pid == u64::from(core_pid) => Ok(true),
+        answered => Err(StartupFailure::PortHeld(format!(
+            "Another program answers on the dashboard's address {gateway_url} ({}), not the ZeroClaw core this app started (process {core_pid}). Close it and reopen ZeroClaw.",
+            answered.map_or_else(
+                || "it does not report a ZeroClaw process".to_string(),
+                |pid| format!("it reports process {pid}")
+            )
+        ))),
     }
 }
 
@@ -205,6 +278,8 @@ pub async fn await_gateway(
 mod tests {
     use super::*;
     use serde_json::json;
+    #[cfg(unix)]
+    use std::time::Instant;
 
     fn handshake(protocol: u64, version: &str, pid: u32) -> CoreHandshake {
         CoreHandshake {
@@ -294,6 +369,7 @@ mod tests {
         assert!(!StartupFailure::Timeout(String::new()).is_final());
         assert!(StartupFailure::PortHeld(String::new()).is_final());
         assert!(StartupFailure::EndpointHeld(String::new()).is_final());
+        assert!(StartupFailure::CoreUnavailable(String::new()).is_final());
     }
 
     /// A core listening on a private socket answers `initialize`; the app
@@ -320,6 +396,240 @@ mod tests {
             .await
             .expect_err("the bundled pair differs");
         assert_eq!(failure.kind(), "incompatible");
+    }
+
+    /// The core reports that its gateway lost the dashboard port. An HTTP
+    /// 200 from some other listener on the address must not override that.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_foreign_http_answer_does_not_override_the_core_s_port_failure() {
+        let core = FakeCore::start("held", gateway_health("error", Some(PORT_HELD)), false).await;
+        let control = await_gateway(&fake_http(503, None), Some(&core.client), SHORT).await;
+        assert!(
+            matches!(control, Err(StartupFailure::PortHeld(_))),
+            "{control:?}"
+        );
+
+        let foreign = fake_http(200, Some(json!({ "status": "ok" })));
+        let outcome = await_gateway(&foreign, Some(&core.client), SHORT).await;
+        assert!(
+            matches!(outcome, Err(StartupFailure::PortHeld(_))),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            core.health_calls(),
+            2,
+            "the core is asked before HTTP is trusted"
+        );
+    }
+
+    /// The core's gateway reports itself bound, but the dashboard address
+    /// answers as another process (or as no ZeroClaw at all).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_address_answering_as_another_process_is_not_the_launched_gateway() {
+        let core = FakeCore::start("other", gateway_health("ok", None), false).await;
+        let other_pid = std::process::id() + 1;
+        for body in [Some(json!({ "runtime": { "pid": other_pid } })), None] {
+            let outcome =
+                await_gateway(&fake_http(200, body.clone()), Some(&core.client), SHORT).await;
+            match outcome {
+                Err(StartupFailure::PortHeld(message)) => {
+                    assert!(
+                        message.contains(&std::process::id().to_string()),
+                        "{message}"
+                    );
+                }
+                other => panic!("{body:?}: expected PortHeld, got {other:?}"),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_launched_gateway_is_ready_once_the_core_and_its_address_agree() {
+        let core = FakeCore::start("agree", gateway_health("ok", None), false).await;
+        let gateway = fake_http(
+            200,
+            Some(json!({ "runtime": { "pid": std::process::id() } })),
+        );
+        await_gateway(&gateway, Some(&core.client), SHORT)
+            .await
+            .expect("the core's own gateway answers");
+    }
+
+    /// An HTTP answer, even from the right process, is not readiness while
+    /// the core still reports its gateway starting or failing; the timeout
+    /// names the gateway's last error.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_gateway_the_core_does_not_report_bound_is_not_ready() {
+        let core = FakeCore::start(
+            "start",
+            gateway_health("error", Some("TLS key missing")),
+            false,
+        )
+        .await;
+        let gateway = fake_http(
+            200,
+            Some(json!({ "runtime": { "pid": std::process::id() } })),
+        );
+        match await_gateway(&gateway, Some(&core.client), Duration::from_millis(300)).await {
+            Err(StartupFailure::Timeout(message)) => {
+                assert!(message.contains("TLS key missing"), "{message}");
+            }
+            other => panic!("expected a timeout, got {other:?}"),
+        }
+    }
+
+    /// The deadline bounds the whole wait, including a core request in
+    /// flight that the core never answers.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_gateway_deadline_bounds_an_in_flight_core_request() {
+        let core = FakeCore::start("stall", gateway_health("ok", None), true).await;
+        let gateway = fake_http(503, None);
+        let started = Instant::now();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            await_gateway(&gateway, Some(&core.client), Duration::from_millis(30)),
+        )
+        .await
+        .expect("the gateway deadline must end the wait, not the core request timeout");
+        assert!(
+            matches!(outcome, Err(StartupFailure::Timeout(_))),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            core.health_calls(),
+            1,
+            "the core received the request it never answers"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[cfg(unix)]
+    const SHORT: Duration = Duration::from_secs(3);
+    #[cfg(unix)]
+    const PORT_HELD: &str = "Failed to bind 127.0.0.1:42617: Address already in use (os error 48)";
+
+    #[cfg(unix)]
+    fn gateway_health(status: &str, last_error: Option<&str>) -> Value {
+        json!({ "components": { "gateway": { "status": status, "last_error": last_error } } })
+    }
+
+    /// A launched core on a private socket, already verified: it answers
+    /// `initialize` as this process, then every `health` with a fixed report,
+    /// or never answers `health` when `stall` is set.
+    #[cfg(unix)]
+    struct FakeCore {
+        _dir: PrivateDir,
+        client: RpcClient,
+        health_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[cfg(unix)]
+    impl FakeCore {
+        async fn start(label: &str, health: Value, stall: bool) -> Self {
+            use std::io::{BufRead, BufReader, Write};
+            let dir = PrivateDir::new(label);
+            let endpoint = dir.0.join("d.sock");
+            let listener =
+                std::os::unix::net::UnixListener::bind(&endpoint).expect("bind endpoint");
+            let pid = std::process::id();
+            let health_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let counted = std::sync::Arc::clone(&health_calls);
+            std::thread::spawn(move || {
+                let (stream, _) = listener.accept().expect("accept");
+                let mut write = stream.try_clone().expect("clone stream");
+                for line in BufReader::new(stream).lines() {
+                    let Ok(line) = line else { break };
+                    let request: Value = serde_json::from_str(&line).expect("json request");
+                    // Like the daemon's dispatcher, refuse null params.
+                    if request["params"].is_null() {
+                        let refusal = json!({
+                            "jsonrpc": "2.0",
+                            "id": request["id"],
+                            "error": {
+                                "code": -32600,
+                                "message": "Invalid request: params must be an object or array when present"
+                            }
+                        });
+                        if write.write_all(format!("{refusal}\n").as_bytes()).is_err() {
+                            break;
+                        }
+                        continue;
+                    }
+                    let result = if request["method"] == "initialize" {
+                        json!({
+                            "protocol_version": RPC_PROTOCOL_VERSION,
+                            "server_version": env!("CARGO_PKG_VERSION"),
+                            "server_pid": pid,
+                        })
+                    } else {
+                        counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        if stall {
+                            continue;
+                        }
+                        health.clone()
+                    };
+                    let answer = json!({ "jsonrpc": "2.0", "id": request["id"], "result": result });
+                    if write.write_all(format!("{answer}\n").as_bytes()).is_err() {
+                        break;
+                    }
+                }
+            });
+            let client = verify_core(&endpoint, Some(pid), true)
+                .await
+                .expect("a matching core on a private endpoint verifies");
+            Self {
+                _dir: dir,
+                client,
+                health_calls,
+            }
+        }
+
+        fn health_calls(&self) -> usize {
+            self.health_calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    /// Answer HTTP on loopback for a few seconds, every request with `status`
+    /// and `body`; returns the base URL.
+    #[cfg(unix)]
+    fn fake_http(status: u16, body: Option<Value>) -> String {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let url = format!("http://{}", listener.local_addr().expect("local address"));
+        listener
+            .set_nonblocking(true)
+            .expect("non-blocking listener");
+        let body = body.map(|body| body.to_string()).unwrap_or_default();
+        std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while Instant::now() < deadline {
+                let Ok((stream, _)) = listener.accept() else {
+                    std::thread::sleep(Duration::from_millis(10));
+                    continue;
+                };
+                let _ = stream.set_nonblocking(false);
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                while reader.read_line(&mut line).unwrap_or(0) > 0 && line != "\r\n" {
+                    line.clear();
+                }
+                let response = format!(
+                    "HTTP/1.1 {status} test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = reader.get_mut().write_all(response.as_bytes());
+            }
+        });
+        url
     }
 
     /// A directory only this account can write, as the endpoint check requires.
