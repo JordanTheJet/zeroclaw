@@ -8,6 +8,7 @@
 //! ownership comes only from the handle the launch returned.
 
 use crate::gateway_client::GatewayClient;
+use crate::possession::ProofFailure;
 use serde_json::Value;
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
@@ -23,6 +24,9 @@ pub const GATEWAY_READY_DEADLINE: Duration = Duration::from_secs(60);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// How often the gateway wait retries.
 const GATEWAY_POLL: Duration = Duration::from_secs(1);
+/// How many answers in a row without the core's proof mean another program
+/// holds the dashboard address, rather than a gateway changing generation.
+const PROOF_MISMATCHES_HELD: u32 = 3;
 
 /// Why the daemon the app launched cannot be used, as the splash shows it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -188,26 +192,23 @@ pub fn gateway_port_held(health: &Value) -> Option<String> {
 
 /// Wait, within `budget` overall, until the dashboard's gateway is ready.
 ///
-/// For the daemon this app launched, `core` is its verified RPC connection.
-/// The core must then report that its own gateway bound its port, and the
-/// dashboard address must answer as that same process. An HTTP answer alone
-/// proves nothing about who serves it: any program can hold the port, and a
-/// gateway that lost the port to one is reported as such. Without a core (an
-/// older kernel), a successful `/health` is all there is to go on.
+/// For the daemon this app launched, `core` is its verified RPC connection,
+/// and the dashboard address must prove it is that core's own gateway (see
+/// [`crate::possession`]). An HTTP answer alone proves nothing about who
+/// serves it: any program can hold the port and copy any body, and a gateway
+/// that lost the port to one is reported as such. Without a core (an older
+/// kernel), a successful `/health` is all there is to go on.
 pub async fn await_gateway(
     gateway_url: &str,
     core: Option<&RpcClient>,
     budget: Duration,
 ) -> Result<(), StartupFailure> {
     let client = GatewayClient::new(gateway_url, None);
-    let mut last_gateway_note = None;
+    let mut progress = GatewayProgress::default();
     let wait = async {
         loop {
             let ready = match core {
-                Some(core) => {
-                    launched_gateway_ready(&client, core, gateway_url, &mut last_gateway_note)
-                        .await?
-                }
+                Some(core) => launched_gateway_ready(core, gateway_url, &mut progress).await?,
                 None => client.get_health().await.unwrap_or(false),
             };
             if ready {
@@ -218,7 +219,8 @@ pub async fn await_gateway(
     };
     let outcome = tokio::time::timeout(budget, wait).await;
     outcome.unwrap_or_else(|_| {
-        let reported = last_gateway_note
+        let reported = progress
+            .note
             .map(|note| format!(" Its gateway: {note}."))
             .unwrap_or_default();
         Err(StartupFailure::Timeout(format!(
@@ -228,73 +230,101 @@ pub async fn await_gateway(
     })
 }
 
-/// One check of the launched daemon's gateway: `Ok(true)` once the core
-/// reports its gateway listener bound to exactly the dashboard's address and
-/// that address answers `/health`.
+/// What the gateway wait has seen so far.
+#[derive(Default)]
+struct GatewayProgress {
+    /// The latest reason the gateway was not ready, for the timeout message.
+    note: Option<String>,
+    /// Answers in a row on the dashboard address without the core's proof.
+    mismatches: u32,
+}
+
+/// One check of the launched daemon's gateway: `Ok(true)` once the dashboard
+/// address proves it is the core's own gateway.
 ///
-/// The bound address is the proof. It arrives over the verified RPC
-/// connection, from the core's own listener, and only after that listener
-/// bound; the supervisor pins the gateway to the dashboard's host. While the
-/// core holds that exact address no other program can listen on it, so the
-/// HTTP answer there is the core's. The process ID the address reports over
-/// HTTP is a diagnostic only: a different one refuses, but a matching one
-/// admits nothing, since any program can copy it.
+/// The proof is the readiness. It is checked against a challenge the core
+/// issues over the verified RPC connection, only while its gateway's
+/// listener accepts connections on exactly the dashboard's address, which
+/// the supervisor pins. A process ID the address reports over HTTP is a
+/// diagnostic only: it decides what the failure says, never whether the
+/// address is trusted.
 async fn launched_gateway_ready(
-    client: &GatewayClient,
     core: &RpcClient,
     gateway_url: &str,
-    last_gateway_note: &mut Option<String>,
+    progress: &mut GatewayProgress,
 ) -> Result<bool, StartupFailure> {
     // The daemon rejects `"params": null`; an empty object is the no-argument
     // form it accepts.
     let health = core
         .request(Method::Health, Value::Object(serde_json::Map::new()))
         .await
-        .map_err(|error| {
-            StartupFailure::CoreUnavailable(format!(
-                "The ZeroClaw core stopped answering while it started: {error}. Its log is in the ZeroClaw config directory under logs/zeroclaw-desktop-daemon.log."
-            ))
-        })?;
+        .map_err(|error| core_stopped(&error.to_string()))?;
     if let Some(error) = gateway_port_held(&health) {
         return Err(StartupFailure::PortHeld(format!(
             "Another program is using the dashboard's address {gateway_url}: {error}. Close it and reopen ZeroClaw."
         )));
     }
-    let gateway = &health["components"]["gateway"];
-    let Some(bound) = gateway["bound_addr"].as_str() else {
-        *last_gateway_note = gateway["last_error"]
-            .as_str()
-            .map(str::to_string)
-            .or_else(|| {
-                (gateway["status"].as_str() == Some("ok"))
-                    .then(|| "it is running but has not reported the address it bound".to_string())
-            });
-        return Ok(false);
-    };
     let dashboard = dashboard_addr(gateway_url).ok_or_else(|| {
         StartupFailure::Incompatible(format!(
             "The dashboard address {gateway_url} is not an IP address and port this app can check."
         ))
     })?;
-    if bound.parse::<SocketAddr>().ok() != Some(dashboard) {
+    // The core's own gateway, when it has one, reports where it is bound. On
+    // another address it cannot be the dashboard's, and whatever answers
+    // there is another program.
+    if let Some(bound) = health["components"]["gateway"]["bound_addr"].as_str()
+        && bound.parse::<SocketAddr>().ok() != Some(dashboard)
+    {
         return Err(StartupFailure::PortHeld(format!(
             "The ZeroClaw core's gateway is listening on {bound}, not on the dashboard's address {dashboard}. Another program may hold that address; close it and reopen ZeroClaw."
         )));
     }
-    let Some(report) = client.health_report().await else {
-        return Ok(false);
-    };
-    let core_pid = core.handshake().server_pid;
-    match report["runtime"]["pid"].as_u64() {
-        Some(pid) if pid != u64::from(core_pid) => Err(StartupFailure::PortHeld(format!(
-            "The dashboard's address {gateway_url} answers as process {pid}, not the ZeroClaw core this app started (process {core_pid}). Close the other program and reopen ZeroClaw."
+    match crate::possession::prove_gateway(core, dashboard).await {
+        Ok(_proven) => Ok(true),
+        Err(ProofFailure::CoreUnavailable(error)) => Err(core_stopped(&error)),
+        Err(ProofFailure::ElsewhereBound(bound)) => Err(StartupFailure::PortHeld(format!(
+            "The ZeroClaw core's gateway is listening on {bound}, not on the dashboard's address {dashboard}. Another program may hold that address; close it and reopen ZeroClaw."
         ))),
-        _ => Ok(true),
+        Err(ProofFailure::NotBound) => {
+            let gateway = &health["components"]["gateway"];
+            progress.mismatches = 0;
+            progress.note = gateway["last_error"]
+                .as_str()
+                .map(str::to_string)
+                .or_else(|| {
+                    (gateway["status"].as_str() == Some("ok")).then(|| {
+                        "it is running but has not reported the address it bound".to_string()
+                    })
+                });
+            Ok(false)
+        }
+        Err(failure @ ProofFailure::Unreachable(_)) => {
+            progress.mismatches = 0;
+            progress.note = Some(failure.to_string());
+            Ok(false)
+        }
+        Err(failure @ ProofFailure::Mismatch { .. }) => {
+            progress.mismatches += 1;
+            progress.note = Some(failure.to_string());
+            if progress.mismatches < PROOF_MISMATCHES_HELD {
+                return Ok(false);
+            }
+            let core_pid = core.handshake().server_pid;
+            Err(StartupFailure::PortHeld(format!(
+                "The dashboard's address {gateway_url} is not served by the ZeroClaw core this app started (process {core_pid}): {failure}. Close the other program and reopen ZeroClaw."
+            )))
+        }
     }
 }
 
+fn core_stopped(error: &str) -> StartupFailure {
+    StartupFailure::CoreUnavailable(format!(
+        "The ZeroClaw core stopped answering while it started: {error}. Its log is in the ZeroClaw config directory under logs/zeroclaw-desktop-daemon.log."
+    ))
+}
+
 /// The dashboard's socket address, from its URL: an IP literal and a port.
-fn dashboard_addr(gateway_url: &str) -> Option<SocketAddr> {
+pub fn dashboard_addr(gateway_url: &str) -> Option<SocketAddr> {
     let url = reqwest::Url::parse(gateway_url).ok()?;
     let host = url.host_str()?;
     let ip: IpAddr = host
@@ -481,22 +511,186 @@ mod tests {
         }
     }
 
+    /// The dashboard address proves it holds the key of the listener the core
+    /// vouches for: the gateway is ready.
     #[cfg(unix)]
     #[tokio::test]
-    async fn the_launched_gateway_is_ready_once_the_core_reports_the_dashboard_address_bound() {
-        let gateway = fake_http(
-            200,
-            Some(json!({ "runtime": { "pid": std::process::id() } })),
-        );
+    async fn the_launched_gateway_is_ready_once_the_dashboard_address_proves_it() {
+        let gateway = ProvingHttp::start(Some(FAKE_KEY));
         let core = FakeCore::start(
             "agree",
-            gateway_health("ok", None, Some(&bound_addr_of(&gateway))),
+            gateway_health("ok", None, Some(&bound_addr_of(&gateway.url))),
             false,
         )
         .await;
-        await_gateway(&gateway, Some(&core.client), SHORT)
+        await_gateway(&gateway.url, Some(&core.client), SHORT)
             .await
             .expect("the core's own gateway answers");
+    }
+
+    /// A separate process on the dashboard address reports the core's real
+    /// process ID, while the core vouches for a listener there (a snapshot of
+    /// its own, released since). The address cannot answer the challenge, so
+    /// it is refused: a process ID admits nothing.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_correct_pid_impostor_on_the_dashboard_address_fails_the_proof() {
+        let core_pid = std::process::id();
+        let mut impostor = CopiedPidServer::start(core_pid);
+        assert_ne!(impostor.pid(), core_pid, "the impostor is its own process");
+        let dashboard = format!("http://127.0.0.1:{}", impostor.port);
+        let core = FakeCore::start(
+            "impostor",
+            gateway_health("ok", None, Some(&bound_addr_of(&dashboard))),
+            false,
+        )
+        .await;
+        let outcome = await_gateway(&dashboard, Some(&core.client), SHORT).await;
+        impostor.stop();
+        match outcome {
+            Err(StartupFailure::PortHeld(message)) => {
+                assert!(
+                    message.contains("without the ZeroClaw core's proof"),
+                    "{message}"
+                );
+                assert!(message.contains(&core_pid.to_string()), "{message}");
+            }
+            other => panic!("a copied process ID must not pass the proof: {other:?}"),
+        }
+    }
+
+    /// A gateway in a separate process, with its own process ID, that holds
+    /// the key of the listener the core vouches for is ready: readiness
+    /// follows the listener's key, never the core's process ID.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_separate_gateway_process_holding_the_vouched_key_is_ready() {
+        let mut gateway = CopiedPidServer::start_with(4_000_000, None, Some(FAKE_KEY), None);
+        assert_ne!(gateway.pid(), std::process::id());
+        let dashboard = format!("http://127.0.0.1:{}", gateway.port);
+        let core = FakeCore::start(
+            "separate",
+            gateway_health("ok", None, Some(&bound_addr_of(&dashboard))),
+            false,
+        )
+        .await;
+        let outcome = await_gateway(&dashboard, Some(&core.client), SHORT).await;
+        gateway.stop();
+        outcome.expect("the vouched listener's key is the proof");
+    }
+
+    /// A credential goes out only on the connection that just proved it is
+    /// the core's gateway: the proof request and the credential share it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_credential_travels_on_the_connection_that_proved_itself() {
+        let gateway = ProvingHttp::start(Some(FAKE_KEY));
+        let core = FakeCore::start(
+            "carry",
+            gateway_health("ok", None, Some(&bound_addr_of(&gateway.url))),
+            false,
+        )
+        .await;
+        let (link, _dir) = core.into_link(&gateway.url);
+        let client = GatewayClient::new(&gateway.url, Some("zc_secret"))
+            .with_core(Some(std::sync::Arc::new(link)));
+        assert!(client.validate_token().await.unwrap());
+
+        let seen = gateway.seen();
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        assert!(seen[0].1.starts_with("get /health?challenge="), "{seen:?}");
+        assert!(seen[1].1.starts_with("get /api/status"), "{seen:?}");
+        assert!(
+            seen[1].1.contains("authorization: bearer zc_secret"),
+            "{seen:?}"
+        );
+        assert!(
+            !seen[0].1.contains("authorization"),
+            "the proof request carries no credential"
+        );
+        assert_eq!(
+            seen[0].0, seen[1].0,
+            "one connection for proof and credential"
+        );
+    }
+
+    /// The core's listener proved itself, then stopped, and another process
+    /// took its address while the core still names it (a challenge taken
+    /// before the release). The next credential is not sent: the new holder
+    /// cannot answer the proof, and it never sees the token.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_listener_replaced_after_its_proof_receives_no_credential() {
+        let gateway = ProvingHttp::start(Some(FAKE_KEY));
+        let port = gateway.port;
+        let core = FakeCore::start(
+            "moved",
+            gateway_health("ok", None, Some(&bound_addr_of(&gateway.url))),
+            false,
+        )
+        .await;
+        let url = gateway.url.clone();
+        let (link, dir) = core.into_link(&url);
+        let link = std::sync::Arc::new(link);
+        link.prove()
+            .await
+            .expect("the core's listener proves itself");
+
+        gateway.stop();
+        let log = dir.0.join("impostor.log");
+        let mut impostor =
+            CopiedPidServer::start_with(std::process::id(), Some(port), None, Some(&log));
+        assert_eq!(impostor.port, port, "the impostor took the address");
+        let client = GatewayClient::new(&url, Some("zc_secret")).with_core(Some(link));
+        let validated = client.validate_token().await.unwrap();
+        let status = client.get_status().await;
+        impostor.stop();
+
+        assert!(!validated, "an unproven address validates nothing");
+        let refused = status.expect_err("no credential without a proof");
+        assert!(
+            refused
+                .to_string()
+                .contains("refusing to send a credential"),
+            "{refused}"
+        );
+        let received = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(
+            received.contains("challenge="),
+            "the impostor was challenged"
+        );
+        assert!(!received.contains("authorization"), "{received}");
+        assert!(!received.contains("zc_secret"), "{received}");
+    }
+
+    /// The pairing code comes from the core over its socket, and the code goes
+    /// to the gateway only on a proven connection.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_pairing_code_comes_from_the_core_and_pairs_on_a_proven_connection() {
+        let gateway = ProvingHttp::start(Some(FAKE_KEY));
+        let core = FakeCore::start(
+            "pair",
+            gateway_health("ok", None, Some(&bound_addr_of(&gateway.url))),
+            false,
+        )
+        .await;
+        let (link, _dir) = core.into_link(&gateway.url);
+        let link = std::sync::Arc::new(link);
+        let code = link.new_pairing_code().await.expect("a code from the core");
+        assert_eq!(code, FAKE_PAIRING_CODE);
+        let token = GatewayClient::new(&gateway.url, None)
+            .with_core(Some(link))
+            .pair_with_code(&code)
+            .await
+            .expect("the code pairs");
+        assert_eq!(token, "zc_paired");
+
+        let seen = gateway.seen();
+        assert!(seen[0].1.starts_with("get /health?challenge="), "{seen:?}");
+        assert!(seen[1].1.starts_with("post /pair"), "{seen:?}");
+        assert!(seen[1].1.contains("x-pairing-code: 246810"), "{seen:?}");
+        assert_eq!(seen[0].0, seen[1].0);
     }
 
     /// The core's gateway is bound somewhere else (here IPv6 loopback on the
@@ -603,7 +797,17 @@ mod tests {
     }
 
     #[cfg(unix)]
-    const SHORT: Duration = Duration::from_secs(3);
+    const SHORT: Duration = Duration::from_secs(10);
+    /// The fake core's possession key, and the proof any holder of it gives.
+    #[cfg(unix)]
+    const FAKE_KEY: &str = "fake-gateway-key";
+    #[cfg(unix)]
+    const FAKE_PAIRING_CODE: &str = "246810";
+
+    #[cfg(unix)]
+    fn proof_of(key: &str, nonce: &str) -> String {
+        format!("proof:{key}:{nonce}")
+    }
     #[cfg(unix)]
     const PORT_HELD: &str = "Failed to bind 127.0.0.1:42617: Address already in use (os error 48)";
 
@@ -624,6 +828,12 @@ mod tests {
 
     #[cfg(unix)]
     const COPIED_PID_ENV: &str = "ZEROCLAW_DESKTOP_TEST_COPIED_PID";
+    #[cfg(unix)]
+    const HELPER_PORT_ENV: &str = "ZEROCLAW_DESKTOP_TEST_HELPER_PORT";
+    #[cfg(unix)]
+    const HELPER_KEY_ENV: &str = "ZEROCLAW_DESKTOP_TEST_HELPER_KEY";
+    #[cfg(unix)]
+    const HELPER_LOG_ENV: &str = "ZEROCLAW_DESKTOP_TEST_HELPER_LOG";
 
     /// A separate process serving `/health` on a loopback port and reporting
     /// whatever process ID it is given: the test binary itself, re-run as
@@ -637,22 +847,42 @@ mod tests {
     #[cfg(unix)]
     impl CopiedPidServer {
         fn start(reported_pid: u32) -> Self {
+            Self::start_with(reported_pid, None, None, None)
+        }
+
+        /// The helper process, on `port` when given, proving `key` when
+        /// given, and appending each request head it reads to `log`.
+        fn start_with(
+            reported_pid: u32,
+            port: Option<u16>,
+            key: Option<&str>,
+            log: Option<&Path>,
+        ) -> Self {
             use std::io::BufRead;
-            let mut child =
-                std::process::Command::new(std::env::current_exe().expect("test binary"))
-                    .args([
-                        "--exact",
-                        "readiness::tests::copied_pid_http_helper",
-                        "--ignored",
-                        "--nocapture",
-                        "--test-threads=1",
-                    ])
-                    .env(COPIED_PID_ENV, reported_pid.to_string())
-                    .stdin(std::process::Stdio::null())
-                    .stdout(std::process::Stdio::piped())
-                    .stderr(std::process::Stdio::null())
-                    .spawn()
-                    .expect("start the impostor process");
+            let mut command =
+                std::process::Command::new(std::env::current_exe().expect("test binary"));
+            command
+                .args([
+                    "--exact",
+                    "readiness::tests::copied_pid_http_helper",
+                    "--ignored",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(COPIED_PID_ENV, reported_pid.to_string())
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null());
+            if let Some(port) = port {
+                command.env(HELPER_PORT_ENV, port.to_string());
+            }
+            if let Some(key) = key {
+                command.env(HELPER_KEY_ENV, key);
+            }
+            if let Some(log) = log {
+                command.env(HELPER_LOG_ENV, log);
+            }
+            let mut child = command.spawn().expect("start the helper process");
             let stdout = child.stdout.take().expect("impostor stdout");
             let port = std::io::BufReader::new(stdout)
                 .lines()
@@ -683,7 +913,72 @@ mod tests {
         }
     }
 
-    /// The impostor process for `a_distinct_process_copying_the_core_pid_is_refused`.
+    /// The `challenge` query value in a request head, if any.
+    #[cfg(unix)]
+    fn challenge_of(head: &str) -> Option<String> {
+        let target = head.split_whitespace().nth(1)?;
+        let query = target.split_once('?')?.1;
+        query
+            .split('&')
+            .find_map(|pair| pair.strip_prefix("challenge="))
+            .map(str::to_string)
+    }
+
+    /// Drives the app's startup and credential handoff against a real kernel:
+    /// `ZEROCLAW_DESKTOP_E2E_ENDPOINT` and `_PID` from its `READY` frame,
+    /// `_URL` its dashboard address. Run by hand; prints what it saw.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "needs a real kernel started with --rpc-readiness"]
+    async fn real_kernel_possession_flow() {
+        let (Some(endpoint), Some(pid), Some(url)) = (
+            std::env::var_os("ZEROCLAW_DESKTOP_E2E_ENDPOINT"),
+            std::env::var("ZEROCLAW_DESKTOP_E2E_PID").ok(),
+            std::env::var("ZEROCLAW_DESKTOP_E2E_URL").ok(),
+        ) else {
+            return;
+        };
+        let endpoint = std::path::PathBuf::from(endpoint);
+        let started = Instant::now();
+        let core = verify_core(&endpoint, pid.parse().ok(), false)
+            .await
+            .expect("the real core verifies");
+        await_gateway(&url, Some(&core), Duration::from_secs(60))
+            .await
+            .expect("the real gateway proves itself");
+        println!("E2E ready in {:?}", started.elapsed());
+        let link = std::sync::Arc::new(crate::possession::CoreLink::new(
+            core,
+            endpoint,
+            false,
+            dashboard_addr(&url).unwrap(),
+        ));
+        let code = link.new_pairing_code().await.expect("a code over RPC");
+        println!("E2E pairing code over RPC: {} characters", code.len());
+        let token = GatewayClient::new(&url, None)
+            .with_core(Some(std::sync::Arc::clone(&link)))
+            .pair_with_code(&code)
+            .await
+            .expect("the code pairs on a proven connection");
+        let valid = GatewayClient::new(&url, Some(&token))
+            .with_core(Some(std::sync::Arc::clone(&link)))
+            .validate_token()
+            .await
+            .unwrap();
+        println!("E2E token issued and valid on a proven connection: {valid}");
+        assert!(valid);
+        let status = GatewayClient::new(&url, Some(&token))
+            .with_core(Some(link))
+            .get_status()
+            .await
+            .expect("status over a proven connection");
+        println!(
+            "E2E /api/status keys: {:?}",
+            status.as_object().map(|o| o.len())
+        );
+    }
+
+    /// The helper process for the tests that need a distinct HTTP process.
     #[cfg(unix)]
     #[test]
     #[ignore = "subprocess helper for a_distinct_process_copying_the_core_pid_is_refused"]
@@ -692,9 +987,21 @@ mod tests {
         let Some(pid) = std::env::var_os(COPIED_PID_ENV) else {
             return;
         };
-        let body = json!({ "status": "ok", "runtime": { "pid": pid.to_string_lossy().parse::<u32>().unwrap() } })
-            .to_string();
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let pid: u32 = pid.to_string_lossy().parse().unwrap();
+        let key = std::env::var(HELPER_KEY_ENV).ok();
+        let log = std::env::var_os(HELPER_LOG_ENV);
+        let port: u16 = std::env::var(HELPER_PORT_ENV)
+            .ok()
+            .map_or(0, |port| port.parse().unwrap());
+        // The address may still be closing in the process that held it.
+        let bind_deadline = Instant::now() + Duration::from_secs(5);
+        let listener = loop {
+            match std::net::TcpListener::bind(("127.0.0.1", port)) {
+                Ok(listener) => break listener,
+                Err(error) if Instant::now() > bind_deadline => panic!("bind loopback: {error}"),
+                Err(_) => std::thread::sleep(Duration::from_millis(10)),
+            }
+        };
         println!("PORT {}", listener.local_addr().unwrap().port());
         std::io::stdout().flush().unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -706,10 +1013,25 @@ mod tests {
             };
             let _ = stream.set_nonblocking(false);
             let mut reader = BufReader::new(stream);
+            let mut head = String::new();
             let mut line = String::new();
             while reader.read_line(&mut line).unwrap_or(0) > 0 && line != "\r\n" {
+                head.push_str(&line);
                 line.clear();
             }
+            if let Some(log) = &log {
+                let mut file = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(log)
+                    .unwrap();
+                let _ = file.write_all(head.to_ascii_lowercase().as_bytes());
+            }
+            let mut body = json!({ "status": "ok", "runtime": { "pid": pid } });
+            if let (Some(key), Some(nonce)) = (key.as_deref(), challenge_of(&head)) {
+                body["challenge_proof"] = json!(proof_of(key, &nonce));
+            }
+            let body = body.to_string();
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
@@ -724,7 +1046,8 @@ mod tests {
     /// or never answers `health` when `stall` is set.
     #[cfg(unix)]
     struct FakeCore {
-        _dir: PrivateDir,
+        dir: PrivateDir,
+        endpoint: std::path::PathBuf,
         client: RpcClient,
         health_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     }
@@ -740,6 +1063,7 @@ mod tests {
             let pid = std::process::id();
             let health_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let counted = std::sync::Arc::clone(&health_calls);
+            let next_nonce = std::sync::atomic::AtomicUsize::new(0);
             std::thread::spawn(move || {
                 let (stream, _) = listener.accept().expect("accept");
                 let mut write = stream.try_clone().expect("clone stream");
@@ -761,18 +1085,44 @@ mod tests {
                         }
                         continue;
                     }
-                    let result = if request["method"] == "initialize" {
-                        json!({
+                    let result = match request["method"].as_str() {
+                        Some("initialize") => json!({
                             "protocol_version": RPC_PROTOCOL_VERSION,
                             "server_version": env!("CARGO_PKG_VERSION"),
                             "server_pid": pid,
-                        })
-                    } else {
-                        counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        if stall {
-                            continue;
+                        }),
+                        Some("health") => {
+                            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            if stall {
+                                continue;
+                            }
+                            health.clone()
                         }
-                        health.clone()
+                        // Like the core: a challenge for the listener it
+                        // vouches for at the asked address, here the one its
+                        // health report names, proved with the fake key.
+                        Some("gateway/possession-challenge") => {
+                            let bound = health["components"]["gateway"]["bound_addr"].as_str();
+                            if bound.is_some() && request["params"]["addr"].as_str() == bound {
+                                let nonce = format!(
+                                    "nonce-{}",
+                                    next_nonce.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                                );
+                                json!({
+                                    "bound_addr": bound,
+                                    "proof": proof_of(FAKE_KEY, &nonce),
+                                    "nonce": nonce,
+                                })
+                            } else {
+                                json!({ "bound_addr": null })
+                            }
+                        }
+                        Some("pairing/new-code") => json!({
+                            "success": true,
+                            "pairing_required": true,
+                            "pairing_code": FAKE_PAIRING_CODE,
+                        }),
+                        _ => json!({}),
                     };
                     let answer = json!({ "jsonrpc": "2.0", "id": request["id"], "result": result });
                     if write.write_all(format!("{answer}\n").as_bytes()).is_err() {
@@ -784,14 +1134,138 @@ mod tests {
                 .await
                 .expect("a matching core on a private endpoint verifies");
             Self {
-                _dir: dir,
+                dir,
+                endpoint,
                 client,
                 health_calls,
             }
         }
 
+        /// The app's link to this core, as kept after a ready startup.
+        fn into_link(self, dashboard: &str) -> (crate::possession::CoreLink, PrivateDir) {
+            let dashboard = dashboard_addr(dashboard).expect("an IP dashboard address");
+            (
+                crate::possession::CoreLink::new(self.client, self.endpoint, true, dashboard),
+                self.dir,
+            )
+        }
+
         fn health_calls(&self) -> usize {
             self.health_calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    /// A gateway fake that keeps connections open: `/health?challenge=N`
+    /// answers with the proof under `key` (none without one), `/pair` with a
+    /// token, anything else `{}`. It records each request head, lower-cased,
+    /// with the number of the connection it arrived on.
+    #[cfg(unix)]
+    struct ProvingHttp {
+        url: String,
+        port: u16,
+        seen: std::sync::Arc<std::sync::Mutex<Vec<(usize, String)>>>,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        accept: Option<std::thread::JoinHandle<()>>,
+    }
+
+    #[cfg(unix)]
+    impl ProvingHttp {
+        fn start(key: Option<&'static str>) -> Self {
+            use std::io::{BufRead, BufReader, Read, Write};
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+            let port = listener.local_addr().expect("local address").port();
+            listener
+                .set_nonblocking(true)
+                .expect("non-blocking listener");
+            let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let accept = {
+                let seen = std::sync::Arc::clone(&seen);
+                let stop = std::sync::Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    let mut connection = 0;
+                    while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                        let Ok((stream, _)) = listener.accept() else {
+                            std::thread::sleep(Duration::from_millis(5));
+                            continue;
+                        };
+                        connection += 1;
+                        let id = connection;
+                        let seen = std::sync::Arc::clone(&seen);
+                        std::thread::spawn(move || {
+                            let _ = stream.set_nonblocking(false);
+                            let mut reader = BufReader::new(stream);
+                            loop {
+                                let mut head = String::new();
+                                let mut line = String::new();
+                                let mut length = 0usize;
+                                while reader.read_line(&mut line).unwrap_or(0) > 0 && line != "\r\n"
+                                {
+                                    let lower = line.to_ascii_lowercase();
+                                    if let Some(value) = lower.strip_prefix("content-length:") {
+                                        length = value.trim().parse().unwrap_or(0);
+                                    }
+                                    head.push_str(&lower);
+                                    line.clear();
+                                }
+                                if head.is_empty() {
+                                    return;
+                                }
+                                let mut body = vec![0; length];
+                                if reader.read_exact(&mut body).is_err() {
+                                    return;
+                                }
+                                let answer = if head.starts_with("get /health") {
+                                    let mut report = json!({ "status": "ok" });
+                                    if let (Some(key), Some(nonce)) = (key, challenge_of(&head)) {
+                                        report["challenge_proof"] = json!(proof_of(key, &nonce));
+                                    }
+                                    report
+                                } else if head.starts_with("post /pair") {
+                                    json!({ "token": "zc_paired" })
+                                } else {
+                                    json!({})
+                                };
+                                seen.lock().unwrap().push((id, head));
+                                let answer = answer.to_string();
+                                let response = format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{answer}",
+                                    answer.len()
+                                );
+                                if reader.get_mut().write_all(response.as_bytes()).is_err() {
+                                    return;
+                                }
+                            }
+                        });
+                    }
+                })
+            };
+            Self {
+                url: format!("http://127.0.0.1:{port}"),
+                port,
+                seen,
+                stop,
+                accept: Some(accept),
+            }
+        }
+
+        fn seen(&self) -> Vec<(usize, String)> {
+            self.seen.lock().unwrap().clone()
+        }
+
+        /// Close the listening socket: its address is free once this returns.
+        fn stop(mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            if let Some(accept) = self.accept.take() {
+                let _ = accept.join();
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for ProvingHttp {
+        fn drop(&mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
         }
     }
 

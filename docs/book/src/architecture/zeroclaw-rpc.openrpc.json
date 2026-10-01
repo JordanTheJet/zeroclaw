@@ -7417,6 +7417,90 @@
         "description": "Free-form JSON object shaped by the daemon at runtime; keys are not enumerable here.",
         "shape": "untyped"
       }
+    },
+    {
+      "name": "gateway/possession-challenge",
+      "paramStructure": "by-name",
+      "params": [],
+      "result": {
+        "name": "result",
+        "schema": {
+          "description": "Free-form JSON shaped by the daemon at runtime."
+        },
+        "x-zeroclaw-shape": "untyped"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "system",
+        "verb": "read"
+      },
+      "x-zeroclaw-params": {
+        "description": "Free-form JSON object shaped by the daemon at runtime; keys are not enumerable here.",
+        "shape": "untyped"
+      }
+    },
+    {
+      "name": "gateway/register-listener",
+      "paramStructure": "by-name",
+      "params": [],
+      "result": {
+        "name": "result",
+        "schema": {
+          "description": "Free-form JSON shaped by the daemon at runtime."
+        },
+        "x-zeroclaw-shape": "untyped"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "system",
+        "verb": "create"
+      },
+      "x-zeroclaw-params": {
+        "description": "Free-form JSON object shaped by the daemon at runtime; keys are not enumerable here.",
+        "shape": "untyped"
+      }
+    },
+    {
+      "name": "gateway/release-listener",
+      "paramStructure": "by-name",
+      "params": [],
+      "result": {
+        "name": "result",
+        "schema": {
+          "description": "Free-form JSON shaped by the daemon at runtime."
+        },
+        "x-zeroclaw-shape": "untyped"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "system",
+        "verb": "delete"
+      },
+      "x-zeroclaw-params": {
+        "description": "Free-form JSON object shaped by the daemon at runtime; keys are not enumerable here.",
+        "shape": "untyped"
+      }
+    },
+    {
+      "name": "pairing/new-code",
+      "paramStructure": "by-name",
+      "params": [],
+      "result": {
+        "name": "result",
+        "schema": {
+          "description": "Free-form JSON shaped by the daemon at runtime."
+        },
+        "x-zeroclaw-shape": "untyped"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "system",
+        "verb": "create"
+      },
+      "x-zeroclaw-params": {
+        "description": "Free-form JSON object shaped by the daemon at runtime; keys are not enumerable here.",
+        "shape": "untyped"
+      }
     }
   ],
   "openrpc": "1.3.2",

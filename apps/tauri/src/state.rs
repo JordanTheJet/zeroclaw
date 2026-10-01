@@ -57,6 +57,10 @@ pub struct AppState {
     pub connected: bool,
     pub agent_status: AgentStatus,
     pub startup: Startup,
+    /// The daemon this app launched, verified over RPC. While it is set,
+    /// every credential sent to the dashboard address travels on a
+    /// connection that first proved it is this core's own gateway.
+    pub core: Option<Arc<crate::possession::CoreLink>>,
 }
 
 impl Default for AppState {
@@ -67,6 +71,7 @@ impl Default for AppState {
             connected: false,
             agent_status: AgentStatus::Idle,
             startup: Startup::default(),
+            core: None,
         }
     }
 }

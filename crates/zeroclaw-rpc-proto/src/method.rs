@@ -145,6 +145,10 @@ pub enum Method {
     SopsGraphDraft,
     SopsTriggerSources,
     ToolsParamOptions,
+    GatewayPossessionChallenge,
+    GatewayRegisterListener,
+    GatewayReleaseListener,
+    PairingNewCode,
 }
 
 impl Method {
@@ -264,6 +268,13 @@ impl Method {
         (Method::SopsGraphDraft, "sops/graph-draft"),
         (Method::SopsTriggerSources, "sops/trigger-sources"),
         (Method::ToolsParamOptions, "tools/param-options"),
+        (
+            Method::GatewayPossessionChallenge,
+            "gateway/possession-challenge",
+        ),
+        (Method::GatewayRegisterListener, "gateway/register-listener"),
+        (Method::GatewayReleaseListener, "gateway/release-listener"),
+        (Method::PairingNewCode, "pairing/new-code"),
     ];
 
     /// Resolve a wire method name to a variant. Table scan, no hand-written
@@ -457,6 +468,10 @@ impl Method {
             M::SopsGraphDraft => (Untyped, Typed("SopGraph")),
             M::SopsTriggerSources => (None, Typed("TriggerSourceRegistry")),
             M::ToolsParamOptions => (Untyped, Untyped),
+            M::GatewayPossessionChallenge => (Untyped, Untyped),
+            M::GatewayRegisterListener => (Untyped, Untyped),
+            M::GatewayReleaseListener => (Untyped, Untyped),
+            M::PairingNewCode => (Untyped, Untyped),
         };
         MethodContract { params, result }
     }

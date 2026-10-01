@@ -104,8 +104,10 @@ impl MethodAuthzExt for Method {
             // like initialize.
             M::CertRenew => return MethodAuthz::Handshake,
 
-            M::Status | M::Health => (Resource::System, Verb::Read),
+            M::Status | M::Health | M::GatewayPossessionChallenge => (Resource::System, Verb::Read),
             M::DoctorRun => (Resource::System, Verb::Execute),
+            M::PairingNewCode | M::GatewayRegisterListener => (Resource::System, Verb::Create),
+            M::GatewayReleaseListener => (Resource::System, Verb::Delete),
 
             M::SessionNew => (Resource::Sessions, Verb::Create),
             M::SessionPrompt => (Resource::Sessions, Verb::Execute),
@@ -667,6 +669,10 @@ pub struct RpcDispatcher {
     /// on its ledger status (a revoked cert cannot self-renew, A5) and authz still
     /// resolves from the registry.
     peer_cert_fingerprint: Option<String>,
+    /// Alive exactly as long as this dispatcher, which is this connection:
+    /// a gateway listener this connection registers is known to the core
+    /// only while it lives.
+    connection_token: Arc<()>,
 }
 
 /// Read an allowlisted personality file through a handle on `workspace`, with
@@ -760,6 +766,7 @@ impl RpcDispatcher {
             uploads: std::sync::Mutex::default(),
             initialize_deadline: None,
             peer_cert_fingerprint: None,
+            connection_token: Arc::new(()),
         }
     }
 
@@ -2261,6 +2268,10 @@ impl RpcDispatcher {
             // Prompt handles do not read frames.
             initialize_deadline: None,
             peer_cert_fingerprint: self.peer_cert_fingerprint.clone(),
+            // Not the connection's token: a prompt task may outlive the
+            // connection briefly, and a listener the connection registered
+            // must not outlive it. Prompt handles register nothing.
+            connection_token: Arc::new(()),
         }
     }
 
@@ -2840,6 +2851,16 @@ impl RpcDispatcher {
             Method::SopsGraphDraft => self.handle_sops_graph_draft(&req.params),
             Method::SopsTriggerSources => self.handle_sops_trigger_sources(),
             Method::ToolsParamOptions => self.handle_tools_param_options(&req.params),
+            Method::GatewayPossessionChallenge => {
+                self.handle_gateway_possession_challenge(&req.params)
+            }
+            Method::GatewayRegisterListener => {
+                self.handle_gateway_register_listener(method, &req.params)
+            }
+            Method::GatewayReleaseListener => {
+                self.handle_gateway_release_listener(method, &req.params)
+            }
+            Method::PairingNewCode => self.handle_pairing_new_code(method, &req.params),
         };
 
         if is_notification {
@@ -3242,6 +3263,184 @@ impl RpcDispatcher {
             }
         }
         Ok(val)
+    }
+
+    /// `gateway/possession-challenge {addr?}`: a fresh nonce, and the proof
+    /// the gateway listener the core knows at `addr` answers it with on
+    /// `/health?challenge=<nonce>`. That listener is the daemon's own gateway
+    /// while it accepts connections there, or a gateway in another process
+    /// that registered itself for `addr` (`gateway/register-listener`) over
+    /// a connection that is still open. Without `addr`, the daemon's own
+    /// gateway, wherever it is bound.
+    ///
+    /// Only that listener holds the key the proof is made with, so a client
+    /// that compares it with the HTTP answer on the address it dials knows
+    /// the answer comes from that listener, whatever process ID or body
+    /// another program could copy. The nonce is chosen here, never by the
+    /// caller. `bound_addr` is `null`, with no nonce, while no such listener
+    /// accepts connections.
+    fn handle_gateway_possession_challenge(&self, params: &Value) -> RpcResult {
+        #[derive(serde::Deserialize)]
+        struct ChallengeParams {
+            #[serde(default)]
+            addr: Option<String>,
+        }
+        let req: ChallengeParams = if params.is_null() {
+            ChallengeParams { addr: None }
+        } else {
+            parse_params(params)?
+        };
+        let own = self
+            .ctx
+            .gateway_binding
+            .as_ref()
+            .and_then(crate::rpc::context::GatewayBinding::bound);
+        let bound = match req.addr.as_deref() {
+            None => own,
+            Some(addr) => {
+                let addr: std::net::SocketAddr = addr.parse().map_err(|_| {
+                    rpc_err(
+                        INVALID_PARAMS,
+                        format!("{addr:?} is not an IP address and port"),
+                    )
+                })?;
+                // The daemon's own listener first: it holds the address while
+                // it is published, so nothing else can be serving it then.
+                own.filter(|own| own.addr == addr)
+                    .or_else(|| self.ctx.external_gateways.bound_at(addr))
+            }
+        };
+        let Some(bound) = bound else {
+            return Ok(serde_json::json!({ "bound_addr": null }));
+        };
+        let nonce = crate::daemon::possession::new_nonce();
+        Ok(serde_json::json!({
+            "bound_addr": bound.addr.to_string(),
+            "nonce": nonce,
+            "proof": bound.possession.proof(&nonce),
+        }))
+    }
+
+    /// Refuse a gateway-listener or pairing operation to anyone but an
+    /// administrator on the local socket.
+    fn require_local_admin(&self, method: Method) -> Result<(), JsonRpcError> {
+        let refusal = if self.transport_kind != crate::rpc::transport::TransportKind::Local {
+            Some(format!(
+                "{} is served only over the local socket",
+                method.wire_name()
+            ))
+        } else if !self.stamped_grants().is_some_and(|grants| grants.admin) {
+            Some(format!("{} requires an administrator", method.wire_name()))
+        } else {
+            None
+        };
+        match refusal {
+            Some(message) => {
+                let denied = crate::rpc::auth::AuthDenied::forbidden(message);
+                self.audit_auth_denial(method, &denied);
+                Err(rpc_err(denied.code, denied.message))
+            }
+            None => Ok(()),
+        }
+    }
+
+    /// `gateway/register-listener {addr, possession}`: a gateway in another
+    /// process (a separate `zeroclaw-gw`) tells the core the address its
+    /// listener bound and the key, as hex, it answers possession challenges
+    /// with. Returns `{registration_id}`. The registration lasts only as long
+    /// as this connection; the gateway ends it earlier with
+    /// `gateway/release-listener` at its shutdown signal, before it closes
+    /// the listener.
+    ///
+    /// Administrators on the local socket only: the registration makes
+    /// `gateway/possession-challenge` vouch for that listener, so whoever
+    /// registers is trusted with every credential sent to the address.
+    fn handle_gateway_register_listener(&self, method: Method, params: &Value) -> RpcResult {
+        #[derive(serde::Deserialize)]
+        struct RegisterParams {
+            addr: String,
+            possession: String,
+        }
+        self.require_local_admin(method)?;
+        let req: RegisterParams = parse_params(params)?;
+        let addr: std::net::SocketAddr = req.addr.parse().map_err(|_| {
+            rpc_err(
+                INVALID_PARAMS,
+                format!("{:?} is not an IP address and port", req.addr),
+            )
+        })?;
+        let possession = crate::daemon::GatewayPossession::from_hex(&req.possession)
+            .ok_or_else(|| rpc_err(INVALID_PARAMS, "possession must be 32 bytes of hex"))?;
+        let registration_id = self.ctx.external_gateways.register(
+            crate::rpc::context::BoundGateway { addr, possession },
+            &self.connection_token,
+        );
+        Ok(serde_json::json!({ "registration_id": registration_id }))
+    }
+
+    /// `gateway/release-listener {registration_id}`: the registering gateway
+    /// stops accepting connections; the core stops vouching for its address.
+    /// Only the connection that registered it can release it. Returns
+    /// `{released}`.
+    fn handle_gateway_release_listener(&self, method: Method, params: &Value) -> RpcResult {
+        #[derive(serde::Deserialize)]
+        struct ReleaseParams {
+            registration_id: u64,
+        }
+        self.require_local_admin(method)?;
+        let req: ReleaseParams = parse_params(params)?;
+        let released = self
+            .ctx
+            .external_gateways
+            .release(req.registration_id, &self.connection_token);
+        Ok(serde_json::json!({ "released": released }))
+    }
+
+    /// `pairing/new-code`: issue a one-time pairing code, which the dashboard
+    /// redeems for its bearer at `POST /pair`. The body is the one the
+    /// gateway's `/admin/paircode/new` answers.
+    ///
+    /// Administrators only, and only over the local socket: a pairing code
+    /// yields a bearer credential for the dashboard. The local socket's
+    /// owner is checked by the kernel, so the code reaches its caller without
+    /// crossing the gateway's HTTP port, and no admin token is presented
+    /// anywhere. Rotating credentials (`rotate`) is not served here.
+    fn handle_pairing_new_code(&self, method: Method, params: &Value) -> RpcResult {
+        #[derive(serde::Deserialize)]
+        struct PairingNewCodeParams {
+            #[serde(default)]
+            rotate: Option<String>,
+        }
+        self.require_local_admin(method)?;
+        let req: PairingNewCodeParams = parse_params(params)?;
+        if req
+            .rotate
+            .as_deref()
+            .is_some_and(|rotate| !rotate.trim().is_empty())
+        {
+            return Err(rpc_err(
+                INVALID_PARAMS,
+                "rotate is not served over RPC; use the gateway's admin pairing route",
+            ));
+        }
+        let policy = self.ctx.config.read().gateway.pairing_code;
+        let Some(code) = self.ctx.auth.pairing().generate_new_pairing_code(policy) else {
+            return Err(rpc_err(
+                INVALID_PARAMS,
+                "Pairing is disabled for this gateway",
+            ));
+        };
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            "new pairing code issued over the local RPC socket"
+        );
+        Ok(serde_json::json!({
+            "success": true,
+            "pairing_required": true,
+            "pairing_code": code,
+            "message": "New pairing code generated — use this one-time code to pair",
+        }))
     }
 
     async fn handle_doctor_run(&self) -> RpcResult {
@@ -25040,7 +25239,9 @@ mod tests {
         let mut ctx = Arc::try_unwrap(RpcContext::minimal(config, sessions))
             .ok()
             .expect("minimal test context should be uniquely owned");
-        let bound = Arc::new(std::sync::Mutex::new(None::<std::net::SocketAddr>));
+        let bound = Arc::new(std::sync::Mutex::new(
+            None::<crate::rpc::context::BoundGateway>,
+        ));
         let reported = Arc::clone(&bound);
         ctx.gateway_binding = Some(crate::rpc::context::GatewayBinding::new(move || {
             *reported.lock().unwrap()
@@ -25054,12 +25255,220 @@ mod tests {
             "{before}"
         );
 
-        *bound.lock().unwrap() = Some("127.0.0.1:42617".parse().unwrap());
+        *bound.lock().unwrap() = Some(crate::rpc::context::BoundGateway {
+            addr: "127.0.0.1:42617".parse().unwrap(),
+            possession: crate::daemon::GatewayPossession::generate(),
+        });
         let after = dispatcher.handle_health().expect("health result");
         assert_eq!(
             after["components"]["gateway"]["bound_addr"],
             "127.0.0.1:42617"
         );
+    }
+
+    fn possession_test_context(
+        configure: impl FnOnce(&mut zeroclaw_config::schema::Config),
+    ) -> (RpcContext, tempfile::TempDir) {
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = zeroclaw_config::schema::Config {
+            config_path: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("data"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        configure(&mut config);
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let ctx = Arc::try_unwrap(RpcContext::minimal(config, sessions))
+            .ok()
+            .expect("minimal test context should be uniquely owned");
+        (ctx, tmp)
+    }
+
+    fn local_admin(ctx: &Arc<RpcContext>) -> RpcDispatcher {
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let mut dispatcher = RpcDispatcher::new(Arc::clone(ctx), tx, "local:test".into());
+        dispatcher.set_authenticated_for_test();
+        dispatcher
+    }
+
+    /// The challenge carries a fresh nonce and the proof the daemon's own
+    /// listener answers it with, only while that listener is published, and
+    /// only for the address it holds.
+    #[tokio::test]
+    async fn the_possession_challenge_proves_with_the_published_listener_only() {
+        let (mut ctx, _tmp) = possession_test_context(|_| {});
+        let bound = Arc::new(std::sync::Mutex::new(
+            None::<crate::rpc::context::BoundGateway>,
+        ));
+        let reported = Arc::clone(&bound);
+        ctx.gateway_binding = Some(crate::rpc::context::GatewayBinding::new(move || {
+            *reported.lock().unwrap()
+        }));
+        let ctx = Arc::new(ctx);
+        let dispatcher = local_admin(&ctx);
+        let challenge = |params: Value| dispatcher.handle_gateway_possession_challenge(&params);
+
+        let unbound = challenge(json!({ "addr": "127.0.0.1:42617" })).unwrap();
+        assert_eq!(unbound, json!({ "bound_addr": null }));
+
+        let possession = crate::daemon::GatewayPossession::generate();
+        *bound.lock().unwrap() = Some(crate::rpc::context::BoundGateway {
+            addr: "127.0.0.1:42617".parse().unwrap(),
+            possession,
+        });
+        let first = challenge(json!({ "addr": "127.0.0.1:42617" })).unwrap();
+        let second = challenge(json!({})).unwrap();
+        for issued in [&first, &second] {
+            assert_eq!(issued["bound_addr"], "127.0.0.1:42617");
+            let nonce = issued["nonce"].as_str().expect("a nonce");
+            assert_eq!(issued["proof"], possession.proof(nonce).as_str());
+        }
+        assert_ne!(first["nonce"], second["nonce"], "every challenge is fresh");
+
+        let elsewhere = challenge(json!({ "addr": "[::1]:42617" })).unwrap();
+        assert_eq!(elsewhere, json!({ "bound_addr": null }));
+        let malformed = challenge(json!({ "addr": "localhost" })).unwrap_err();
+        assert_eq!(malformed.code, INVALID_PARAMS);
+
+        *bound.lock().unwrap() = None;
+        let released = challenge(json!({ "addr": "127.0.0.1:42617" })).unwrap();
+        assert_eq!(released, json!({ "bound_addr": null }));
+    }
+
+    /// A gateway in another process registers its listener over its own
+    /// local administrator connection. The core vouches for it, by its key
+    /// and not by any process ID, until it releases it or its connection
+    /// closes; nobody else can release it.
+    #[tokio::test]
+    async fn a_registered_external_listener_is_vouched_for_only_while_registered() {
+        let (ctx, _tmp) = possession_test_context(|_| {});
+        let ctx = Arc::new(ctx);
+        let gateway = local_admin(&ctx);
+        let desktop = local_admin(&ctx);
+        let key = crate::daemon::GatewayPossession::generate();
+        let register = json!({ "addr": "127.0.0.1:42617", "possession": key.to_hex() });
+        let challenge = || {
+            desktop
+                .handle_gateway_possession_challenge(&json!({ "addr": "127.0.0.1:42617" }))
+                .unwrap()
+        };
+
+        let registered = gateway
+            .handle_gateway_register_listener(Method::GatewayRegisterListener, &register)
+            .unwrap();
+        let id = registered["registration_id"].as_u64().expect("an id");
+        let issued = challenge();
+        assert_eq!(issued["bound_addr"], "127.0.0.1:42617");
+        assert_eq!(
+            issued["proof"],
+            key.proof(issued["nonce"].as_str().unwrap()).as_str()
+        );
+
+        let foreign = desktop
+            .handle_gateway_release_listener(
+                Method::GatewayReleaseListener,
+                &json!({ "registration_id": id }),
+            )
+            .unwrap();
+        assert_eq!(foreign, json!({ "released": false }));
+        assert_eq!(challenge()["bound_addr"], "127.0.0.1:42617");
+
+        let own = gateway
+            .handle_gateway_release_listener(
+                Method::GatewayReleaseListener,
+                &json!({ "registration_id": id }),
+            )
+            .unwrap();
+        assert_eq!(own, json!({ "released": true }));
+        assert_eq!(challenge(), json!({ "bound_addr": null }));
+
+        gateway
+            .handle_gateway_register_listener(Method::GatewayRegisterListener, &register)
+            .unwrap();
+        assert_eq!(challenge()["bound_addr"], "127.0.0.1:42617");
+        drop(gateway);
+        assert_eq!(
+            challenge(),
+            json!({ "bound_addr": null }),
+            "a registration ends with the connection that made it"
+        );
+    }
+
+    /// Registering a listener and minting a pairing code each decide who a
+    /// credential reaches: only an administrator on the local socket may.
+    #[tokio::test]
+    async fn only_a_local_administrator_registers_listeners_or_mints_pairing_codes() {
+        let (ctx, _tmp) = possession_test_context(|config| {
+            config.gateway.require_pairing = true;
+        });
+        let ctx = Arc::new(ctx);
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let mut remote = RpcDispatcher::new(Arc::clone(&ctx), tx, "wss:test".into())
+            .with_transport(
+                crate::rpc::transport::TransportKind::Wss,
+                crate::security::auth_provider::Credential::None,
+            );
+        remote.set_authenticated_for_test();
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let unauthenticated = RpcDispatcher::new(Arc::clone(&ctx), tx, "local:test".into());
+        let register = json!({
+            "addr": "127.0.0.1:42617",
+            "possession": crate::daemon::GatewayPossession::generate().to_hex(),
+        });
+        for dispatcher in [&remote, &unauthenticated] {
+            let error = dispatcher
+                .handle_gateway_register_listener(Method::GatewayRegisterListener, &register)
+                .unwrap_err();
+            assert_eq!(error.code, FORBIDDEN, "{}", error.message);
+            let error = dispatcher
+                .handle_pairing_new_code(Method::PairingNewCode, &json!({}))
+                .unwrap_err();
+            assert_eq!(error.code, FORBIDDEN, "{}", error.message);
+        }
+        let bad_key = local_admin(&ctx)
+            .handle_gateway_register_listener(
+                Method::GatewayRegisterListener,
+                &json!({ "addr": "127.0.0.1:42617", "possession": "abcd" }),
+            )
+            .unwrap_err();
+        assert_eq!(bad_key.code, INVALID_PARAMS);
+    }
+
+    /// A code minted over the local socket is one the gateway's `/pair`
+    /// accepts: the core and its gateway share one pairing authority.
+    #[tokio::test]
+    async fn a_pairing_code_from_the_local_socket_pairs_at_the_gateway() {
+        let (ctx, _tmp) = possession_test_context(|config| {
+            config.gateway.require_pairing = true;
+        });
+        let ctx = Arc::new(ctx);
+        let issued = local_admin(&ctx)
+            .handle_pairing_new_code(Method::PairingNewCode, &json!({}))
+            .unwrap();
+        assert_eq!(issued["success"], true);
+        let code = issued["pairing_code"].as_str().expect("a code");
+        let token = ctx
+            .auth
+            .pairing()
+            .try_pair(code, "desktop-test")
+            .await
+            .expect("not locked out")
+            .expect("the code pairs");
+        assert!(ctx.auth.pairing().is_authenticated(&token));
+
+        let rotate = local_admin(&ctx)
+            .handle_pairing_new_code(Method::PairingNewCode, &json!({ "rotate": "all" }))
+            .unwrap_err();
+        assert_eq!(rotate.code, INVALID_PARAMS);
+
+        let (open_ctx, _open_tmp) = possession_test_context(|config| {
+            config.gateway.require_pairing = false;
+        });
+        let disabled = local_admin(&Arc::new(open_ctx))
+            .handle_pairing_new_code(Method::PairingNewCode, &json!({}))
+            .unwrap_err();
+        assert_eq!(disabled.code, INVALID_PARAMS);
     }
 
     #[tokio::test]
@@ -34608,6 +35017,7 @@ mod tests {
             reload_tx: None,
             gateway_shutdown_tx: None,
             gateway_binding: None,
+            external_gateways: Arc::default(),
             approval_pending: Arc::new(crate::rpc::context::ApprovalPendingMap::default()),
             tui_registry: Arc::new(crate::rpc::tui_identity::TuiRegistry::new_unsigned()),
             acp_session_store: None,
@@ -34660,6 +35070,7 @@ mod tests {
             reload_tx: None,
             gateway_shutdown_tx: None,
             gateway_binding: None,
+            external_gateways: Arc::default(),
             approval_pending: Arc::new(crate::rpc::context::ApprovalPendingMap::default()),
             tui_registry: Arc::new(crate::rpc::tui_identity::TuiRegistry::new_unsigned()),
             acp_session_store: None,
@@ -34771,6 +35182,7 @@ mod tests {
             reload_tx: None,
             gateway_shutdown_tx: None,
             gateway_binding: None,
+            external_gateways: Arc::default(),
             approval_pending: Arc::new(crate::rpc::context::ApprovalPendingMap::default()),
             tui_registry: Arc::new(crate::rpc::tui_identity::TuiRegistry::new_unsigned()),
             acp_session_store: None,

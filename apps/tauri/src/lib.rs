@@ -6,6 +6,7 @@ pub mod daemon;
 pub mod gateway_client;
 pub mod health;
 pub mod macos;
+pub mod possession;
 pub mod readiness;
 pub mod state;
 pub mod tray;
@@ -87,29 +88,44 @@ async fn ensure_daemon(app: tauri::AppHandle, state: state::SharedState) {
                     publish_startup(&app, &state, failed).await;
                 }
                 Ok(mut launched) => {
-                    let outcome = match &launched.readiness {
+                    let (outcome, core) = match &launched.readiness {
                         daemon::Readiness::Rpc { endpoint, pid } => {
                             match readiness::verify_core(endpoint, *pid, bundled).await {
                                 Ok(core) => {
-                                    readiness::await_gateway(
+                                    let outcome = readiness::await_gateway(
                                         &url,
                                         Some(&core),
                                         readiness::GATEWAY_READY_DEADLINE,
                                     )
-                                    .await
+                                    .await;
+                                    // Kept for the proofs every credential
+                                    // handoff to the dashboard address makes.
+                                    let link = readiness::dashboard_addr(&url).map(|dashboard| {
+                                        std::sync::Arc::new(possession::CoreLink::new(
+                                            core,
+                                            endpoint.clone(),
+                                            bundled,
+                                            dashboard,
+                                        ))
+                                    });
+                                    (outcome, link)
                                 }
-                                Err(failure) => Err(failure),
+                                Err(failure) => (Err(failure), None),
                             }
                         }
                         // An older kernel reports readiness at daemon start;
                         // only the gateway's health can say more.
-                        daemon::Readiness::Spawned => {
+                        daemon::Readiness::Spawned => (
                             readiness::await_gateway(&url, None, readiness::GATEWAY_READY_DEADLINE)
-                                .await
-                        }
+                                .await,
+                            None,
+                        ),
                     };
                     match outcome {
-                        Ok(()) => publish_startup(&app, &state, Startup::Ready).await,
+                        Ok(()) => {
+                            state.write().await.core = core;
+                            publish_startup(&app, &state, Startup::Ready).await;
+                        }
                         Err(failure) => {
                             publish_startup(
                                 &app,
@@ -142,16 +158,22 @@ async fn ensure_daemon(app: tauri::AppHandle, state: state::SharedState) {
 }
 
 /// Attempt to auto-pair with the gateway so the WebView has a valid token
-/// before the React frontend mounts. The code is minted through the kernel
-/// CLI, which presents the gateway's owner-only admin token; see
-/// [`daemon::mint_pairing_code`].
+/// before the React frontend mounts.
+///
+/// For the daemon this app launched, the code comes from the core over its
+/// verified RPC socket, so no admin token is presented and nothing secret
+/// crosses the dashboard's port to get it; the code and the stored token
+/// then travel only on connections that proved they are the core's own
+/// gateway. For a gateway that was already running, the code is minted
+/// through the kernel CLI, which presents the gateway's owner-only admin
+/// token; see [`daemon::mint_pairing_code`].
 async fn auto_pair(state: &state::SharedState) -> Option<String> {
-    let url = {
+    let (url, core) = {
         let s = state.read().await;
-        s.gateway_url.clone()
+        (s.gateway_url.clone(), s.core.clone())
     };
 
-    let client = GatewayClient::new(&url, None);
+    let client = GatewayClient::new(&url, None).with_core(core.clone());
 
     // Check if gateway is reachable and requires pairing.
     if !client.requires_pairing().await.unwrap_or(false) {
@@ -162,21 +184,24 @@ async fn auto_pair(state: &state::SharedState) -> Option<String> {
     {
         let s = state.read().await;
         if let Some(ref token) = s.token {
-            let authed = GatewayClient::new(&url, Some(token));
+            let authed = GatewayClient::new(&url, Some(token)).with_core(core.clone());
             if authed.validate_token().await.unwrap_or(false) {
                 return Some(token.clone()); // Existing token is valid.
             }
         }
     }
 
-    // No valid token — mint a new code through the CLI and exchange it.
-    let binary = daemon::find_zeroclaw_binary()?;
-    let code =
-        tokio::task::spawn_blocking(move || daemon::mint_pairing_code(&binary, GATEWAY_PORT))
-            .await
-            .ok()?
-            .ok()?;
-    let client = GatewayClient::new(&url, None);
+    // No valid token — mint a new code and exchange it.
+    let code = match &core {
+        Some(core) => core.new_pairing_code().await.ok()?,
+        None => {
+            let binary = daemon::find_zeroclaw_binary()?;
+            tokio::task::spawn_blocking(move || daemon::mint_pairing_code(&binary, GATEWAY_PORT))
+                .await
+                .ok()?
+                .ok()?
+        }
+    };
     match client.pair_with_code(&code).await {
         Ok(token) => {
             let mut s = state.write().await;
@@ -212,7 +237,23 @@ async fn open_dashboard(
         s.gateway_url.clone()
     };
     let token = auto_pair(state.inner()).await;
-    state.read().await.startup.dashboard_gate()?;
+    let core = {
+        let s = state.read().await;
+        s.startup.dashboard_gate()?;
+        s.core.clone()
+    };
+    // The WebView sends the token to the dashboard address from now on. Prove
+    // that address is the launched core's own gateway once more, right
+    // before handing the token over.
+    if token.is_some()
+        && let Some(core) = core
+    {
+        core.prove().await.map_err(|failure| {
+            format!(
+                "The dashboard address is not the ZeroClaw core's gateway right now ({failure}), so it was not opened with your credential. Reopen ZeroClaw."
+            )
+        })?;
+    }
 
     let dashboard_url = format!("{}/", base.trim_end_matches('/'));
     let parsed = tauri::Url::parse(&dashboard_url).map_err(|e| e.to_string())?;
