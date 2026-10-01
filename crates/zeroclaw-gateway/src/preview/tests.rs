@@ -53,6 +53,11 @@ fn defaults_serve_on_loopback_without_tls_or_dashboard() {
     assert_eq!(plain.listen, DEFAULT_LISTEN.parse::<SocketAddr>().unwrap());
     assert_eq!(plain.web_dist, None);
     assert_eq!(plain.tls, None);
+    assert_eq!(
+        plain.request_timeout,
+        Duration::from_secs(crate::REQUEST_TIMEOUT_SECS),
+        "the in-process gateway's default"
+    );
 }
 
 #[test]
@@ -107,6 +112,18 @@ fn tls_needs_both_files_and_malformed_arguments_are_refused() {
     assert_eq!(parse_args(args(&["-V"]), None), Ok(Invocation::Version));
 }
 
+#[test]
+fn the_request_timeout_is_a_positive_number_of_seconds() {
+    let set = bootstrap(&["--socket", "/s", "--request-timeout", "5"], None).unwrap();
+    assert_eq!(set.request_timeout, Duration::from_secs(5));
+    for bad in ["0", "-1", "soon", ""] {
+        assert!(
+            bootstrap(&["--socket", "/s", "--request-timeout", bad], None).is_err(),
+            "{bad:?} must be refused"
+        );
+    }
+}
+
 // ── The fail-closed route map ────────────────────────────────────
 
 /// Routes of the in-process gateway the preview serves: its own, then the
@@ -122,6 +139,8 @@ const SERVED: &[&str] = &[
     "/api/sessions",
     "/api/version/check",
     "/ws/sops/runs",
+    "/admin/shutdown",
+    "/hooks/claude-code",
 ];
 
 /// Route paths the in-process gateway registers with a string literal, from
@@ -285,6 +304,157 @@ async fn busy_timeout_and_an_untrusted_endpoint_get_their_own_hints() {
         );
     }
     assert_ne!(busy["hint"], timeout["hint"]);
+}
+
+// ── Gateway-local routes ─────────────────────────────────────────
+
+/// `/admin/shutdown` and `/hooks/claude-code` need no core. The preview
+/// answers each request exactly as the in-process routes do, and only a
+/// caller on loopback stops it.
+#[tokio::test]
+async fn the_gateway_local_routes_answer_as_the_in_process_gateway_does() {
+    use axum::body::Body;
+    use axum::http::Request;
+    use http_body_util::BodyExt as _;
+    use tower::ServiceExt as _;
+
+    async fn answer(router: &Router, request: Request<Body>) -> (StatusCode, String) {
+        let response = router.clone().oneshot(request).await.unwrap();
+        let status = response.status();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        (status, String::from_utf8_lossy(&body).into_owned())
+    }
+    fn request(path: &str, peer: SocketAddr, body: &str) -> Request<Body> {
+        Request::post(path)
+            .header("content-type", "application/json")
+            .extension(ConnectInfo(peer))
+            .body(Body::from(body.to_owned()))
+            .unwrap()
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    // No core listens here: neither route may need one.
+    let endpoint = tmp.path().join("daemon.sock");
+    let (preview_stop, preview_stopped) = watch::channel(false);
+    let preview = router(
+        CoreRpc::local(endpoint.clone(), EndpointOwner::SameAccount),
+        endpoint,
+        None,
+        preview_stop,
+        Duration::from_secs(crate::REQUEST_TIMEOUT_SECS),
+    );
+    let state = crate::api::test_state(zeroclaw_config::schema::Config {
+        data_dir: tmp.path().to_path_buf(),
+        config_path: tmp.path().join("config.toml"),
+        ..Default::default()
+    });
+    let in_process_stopped = state.shutdown_tx.subscribe();
+    let in_process: Router = Router::new()
+        .route("/admin/shutdown", post(crate::handle_admin_shutdown))
+        .route(
+            "/hooks/claude-code",
+            post(crate::api::handle_claude_code_hook),
+        )
+        .with_state(state);
+
+    let loopback = SocketAddr::from(([127, 0, 0, 1], 40_000));
+    let remote = SocketAddr::from(([203, 0, 113, 7], 40_000));
+    let event = r#"{"session_id":"s1","event_type":"tool_use","tool_name":"Bash","summary":"ls"}"#;
+    for (peer, body) in [
+        (loopback, event),
+        (remote, event),
+        (loopback, "not json"),
+        (loopback, r#"{"event_type":"tool_use"}"#),
+    ] {
+        let served = answer(&preview, request("/hooks/claude-code", peer, body)).await;
+        let in_process = answer(&in_process, request("/hooks/claude-code", peer, body)).await;
+        assert_eq!(served, in_process, "{peer} {body}");
+    }
+    let (status, body) = answer(&preview, request("/hooks/claude-code", remote, event)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&body).unwrap(),
+        json!({ "ok": true })
+    );
+
+    // From another machine: refused the same way, and nothing stops.
+    let served = answer(&preview, request("/admin/shutdown", remote, "")).await;
+    let in_process_answer = answer(&in_process, request("/admin/shutdown", remote, "")).await;
+    assert_eq!(served, in_process_answer);
+    assert_eq!(served.0, StatusCode::FORBIDDEN, "{}", served.1);
+    assert!(!*preview_stopped.borrow() && !*in_process_stopped.borrow());
+
+    // From loopback: the same answer, and each asks its own process to stop.
+    let served = answer(&preview, request("/admin/shutdown", loopback, "")).await;
+    let in_process_answer = answer(&in_process, request("/admin/shutdown", loopback, "")).await;
+    assert_eq!(served, in_process_answer);
+    assert_eq!(served.0, StatusCode::OK, "{}", served.1);
+    assert!(*preview_stopped.borrow() && *in_process_stopped.borrow());
+}
+
+// ── Request limits ───────────────────────────────────────────────
+
+/// Every route, served, refused or unknown, answers `413` to a body over the
+/// in-process limit and `408` to a request not done within the timeout,
+/// before any handler runs: the preview's own router, at its boundary.
+#[tokio::test]
+async fn every_route_sits_behind_the_in_process_request_limits() {
+    use axum::body::{Body, Bytes};
+    use axum::http::Request;
+    use futures_util::StreamExt as _;
+    use tower::ServiceExt as _;
+
+    let tmp = tempfile::tempdir().unwrap();
+    // No core listens here: no limit may need one.
+    let endpoint = tmp.path().join("daemon.sock");
+    let (stop, stopped) = watch::channel(false);
+    let preview = router(
+        CoreRpc::local(endpoint.clone(), EndpointOwner::SameAccount),
+        endpoint,
+        None,
+        stop,
+        Duration::from_millis(300),
+    );
+    let loopback = ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40_000)));
+
+    let oversized = vec![b' '; crate::MAX_BODY_SIZE + 1];
+    for path in [
+        "/hooks/claude-code",
+        "/admin/shutdown",
+        "/api/sessions",
+        "/webhook",
+        "/api/no-such-route",
+    ] {
+        let request = Request::post(path)
+            .header("content-type", "application/json")
+            .header("content-length", oversized.len())
+            .extension(loopback)
+            .body(Body::from(oversized.clone()))
+            .unwrap();
+        let response = preview.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE, "{path}");
+    }
+    assert!(
+        !*stopped.borrow(),
+        "an oversized shutdown request stops nothing"
+    );
+
+    // A declared body that never finishes arriving.
+    let stalled = Body::from_stream(
+        futures_util::stream::once(async { Ok::<_, std::io::Error>(Bytes::from_static(b"{")) })
+            .chain(futures_util::stream::pending()),
+    );
+    let request = Request::post("/hooks/claude-code")
+        .header("content-type", "application/json")
+        .header("content-length", "100")
+        .extension(loopback)
+        .body(stalled)
+        .unwrap();
+    let response = tokio::time::timeout(Duration::from_secs(10), preview.clone().oneshot(request))
+        .await
+        .expect("a stalled request is answered within the timeout")
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
 }
 
 // ── The router, against a real core on a real socket ─────────────
@@ -493,6 +663,8 @@ mod against_a_core {
             CoreRpc::local(core.endpoint.clone(), EndpointOwner::SameAccount),
             core.endpoint.clone(),
             Some(web_dist(tmp.path())),
+            watch::channel(false).0,
+            Duration::from_secs(crate::REQUEST_TIMEOUT_SECS),
         );
 
         let (status, body) = get(&router, "/health", None).await;
@@ -679,7 +851,13 @@ mod against_a_core {
         }
         let core = Core::serve(ctx).await;
         let rpc = CoreRpc::local(core.endpoint.clone(), EndpointOwner::SameAccount);
-        let preview = router(rpc.clone(), core.endpoint.clone(), None);
+        let preview = router(
+            rpc.clone(),
+            core.endpoint.clone(),
+            None,
+            watch::channel(false).0,
+            Duration::from_secs(crate::REQUEST_TIMEOUT_SECS),
+        );
         let state = crate::api::tests::test_state_with_session_backend(config, backend);
 
         // A terminal attached to the core next to the gateway.
@@ -792,6 +970,8 @@ mod against_a_core {
             CoreRpc::local(core.endpoint.clone(), EndpointOwner::SameAccount),
             core.endpoint.clone(),
             None,
+            watch::channel(false).0,
+            Duration::from_secs(crate::REQUEST_TIMEOUT_SECS),
         ))
         .await;
         let mut state = crate::api::test_state(config);
@@ -846,6 +1026,8 @@ mod against_a_core {
             CoreRpc::local(core.endpoint.clone(), EndpointOwner::SameAccount),
             core.endpoint.clone(),
             None,
+            watch::channel(false).0,
+            Duration::from_secs(crate::REQUEST_TIMEOUT_SECS),
         );
         let private = tmp.path().display().to_string();
         let expected_sign_in = serde_json::json!({
@@ -888,6 +1070,8 @@ mod against_a_core {
             CoreRpc::local(core.endpoint.clone(), EndpointOwner::SameAccount),
             core.endpoint.clone(),
             Some(web_dist(tmp.path())),
+            watch::channel(false).0,
+            Duration::from_secs(crate::REQUEST_TIMEOUT_SECS),
         );
 
         // The page loads; health says to sign in with a token, and where to
@@ -921,6 +1105,8 @@ mod against_a_core {
             CoreRpc::local(recorder.endpoint.clone(), EndpointOwner::SameAccount),
             recorder.endpoint.clone(),
             None,
+            watch::channel(false).0,
+            Duration::from_secs(crate::REQUEST_TIMEOUT_SECS),
         );
 
         let (status, body) = get(&router, "/health", None).await;
@@ -961,6 +1147,8 @@ mod against_a_core {
             CoreRpc::local(recorder.endpoint.clone(), EndpointOwner::SameAccount),
             recorder.endpoint.clone(),
             None,
+            watch::channel(false).0,
+            Duration::from_secs(crate::REQUEST_TIMEOUT_SECS),
         );
 
         let (status, body) = get(&router, "/health", None).await;
@@ -990,6 +1178,8 @@ mod against_a_core {
             CoreRpc::local(core.endpoint.clone(), EndpointOwner::SameAccount),
             core.endpoint.clone(),
             None,
+            watch::channel(false).0,
+            Duration::from_secs(crate::REQUEST_TIMEOUT_SECS),
         );
         let (status, body) = get(&router, "/sessions", None).await;
         assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
