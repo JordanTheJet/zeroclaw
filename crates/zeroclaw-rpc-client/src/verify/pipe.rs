@@ -12,10 +12,24 @@
 //!   administrator cannot produce a pipe owned by this one. This also holds
 //!   when the process that created the pipe has exited and its ID now names
 //!   some other process;
-//! - the pipe's access list, which must not let a broad group (everyone,
-//!   anonymous, or every signed-in user) write to the pipe, add instances of
-//!   its own, or change its security. A pipe with no access list lets every
-//!   account do all of that.
+//! - the pipe's access list. Windows checks a new server instance of an
+//!   existing pipe against that pipe's access list, and the instance's
+//!   creator does not become the owner, so the owner alone does not prove
+//!   who made the instance this client reached. Only the expected account,
+//!   `SYSTEM`, the Administrators group and `CREATOR OWNER` may hold the
+//!   right to add instances or to change the pipe's security; any other
+//!   account or group holding either fails the check. A broad group
+//!   (everyone, anonymous, or every signed-in user) may not even write to
+//!   the pipe. A pipe with no access list lets every account do all of that.
+//!
+//! Where the line falls:
+//!
+//! - an administrator is outside the boundary. An elevated process of any
+//!   administrator account creates pipes the Administrators group owns, and
+//!   those pass the owner check;
+//! - another named account or group may be granted plain read and write
+//!   access to the pipe. That lets it connect as one more client, not serve
+//!   under the pipe's name, so it is the owner's choice to make.
 //!
 //! The decision is written against [`PipeServer`], so it runs on every
 //! platform under test; only the Windows implementation calls the operating
@@ -60,8 +74,10 @@ impl Sid {
             .fold(0u64, |value, byte| (value << 8) | u64::from(*byte));
         let sub_authorities = rest
             .get(6..6 + 4 * count)?
-            .chunks_exact(4)
-            .map(|word| u32::from_le_bytes([word[0], word[1], word[2], word[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|word| u32::from_le_bytes(*word))
             .collect();
         Some((
             Self {
@@ -112,6 +128,17 @@ fn administrators() -> Sid {
     Sid::new(5, &[32, 544])
 }
 
+/// `NT AUTHORITY\SYSTEM`, the account the operating system runs as.
+fn system() -> Sid {
+    Sid::new(5, &[18])
+}
+
+/// `CREATOR OWNER`, a placeholder Windows replaces with the creator's
+/// account when an object inherits the entry.
+fn creator_owner() -> Sid {
+    Sid::new(3, &[0])
+}
+
 /// Groups so broad that access granted to them is access granted to other
 /// accounts.
 fn broad_groups() -> [Sid; 9] {
@@ -128,14 +155,19 @@ fn broad_groups() -> [Sid; 9] {
     ]
 }
 
-/// Access that lets its holder write to the pipe, create a server instance
-/// of its own under the pipe's name, or change who may.
-const WRITE_ACCESS: u32 = 0x0000_0002 // FILE_WRITE_DATA
-    | 0x0000_0004 // FILE_CREATE_PIPE_INSTANCE
+/// Access that lets its holder create a server instance of its own under the
+/// pipe's name, or change who may. `GENERIC_WRITE` is here because on a pipe
+/// it maps to `FILE_GENERIC_WRITE`, which includes the instance right.
+const CONTROL_ACCESS: u32 = 0x0000_0004 // FILE_CREATE_PIPE_INSTANCE
     | 0x0004_0000 // WRITE_DAC
     | 0x0008_0000 // WRITE_OWNER
     | 0x1000_0000 // GENERIC_ALL
     | 0x4000_0000; // GENERIC_WRITE
+
+/// Access that lets its holder write to the pipe, or any of
+/// [`CONTROL_ACCESS`].
+const WRITE_ACCESS: u32 = 0x0000_0002 // FILE_WRITE_DATA
+    | CONTROL_ACCESS;
 
 const SE_DACL_PRESENT: u16 = 0x0004;
 const SE_SELF_RELATIVE: u16 = 0x8000;
@@ -256,11 +288,19 @@ fn check_pipe_security(descriptor: &[u8], expected: &Sid) -> Result<(), Endpoint
     let Some(grants) = security.grants else {
         return Err(EndpointRejection::PipeUnprotected);
     };
+    // Instance and security control is an allowlist: no list of the accounts
+    // that must not hold it can be complete, so name the few that may.
+    let may_control = [
+        expected.clone(),
+        system(),
+        administrators(),
+        creator_owner(),
+    ];
     let broad = broad_groups();
-    if let Some(grant) = grants
-        .iter()
-        .find(|grant| grant.access & WRITE_ACCESS != 0 && broad.contains(&grant.sid))
-    {
+    if let Some(grant) = grants.iter().find(|grant| {
+        (grant.access & CONTROL_ACCESS != 0 && !may_control.contains(&grant.sid))
+            || (grant.access & WRITE_ACCESS != 0 && broad.contains(&grant.sid))
+    }) {
         return Err(EndpointRejection::PipeWritable {
             account: grant.sid.to_string(),
             access: grant.access,
@@ -288,8 +328,9 @@ pub(crate) trait PipeServer {
 }
 
 /// Prove the pipe `server` describes is served by `expected` (this
-/// process's own user when `None`), and that no other account owns it or
-/// may write to it. Any query the kernel refuses fails the check.
+/// process's own user when `None`), that no other account owns it or may add
+/// instances to it or change its security, and that no broad group may
+/// write to it. Any query the kernel refuses fails the check.
 pub(crate) fn verify_pipe_server<P: PipeServer>(
     server: &P,
     expected: Option<Sid>,
@@ -497,8 +538,9 @@ mod tests {
         Sid::new(5, &[21, 1_004_336_348, 1_177_238_915, 682_003_330, 1002])
     }
 
-    fn system() -> Sid {
-        Sid::new(5, &[18])
+    /// A group of this machine or domain that is none of the broad ones.
+    fn custom_group() -> Sid {
+        Sid::new(5, &[21, 1_004_336_348, 1_177_238_915, 682_003_330, 2100])
     }
 
     fn everyone() -> Sid {
@@ -506,7 +548,14 @@ mod tests {
     }
 
     const GENERIC_ALL: u32 = 0x1000_0000;
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+    const WRITE_DAC: u32 = 0x0004_0000;
+    const WRITE_OWNER: u32 = 0x0008_0000;
+    const FILE_CREATE_PIPE_INSTANCE: u32 = 0x0000_0004;
     const FILE_GENERIC_READ: u32 = 0x0012_0089;
+    /// What an ordinary client needs: read and write the pipe's data and
+    /// attributes, without the right to add instances.
+    const CLIENT_READ_WRITE: u32 = 0x0012_019b;
 
     /// One access list entry: its type, flags, access mask and account.
     type Entry = (u8, u8, u32, Sid);
@@ -759,20 +808,177 @@ mod tests {
     fn entries_that_grant_nothing_on_the_pipe_itself_are_ignored() {
         let mut entries = default_entries(&me());
         entries.push((ACCESS_DENIED_ACE_TYPE, 0, GENERIC_ALL, everyone()));
-        entries.push((
-            ACCESS_ALLOWED_ACE_TYPE,
-            INHERIT_ONLY_ACE,
-            GENERIC_ALL,
-            everyone(),
-        ));
-        // A write grant to one named account is that account's business,
-        // not a broad group's.
-        entries.push(allow(GENERIC_ALL, someone_else()));
+        for grantee in [everyone(), someone_else()] {
+            entries.push((
+                ACCESS_ALLOWED_ACE_TYPE,
+                INHERIT_ONLY_ACE,
+                GENERIC_ALL,
+                grantee,
+            ));
+        }
         let pipe = FakePipe {
             descriptor: Ok(descriptor(Some(&me()), Some(&entries))),
             ..FakePipe::mine()
         };
         assert_eq!(verify_pipe_server(&pipe, None), Ok(()));
+    }
+
+    #[test]
+    fn another_account_or_group_that_may_add_instances_or_change_security_is_refused() {
+        for grantee in [someone_else(), custom_group()] {
+            for access in [
+                FILE_CREATE_PIPE_INSTANCE,
+                WRITE_DAC,
+                WRITE_OWNER,
+                GENERIC_ALL,
+                GENERIC_WRITE,
+                CLIENT_READ_WRITE | FILE_CREATE_PIPE_INSTANCE,
+            ] {
+                let mut entries = default_entries(&me());
+                entries.push(allow(access, grantee.clone()));
+                let pipe = FakePipe {
+                    descriptor: Ok(descriptor(Some(&me()), Some(&entries))),
+                    ..FakePipe::mine()
+                };
+                assert_eq!(
+                    verify_pipe_server(&pipe, None),
+                    Err(EndpointRejection::PipeWritable {
+                        account: grantee.to_string(),
+                        access,
+                    }),
+                    "{grantee} {access:#x}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn another_account_or_group_may_read_and_write_as_a_client() {
+        for grantee in [someone_else(), custom_group()] {
+            for access in [FILE_GENERIC_READ, CLIENT_READ_WRITE] {
+                let mut entries = default_entries(&me());
+                entries.push(allow(access, grantee.clone()));
+                let pipe = FakePipe {
+                    descriptor: Ok(descriptor(Some(&me()), Some(&entries))),
+                    ..FakePipe::mine()
+                };
+                assert_eq!(
+                    verify_pipe_server(&pipe, None),
+                    Ok(()),
+                    "{grantee} {access:#x}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn this_account_system_administrators_and_creator_owner_may_hold_control() {
+        for holder in [me(), system(), administrators(), creator_owner()] {
+            for access in [
+                FILE_CREATE_PIPE_INSTANCE,
+                WRITE_DAC,
+                WRITE_OWNER,
+                GENERIC_ALL,
+            ] {
+                let pipe = FakePipe {
+                    descriptor: Ok(descriptor(
+                        Some(&me()),
+                        Some(&[allow(access, holder.clone())]),
+                    )),
+                    ..FakePipe::mine()
+                };
+                assert_eq!(
+                    verify_pipe_server(&pipe, None),
+                    Ok(()),
+                    "{holder} {access:#x}"
+                );
+            }
+        }
+    }
+
+    /// The account check passes whenever the server process ID names a
+    /// process of this account, which also happens when the pipe's creator
+    /// exited and its ID was reused. A pipe this account owns, whose access
+    /// list let another account add an instance under its name, would then
+    /// hand that account the credential: the instance's creator never
+    /// becomes the pipe's owner.
+    fn reused_process_pipe(grantee: Sid, access: u32) -> FakePipe {
+        let entries = [
+            allow(GENERIC_ALL, me()),
+            allow(access | CLIENT_READ_WRITE, grantee),
+        ];
+        FakePipe {
+            descriptor: Ok(descriptor(Some(&me()), Some(&entries))),
+            ..FakePipe::mine()
+        }
+    }
+
+    #[test]
+    fn a_named_account_with_instance_or_security_control_is_refused_after_pid_reuse() {
+        let accepted: Vec<u32> = [
+            FILE_CREATE_PIPE_INSTANCE,
+            WRITE_DAC,
+            WRITE_OWNER,
+            GENERIC_ALL,
+        ]
+        .into_iter()
+        .filter(|access| {
+            verify_pipe_server(&reused_process_pipe(someone_else(), *access), None).is_ok()
+        })
+        .collect();
+        assert!(
+            accepted.is_empty(),
+            "control granted to another account was accepted: {accepted:#x?}"
+        );
+    }
+
+    #[test]
+    fn a_custom_group_with_full_control_is_refused_after_pid_reuse() {
+        assert!(!broad_groups().contains(&custom_group()));
+        let outcome = verify_pipe_server(&reused_process_pipe(custom_group(), GENERIC_ALL), None);
+        assert!(
+            outcome.is_err(),
+            "full control for a custom group was accepted: {outcome:?}"
+        );
+    }
+
+    /// The structural comparison of [`Sid`] agrees with the operating
+    /// system's own `EqualSid` on the forms this check meets.
+    #[cfg(windows)]
+    #[test]
+    fn sid_equality_matches_equal_sid() {
+        use windows_sys::Win32::Security::{EqualSid, IsValidSid};
+        let sids = [
+            me(),
+            someone_else(),
+            custom_group(),
+            system(),
+            administrators(),
+            creator_owner(),
+            everyone(),
+            Sid::new(5, &[21, 1_004_336_348, 1_177_238_915, 682_003_330]),
+            Sid::new(1 << 40, &[7]),
+            Sid::new(16, &[8192]),
+        ];
+        for left in &sids {
+            for right in &sids {
+                let mut left_bytes = left.to_bytes();
+                let mut right_bytes = right.to_bytes();
+                // SAFETY: both buffers hold a complete SID in its binary
+                // form and outlive the calls.
+                let native = unsafe {
+                    assert_ne!(IsValidSid(left_bytes.as_mut_ptr().cast()), 0, "{left}");
+                    assert_ne!(IsValidSid(right_bytes.as_mut_ptr().cast()), 0, "{right}");
+                    EqualSid(
+                        left_bytes.as_mut_ptr().cast(),
+                        right_bytes.as_mut_ptr().cast(),
+                    ) != 0
+                };
+                let read_left = Sid::read(&left_bytes).map(|(sid, _)| sid);
+                let read_right = Sid::read(&right_bytes).map(|(sid, _)| sid);
+                assert_eq!(read_left == read_right, native, "{left} and {right}");
+            }
+        }
     }
 
     #[test]

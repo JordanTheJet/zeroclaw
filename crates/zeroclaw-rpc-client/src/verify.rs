@@ -8,15 +8,30 @@
 //! other write access, so no other account can have placed or swapped the
 //! socket. On Windows the process the kernel names as the pipe's server
 //! must run as the expected account, and the pipe itself must be owned by
-//! that account (or the Administrators group) with no write access for a
-//! broad group (the `pipe` module, built for Windows). These checks run on
+//! that account (or the Administrators group). Only that account, `SYSTEM`,
+//! the Administrators group and `CREATOR OWNER` may hold the right to add
+//! instances to the pipe or change its security, and no broad group may
+//! write to it (the `pipe` module, built for Windows). These checks run on
 //! every dial that carries a credential (a bearer, a TUI signature, or
 //! forwarded environment), reconnects included, and there is no switch that
 //! skips them.
 //!
+//! The check runs after the stream is open and before anything is written.
+//! On Windows the client opens the pipe with identification-level security
+//! only (`SECURITY_IDENTIFICATION | SECURITY_SQOS_PRESENT`, set explicitly
+//! rather than inherited from tokio's default), so whichever server answers
+//! before the check can learn who this client is but cannot act as it.
+//!
 //! What this cannot tell apart: two processes of the same account. Malware
 //! running as the core's own user can read its configuration and tokens
-//! anyway, so the check draws the line at the OS account.
+//! anyway, so the check draws the line at the OS account. On Windows an
+//! administrator is outside the line too: an elevated process of any
+//! administrator account creates pipes the Administrators group owns, and
+//! those pass. Another named account or group may be granted plain read and
+//! write access, which lets it connect as a client but not serve under the
+//! pipe's name. An [`EndpointOwner::Uid`] has no Windows form yet, so a
+//! launcher that runs the core under another Windows account cannot name
+//! that account to the check.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -69,9 +84,11 @@ pub enum EndpointRejection {
     /// The pipe is owned by an account that is neither the expected one nor
     /// the Administrators group.
     PipeOwner { expected: String, actual: String },
-    /// A broad group (everyone, anonymous, or every signed-in user) may write
-    /// to the pipe, add instances of its own, or change its security.
-    /// `access` is the access mask granted to `account`.
+    /// An account other than the expected one, `SYSTEM`, the Administrators
+    /// group or `CREATOR OWNER` may add instances of the pipe or change its
+    /// security, or a broad group (everyone, anonymous, or every signed-in
+    /// user) may write to it. `access` is the access mask granted to
+    /// `account`.
     PipeWritable { account: String, access: u32 },
     /// The pipe has no access list, so every account may do anything to it.
     PipeUnprotected,

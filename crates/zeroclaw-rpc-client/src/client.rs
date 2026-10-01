@@ -731,11 +731,18 @@ async fn open_local_stream(path: &Path) -> Result<LocalStream, ClientError> {
 #[cfg(windows)]
 async fn open_local_stream(path: &Path) -> Result<LocalStream, ClientError> {
     use tokio::net::windows::named_pipe::ClientOptions;
+    use windows_sys::Win32::Storage::FileSystem::{SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT};
     const ERROR_PIPE_BUSY: i32 = 231;
     let name = path.to_string_lossy().into_owned();
+    let mut options = ClientOptions::new();
+    // The server may learn who this client is but never act as it, even
+    // before `verify_local_endpoint` has checked who the server is. This is
+    // tokio's default today; it is set here so the order argument does not
+    // rest on a default.
+    options.security_qos_flags(SECURITY_IDENTIFICATION | SECURITY_SQOS_PRESENT);
     // The daemon may not have a pending pipe instance yet; retry briefly.
     for _ in 0..50 {
-        match ClientOptions::new().open(&name) {
+        match options.open(&name) {
             Ok(client) => return Ok(client),
             Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY) => {
                 tokio::time::sleep(Duration::from_millis(20)).await;

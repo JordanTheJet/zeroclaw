@@ -23,12 +23,14 @@ zeroclaw-rpc-proto = { workspace = true }
 libc = "0.2"
 
 # On Windows the endpoint check asks the kernel which process serves the
-# pipe, which account that process runs as, and who owns the pipe. The same
+# pipe, which account that process runs as, and who owns the pipe, and the
+# pipe is opened with identification-only impersonation. The same
 # windows-sys tokio already links there.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",
+    "Win32_Storage_FileSystem",
     "Win32_System_Pipes",
     "Win32_System_Threading",
 ] }
