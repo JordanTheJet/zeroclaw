@@ -1435,3 +1435,8 @@ cron-agent-job-failed = The scheduled task could not be completed. Please try ag
 rpc-config-set-many-empty = config/set-many requires at least one entry in `sets`
 rpc-config-set-many-limit = config/set-many accepts at most { $limit } entries in `sets`; got { $count }
 rpc-config-set-many-entry-rejected = config/set-many entry { $index } (`{ $prop }`) rejected; nothing was saved: { $reason }
+
+# The standalone gateway (`zeroclaw-gw`) on stderr, its log. It serves only
+# through a core of its own version unless started with --allow-version-skew.
+gw-core-version-refused = zeroclaw-gw: refusing to serve through the core: it is version { $core }, this gateway is version { $gateway } (core_version_mismatch)
+gw-version-skew-allowed = zeroclaw-gw: --allow-version-skew: serving through a core of any version; for development only, answers may silently lack what was asked for

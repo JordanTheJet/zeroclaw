@@ -24,6 +24,7 @@
 //! the preview refuses to start there.
 
 use std::future::Future;
+use std::io::Write as _;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -676,9 +677,14 @@ fn report_refused_core(core: &str, gateway: &str) {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     if reported.as_deref() != Some(core) {
-        eprintln!(
-            "zeroclaw-gw: refusing to serve through the core: it is version {core}, this \
-             gateway is version {gateway} (core_version_mismatch)"
+        // Written so that a closed stderr cannot panic the request handler.
+        let _ = writeln!(
+            std::io::stderr(),
+            "{}",
+            zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+                "gw-core-version-refused",
+                &[("core", core), ("gateway", gateway)],
+            )
         );
         *reported = Some(core.to_owned());
     }
@@ -985,9 +991,10 @@ pub async fn serve(bootstrap: Bootstrap) -> anyhow::Result<()> {
         bootstrap.endpoint.display()
     );
     if bootstrap.version_skew == VersionSkew::Allow {
-        eprintln!(
-            "zeroclaw-gw: --allow-version-skew: serving through a core of any version; for \
-             development only, answers may silently lack what was asked for"
+        let _ = writeln!(
+            std::io::stderr(),
+            "{}",
+            zeroclaw_runtime::i18n::get_required_cli_string("gw-version-skew-allowed")
         );
     }
 
