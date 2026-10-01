@@ -5,6 +5,7 @@
 //! not here; the generator then records it as external, with its owning
 //! crate from [`crate::method::EXTERNAL_TYPES`].
 
+use crate::error_reasons::{RefusalData, RefusalReason};
 use crate::types::*;
 use schemars::{Schema, SchemaGenerator};
 
@@ -86,6 +87,8 @@ catalog! {
     // Quickstart (wire-stable subset)
     QuickstartStateResult, QuickstartTypeOption, QuickstartValidateParams, QuickstartApplyParams,
     QuickstartDismissResult,
+    // Refusals (`error.data`)
+    RefusalReason, RefusalData,
     // SOP graph projection
     SopGraph, GraphLegend,
 }

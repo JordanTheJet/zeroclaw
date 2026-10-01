@@ -43,6 +43,8 @@ pub mod openapi;
 mod plugin_webhook;
 pub mod preview;
 pub mod principal_gate;
+#[cfg(test)]
+mod refusal_parity;
 pub mod security_headers;
 pub mod session_queue;
 pub mod sse;

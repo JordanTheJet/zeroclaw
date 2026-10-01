@@ -235,6 +235,40 @@ async fn a_protocol_mismatch_says_to_install_matching_versions() {
 }
 
 #[tokio::test]
+async fn a_classified_refusal_answers_as_the_route_does_without_a_hint() {
+    use zeroclaw_api::jsonrpc::error_codes::{INTERNAL_ERROR, INVALID_PARAMS};
+    use zeroclaw_rpc_proto::error_reasons::RefusalReason;
+
+    for (reason, code, status) in [
+        (
+            RefusalReason::NotFound,
+            INVALID_PARAMS,
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            RefusalReason::Disabled,
+            INTERNAL_ERROR,
+            StatusCode::SERVICE_UNAVAILABLE,
+        ),
+    ] {
+        let (answered, body) =
+            explained(CoreError::Rpc(reason.error(code, "SOP 'x' not found"))).await;
+        assert_eq!(answered, status, "{reason:?}");
+        assert_eq!(body, serde_json::json!({ "error": "SOP 'x' not found" }));
+    }
+    // Without a reason the operator still gets the code and a hint.
+    let (status, body) = explained(CoreError::Rpc(zeroclaw_api::jsonrpc::JsonRpcError {
+        code: INVALID_PARAMS,
+        message: "SOP 'x' not found".into(),
+        data: None,
+    }))
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["code"], "invalid_params");
+    assert!(body["hint"].is_string(), "{body}");
+}
+
+#[tokio::test]
 async fn a_refused_credential_and_an_unreachable_core_explain_themselves_distinctly() {
     let (status, body) = explained(CoreError::AuthRequired("credential rejected".into())).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);

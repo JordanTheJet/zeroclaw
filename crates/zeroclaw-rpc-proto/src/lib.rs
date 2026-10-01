@@ -9,7 +9,8 @@
 //! - [`notification`]: the server-to-client notification names;
 //! - [`types`]: every wire-stable request, response and notification
 //!   payload type;
-//! - [`error_codes`]: the JSON-RPC error codes the daemon returns;
+//! - [`error_codes`]: the JSON-RPC error codes the daemon returns, and
+//!   [`error_reasons`] for the `data.reason` some errors carry;
 //! - [`sop`]: the SOP graph projection types the `sops/*` methods return.
 //!
 //! The runtime depends on this crate and re-exports it from
@@ -69,6 +70,10 @@ pub mod error_codes {
         }
     }
 }
+
+/// `data.reason` values the daemon sets on an error when its code alone does
+/// not say why.
+pub mod error_reasons;
 
 /// SOP graph projection types returned by `sops/graph` and `sops/graph-draft`.
 pub mod sop {

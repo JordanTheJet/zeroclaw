@@ -129,6 +129,42 @@ Provider/model views are prepared from the complete candidate and installed
 after the successful commit. Deletes and map-key operations are not part of
 this method.
 
+### Refusal reasons
+
+A method error keeps its JSON-RPC `code`. When one code covers several
+outcomes, the error also names the outcome in `data.reason`:
+
+```json
+{"jsonrpc":"2.0","error":{"code":-32602,"message":"SOP 'nightly': ...","data":{"reason":"not_found"}},"id":7}
+```
+
+| `reason` | Meaning |
+|---|---|
+| `not_found` | The named resource does not exist. |
+| `unowned` | The resource exists, but nothing the request names owns it (a SOP step with no agent, started from outside an agent turn). |
+| `conflict` | The request conflicts with the resource's current state. |
+| `disabled` | The subsystem that serves the method is off. |
+| `deferred` | Accepted but not acted on yet; retrying later can succeed unchanged. |
+| `capacity` | A concurrency or size limit refused the request. |
+| `forbidden` | The caller's principal may not perform the operation. |
+| `invalid` | The request is malformed or names an invalid value. |
+| `blocked` | A safety screen refused the request's content. |
+| `malformed` | The resource exists, but what is stored for it does not parse. |
+| `entry_exceeds_max_bytes` | One entry alone is larger than the size bound the caller set (`session/messages` `max_bytes`); `data.index` and `data.bytes` name it. |
+
+The values are `RefusalReason` in `zeroclaw_rpc_proto::error_reasons`, which
+also spells each one as a string constant.
+
+A refused config operation also carries `data.config_error`, the structured
+config error (`code`, `message`, `path`) the config surfaces report.
+
+`data` is optional and additive. A daemon that predates it, and every error
+it does not classify, sends no `data`. Clients must keep code-based handling
+for those, ignore a `reason` they do not know, and ignore members they do not
+know. Values are never removed or renamed. The transport's own `id: null`
+frames ([Connection limits](#connection-limits)) use their own
+`data.reason` values, which are not part of this set.
+
 ### Bidirectional requests
 
 Either side may send a request on the established socket. The receiver must
@@ -310,8 +346,9 @@ On Windows, use any named-pipe client (PowerShell `[System.IO.Pipes.NamedPipeCli
 
 ## Contract document
 
-The method table, every wire type's JSON Schema, the notification names and
-the error codes are rendered into
+The method table, every wire type's JSON Schema, the notification names,
+the error codes and the schema of a refusal's `error.data` (`x-error-data`)
+are rendered into
 [`zeroclaw-rpc.openrpc.json`](zeroclaw-rpc.openrpc.json) by
 `cargo generate openrpc`. CI fails when that file drifts from
 `zeroclaw-rpc-proto`. OpenRPC describes what travels inside the JSON-RPC
