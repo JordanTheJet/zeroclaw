@@ -194,6 +194,28 @@ async fn the_separate_gateway_follows_the_core_through_restarts_of_either() {
     assert_eq!(status, 503, "{refused}");
     assert_eq!(refused["code"], "capability_missing");
 
+    // A ported dashboard route is served through the core. The gateway's own
+    // connection, which the core registers like any client's, declared
+    // itself a gateway's and is not listed as a terminal.
+    let (status, health) = get(&gateway.address, "/api/health", Some(TOKEN)).await;
+    assert_eq!(status, 200, "{health}");
+    assert!(health["health"]["components"].is_object(), "{health}");
+    let (status, tuis) = get(&gateway.address, "/api/tuis", Some(TOKEN)).await;
+    assert_eq!(status, 200, "{tuis}");
+    assert_eq!(tuis["tuis"], serde_json::json!([]), "{tuis}");
+    let registered = core.ctx.tui_registry.list();
+    assert!(
+        registered
+            .iter()
+            .any(|tui| tui.peer_label.starts_with("unix:")
+                && tui.client_kind.as_deref() == Some("gateway")),
+        "the core registers the separate gateway's connection as a gateway's: {:?}",
+        registered
+            .iter()
+            .map(|tui| (&tui.peer_label, &tui.client_kind))
+            .collect::<Vec<_>>()
+    );
+
     // The core stops: the gateway keeps running and says so.
     let ctx = core.stop().await;
     let health = until_status(&gateway.address, "/health", None, 503).await;

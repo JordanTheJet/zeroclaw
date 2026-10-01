@@ -109,8 +109,18 @@ fn tls_needs_both_files_and_malformed_arguments_are_refused() {
 
 // ── The fail-closed route map ────────────────────────────────────
 
-/// Routes of the in-process gateway the preview serves itself.
-const SERVED: &[&str] = &["/health", "/api/openapi.json", "/api/docs"];
+/// Routes of the in-process gateway the preview serves: its own, then the
+/// dashboard routes the core serves.
+const SERVED: &[&str] = &[
+    "/health",
+    "/api/openapi.json",
+    "/api/docs",
+    "/api/health",
+    "/api/tuis",
+    "/api/cost",
+    "/api/events/history",
+    "/api/sessions",
+];
 
 /// Route paths the in-process gateway registers with a string literal, from
 /// its production source (test modules excluded).
@@ -300,6 +310,10 @@ mod against_a_core {
 
     impl Core {
         async fn start(dir: &Path) -> Self {
+            Self::serve(Self::context(dir)).await
+        }
+
+        fn context(dir: &Path) -> Arc<zeroclaw_runtime::rpc::context::RpcContext> {
             assert!(
                 std::env::var_os("ZEROCLAW_SOCKET").is_none(),
                 "ZEROCLAW_SOCKET must be unset for these tests"
@@ -316,8 +330,7 @@ mod against_a_core {
                     4, 10, 60,
                 )),
             ));
-            let ctx = zeroclaw_runtime::rpc::context::RpcContext::for_live_test(config, sessions);
-            Self::serve(ctx).await
+            zeroclaw_runtime::rpc::context::RpcContext::for_live_test(config, sessions)
         }
 
         async fn serve(ctx: Arc<zeroclaw_runtime::rpc::context::RpcContext>) -> Self {
@@ -579,6 +592,164 @@ mod against_a_core {
         assert_eq!(status, StatusCode::OK, "{body}");
         let (status, body) = get(&router, CORE_LINK_PATH, Some(TOKEN)).await;
         assert_eq!(status, StatusCode::OK, "{body}");
+        core.stop().await;
+    }
+
+    /// The in-process gateway's body for `path` when the request reaches the
+    /// core through `core`.
+    async fn in_process_body(state: &crate::AppState, core: &CoreRpc, path: &str) -> String {
+        use crate::api::{
+            handle_api_cost, handle_api_health, handle_api_sessions_list, handle_api_tuis,
+        };
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {TOKEN}").parse().unwrap(),
+        );
+        let access = core
+            .access(&headers)
+            .await
+            .expect("served through the core");
+        assert!(matches!(access, CoreAccess::Core(_)));
+        let state = State(state.clone());
+        let response = match path {
+            "/api/health" => handle_api_health(state, headers, access)
+                .await
+                .into_response(),
+            "/api/tuis" => handle_api_tuis(state, headers, access)
+                .await
+                .into_response(),
+            "/api/cost" => handle_api_cost(state, headers, Query(CostQuery::default()), access)
+                .await
+                .into_response(),
+            "/api/cost?agent=main" => {
+                let query = CostQuery {
+                    agent: Some("main".into()),
+                    ..CostQuery::default()
+                };
+                handle_api_cost(state, headers, Query(query), access)
+                    .await
+                    .into_response()
+            }
+            "/api/events/history" => crate::sse::handle_events_history(state, headers, access)
+                .await
+                .into_response(),
+            "/api/sessions" => handle_api_sessions_list(state, access, headers)
+                .await
+                .into_response(),
+            other => panic!("no in-process handler for {other}"),
+        };
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        String::from_utf8_lossy(&body).into_owned()
+    }
+
+    /// Each ported dashboard route answers through the separate gateway
+    /// exactly what the in-process gateway answers when the same request
+    /// reaches the same core, and lists only terminals as terminals.
+    #[tokio::test]
+    async fn the_ported_routes_answer_as_the_in_process_gateway_does() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ctx = Core::context(tmp.path());
+        let config = ctx.config.read().clone();
+        let backend = zeroclaw_infra::make_session_backend(
+            &config.data_dir,
+            &config.channels.session_backend,
+        )
+        .expect("open the session store");
+        backend
+            .append("gw_alpha", &zeroclaw_providers::ChatMessage::user("hi"))
+            .unwrap();
+        backend.set_session_agent_alias("gw_alpha", "main").unwrap();
+        let history = Arc::new(crate::sse::EventBuffer::new(8));
+        history.push(json!({ "type": "agent_start", "provider": "test" }));
+        {
+            let ctx = Arc::get_mut(&mut ctx).expect("a fresh context has one owner");
+            ctx.session_backend = Some(Arc::clone(&backend));
+            ctx.event_history = Some(history);
+        }
+        let core = Core::serve(ctx).await;
+        let rpc = CoreRpc::local(core.endpoint.clone(), EndpointOwner::SameAccount);
+        let preview = router(rpc.clone(), core.endpoint.clone(), None);
+        let state = crate::api::tests::test_state_with_session_backend(config, backend);
+
+        // A terminal attached to the core next to the gateway.
+        let terminal = RpcClient::connect_local(
+            &core.endpoint,
+            zeroclaw_rpc_client::ConnectOptions {
+                auth_token: Some(TOKEN.into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("a terminal connects");
+        let terminal_id = terminal
+            .handshake()
+            .tui_id
+            .clone()
+            .expect("the core names the terminal");
+
+        for path in [
+            "/api/health",
+            "/api/tuis",
+            "/api/cost",
+            "/api/cost?agent=main",
+            "/api/events/history",
+            "/api/sessions",
+        ] {
+            let (status, body) = get(&preview, path, None).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{path}: {body}");
+            assert!(json_of(&body)["hint"].is_string(), "{path}: {body}");
+
+            // The health snapshot is process-wide and its `updated_at` is the
+            // moment it was taken, so it is compared without that, and again
+            // if a parallel test touched a component in between.
+            let comparable = |body: &str| {
+                let mut body = json_of(body);
+                if let Some(health) = body.get_mut("health").and_then(|h| h.as_object_mut()) {
+                    health.remove("updated_at");
+                }
+                body
+            };
+            for attempt in 0.. {
+                let (status, served) = get(&preview, path, Some(TOKEN)).await;
+                assert_eq!(status, StatusCode::OK, "{path}: {served}");
+                let in_process = in_process_body(&state, &rpc, path).await;
+                if comparable(&served) == comparable(&in_process) {
+                    break;
+                }
+                assert!(
+                    attempt < 20,
+                    "{path}: the preview answered {served}, the in-process gateway {in_process}"
+                );
+            }
+        }
+
+        let (_, body) = get(&preview, "/api/tuis", Some(TOKEN)).await;
+        let listed: Vec<String> = json_of(&body)["tuis"]
+            .as_array()
+            .expect("tuis")
+            .iter()
+            .map(|tui| tui["tui_id"].as_str().expect("an id").to_owned())
+            .collect();
+        assert_eq!(listed, [terminal_id], "{body}");
+        assert!(
+            core.ctx
+                .tui_registry
+                .list()
+                .iter()
+                .any(|tui| tui.client_kind.as_deref() == Some("gateway")),
+            "the core registered the gateway's connection as a gateway's"
+        );
+        let (_, body) = get(&preview, "/api/sessions", Some(TOKEN)).await;
+        assert_eq!(
+            json_of(&body)["sessions"][0]["session_id"],
+            "alpha",
+            "{body}"
+        );
+        let (_, body) = get(&preview, "/api/events/history", Some(TOKEN)).await;
+        assert_eq!(json_of(&body)["events"][0]["type"], "agent_start", "{body}");
+
+        drop(terminal);
         core.stop().await;
     }
 

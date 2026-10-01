@@ -15,6 +15,7 @@ use axum::response::{IntoResponse, Response};
 use http_body_util::BodyExt as _;
 use serde_json::{Value, json};
 use zeroclaw_config::cost::{CostTracker, TokenUsage};
+use zeroclaw_rpc_proto::types::CLIENT_KIND_GATEWAY;
 use zeroclaw_runtime::rpc::context::RpcContext;
 use zeroclaw_runtime::rpc::inproc::InprocConnector;
 use zeroclaw_runtime::rpc::tui_identity::TuiEntry;
@@ -195,20 +196,20 @@ async fn api_tuis_through_the_core_matches_the_in_process_body() {
         peer_label: "unix:parity".into(),
         transport: "unix".into(),
         env: HashMap::new(),
+        client_kind: None,
     });
 
     // As in production, the gateway's own core connection exists (and the
-    // core has registered it) before either body is read.
+    // core has registered it, as a gateway's) before either body is read.
     let through_core = harness.through_core().await;
-    assert!(
-        harness
-            .ctx
-            .tui_registry
-            .list()
-            .iter()
-            .any(|tui| tui.peer_label == zeroclaw_runtime::rpc::inproc::PEER_LABEL),
-        "the core registers the gateway's connection"
-    );
+    let own = harness
+        .ctx
+        .tui_registry
+        .list()
+        .into_iter()
+        .find(|tui| tui.peer_label == zeroclaw_runtime::rpc::inproc::PEER_LABEL)
+        .expect("the core registers the gateway's connection");
+    assert_eq!(own.client_kind.as_deref(), Some(CLIENT_KIND_GATEWAY));
     let in_process = body_of(
         handle_api_tuis(
             State(harness.state.clone()),
@@ -233,9 +234,12 @@ async fn api_tuis_through_the_core_matches_the_in_process_body() {
     let tuis = body["tuis"].as_array().expect("tuis");
     assert!(tuis.iter().any(|tui| tui["tui_id"] == "tui_parity"));
     assert!(
-        tuis.iter()
-            .all(|tui| tui["peer_label"] != zeroclaw_runtime::rpc::inproc::PEER_LABEL),
+        tuis.iter().all(|tui| tui["tui_id"] != own.tui_id.as_str()),
         "the gateway's own connections are not terminals: {body}"
+    );
+    assert!(
+        tuis.iter().all(|tui| tui.get("client_kind").is_none()),
+        "the route's rows carry no client kind: {body}"
     );
 }
 

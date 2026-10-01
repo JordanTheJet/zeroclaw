@@ -71,6 +71,7 @@ use zeroclaw_api::jsonrpc::error_codes::{
 use zeroclaw_rpc_client::{
     ClientError, ConnectOptions, ConnectionState, EndpointOwner, Method, RpcClient,
 };
+use zeroclaw_rpc_proto::types::CLIENT_KIND_GATEWAY;
 use zeroclaw_runtime::rpc::inproc::InprocConnector;
 
 use crate::principal_gate::AUTH_PROVIDER_HEADER;
@@ -374,11 +375,14 @@ impl HttpCredential<'_> {
     }
 
     /// The handshake options for this credential. Always carries the
-    /// bearer and the provider that must verify it.
+    /// bearer and the provider that must verify it, and declares the
+    /// connection a gateway's, so the core's `tui/list` does not pass it off
+    /// as a terminal. The declaration grants nothing.
     fn connect_options(&self) -> ConnectOptions {
         ConnectOptions {
             auth_token: Some(self.token.to_owned()),
             auth_provider: Some(self.provider.to_owned()),
+            client_capabilities: Some(serde_json::json!({ "client_kind": CLIENT_KIND_GATEWAY })),
             ..ConnectOptions::default()
         }
     }

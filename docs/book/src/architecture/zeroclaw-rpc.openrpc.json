@@ -1426,7 +1426,9 @@
               "null"
             ]
           },
-          "clientCapabilities": true,
+          "clientCapabilities": {
+            "description": "What the client supports. `client_kind` says what kind of client\nit is: a gateway sends `\"gateway\"` for the connections it opens on\nits callers' behalf. The kind is a label and grants nothing."
+          },
           "env": {
             "additionalProperties": {
               "type": "string"
@@ -4078,6 +4080,13 @@
       },
       "TuiListEntry": {
         "properties": {
+          "client_kind": {
+            "description": "The `clientCapabilities.client_kind` the connection declared on\n`initialize`, when the core knows that kind: `\"gateway\"` for a\ngateway's connection. Absent for a terminal and for a kind the core\ndoes not know. A label only.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "connected_at": {
             "description": "RFC 3339 timestamp (for gateway API / web frontend).",
             "type": "string"
@@ -4167,7 +4176,9 @@
         {
           "name": "clientCapabilities",
           "required": false,
-          "schema": true
+          "schema": {
+            "description": "What the client supports. `client_kind` says what kind of client\nit is: a gateway sends `\"gateway\"` for the connections it opens on\nits callers' behalf. The kind is a label and grants nothing."
+          }
         },
         {
           "name": "env",

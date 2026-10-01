@@ -64,6 +64,9 @@ rpc_type! {
         /// daemon on their behalf. Omitted by older clients; defaults to empty.
         #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
         pub env: std::collections::HashMap<String, String>,
+        /// What the client supports. `client_kind` says what kind of client
+        /// it is: a gateway sends `"gateway"` for the connections it opens on
+        /// its callers' behalf. The kind is a label and grants nothing.
         #[serde(
             default,
             rename = "clientCapabilities",
@@ -87,6 +90,12 @@ rpc_type! {
 fn default_protocol_version() -> u64 {
     crate::RPC_PROTOCOL_VERSION
 }
+
+/// The `clientCapabilities.client_kind` a gateway declares on `initialize`
+/// for each connection it opens on its callers' behalf. The core reports it
+/// as [`TuiListEntry::client_kind`] so a listing can tell those connections
+/// from terminals. It is a label: it grants nothing.
+pub const CLIENT_KIND_GATEWAY: &str = "gateway";
 
 rpc_type! {
     /// Command identity and accepted tokens advertised to an RPC client.
@@ -174,6 +183,12 @@ rpc_type! {
         pub peer_label: String,
         /// Transport protocol: `"unix"` or `"wss"`.
         pub transport: String,
+        /// The `clientCapabilities.client_kind` the connection declared on
+        /// `initialize`, when the core knows that kind: `"gateway"` for a
+        /// gateway's connection. Absent for a terminal and for a kind the core
+        /// does not know. A label only.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub client_kind: Option<String>,
     }
 }
 
@@ -1987,12 +2002,29 @@ mod tests {
             connected_at_unix: 1_750_000_000,
             peer_label: "desktop".into(),
             transport: "wss".into(),
+            client_kind: Some(CLIENT_KIND_GATEWAY.into()),
         };
         let v: Value = serde_json::to_value(&entry).unwrap();
         let back: TuiListEntry = serde_json::from_value(v).unwrap();
         assert_eq!(back.tui_id, entry.tui_id);
         assert_eq!(back.connected_at_unix, entry.connected_at_unix);
         assert_eq!(back.transport, entry.transport);
+        assert_eq!(back.client_kind.as_deref(), Some(CLIENT_KIND_GATEWAY));
+    }
+
+    #[test]
+    fn a_terminal_entry_carries_no_client_kind() {
+        let entry: TuiListEntry = serde_json::from_value(json!({
+            "tui_id": "tui-1",
+            "connected_at": "2026-06-29T10:00:00Z",
+            "connected_at_unix": 1_750_000_000,
+            "peer_label": "unix:pid=1,uid=501",
+            "transport": "unix",
+        }))
+        .unwrap();
+        assert!(entry.client_kind.is_none());
+        let v = serde_json::to_value(&entry).unwrap();
+        assert!(v.get("client_kind").is_none(), "{v}");
     }
 
     #[test]

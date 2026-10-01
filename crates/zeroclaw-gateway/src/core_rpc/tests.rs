@@ -278,6 +278,26 @@ async fn one_credential_under_two_providers_is_two_connections() {
 }
 
 #[tokio::test]
+async fn every_connection_declares_itself_a_gateway_client() {
+    let fake = FakeCore::accepting(&["zc_alice", "zc_bob"]);
+    let core = core_over(&fake, true, PoolLimits::default());
+
+    call_for(&core, "zc_alice").await;
+    match core
+        .access(&headers(Some("zc_bob"), Some("oidc.corp")))
+        .await
+    {
+        Ok(CoreAccess::Core(_)) => {}
+        _ => panic!("oidc selection is served by the core"),
+    }
+    let kinds: Vec<Value> = lock(&fake.handshakes)
+        .iter()
+        .map(|params| params["clientCapabilities"]["client_kind"].clone())
+        .collect();
+    assert_eq!(kinds, [json!("gateway"), json!("gateway")]);
+}
+
+#[tokio::test]
 async fn concurrent_first_requests_with_one_credential_share_one_dial() {
     let fake = FakeCore::accepting(&["zc_alice"]);
     let core = core_over(&fake, true, PoolLimits::default());

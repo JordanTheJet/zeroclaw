@@ -2,11 +2,13 @@
 //! daemon, reaching the core only through the daemon's local socket.
 //!
 //! This is a stretch preview, not a supported deployment. It serves the
-//! static dashboard, the OpenAPI document, its own health and a core-link
-//! diagnostic. Every other route the in-process gateway serves answers a
-//! distinct JSON refusal naming the route; nothing falls through to
-//! in-process state or to the dashboard's page fallback. Routes join as
-//! they are ported onto the core's RPC surface.
+//! static dashboard, the OpenAPI document, its own health, a core-link
+//! diagnostic, and the dashboard routes ported onto the core's RPC surface,
+//! with the same bodies the in-process gateway answers when a request
+//! reaches the core. Every other route the in-process gateway serves
+//! answers a distinct JSON refusal naming the route; nothing falls through
+//! to in-process state or to the dashboard's page fallback. Routes join as
+//! they are ported.
 //!
 //! It is configured from flags and the environment only and never reads
 //! `config.toml`. It runs as the same OS account as the core: every
@@ -15,13 +17,14 @@
 //! needs a credential of its own. Windows cannot make that check yet, so
 //! the preview refuses to start there.
 
+use std::future::Future;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use axum::Json;
 use axum::Router;
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::{Method as HttpMethod, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{MethodFilter, MethodRouter, get, on};
@@ -30,7 +33,8 @@ use zeroclaw_rpc_client::{
     ClientError, EndpointOwner, EndpointRejection, Method, RPC_PROTOCOL_VERSION, RpcClient,
 };
 
-use crate::core_rpc::{CoreAccess, CoreError, CoreRpc};
+use crate::api::CostQuery;
+use crate::core_rpc::{CoreAccess, CoreCall, CoreError, CoreRpc};
 
 /// Where the dashboard reaches when no `--listen` is given: the address the
 /// in-process gateway uses.
@@ -318,17 +322,12 @@ const REFUSED: &[(&str, &str, Refusal)] = &[
     ("/metrics", "GET", Refusal::Deferred("metrics")),
     // Dashboard routes not yet served through the core.
     ("/api/status", "GET", Refusal::NotPorted),
-    ("/api/health", "GET", Refusal::NotPorted),
-    ("/api/tuis", "GET", Refusal::NotPorted),
-    ("/api/cost", "GET", Refusal::NotPorted),
     ("/api/logs", "GET", Refusal::NotPorted),
     ("/api/doctor", "GET,POST", Refusal::NotPorted),
     ("/api/events", "GET", Refusal::NotPorted),
-    ("/api/events/history", "GET", Refusal::NotPorted),
     ("/api/version/check", "GET", Refusal::NotPorted),
     ("/api/version/upgrade", "POST", Refusal::NotPorted),
     ("/api/version/upgrade/status", "GET", Refusal::NotPorted),
-    ("/api/sessions", "GET", Refusal::NotPorted),
     ("/api/sessions/running", "GET", Refusal::NotPorted),
     ("/api/sessions/{id}", "DELETE,PUT", Refusal::NotPorted),
     (
@@ -538,7 +537,12 @@ pub fn router(core: CoreRpc, endpoint: PathBuf, web_dist: Option<PathBuf>) -> Ro
             get(crate::openapi::handle_openapi_json),
         )
         .route("/api/docs", get(crate::openapi::handle_docs))
-        .route(CORE_LINK_PATH, get(core_link));
+        .route(CORE_LINK_PATH, get(core_link))
+        .route("/api/health", get(api_health))
+        .route("/api/tuis", get(api_tuis))
+        .route("/api/cost", get(api_cost))
+        .route("/api/events/history", get(api_events_history))
+        .route("/api/sessions", get(api_sessions_list));
     for &(path, methods, refusal) in REFUSED {
         let handler: MethodRouter<PreviewState> = on(
             method_filter(methods),
@@ -736,17 +740,80 @@ async fn health(State(state): State<PreviewState>) -> Response {
     }
 }
 
+/// The caller's own core connection, or why it has none.
+fn attached(access: Result<CoreAccess, CoreError>) -> Result<CoreCall, CoreError> {
+    match access? {
+        CoreAccess::Core(call) => Ok(call),
+        // A gateway attached to a socket never serves in-process.
+        CoreAccess::InProcess => Err(CoreError::Unavailable(
+            "this gateway has no core attached".into(),
+        )),
+    }
+}
+
+/// A dashboard route the core serves: `body` is the route's core path, the
+/// one the in-process gateway runs when the same request reaches the core.
+/// A refusal carries the hint the dashboard shows.
+async fn served<F, Fut>(access: Result<CoreAccess, CoreError>, body: F) -> Response
+where
+    F: FnOnce(CoreCall) -> Fut,
+    Fut: Future<Output = Result<Response, CoreError>>,
+{
+    let answered = match attached(access) {
+        Ok(call) => body(call).await,
+        Err(error) => Err(error),
+    };
+    answered.unwrap_or_else(explain)
+}
+
+/// `GET /api/health`
+async fn api_health(access: Result<CoreAccess, CoreError>) -> Response {
+    served(access, |call| async move {
+        crate::api::api_health_through_core(&call).await
+    })
+    .await
+}
+
+/// `GET /api/tuis`
+async fn api_tuis(access: Result<CoreAccess, CoreError>) -> Response {
+    served(access, |call| async move {
+        crate::api::api_tuis_through_core(&call).await
+    })
+    .await
+}
+
+/// `GET /api/cost`
+async fn api_cost(
+    Query(query): Query<CostQuery>,
+    access: Result<CoreAccess, CoreError>,
+) -> Response {
+    served(access, |call| async move {
+        crate::api::api_cost_through_core(&call, &query).await
+    })
+    .await
+}
+
+/// `GET /api/events/history`
+async fn api_events_history(access: Result<CoreAccess, CoreError>) -> Response {
+    served(access, |call| async move {
+        crate::sse::events_history_through_core(&call).await
+    })
+    .await
+}
+
+/// `GET /api/sessions`
+async fn api_sessions_list(access: Result<CoreAccess, CoreError>) -> Response {
+    served(access, |call| async move {
+        crate::api::api_sessions_list_through_core(&call).await
+    })
+    .await
+}
+
 /// `GET /api/gateway/core`: which principal the caller's credential binds
 /// and which core answers, over the caller's own core connection.
 async fn core_link(access: Result<CoreAccess, CoreError>) -> Response {
-    let call = match access {
-        Ok(CoreAccess::Core(call)) => call,
-        // A gateway attached to a socket never serves in-process.
-        Ok(CoreAccess::InProcess) => {
-            return explain(CoreError::Unavailable(
-                "this gateway has no core attached".into(),
-            ));
-        }
+    let call = match attached(access) {
+        Ok(call) => call,
         Err(error) => return explain(error),
     };
     let principal = call.principal_id().map(str::to_owned);
