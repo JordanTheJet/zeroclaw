@@ -831,6 +831,54 @@ mod tests {
         }
     }
 
+    /// Serve the scripted daemon on the named pipe `name`.
+    #[cfg(windows)]
+    fn fake_daemon_on_pipe(name: &std::path::Path) {
+        let mut server = tokio::net::windows::named_pipe::ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(name)
+            .expect("create the test pipe");
+        tokio::spawn(async move {
+            server.connect().await.expect("accept the client");
+            let (mut client_half, server_half) = tokio::io::duplex(64 * 1024);
+            let _seen = fake_daemon(server_half, None);
+            let _ = tokio::io::copy_bidirectional(&mut server, &mut client_half).await;
+        });
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn local_pipe_endpoints_fall_through_to_the_legacy_pipe() {
+        // The real names for a data directory: nothing serves the stable
+        // pipe, a daemon serves the legacy one.
+        let data_dir =
+            std::env::temp_dir().join(format!("zc-rpcc-{}-pipe-fallback", std::process::id()));
+        let endpoints = crate::endpoint::client_endpoints_with(None, &data_dir);
+        let legacy = endpoints
+            .legacy
+            .clone()
+            .expect("a Windows client without an override carries the legacy pipe");
+        fake_daemon_on_pipe(&legacy);
+        let client = RpcClient::connect_local_endpoints(&endpoints, ConnectOptions::default())
+            .await
+            .expect("the legacy pipe answers when nothing serves the stable one");
+        assert_eq!(client.handshake().server_version, "test");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn local_pipe_endpoints_reach_a_daemon_on_the_stable_pipe() {
+        let data_dir =
+            std::env::temp_dir().join(format!("zc-rpcc-{}-pipe-primary", std::process::id()));
+        let endpoints = crate::endpoint::client_endpoints_with(None, &data_dir);
+        assert!(endpoints.legacy.is_some());
+        fake_daemon_on_pipe(&endpoints.primary);
+        let client = RpcClient::connect_local_endpoints(&endpoints, ConnectOptions::default())
+            .await
+            .expect("the stable pipe answers");
+        assert_eq!(client.handshake().server_version, "test");
+    }
+
     #[tokio::test]
     async fn handshake_and_request_round_trip() {
         let (client_half, server_half) = tokio::io::duplex(64 * 1024);

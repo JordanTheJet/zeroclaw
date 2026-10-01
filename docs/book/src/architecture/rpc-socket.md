@@ -15,15 +15,33 @@ same machine do not collide. The data dir is derived from the config dir
 |---|---|
 | Linux | `<data_dir>/daemon.sock` (Unix domain socket) |
 | macOS | `<data_dir>/daemon.sock` (Unix domain socket) |
-| Windows | `\\.\pipe\zeroclaw-daemon-<hash>`, where `<hash>` is the 64-bit FNV-1a hash of `data_dir` with ASCII letters lower-cased |
+| Windows | `\\.\pipe\zeroclaw-daemon-<hash>`, where `<hash>` is a 64-bit FNV-1a hash of `data_dir` (below) |
 
-The daemon and every client resolve the endpoint with the same function, so
-they always agree. The Windows hash is a fixed function, so the name is the same
-for every release and toolchain. Releases before it named the pipe
-`\\.\pipe\zeroclaw-<hash>` from Rust's `DefaultHasher`, which is not stable
-across toolchains. For one release, clients also try that older name when
-nothing listens at the new one, so they still reach a daemon an earlier release
-started. The daemon binds only the new name.
+The daemon and every client derive the endpoint from a data directory with the
+same function, so for the same data directory they agree. The Windows hash
+input is fixed, so the name is the same for every release and toolchain:
+
+- `data_dir` as UTF-16 code units, read without loss.
+- Spellings of one directory made equal: `\` and `/` both separate, repeated
+  and trailing separators and `.` components are dropped. Verbatim `\\?\`
+  paths separate only on `\` and keep `.`. `..` is not resolved.
+- ASCII letters lower-cased. Other letters keep their case, because Windows
+  folds them per volume and a directory can be case-sensitive.
+- Each unit hashed as two little-endian bytes.
+
+Releases before this named the pipe `\\.\pipe\zeroclaw-<hash>` from Rust's
+`DefaultHasher`, which is not stable across toolchains. For one release,
+clients also try that older name when nothing listens at the new one, so they
+find a daemon an earlier binary started that has not been restarted. Finding
+it does not make it usable: zerocode still requires the daemon's version to
+equal its own, so against an older daemon it reports the mismatch, which means
+restart the daemon, instead of starting a second daemon beside it. The daemon
+binds only the new name.
+
+Clients choose the data directory themselves. zerocode uses
+`<config_dir>/data`; it does not follow `ZEROCLAW_DATA_DIR`,
+`ZEROCLAW_WORKSPACE` or the Homebrew layout. Against a daemon that uses one of
+those, set `ZEROCLAW_SOCKET` for zerocode.
 
 Override with the `ZEROCLAW_SOCKET` environment variable on either platform. A
 blank value is ignored, and surrounding whitespace is trimmed:

@@ -12,10 +12,12 @@
 //! The Windows name used to come from `std`'s `DefaultHasher`, whose output
 //! the standard library does not promise to keep across releases, so two
 //! binaries built by different toolchains could derive different names for
-//! one data directory. The name now comes from FNV-1a, a fixed published
-//! function. For one release a client also tries the old name, so it still
-//! reaches a daemon that was started by an older binary and not yet
-//! restarted. The daemon itself binds only the new name.
+//! one data directory. The name now comes from FNV-1a over a specified
+//! encoding of the directory; see [`pipe_name`]. For one release a client
+//! also tries the old name when nothing listens at the new one, so it still
+//! finds a daemon that an older binary started and nobody has restarted yet.
+//! Finding that daemon is all the fallback does: whether the client can then
+//! use it is up to the client's handshake. The daemon binds only the new name.
 
 use std::path::{Path, PathBuf};
 
@@ -34,13 +36,16 @@ pub fn resolve_endpoint(data_dir: &Path) -> PathBuf {
 /// trimmed.
 #[must_use]
 pub fn resolve_endpoint_with(socket_override: Option<&str>, data_dir: &Path) -> PathBuf {
-    match socket_override
+    explicit_endpoint(socket_override).unwrap_or_else(|| default_endpoint(data_dir))
+}
+
+/// The endpoint an override names, if it names one: trimmed, and `None` when
+/// blank.
+fn explicit_endpoint(socket_override: Option<&str>) -> Option<PathBuf> {
+    socket_override
         .map(str::trim)
         .filter(|path| !path.is_empty())
-    {
-        Some(path) => PathBuf::from(path),
-        None => default_endpoint(data_dir),
-    }
+        .map(PathBuf::from)
 }
 
 /// The platform default endpoint under `data_dir`, ignoring the override.
@@ -57,17 +62,83 @@ pub fn default_endpoint(data_dir: &Path) -> PathBuf {
     PathBuf::from(pipe_name(data_dir))
 }
 
-/// The named-pipe name for `data_dir`. Defined on every platform so its
-/// stability can be tested anywhere; only Windows uses it.
+/// The named-pipe name for `data_dir`: `\\.\pipe\zeroclaw-daemon-` followed
+/// by 16 hex digits of a 64-bit FNV-1a hash. Every binary derives the same
+/// name because the hash input is fixed:
 ///
-/// The key is the data directory's exact bytes with ASCII letters folded to
-/// lower case, because Windows compares paths case-insensitively. Non-ASCII
-/// bytes are kept as they are, so the name never depends on Unicode case
-/// tables that change between toolchains.
+/// 1. The path as UTF-16 code units. On Windows these come from
+///    `encode_wide`, which is lossless, unpaired surrogates included.
+/// 2. Spellings Windows treats as one directory are made equal. `\` and `/`
+///    are both separators (after a verbatim `\\?\` prefix only `\` is), a
+///    run of separators inside the path counts as one, a trailing separator
+///    is dropped, and `.` components are dropped (verbatim paths keep them).
+///    A leading `\` or `\\` is kept, so rooted, UNC and drive-relative paths
+///    stay distinct.
+/// 3. ASCII letters are lower-cased, so drive letters and ASCII names match
+///    in either case. Other letters are left alone: Windows folds them with a
+///    per-volume table that cannot be reproduced stably, and a directory can
+///    be case-sensitive.
+/// 4. Each unit is hashed as two little-endian bytes.
+///
+/// `..` is not resolved and links are not followed; both need the
+/// filesystem. The function is defined on every platform so its values can
+/// be tested anywhere. Off Windows the units come from the path's Unicode
+/// form, which equals `encode_wide` for every path that is valid Unicode.
 #[must_use]
 pub fn pipe_name(data_dir: &Path) -> String {
-    let key = data_dir.as_os_str().as_encoded_bytes().to_ascii_lowercase();
-    format!(r"\\.\pipe\zeroclaw-daemon-{:016x}", fnv1a_64(&key))
+    pipe_name_from_units(&path_units(data_dir))
+}
+
+#[cfg(windows)]
+fn path_units(path: &Path) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+    path.as_os_str().encode_wide().collect()
+}
+
+#[cfg(not(windows))]
+fn path_units(path: &Path) -> Vec<u16> {
+    path.to_string_lossy().encode_utf16().collect()
+}
+
+fn pipe_name_from_units(units: &[u16]) -> String {
+    let key = pipe_key(units);
+    let hash = fnv1a_64(key.iter().flat_map(|unit| unit.to_le_bytes()));
+    format!(r"\\.\pipe\zeroclaw-daemon-{hash:016x}")
+}
+
+/// Steps 2 and 3 of [`pipe_name`]: one spelling per directory.
+fn pipe_key(units: &[u16]) -> Vec<u16> {
+    const BACKSLASH: u16 = b'\\' as u16;
+    const SLASH: u16 = b'/' as u16;
+    const DOT: u16 = b'.' as u16;
+    const VERBATIM_PREFIX: [u16; 4] = [BACKSLASH, BACKSLASH, b'?' as u16, BACKSLASH];
+
+    let verbatim = units.starts_with(&VERBATIM_PREFIX);
+    let is_separator = |unit: &u16| *unit == BACKSLASH || (!verbatim && *unit == SLASH);
+    let leading = units
+        .iter()
+        .take_while(|unit| is_separator(unit))
+        .count()
+        .min(2);
+
+    let mut key = vec![BACKSLASH; leading];
+    let components = units
+        .split(is_separator)
+        .filter(|component| !component.is_empty() && (verbatim || component[..] != [DOT]));
+    for (index, component) in components.enumerate() {
+        if index > 0 {
+            key.push(BACKSLASH);
+        }
+        key.extend(component.iter().map(|&unit| fold_ascii(unit)));
+    }
+    key
+}
+
+fn fold_ascii(unit: u16) -> u16 {
+    match u8::try_from(unit) {
+        Ok(byte) => u16::from(byte.to_ascii_lowercase()),
+        Err(_) => unit,
+    }
 }
 
 /// The named-pipe name daemons used before the stable hash, derived with
@@ -110,10 +181,29 @@ pub fn client_endpoints(data_dir: &Path) -> ClientEndpoints {
 /// the environment.
 #[must_use]
 pub fn client_endpoints_with(socket_override: Option<&str>, data_dir: &Path) -> ClientEndpoints {
-    let primary = resolve_endpoint_with(socket_override, data_dir);
-    let overridden = primary != default_endpoint(data_dir);
-    let legacy = (cfg!(windows) && !overridden).then(|| PathBuf::from(legacy_pipe_name(data_dir)));
-    ClientEndpoints { primary, legacy }
+    endpoints_with_fallback(socket_override, data_dir, cfg!(windows))
+}
+
+/// [`client_endpoints_with`] with the platform's legacy fallback passed in,
+/// so the Windows rule is tested on every platform.
+fn endpoints_with_fallback(
+    socket_override: Option<&str>,
+    data_dir: &Path,
+    legacy_fallback: bool,
+) -> ClientEndpoints {
+    // Whether an override was given is read from the override itself: one
+    // that happens to name the default endpoint is still an explicit choice
+    // and must not open a second one.
+    match explicit_endpoint(socket_override) {
+        Some(primary) => ClientEndpoints {
+            primary,
+            legacy: None,
+        },
+        None => ClientEndpoints {
+            primary: default_endpoint(data_dir),
+            legacy: legacy_fallback.then(|| PathBuf::from(legacy_pipe_name(data_dir))),
+        },
+    }
 }
 
 /// Data directories every endpoint caller's agreement test resolves. One
@@ -131,11 +221,11 @@ pub const AGREEMENT_DATA_DIRS: &[&str] = &[
 
 /// 64-bit FNV-1a: a fixed, published hash, so the pipe name is the same for
 /// every binary that ever computes it.
-fn fnv1a_64(bytes: &[u8]) -> u64 {
+fn fnv1a_64(bytes: impl IntoIterator<Item = u8>) -> u64 {
     const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
     const PRIME: u64 = 0x0000_0100_0000_01b3;
-    bytes.iter().fold(OFFSET_BASIS, |hash, byte| {
-        (hash ^ u64::from(*byte)).wrapping_mul(PRIME)
+    bytes.into_iter().fold(OFFSET_BASIS, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(PRIME)
     })
 }
 
@@ -150,28 +240,99 @@ mod tests {
         // daemon from new clients; do not update them to make a test pass.
         assert_eq!(
             pipe_name(Path::new(r"C:\Users\Alice\.zeroclaw\data")),
-            r"\\.\pipe\zeroclaw-daemon-1ec1cf469dce10fd"
+            r"\\.\pipe\zeroclaw-daemon-811bcf3aa85679f9"
         );
         assert_eq!(
             pipe_name(Path::new("/home/alice/.zeroclaw/data")),
-            r"\\.\pipe\zeroclaw-daemon-916a747457f5883f"
+            r"\\.\pipe\zeroclaw-daemon-679420572319782d"
         );
         assert_eq!(
             pipe_name(Path::new(r"D:\ZeroClaw\Data")),
-            r"\\.\pipe\zeroclaw-daemon-c5c6349b4cd0d584"
+            r"\\.\pipe\zeroclaw-daemon-c58e01b43a3f5ca0"
+        );
+        assert_eq!(
+            pipe_name(Path::new(r"\\server\share\zeroclaw\data")),
+            r"\\.\pipe\zeroclaw-daemon-e9dc363b4b04616a"
         );
     }
 
     #[test]
-    fn pipe_names_fold_case_and_separate_directories() {
-        assert_eq!(
-            pipe_name(Path::new(r"C:\Users\Alice\.zeroclaw\data")),
-            pipe_name(Path::new(r"c:\users\alice\.zeroclaw\data"))
-        );
+    fn spellings_of_one_windows_directory_share_a_pipe() {
+        let canonical = pipe_name(Path::new(r"C:\Users\Alice\.zeroclaw\data"));
+        for spelling in [
+            r"c:\users\alice\.zeroclaw\data",
+            "C:/Users/Alice/.zeroclaw/data",
+            "C:\\Users\\Alice\\.zeroclaw\\data\\",
+            r"C:\Users\\Alice\.zeroclaw\\\data",
+            r"C:\Users\.\Alice\.zeroclaw/./data/",
+            r"C:\Users/Alice\.zeroclaw/data",
+        ] {
+            assert_eq!(pipe_name(Path::new(spelling)), canonical, "{spelling}");
+        }
+    }
+
+    #[test]
+    fn distinct_windows_directories_get_distinct_pipes() {
+        let names = [
+            r"C:\a\data",
+            r"C:\b\data",
+            r"C:data",
+            r"\data",
+            r"\\data\share",
+            "data",
+            r"C:\a\..\data",
+            r"C:\data",
+            r"\\?\C:\a\.\data",
+            r"\\?\C:\a\data",
+            r"\\?\C:/a/data",
+        ]
+        .map(|name| pipe_name(Path::new(name)));
+        for (i, left) in names.iter().enumerate() {
+            for right in &names[i + 1..] {
+                assert_ne!(left, right);
+            }
+        }
+    }
+
+    #[test]
+    fn only_ascii_letters_are_case_folded() {
+        // The supported identity: ASCII case folds, other letters do not.
+        // Windows folds those with a per-volume table, and a directory can
+        // be case-sensitive, so no fixed rule matches it for every volume.
         assert_ne!(
-            pipe_name(Path::new(r"C:\a\data")),
-            pipe_name(Path::new(r"C:\b\data"))
+            pipe_name(Path::new(r"C:\Users\Émile\.zeroclaw\data")),
+            pipe_name(Path::new(r"C:\Users\émile\.zeroclaw\data"))
         );
+        // The ASCII letters around a non-ASCII one still fold.
+        assert_eq!(
+            pipe_name(Path::new(r"C:\Users\ÉMILE\.zeroclaw\data")),
+            pipe_name(Path::new(r"c:\users\Émile\.zeroclaw\data"))
+        );
+    }
+
+    #[test]
+    fn every_utf16_unit_reaches_the_hash() {
+        // Two unpaired surrogates: a lossy conversion would turn both into
+        // U+FFFD and give them one pipe.
+        let drive = [u16::from(b'C'), u16::from(b':'), u16::from(b'\\')];
+        let first = [drive.as_slice(), &[0xd800]].concat();
+        let second = [drive.as_slice(), &[0xd801]].concat();
+        assert_ne!(pipe_name_from_units(&first), pipe_name_from_units(&second));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_paths_are_read_without_loss() {
+        use std::os::windows::ffi::OsStringExt;
+        let path = |unit| {
+            PathBuf::from(std::ffi::OsString::from_wide(&[
+                u16::from(b'C'),
+                u16::from(b':'),
+                u16::from(b'\\'),
+                unit,
+            ]))
+        };
+        assert_ne!(pipe_name(&path(0xd800)), pipe_name(&path(0xd801)));
     }
 
     #[test]
@@ -215,18 +376,43 @@ mod tests {
         let dir = Path::new(r"C:\Users\Alice\.zeroclaw\data");
         let defaults = client_endpoints_with(None, dir);
         assert_eq!(defaults.primary, default_endpoint(dir));
-        if cfg!(windows) {
-            assert_eq!(defaults.legacy, Some(PathBuf::from(legacy_pipe_name(dir))));
-        } else {
-            assert_eq!(defaults.legacy, None);
-        }
+        assert_eq!(defaults.legacy.is_some(), cfg!(windows));
         assert_eq!(defaults.iter().count(), 1 + usize::from(cfg!(windows)));
 
-        let overridden = client_endpoints_with(Some(r"\\.\pipe\mine"), dir);
+        // The Windows rule, on every platform.
+        for blank in [None, Some(""), Some(" \t")] {
+            let endpoints = endpoints_with_fallback(blank, dir, true);
+            assert_eq!(endpoints.primary, default_endpoint(dir), "{blank:?}");
+            assert_eq!(
+                endpoints.legacy,
+                Some(PathBuf::from(legacy_pipe_name(dir))),
+                "{blank:?}"
+            );
+        }
+        let overridden = endpoints_with_fallback(Some(r"\\.\pipe\mine"), dir, true);
         assert_eq!(overridden.primary, PathBuf::from(r"\\.\pipe\mine"));
         assert_eq!(
             overridden.legacy, None,
             "an explicit endpoint has no fallback"
         );
+    }
+
+    #[test]
+    fn an_explicit_override_naming_the_default_endpoint_has_no_fallback() {
+        // Naming the default endpoint explicitly is still an explicit choice:
+        // the client dials that endpoint and nothing else.
+        let dir = Path::new(r"C:\Users\Alice\.zeroclaw\data");
+        let default = default_endpoint(dir);
+        let default = default.to_str().expect("the default endpoint is Unicode");
+        for explicit in [default.to_string(), format!("  {default}\n")] {
+            for endpoints in [
+                endpoints_with_fallback(Some(&explicit), dir, true),
+                client_endpoints_with(Some(&explicit), dir),
+            ] {
+                assert_eq!(endpoints.primary, PathBuf::from(default), "{explicit:?}");
+                assert_eq!(endpoints.legacy, None, "{explicit:?}");
+                assert_eq!(endpoints.iter().count(), 1);
+            }
+        }
     }
 }

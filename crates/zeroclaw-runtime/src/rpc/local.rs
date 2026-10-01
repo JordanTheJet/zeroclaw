@@ -1461,7 +1461,6 @@ mod tests {
         drop(guard);
     }
 
-    #[cfg(unix)]
     #[test]
     fn socket_path_is_the_shared_resolver_for_every_data_dir() {
         // The daemon binds what every client resolves; the client crates run
@@ -1480,6 +1479,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn socket_path_length_check_matches_the_platform_bind_limit() {
         use std::os::unix::net::SocketAddr;
