@@ -1870,11 +1870,12 @@ fn health_response(mut health: serde_json::Value) -> serde_json::Value {
 //   shape, so that move changes only where they come from. The standalone
 //   preview gateway serves it through the core already
 //   (`api_sessions_list_through_core`).
-// - The routes that address one session by id: the core resolves a session
-//   id by trying `rpc_{id}`, `gw_{id}` and `{id}` in turn, so it cannot be
-//   told to act on exactly the row this gateway's resolver picked. A
-//   competing row with another prefix would be read or deleted instead. That
-//   needs an exact durable-row reference in the core.
+// - The routes that address one session by id: the core takes the exact
+//   stored keys this gateway's resolver tries (`session_keys`), and the
+//   standalone preview gateway serves messages, state and delete that way
+//   (`api_session_*_through_core`). This gateway keeps its own bodies: its
+//   core connection sees only the sessions it opened itself, as for the
+//   listing, and its delete must settle its own turns first (below).
 // - A delete must first cancel and wait for the gateway's own chat turn,
 //   which only the gateway can do, while only the core can authorize the
 //   delete. Until those turns run in the core, the two cannot be made one
