@@ -53,7 +53,7 @@ use std::time::Duration;
 use axum::Json;
 use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -69,7 +69,7 @@ use zeroclaw_api::jsonrpc::error_codes::{
     SOP_NOT_FOUND, VERSION_MISMATCH,
 };
 use zeroclaw_rpc_client::{
-    ClientError, ConnectOptions, ConnectionState, EndpointOwner, Method, RpcClient,
+    ClientError, ConnectOptions, ConnectionState, EndpointOwner, Method, Notification, RpcClient,
 };
 use zeroclaw_rpc_proto::types::CLIENT_KIND_GATEWAY;
 use zeroclaw_runtime::rpc::inproc::InprocConnector;
@@ -229,6 +229,50 @@ impl<S: Send + Sync> FromRequestParts<S> for CoreAccess {
         };
         core.access(&parts.headers).await
     }
+}
+
+/// [`CoreAccess`] for a WebSocket upgrade. A browser cannot set an
+/// `Authorization` header on a WebSocket, so the dashboard offers its bearer
+/// as a `bearer.<token>` subprotocol, which the in-process sockets accept.
+/// That bearer counts only when the request carries no `Authorization`
+/// header; the decision is then exactly [`CoreRpc::access`]'s.
+pub struct WsCoreAccess(pub CoreAccess);
+
+impl<S: Send + Sync> FromRequestParts<S> for WsCoreAccess {
+    type Rejection = CoreError;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        let Some(core) = parts.extensions.get::<CoreRpc>().cloned() else {
+            return Err(CoreError::Unavailable(
+                "the core connection is not configured for this route".into(),
+            ));
+        };
+        let offered = subprotocol_bearer(&parts.headers)
+            .filter(|_| !parts.headers.contains_key(header::AUTHORIZATION))
+            .and_then(|token| HeaderValue::from_str(&format!("Bearer {token}")).ok());
+        let access = match offered {
+            Some(authorization) => {
+                let mut headers = parts.headers.clone();
+                headers.insert(header::AUTHORIZATION, authorization);
+                core.access(&headers).await
+            }
+            None => core.access(&parts.headers).await,
+        };
+        access.map(Self)
+    }
+}
+
+/// The bearer a WebSocket client offers as a `bearer.<token>` subprotocol.
+pub(crate) fn subprotocol_bearer(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(header::SEC_WEBSOCKET_PROTOCOL)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|protos| {
+            protos
+                .split(',')
+                .map(str::trim)
+                .find_map(|p| p.strip_prefix("bearer."))
+        })
 }
 
 /// Why a request could not be served through the core. Each case answers
@@ -853,6 +897,18 @@ impl CoreCall {
                 )))
             }
         }
+    }
+
+    /// The core's notifications on this caller's connection, for every
+    /// subscription it holds. Take the receiver before subscribing: a
+    /// notification can arrive ahead of the subscribe result.
+    pub fn notifications(&self) -> tokio::sync::broadcast::Receiver<Notification> {
+        self.pooled.client.notifications()
+    }
+
+    /// Resolve once this caller's core connection has ended.
+    pub async fn closed(&self) {
+        self.pooled.client.closed().await;
     }
 
     /// [`CoreCall::request`], decoding the result into `T`. A result that

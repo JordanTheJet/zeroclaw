@@ -24,8 +24,8 @@ use std::sync::Arc;
 
 use axum::Json;
 use axum::Router;
-use axum::extract::{Query, State};
-use axum::http::{Method as HttpMethod, StatusCode, Uri};
+use axum::extract::{Query, State, WebSocketUpgrade};
+use axum::http::{HeaderMap, Method as HttpMethod, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{MethodFilter, MethodRouter, get, on};
 use serde_json::json;
@@ -34,7 +34,8 @@ use zeroclaw_rpc_client::{
 };
 
 use crate::api::CostQuery;
-use crate::core_rpc::{CoreAccess, CoreCall, CoreError, CoreRpc};
+use crate::core_rpc::{CoreAccess, CoreCall, CoreError, CoreRpc, WsCoreAccess};
+use crate::version::CheckQuery;
 
 /// Where the dashboard reaches when no `--listen` is given: the address the
 /// in-process gateway uses.
@@ -325,7 +326,6 @@ const REFUSED: &[(&str, &str, Refusal)] = &[
     ("/api/logs", "GET", Refusal::NotPorted),
     ("/api/doctor", "GET,POST", Refusal::NotPorted),
     ("/api/events", "GET", Refusal::NotPorted),
-    ("/api/version/check", "GET", Refusal::NotPorted),
     ("/api/version/upgrade", "POST", Refusal::NotPorted),
     ("/api/version/upgrade/status", "GET", Refusal::NotPorted),
     ("/api/sessions/running", "GET", Refusal::NotPorted),
@@ -338,7 +338,6 @@ const REFUSED: &[(&str, &str, Refusal)] = &[
     ("/api/sessions/{id}/state", "GET", Refusal::NotPorted),
     ("/api/sessions/{id}/abort", "POST", Refusal::NotPorted),
     ("/ws/chat", "GET", Refusal::NotPorted),
-    ("/ws/sops/runs", "GET", Refusal::NotPorted),
     ("/ws/canvas/{id}", "GET", Refusal::NotPorted),
     ("/api/config", "GET,PATCH,OPTIONS", Refusal::NotPorted),
     (
@@ -542,7 +541,9 @@ pub fn router(core: CoreRpc, endpoint: PathBuf, web_dist: Option<PathBuf>) -> Ro
         .route("/api/tuis", get(api_tuis))
         .route("/api/cost", get(api_cost))
         .route("/api/events/history", get(api_events_history))
-        .route("/api/sessions", get(api_sessions_list));
+        .route("/api/sessions", get(api_sessions_list))
+        .route("/api/version/check", get(api_version_check))
+        .route("/ws/sops/runs", get(ws_sop_runs));
     for &(path, methods, refusal) in REFUSED {
         let handler: MethodRouter<PreviewState> = on(
             method_filter(methods),
@@ -805,6 +806,31 @@ async fn api_events_history(access: Result<CoreAccess, CoreError>) -> Response {
 async fn api_sessions_list(access: Result<CoreAccess, CoreError>) -> Response {
     served(access, |call| async move {
         crate::api::api_sessions_list_through_core(&call).await
+    })
+    .await
+}
+
+/// `GET /api/version/check`: the core's own release check.
+async fn api_version_check(
+    Query(query): Query<CheckQuery>,
+    access: Result<CoreAccess, CoreError>,
+) -> Response {
+    served(access, |call| async move {
+        crate::version::version_check_through_core(&call, &query).await
+    })
+    .await
+}
+
+/// `GET /ws/sops/runs`: the core's SOP run feed, in the in-process socket's
+/// frames. The dashboard offers its bearer as a WebSocket subprotocol.
+async fn ws_sop_runs(
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+    access: Result<WsCoreAccess, CoreError>,
+) -> Response {
+    let ws = crate::ws_sop_runs::negotiate(ws, &headers);
+    served(access.map(|WsCoreAccess(access)| access), |call| {
+        crate::ws_sop_runs::sop_runs_through_core(call, ws)
     })
     .await
 }

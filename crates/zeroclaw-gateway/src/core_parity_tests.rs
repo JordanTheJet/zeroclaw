@@ -3,8 +3,9 @@
 //! Each test runs a route's handler twice over one shared state, once
 //! in-process and once through the daemon's real in-process connector, and
 //! requires the same status and body. The state the two paths read (cost
-//! tracker, TUI registry, event history, pairing) is the same instance, as
-//! it is under the daemon.
+//! tracker, TUI registry, event history, pairing, SOP engine) is the same
+//! instance, as it is under the daemon. The SOP runs socket is served on a
+//! loopback port both ways and must send the same frames.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -24,6 +25,8 @@ use crate::AppState;
 use crate::api::{CostQuery, handle_api_cost, handle_api_health, handle_api_tuis};
 use crate::core_rpc::{CoreAccess, CoreRpc};
 use crate::sse::{EventBuffer, handle_events_history};
+use crate::version::{CheckQuery, VersionCheckResponse, handle_version_check};
+use zeroclaw_runtime::sop::{SopEngine, SopRunStatus, SopRunSummary};
 
 const TOKEN: &str = "zc_parity_operator";
 
@@ -43,6 +46,18 @@ impl Drop for Harness {
 
 impl Harness {
     fn new(cost_tracker: Option<Arc<CostTracker>>) -> Self {
+        Self::with(cost_tracker, None)
+    }
+
+    /// A harness whose core and in-process state share `sop_engine`.
+    fn with_sop_engine(sop_engine: Arc<std::sync::Mutex<SopEngine>>) -> Self {
+        Self::with(None, Some(sop_engine))
+    }
+
+    fn with(
+        cost_tracker: Option<Arc<CostTracker>>,
+        sop_engine: Option<Arc<std::sync::Mutex<SopEngine>>>,
+    ) -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut config = zeroclaw_config::schema::Config {
             data_dir: dir.path().to_path_buf(),
@@ -63,6 +78,7 @@ impl Harness {
             let ctx = Arc::get_mut(&mut ctx).expect("a fresh context is unshared");
             ctx.cost_tracker = cost_tracker.clone();
             ctx.event_history = Some(Arc::clone(&history));
+            ctx.sop_engine = sop_engine.clone();
         }
         let cancel = tokio_util::sync::CancellationToken::new();
         let connector = InprocConnector::new(cancel.clone());
@@ -73,6 +89,7 @@ impl Harness {
         state.cost_tracker = cost_tracker;
         state.event_buffer = history;
         state.tui_registry = Some(Arc::clone(&ctx.tui_registry));
+        state.sop_engine = sop_engine;
 
         Self {
             state,
@@ -441,4 +458,404 @@ async fn api_cost_with_tracking_disabled_matches_the_in_process_body() {
     .await;
     let body = assert_same(in_process, core);
     assert_eq!(body["cost"]["request_count"], 0);
+}
+
+/// The latest release every test in this crate records as the core's cached
+/// check, so tests that read the cache in parallel agree.
+pub(crate) fn latest_release() -> VersionCheckResponse {
+    VersionCheckResponse {
+        current_version: env!("CARGO_PKG_VERSION").into(),
+        latest_version: Some("99.0.0".into()),
+        is_newer: true,
+        release_url: Some("https://example.com/releases/99.0.0".into()),
+        release_notes: Some("- parity".into()),
+        published_at: Some("2026-10-01T00:00:00Z".into()),
+        error: None,
+    }
+}
+
+#[tokio::test]
+async fn version_check_through_the_core_matches_the_in_process_body() {
+    let harness = Harness::new(None);
+    zeroclaw_runtime::update_check::remember_latest_check(latest_release());
+    let cases = [
+        ("the cached latest release", CheckQuery::default()),
+        // A specific release is never cached, so both paths run the check.
+        // Here it fails (the test binary refuses the arguments), and a
+        // failed check is a 200 body with `error`, never an error status.
+        (
+            "a failed check",
+            CheckQuery {
+                force: false,
+                version: Some("v0.0.0-unreleased".into()),
+            },
+        ),
+    ];
+    for (case, query) in cases {
+        let in_process = body_of(
+            handle_version_check(
+                State(harness.state.clone()),
+                Harness::headers(),
+                Query(query.clone()),
+                CoreAccess::InProcess,
+            )
+            .await
+            .into_response(),
+        )
+        .await;
+        let core = body_of(
+            handle_version_check(
+                State(harness.state.clone()),
+                Harness::headers(),
+                Query(query),
+                harness.through_core().await,
+            )
+            .await
+            .into_response(),
+        )
+        .await;
+        let body = assert_same(in_process, core);
+        if case == "a failed check" {
+            assert!(body["error"].is_string(), "{case}: {body}");
+            assert!(body["latest_version"].is_null(), "{case}: {body}");
+        } else {
+            assert_eq!(body, serde_json::to_value(latest_release()).unwrap());
+        }
+    }
+}
+
+// ── /ws/sops/runs ────────────────────────────────────────────────
+
+pub(crate) type Socket =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// Serve `router` on a loopback port.
+pub(crate) async fn serve(router: axum::Router) -> std::net::SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind a loopback port");
+    let address = listener.local_addr().expect("local address");
+    zeroclaw_spawn::spawn!(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+    address
+}
+
+/// Serve the in-process gateway's SOP runs socket over `core`: in-process
+/// with [`CoreRpc::default`], through the core with a harness's handle.
+pub(crate) async fn serve_sop_runs(state: AppState, core: CoreRpc) -> std::net::SocketAddr {
+    serve(
+        axum::Router::new()
+            .route(
+                "/ws/sops/runs",
+                axum::routing::get(crate::ws_sop_runs::handle_ws_sop_runs),
+            )
+            .layer(axum::Extension(core))
+            .with_state(state),
+    )
+    .await
+}
+
+/// Open the socket as the dashboard does: the bearer rides in the
+/// subprotocol list, next to `zeroclaw.v1`.
+pub(crate) async fn open_sop_runs(
+    address: std::net::SocketAddr,
+    bearer: Option<&str>,
+) -> Result<Socket, tokio_tungstenite::tungstenite::Error> {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
+    let mut request = format!("ws://{address}/ws/sops/runs")
+        .into_client_request()
+        .expect("a valid request");
+    let protocols = match bearer {
+        Some(token) => format!("zeroclaw.v1, bearer.{token}"),
+        None => "zeroclaw.v1".to_owned(),
+    };
+    request.headers_mut().insert(
+        "sec-websocket-protocol",
+        HeaderValue::from_str(&protocols).expect("header"),
+    );
+    tokio_tungstenite::connect_async(request)
+        .await
+        .map(|(socket, _)| socket)
+}
+
+/// The next JSON frame, or `None` once the server closes the socket.
+pub(crate) async fn next_frame(socket: &mut Socket) -> Option<Value> {
+    use futures_util::StreamExt as _;
+    use tokio_tungstenite::tungstenite::Message;
+    loop {
+        let message = tokio::time::timeout(std::time::Duration::from_secs(5), socket.next())
+            .await
+            .expect("a frame or a close within 5s");
+        match message {
+            Some(Ok(Message::Text(text))) => {
+                return Some(serde_json::from_str(&text).expect("a JSON frame"));
+            }
+            Some(Ok(Message::Close(_)) | Err(_)) | None => return None,
+            Some(Ok(_)) => {}
+        }
+    }
+}
+
+/// The next frame from each socket, required to be the same.
+pub(crate) async fn same_next_frame(in_process: &mut Socket, core: &mut Socket) -> Option<Value> {
+    let expected = next_frame(in_process).await;
+    let served = next_frame(core).await;
+    assert_eq!(
+        served, expected,
+        "the socket through the core must send the in-process frame"
+    );
+    expected
+}
+
+pub(crate) fn run_change(run_id: &str, status: SopRunStatus) -> SopRunSummary {
+    SopRunSummary {
+        run_id: run_id.into(),
+        sop_name: "parity-sop".into(),
+        status,
+        current_step: 1,
+        total_steps: 2,
+        started_at: "2026-10-01T00:00:00Z".into(),
+        completed_at: None,
+        trigger_source: "manual".into(),
+        active: true,
+    }
+}
+
+/// An engine publishing its run changes on the returned sender. One deep,
+/// so three changes sent at once overflow it the same way on both paths.
+pub(crate) fn sop_engine() -> (
+    Arc<std::sync::Mutex<SopEngine>>,
+    tokio::sync::broadcast::Sender<SopRunSummary>,
+) {
+    let (changes, _) = tokio::sync::broadcast::channel(1);
+    let engine = SopEngine::new(zeroclaw_config::schema::SopConfig::default())
+        .with_run_notifier(changes.clone());
+    (Arc::new(std::sync::Mutex::new(engine)), changes)
+}
+
+#[tokio::test]
+async fn sop_runs_socket_through_the_core_sends_the_in_process_frames() {
+    let (engine, changes) = sop_engine();
+    let harness = Harness::with_sop_engine(engine);
+    let in_process_at = serve_sop_runs(harness.state.clone(), CoreRpc::default()).await;
+    let core_at = serve_sop_runs(harness.state.clone(), harness.core.clone()).await;
+
+    let mut in_process = open_sop_runs(in_process_at, Some(TOKEN))
+        .await
+        .expect("the in-process socket opens");
+    let mut core = open_sop_runs(core_at, Some(TOKEN))
+        .await
+        .expect("the socket through the core opens");
+    let snapshot = same_next_frame(&mut in_process, &mut core).await;
+    assert_eq!(snapshot, Some(json!({"type": "snapshot", "runs": []})));
+
+    let running = run_change("parity-run", SopRunStatus::Running);
+    changes.send(running.clone()).expect("both sockets listen");
+    let changed = same_next_frame(&mut in_process, &mut core).await;
+    assert_eq!(changed, Some(json!({"type": "run", "run": running})));
+
+    // Three changes before either reader runs: the one-deep feed keeps the
+    // last, and both sockets report the two they missed before it.
+    for n in 1..=3 {
+        changes
+            .send(run_change(&format!("burst-{n}"), SopRunStatus::Completed))
+            .expect("both sockets listen");
+    }
+    let lagged = same_next_frame(&mut in_process, &mut core).await;
+    assert_eq!(lagged, Some(json!({"type": "lagged", "missed": 2})));
+    let last = same_next_frame(&mut in_process, &mut core).await;
+    assert_eq!(last.expect("a frame")["run"]["run_id"], "burst-3");
+
+    // Without a bearer the core path refuses before the upgrade.
+    assert!(open_sop_runs(core_at, None).await.is_err());
+
+    // Closing both sockets lets go of both feeds: the in-process socket's
+    // receiver, and the core's subscription the gateway cancels.
+    in_process
+        .close(None)
+        .await
+        .expect("close the in-process socket");
+    core.close(None)
+        .await
+        .expect("close the socket through the core");
+    feed_released(&changes).await;
+}
+
+/// Wait until nothing listens on the engine's run feed.
+async fn feed_released(changes: &tokio::sync::broadcast::Sender<SopRunSummary>) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while changes.receiver_count() > 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{} run feed listener(s) left behind",
+            changes.receiver_count()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// A subscription whose socket never ran, because the upgrade did not
+/// complete, is still cancelled on the core: the feed does not keep running
+/// on the connection the caller's other requests share.
+#[tokio::test]
+async fn an_abandoned_sop_runs_subscription_is_cancelled_on_the_core() {
+    let (engine, changes) = sop_engine();
+    let harness = Harness::with_sop_engine(engine);
+    let CoreAccess::Core(call) = harness.through_core().await else {
+        panic!("served in-process");
+    };
+    let (notifications, opened) = crate::ws_sop_runs::subscribe(call)
+        .await
+        .expect("the core opens the feed");
+    assert!(matches!(opened, crate::ws_sop_runs::Opened::Feed { .. }));
+    assert_eq!(changes.receiver_count(), 1, "the core's feed is armed");
+    drop(notifications);
+    drop(opened);
+    feed_released(&changes).await;
+}
+
+/// The subprotocol bearer counts only when the request has no
+/// `Authorization` header: a refused header is not rescued by it.
+#[tokio::test]
+async fn an_authorization_header_outranks_the_subprotocol_bearer() {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
+    let (engine, _changes) = sop_engine();
+    let harness = Harness::with_sop_engine(engine);
+    let core_at = serve_sop_runs(harness.state.clone(), harness.core.clone()).await;
+    let mut request = format!("ws://{core_at}/ws/sops/runs")
+        .into_client_request()
+        .expect("a valid request");
+    request.headers_mut().insert(
+        "sec-websocket-protocol",
+        HeaderValue::from_str(&format!("zeroclaw.v1, bearer.{TOKEN}")).expect("header"),
+    );
+    request.headers_mut().insert(
+        header::AUTHORIZATION,
+        HeaderValue::from_static("Bearer zc_not_paired"),
+    );
+    match tokio_tungstenite::connect_async(request).await {
+        Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+        other => panic!("the refused header must decide: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn sop_runs_socket_with_sops_disabled_matches_the_in_process_frame() {
+    let harness = Harness::new(None);
+    let in_process_at = serve_sop_runs(harness.state.clone(), CoreRpc::default()).await;
+    let core_at = serve_sop_runs(harness.state.clone(), harness.core.clone()).await;
+    let mut in_process = open_sop_runs(in_process_at, Some(TOKEN))
+        .await
+        .expect("the in-process socket opens");
+    let mut core = open_sop_runs(core_at, Some(TOKEN))
+        .await
+        .expect("the socket through the core opens");
+    let disabled = same_next_frame(&mut in_process, &mut core).await;
+    assert_eq!(disabled, Some(json!({"type": "disabled"})));
+    assert_eq!(same_next_frame(&mut in_process, &mut core).await, None);
+}
+
+/// The engine failure the core reports as `-32603 engine lock poisoned`
+/// reaches the dashboard as the in-process socket's `error` frame, and the
+/// socket closes after it on both paths.
+#[tokio::test]
+async fn sop_runs_socket_with_a_failed_engine_matches_the_in_process_frame() {
+    let (engine, _changes) = sop_engine();
+    let poisoner = Arc::clone(&engine);
+    let _ = std::thread::spawn(move || {
+        let _held = poisoner.lock().expect("the first lock succeeds");
+        panic!("poison the engine lock for this test");
+    })
+    .join();
+    assert!(engine.is_poisoned());
+    let harness = Harness::with_sop_engine(engine);
+    let in_process_at = serve_sop_runs(harness.state.clone(), CoreRpc::default()).await;
+    let core_at = serve_sop_runs(harness.state.clone(), harness.core.clone()).await;
+    let mut in_process = open_sop_runs(in_process_at, Some(TOKEN))
+        .await
+        .expect("the in-process socket opens");
+    let mut core = open_sop_runs(core_at, Some(TOKEN))
+        .await
+        .expect("the socket through the core opens");
+    let failed = same_next_frame(&mut in_process, &mut core).await;
+    assert_eq!(
+        failed,
+        Some(json!({"type": "error", "error": "engine lock poisoned"}))
+    );
+    assert_eq!(same_next_frame(&mut in_process, &mut core).await, None);
+}
+
+/// The refusals the core path can tell apart keep the in-process status:
+/// no bearer is `401` on both routes, and a socket request that is not an
+/// upgrade is refused the same way before any credential is looked at. The
+/// bodies differ: each path answers with its own refusal shape.
+#[tokio::test]
+async fn refusals_keep_the_in_process_status_through_the_core() {
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt as _;
+
+    let (engine, _changes) = sop_engine();
+    let harness = Harness::with_sop_engine(engine);
+
+    // `GET /api/version/check` without a bearer.
+    let in_process = handle_version_check(
+        State(harness.state.clone()),
+        HeaderMap::new(),
+        Query(CheckQuery::default()),
+        CoreAccess::InProcess,
+    )
+    .await
+    .into_response()
+    .status();
+    let through_core = match harness.core.access(&HeaderMap::new()).await {
+        Err(error) => error.into_response().status(),
+        Ok(_) => panic!("no bearer must not reach the core"),
+    };
+    assert_eq!(in_process, StatusCode::UNAUTHORIZED);
+    assert_eq!(through_core, in_process);
+
+    // `GET /ws/sops/runs` without a bearer.
+    let in_process_at = serve_sop_runs(harness.state.clone(), CoreRpc::default()).await;
+    let core_at = serve_sop_runs(harness.state.clone(), harness.core.clone()).await;
+    let status = |opened: Result<Socket, tokio_tungstenite::tungstenite::Error>| match opened {
+        Err(tokio_tungstenite::tungstenite::Error::Http(response)) => response.status(),
+        other => panic!("a socket without a bearer must be refused: {other:?}"),
+    };
+    let in_process = status(open_sop_runs(in_process_at, None).await);
+    let through_core = status(open_sop_runs(core_at, None).await);
+    assert_eq!(in_process, StatusCode::UNAUTHORIZED);
+    assert_eq!(through_core, in_process);
+
+    // A plain `GET /ws/sops/runs` with a valid bearer but no upgrade.
+    let router = |core: CoreRpc| {
+        axum::Router::new()
+            .route(
+                "/ws/sops/runs",
+                axum::routing::get(crate::ws_sop_runs::handle_ws_sop_runs),
+            )
+            .layer(axum::Extension(core))
+            .with_state(harness.state.clone())
+    };
+    let plain = || {
+        Request::get("/ws/sops/runs")
+            .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+            .body(Body::empty())
+            .expect("request")
+    };
+    let in_process = router(CoreRpc::default())
+        .oneshot(plain())
+        .await
+        .expect("a response")
+        .status();
+    let through_core = router(harness.core.clone())
+        .oneshot(plain())
+        .await
+        .expect("a response")
+        .status();
+    assert!(in_process.is_client_error(), "{in_process}");
+    assert_eq!(through_core, in_process);
 }

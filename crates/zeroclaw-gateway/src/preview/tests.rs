@@ -120,6 +120,8 @@ const SERVED: &[&str] = &[
     "/api/cost",
     "/api/events/history",
     "/api/sessions",
+    "/api/version/check",
+    "/ws/sops/runs",
 ];
 
 /// Route paths the in-process gateway registers with a string literal, from
@@ -637,6 +639,14 @@ mod against_a_core {
             "/api/sessions" => handle_api_sessions_list(state, access, headers)
                 .await
                 .into_response(),
+            "/api/version/check" => crate::version::handle_version_check(
+                state,
+                headers,
+                Query(CheckQuery::default()),
+                access,
+            )
+            .await
+            .into_response(),
             other => panic!("no in-process handler for {other}"),
         };
         let body = response.into_body().collect().await.unwrap().to_bytes();
@@ -688,6 +698,11 @@ mod against_a_core {
             .clone()
             .expect("the core names the terminal");
 
+        // The core's cached release check, which both paths read.
+        zeroclaw_runtime::update_check::remember_latest_check(
+            crate::core_parity_tests::latest_release(),
+        );
+
         for path in [
             "/api/health",
             "/api/tuis",
@@ -695,6 +710,7 @@ mod against_a_core {
             "/api/cost?agent=main",
             "/api/events/history",
             "/api/sessions",
+            "/api/version/check",
         ] {
             let (status, body) = get(&preview, path, None).await;
             assert_eq!(status, StatusCode::UNAUTHORIZED, "{path}: {body}");
@@ -750,6 +766,75 @@ mod against_a_core {
         assert_eq!(json_of(&body)["events"][0]["type"], "agent_start", "{body}");
 
         drop(terminal);
+        core.stop().await;
+    }
+
+    /// The SOP runs socket through the separate gateway sends the frames the
+    /// in-process socket sends for the same engine. It signs in with the
+    /// bearer the dashboard offers as a subprotocol, and a caller without
+    /// one is refused before the upgrade with the hint the dashboard shows.
+    #[tokio::test]
+    async fn the_sop_runs_socket_sends_the_in_process_frames() {
+        use crate::core_parity_tests::{
+            open_sop_runs, run_change, same_next_frame, serve, serve_sop_runs, sop_engine,
+        };
+        use zeroclaw_runtime::sop::SopRunStatus;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, changes) = sop_engine();
+        let mut ctx = Core::context(tmp.path());
+        Arc::get_mut(&mut ctx)
+            .expect("a fresh context has one owner")
+            .sop_engine = Some(Arc::clone(&engine));
+        let config = ctx.config.read().clone();
+        let core = Core::serve(ctx).await;
+        let preview_at = serve(router(
+            CoreRpc::local(core.endpoint.clone(), EndpointOwner::SameAccount),
+            core.endpoint.clone(),
+            None,
+        ))
+        .await;
+        let mut state = crate::api::test_state(config);
+        state.sop_engine = Some(engine);
+        let in_process_at = serve_sop_runs(state, CoreRpc::default()).await;
+
+        let mut in_process = open_sop_runs(in_process_at, Some(TOKEN))
+            .await
+            .expect("the in-process socket opens");
+        let mut preview = open_sop_runs(preview_at, Some(TOKEN))
+            .await
+            .expect("the preview's socket opens");
+        let snapshot = same_next_frame(&mut in_process, &mut preview).await;
+        assert_eq!(snapshot, Some(json!({"type": "snapshot", "runs": []})));
+
+        let running = run_change("preview-run", SopRunStatus::Running);
+        changes.send(running.clone()).expect("both sockets listen");
+        let changed = same_next_frame(&mut in_process, &mut preview).await;
+        assert_eq!(changed, Some(json!({"type": "run", "run": running})));
+
+        // A burst the one-deep feed cannot hold: both report the same lag,
+        // then the change it kept.
+        for n in 1..=3 {
+            changes
+                .send(run_change(&format!("burst-{n}"), SopRunStatus::Completed))
+                .expect("both sockets listen");
+        }
+        let lagged = same_next_frame(&mut in_process, &mut preview).await;
+        assert_eq!(lagged, Some(json!({"type": "lagged", "missed": 2})));
+        let last = same_next_frame(&mut in_process, &mut preview).await;
+        assert_eq!(last.expect("a frame")["run"]["run_id"], "burst-3");
+
+        match open_sop_runs(preview_at, None).await {
+            Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+                assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+                let body = json_of(&String::from_utf8_lossy(
+                    response.body().as_deref().unwrap_or_default(),
+                ));
+                assert_eq!(body["code"], "auth_required", "{body}");
+                assert!(body["hint"].is_string(), "{body}");
+            }
+            other => panic!("a socket without a bearer must be refused: {other:?}"),
+        }
         core.stop().await;
     }
 
