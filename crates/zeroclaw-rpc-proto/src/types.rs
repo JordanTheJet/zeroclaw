@@ -1095,6 +1095,12 @@ rpc_type! {
         /// Accepts `model_provider` or aliased `provider` (gateway compat).
         #[serde(alias = "provider")]
         pub model_provider: String,
+        /// A configured alias of `model_provider`. When given, the catalog is
+        /// listed through the `<model_provider>.<alias>` profile, with that
+        /// profile's endpoint and credential; the result still names the bare
+        /// `model_provider`. Omitted or blank lists the provider family.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub alias: Option<String>,
     }
 }
 
