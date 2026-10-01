@@ -1074,6 +1074,14 @@ async fn fallback(State(state): State<PreviewState>, method: HttpMethod, uri: Ur
     }
 }
 
+/// The operator's note on stderr once the preview serves `url`.
+fn serving_notice(url: &str, endpoint: &Path) -> String {
+    zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+        "cli-gw-preview-serving",
+        &[("url", url), ("endpoint", &endpoint.display().to_string())],
+    )
+}
+
 /// Run the preview until interrupted. Prints `READY <url>` on stdout once
 /// it is serving.
 pub async fn serve(bootstrap: Bootstrap) -> anyhow::Result<()> {
@@ -1116,10 +1124,11 @@ pub async fn serve(bootstrap: Bootstrap) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(bootstrap.listen).await?;
     let address = listener.local_addr()?;
     let scheme = if tls.is_some() { "https" } else { "http" };
+    // i18n-exempt: `READY <url>` is the startup line a supervisor parses, not prose
     println!("READY {scheme}://{address}");
     eprintln!(
-        "zeroclaw-gw preview serving {scheme}://{address}; core endpoint {}",
-        bootstrap.endpoint.display()
+        "{}",
+        serving_notice(&format!("{scheme}://{address}"), &bootstrap.endpoint)
     );
 
     match tls {
