@@ -94,19 +94,20 @@ pub mod feature {
     /// client declared on `initialize`.
     pub const TUI_CLIENT_KIND: &str = "tui.client_kind";
 
-    /// Every extension this build's core supports.
-    pub const ALL: &[&str] = &[TUI_CLIENT_KIND];
+    /// Every extension name this protocol defines. A core advertises only
+    /// the ones it implements, from its own list beside the handlers.
+    pub const KNOWN: &[&str] = &[TUI_CLIENT_KIND];
 
     #[cfg(test)]
     mod tests {
-        use super::ALL;
+        use super::KNOWN;
         use std::collections::BTreeSet;
 
         #[test]
         fn feature_names_are_unique_and_scoped_to_an_area() {
-            let names: BTreeSet<_> = ALL.iter().collect();
-            assert_eq!(names.len(), ALL.len(), "duplicate feature name");
-            for name in ALL {
+            let names: BTreeSet<_> = KNOWN.iter().collect();
+            assert_eq!(names.len(), KNOWN.len(), "duplicate feature name");
+            for name in KNOWN {
                 let (area, extension) = name
                     .split_once('.')
                     .unwrap_or_else(|| panic!("{name} is not <area>.<extension>"));

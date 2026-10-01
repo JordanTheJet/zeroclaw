@@ -320,6 +320,13 @@ fn principal_tool_ceiling(grants: &zeroclaw_api::grants::ResolvedGrants) -> Opti
 /// The `clientCapabilities.client_kind` a connection declared, kept only for
 /// a kind the core knows. `tui/list` reports it so a listing can tell a
 /// gateway's connections from terminals; nothing authorizes on it.
+/// The additive extensions this core advertises on `initialize`, each
+/// listed only beside the behaviour it names and the test that proves it:
+///
+/// - `tui.client_kind`: `tui/list` reports the kind a connection declared
+///   (`tui_list_labels_only_a_declared_gateway_connection`).
+pub const ADVERTISED_FEATURES: &[&str] = &[zeroclaw_rpc_proto::feature::TUI_CLIENT_KIND];
+
 fn declared_client_kind(capabilities: Option<&Value>) -> Option<String> {
     capabilities?
         .get("client_kind")?
@@ -3466,7 +3473,7 @@ impl RpcDispatcher {
             commands,
             auth_methods: self.ctx.auth.provider_names(),
             principal_id: Some(principal_id),
-            features: zeroclaw_rpc_proto::feature::ALL
+            features: ADVERTISED_FEATURES
                 .iter()
                 .map(|name| (*name).to_string())
                 .collect(),
@@ -26789,10 +26796,13 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(
-            result["features"],
-            serde_json::json!(zeroclaw_rpc_proto::feature::ALL)
-        );
+        assert_eq!(result["features"], serde_json::json!(ADVERTISED_FEATURES));
+        for name in ADVERTISED_FEATURES {
+            assert!(
+                zeroclaw_rpc_proto::feature::KNOWN.contains(name),
+                "{name} is advertised but the protocol does not define it"
+            );
+        }
         assert!(
             result["features"]
                 .as_array()

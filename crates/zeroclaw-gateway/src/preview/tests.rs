@@ -551,7 +551,7 @@ mod against_a_core {
         assert_eq!(link["core"]["server_version"], env!("CARGO_PKG_VERSION"));
         assert_eq!(
             link["core"]["features"],
-            json!(zeroclaw_rpc_proto::feature::ALL),
+            json!(zeroclaw_runtime::rpc::dispatch::ADVERTISED_FEATURES),
             "the core-link diagnostic reports what the core advertised"
         );
         assert_eq!(link["gateway"]["protocol_version"], RPC_PROTOCOL_VERSION);
