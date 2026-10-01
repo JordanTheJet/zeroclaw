@@ -136,6 +136,11 @@ rpc_type! {
         /// field.
         #[serde(default)]
         pub commands: Vec<CommandDescriptor>,
+        /// Additive extensions this core supports, by name (e.g.
+        /// `tui.client_kind`). An older core omits the field, which reads as
+        /// none.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub features: Vec<String>,
     }
 }
 
@@ -1934,6 +1939,32 @@ mod tests {
         // to `1` so the handshake succeeds without an explicit version.
         let p: InitializeParams = serde_json::from_value(json!({})).unwrap();
         assert_eq!(p.protocol_version, 1);
+    }
+
+    #[test]
+    fn initialize_result_features_are_optional_on_the_wire() {
+        let older: InitializeResult = serde_json::from_value(json!({
+            "protocol_version": 1,
+            "server_version": "0.8.4",
+            "server_pid": 7
+        }))
+        .unwrap();
+        assert!(older.features.is_empty(), "an older core advertises none");
+        let value = serde_json::to_value(&older).unwrap();
+        assert!(value.get("features").is_none(), "none is not serialized");
+
+        let current: InitializeResult = serde_json::from_value(json!({
+            "protocol_version": 1,
+            "server_version": "0.8.5",
+            "server_pid": 7,
+            "features": [crate::feature::TUI_CLIENT_KIND]
+        }))
+        .unwrap();
+        assert_eq!(current.features, [crate::feature::TUI_CLIENT_KIND]);
+        assert_eq!(
+            serde_json::to_value(&current).unwrap()["features"],
+            json!([crate::feature::TUI_CLIENT_KIND])
+        );
     }
 
     #[test]
