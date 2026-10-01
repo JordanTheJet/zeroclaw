@@ -24,6 +24,7 @@ use std::sync::Arc;
 
 use axum::Json;
 use axum::Router;
+use axum::extract::rejection::QueryRejection;
 use axum::extract::{Query, State};
 use axum::http::{Method as HttpMethod, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
@@ -34,6 +35,8 @@ use zeroclaw_rpc_client::{
 };
 
 use crate::api::CostQuery;
+use crate::api_config::{AliasSourceQuery, MapPathQuery};
+use crate::api_sections::ModelsQuery;
 use crate::core_rpc::{CoreAccess, CoreCall, CoreError, CoreRpc};
 
 /// Where the dashboard reaches when no `--listen` is given: the address the
@@ -340,22 +343,19 @@ const REFUSED: &[(&str, &str, Refusal)] = &[
     ("/ws/chat", "GET", Refusal::NotPorted),
     ("/ws/sops/runs", "GET", Refusal::NotPorted),
     ("/ws/canvas/{id}", "GET", Refusal::NotPorted),
-    ("/api/config", "GET,PATCH,OPTIONS", Refusal::NotPorted),
+    // `GET` and `OPTIONS /api/config` are served.
+    ("/api/config", "PATCH", Refusal::NotPorted),
+    // The core's reads lack the route's `warnings` and its secret reduction
+    // to `{populated}` until the config parity methods land.
     (
         "/api/config/prop",
         "GET,PUT,DELETE,OPTIONS",
         Refusal::NotPorted,
     ),
+    // Needs the core's `config/drift` for the list's `drifted` entries.
     ("/api/config/list", "GET", Refusal::NotPorted),
     ("/api/config/drift", "GET", Refusal::NotPorted),
     ("/api/config/reload-status", "GET", Refusal::NotPorted),
-    ("/api/config/templates", "GET", Refusal::NotPorted),
-    ("/api/config/map-keys", "GET", Refusal::NotPorted),
-    (
-        "/api/config/resolve-alias-source",
-        "GET",
-        Refusal::NotPorted,
-    ),
     ("/api/config/map-key", "POST,DELETE", Refusal::NotPorted),
     ("/api/config/rename-map-key", "POST", Refusal::NotPorted),
     (
@@ -364,8 +364,8 @@ const REFUSED: &[(&str, &str, Refusal)] = &[
         Refusal::NotPorted,
     ),
     ("/api/config/delete-plan", "GET", Refusal::NotPorted),
-    ("/api/config/catalog", "GET", Refusal::NotPorted),
-    ("/api/config/catalog/models", "GET", Refusal::NotPorted),
+    // The core derives readiness differently until the config parity
+    // methods land; so do the sections' `ready` and `completed`.
     ("/api/config/status", "GET", Refusal::NotPorted),
     ("/api/config/agent-options", "GET", Refusal::NotPorted),
     ("/api/config/sections", "GET", Refusal::NotPorted),
@@ -542,7 +542,19 @@ pub fn router(core: CoreRpc, endpoint: PathBuf, web_dist: Option<PathBuf>) -> Ro
         .route("/api/tuis", get(api_tuis))
         .route("/api/cost", get(api_cost))
         .route("/api/events/history", get(api_events_history))
-        .route("/api/sessions", get(api_sessions_list));
+        .route("/api/sessions", get(api_sessions_list))
+        .route(
+            "/api/config",
+            get(config_get).options(crate::api_config::handle_options_config),
+        )
+        .route("/api/config/templates", get(config_templates))
+        .route("/api/config/map-keys", get(config_map_keys))
+        .route(
+            "/api/config/resolve-alias-source",
+            get(config_resolve_alias_source),
+        )
+        .route("/api/config/catalog", get(config_catalog))
+        .route("/api/config/catalog/models", get(config_catalog_models));
     for &(path, methods, refusal) in REFUSED {
         let handler: MethodRouter<PreviewState> = on(
             method_filter(methods),
@@ -805,6 +817,87 @@ async fn api_events_history(access: Result<CoreAccess, CoreError>) -> Response {
 async fn api_sessions_list(access: Result<CoreAccess, CoreError>) -> Response {
     served(access, |call| async move {
         crate::api::api_sessions_list_through_core(&call).await
+    })
+    .await
+}
+
+/// A dashboard route the core serves that reads a query. The credential is
+/// checked before the query, as the in-process gateway authenticates before
+/// its handlers parse anything.
+async fn served_with_query<Q, F, Fut>(
+    access: Result<CoreAccess, CoreError>,
+    query: Result<Query<Q>, QueryRejection>,
+    body: F,
+) -> Response
+where
+    F: FnOnce(CoreCall, Q) -> Fut,
+    Fut: Future<Output = Result<Response, CoreError>>,
+{
+    let call = match attached(access) {
+        Ok(call) => call,
+        Err(error) => return explain(error),
+    };
+    match query {
+        Ok(Query(query)) => body(call, query).await.unwrap_or_else(explain),
+        Err(rejection) => rejection.into_response(),
+    }
+}
+
+/// `GET /api/config`: the masked configuration. (`OPTIONS /api/config` is
+/// the configuration's JSON Schema, built into this binary, served as the
+/// in-process route serves it: without a credential.)
+async fn config_get(access: Result<CoreAccess, CoreError>) -> Response {
+    served(access, |call| async move {
+        crate::api_config::config_get_through_core(&call).await
+    })
+    .await
+}
+
+/// `GET /api/config/templates`
+async fn config_templates(access: Result<CoreAccess, CoreError>) -> Response {
+    served(access, |call| async move {
+        crate::api_config::templates_through_core(&call).await
+    })
+    .await
+}
+
+/// `GET /api/config/map-keys`
+async fn config_map_keys(
+    access: Result<CoreAccess, CoreError>,
+    query: Result<Query<MapPathQuery>, QueryRejection>,
+) -> Response {
+    served_with_query(access, query, |call, query| async move {
+        crate::api_config::map_keys_through_core(&call, &query).await
+    })
+    .await
+}
+
+/// `GET /api/config/resolve-alias-source`
+async fn config_resolve_alias_source(
+    access: Result<CoreAccess, CoreError>,
+    query: Result<Query<AliasSourceQuery>, QueryRejection>,
+) -> Response {
+    served_with_query(access, query, |call, query| async move {
+        crate::api_config::resolve_alias_source_through_core(&call, &query).await
+    })
+    .await
+}
+
+/// `GET /api/config/catalog`
+async fn config_catalog(access: Result<CoreAccess, CoreError>) -> Response {
+    served(access, |call| async move {
+        crate::api_sections::catalog_through_core(&call).await
+    })
+    .await
+}
+
+/// `GET /api/config/catalog/models`
+async fn config_catalog_models(
+    access: Result<CoreAccess, CoreError>,
+    query: Result<Query<ModelsQuery>, QueryRejection>,
+) -> Response {
+    served_with_query(access, query, |call, query| async move {
+        crate::api_sections::catalog_models_through_core(&call, &query).await
     })
     .await
 }

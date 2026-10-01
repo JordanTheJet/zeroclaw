@@ -120,6 +120,12 @@ const SERVED: &[&str] = &[
     "/api/cost",
     "/api/events/history",
     "/api/sessions",
+    "/api/config",
+    "/api/config/templates",
+    "/api/config/map-keys",
+    "/api/config/resolve-alias-source",
+    "/api/config/catalog",
+    "/api/config/catalog/models",
 ];
 
 /// Route paths the in-process gateway registers with a string literal, from
@@ -750,6 +756,168 @@ mod against_a_core {
         assert_eq!(json_of(&body)["events"][0]["type"], "agent_start", "{body}");
 
         drop(terminal);
+        core.stop().await;
+    }
+
+    /// The config reads answer through the separate gateway exactly what the
+    /// in-process routes compute from the same configuration themselves,
+    /// errors included. The model catalog lists a configured alias through
+    /// that alias's own endpoint, which the core resolves from the route's
+    /// `alias`.
+    #[tokio::test]
+    async fn the_config_reads_answer_as_the_in_process_gateway_computes_them() {
+        use crate::api_config::{
+            AliasSourceQuery, MapPathQuery, handle_config_get, handle_get_map_keys,
+            handle_options_config, handle_resolve_alias_source, handle_templates,
+        };
+        use crate::api_sections::{ModelsQuery, handle_catalog, handle_catalog_models};
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        async fn json_body(response: Response) -> (StatusCode, serde_json::Value) {
+            let status = response.status();
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            (status, serde_json::from_slice(&body).expect("a JSON body"))
+        }
+
+        // The alias's own model listing, so nothing leaves this machine.
+        let listing = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "object": "list",
+                "data": [
+                    { "id": "gpt-4o", "object": "model" },
+                    { "id": "gpt-4o-mini", "object": "model" },
+                ],
+            })))
+            .mount(&listing)
+            .await;
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = Core::context(tmp.path());
+        let configured: zeroclaw_config::schema::Config = toml::from_str(&format!(
+            "[providers.models.openai.work]\nuri = \"{}\"\napi_key = \"sk-preview-test\"\n",
+            listing.uri()
+        ))
+        .expect("a configured provider alias");
+        ctx.config.write().providers = configured.providers;
+        let config = ctx.config.read().clone();
+        let core = Core::serve(ctx).await;
+        let preview = router(
+            CoreRpc::local(core.endpoint.clone(), EndpointOwner::SameAccount),
+            core.endpoint.clone(),
+            None,
+        );
+        let state = State(crate::api::test_state(config));
+        let local = || CoreAccess::InProcess;
+
+        let models = |model_provider: &str, alias: Option<&str>| {
+            Query(ModelsQuery {
+                model_provider: model_provider.into(),
+                alias: alias.map(Into::into),
+            })
+        };
+        let map_keys = |path: &str| Query(MapPathQuery { path: path.into() });
+        let cases = [
+            (
+                "/api/config",
+                handle_config_get(state.clone(), local()).await,
+            ),
+            (
+                "/api/config/templates",
+                handle_templates(state.clone(), local()).await,
+            ),
+            (
+                "/api/config/map-keys?path=providers.models.openai",
+                handle_get_map_keys(state.clone(), local(), map_keys("providers.models.openai"))
+                    .await,
+            ),
+            (
+                "/api/config/map-keys?path=no.such.section",
+                handle_get_map_keys(state.clone(), local(), map_keys("no.such.section")).await,
+            ),
+            (
+                "/api/config/resolve-alias-source?source=model_providers",
+                handle_resolve_alias_source(
+                    state.clone(),
+                    local(),
+                    Query(AliasSourceQuery {
+                        source: zeroclaw_config::traits::AliasSource::ModelProviders,
+                    }),
+                )
+                .await,
+            ),
+            (
+                "/api/config/catalog",
+                handle_catalog(state.clone(), local()).await,
+            ),
+            (
+                "/api/config/catalog/models?model_provider=openai&alias=work",
+                handle_catalog_models(state.clone(), local(), models("openai", Some("work"))).await,
+            ),
+            (
+                "/api/config/catalog/models?provider=openai&alias=missing",
+                handle_catalog_models(state.clone(), local(), models("openai", Some("missing")))
+                    .await,
+            ),
+        ];
+        for (path, in_process) in cases {
+            let (status, body) = get(&preview, path, None).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{path}: {body}");
+            let expected = json_body(in_process).await;
+            let (status, served) = get(&preview, path, Some(TOKEN)).await;
+            assert_eq!((status, json_of(&served)), expected, "{path}");
+        }
+
+        // The alias's catalog really came from its endpoint, through the core.
+        let (_, body) = get(
+            &preview,
+            "/api/config/catalog/models?model_provider=openai&alias=work",
+            Some(TOKEN),
+        )
+        .await;
+        let catalog = json_of(&body);
+        assert_eq!(catalog["model_provider"], "openai", "{body}");
+        assert_eq!(catalog["live"], true, "{body}");
+        assert!(
+            catalog["models"]
+                .as_array()
+                .is_some_and(|models| models.iter().any(|m| m == "gpt-4o")),
+            "{body}"
+        );
+        let (status, body) = get(
+            &preview,
+            "/api/config/map-keys?path=no.such.section",
+            Some(TOKEN),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+
+        // A malformed query is refused, but only after the credential.
+        let (status, _) = get(
+            &preview,
+            "/api/config/resolve-alias-source?source=nope",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let (status, _) = get(
+            &preview,
+            "/api/config/resolve-alias-source?source=nope",
+            Some(TOKEN),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // The schema needs no credential, in-process or here.
+        let (status, served) = send(&preview, "OPTIONS", "/api/config", None).await;
+        let expected = json_body(handle_options_config(axum::http::HeaderMap::new()).await).await;
+        assert_eq!((status, json_of(&served)), expected);
+
+        // Writes on the same path are still refused.
+        let (status, body) = send(&preview, "PATCH", "/api/config", Some(TOKEN)).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert_eq!(json_of(&body)["route"], "PATCH /api/config");
+
         core.stop().await;
     }
 
