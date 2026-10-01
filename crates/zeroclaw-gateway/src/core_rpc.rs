@@ -58,7 +58,7 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::io::DuplexStream;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use tokio::time::Instant;
 use zeroclaw_api::jsonrpc::JsonRpcError;
 use zeroclaw_api::jsonrpc::error_codes::{
@@ -394,6 +394,9 @@ struct Pool {
     /// One permit per open core connection. A connection takes its permit
     /// before it is dialed and returns it when it closes.
     capacity: Arc<Semaphore>,
+    /// Woken when a request lets go of its connection, which may leave that
+    /// connection evictable for a request waiting for capacity.
+    lease_released: Notify,
     slots: Mutex<HashMap<PoolKey, Arc<Slot>>>,
 }
 
@@ -457,6 +460,7 @@ impl Pool {
             dialer,
             limits,
             capacity: Arc::new(Semaphore::new(limits.max_credentials)),
+            lease_released: Notify::new(),
             slots: Mutex::new(HashMap::new()),
         }
     }
@@ -514,24 +518,30 @@ impl Pool {
 
     /// Capacity for one more connection. When none is free, close the least
     /// recently used connection no request holds; when every connection is
-    /// in use, wait briefly for one to close.
+    /// in use, wait until one closes or a request lets go of one, within
+    /// one overall deadline.
     async fn reserve(&self, dialing: &PoolKey) -> Result<OwnedSemaphorePermit, CoreError> {
+        let deadline = Instant::now() + self.limits.capacity_wait;
         loop {
+            // Register for the wake-up before looking, so a release between
+            // the look and the wait is not missed.
+            let released = self.lease_released.notified();
+            tokio::pin!(released);
+            released.as_mut().enable();
             if let Ok(permit) = Arc::clone(&self.capacity).try_acquire_owned() {
                 return Ok(permit);
             }
-            if !self.evict_one_unleased(dialing) {
-                break;
+            if self.evict_one_unleased(dialing) {
+                continue;
+            }
+            tokio::select! {
+                permit = Arc::clone(&self.capacity).acquire_owned() => {
+                    return permit.map_err(|_| CoreError::Busy);
+                }
+                () = &mut released => {}
+                () = tokio::time::sleep_until(deadline) => return Err(CoreError::Busy),
             }
         }
-        tokio::time::timeout(
-            self.limits.capacity_wait,
-            Arc::clone(&self.capacity).acquire_owned(),
-        )
-        .await
-        .ok()
-        .and_then(Result::ok)
-        .ok_or(CoreError::Busy)
     }
 
     /// Close one connection no request holds, ended ones first, then the
@@ -562,6 +572,7 @@ impl Pool {
             key,
             slot,
             pooled,
+            _lease_released: LeaseReleased(Arc::clone(self)),
         }
     }
 
@@ -692,6 +703,20 @@ pub struct CoreCall {
     key: PoolKey,
     slot: Arc<Slot>,
     pooled: Arc<PooledClient>,
+    /// Must stay the last field. Fields drop in declaration order, so by the
+    /// time this wakes the waiters, `pooled` above has already released the
+    /// request's hold on the connection and they find it evictable.
+    _lease_released: LeaseReleased,
+}
+
+/// Wakes requests waiting for capacity when a request lets go of its
+/// connection, which may have left that connection idle and evictable.
+struct LeaseReleased(Arc<Pool>);
+
+impl Drop for LeaseReleased {
+    fn drop(&mut self) {
+        self.0.lease_released.notify_waiters();
+    }
 }
 
 impl CoreCall {
