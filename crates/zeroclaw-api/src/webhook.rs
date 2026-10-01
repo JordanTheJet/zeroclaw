@@ -7,7 +7,9 @@
 //! HTTP response.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -140,6 +142,145 @@ impl WebhookIdempotency {
     #[must_use]
     pub fn rollback(&self, token: &WebhookReservationToken) -> bool {
         (self.rollback)(token)
+    }
+}
+
+/// The deduplication store behind plugin webhook deliveries.
+///
+/// A delivery reserves its message's key, then commits it once the message is
+/// enqueued for the channel or rolls it back when the delivery fails. A
+/// duplicate of a committed key is acknowledged without being delivered
+/// again; a duplicate of a key still in flight waits for its owner's outcome.
+/// Committed keys expire after `ttl`. Committed and in-flight keys are each
+/// bounded by `max_keys`: the oldest committed key is evicted to make room,
+/// and a new delivery is refused while every in-flight slot is taken.
+///
+/// The daemon creates one store for each gateway run, so its contents last
+/// exactly as long as that run.
+#[derive(Debug)]
+pub struct WebhookReservationStore {
+    ttl: Duration,
+    max_keys: usize,
+    entries: Mutex<ReservationEntries>,
+    next_generation: AtomicU64,
+}
+
+#[derive(Debug, Default)]
+struct ReservationEntries {
+    committed: HashMap<String, Instant>,
+    pending: HashMap<String, PendingReservation>,
+}
+
+#[derive(Debug)]
+struct PendingReservation {
+    generation: u64,
+    status: watch::Sender<WebhookReservationStatus>,
+}
+
+impl WebhookReservationStore {
+    /// An empty store keeping committed keys for `ttl`, with at most
+    /// `max_keys` committed and at most `max_keys` in-flight keys.
+    #[must_use]
+    pub fn new(ttl: Duration, max_keys: usize) -> Self {
+        Self {
+            ttl,
+            max_keys: max_keys.max(1),
+            entries: Mutex::new(ReservationEntries::default()),
+            next_generation: AtomicU64::new(1),
+        }
+    }
+
+    fn entries(&self) -> MutexGuard<'_, ReservationEntries> {
+        self.entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Reserve `key` for a new delivery, or report the state of the delivery
+    /// that already holds it.
+    #[must_use]
+    pub fn begin(&self, key: &str) -> WebhookReservation {
+        let now = Instant::now();
+        let mut entries = self.entries();
+        entries
+            .committed
+            .retain(|_, seen_at| now.duration_since(*seen_at) < self.ttl);
+        if entries.committed.contains_key(key) {
+            return WebhookReservation::Committed;
+        }
+        if let Some(pending) = entries.pending.get(key) {
+            return WebhookReservation::InFlight(WebhookReservationWaiter::new(
+                pending.status.subscribe(),
+            ));
+        }
+        if entries.pending.len() >= self.max_keys {
+            return WebhookReservation::Unavailable;
+        }
+        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
+        let (status, _) = watch::channel(WebhookReservationStatus::InFlight);
+        entries
+            .pending
+            .insert(key.to_string(), PendingReservation { generation, status });
+        WebhookReservation::Owner(WebhookReservationToken::new(key.to_string(), generation))
+    }
+
+    /// Commit the reservation `token` owns. `false` when it no longer owns
+    /// one (already settled, or a later reservation took the key).
+    #[must_use]
+    pub fn commit(&self, token: &WebhookReservationToken) -> bool {
+        let mut entries = self.entries();
+        let Some(pending) = Self::take_owned(&mut entries, token) else {
+            return false;
+        };
+        pending
+            .status
+            .send_replace(WebhookReservationStatus::Committed);
+        let now = Instant::now();
+        entries
+            .committed
+            .retain(|_, seen_at| now.duration_since(*seen_at) < self.ttl);
+        if entries.committed.len() >= self.max_keys {
+            let evict_key = entries
+                .committed
+                .iter()
+                .min_by_key(|(_, seen_at)| *seen_at)
+                .map(|(key, _)| key.clone());
+            if let Some(evict_key) = evict_key {
+                entries.committed.remove(&evict_key);
+            }
+        }
+        entries.committed.insert(token.key().to_string(), now);
+        true
+    }
+
+    /// Release the reservation `token` owns, so a retry can deliver. `false`
+    /// when it no longer owns one.
+    #[must_use]
+    pub fn rollback(&self, token: &WebhookReservationToken) -> bool {
+        let mut entries = self.entries();
+        let Some(pending) = Self::take_owned(&mut entries, token) else {
+            return false;
+        };
+        pending
+            .status
+            .send_replace(WebhookReservationStatus::RolledBack);
+        true
+    }
+
+    /// Remove and return the pending reservation `token` owns, if it still
+    /// owns that exact generation.
+    fn take_owned(
+        entries: &mut ReservationEntries,
+        token: &WebhookReservationToken,
+    ) -> Option<PendingReservation> {
+        if entries
+            .pending
+            .get(token.key())
+            .is_none_or(|pending| pending.generation != token.generation())
+        {
+            return None;
+        }
+        entries.pending.remove(token.key())
     }
 }
 
@@ -339,5 +480,102 @@ mod tests {
         drop(current);
         assert!(registry.get("current").is_none());
         drop((stale_rx, current_rx, late_rx));
+    }
+
+    #[tokio::test]
+    async fn reservations_wait_for_the_owners_outcome_and_fence_stale_tokens() {
+        use super::{WebhookReservation, WebhookReservationStatus, WebhookReservationStore};
+        use std::time::Duration;
+
+        let store = WebhookReservationStore::new(Duration::from_secs(300), 8);
+        let first = match store.begin("stable-id") {
+            WebhookReservation::Owner(token) => token,
+            _ => panic!("first request must own the reservation"),
+        };
+        let mut duplicate = match store.begin("stable-id") {
+            WebhookReservation::InFlight(waiter) => waiter,
+            _ => panic!("duplicate must observe an in-flight owner"),
+        };
+
+        assert!(store.rollback(&first));
+        assert_eq!(duplicate.wait().await, WebhookReservationStatus::RolledBack);
+        let replacement = match store.begin("stable-id") {
+            WebhookReservation::Owner(token) => token,
+            _ => panic!("duplicate must acquire after owner rollback"),
+        };
+        assert_ne!(first.generation(), replacement.generation());
+        assert!(!store.rollback(&first));
+
+        let mut committed_duplicate = match store.begin("stable-id") {
+            WebhookReservation::InFlight(waiter) => waiter,
+            _ => panic!("later duplicate must wait for replacement owner"),
+        };
+        assert!(store.commit(&replacement));
+        assert_eq!(
+            committed_duplicate.wait().await,
+            WebhookReservationStatus::Committed
+        );
+        assert!(matches!(
+            store.begin("stable-id"),
+            WebhookReservation::Committed
+        ));
+    }
+
+    #[test]
+    fn in_flight_reservations_are_bounded_and_released_by_rollback() {
+        use super::{WebhookReservation, WebhookReservationStore};
+        use std::time::Duration;
+
+        let store = WebhookReservationStore::new(Duration::from_secs(300), 1);
+        let owner = match store.begin("first") {
+            WebhookReservation::Owner(token) => token,
+            _ => panic!("first plugin delivery owns the pending slot"),
+        };
+        assert!(matches!(
+            store.begin("second"),
+            WebhookReservation::Unavailable
+        ));
+        assert!(store.rollback(&owner));
+
+        let replacement = match store.begin("second") {
+            WebhookReservation::Owner(token) => token,
+            _ => panic!("rolling back frees the bounded pending slot"),
+        };
+        assert!(store.commit(&replacement));
+        let entries = store.entries();
+        assert_eq!(entries.pending.len(), 0);
+        assert_eq!(entries.committed.len(), 1);
+        assert!(entries.committed.contains_key(replacement.key()));
+    }
+
+    #[test]
+    fn committed_keys_expire_and_the_oldest_is_evicted_at_capacity() {
+        use super::{WebhookReservation, WebhookReservationStore};
+        use std::time::Duration;
+
+        let commit = |store: &WebhookReservationStore, key: &str| match store.begin(key) {
+            WebhookReservation::Owner(token) => assert!(store.commit(&token)),
+            _ => panic!("{key} must be new"),
+        };
+
+        let bounded = WebhookReservationStore::new(Duration::from_secs(300), 2);
+        commit(&bounded, "a");
+        std::thread::sleep(Duration::from_millis(5));
+        commit(&bounded, "b");
+        std::thread::sleep(Duration::from_millis(5));
+        commit(&bounded, "c");
+        assert!(
+            matches!(bounded.begin("a"), WebhookReservation::Owner(_)),
+            "the oldest committed key was evicted to make room"
+        );
+        assert!(matches!(bounded.begin("c"), WebhookReservation::Committed));
+
+        let expiring = WebhookReservationStore::new(Duration::from_millis(1), 8);
+        commit(&expiring, "short");
+        std::thread::sleep(Duration::from_millis(10));
+        assert!(
+            matches!(expiring.begin("short"), WebhookReservation::Owner(_)),
+            "a committed key past its TTL is no longer a duplicate"
+        );
     }
 }
