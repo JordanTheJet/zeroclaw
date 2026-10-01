@@ -455,6 +455,16 @@ async fn every_route_sits_behind_the_in_process_request_limits() {
     assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
 }
 
+/// The serving note comes from the Fluent catalog: a missing key would
+/// render as the `{key}` sentinel instead of the text.
+#[test]
+fn the_serving_notice_resolves_via_fluent() {
+    let notice = serving_notice("http://127.0.0.1:42617", Path::new("/run/zeroclaw.sock"));
+    assert!(!notice.starts_with('{'), "missing Fluent string: {notice}");
+    assert!(notice.contains("http://127.0.0.1:42617"), "{notice}");
+    assert!(notice.contains("/run/zeroclaw.sock"), "{notice}");
+}
+
 // ── The router, against a real core on a real socket ─────────────
 
 #[cfg(unix)]
@@ -806,7 +816,8 @@ mod against_a_core {
             "/api/events/history" => crate::sse::handle_events_history(state, headers, access)
                 .await
                 .into_response(),
-            "/api/sessions" => handle_api_sessions_list(state, access, headers)
+            // Served from the gateway's own store even with a core attached.
+            "/api/sessions" => handle_api_sessions_list(state, headers)
                 .await
                 .into_response(),
             other => panic!("no in-process handler for {other}"),
