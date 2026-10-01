@@ -1025,6 +1025,13 @@ rpc_type! {
         /// As on `personality/list`.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         pub require_configured_agent: bool,
+        /// Return at most this many characters of the file, with `truncated`
+        /// set when it is longer: the bounded view the dashboard shows,
+        /// small enough to cross the connection whatever the file's size.
+        /// Omitted, the whole file is returned, as before; a client that
+        /// edits and saves what it reads needs all of it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub max_chars: Option<usize>,
     }
 }
 

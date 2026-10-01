@@ -8868,7 +8868,16 @@ impl RpcDispatcher {
         // the workspace; the allowlist constrains the name, not its target.
         match read_personality_file(&workspace, &req.filename) {
             Ok((content, mtime_ms)) => {
-                let truncated = content.chars().count() > crate::agent::personality::MAX_FILE_CHARS;
+                // Bounded before it is serialized when the caller asks, so a
+                // file of any size answers within one frame.
+                let (content, truncated) = match req.max_chars {
+                    Some(max_chars) => bounded_to_chars(content, max_chars),
+                    None => {
+                        let truncated =
+                            content.chars().count() > crate::agent::personality::MAX_FILE_CHARS;
+                        (content, truncated)
+                    }
+                };
                 to_result(PersonalityGetResult {
                     filename: req.filename,
                     content: Some(content),
@@ -8932,6 +8941,7 @@ impl RpcDispatcher {
                     format!("{} changed on disk since it was read", req.filename),
                 );
                 let mut data = serde_json::json!({
+                    "reason": RefusalReason::Conflict.as_str(),
                     "error": "personality_disk_drift",
                     "filename": req.filename,
                 });
@@ -11085,20 +11095,48 @@ fn resolve_skill_ref(
         .map_err(|e| refused(INVALID_PARAMS, RefusalReason::Invalid, e.to_string()))
 }
 
+/// `content` cut to its first `max_chars` characters, and whether it was
+/// longer.
+fn bounded_to_chars(content: String, max_chars: usize) -> (String, bool) {
+    match content.char_indices().nth(max_chars) {
+        Some((end, _)) => (content[..end].to_owned(), true),
+        None => (content, false),
+    }
+}
+
 /// Refuse, as invalid params, an agent `[agents]` does not configure, for a
 /// caller that asked (`require_configured_agent`), before anything is read
-/// or written for it.
+/// or written for it: `not_found` for an unconfigured alias, `invalid` for a
+/// missing one or one not spelled exactly as configured.
 fn require_configured_agent(
     config: &zeroclaw_config::schema::Config,
     agent: Option<&str>,
 ) -> Result<(), JsonRpcError> {
-    let Some(alias) = agent.map(str::trim).filter(|alias| !alias.is_empty()) else {
-        return Err(rpc_err(INVALID_PARAMS, "An agent is required"));
+    let Some(alias) = agent.filter(|alias| !alias.trim().is_empty()) else {
+        return Err(refused(
+            INVALID_PARAMS,
+            RefusalReason::Invalid,
+            "An agent is required",
+        ));
     };
+    // The caller names the workspace with this same string, so it must be
+    // the configured spelling itself: a padded alias would pass a trimmed
+    // lookup and still name another directory.
+    if alias != alias.trim() {
+        return Err(refused(
+            INVALID_PARAMS,
+            RefusalReason::Invalid,
+            format!("Agent {alias:?} must be named exactly as configured"),
+        ));
+    }
     if config.agents.contains_key(alias) {
         Ok(())
     } else {
-        Err(rpc_err(INVALID_PARAMS, format!("Unknown agent {alias:?}")))
+        Err(refused(
+            INVALID_PARAMS,
+            RefusalReason::NotFound,
+            format!("Unknown agent {alias:?}"),
+        ))
     }
 }
 
@@ -24210,6 +24248,290 @@ mod tests {
             assert_eq!(ctx.timezone, "Asia/Tokyo", "{defaults:?}");
             assert_eq!(ctx.communication_style, "terse", "{defaults:?}");
             assert!(!ctx.include_memory, "{defaults:?}");
+        }
+    }
+
+    /// A roster for the personality methods: `ada` is an administrator,
+    /// `edith` may read and update personality files, `walt` may only update
+    /// them. One agent, `main`.
+    fn personality_roster(tmp: &tempfile::TempDir) -> zeroclaw_config::schema::Config {
+        use zeroclaw_api::grants::{Resource, Verb};
+        use zeroclaw_config::schema::{PermissionProfileConfig, UserConfig};
+        let mut config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Default::default()
+        };
+        config.agents.insert("main".into(), Default::default());
+        for (profile, verbs) in [
+            ("editor", vec![Verb::Read, Verb::Update]),
+            ("writer", vec![Verb::Update]),
+        ] {
+            config.permission_profiles.insert(
+                profile.into(),
+                PermissionProfileConfig {
+                    allowed_agents: vec!["*".into()],
+                    grants: std::collections::HashMap::from([(Resource::Personality, verbs)]),
+                    ..PermissionProfileConfig::default()
+                },
+            );
+        }
+        config.permission_profiles.insert(
+            "admin".into(),
+            PermissionProfileConfig {
+                admin: true,
+                ..PermissionProfileConfig::default()
+            },
+        );
+        for (name, uid, profile) in [
+            ("ada", 5353u32, "admin"),
+            ("edith", 5151u32, "editor"),
+            ("walt", 5252u32, "writer"),
+        ] {
+            config.users.insert(
+                name.into(),
+                UserConfig {
+                    principal_id: None,
+                    uid: Some(uid),
+                    permission_profiles: vec![profile.into()],
+                },
+            );
+        }
+        config
+    }
+
+    fn personality_ctx(config: zeroclaw_config::schema::Config) -> Arc<RpcContext> {
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(
+            16,
+            Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
+                4, 10, 60,
+            )),
+        ));
+        RpcContext::for_live_test(config, sessions)
+    }
+
+    /// A connection authenticated as the roster user with `uid`, and the
+    /// frames it writes back.
+    async fn roster_connection(
+        ctx: &Arc<RpcContext>,
+        uid: u32,
+    ) -> (RpcDispatcher, tokio::sync::mpsc::Receiver<String>) {
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let mut dispatcher = RpcDispatcher::new(Arc::clone(ctx), tx, "unix:test".into())
+            .with_transport(
+                crate::rpc::transport::TransportKind::Local,
+                crate::security::auth_provider::Credential::Peercred { uid },
+            );
+        dispatcher
+            .handle_initialize(&json!({}))
+            .await
+            .expect("roster principal authenticates");
+        (dispatcher, rx)
+    }
+
+    /// A stale write is refused with what is on disk now, in the error's
+    /// `data` as the client receives it, and that content goes only to a
+    /// caller allowed to read personality files.
+    #[tokio::test]
+    async fn a_stale_personality_write_carries_the_file_only_to_a_reader() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = personality_roster(&tmp);
+        let workspace = config.agent_workspace_dir("main");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("SOUL.md"), "# Soul\n").unwrap();
+        let ctx = personality_ctx(config);
+
+        for (uid, reader) in [(5151u32, true), (5252u32, false)] {
+            let (mut connection, mut frames) = roster_connection(&ctx, uid).await;
+            connection
+                .process_line_for_test(
+                    &json!({
+                        "jsonrpc": "2.0",
+                        "id": 7,
+                        "method": "personality/put",
+                        "params": {
+                            "agent": "main",
+                            "filename": "SOUL.md",
+                            "content": "# Overwritten\n",
+                            "expected_mtime_ms": 1,
+                        },
+                    })
+                    .to_string(),
+                )
+                .await;
+            let frame: Value =
+                serde_json::from_str(&frames.recv().await.expect("a reply")).expect("a JSON frame");
+            let error = &frame["error"];
+            assert_eq!(error["code"], PRECONDITION_FAILED, "{frame}");
+            let data = &error["data"];
+            assert_eq!(data["reason"], "conflict", "{frame}");
+            assert_eq!(data["error"], "personality_disk_drift", "{frame}");
+            assert_eq!(data["filename"], "SOUL.md", "{frame}");
+            if reader {
+                assert_eq!(data["current_content"], "# Soul\n", "{frame}");
+                assert!(data["current_mtime_ms"].is_i64(), "{frame}");
+            } else {
+                assert!(data.get("current_content").is_none(), "{frame}");
+                assert!(data.get("current_mtime_ms").is_none(), "{frame}");
+            }
+            assert_eq!(
+                std::fs::read_to_string(workspace.join("SOUL.md")).unwrap(),
+                "# Soul\n",
+                "the stale write changed nothing"
+            );
+        }
+    }
+
+    /// Asked for a bounded view, the core cuts the file before it is
+    /// serialized and says so; unasked, it returns the whole file.
+    #[tokio::test]
+    async fn a_personality_read_is_bounded_only_when_asked() {
+        use crate::agent::personality::MAX_FILE_CHARS;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = personality_roster(&tmp);
+        let workspace = config.agent_workspace_dir("main");
+        std::fs::create_dir_all(&workspace).unwrap();
+        // Multi-byte characters, so a byte cut would land mid-character.
+        let long = "\u{e9}".repeat(MAX_FILE_CHARS + 10);
+        std::fs::write(workspace.join("IDENTITY.md"), &long).unwrap();
+        std::fs::write(workspace.join("SOUL.md"), "# Soul\n").unwrap();
+        let ctx = personality_ctx(config);
+        let (reader, _frames) = roster_connection(&ctx, 5151).await;
+        let read = |filename: &str, max_chars: Option<usize>| {
+            let mut params = json!({ "agent": "main", "filename": filename });
+            if let Some(max_chars) = max_chars {
+                params["max_chars"] = json!(max_chars);
+            }
+            reader
+                .handle_personality_get(&params)
+                .expect("an allowlisted file reads")
+        };
+
+        let whole = read("IDENTITY.md", None);
+        assert_eq!(whole["content"], long, "unasked, the whole file");
+        assert_eq!(whole["truncated"], true);
+
+        let bounded = read("IDENTITY.md", Some(MAX_FILE_CHARS));
+        assert_eq!(
+            bounded["content"],
+            "\u{e9}".repeat(MAX_FILE_CHARS),
+            "the first MAX_FILE_CHARS characters"
+        );
+        assert_eq!(bounded["truncated"], true);
+        assert_eq!(bounded["exists"], true);
+        assert_eq!(bounded["mtime_ms"], whole["mtime_ms"]);
+
+        let short = read("SOUL.md", Some(MAX_FILE_CHARS));
+        assert_eq!(short["content"], "# Soul\n");
+        assert_eq!(short["truncated"], false);
+    }
+
+    /// With `require_configured_agent`, an unknown agent is `not_found` and a
+    /// missing or padded alias is `invalid`, before any workspace is made. A
+    /// scoped principal is refused an unknown agent earlier, by the agent
+    /// selector, with no reason: that refusal does not tell it which agents
+    /// exist.
+    #[tokio::test]
+    async fn a_configured_agent_is_required_as_spelled() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = personality_roster(&tmp);
+        let probe = config.clone();
+        let ctx = personality_ctx(config);
+        let (admin, _frames) = roster_connection(&ctx, 5353).await;
+        for (agent, reason) in [
+            ("ghost", "not_found"),
+            (" main ", "invalid"),
+            ("", "invalid"),
+        ] {
+            let error = admin
+                .handle_personality_put(&json!({
+                    "agent": agent,
+                    "filename": "SOUL.md",
+                    "content": "x",
+                    "require_configured_agent": true,
+                }))
+                .expect_err("only a configured agent, as spelled, is written for");
+            assert_eq!(error.code, INVALID_PARAMS, "{agent:?}");
+            assert_eq!(
+                zeroclaw_rpc_proto::error_reasons::RefusalReason::of(&error)
+                    .map(|reason| reason.as_str()),
+                Some(reason),
+                "{agent:?}: {error:?}"
+            );
+            assert!(
+                !probe.agent_workspace_dir(agent).join("SOUL.md").exists(),
+                "{agent:?}: nothing was written"
+            );
+        }
+        admin
+            .handle_personality_put(&json!({
+                "agent": "main",
+                "filename": "SOUL.md",
+                "content": "x",
+                "require_configured_agent": true,
+            }))
+            .expect("the configured agent is written for");
+
+        let (scoped, _frames) = roster_connection(&ctx, 5151).await;
+        let error = scoped
+            .handle_personality_put(&json!({
+                "agent": "ghost",
+                "filename": "SOUL.md",
+                "content": "x",
+                "require_configured_agent": true,
+            }))
+            .expect_err("a scoped principal names no unconfigured agent");
+        assert_eq!(error.code, FORBIDDEN);
+        assert_eq!(
+            zeroclaw_rpc_proto::error_reasons::RefusalReason::of(&error),
+            None
+        );
+    }
+
+    /// `skills/delete {purge}` removes the skill; without it the skill is
+    /// archived, as before.
+    #[tokio::test]
+    async fn skills_delete_purges_only_when_asked() {
+        use crate::skills::{ScaffoldOptions, SkillFrontmatter, SkillsService};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = personality_roster(&tmp);
+        let bundles: zeroclaw_config::schema::Config =
+            toml::from_str("[skill_bundles.team]\n").expect("a skill bundle");
+        config.skill_bundles = bundles.skill_bundles;
+        let service = SkillsService::new(&config, config.install_root_dir());
+        for name in ["purged", "archived"] {
+            let target = service.resolve_ref(name, Some("team")).unwrap();
+            service
+                .scaffold_skill(
+                    &target,
+                    SkillFrontmatter {
+                        name: name.into(),
+                        description: "stub".into(),
+                        ..Default::default()
+                    },
+                    ScaffoldOptions::default(),
+                )
+                .unwrap();
+        }
+        let shared = config.install_root_dir().join("shared/skills");
+        let ctx = personality_ctx(config);
+        let (editor, _frames) = roster_connection(&ctx, 5151).await;
+        for (name, purge) in [("purged", true), ("archived", false)] {
+            editor
+                .handle_skills_delete(&json!({ "bundle": "team", "name": name, "purge": purge }))
+                .expect("the skill is deleted");
+            assert!(
+                !shared.join("team").join(name).exists(),
+                "{name} left the bundle"
+            );
+            let archived = std::fs::read_dir(shared.join("_deleted")).is_ok_and(|entries| {
+                entries
+                    .flatten()
+                    .any(|entry| entry.file_name().to_string_lossy().starts_with(name))
+            });
+            assert_eq!(archived, !purge, "{name}");
         }
     }
 

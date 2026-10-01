@@ -46,6 +46,7 @@ pub mod error_codes {
         ("SESSION_LIMIT_REACHED", SESSION_LIMIT_REACHED),
         ("SESSION_BUSY", SESSION_BUSY),
         ("SESSION_NOT_OWNED", SESSION_NOT_OWNED),
+        ("PRECONDITION_FAILED", PRECONDITION_FAILED),
         ("AUTH_REQUIRED", AUTH_REQUIRED),
         ("VERSION_MISMATCH", VERSION_MISMATCH),
         ("FORBIDDEN", FORBIDDEN),
@@ -60,6 +61,15 @@ pub mod error_codes {
     mod tests {
         use super::ALL;
         use std::collections::BTreeSet;
+
+        #[test]
+        fn a_method_refusal_code_is_published() {
+            assert!(
+                ALL.iter().any(|(name, code)| *name == "PRECONDITION_FAILED"
+                    && *code == super::PRECONDITION_FAILED),
+                "personality/put answers a stale write with PRECONDITION_FAILED"
+            );
+        }
 
         #[test]
         fn error_codes_are_unique() {
