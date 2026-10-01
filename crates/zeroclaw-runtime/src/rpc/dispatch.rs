@@ -3503,6 +3503,10 @@ impl RpcDispatcher {
             commands,
             auth_methods: self.ctx.auth.provider_names(),
             principal_id: Some(principal_id),
+            features: zeroclaw_rpc_proto::feature::ALL
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect(),
         })
     }
 
@@ -26773,6 +26777,7 @@ mod tests {
             commands: vec![],
             auth_methods: Vec::new(),
             principal_id: None,
+            features: Vec::new(),
         };
         let val = to_result(r).unwrap();
         assert_eq!(val["protocol_version"], 1);
@@ -27064,6 +27069,30 @@ mod tests {
                 {"id": "new", "name": "new", "aliases": ["new-session"]},
                 {"id": "model", "name": "model"}
             ])
+        );
+    }
+
+    #[tokio::test]
+    async fn initialize_advertises_every_feature_this_core_supports() {
+        let (mut dispatcher, _sessions) =
+            make_acp_test_dispatcher(zeroclaw_config::schema::Config::default());
+        let result = dispatcher
+            .handle_initialize(&serde_json::json!({
+                "protocol_version": RPC_PROTOCOL_VERSION
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result["features"],
+            serde_json::json!(zeroclaw_rpc_proto::feature::ALL)
+        );
+        assert!(
+            result["features"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("tui.client_kind")),
+            "the core reports client_kind on tui/list: {result}"
         );
     }
 

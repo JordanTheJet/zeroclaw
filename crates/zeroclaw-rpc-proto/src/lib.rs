@@ -11,6 +11,8 @@
 //!   payload type;
 //! - [`error_codes`]: the JSON-RPC error codes the daemon returns, and
 //!   [`error_reasons`] for the `data.reason` some errors carry;
+//! - [`feature`]: the names of the additive extensions a core advertises
+//!   on `initialize`;
 //! - [`sop`]: the SOP graph projection types the `sops/*` methods return.
 //!
 //! The runtime depends on this crate and re-exports it from
@@ -82,3 +84,42 @@ pub mod sop {
 
 /// Wire protocol version. Bump on breaking changes.
 pub const RPC_PROTOCOL_VERSION: u64 = 1;
+
+/// Names of the additive extensions a core advertises in
+/// [`types::InitializeResult::features`].
+///
+/// An extension is an optional param or result field added to a method
+/// after it shipped. Every core at one [`RPC_PROTOCOL_VERSION`] accepts the
+/// same requests, so a client cannot tell from the version whether a core
+/// honours an extension: an older core ignores the param or leaves the field
+/// out. The core lists the extensions it supports so a client can check
+/// rather than guess. A name is `<area>.<extension>` and is never reused.
+pub mod feature {
+    /// `tui/list` reports each connection's `client_kind`, the label its
+    /// client declared on `initialize`.
+    pub const TUI_CLIENT_KIND: &str = "tui.client_kind";
+
+    /// Every extension this build's core supports.
+    pub const ALL: &[&str] = &[TUI_CLIENT_KIND];
+
+    #[cfg(test)]
+    mod tests {
+        use super::ALL;
+        use std::collections::BTreeSet;
+
+        #[test]
+        fn feature_names_are_unique_and_scoped_to_an_area() {
+            let names: BTreeSet<_> = ALL.iter().collect();
+            assert_eq!(names.len(), ALL.len(), "duplicate feature name");
+            for name in ALL {
+                let (area, extension) = name
+                    .split_once('.')
+                    .unwrap_or_else(|| panic!("{name} is not <area>.<extension>"));
+                assert!(
+                    !area.is_empty() && !extension.is_empty(),
+                    "{name} is not <area>.<extension>"
+                );
+            }
+        }
+    }
+}

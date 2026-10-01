@@ -15,6 +15,12 @@
 //! within the request timeout (`408` after it), so a slow or oversized
 //! request is bounded here as it is there, shutdown included.
 //!
+//! It serves only through a core of its own version: a core of another
+//! version speaks the same protocol but may ignore what this gateway asks
+//! for, so every core-backed route answers `503 core_version_mismatch`
+//! instead, while its own routes keep answering. `--allow-version-skew`
+//! lifts that, for development only.
+//!
 //! It is configured from flags and the environment only and never reads
 //! `config.toml`. It runs as the same OS account as the core: every
 //! connection verifies through the kernel that this account serves the
@@ -41,7 +47,7 @@ use zeroclaw_rpc_client::{
 };
 
 use crate::api::CostQuery;
-use crate::core_rpc::{CoreAccess, CoreCall, CoreError, CoreRpc};
+use crate::core_rpc::{CoreAccess, CoreCall, CoreError, CoreRpc, VersionSkew};
 
 /// Where the dashboard reaches when no `--listen` is given: the address the
 /// in-process gateway uses.
@@ -79,12 +85,15 @@ Options:
   --request-timeout SECS
                         answer 408 to a request not done within SECS
                         [default: 30, the in-process gateway's default]
+  --allow-version-skew  serve through a core of another version (development
+                        only: answers may silently lack what was asked for)
   -h, --help            print this help
   -V, --version         print the version
 
-Runs as the same OS account as the core, on Unix. On start it prints
-`READY <url>` on stdout once it is serving. It stops on SIGINT or SIGTERM,
-or on `POST /admin/shutdown` from this machine.";
+Runs as the same OS account as the core, on Unix. Serves only through a
+core of its own version unless --allow-version-skew is given. On start it
+prints `READY <url>` on stdout once it is serving. It stops on SIGINT or
+SIGTERM, or on `POST /admin/shutdown` from this machine.";
 
 /// Everything the preview needs to start, from flags and the environment.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,6 +104,8 @@ pub struct Bootstrap {
     pub tls: Option<TlsFiles>,
     /// How long a request may take before it is answered `408`.
     pub request_timeout: Duration,
+    /// Refused unless `--allow-version-skew` is given.
+    pub version_skew: VersionSkew,
 }
 
 /// The PEM files for serving HTTPS.
@@ -126,6 +137,7 @@ pub fn parse_args(
     let mut tls_key: Option<PathBuf> = None;
     let mut request_timeout = Duration::from_secs(crate::REQUEST_TIMEOUT_SECS);
     let mut allow_public_bind = false;
+    let mut version_skew = VersionSkew::Refuse;
 
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
@@ -155,6 +167,7 @@ pub fn parse_args(
                     })?;
             }
             "--allow-public-bind" => allow_public_bind = true,
+            "--allow-version-skew" => version_skew = VersionSkew::Allow,
             "--config" | "--config-dir" => {
                 return Err(format!(
                     "{arg}: zeroclaw-gw never reads config.toml; pass --socket PATH or \
@@ -201,6 +214,7 @@ pub fn parse_args(
         web_dist,
         tls,
         request_timeout,
+        version_skew,
     }))
 }
 
@@ -647,14 +661,16 @@ fn capability_missing(route: &str, message: &str, deferred: bool) -> Response {
 }
 
 /// A core refusal with what the operator can do about it, in the shape the
-/// dashboard shows as a banner: `{error, code, hint}`. A refusal the core
-/// classified is the route's own answer, not a fault to explain: it answers
-/// with the in-process route's status and body.
+/// dashboard shows as a banner: `{error, code, hint}`, plus `versions`
+/// (`{core, gateway}`) when the core was refused for its version. A refusal
+/// the core classified is the route's own answer, not a fault to explain: it
+/// answers with the in-process route's status and body.
 pub(crate) fn explain(error: CoreError) -> Response {
     if error.reason().is_some() {
         return error.into_response();
     }
     let (status, code) = error.status();
+    let mut versions = None;
     let message = match error {
         CoreError::AuthRequired(message)
         | CoreError::Forbidden(message)
@@ -662,6 +678,12 @@ pub(crate) fn explain(error: CoreError) -> Response {
         | CoreError::UntrustedEndpoint(message) => message,
         CoreError::Busy => "every core connection this gateway may hold is in use".into(),
         CoreError::Timeout => "the core did not answer in time".into(),
+        CoreError::VersionMismatch { core, gateway } => {
+            report_refused_core(&core, &gateway);
+            let message = crate::core_rpc::version_mismatch_message(&core, &gateway);
+            versions = Some(json!({ "core": core, "gateway": gateway }));
+            message
+        }
         CoreError::Rpc(error) => error.message,
     };
     let hint = match code {
@@ -679,14 +701,39 @@ pub(crate) fn explain(error: CoreError) -> Response {
             "zeroclaw-gw and the core speak different protocol versions: install matching \
              versions of zeroclaw and zeroclaw-gw."
         }
+        "core_version_mismatch" => {
+            "zeroclaw-gw serves only through a core of its own version: install matching \
+             versions of zeroclaw and zeroclaw-gw. A restarted core is picked up on the next \
+             request."
+        }
         "forbidden" => "Your principal lacks the grant for this operation.",
         _ => "The core refused the request.",
     };
-    (
-        status,
-        Json(json!({ "error": message, "code": code, "hint": hint })),
-    )
-        .into_response()
+    let mut body = json!({ "error": message, "code": code, "hint": hint });
+    if let Some(versions) = versions {
+        body["versions"] = versions;
+    }
+    (status, Json(body)).into_response()
+}
+
+/// The core version this process last reported refusing, so a dashboard
+/// polling a refused core puts one line on stderr rather than one per
+/// request.
+static REPORTED_REFUSAL: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Say on stderr, this process's log, that a core was refused for its
+/// version, once per core version.
+fn report_refused_core(core: &str, gateway: &str) {
+    let mut reported = REPORTED_REFUSAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if reported.as_deref() != Some(core) {
+        eprintln!(
+            "zeroclaw-gw: refusing to serve through the core: it is version {core}, this \
+             gateway is version {gateway} (core_version_mismatch)"
+        );
+        *reported = Some(core.to_owned());
+    }
 }
 
 /// Why the health probe could not vouch for the core's endpoint.
@@ -879,8 +926,9 @@ async fn claude_code_hook(
     crate::api::claude_code_hook(&payload)
 }
 
-/// `GET /api/gateway/core`: which principal the caller's credential binds
-/// and which core answers, over the caller's own core connection.
+/// `GET /api/gateway/core`: which principal the caller's credential binds,
+/// which core answers and the extensions it advertised, over the caller's
+/// own core connection.
 async fn core_link(access: Result<CoreAccess, CoreError>) -> Response {
     let call = match attached(access) {
         Ok(call) => call,
@@ -895,6 +943,7 @@ async fn core_link(access: Result<CoreAccess, CoreError>) -> Response {
                 "core": {
                     "server_version": status["server_version"],
                     "protocol_version": status["protocol_version"],
+                    "features": call.core_features(),
                 },
                 "gateway": {
                     "version": env!("CARGO_PKG_VERSION"),
@@ -986,7 +1035,11 @@ pub async fn serve(bootstrap: Bootstrap) -> anyhow::Result<()> {
         None => None,
     };
 
-    let core = CoreRpc::local(bootstrap.endpoint.clone(), EndpointOwner::SameAccount);
+    let core = CoreRpc::local(
+        bootstrap.endpoint.clone(),
+        EndpointOwner::SameAccount,
+        bootstrap.version_skew,
+    );
     let (shutdown, shutdown_requested) = watch::channel(false);
     let mut app = router(
         core,
@@ -1008,6 +1061,12 @@ pub async fn serve(bootstrap: Bootstrap) -> anyhow::Result<()> {
         "zeroclaw-gw preview serving {scheme}://{address}; core endpoint {}",
         bootstrap.endpoint.display()
     );
+    if bootstrap.version_skew == VersionSkew::Allow {
+        eprintln!(
+            "zeroclaw-gw: --allow-version-skew: serving through a core of any version; for \
+             development only, answers may silently lack what was asked for"
+        );
+    }
 
     match tls {
         None => {
