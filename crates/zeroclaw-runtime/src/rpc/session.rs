@@ -1501,6 +1501,19 @@ impl SessionStore {
         self.sessions.lock().await.keys().cloned().collect()
     }
 
+    /// Hold the session index until `release` is notified, signalling
+    /// `entered` once it is held, so a test can park a request that reads it.
+    #[cfg(test)]
+    pub(crate) async fn hold_index_for_test(
+        &self,
+        entered: &tokio::sync::Notify,
+        release: &tokio::sync::Notify,
+    ) {
+        let _index = self.sessions.lock().await;
+        entered.notify_one();
+        release.notified().await;
+    }
+
     pub fn register_cancel_token(
         &self,
         id: &str,

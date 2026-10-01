@@ -3228,11 +3228,21 @@ impl RpcDispatcher {
             .map(|b| b.list_sessions_with_metadata().len())
             .unwrap_or(0);
         let total = ids.len().max(persisted_count);
-        // Checked here, after every await above, so the answer reflects the
-        // caller's entitlement at the moment the agent's details are read.
+        // The caller's grants are resolved again here, after every await
+        // above, rather than read from the connection's stamp: a policy
+        // publication can land while the request waits, and the answer must
+        // reflect the caller's entitlement when the agent's details are read.
         let overview = if req.overview {
+            let grants = self.recheck_authority_after_admission(Method::Status)?;
             if let Some(alias) = agent {
-                self.selector_agent(Method::Status, alias)?;
+                match &grants {
+                    Some(grants) => {
+                        self.check_agent_selector_with_grants(Method::Status, grants, alias, true)?
+                    }
+                    // No principal is bound, which only the direct handler
+                    // tests reach; this refuses as the gate would.
+                    None => self.selector_agent(Method::Status, alias)?,
+                }
             }
             Some(self.status_overview(agent))
         } else {
@@ -14776,6 +14786,73 @@ mod tests {
             install_wide["result"]["overview"].is_object(),
             "{install_wide}"
         );
+    }
+
+    /// The overview's agent selector is evaluated on grants resolved after
+    /// the handler's waits, not on those stamped at the gate: a selector
+    /// narrowed while the request waits on the session index refuses it.
+    #[tokio::test]
+    async fn status_overview_rechecks_the_agent_selector_after_its_waits() {
+        use zeroclaw_api::grants::{Resource, Verb};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = agent_scoped_config_in(&tmp, 4242);
+        config
+            .permission_profiles
+            .get_mut("cron-alpha")
+            .expect("the fixture profile exists")
+            .grants
+            .insert(Resource::System, vec![Verb::Read]);
+        let ctx = enforcement_ctx(config);
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+        let params = json!({"overview": true, "agent": "alpha"});
+
+        let admitted = rpc(&mut alice, &mut rx, 1, "status", params.clone()).await;
+        assert_eq!(
+            admitted["result"]["overview"]["agent_alias"],
+            json!("alpha"),
+            "{admitted}"
+        );
+
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let holder = {
+            let sessions = Arc::clone(&ctx.sessions);
+            let (entered, release) = (Arc::clone(&entered), Arc::clone(&release));
+            zeroclaw_spawn::spawn!(async move {
+                sessions.hold_index_for_test(&entered, &release).await;
+            })
+        };
+        entered.notified().await;
+        let waited = {
+            let waiting = rpc(&mut alice, &mut rx, 2, "status", params.clone());
+            tokio::pin!(waiting);
+            tokio::select! {
+                response = &mut waiting => panic!("status answered while the index was held: {response}"),
+                _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
+            }
+            // Admitted by the gate and parked on the session index: narrow the
+            // selector to no agents, then let the request go on.
+            let mut narrowed = ctx.config.read().clone();
+            narrowed
+                .permission_profiles
+                .get_mut("cron-alpha")
+                .expect("the fixture profile exists")
+                .allowed_agents
+                .clear();
+            *ctx.config.write() = narrowed.clone();
+            let revision = ctx.auth.accepted_revision().saturating_add(1);
+            ctx.auth
+                .publish_accepted(&narrowed, revision)
+                .expect("the narrowed policy publishes as an accepted revision");
+            release.notify_one();
+            holder.await.expect("the index holder must not panic");
+
+            waiting.await
+        };
+        assert_eq!(waited["error"]["code"], json!(FORBIDDEN), "{waited}");
+        assert!(waited.get("result").is_none(), "{waited}");
+        let fresh = rpc(&mut alice, &mut rx, 3, "status", params).await;
+        assert_eq!(fresh["error"]["code"], json!(FORBIDDEN), "{fresh}");
     }
 
     #[tokio::test]
