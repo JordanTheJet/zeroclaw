@@ -133,6 +133,29 @@ fn desktop_app_check_runs_the_desktop_unit_tests() {
 }
 
 #[test]
+fn desktop_dashboard_smoke_launches_like_a_fresh_install() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let script = fs::read_to_string(root.join("scripts/desktop/smoke-dashboard.sh"))
+        .expect("desktop dashboard smoke script should be readable");
+
+    assert!(
+        script.contains("cd \"$smoke_cwd\"")
+            && script.contains("--config-dir \"$(native_path \"$config_dir\")\"")
+            && script.contains("HOME=\"$smoke_home\"")
+            && script.contains("XDG_DATA_HOME=\"$xdg_data_home\"")
+            && script.contains("host=\"127.0.0.1\"")
+            && script.contains("--host \"$host\" --port \"$port\""),
+        "the dashboard smoke must launch from an empty cwd with isolated config"
+    );
+    assert!(
+        script.contains("\"$origin/\"")
+            && script.contains("[[ \"$status_code\" == \"200\" ]]")
+            && script.contains("grep -Fq 'id=\"root\"'"),
+        "the dashboard smoke must require a successful SPA response"
+    );
+}
+
+#[test]
 fn linux_and_windows_desktop_sidecars_embed_the_web_artifact() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let workflow = fs::read_to_string(root.join(".github/workflows/release-stable-manual.yml"))
