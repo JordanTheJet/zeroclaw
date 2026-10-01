@@ -2199,14 +2199,14 @@ fn generate_current_emits_at_current_schema_version() {
 
 // ── Pairing-code policy ──────────────────────────────
 
-/// Review MAJOR-3: `zeroclaw config generate 3` must not hand the operator
-/// a config that names the retired `pairing_dashboard.code_length`, and must
+/// Review MAJOR-3: generating the current version must not hand the operator
+/// a config that names the retired `[gateway.pairing_dashboard]` (its
+/// `code_length` retired at V3, the rest of the table at V4), and must
 /// surface the `[gateway.pairing_code]` policy that actually decides pairing
 /// strength. The generator migrates the frozen V1 fixture, which still
-/// carries the retired key — so this pins the migration step, not the
-/// fixture.
+/// carries the table — so this pins the migration, not the fixture.
 #[test]
-fn generate_current_retires_dashboard_code_length_and_surfaces_pairing_code() {
+fn generate_current_retires_the_dashboard_table_and_surfaces_pairing_code() {
     let raw = generate(CURRENT_SCHEMA_VERSION, &GenerateOptions::default())
         .expect("generate current succeeds");
     let parsed: toml::Value = toml::from_str(&raw).expect("generated output parses as TOML");
@@ -2215,22 +2215,14 @@ fn generate_current_retires_dashboard_code_length_and_surfaces_pairing_code() {
         .and_then(toml::Value::as_table)
         .expect("generated config has a [gateway] section");
 
-    // The V1 fixture still carries the retired key; the migration drops it.
+    // The V1 fixture still carries the retired table; the migration drops it.
     assert!(
-        V1_FIXTURE.contains("code_length"),
-        "precondition: the frozen V1 fixture still carries the retired key"
-    );
-    let dashboard = gateway
-        .get("pairing_dashboard")
-        .and_then(toml::Value::as_table)
-        .expect("[gateway.pairing_dashboard] survives with its other fields");
-    assert!(
-        !dashboard.contains_key("code_length"),
-        "retired key must not reach a current-schema config: {dashboard:?}"
+        V1_FIXTURE.contains("[gateway.pairing_dashboard]") && V1_FIXTURE.contains("code_length"),
+        "precondition: the frozen V1 fixture still carries the retired table"
     );
     assert!(
-        dashboard.contains_key("code_ttl_secs"),
-        "the rest of the dashboard section must be preserved"
+        !gateway.contains_key("pairing_dashboard"),
+        "the retired table must not reach a current-schema config: {gateway:?}"
     );
 
     // The shared policy is surfaced, at the shipped default.

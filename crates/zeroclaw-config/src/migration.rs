@@ -350,6 +350,16 @@ pub const RETIRED_KEYS: &[RetiredKey] = &[
         retirement: Retirement::Remove,
         reason: "identity is set per agent; move it to `[agents.<alias>.identity]`",
     },
+    // The rest of the dashboard table, after the V3 entry for its
+    // `code_length`. Pairing never read these settings: its limits are fixed
+    // in the pairing guard.
+    RetiredKey {
+        retired_in: 4,
+        path: &["gateway", "pairing_dashboard"],
+        retirement: Retirement::Remove,
+        reason: "never read: pairing uses fixed limits (5 failed attempts, 300 s lockout, \
+                 10-minute code lifetime); `[gateway.pairing_code]` sets the code shape",
+    },
 ];
 
 /// The retired key a config path lies at or under, matching [`ANY_KEY`]
@@ -6187,7 +6197,7 @@ summary_model = "opus"
         }
     }
 
-    // ── R1: the dashboard's retired pairing-code length ──
+    // ── R1: the dashboard's retired pairing settings ──
 
     const RETIRED_CODE_LENGTH_BODY: &str = "locale = \"en\"\n\n\
          [gateway.pairing_dashboard]\n\
@@ -6197,11 +6207,16 @@ summary_model = "opus"
          length = 20\n\
          charset = \"unambiguous\"\n";
 
+    /// The table as V3 wrote it: the length the V3 step retired goes first,
+    /// then the rest of the table at V4.
     #[test]
     fn retired_dashboard_code_length_is_removed_on_every_path() {
         for version in [3, CURRENT_SCHEMA_VERSION] {
             let raw = format!("schema_version = {version}\n{RETIRED_CODE_LENGTH_BODY}");
-            let expected = ["gateway.pairing_dashboard.code_length"];
+            let expected = [
+                "gateway.pairing_dashboard",
+                "gateway.pairing_dashboard.code_length",
+            ];
 
             let (migrated, notices) = migrate_file_with_notices(&raw)
                 .unwrap()
@@ -6211,9 +6226,12 @@ summary_model = "opus"
                 migrated,
                 format!(
                     "schema_version = {CURRENT_SCHEMA_VERSION}\n{}",
-                    RETIRED_CODE_LENGTH_BODY.replace("code_length = 8\n", "")
+                    RETIRED_CODE_LENGTH_BODY.replace(
+                        "[gateway.pairing_dashboard]\ncode_length = 8\ncode_ttl_secs = 3600\n\n",
+                        ""
+                    )
                 ),
-                "V{version}: only the retired key and the version may change"
+                "V{version}: only the retired table and the version may change"
             );
 
             let load = migrate_to_current_salvaged(&raw);
@@ -6229,7 +6247,50 @@ summary_model = "opus"
                 expected,
                 "V{version} document cleanup"
             );
-            assert!(!out.contains("code_length") && out.contains("code_ttl_secs = 3600"));
+            assert!(!out.contains("pairing_dashboard") && out.contains("length = 20"));
+        }
+    }
+
+    /// The four settings V4 retires with the table, after a body whose bytes
+    /// must not change.
+    const RETIRED_DASHBOARD_TABLE: &str = "\n[gateway.pairing_dashboard]\n\
+         code_ttl_secs = 3600\n\
+         max_pending_codes = 3\n\
+         max_failed_attempts = 5\n\
+         lockout_secs = 300\n";
+
+    #[test]
+    fn retired_dashboard_table_is_removed_with_one_notice_and_no_other_change() {
+        let expected = vec![MigrationNotice::Removed {
+            path: "gateway.pairing_dashboard".to_string(),
+            reason: retired_key_covering(&["gateway", "pairing_dashboard", "lockout_secs"])
+                .expect("the dashboard table is retired")
+                .reason,
+        }];
+        for version in [3, CURRENT_SCHEMA_VERSION] {
+            let raw =
+                format!("schema_version = {version}\n{UNTOUCHED_V3_BODY}{RETIRED_DASHBOARD_TABLE}");
+
+            let (migrated, notices) = migrate_file_with_notices(&raw)
+                .unwrap()
+                .unwrap_or_else(|| panic!("V{version}: the retired table must trigger a rewrite"));
+            assert_eq!(notices, expected, "V{version}");
+            assert_eq!(
+                migrated,
+                format!("schema_version = {CURRENT_SCHEMA_VERSION}\n{UNTOUCHED_V3_BODY}"),
+                "V{version}: only the retired table and the version may change"
+            );
+
+            let load = migrate_to_current_salvaged(&raw);
+            assert_eq!(load.notices, expected, "V{version} load");
+
+            let (out, notices) = apply_doc(&raw);
+            assert_eq!(notices, expected, "V{version} document cleanup");
+            assert_eq!(
+                out,
+                raw.replace(RETIRED_DASHBOARD_TABLE, ""),
+                "V{version} document cleanup"
+            );
         }
     }
 

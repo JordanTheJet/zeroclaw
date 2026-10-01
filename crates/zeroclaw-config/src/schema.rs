@@ -7835,11 +7835,6 @@ pub struct GatewayConfig {
     #[nested]
     pub pairing_code: PairingCodePolicy,
 
-    /// Pairing dashboard configuration
-    #[serde(default)]
-    #[nested]
-    pub pairing_dashboard: PairingDashboardConfig,
-
     /// Path to the web dashboard `dist` directory. When set, the gateway
     /// serves the compiled frontend from the filesystem instead of requiring
     /// it to be embedded in the binary. Accepts absolute paths or paths
@@ -7955,63 +7950,12 @@ impl Default for GatewayConfig {
             session_ttl_hours: 0,
             websocket_ping_interval_secs: default_gateway_websocket_ping_interval_secs(),
             pairing_code: PairingCodePolicy::default(),
-            pairing_dashboard: PairingDashboardConfig::default(),
             web_dist_dir: None,
             tls: None,
             request_timeout_secs: default_gateway_request_timeout_secs(),
             long_running_request_timeout_secs: default_gateway_long_running_request_timeout_secs(),
             check_updates: true,
             allow_self_upgrade: false,
-        }
-    }
-}
-
-/// Pairing dashboard configuration (`[gateway.pairing_dashboard]`).
-///
-/// Code length and character family are **not** configured here. The
-/// dashboard pairing flow issues its codes through the same
-/// [`PairingGuard`](crate::pairing::PairingGuard) as startup pairing and
-/// `zeroclaw gateway get-paircode`, so it consumes
-/// [`gateway.pairing_code`](crate::pairing::PairingCodePolicy) rather than
-/// carrying a second, dashboard-only setting.
-#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "gateway.pairing_dashboard"]
-pub struct PairingDashboardConfig {
-    /// Time-to-live for pending pairing codes in seconds (default: 3600)
-    #[serde(default = "default_pairing_ttl")]
-    pub code_ttl_secs: u64,
-    /// Maximum concurrent pending pairing codes (default: 3)
-    #[serde(default = "default_max_pending_codes")]
-    pub max_pending_codes: usize,
-    /// Maximum failed pairing attempts before lockout (default: 5)
-    #[serde(default = "default_max_failed_attempts")]
-    pub max_failed_attempts: u32,
-    /// Lockout duration in seconds after max attempts (default: 300)
-    #[serde(default = "default_pairing_lockout_secs")]
-    pub lockout_secs: u64,
-}
-
-fn default_pairing_ttl() -> u64 {
-    3600
-}
-fn default_max_pending_codes() -> usize {
-    3
-}
-fn default_max_failed_attempts() -> u32 {
-    5
-}
-fn default_pairing_lockout_secs() -> u64 {
-    300
-}
-
-impl Default for PairingDashboardConfig {
-    fn default() -> Self {
-        Self {
-            code_ttl_secs: default_pairing_ttl(),
-            max_pending_codes: default_max_pending_codes(),
-            max_failed_attempts: default_max_failed_attempts(),
-            lockout_secs: default_pairing_lockout_secs(),
         }
     }
 }
@@ -30445,9 +30389,6 @@ enabled = true
             config.gateway.pairing_code.charset,
             crate::pairing::PairingCodeCharset::Unambiguous
         );
-        // The dashboard section survives with its remaining fields.
-        assert_eq!(config.gateway.pairing_dashboard.code_ttl_secs, 3600);
-
         // No settable property anywhere still offers a second code length.
         let code_length_props: Vec<String> = config
             .prop_fields()
@@ -35071,7 +35012,6 @@ allowed_numbers = ["+1", "+2"]
             session_ttl_hours: 0,
             websocket_ping_interval_secs: 30,
             pairing_code: PairingCodePolicy::default(),
-            pairing_dashboard: PairingDashboardConfig::default(),
             web_dist_dir: None,
             tls: None,
             request_timeout_secs: 30,
@@ -40965,10 +40905,10 @@ channel = "telegram.main"
     }
 
     #[test]
-    async fn save_dirty_removes_retired_dashboard_code_length() {
+    async fn save_dirty_removes_the_retired_dashboard_table() {
         // An unrelated incremental save must drop the retired dashboard
-        // length at V3 and V4 while keeping the live dashboard TTL and the
-        // shared pairing-code policy.
+        // table, with the length V3 retired from it, at V3 and V4 while
+        // keeping the shared pairing-code policy.
         for version in [3, crate::migration::CURRENT_SCHEMA_VERSION] {
             let tmp = tempfile::TempDir::new().unwrap();
             let written = save_dirty_after_unrelated_edit(
@@ -40982,7 +40922,7 @@ channel = "telegram.main"
             )
             .await;
             assert!(
-                !written.contains("code_length"),
+                !written.contains("pairing_dashboard") && !written.contains("code_ttl_secs"),
                 "V{version}; got:\n{written}"
             );
             let reloaded = crate::migration::migrate_to_current_salvaged(&written);
@@ -40991,15 +40931,45 @@ channel = "telegram.main"
                 "V{version}: {:?}",
                 reloaded.notices
             );
-            assert_eq!(
-                reloaded.config.gateway.pairing_dashboard.code_ttl_secs,
-                3600
-            );
             assert_eq!(reloaded.config.gateway.pairing_code.length, 20);
             assert_eq!(
                 reloaded.config.observability.backend,
                 ObservabilityBackend::Otel
             );
+        }
+    }
+
+    #[test]
+    async fn save_removes_the_retired_dashboard_table() {
+        // A full save writes the file from the typed config, which has no
+        // field for the table, so the table is gone whatever version the file
+        // on disk was at and even when the config was read without migrating.
+        for version in [3, crate::migration::CURRENT_SCHEMA_VERSION] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config_path = tmp.path().join("config.toml");
+            let raw = format!(
+                "schema_version = {version}\n\n\
+                 [gateway.pairing_dashboard]\ncode_ttl_secs = 3600\nlockout_secs = 300\n\n\
+                 [gateway.pairing_code]\nlength = 20\ncharset = \"unambiguous\"\n"
+            );
+            std::fs::write(&config_path, &raw).unwrap();
+            let mut config: Config =
+                toml::from_str(&raw).expect("a config carrying the retired table still loads");
+            config.config_path = config_path.clone();
+            config.save().await.unwrap();
+
+            let written = std::fs::read_to_string(&config_path).unwrap();
+            assert!(
+                !written.contains("pairing_dashboard"),
+                "V{version}; got:\n{written}"
+            );
+            let reloaded = crate::migration::migrate_to_current_salvaged(&written);
+            assert!(
+                reloaded.notices.is_empty(),
+                "V{version}: {:?}",
+                reloaded.notices
+            );
+            assert_eq!(reloaded.config.gateway.pairing_code.length, 20);
         }
     }
 

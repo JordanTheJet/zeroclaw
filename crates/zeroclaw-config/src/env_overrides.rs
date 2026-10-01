@@ -671,4 +671,28 @@ mod tests {
             "an ignored variable is not a change to write"
         );
     }
+
+    /// `[gateway.pairing_dashboard]` is retired as a whole table, so a
+    /// variable naming one of its settings is ignored the same way.
+    #[tokio::test]
+    async fn an_env_override_for_a_retired_dashboard_setting_is_ignored() {
+        let _lock = env_test_lock().await;
+        let variable = "ZEROCLAW_gateway__pairing_dashboard__lockout_secs";
+        let _var = EnvVarGuard::set(variable, "60");
+        let mut config = Config::default();
+        let applied = apply_env_overrides(&mut config).expect("a retired key does not fail");
+        assert!(applied.paths.is_empty());
+        assert!(config.migration_notices.iter().any(|notice| matches!(
+            notice,
+            crate::migration::MigrationNotice::IgnoredEnvOverride { variable: ignored, reason }
+                if ignored == variable && reason.contains("fixed limits")
+        )));
+        assert!(
+            config
+                .migration_notices
+                .iter()
+                .all(|notice| !notice.changes_file()),
+            "an ignored variable is not a change to write"
+        );
+    }
 }
