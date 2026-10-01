@@ -465,7 +465,7 @@ async fn a_map_key_rename_answers_and_saves_alike() {
     };
     for (case, expected, from, to) in [
         ("a rename", StatusCode::OK, "old", "new"),
-        ("a missing alias", StatusCode::NOT_FOUND, "absent", "other"),
+        ("a missing generic key", StatusCode::OK, "absent", "other"),
     ] {
         let pair = Pair::new(seed).await;
         let body = || RenameMapKeyBody {
@@ -482,6 +482,29 @@ async fn a_map_key_rename_answers_and_saves_alike() {
         assert_parity(case, expected, in_process, through_core).await;
         pair.assert_same_config(case, &[]);
     }
+}
+
+#[tokio::test]
+async fn a_missing_cascade_alias_rename_is_refused_alike() {
+    let pair = Pair::new(|_| {}).await;
+    let body = || RenameMapKeyBody {
+        path: "providers.models.openai".into(),
+        from: "absent".into(),
+        to: "other".into(),
+    };
+    let in_process =
+        crate::api_config::handle_rename_map_key(State(pair.state.clone()), None, Json(body()))
+            .await;
+    let call = pair.call().await;
+    let through_core = served(crate::api_config::rename_map_key_through_core(&call, body()).await);
+    assert_parity(
+        "a missing cascade alias",
+        StatusCode::NOT_FOUND,
+        in_process,
+        through_core,
+    )
+    .await;
+    pair.assert_same_config("a missing cascade alias", &[]);
 }
 
 // ── Quickstart ───────────────────────────────────────────────────
