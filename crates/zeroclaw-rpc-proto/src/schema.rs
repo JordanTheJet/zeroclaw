@@ -59,7 +59,8 @@ catalog! {
     ConfigMapKeyDeleteParams, ConfigMapKeyDeleteResult, ConfigMapKeyRenameParams,
     ConfigMapKeyRenameResult, ConfigTemplateEntry, ConfigTemplatesResult,
     // Agents and cost
-    AgentEntry, AgentsListResult, AgentStatusEntry, AgentsStatusResult, CostQueryParams,
+    AgentEntry, AgentsListResult, AgentStatusEntry, AgentsStatusResult,
+    AgentDeleteParams, AgentDeletePreviewResult, AgentDeleteResult, CostQueryParams,
     // Skills
     SkillBundleEntry, SkillsBundlesResult, SkillsListParams, AgentSkillEntry, ShadowedSkillEntry,
     DroppedSkillEntry, AgentSkillsResult, SkillsReadParams, SkillsWriteResult, SkillsDeleteParams,
