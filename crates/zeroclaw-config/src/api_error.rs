@@ -127,10 +127,17 @@ impl ConfigApiError {
 
     /// The error a property read or write that failed with `err` answers
     /// for `path`: `path_not_found` when the schema does not define the
-    /// path, otherwise the validation failure, pinned to the path. Every
-    /// surface that reports a failed `get_prop`/`set_prop` uses this one rule.
+    /// path, `validation_failed` for a masked placeholder no stored value can
+    /// resolve (the caller has to send the full value), otherwise the
+    /// validation failure, pinned to the path. Every surface that reports a
+    /// failed `get_prop`/`set_prop` uses this one rule.
     pub fn for_prop(err: anyhow::Error, path: &str) -> Self {
-        if err.to_string().starts_with("Unknown property") {
+        if err
+            .downcast_ref::<crate::url_credentials::UnresolvedMask>()
+            .is_some()
+        {
+            Self::new(ConfigApiCode::ValidationFailed, err.to_string()).with_path(path)
+        } else if err.to_string().starts_with("Unknown property") {
             Self::path_not_found(path)
         } else {
             Self::from_validation(err).with_path(path)
