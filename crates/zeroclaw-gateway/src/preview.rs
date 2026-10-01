@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 use axum::Json;
 use axum::Router;
-use axum::extract::{Query, State};
+use axum::extract::{Path as UrlPath, Query, State};
 use axum::http::{Method as HttpMethod, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{MethodFilter, MethodRouter, get, on};
@@ -33,7 +33,7 @@ use zeroclaw_rpc_client::{
     ClientError, EndpointOwner, EndpointRejection, Method, RPC_PROTOCOL_VERSION, RpcClient,
 };
 
-use crate::api::CostQuery;
+use crate::api::{CostQuery, CronRunsQuery, MemoryDeleteQuery, MemoryQuery, MemoryStoreBody};
 use crate::core_rpc::{CoreAccess, CoreCall, CoreError, CoreRpc};
 
 /// Where the dashboard reaches when no `--listen` is given: the address the
@@ -458,15 +458,13 @@ const REFUSED: &[(&str, &str, Refusal)] = &[
         "GET,PUT,DELETE",
         Refusal::NotPorted,
     ),
-    ("/api/cron", "GET,POST", Refusal::NotPorted),
-    ("/api/cron/settings", "GET,PATCH", Refusal::NotPorted),
-    ("/api/cron/{id}", "DELETE,PATCH", Refusal::NotPorted),
-    ("/api/cron/{id}/runs", "GET", Refusal::NotPorted),
-    ("/api/cron/{id}/run", "POST", Refusal::NotPorted),
+    // Creating and editing a job wait on the core's `cron/add` and
+    // `cron/patch` taking the agent-job fields and policy approval; the other
+    // cron methods on these paths are served.
+    ("/api/cron", "POST", Refusal::NotPorted),
+    ("/api/cron/{id}", "PATCH", Refusal::NotPorted),
     ("/api/integrations", "GET", Refusal::NotPorted),
     ("/api/integrations/settings", "GET", Refusal::NotPorted),
-    ("/api/memory", "GET,POST", Refusal::NotPorted),
-    ("/api/memory/{key}", "DELETE", Refusal::NotPorted),
     ("/api/cli-tools", "GET", Refusal::NotPorted),
     ("/api/devices", "GET", Refusal::NotPorted),
     ("/api/devices/me/capabilities", "POST", Refusal::NotPorted),
@@ -542,7 +540,20 @@ pub fn router(core: CoreRpc, endpoint: PathBuf, web_dist: Option<PathBuf>) -> Ro
         .route("/api/tuis", get(api_tuis))
         .route("/api/cost", get(api_cost))
         .route("/api/events/history", get(api_events_history))
-        .route("/api/sessions", get(api_sessions_list));
+        .route("/api/sessions", get(api_sessions_list))
+        .route("/api/cron", get(api_cron_list))
+        .route(
+            "/api/cron/settings",
+            get(api_cron_settings).patch(api_cron_settings_patch),
+        )
+        .route("/api/cron/{id}", axum::routing::delete(api_cron_delete))
+        .route("/api/cron/{id}/run", axum::routing::post(api_cron_run))
+        .route("/api/cron/{id}/runs", get(api_cron_runs))
+        .route("/api/memory", get(api_memory_list).post(api_memory_store))
+        .route(
+            "/api/memory/{key}",
+            axum::routing::delete(api_memory_delete),
+        );
     for &(path, methods, refusal) in REFUSED {
         let handler: MethodRouter<PreviewState> = on(
             method_filter(methods),
@@ -805,6 +816,101 @@ async fn api_events_history(access: Result<CoreAccess, CoreError>) -> Response {
 async fn api_sessions_list(access: Result<CoreAccess, CoreError>) -> Response {
     served(access, |call| async move {
         crate::api::api_sessions_list_through_core(&call).await
+    })
+    .await
+}
+
+/// `GET /api/cron`
+async fn api_cron_list(access: Result<CoreAccess, CoreError>) -> Response {
+    served(access, |call| async move {
+        crate::api::api_cron_list_through_core(&call).await
+    })
+    .await
+}
+
+/// `GET /api/cron/settings`
+async fn api_cron_settings(access: Result<CoreAccess, CoreError>) -> Response {
+    served(access, |call| async move {
+        crate::api::api_cron_settings_through_core(&call).await
+    })
+    .await
+}
+
+/// `PATCH /api/cron/settings`
+async fn api_cron_settings_patch(
+    access: Result<CoreAccess, CoreError>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    served(access, |call| async move {
+        crate::api::api_cron_settings_patch_through_core(&call, &body).await
+    })
+    .await
+}
+
+/// `DELETE /api/cron/{id}`
+async fn api_cron_delete(
+    UrlPath(id): UrlPath<String>,
+    access: Result<CoreAccess, CoreError>,
+) -> Response {
+    served(access, |call| async move {
+        crate::api::api_cron_delete_through_core(&call, &id).await
+    })
+    .await
+}
+
+/// `POST /api/cron/{id}/run`
+async fn api_cron_run(
+    UrlPath(id): UrlPath<String>,
+    access: Result<CoreAccess, CoreError>,
+) -> Response {
+    served(access, |call| async move {
+        crate::api::api_cron_run_through_core(&call, &id).await
+    })
+    .await
+}
+
+/// `GET /api/cron/{id}/runs`
+async fn api_cron_runs(
+    UrlPath(id): UrlPath<String>,
+    Query(params): Query<CronRunsQuery>,
+    access: Result<CoreAccess, CoreError>,
+) -> Response {
+    served(access, |call| async move {
+        crate::api::api_cron_runs_through_core(&call, &id, &params).await
+    })
+    .await
+}
+
+/// `GET /api/memory`
+async fn api_memory_list(
+    Query(params): Query<MemoryQuery>,
+    access: Result<CoreAccess, CoreError>,
+) -> Response {
+    served(access, |call| async move {
+        crate::api::api_memory_list_through_core(&call, &params).await
+    })
+    .await
+}
+
+/// `POST /api/memory`
+async fn api_memory_store(
+    access: Result<CoreAccess, CoreError>,
+    Json(body): Json<MemoryStoreBody>,
+) -> Response {
+    served(access, |call| async move {
+        crate::api::api_memory_store_through_core(&call, &body).await
+    })
+    .await
+}
+
+/// `DELETE /api/memory/{key}`
+async fn api_memory_delete(
+    UrlPath(key): UrlPath<String>,
+    Query(query): Query<MemoryDeleteQuery>,
+    access: Result<CoreAccess, CoreError>,
+) -> Response {
+    served(access, |call| async move {
+        crate::api::api_memory_delete_through_core(&call, &key, &query).await
     })
     .await
 }

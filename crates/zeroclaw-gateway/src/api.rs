@@ -15,7 +15,9 @@ use zeroclaw_api::jsonrpc::error_codes::INTERNAL_ERROR;
 use zeroclaw_config::schema::{ChannelAliasInfo, Config};
 use zeroclaw_memory::MemoryEntry;
 use zeroclaw_rpc_client::Method;
-use zeroclaw_rpc_proto::types::{CLIENT_KIND_GATEWAY, SessionEntry, SessionListResult};
+use zeroclaw_rpc_proto::types::{
+    CLIENT_KIND_GATEWAY, MemoryListResult, MemorySearchResult, SessionEntry, SessionListResult,
+};
 
 use crate::core_rpc::{CoreCall, CoreError};
 
@@ -445,7 +447,13 @@ pub async fn handle_api_tools(
 pub async fn handle_api_cron_list(
     State(state): State<AppState>,
     headers: HeaderMap,
+    access: CoreAccess,
 ) -> impl IntoResponse {
+    if let CoreAccess::Core(core) = access {
+        return api_cron_list_through_core(&core)
+            .await
+            .unwrap_or_else(IntoResponse::into_response);
+    }
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
@@ -601,12 +609,18 @@ pub async fn handle_api_cron_runs(
     headers: HeaderMap,
     Path(id): Path<String>,
     Query(params): Query<CronRunsQuery>,
+    access: CoreAccess,
 ) -> impl IntoResponse {
+    if let CoreAccess::Core(core) = access {
+        return api_cron_runs_through_core(&core, &id, &params)
+            .await
+            .unwrap_or_else(IntoResponse::into_response);
+    }
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
 
-    let limit = params.limit.unwrap_or(20).clamp(1, 100) as usize;
+    let limit = cron_runs_limit(&params) as usize;
     let config = state.config.read().clone();
 
     // A missing job is not necessarily a missing history: a successful
@@ -626,28 +640,7 @@ pub async fn handle_api_cron_runs(
     }
 
     match zeroclaw_runtime::cron::list_runs(&config, &id, limit) {
-        Ok(runs) => {
-            let runs_json: Vec<serde_json::Value> = runs
-                .iter()
-                .map(|r| {
-                    serde_json::json!({
-                        "id": r.id,
-                        "job_id": r.job_id,
-                        "started_at": r.started_at.to_rfc3339(),
-                        "finished_at": r.finished_at.to_rfc3339(),
-                        "status": r.status,
-                        "output": r.output,
-                        "duration_ms": r.duration_ms,
-                        "execution": r.execution,
-                        "delivery": r.delivery,
-                        "persistence": r.persistence,
-                        "principal": r.principal,
-                        "executing_agent": r.executing_agent,
-                    })
-                })
-                .collect();
-            Json(serde_json::json!({"runs": runs_json})).into_response()
-        }
+        Ok(runs) => cron_runs_response(&runs),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": format!("Failed to list cron runs: {e}")})),
@@ -661,7 +654,13 @@ pub async fn handle_api_cron_run(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(id): Path<String>,
+    access: CoreAccess,
 ) -> impl IntoResponse {
+    if let CoreAccess::Core(core) = access {
+        return api_cron_run_through_core(&core, &id)
+            .await
+            .unwrap_or_else(IntoResponse::into_response);
+    }
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
@@ -840,7 +839,13 @@ pub async fn handle_api_cron_delete(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(id): Path<String>,
+    access: CoreAccess,
 ) -> impl IntoResponse {
+    if let CoreAccess::Core(core) = access {
+        return api_cron_delete_through_core(&core, &id)
+            .await
+            .unwrap_or_else(IntoResponse::into_response);
+    }
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
@@ -860,7 +865,13 @@ pub async fn handle_api_cron_delete(
 pub async fn handle_api_cron_settings_get(
     State(state): State<AppState>,
     headers: HeaderMap,
+    access: CoreAccess,
 ) -> impl IntoResponse {
+    if let CoreAccess::Core(core) = access {
+        return api_cron_settings_through_core(&core)
+            .await
+            .unwrap_or_else(IntoResponse::into_response);
+    }
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
@@ -878,8 +889,14 @@ pub async fn handle_api_cron_settings_get(
 pub async fn handle_api_cron_settings_patch(
     State(state): State<AppState>,
     headers: HeaderMap,
+    access: CoreAccess,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
+    if let CoreAccess::Core(core) = access {
+        return api_cron_settings_patch_through_core(&core, &body)
+            .await
+            .unwrap_or_else(IntoResponse::into_response);
+    }
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
@@ -1044,7 +1061,13 @@ pub async fn handle_api_memory_list(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(params): Query<MemoryQuery>,
+    access: CoreAccess,
 ) -> impl IntoResponse {
+    if let CoreAccess::Core(core) = access {
+        return api_memory_list_through_core(&core, &params)
+            .await
+            .unwrap_or_else(IntoResponse::into_response);
+    }
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
@@ -1132,8 +1155,14 @@ fn truncate_with_ellipsis_total_chars(mut s: String) -> String {
 pub async fn handle_api_memory_store(
     State(state): State<AppState>,
     headers: HeaderMap,
+    access: CoreAccess,
     Json(body): Json<MemoryStoreBody>,
 ) -> impl IntoResponse {
+    if let CoreAccess::Core(core) = access {
+        return api_memory_store_through_core(&core, &body)
+            .await
+            .unwrap_or_else(IntoResponse::into_response);
+    }
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
@@ -1170,7 +1199,13 @@ pub async fn handle_api_memory_delete(
     headers: HeaderMap,
     Path(key): Path<String>,
     Query(query): Query<MemoryDeleteQuery>,
+    access: CoreAccess,
 ) -> impl IntoResponse {
+    if let CoreAccess::Core(core) = access {
+        return api_memory_delete_through_core(&core, &key, &query)
+            .await
+            .unwrap_or_else(IntoResponse::into_response);
+    }
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
@@ -1190,6 +1225,244 @@ pub async fn handle_api_memory_delete(
         )
             .into_response(),
     }
+}
+
+// ── Cron and memory through the core ─────────────────────────────
+//
+// Each function is the route's body when the request reaches the core: the
+// same status and body the in-process handler answers for the same state. A
+// refusal is the core's, answered by its error code; its text is never read
+// for a status.
+
+/// `GET /api/cron` through the core.
+pub(crate) async fn api_cron_list_through_core(core: &CoreCall) -> Result<Response, CoreError> {
+    let listed = core
+        .request(Method::CronList, serde_json::json!({}))
+        .await?;
+    Ok(Json(serde_json::json!({ "jobs": listed["jobs"] })).into_response())
+}
+
+/// `POST /api/cron/{id}/run` through the core. `cron/trigger` runs the job as
+/// this route does and reports the same fields, its id as `id`.
+pub(crate) async fn api_cron_run_through_core(
+    core: &CoreCall,
+    id: &str,
+) -> Result<Response, CoreError> {
+    let run = core
+        .request(Method::CronTrigger, serde_json::json!({ "id": id }))
+        .await?;
+    Ok(Json(serde_json::json!({
+        "status": run["status"],
+        "job_id": run["id"],
+        "success": run["success"],
+        "output": run["output"],
+        "duration_ms": run["duration_ms"],
+        "started_at": run["started_at"],
+        "finished_at": run["finished_at"],
+    }))
+    .into_response())
+}
+
+/// `DELETE /api/cron/{id}` through the core.
+pub(crate) async fn api_cron_delete_through_core(
+    core: &CoreCall,
+    id: &str,
+) -> Result<Response, CoreError> {
+    core.request(Method::CronDelete, serde_json::json!({ "id": id }))
+        .await?;
+    Ok(Json(serde_json::json!({ "status": "ok" })).into_response())
+}
+
+/// `GET /api/cron/{id}/runs` through the core, with the route's default and
+/// clamp on `limit`.
+pub(crate) async fn api_cron_runs_through_core(
+    core: &CoreCall,
+    id: &str,
+    params: &CronRunsQuery,
+) -> Result<Response, CoreError> {
+    let listed: CronRunsListed = core
+        .call(
+            Method::CronRuns,
+            serde_json::json!({ "id": id, "limit": cron_runs_limit(params) }),
+        )
+        .await?;
+    Ok(cron_runs_response(&listed.runs))
+}
+
+/// The `cron/runs` result, read back into the runtime's own run records.
+#[derive(Deserialize)]
+struct CronRunsListed {
+    runs: Vec<zeroclaw_runtime::cron::CronRun>,
+}
+
+/// How many runs `GET /api/cron/{id}/runs` lists: 20 by default, between 1
+/// and 100.
+fn cron_runs_limit(params: &CronRunsQuery) -> u32 {
+    params.limit.unwrap_or(20).clamp(1, 100)
+}
+
+/// The route's body for a job's runs, whichever path read them.
+fn cron_runs_response(runs: &[zeroclaw_runtime::cron::CronRun]) -> Response {
+    let runs: Vec<serde_json::Value> = runs
+        .iter()
+        .map(|run| {
+            serde_json::json!({
+                "id": run.id,
+                "job_id": run.job_id,
+                "started_at": run.started_at.to_rfc3339(),
+                "finished_at": run.finished_at.to_rfc3339(),
+                "status": run.status,
+                "output": run.output,
+                "duration_ms": run.duration_ms,
+                "execution": run.execution,
+                "delivery": run.delivery,
+                "persistence": run.persistence,
+                "principal": run.principal,
+                "executing_agent": run.executing_agent,
+            })
+        })
+        .collect();
+    Json(serde_json::json!({ "runs": runs })).into_response()
+}
+
+/// The settings `GET`/`PATCH /api/cron/settings` report, from the core's
+/// scheduler section.
+fn cron_settings_body(scheduler: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "enabled": scheduler["enabled"],
+        "catch_up_on_startup": scheduler["catch_up_on_startup"],
+        "max_run_history": scheduler["max_run_history"],
+    })
+}
+
+/// `GET /api/cron/settings` through the core.
+pub(crate) async fn api_cron_settings_through_core(core: &CoreCall) -> Result<Response, CoreError> {
+    let scheduler = core
+        .request(Method::CronSettings, serde_json::json!({}))
+        .await?;
+    Ok(Json(cron_settings_body(&scheduler)).into_response())
+}
+
+/// `PATCH /api/cron/settings` through the core: the values this route
+/// applies, written as one `config/set-many` batch (nothing to write writes
+/// nothing), then the settings read back.
+pub(crate) async fn api_cron_settings_patch_through_core(
+    core: &CoreCall,
+    body: &serde_json::Value,
+) -> Result<Response, CoreError> {
+    let sets = cron_settings_sets(body);
+    if !sets.is_empty() {
+        core.request(Method::ConfigSetMany, serde_json::json!({ "sets": sets }))
+            .await?;
+    }
+    let scheduler = core
+        .request(Method::CronSettings, serde_json::json!({}))
+        .await?;
+    let mut settings = cron_settings_body(&scheduler);
+    settings["status"] = "ok".into();
+    Ok(Json(settings).into_response())
+}
+
+/// The `config/set-many` entries for a settings patch: only the values the
+/// in-process body applies, of the types it accepts, `max_run_history`
+/// clamped to `u32` as it is there.
+fn cron_settings_sets(body: &serde_json::Value) -> Vec<serde_json::Value> {
+    let mut sets = Vec::new();
+    if let Some(value) = body.get("enabled").and_then(serde_json::Value::as_bool) {
+        sets.push(serde_json::json!({ "prop": "scheduler.enabled", "value": value }));
+    }
+    if let Some(value) = body
+        .get("catch_up_on_startup")
+        .and_then(serde_json::Value::as_bool)
+    {
+        sets.push(serde_json::json!({ "prop": "scheduler.catch_up_on_startup", "value": value }));
+    }
+    if let Some(value) = body
+        .get("max_run_history")
+        .and_then(serde_json::Value::as_u64)
+    {
+        let value = u32::try_from(value).unwrap_or(u32::MAX);
+        sets.push(serde_json::json!({ "prop": "scheduler.max_run_history", "value": value }));
+    }
+    sets
+}
+
+/// A memory request on the shared plane, the store this route reads and
+/// writes, for `agent` when one is named.
+fn shared_memory_params(agent: Option<&str>) -> serde_json::Value {
+    let mut params = serde_json::json!({ "plane": "shared" });
+    if let Some(agent) = agent {
+        params["agent"] = agent.into();
+    }
+    params
+}
+
+/// `GET /api/memory` through the core: a listing, or with a query or a time
+/// range a search of up to 50 entries filtered by category, each entry's
+/// content cut as this route cuts it.
+pub(crate) async fn api_memory_list_through_core(
+    core: &CoreCall,
+    params: &MemoryQuery,
+) -> Result<Response, CoreError> {
+    let mut request = shared_memory_params(params.agent.as_deref());
+    request["content_max_chars"] = MEMORY_API_CONTENT_MAX_CHARS.into();
+    let searching = params.query.is_some() || params.since.is_some() || params.until.is_some();
+    let entries = if searching {
+        request["query"] = params.query.clone().unwrap_or_default().into();
+        request["limit"] = 50.into();
+        if let Some(since) = &params.since {
+            request["since"] = since.clone().into();
+        }
+        if let Some(until) = &params.until {
+            request["until"] = until.clone().into();
+        }
+        let found: MemorySearchResult = core.call(Method::MemorySearch, request).await?;
+        match params.category.as_deref() {
+            Some(category) => found
+                .entries
+                .into_iter()
+                .filter(|entry| entry.category.to_string() == category)
+                .collect(),
+            None => found.entries,
+        }
+    } else {
+        if let Some(category) = &params.category {
+            request["category"] = category.clone().into();
+        }
+        let listed: MemoryListResult = core.call(Method::MemoryList, request).await?;
+        listed.entries
+    };
+    Ok(Json(serde_json::json!({ "entries": entries })).into_response())
+}
+
+/// `POST /api/memory` through the core. The route files an entry without a
+/// category under `core`, so that is sent rather than the core's default.
+pub(crate) async fn api_memory_store_through_core(
+    core: &CoreCall,
+    body: &MemoryStoreBody,
+) -> Result<Response, CoreError> {
+    let mut request = shared_memory_params(body.agent.as_deref());
+    request["key"] = body.key.clone().into();
+    request["content"] = body.content.clone().into();
+    request["category"] = body.category.as_deref().unwrap_or("core").into();
+    core.request(Method::MemoryStore, request).await?;
+    Ok(Json(serde_json::json!({ "status": "ok" })).into_response())
+}
+
+/// `DELETE /api/memory/{key}` through the core.
+pub(crate) async fn api_memory_delete_through_core(
+    core: &CoreCall,
+    key: &str,
+    query: &MemoryDeleteQuery,
+) -> Result<Response, CoreError> {
+    let mut request = shared_memory_params(query.agent.as_deref());
+    request["key"] = key.into();
+    let result = core.request(Method::MemoryDelete, request).await?;
+    Ok(Json(serde_json::json!({
+        "status": "ok",
+        "deleted": result["deleted"],
+    }))
+    .into_response())
 }
 
 /// Query parameters for `GET /api/cost`. When `agent` is set, the
@@ -2875,6 +3148,7 @@ pub(crate) mod tests {
                 until: None,
                 agent: None,
             }),
+            CoreAccess::InProcess,
         )
         .await
         .into_response();
@@ -2906,6 +3180,7 @@ pub(crate) mod tests {
                 until: None,
                 agent: None,
             }),
+            CoreAccess::InProcess,
         )
         .await
         .into_response();
@@ -4461,9 +4736,10 @@ pub(crate) mod tests {
         assert_eq!(add_json["job"]["delivery"]["channel"], "discord");
         assert_eq!(add_json["job"]["delivery"]["to"], "1234567890");
 
-        let list_response = handle_api_cron_list(State(state), HeaderMap::new())
-            .await
-            .into_response();
+        let list_response =
+            handle_api_cron_list(State(state), HeaderMap::new(), CoreAccess::InProcess)
+                .await
+                .into_response();
         let list_json = response_json(list_response).await;
         let jobs = list_json["jobs"].as_array().expect("jobs array");
         assert_eq!(jobs.len(), 1);
@@ -5342,10 +5618,14 @@ pub(crate) mod tests {
         // The regression this PATCH must actually prove: the persisted
         // value is what execution reads, not just what get_job() reports.
         // A job created wrapped, then PATCHed to raw, must run raw.
-        let run_response =
-            handle_api_cron_run(State(state.clone()), HeaderMap::new(), Path(job.id.clone()))
-                .await
-                .into_response();
+        let run_response = handle_api_cron_run(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path(job.id.clone()),
+            CoreAccess::InProcess,
+        )
+        .await
+        .into_response();
         assert_eq!(run_response.status(), StatusCode::OK);
         let run_json = response_json(run_response).await;
         assert_eq!(run_json["success"], true);
@@ -5626,10 +5906,14 @@ pub(crate) mod tests {
         // fallback for rows without one.
         link_job_to_test_agent(&state, &job.id);
 
-        let response =
-            handle_api_cron_run(State(state.clone()), HeaderMap::new(), Path(job.id.clone()))
-                .await
-                .into_response();
+        let response = handle_api_cron_run(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path(job.id.clone()),
+            CoreAccess::InProcess,
+        )
+        .await
+        .into_response();
 
         assert_eq!(response.status(), StatusCode::OK);
         let json = response_json(response).await;
@@ -5692,6 +5976,7 @@ pub(crate) mod tests {
             HeaderMap::new(),
             Path("retained-one-shot".to_string()),
             axum::extract::Query(CronRunsQuery { limit: None }),
+            CoreAccess::InProcess,
         )
         .await
         .into_response();
@@ -5707,6 +5992,7 @@ pub(crate) mod tests {
             HeaderMap::new(),
             Path("never-existed".to_string()),
             axum::extract::Query(CronRunsQuery { limit: None }),
+            CoreAccess::InProcess,
         )
         .await
         .into_response();
@@ -5756,10 +6042,14 @@ pub(crate) mod tests {
         .expect("job added");
         link_job_to_test_agent(&state, &job.id);
 
-        let response =
-            handle_api_cron_run(State(state.clone()), HeaderMap::new(), Path(job.id.clone()))
-                .await
-                .into_response();
+        let response = handle_api_cron_run(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path(job.id.clone()),
+            CoreAccess::InProcess,
+        )
+        .await
+        .into_response();
 
         assert_eq!(response.status(), StatusCode::OK);
         let json = response_json(response).await;
@@ -5810,6 +6100,7 @@ pub(crate) mod tests {
             State(state),
             HeaderMap::new(),
             Path("does-not-exist".to_string()),
+            CoreAccess::InProcess,
         )
         .await
         .into_response();
@@ -6246,9 +6537,13 @@ pub(crate) mod tests {
         let job_id = add_json["job"]["id"].as_str().expect("job id").to_string();
 
         // 2. Read the job back via list and verify shell_output_format persisted.
-        let list_response = handle_api_cron_list(State(state.clone()), HeaderMap::new())
-            .await
-            .into_response();
+        let list_response = handle_api_cron_list(
+            State(state.clone()),
+            HeaderMap::new(),
+            CoreAccess::InProcess,
+        )
+        .await
+        .into_response();
         let list_json = response_json(list_response).await;
         let jobs = list_json["jobs"].as_array().expect("jobs array");
         let listed = jobs
@@ -6265,10 +6560,14 @@ pub(crate) mod tests {
         link_job_to_test_agent(&state, &job_id);
 
         // 4. Trigger the job manually and verify raw output.
-        let run_response =
-            handle_api_cron_run(State(state.clone()), HeaderMap::new(), Path(job_id.clone()))
-                .await
-                .into_response();
+        let run_response = handle_api_cron_run(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path(job_id.clone()),
+            CoreAccess::InProcess,
+        )
+        .await
+        .into_response();
         assert_eq!(run_response.status(), StatusCode::OK);
         let run_json = response_json(run_response).await;
         assert_eq!(run_json["status"], "ok", "job should succeed: {run_json}");

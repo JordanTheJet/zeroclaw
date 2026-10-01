@@ -120,6 +120,11 @@ const SERVED: &[&str] = &[
     "/api/cost",
     "/api/events/history",
     "/api/sessions",
+    "/api/cron/settings",
+    "/api/cron/{id}/run",
+    "/api/cron/{id}/runs",
+    "/api/memory",
+    "/api/memory/{key}",
 ];
 
 /// Route paths the in-process gateway registers with a string literal, from
@@ -513,14 +518,21 @@ mod against_a_core {
 
         // A dashboard route not served yet: the credential first, then a
         // refusal that names the route.
-        let (status, body) = get(&router, "/api/cron", None).await;
+        let (status, body) = get(&router, "/api/integrations", None).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
-        let (status, body) = get(&router, "/api/cron", Some(TOKEN)).await;
+        let (status, body) = get(&router, "/api/integrations", Some(TOKEN)).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
         let refused = json_of(&body);
         assert_eq!(refused["code"], "capability_missing");
-        assert_eq!(refused["route"], "GET /api/cron");
+        assert_eq!(refused["route"], "GET /api/integrations");
         assert_eq!(refused["deferred"], false);
+        // On a path that also serves other methods, the unported method is
+        // still refused by name.
+        let (status, body) = send(&router, "POST", "/api/cron", Some(TOKEN)).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert_eq!(json_of(&body)["route"], "POST /api/cron");
+        let (_, body) = send(&router, "PATCH", "/api/cron/job-1", Some(TOKEN)).await;
+        assert_eq!(json_of(&body)["route"], "PATCH /api/cron/{id}");
         let (_, body) = get(&router, "/api/sessions/abc/state", Some(TOKEN)).await;
         assert_eq!(json_of(&body)["route"], "GET /api/sessions/{id}/state");
 
@@ -750,6 +762,247 @@ mod against_a_core {
         assert_eq!(json_of(&body)["events"][0]["type"], "agent_start", "{body}");
 
         drop(terminal);
+        core.stop().await;
+    }
+
+    async fn send_json(
+        router: &Router,
+        method: &str,
+        path: &str,
+        body: serde_json::Value,
+    ) -> (StatusCode, String) {
+        let request = Request::builder()
+            .method(method)
+            .uri(path)
+            .header("authorization", format!("Bearer {TOKEN}"))
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let response = router.clone().oneshot(request).await.unwrap();
+        let status = response.status();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    async fn send_raw(
+        router: &Router,
+        method: &str,
+        path: &str,
+        body: &str,
+    ) -> (StatusCode, String) {
+        let request = Request::builder()
+            .method(method)
+            .uri(path)
+            .header("authorization", format!("Bearer {TOKEN}"))
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_owned()))
+            .unwrap();
+        let response = router.clone().oneshot(request).await.unwrap();
+        let status = response.status();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    /// What axum's JSON extractor, which the in-process route runs on the
+    /// same body, answers for `body`.
+    async fn json_rejection<T: serde::de::DeserializeOwned>(body: &str) -> (StatusCode, String) {
+        use axum::extract::FromRequest;
+        let request = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_owned()))
+            .unwrap();
+        let Err(rejection) = axum::Json::<T>::from_request(request, &()).await else {
+            panic!("{body} parsed");
+        };
+        let response = rejection.into_response();
+        let status = response.status();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    /// A malformed, incomplete or ill-typed body is refused by the separate
+    /// gateway exactly as the in-process route's extractor refuses it, before
+    /// anything reaches the core.
+    #[tokio::test]
+    async fn bad_bodies_on_the_cron_and_memory_writes_are_refused_as_in_process() {
+        let tmp = tempfile::tempdir().unwrap();
+        let core = Core::start(tmp.path()).await;
+        let preview = router(
+            CoreRpc::local(core.endpoint.clone(), EndpointOwner::SameAccount),
+            core.endpoint.clone(),
+            None,
+        );
+        for body in ["{not json", "{\"enabled\": tru"] {
+            let served = send_raw(&preview, "PATCH", "/api/cron/settings", body).await;
+            let expected = json_rejection::<serde_json::Value>(body).await;
+            assert_eq!(served, expected, "PATCH /api/cron/settings {body}");
+        }
+        for body in [
+            "{not json",
+            "{\"key\": \"k\"",
+            "{\"key\": \"k\"}",
+            "{\"key\": 1, \"content\": 2}",
+        ] {
+            let served = send_raw(&preview, "POST", "/api/memory", body).await;
+            let expected = json_rejection::<crate::api::MemoryStoreBody>(body).await;
+            assert_eq!(served, expected, "POST /api/memory {body}");
+        }
+        core.stop().await;
+    }
+
+    /// The cron and memory routes through the separate gateway: reads answer
+    /// what the in-process route answers through the same core, and writes
+    /// land in the core's stores.
+    #[tokio::test]
+    async fn the_cron_and_memory_routes_answer_through_the_preview() {
+        use crate::api::{
+            MemoryQuery, handle_api_cron_list, handle_api_cron_settings_get, handle_api_memory_list,
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ctx = Core::context(tmp.path());
+        let memory_dir = tempfile::tempdir().unwrap();
+        let memory: Arc<dyn zeroclaw_api::memory_traits::Memory> = Arc::new(
+            zeroclaw_memory::sqlite::SqliteMemory::new("preview", memory_dir.path()).unwrap(),
+        );
+        {
+            let ctx = Arc::get_mut(&mut ctx).expect("a fresh context has one owner");
+            ctx.memory = Some(Arc::clone(&memory));
+        }
+        {
+            let mut config = ctx.config.write();
+            config.providers.models.openrouter.insert(
+                "default".to_string(),
+                zeroclaw_config::schema::OpenRouterModelProviderConfig::default(),
+            );
+            config.risk_profiles.insert(
+                "preview-profile".to_string(),
+                zeroclaw_config::schema::RiskProfileConfig::default(),
+            );
+            config.agents.insert(
+                "preview-agent".to_string(),
+                zeroclaw_config::schema::AliasedAgentConfig {
+                    model_provider: "openrouter.default".into(),
+                    risk_profile: "preview-profile".into(),
+                    ..Default::default()
+                },
+            );
+        }
+        let config = ctx.config.read().clone();
+        let job = zeroclaw_runtime::cron::add_shell_job(
+            &config,
+            "preview-agent",
+            Some("preview-job".into()),
+            zeroclaw_runtime::cron::Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "echo preview",
+        )
+        .unwrap();
+        let core = Core::serve(ctx).await;
+        let rpc = CoreRpc::local(core.endpoint.clone(), EndpointOwner::SameAccount);
+        let preview = router(rpc.clone(), core.endpoint.clone(), None);
+        let mut state = crate::api::test_state(config.clone());
+        state.mem = Arc::clone(&memory);
+
+        // Writes through the preview.
+        let (status, body) = send_json(
+            &preview,
+            "POST",
+            "/api/memory",
+            json!({ "key": "preview-note", "content": "a preview note" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(json_of(&body), json!({ "status": "ok" }));
+        let (status, body) = send_json(
+            &preview,
+            "PATCH",
+            "/api/cron/settings",
+            json!({ "max_run_history": 12 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(json_of(&body)["max_run_history"], 12);
+        assert_eq!(core.ctx.config.read().scheduler.max_run_history, 12);
+        let run_path = format!("/api/cron/{}/run", job.id);
+        let (status, body) = send(&preview, "POST", &run_path, Some(TOKEN)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(json_of(&body)["job_id"], job.id.as_str());
+
+        // Reads match the in-process route through the same core.
+        let headers = || {
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert(
+                axum::http::header::AUTHORIZATION,
+                format!("Bearer {TOKEN}").parse().unwrap(),
+            );
+            headers
+        };
+        let access = || async { rpc.access(&headers()).await.expect("through the core") };
+        let collected = |response: axum::response::Response| async move {
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            json_of(&String::from_utf8_lossy(&body))
+        };
+        let (status, served) = get(&preview, "/api/cron", Some(TOKEN)).await;
+        assert_eq!(status, StatusCode::OK, "{served}");
+        let in_process = collected(
+            handle_api_cron_list(State(state.clone()), headers(), access().await)
+                .await
+                .into_response(),
+        )
+        .await;
+        assert_eq!(json_of(&served), in_process);
+        assert_eq!(in_process["jobs"][0]["id"], job.id.as_str());
+        let (_, served) = get(&preview, "/api/cron/settings", Some(TOKEN)).await;
+        let in_process = collected(
+            handle_api_cron_settings_get(State(state.clone()), headers(), access().await)
+                .await
+                .into_response(),
+        )
+        .await;
+        assert_eq!(json_of(&served), in_process);
+        let (_, served) = get(&preview, "/api/memory?query=preview", Some(TOKEN)).await;
+        let query = MemoryQuery {
+            query: Some("preview".into()),
+            category: None,
+            since: None,
+            until: None,
+            agent: None,
+        };
+        let in_process = collected(
+            handle_api_memory_list(
+                State(state.clone()),
+                headers(),
+                Query(query),
+                access().await,
+            )
+            .await
+            .into_response(),
+        )
+        .await;
+        assert_eq!(json_of(&served), in_process);
+        assert_eq!(in_process["entries"][0]["key"], "preview-note");
+
+        // Deletes through the preview.
+        let (status, body) =
+            send(&preview, "DELETE", "/api/memory/preview-note", Some(TOKEN)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(json_of(&body), json!({ "status": "ok", "deleted": true }));
+        let delete_path = format!("/api/cron/{}", job.id);
+        let (status, body) = send(&preview, "DELETE", &delete_path, Some(TOKEN)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(
+            zeroclaw_runtime::cron::list_jobs(&config)
+                .unwrap()
+                .is_empty()
+        );
+
+        // Without a credential the served routes ask for one.
+        let (status, _) = get(&preview, "/api/memory", None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
         core.stop().await;
     }
 
