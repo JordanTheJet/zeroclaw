@@ -379,6 +379,10 @@ rpc_type! {
         pub tool_input: Option<serde_json::Value>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub tool_output: Option<String>,
+        /// When the entry was persisted (RFC 3339). Absent for stores that
+        /// do not stamp individual rows.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub created_at: Option<String>,
     }
 }
 

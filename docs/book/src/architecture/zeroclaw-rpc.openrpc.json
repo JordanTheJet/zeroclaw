@@ -2077,6 +2077,13 @@
           "content": {
             "type": "string"
           },
+          "created_at": {
+            "description": "When the entry was persisted (RFC 3339). Absent for stores that\ndo not stamp individual rows.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "kind": {
             "allOf": [
               {
