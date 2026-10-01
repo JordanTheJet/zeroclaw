@@ -1,4 +1,5 @@
-//! Release invariant: the macOS desktop sidecar must contain the dashboard.
+//! Desktop invariants: CI runs the desktop app's unit tests, and the macOS
+//! release sidecar must contain the dashboard.
 
 use std::{fs, path::Path};
 
@@ -97,76 +98,36 @@ fn macos_desktop_sidecar_embeds_the_web_artifact() {
 }
 
 #[test]
-fn desktop_bundle_dry_run_uses_the_real_dashboard_and_smoke_test() {
+fn desktop_app_check_runs_the_desktop_unit_tests() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let workflow = fs::read_to_string(root.join(".github/workflows/desktop-bundle-check.yml"))
-        .expect("desktop bundle dry-run workflow should be readable");
+    let workflow = fs::read_to_string(root.join(".github/workflows/desktop-check.yml"))
+        .expect("desktop app check workflow should be readable");
+    let (triggers, jobs) = workflow
+        .split_once("\njobs:\n")
+        .expect("desktop app check should define jobs");
 
     assert!(
-        workflow.contains("run: cargo web build")
-            && workflow.contains("name: web-dist")
-            && workflow.contains("path: web/dist/"),
-        "the dry run must build and restore the real web dashboard"
+        triggers.contains("\n  pull_request:\n") && triggers.contains("- \"apps/tauri/**\""),
+        "desktop app check must run on pull requests that change the desktop app"
     );
     assert!(
-        !workflow.contains(".gitkeep"),
-        "the dry run must not substitute a placeholder for the dashboard"
+        jobs.contains("os: [macos-14, ubuntu-22.04, windows-latest]"),
+        "desktop unit tests must run on macOS, Linux, and Windows"
+    );
+    assert!(
+        !workflow.contains("continue-on-error"),
+        "a failing desktop unit test must fail the desktop app check"
     );
 
-    let bundle_job = workflow
-        .split_once("\n  bundle:\n")
-        .map(|(_, job)| job)
-        .expect("desktop bundle dry run should have a bundle job");
+    let test_step = jobs
+        .split("\n      - ")
+        .find(|step| step.starts_with("name: Test (zeroclaw-desktop)"))
+        .expect("desktop app check must have a desktop unit-test step");
     assert!(
-        bundle_job.contains("needs: [web]"),
-        "the bundle job must wait for the web dashboard build"
-    );
-    for os in ["macos-14", "ubuntu-22.04", "windows-latest"] {
-        assert!(
-            bundle_job.contains(&format!("os: {os}")),
-            "the bundle dry run must cover {os}"
-        );
-    }
-
-    let restore = bundle_job
-        .find("uses: actions/download-artifact@")
-        .expect("the bundle job must restore the web dashboard");
-    let stage = bundle_job
-        .find(
-            "scripts/desktop/prepare-kernel.sh --target ${{ matrix.target }} --features embedded-web",
-        )
-        .expect("the bundle job must stage the kernel with embedded-web");
-    let smoke = bundle_job
-        .find("scripts/desktop/smoke-dashboard.sh \"apps/tauri/binaries/${{ matrix.kernel }}\"")
-        .expect("the bundle job must smoke test the staged kernel");
-    let bundle = bundle_job
-        .find("cargo tauri build --config tauri.bundled.conf.json")
-        .expect("the bundle job must build with the sidecar overlay");
-    assert!(
-        restore < stage && stage < smoke && smoke < bundle,
-        "the dry run must restore the dashboard, stage, smoke test, then bundle"
-    );
-}
-
-#[test]
-fn desktop_dashboard_smoke_launches_like_a_fresh_install() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let script = fs::read_to_string(root.join("scripts/desktop/smoke-dashboard.sh"))
-        .expect("desktop dashboard smoke script should be readable");
-
-    assert!(
-        script.contains("cd \"$smoke_cwd\"")
-            && script.contains("--config-dir \"$(native_path \"$config_dir\")\"")
-            && script.contains("HOME=\"$smoke_home\"")
-            && script.contains("XDG_DATA_HOME=\"$xdg_data_home\"")
-            && script.contains("host=\"127.0.0.1\"")
-            && script.contains("--host \"$host\" --port \"$port\""),
-        "the dashboard smoke must launch from an empty cwd with isolated config"
-    );
-    assert!(
-        script.contains("\"$origin/\"")
-            && script.contains("[[ \"$status_code\" == \"200\" ]]")
-            && script.contains("grep -Fq 'id=\"root\"'"),
-        "the dashboard smoke must require a successful SPA response"
+        test_step
+            .lines()
+            .any(|line| line.trim() == "run: cargo test --locked -p zeroclaw-desktop")
+            && !test_step.contains("if:"),
+        "the desktop unit-test step must run every desktop test on every platform"
     );
 }
