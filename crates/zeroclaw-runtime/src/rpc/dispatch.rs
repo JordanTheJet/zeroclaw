@@ -8520,20 +8520,18 @@ impl RpcDispatcher {
         }
         // Boxed for the same stack-frame reason as in `handle_config_set`.
         let mut working = Box::new(old_config.clone());
-        let results = patch::apply_patch_ops(&mut working, &ops).map_err(config_patch_refused)?;
+        let results = {
+            let authority = self.ctx.auth.hold_authority();
+            self.authorize_config_patch_paths(&ops, &authority)?;
+            patch::apply_patch_ops(&mut working, &ops).map_err(config_patch_refused)?
+        };
         let scoped_validation_warnings =
             patch::scoped_validate(&working).map_err(config_patch_refused)?;
         let annotations = patch::annotations(&ops, &results);
         let config_path = working.config_path.clone();
         let mut warnings = working.collect_warnings();
         warnings.extend(scoped_validation_warnings);
-        self.authorize_config_write_effects(
-            Method::ConfigSetMany,
-            &old_config,
-            &working,
-            &patch::removed_paths(&ops),
-        )?;
-        let _agent_config_reservations: Vec<_> = patch::agent_aliases(&ops)
+        let agent_config_reservations: Vec<_> = patch::agent_aliases(&ops)
             .into_iter()
             .map(|alias| {
                 self.ctx
@@ -8561,70 +8559,151 @@ impl RpcDispatcher {
             .iter()
             .filter_map(|prop| LiveSessionRefreshScope::for_prop(prop))
             .collect();
-        if scopes.is_empty() {
-            self.save_and_swap_config(*working, &config_write_guard)
-                .await?;
+        let prepared = if scopes.is_empty() {
+            Vec::new()
         } else {
-            Box::pin(self.commit_config_with_live_session_refresh(
-                *working,
-                &config_write_guard,
+            Self::prepare_live_sessions_refresh(
+                Arc::clone(&self.ctx),
+                &working,
                 &LiveSessionRefreshScope::Batch(scopes),
-            ))
-            .await?;
+            )
+            .await?
+        };
+        #[cfg(test)]
+        if let Some(pause) = self.ctx.config_commit_pause.as_ref() {
+            pause.arrived.notify_one();
+            pause.release.notified().await;
         }
-        let _config_write_guard = self
-            .finish_channel_generation_mutation(channel_generation_revocation, config_write_guard)
-            .await?;
-        if !annotations.is_empty()
-            && let Err(error) =
-                zeroclaw_config::comment_writer::apply_comments(&config_path, &annotations).await
-        {
-            // Comments are decoration: the patch itself is saved.
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"error": error.to_string()})),
-                "failed to apply config/set-many op comments to config.toml"
-            );
-        }
-        let new_config = self.ctx.config.read().clone();
-        let channel_agents: std::collections::BTreeSet<_> = props
-            .iter()
-            .filter_map(|prop| agent_alias_from_channel_auth_prop(prop))
-            .collect();
-        for alias in channel_agents {
-            self.refresh_live_channel_handles_between_configs(&old_config, &new_config, &alias)
+
+        // Preparation may wait on live sessions. Admit only after those waits,
+        // holding the accepted policy through the synchronous task enqueue.
+        // The retained task owns the writer and reservations until publication.
+        let commit = {
+            let authority = self.ctx.auth.hold_authority();
+            self.authorize_config_patch_paths(&ops, &authority)?;
+            self.authorize_config_write_effects(
+                Method::ConfigSetMany,
+                &old_config,
+                &working,
+                &patch::removed_paths(&ops),
+                &authority,
+            )?;
+            let dispatcher = self.spawn_handle();
+            crate::live_config_authority::spawn_agent_lifecycle_job(Box::pin(async move {
+                let _agent_config_reservations = agent_config_reservations;
+                #[cfg(test)]
+                if let Some(pause) = dispatcher.ctx.config_patch_enqueued_pause.as_ref() {
+                    pause.arrived.notify_one();
+                    pause.release.notified().await;
+                }
+                dispatcher
+                    .save_and_swap_config(*working, &config_write_guard)
+                    .await?;
+                let config_generation = Arc::new(dispatcher.ctx.config.read().clone());
+                Self::apply_prepared_live_sessions_refresh(
+                    Arc::clone(&dispatcher.ctx),
+                    prepared,
+                    config_generation,
+                )
                 .await;
+                let _config_write_guard = dispatcher
+                    .finish_channel_generation_mutation(
+                        channel_generation_revocation,
+                        config_write_guard,
+                    )
+                    .await?;
+                if !annotations.is_empty()
+                    && let Err(error) =
+                        zeroclaw_config::comment_writer::apply_comments(&config_path, &annotations)
+                            .await
+                {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"error": error.to_string()})),
+                        "failed to apply config/set-many op comments to config.toml"
+                    );
+                }
+                let new_config = dispatcher.ctx.config.read().clone();
+                let channel_agents: std::collections::BTreeSet<_> = props
+                    .iter()
+                    .filter_map(|prop| agent_alias_from_channel_auth_prop(prop))
+                    .collect();
+                for alias in channel_agents {
+                    dispatcher
+                        .refresh_live_channel_handles_between_configs(
+                            &old_config,
+                            &new_config,
+                            &alias,
+                        )
+                        .await;
+                }
+                let providers: std::collections::BTreeSet<_> = props
+                    .iter()
+                    .filter_map(|prop| model_provider_ref_from_provider_profile_prop(prop))
+                    .collect();
+                for provider in providers {
+                    dispatcher.refresh_memory_embedder_for_model_provider(&provider);
+                }
+                to_result(ConfigSetManyResult {
+                    props,
+                    set: true,
+                    results,
+                    warnings,
+                })
+            }))
+        };
+        commit.await.map_err(|error| {
+            rpc_err(INTERNAL_ERROR, format!("Config patch task failed: {error}"))
+        })?
+    }
+
+    /// Every operation names a config path, including comparisons and
+    /// annotations that do not dirty a value. Check those selectors before
+    /// staging can reveal a value and again at the final transaction admission.
+    fn authorize_config_patch_paths(
+        &self,
+        ops: &[ConfigPatchOp],
+        authority: &crate::rpc::auth::AuthorityLease<'_>,
+    ) -> Result<(), JsonRpcError> {
+        use crate::rpc::auth::AuthDenied;
+        let method = Method::ConfigSetMany;
+        let refuse = |denied: AuthDenied| {
+            self.audit_auth_denial(method, &denied);
+            rpc_err(denied.code, denied.message)
+        };
+        let auth = self.auth.as_ref().ok_or_else(|| {
+            refuse(AuthDenied::auth_required(
+                crate::i18n::get_required_cli_string("rpc-auth-first-call-initialize"),
+            ))
+        })?;
+        let grants = current_authority_under(authority, auth, method).map_err(refuse)?;
+        for op in ops {
+            let path = crate::config_ops::patch::json_pointer_to_dotted(&op.path);
+            if !grants.may_write_config(&path) {
+                return Err(refuse(AuthDenied::forbidden(format!(
+                    "Principal's config path selectors do not cover `{path}`"
+                ))));
+            }
         }
-        let providers: std::collections::BTreeSet<_> = props
-            .iter()
-            .filter_map(|prop| model_provider_ref_from_provider_profile_prop(prop))
-            .collect();
-        for provider in providers {
-            self.refresh_memory_embedder_for_model_provider(&provider);
-        }
-        to_result(ConfigSetManyResult {
-            props,
-            set: true,
-            results,
-            warnings,
-        })
+        Ok(())
     }
 
     /// Authorize a staged config write by its effect, as the gateway's
     /// principal gate authorizes the dashboard's config routes: every dirty
     /// path of `working`, classified against `before` (plus each of
     /// `deleted`, pinned as a deletion), needs the Config verb its effect
-    /// implies and a matching config path selector. Checked on grants
-    /// re-resolved now, so the caller runs it after its last await, under
-    /// the config write lock.
+    /// implies and a matching config path selector. Resolve grants from the
+    /// held authority lease after preparation's last await; keep the lease
+    /// until the transaction has been enqueued under the config write lock.
     fn authorize_config_write_effects(
         &self,
         method: Method,
         before: &Config,
         working: &Config,
         deleted: &[String],
+        authority: &crate::rpc::auth::AuthorityLease<'_>,
     ) -> Result<(), JsonRpcError> {
         use crate::config_ops::write_set;
         use crate::rpc::auth::AuthDenied;
@@ -8634,11 +8713,12 @@ impl RpcDispatcher {
             self.audit_auth_denial(method, &denied);
             rpc_err(denied.code, denied.message)
         };
-        let Some(grants) = self.recheck_authority_after_admission(method)? else {
+        let Some(auth) = self.auth.as_ref() else {
             return Err(refuse(AuthDenied::auth_required(
                 crate::i18n::get_required_cli_string("rpc-auth-first-call-initialize"),
             )));
         };
+        let grants = current_authority_under(authority, auth, method).map_err(refuse)?;
         if grants.admin {
             return Ok(());
         }
@@ -9206,14 +9286,42 @@ impl RpcDispatcher {
             }
             created
         } else {
-            let mut working = self.ctx.config.read().clone();
+            let before = self.ctx.config.read().clone();
+            let mut working = before.clone();
             let created = create(&mut working)?;
             if created {
                 if req.path == "skill_bundles" {
-                    Self::scaffold_skill_bundle_dir(&working, &req.key).await;
+                    // Directory creation and persistence are one admitted job.
+                    let commit = {
+                        let authority = self.ctx.auth.hold_authority();
+                        self.authorize_config_write_effects(
+                            Method::ConfigMapKeyCreate,
+                            &before,
+                            &working,
+                            &[],
+                            &authority,
+                        )?;
+                        let dispatcher = self.spawn_handle();
+                        let key = req.key.clone();
+                        crate::live_config_authority::spawn_agent_lifecycle_job(Box::pin(
+                            async move {
+                                Self::scaffold_skill_bundle_dir(&working, &key).await;
+                                dispatcher
+                                    .save_and_swap_config(working, &config_write_guard)
+                                    .await
+                            },
+                        ))
+                    };
+                    commit.await.map_err(|error| {
+                        rpc_err(
+                            INTERNAL_ERROR,
+                            format!("Skill bundle create task failed: {error}"),
+                        )
+                    })??;
+                } else {
+                    self.save_and_swap_config(working, &config_write_guard)
+                        .await?;
                 }
-                self.save_and_swap_config(working, &config_write_guard)
-                    .await?;
             }
             created
         };
@@ -33959,6 +34067,8 @@ mod tests {
             agent_lifecycle: authority.agent_lifecycle(),
             channel_generation_control: Some(control),
             config_commit_pause: None,
+            #[cfg(test)]
+            config_patch_enqueued_pause: None,
             sessions,
             session_backend: None,
             memory: None,
@@ -38712,6 +38822,8 @@ mod tests {
         runner.register(Box::new(_hook));
         let ctx = Arc::new(crate::rpc::context::RpcContext {
             config_commit_pause: None,
+            #[cfg(test)]
+            config_patch_enqueued_pause: None,
             config: Arc::new(parking_lot::RwLock::new(
                 zeroclaw_config::schema::Config::default(),
             )),
@@ -38765,6 +38877,8 @@ mod tests {
         runner.register(Box::new(_hook));
         let ctx = Arc::new(crate::rpc::context::RpcContext {
             config_commit_pause: None,
+            #[cfg(test)]
+            config_patch_enqueued_pause: None,
             config: Arc::new(parking_lot::RwLock::new(
                 zeroclaw_config::schema::Config::default(),
             )),
@@ -38954,6 +39068,8 @@ mod tests {
 
         let ctx = Arc::new(crate::rpc::context::RpcContext {
             config_commit_pause: None,
+            #[cfg(test)]
+            config_patch_enqueued_pause: None,
             config: Arc::new(parking_lot::RwLock::new(
                 zeroclaw_config::schema::Config::default(),
             )),
@@ -39763,6 +39879,121 @@ mod tests {
                 before,
                 "the refused patch must not reach disk"
             );
+        });
+    }
+
+    #[test]
+    fn config_patch_revoked_after_live_session_preparation_is_refused() {
+        run_on_a_large_stack(|| async move {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let pause = Arc::new(crate::rpc::context::ConfigCommitPause::default());
+            let config = config_write_roster_config(&tmp, 4242, &["providers.*"]);
+            config.save().await.unwrap();
+            let before = std::fs::read_to_string(&config.config_path).unwrap();
+            let mut inner = Arc::try_unwrap(enforcement_ctx(config))
+                .unwrap_or_else(|_| panic!("fresh context is uniquely owned"));
+            inner.config_commit_pause = Some(Arc::clone(&pause));
+            let ctx = Arc::new(inner);
+            let (alice, _rx) = roster_peer(&ctx, 4242).await;
+            let task = zeroclaw_spawn::spawn!(async move {
+                alice
+                    .handle_config_set_many(&json!({"ops": [{
+                        "op": "replace", "path": "/providers/models/anthropic/default/model",
+                        "value": "revoked-after-preparation"
+                    }]}))
+                    .await
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(10), pause.arrived.notified())
+                .await
+                .expect("patch reaches the prepared commit boundary");
+            revoke_alice_config_writes(&ctx);
+            pause.release.notify_one();
+            let error = task
+                .await
+                .unwrap()
+                .expect_err("revoked patch must be refused");
+            assert_eq!(error.code, FORBIDDEN, "{error:?}");
+            assert_eq!(
+                std::fs::read_to_string(&ctx.config.read().config_path).unwrap(),
+                before
+            );
+            let _guard = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                Arc::clone(&ctx.config_write_lock).lock_owned(),
+            )
+            .await
+            .expect("refused patch releases the process-wide writer");
+        });
+    }
+
+    #[test]
+    fn config_patch_cancellation_after_enqueue_retains_the_writer_until_publication() {
+        run_on_a_large_stack(|| async move {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let pause = Arc::new(crate::rpc::context::ConfigCommitPause::default());
+            let config = config_write_roster_config(&tmp, 4242, &["memory.*"]);
+            config.save().await.unwrap();
+            let mut inner = Arc::try_unwrap(enforcement_ctx(config))
+                .unwrap_or_else(|_| panic!("fresh context is uniquely owned"));
+            inner.config_patch_enqueued_pause = Some(Arc::clone(&pause));
+            let ctx = Arc::new(inner);
+            let revision = ctx.auth.accepted_revision();
+            let (alice, _rx) = roster_peer(&ctx, 4242).await;
+            let task = zeroclaw_spawn::spawn!(async move {
+                alice
+                    .handle_config_set_many(&json!({"ops": [{
+                        "op": "replace", "path": "/memory/backend", "value": "none"
+                    }]}))
+                    .await
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(10), pause.arrived.notified())
+                .await
+                .expect("patch is admitted into a retained task");
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+            assert!(
+                ctx.config_write_lock.try_lock().is_err(),
+                "retained save owns the writer"
+            );
+            pause.release.notify_one();
+            let _guard = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                Arc::clone(&ctx.config_write_lock).lock_owned(),
+            )
+            .await
+            .expect("retained transaction finishes publication");
+            assert_eq!(ctx.config.read().memory.backend, "none");
+            assert_eq!(ctx.auth.accepted_revision(), revision + 1);
+            let saved = std::fs::read_to_string(&ctx.config.read().config_path).unwrap();
+            let saved: toml::Value = toml::from_str(&saved).unwrap();
+            assert_eq!(saved["memory"]["backend"].as_str(), Some("none"));
+        });
+    }
+
+    #[test]
+    fn config_patch_tests_and_comments_obey_path_selectors() {
+        run_on_a_large_stack(|| async move {
+            for operation in ["test", "comment"] {
+                let tmp = tempfile::TempDir::new().unwrap();
+                let config = config_write_roster_config(&tmp, 4242, &["memory.*"]);
+                let value = config.get_prop("scheduler.max_run_history").unwrap();
+                config.save().await.unwrap();
+                let before = std::fs::read_to_string(&config.config_path).unwrap();
+                let ctx = enforcement_ctx(config);
+                let (alice, _rx) = roster_peer(&ctx, 4242).await;
+                let error = alice
+                    .handle_config_set_many(&json!({"ops": [{
+                        "op": operation, "path": "/scheduler/max_run_history",
+                        "value": value, "comment": "outside the allowed paths"
+                    }]}))
+                    .await
+                    .expect_err("every operation must obey config path selectors");
+                assert_eq!(error.code, FORBIDDEN, "{operation}: {error:?}");
+                assert_eq!(
+                    std::fs::read_to_string(&ctx.config.read().config_path).unwrap(),
+                    before
+                );
+            }
         });
     }
 
