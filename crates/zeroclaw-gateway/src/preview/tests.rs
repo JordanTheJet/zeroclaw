@@ -375,7 +375,11 @@ async fn the_gateway_local_routes_answer_as_the_in_process_gateway_does() {
     let endpoint = tmp.path().join("daemon.sock");
     let (preview_stop, preview_stopped) = watch::channel(false);
     let preview = router(
-        CoreRpc::local(endpoint.clone(), EndpointOwner::SameAccount),
+        CoreRpc::local(
+            endpoint.clone(),
+            EndpointOwner::SameAccount,
+            VersionSkew::Refuse,
+        ),
         endpoint,
         None,
         preview_stop,
@@ -447,7 +451,11 @@ async fn every_route_sits_behind_the_in_process_request_limits() {
     let endpoint = tmp.path().join("daemon.sock");
     let (stop, stopped) = watch::channel(false);
     let preview = router(
-        CoreRpc::local(endpoint.clone(), EndpointOwner::SameAccount),
+        CoreRpc::local(
+            endpoint.clone(),
+            EndpointOwner::SameAccount,
+            VersionSkew::Refuse,
+        ),
         endpoint,
         None,
         stop,
@@ -1310,6 +1318,8 @@ mod against_a_core {
             ),
             endpoint.clone(),
             Some(web_dist(tmp.path())),
+            watch::channel(false).0,
+            Duration::from_secs(crate::REQUEST_TIMEOUT_SECS),
         );
 
         // Every core-backed route, served or not yet ported, is refused with
@@ -1386,6 +1396,8 @@ mod against_a_core {
             ),
             core.endpoint.clone(),
             None,
+            watch::channel(false).0,
+            Duration::from_secs(crate::REQUEST_TIMEOUT_SECS),
         );
 
         for attempt in 0..(crate::core_rpc::MAX_CREDENTIALS + 6) {
@@ -1438,6 +1450,8 @@ mod against_a_core {
             ),
             endpoint.clone(),
             None,
+            watch::channel(false).0,
+            Duration::from_secs(crate::REQUEST_TIMEOUT_SECS),
         );
 
         let (status, body) = get(&router, CORE_LINK_PATH, Some(TOKEN)).await;
@@ -1464,6 +1478,8 @@ mod against_a_core {
             ),
             endpoint.clone(),
             None,
+            watch::channel(false).0,
+            Duration::from_secs(crate::REQUEST_TIMEOUT_SECS),
         );
 
         let (status, body) = get(&router, CORE_LINK_PATH, Some(TOKEN)).await;
