@@ -21013,8 +21013,8 @@ mod tests {
 
     #[tokio::test]
     async fn change_directory_on_the_chat_pane_explains_why_it_is_unavailable() {
-        // Chat follows the selected agent's workspace, so there is no root to
-        // re-select — but a silent no-op looks like a broken command.
+        // Directory selection belongs to Code; Chat explains the unavailable
+        // command without changing its current session or root.
         let mut chat = active_chat();
 
         chat.begin_change_directory();
@@ -21678,7 +21678,7 @@ mod tests {
             &request,
             serde_json::json!({
                 "session_id": "sess-fresh",
-                "workspace_dir": "/agents/alpha/workspace"
+                "workspace_dir": "/launch/project"
             }),
         );
 
@@ -21690,8 +21690,8 @@ mod tests {
             .await
             .expect("start should finish")
             .unwrap();
-        // The daemon-selected workspace is the session root of record.
-        assert_eq!(chat.current_cwd(), Some("/agents/alpha/workspace"));
+        // The daemon reports the launch project as the root of the new session.
+        assert_eq!(chat.current_cwd(), Some("/launch/project"));
     }
 
     #[test]
@@ -21830,8 +21830,169 @@ mod tests {
             .await;
     }
 
+    fn draw_app_notice_frame(
+        mode: crate::app::Mode,
+        chat: &mut Chat,
+        code: &mut crate::acp::Acp,
+    ) -> (Vec<String>, Rect) {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(180, 50)).unwrap();
+        let mut content = Rect::default();
+        terminal
+            .draw(|frame| {
+                crate::app::draw_app_frame(frame, mode, chat, code, |frame, areas, chat, code| {
+                    content = areas[1];
+                    match mode {
+                        crate::app::Mode::Acp => code.draw_with_dock(frame, content, None, None),
+                        crate::app::Mode::Chat => chat.draw_with_dock(frame, content, None, None),
+                        _ => {}
+                    }
+                    frame.render_widget(ratatui::widgets::Paragraph::new("STATUS"), areas[2]);
+                });
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let rows = (0..50)
+            .map(|y| {
+                (0..180)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect();
+        (rows, content)
+    }
+
+    async fn assert_sibling_capture_refusal_reaches_app_frame(
+        pane_kind: PaneKind,
+        launch_dir: LaunchDirSource,
+    ) {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let mut focused = local_code_chat_with_session(&rpc, "sess-focused", "/selected/project");
+        focused.pane_kind = pane_kind;
+        focused.launch_dir = launch_dir;
+        if let ChatPhase::Active(state) = &mut focused.phase {
+            state.input_bar.insert_text("PRESERVED_APP_DRAFT");
+            state.turn_in_flight = true;
+        }
+        let capture_error = default_fresh_session_cwd(crate::client::Transport::Local, launch_dir)
+            .expect_err("fixture must refuse launch capture")
+            .localized();
+        let mut other = local_code_chat_with_session(&rpc, "sess-other", "/other/project");
+        if let ChatPhase::Active(state) = &mut other.phase {
+            state.set_info_notice("OTHER_PANE_NOTICE".to_string());
+        }
+        let (mode, mut chat, mut code) = if pane_kind == PaneKind::Acp {
+            other.pane_kind = PaneKind::Chat;
+            (
+                crate::app::Mode::Acp,
+                other,
+                crate::acp::Acp::from_chat_for_test(focused),
+            )
+        } else {
+            (
+                crate::app::Mode::Chat,
+                focused,
+                crate::acp::Acp::from_chat_for_test(other),
+            )
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            if pane_kind == PaneKind::Acp {
+                code.add_agent_session("alpha").await;
+                assert_eq!(code.current_session_id(), Some("sess-focused"));
+                assert_eq!(code.current_cwd(), Some("/selected/project"));
+            } else {
+                chat.add_agent_session("alpha").await;
+                assert_eq!(chat.current_session_id(), Some("sess-focused"));
+                assert_eq!(chat.current_cwd(), Some("/selected/project"));
+            }
+        })
+        .await
+        .expect("capture refusal must restore focus without an RPC response");
+        assert_no_rpc_request(&mut rx, "capture refusal must send no RPC request").await;
+
+        let (rows, content) = draw_app_notice_frame(mode, &mut chat, &mut code);
+        assert!(rows[48].contains(&capture_error), "app frame: {rows:#?}");
+        assert!(!rows.iter().any(|row| row.contains("OTHER_PANE_NOTICE")));
+        assert!(rows.iter().any(|row| row.contains("PRESERVED_APP_DRAFT")));
+        assert_eq!(content.bottom(), 48, "notice must have its own app row");
+        assert!(rows[49].starts_with("STATUS"));
+    }
+
+    fn assert_sibling_capture_refusal_is_rendered(
+        pane_kind: PaneKind,
+        launch_dir: LaunchDirSource,
+    ) {
+        let _guard = crate::test_support::env_test_lock();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(assert_sibling_capture_refusal_reaches_app_frame(
+                pane_kind, launch_dir,
+            ));
+    }
+
+    #[test]
+    fn app_frame_chat_sibling_capture_refusal_is_rendered() {
+        assert_sibling_capture_refusal_is_rendered(PaneKind::Chat, removed_launch_dir);
+    }
+
+    #[test]
+    fn app_frame_code_sibling_capture_refusal_is_rendered() {
+        assert_sibling_capture_refusal_is_rendered(PaneKind::Acp, removed_launch_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn app_frame_code_non_utf8_sibling_capture_refusal_is_rendered() {
+        assert_sibling_capture_refusal_is_rendered(PaneKind::Acp, non_utf8_launch_dir);
+    }
+
     #[tokio::test]
-    async fn fresh_local_acp_session_with_an_unreadable_launch_directory_sends_no_request() {
+    async fn app_frame_notice_follows_active_pane_and_expires_from_canonical_state() {
+        let _guard = crate::test_support::env_test_lock();
+        let (tx, _rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let mut chat = local_code_chat_with_session(&rpc, "sess-chat", "/chat/project");
+        chat.pane_kind = PaneKind::Chat;
+        let mut inner = local_code_chat_with_session(&rpc, "sess-code", "/code/project");
+        if let ChatPhase::Active(state) = &mut chat.phase {
+            state.set_info_notice("CHAT_NOTICE".to_string());
+        }
+        if let ChatPhase::Active(state) = &mut inner.phase {
+            state.set_info_notice("CODE_NOTICE".to_string());
+        }
+        let mut code = crate::acp::Acp::from_chat_for_test(inner);
+        for (mode, expected) in [
+            (crate::app::Mode::Chat, "CHAT_NOTICE"),
+            (crate::app::Mode::Acp, "CODE_NOTICE"),
+            (crate::app::Mode::Chat, "CHAT_NOTICE"),
+        ] {
+            let (rows, content) = draw_app_notice_frame(mode, &mut chat, &mut code);
+            assert_eq!(rows[48].trim_end(), expected);
+            assert_eq!(content.bottom(), 48);
+        }
+        let (rows, content) =
+            draw_app_notice_frame(crate::app::Mode::Dashboard, &mut chat, &mut code);
+        assert!(!rows.iter().any(|row| row.contains("NOTICE")));
+        assert_eq!(content.bottom(), 49);
+
+        // Age the existing notice rather than adding an app-owned copy or sleeping.
+        let mut expired = local_code_chat_with_session(&rpc, "sess-expired", "/code/project");
+        if let ChatPhase::Active(state) = &mut expired.phase {
+            state.set_info_notice("EXPIRED_CODE_NOTICE".to_string());
+            state.info_message.as_mut().unwrap().set_at =
+                Instant::now() - crate::widgets::INFO_BAR_TTL - Duration::from_secs(1);
+        }
+        let mut code = crate::acp::Acp::from_chat_for_test(expired);
+        let (rows, content) = draw_app_notice_frame(crate::app::Mode::Acp, &mut chat, &mut code);
+        assert!(!rows.iter().any(|row| row.contains("NOTICE")));
+        assert_eq!(content.bottom(), 49);
+    }
+
+    #[tokio::test]
+    async fn fresh_local_acp_session_with_an_unavailable_launch_directory_sends_no_request() {
         let (tx, mut rx) = mpsc::channel::<String>(16);
         let rpc = Arc::new(RpcOutbound::new(tx));
         let client = Arc::new(RpcClient::with_rpc_transport(
@@ -21849,7 +22010,7 @@ mod tests {
         // workspace while it looked healthy.
         assert_no_rpc_request(
             &mut rx,
-            "an unreadable launch directory must stop the session before session/new",
+            "an unavailable launch directory must stop the session before session/new",
         )
         .await;
         let (chat, outcome) = tokio::time::timeout(Duration::from_secs(2), task)
@@ -21905,7 +22066,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restart_local_acp_session_with_an_unreadable_launch_directory_keeps_the_old_session() {
+    async fn restart_local_acp_session_with_an_unavailable_launch_directory_keeps_the_old_session()
+    {
         let (tx, mut rx) = mpsc::channel::<String>(16);
         let rpc = Arc::new(RpcOutbound::new(tx));
         let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
@@ -21946,7 +22108,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fresh_local_chat_session_with_an_unreadable_launch_directory_sends_no_request() {
+    async fn fresh_local_chat_session_with_an_unavailable_launch_directory_sends_no_request() {
         let (tx, mut rx) = mpsc::channel::<String>(16);
         let rpc = Arc::new(RpcOutbound::new(tx));
         let client = Arc::new(RpcClient::with_rpc_transport(
@@ -21962,7 +22124,7 @@ mod tests {
 
         assert_no_rpc_request(
             &mut rx,
-            "an unreadable launch directory must stop a Chat session before session/new",
+            "an unavailable launch directory must stop a Chat session before session/new",
         )
         .await;
         let (chat, outcome) = tokio::time::timeout(Duration::from_secs(2), task)
@@ -21977,7 +22139,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restart_local_chat_session_with_an_unreadable_launch_directory_keeps_the_old_session()
+    async fn restart_local_chat_session_with_an_unavailable_launch_directory_keeps_the_old_session()
     {
         let (tx, mut rx) = mpsc::channel::<String>(16);
         let rpc = Arc::new(RpcOutbound::new(tx));
@@ -22325,7 +22487,7 @@ mod tests {
             &request,
             serde_json::json!({
                 "session_id": "sess-fresh",
-                "workspace_dir": "/agents/alpha/workspace"
+                "workspace_dir": "/launch/project"
             }),
         );
 
@@ -22343,8 +22505,8 @@ mod tests {
             .expect("restart should finish")
             .unwrap();
         assert!(phase.is_none());
-        // The replacement session adopts the daemon-selected workspace.
-        assert_eq!(state.cwd.as_deref(), Some("/agents/alpha/workspace"));
+        // The replacement adopts the launch project reported by the daemon.
+        assert_eq!(state.cwd.as_deref(), Some("/launch/project"));
     }
 
     #[tokio::test]
