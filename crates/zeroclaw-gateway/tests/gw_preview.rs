@@ -268,6 +268,42 @@ async fn without_an_endpoint_it_refuses_to_start() {
 }
 
 #[tokio::test]
+async fn the_serving_notice_never_reads_the_daemon_config() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config_path = tmp.path().join("config.toml");
+    // Reading this file would wait for a writer, making an implicit locale
+    // lookup observable at the process boundary.
+    let fifo = std::process::Command::new("mkfifo")
+        .arg(&config_path)
+        .status()
+        .expect("create config FIFO");
+    assert!(fifo.success());
+    let mut child = Command::new(env!("CARGO_BIN_EXE_zeroclaw-gw"))
+        .arg("--listen")
+        .arg("127.0.0.1:0")
+        .arg("--socket")
+        .arg(tmp.path().join("absent.sock"))
+        .env("ZEROCLAW_CONFIG_DIR", tmp.path())
+        .env_remove("ZEROCLAW_SOCKET")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn zeroclaw-gw");
+    let stderr = child.stderr.take().expect("piped stderr");
+    let mut notice = String::new();
+    let result = tokio::time::timeout(WAIT, BufReader::new(stderr).read_line(&mut notice)).await;
+    child.kill().await.expect("kill zeroclaw-gw");
+    result
+        .expect("startup must not read the config FIFO")
+        .expect("read serving notice");
+    assert!(
+        notice.starts_with("zeroclaw-gw preview serving http://127.0.0.1:"),
+        "{notice}"
+    );
+}
+
+#[tokio::test]
 async fn with_tls_flags_it_serves_https() {
     let tmp = tempfile::tempdir().unwrap();
     let key = rcgen::KeyPair::generate().unwrap();
