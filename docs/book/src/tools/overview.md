@@ -48,10 +48,10 @@ built-in list. No replacement plugin is required or claimed here.
 
 | Channel | Standard build | Recovering optional native adapters |
 | --- | --- | --- |
-| Release archive | `dist`: eleven defaults; vendor/CLI/external adapters compiled out | Download `zeroclaw-<target>-compat.tar.gz` (Windows: `.zip`), which uses `dist-compat`, then select the tools |
-| Desktop sidecar | `dist`, resolved for each target, plus requested desktop features | Prepare a compatibility sidecar with `scripts/desktop/prepare-kernel.sh --distribution dist-compat`; users can run a downloaded compatibility daemon and connect the desktop to it |
-| Homebrew source build | Cargo defaults: the same eleven-tool policy; optional external adapters compiled out | Use the platform compatibility archive alongside the package-managed binary; adding config cannot change a bottle's compiled features |
-| Docker | `dist`: the same eleven-tool policy | Use the `compat-tools` image tag, then select the tools and configure their dependencies |
+| Release archive | `dist`: eleven defaults; vendor/CLI/external adapters compiled out | Build `dist-compat` from source/on demand, then select the tools; standard releases publish ten lean CLI archives |
+| Desktop sidecar | `dist`, resolved for each target, plus requested desktop features | Build a compatibility sidecar with `scripts/desktop/prepare-kernel.sh --distribution dist-compat`, or connect the desktop to your source-built compatibility daemon |
+| Homebrew source build | Cargo defaults: the same eleven-tool policy; optional external adapters compiled out | Run a source-built compatibility binary alongside the package-managed binary; adding config cannot change a bottle's compiled features |
+| Docker | `dist`: the same eleven-tool policy | Build an image on demand with the `dist-compat` feature list below, then select the tools and configure their dependencies |
 
 Standard `dist` and `dist-compat` retain the portable WASM plugin host through
 `plugins-wasm-cranelift` on the seven supported native 64-bit targets: GNU and
@@ -63,6 +63,18 @@ false; configured plugin activation, consent, trust and grants still apply.
 Runtime-only precompiled `.cwasm` support and Pulley alone do not replace the
 portable registry `.wasm` compilation contract. Distribution features and
 platform exclusions come from `package.metadata.zeroclaw` in `Cargo.toml`.
+
+Compatibility archives and a `compat-tools` image are not published by default.
+The compatibility selection remains available for source and on-demand builds:
+
+```sh
+# Run from a source checkout; choose the target you intend to run.
+TARGET=x86_64-unknown-linux-gnu
+FEATURES="$(cargo run --quiet --locked -p xtask --bin generate -- features --selection dist-compat --target "$TARGET")"
+cargo build --release --locked --bin zeroclaw --target "$TARGET" --no-default-features --features "$FEATURES"
+# For a local Linux image, resolve features for its build target.
+docker build --build-arg "ZEROCLAW_CARGO_FLAGS=--no-default-features --features $FEATURES" -t zeroclaw-compat-local .
+```
 
 `dist-compat` adds the `tools-compat` Cargo bundle: `tools-saas`,
 `tools-coding-cli`, and `tools-external`. Source users can select an individual

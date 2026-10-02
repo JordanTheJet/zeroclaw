@@ -44,12 +44,6 @@ fn tag_specs() -> Vec<TagSpec> {
             platforms: MULTI_ARCH,
         },
         TagSpec {
-            stem: "compat-tools",
-            selection: Selection::DistCompat,
-            dockerfile: "Dockerfile",
-            platforms: MULTI_ARCH,
-        },
-        TagSpec {
             stem: "all-features",
             selection: Selection::All,
             dockerfile: "Containerfile",
@@ -110,6 +104,10 @@ mod tests {
         let v: toml::Value = toml::from_str(&s).expect("valid TOML");
         let tags = v["tags"].as_array().unwrap();
         assert_eq!(tags.len(), tag_specs().len());
+        assert!(
+            tags.iter()
+                .all(|tag| tag["stem"].as_str() != Some("compat-tools"))
+        );
         let ver = v["version"].as_str().unwrap();
         let dist = tags
             .iter()

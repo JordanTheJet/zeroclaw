@@ -198,7 +198,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
   build:
-    name: Build ${{ matrix.target }}${{ matrix.suffix }}
+    name: Build ${{ matrix.target }}
     needs: [validate, web]
     runs-on: ${{ matrix.os }}
     # 90 min: the x86_64-apple-darwin leg needs ~45-50 min on GitHub's slower
@@ -210,12 +210,10 @@ jobs:
       fail-fast: false
       matrix:
         target: [x86_64-unknown-linux-gnu, x86_64-unknown-linux-musl, aarch64-unknown-linux-gnu, aarch64-unknown-linux-musl, armv7-unknown-linux-gnueabihf, arm-unknown-linux-gnueabihf, aarch64-apple-darwin, x86_64-apple-darwin, aarch64-linux-android, x86_64-pc-windows-msvc]
-        distribution: [dist, dist-compat]
+        # >>> generated:release-distributions by `cargo generate installers` - do not edit <<<
+        distribution: ["dist"]
+# >>> end generated:release-distributions <<<
         include:
-          - distribution: dist
-            suffix: ""
-          - distribution: dist-compat
-            suffix: -compat
           # Use ubuntu-22.04 for Linux builds to link against glibc 2.35,
           # ensuring compatibility with Ubuntu 22.04+ (#3573).
           - os: ubuntu-22.04
@@ -370,7 +368,7 @@ jobs:
           done
           cp -r web/dist staging/web/dist
           cd staging
-          tar czf ../zeroclaw-${{ matrix.target }}${{ matrix.suffix }}.${{ matrix.ext }} ${{ matrix.artifact }} $extra web/dist
+          tar czf ../zeroclaw-${{ matrix.target }}.${{ matrix.ext }} ${{ matrix.artifact }} $extra web/dist
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
@@ -387,12 +385,12 @@ jobs:
           done
           cp -r web/dist staging/web/dist
           cd staging
-          7z a ../zeroclaw-${{ matrix.target }}${{ matrix.suffix }}.${{ matrix.ext }} ${{ matrix.artifact }} $extra web/dist
+          7z a ../zeroclaw-${{ matrix.target }}.${{ matrix.ext }} ${{ matrix.artifact }} $extra web/dist
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: zeroclaw-${{ matrix.target }}${{ matrix.suffix }}
-          path: zeroclaw-${{ matrix.target }}${{ matrix.suffix }}.${{ matrix.ext }}
+          name: zeroclaw-${{ matrix.target }}
+          path: zeroclaw-${{ matrix.target }}.${{ matrix.ext }}
           retention-days: 14
 
   build-desktop:

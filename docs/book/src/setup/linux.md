@@ -124,6 +124,13 @@ sudo usermod -aG gpio,spi,i2c $USER
 
 ## Update
 
+Standard updates install the lean build with eleven default tools. Before
+upgrading an existing configuration, select any required extras in
+`[tools].optional`. Vendor/CLI/external native adapters also need a
+source/on-demand compatibility build; standard updates do not supply a separate
+compatibility download. See [tool selection and recovery](../tools/overview.md#builds-and-upgrade-path)
+for the exact build commands and runtime prerequisites.
+
 Re-run the installer, it detects the existing install and upgrades in place:
 
 <div class="os-tabs-src">

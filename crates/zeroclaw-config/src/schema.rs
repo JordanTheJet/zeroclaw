@@ -23130,8 +23130,8 @@ impl Config {
                         crate::validation_warnings::TOOL_COMPILED_OUT,
                         format!(
                             "{name} was selected in tools.optional, but this build lacks \
-                                 `tools-external`. Use the compatibility archive or build with \
-                                 `tools-compat`; runtime config cannot add compiled-out code."
+                                 `tools-external`. Build from source with `tools-compat`; \
+                                 runtime config cannot add compiled-out code."
                         ),
                         "tools.optional".to_string(),
                     ));

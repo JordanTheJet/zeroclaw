@@ -10,6 +10,7 @@ pub mod docs;
 pub mod flake;
 pub mod install_sh;
 pub mod packaging;
+pub mod release;
 pub mod review_docs;
 pub mod runtime_locales;
 pub mod setup_bat;
@@ -134,6 +135,11 @@ fn registry() -> Vec<Surface> {
             name: "flake",
             file: "flake.nix",
             render: |root, cur| flake::render_file(root, cur),
+        },
+        Surface {
+            name: "release-distributions",
+            file: ".github/workflows/release-stable-manual.yml",
+            render: release::render_file,
         },
         Surface {
             name: "docker-tags",

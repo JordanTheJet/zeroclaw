@@ -561,6 +561,19 @@ pub fn dist_extra_features(pkg: &cargo_metadata::Package) -> anyhow::Result<Vec<
     required_registry_list(pkg, "dist_extra_features")
 }
 
+/// Selections published across the canonical release workflow target matrix.
+/// On-demand selections remain available without adding release artifacts.
+pub fn release_distributions(pkg: &cargo_metadata::Package) -> anyhow::Result<Vec<String>> {
+    let selections = required_registry_list(pkg, "release_distributions")?;
+    for id in &selections {
+        anyhow::ensure!(
+            matches!(Selection::from_id(id), Some(Selection::Dist)),
+            "release_distributions supports the lean `dist` selection; `{id}` is on-demand only"
+        );
+    }
+    Ok(selections)
+}
+
 /// Target-specific compatibility exclusions for standard distribution builds.
 /// Release workflows provide a target triple and never duplicate this policy.
 pub fn dist_target_exclusions(
@@ -820,7 +833,7 @@ pub(crate) fn features_outside_dist(manifest_dir: &Path) -> anyhow::Result<Vec<S
         .collect())
 }
 
-fn workspace_root_package(
+pub(super) fn workspace_root_package(
     meta: &cargo_metadata::Metadata,
 ) -> anyhow::Result<&cargo_metadata::Package> {
     meta.root_package()

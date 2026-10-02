@@ -210,6 +210,9 @@ libc = "0.2"
 # it lives here in the canonical registry. install.sh and `cargo cmd convert`
 # both read this; neither shadows it with its own list.
 [package.metadata.zeroclaw]
+# Published CLI archives use this selection across the release target matrix.
+# Native compatibility remains a source/on-demand build, not a second archive.
+release_distributions = ["dist"]
 non_row_features = [
     "default",
     "default-channels",
@@ -299,7 +302,7 @@ channels-full = [
 # Opt-in native adapters. Standard distributions omit external integrations;
 # the compatibility bundle keeps them available for explicit selection.
 tools-external = ["zeroclaw-runtime/tools-external", "zeroclaw-tools/tools-external"]
-# An explicit compatibility artifact; registration still requires [tools].optional.
+# Source/on-demand compatibility bundle; registration still requires [tools].optional.
 tools-compat = ["tools-saas", "tools-coding-cli", "tools-external"]
 tools-saas = [
     "tool-jira",
