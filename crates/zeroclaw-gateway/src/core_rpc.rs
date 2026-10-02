@@ -965,6 +965,27 @@ impl CoreCall {
         &self.pooled.client.handshake().features
     }
 
+    /// Require an extension from this serving connection's handshake.
+    /// Reconnecting obtains a new handshake; no feature state is copied
+    /// into the pool or inferred from the reported package version.
+    pub(crate) fn require_feature(&self, feature: &'static str) -> Result<(), CoreError> {
+        if self
+            .core_features()
+            .iter()
+            .any(|supported| supported == feature)
+        {
+            Ok(())
+        } else {
+            Err(CoreError::Rpc(JsonRpcError {
+                code: METHOD_NOT_FOUND,
+                message: format!(
+                    "the core does not advertise required feature {feature}; install a core supporting it"
+                ),
+                data: None,
+            }))
+        }
+    }
+
     /// Send `method` on this caller's connection.
     ///
     /// `initialize` is refused here without reaching the core: only the pool

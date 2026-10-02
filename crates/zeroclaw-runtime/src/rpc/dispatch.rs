@@ -350,7 +350,18 @@ fn principal_tool_ceiling(grants: &zeroclaw_api::grants::ResolvedGrants) -> Opti
 ///
 /// - `tui.client_kind`: `tui/list` reports the kind a connection declared
 ///   (`tui_list_labels_only_a_declared_gateway_connection`).
-pub const ADVERTISED_FEATURES: &[&str] = &[zeroclaw_rpc_proto::feature::TUI_CLIENT_KIND];
+///
+/// The skills/personality extensions are backed by the dispatcher regressions
+/// for purge, canonical configured aliases, bounded reads, reader-restricted
+/// drift state, and editor template context.
+pub const ADVERTISED_FEATURES: &[&str] = &[
+    zeroclaw_rpc_proto::feature::TUI_CLIENT_KIND,
+    zeroclaw_rpc_proto::feature::SKILLS_DELETE_PURGE,
+    zeroclaw_rpc_proto::feature::PERSONALITY_CONFIGURED_AGENT,
+    zeroclaw_rpc_proto::feature::PERSONALITY_MAX_CHARS,
+    zeroclaw_rpc_proto::feature::PERSONALITY_EXPECTED_MTIME,
+    zeroclaw_rpc_proto::feature::PERSONALITY_EDITOR_TEMPLATES,
+];
 
 fn declared_client_kind(capabilities: Option<&Value>) -> Option<String> {
     capabilities?

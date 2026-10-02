@@ -438,6 +438,7 @@ pub(crate) async fn index_through_core(
         Ok(agent) => agent,
         Err(refusal) => return Ok(refusal.into_response()),
     };
+    core.require_feature(zeroclaw_rpc_proto::feature::PERSONALITY_CONFIGURED_AGENT)?;
     let params = serde_json::json!({ "agent": agent, "require_configured_agent": true });
     match core.request(Method::PersonalityList, params).await {
         Ok(listing) => Ok(Json(listing).into_response()),
@@ -465,9 +466,8 @@ struct DriftData {
     current_mtime_ms: Option<i64>,
 }
 
-/// `GET /api/personality/{filename}` through the core. The core returns a
-/// file's whole content; this route answers at most `MAX_FILE_CHARS` of it,
-/// and an empty content for a file that does not exist.
+/// `GET /api/personality/{filename}` through a core that supports its bounded
+/// projection and configured-agent guard. A missing file has empty content.
 pub(crate) async fn get_through_core(
     core: &CoreCall,
     filename: &str,
@@ -481,6 +481,8 @@ pub(crate) async fn get_through_core(
         Ok(agent) => agent,
         Err(refusal) => return Ok(refusal.into_response()),
     };
+    core.require_feature(zeroclaw_rpc_proto::feature::PERSONALITY_CONFIGURED_AGENT)?;
+    core.require_feature(zeroclaw_rpc_proto::feature::PERSONALITY_MAX_CHARS)?;
     // The core cuts the file to the editor's view before it is serialized,
     // so a file of any size answers within one frame.
     let params = serde_json::json!({
@@ -498,8 +500,6 @@ pub(crate) async fn get_through_core(
             "the core's personality/get result is malformed: {e}"
         ))
     })?;
-    // A core that predates `max_chars` sends the whole file; cutting it here
-    // too keeps the view the same (a no-op on a bounded answer).
     let content = read
         .content
         .map(|content| truncate_to_chars(&content, MAX_FILE_CHARS).0)
@@ -529,6 +529,10 @@ pub(crate) async fn put_through_core(
         Ok(agent) => agent,
         Err(refusal) => return Ok(refusal.into_response()),
     };
+    core.require_feature(zeroclaw_rpc_proto::feature::PERSONALITY_CONFIGURED_AGENT)?;
+    if body.expected_mtime_ms.is_some() {
+        core.require_feature(zeroclaw_rpc_proto::feature::PERSONALITY_EXPECTED_MTIME)?;
+    }
     let mut params = serde_json::json!({
         "agent": agent,
         "filename": allowed,
@@ -583,6 +587,7 @@ pub(crate) async fn templates_through_core(
     core: &CoreCall,
     q: &TemplateQuery,
 ) -> Result<Response, CoreError> {
+    core.require_feature(zeroclaw_rpc_proto::feature::PERSONALITY_EDITOR_TEMPLATES)?;
     let mut params = serde_json::json!({ "defaults": "editor" });
     for (field, value) in [
         ("preset", &q.preset),

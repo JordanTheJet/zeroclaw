@@ -2158,4 +2158,6 @@ mod against_a_core {
         assert_eq!(json_of(&body)["code"], "dashboard_unavailable");
         core.stop().await;
     }
+
+    include!("fs9_semantics_tests.rs");
 }

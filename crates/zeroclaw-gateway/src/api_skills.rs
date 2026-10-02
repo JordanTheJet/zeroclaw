@@ -431,6 +431,9 @@ pub(crate) async fn delete_skill_through_core(
     name: &str,
     q: &DeleteQuery,
 ) -> Result<Response, CoreError> {
+    if q.purge {
+        core.require_feature(zeroclaw_rpc_proto::feature::SKILLS_DELETE_PURGE)?;
+    }
     let params = serde_json::json!({ "bundle": alias, "name": name, "purge": q.purge });
     core.request(Method::SkillsDelete, params).await?;
     Ok(StatusCode::NO_CONTENT.into_response())

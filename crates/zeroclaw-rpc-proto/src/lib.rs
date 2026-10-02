@@ -109,9 +109,35 @@ pub mod feature {
     /// client declared on `initialize`.
     pub const TUI_CLIENT_KIND: &str = "tui.client_kind";
 
+    /// `skills/delete` honors `purge: true` instead of archiving.
+    pub const SKILLS_DELETE_PURGE: &str = "skills.delete_purge";
+
+    /// `personality/list`, `get`, and `put` reject an unconfigured or
+    /// noncanonical agent before filesystem work when requested, using
+    /// the structured not-found/invalid refusal reasons.
+    pub const PERSONALITY_CONFIGURED_AGENT: &str = "personality.configured_agent";
+
+    /// `personality/get` honors `max_chars` before serializing content,
+    /// preserving existence, mtime, and truncation metadata.
+    pub const PERSONALITY_MAX_CHARS: &str = "personality.max_chars";
+
+    /// `personality/put` honors `expected_mtime_ms` and returns the drift
+    /// error data, with current state restricted to personality readers.
+    pub const PERSONALITY_EXPECTED_MTIME: &str = "personality.expected_mtime";
+
+    /// `personality/templates` honors editor defaults and template overrides.
+    pub const PERSONALITY_EDITOR_TEMPLATES: &str = "personality.editor_templates";
+
     /// Every extension name this protocol defines. A core advertises only
     /// the ones it implements, from its own list beside the handlers.
-    pub const KNOWN: &[&str] = &[TUI_CLIENT_KIND];
+    pub const KNOWN: &[&str] = &[
+        TUI_CLIENT_KIND,
+        SKILLS_DELETE_PURGE,
+        PERSONALITY_CONFIGURED_AGENT,
+        PERSONALITY_MAX_CHARS,
+        PERSONALITY_EXPECTED_MTIME,
+        PERSONALITY_EDITOR_TEMPLATES,
+    ];
 
     #[cfg(test)]
     mod tests {
