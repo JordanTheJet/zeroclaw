@@ -733,6 +733,71 @@
         ],
         "type": "object"
       },
+      "ConfigPatchOp": {
+        "description": "One JSON Patch operation of `config/set-many`'s `ops`. `path` is a\nJSON Pointer (`/agents/main/model_provider`) or a dotted property path.\n`add`, `replace` and `test` need `value`; `comment` needs `comment`\nand writes only the comment above the property. `test` also needs\nConfig read; every operation obeys the config write-path selectors.",
+        "properties": {
+          "comment": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "op": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "value": true
+        },
+        "required": [
+          "op",
+          "path"
+        ],
+        "type": "object"
+      },
+      "ConfigPatchOpResult": {
+        "description": "What one applied JSON Patch operation did, by dotted property path.",
+        "properties": {
+          "comment": {
+            "description": "The comment written with the operation, if any.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "op": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "populated": {
+            "description": "For a secret, whether it holds a value after the operation.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "value": {
+            "description": "The value at the path after the operation: the stored form for an\n`add` or `replace`, the value compared for a `test`, `null` for a\n`remove`. Absent for a secret and for a `comment`."
+          }
+        },
+        "required": [
+          "op",
+          "path"
+        ],
+        "type": "object"
+      },
+      "ConfigReloadParams": {
+        "properties": {
+          "remote_admin": {
+            "description": "Set by the HTTP edge when the caller is not on loopback. The\ncore checks its live remote-admin flag and pairing guard before\nenqueuing the reload. Omitted, existing local callers are unchanged.",
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      },
       "ConfigReloadResult": {
         "properties": {
           "reloading": {
@@ -852,18 +917,30 @@
         "type": "object"
       },
       "ConfigSetManyParams": {
-        "description": "An ordered batch of `config/set` entries committed as one unit: every\nentry is staged on a single working copy in order (a later entry for\nthe same prop wins), and the result is saved and installed once, or\nnot at all. Must contain at least one entry and at most the\ndispatcher's batch cap (256); either bound violated is `INVALID_PARAMS`.",
+        "description": "An ordered batch of `config/set` entries committed as one unit: every\nentry is staged on a single working copy in order (a later entry for\nthe same prop wins), and the result is saved and installed once, or\nnot at all. Must contain at least one entry and at most the\ndispatcher's batch cap (256); either bound violated is `INVALID_PARAMS`.\n\nThe batch is either `sets` or `ops`, never both. `ops` is a JSON\nPatch, applied as the dashboard's config routes apply one: values are\nchecked against each field's declared kind, the resulting\nconfiguration is validated, and the result reports each operation and\nany validation warnings.",
         "properties": {
+          "drift_guard": {
+            "description": "Refuse the batch when the config file on disk differs from the\nrunning configuration at any path the batch names, as an edit\nmade outside the daemon would leave it.",
+            "type": "boolean"
+          },
+          "ops": {
+            "description": "JSON Patch operations (RFC 6902 `add`, `replace`, `remove` and\n`test`, plus `comment`), applied in order; the first that fails\nrefuses the whole batch, naming its index. Present but empty, the\nbatch writes nothing and reports the configuration's warnings.",
+            "items": {
+              "$ref": "#/components/schemas/ConfigPatchOp"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
           "sets": {
+            "default": [],
             "items": {
               "$ref": "#/components/schemas/ConfigSetParams"
             },
             "type": "array"
           }
         },
-        "required": [
-          "sets"
-        ],
         "type": "object"
       },
       "ConfigSetManyResult": {
@@ -875,8 +952,22 @@
             },
             "type": "array"
           },
+          "results": {
+            "description": "One entry per operation of an `ops` batch, in order.",
+            "items": {
+              "$ref": "#/components/schemas/ConfigPatchOpResult"
+            },
+            "type": "array"
+          },
           "set": {
             "type": "boolean"
+          },
+          "warnings": {
+            "description": "Validation warnings against the saved configuration (`ops` only).",
+            "items": {
+              "$ref": "#/components/schemas/ValidationWarning"
+            },
+            "type": "array"
           }
         },
         "required": [
@@ -4447,6 +4538,29 @@
           "failed"
         ],
         "type": "string"
+      },
+      "ValidationWarning": {
+        "description": "One non-fatal validation issue surfaced after a successful save.\n\nStable codes (extend as new warnings are added):\n- `empty_server_fallback_model`: `server_fallback_models` contains an empty\n  string entry, which cannot match any model name and is dropped before the\n  request is sent.\n- `server_fallback_model_duplicates_primary`: `server_fallback_models` contains\n  the primary model name, which duplicates the requested model and is dropped\n  before the request is sent.\n- `codex_cli_extra_args_security_boundary`: `codex_cli.extra_args` contains\n  a known Codex CLI argument that can change sandbox, approval, policy,\n  workspace, feature, trust, or executable-integration boundaries. The\n  argument remains allowed.\n- `memory_semantic_search_without_embedder`: `memory.search_mode` requests\n  vector search on sqlite memory, but no effective embedder is configured.\n- `cron_job_contested_claim`: a cron job id is listed in the `cron_jobs` of\n  more than one enabled agent; without a stored owner the job is refused\n  rather than run under an arbitrary claimant.\n- `whatsapp_chat_policy_inert`: a WhatsApp Web `self_chat_mode` is set but\n  the transport only consults it under `mode = \"personal\"`, so it currently\n  has no effect. `dm_policy` and `group_policy` apply under both modes and\n  are never reported under this code.\n- `whatsapp_empty_group_list_serves_no_group`: `allowed_groups` is empty and\n  `group_policy` is `\"allowlist\"`, so the channel answers no group where an\n  empty list used to admit every group at the identity gate. A migration\n  notice about lost capability, not a fail-open alarm. `\"all\"` admits every\n  group before and after, and `\"ignore\"` rejects every group before and\n  after under BOTH modes, so neither is reported.\n- `memory_config_knob_inert`: a `[memory]` knob is set to a non-default\n  value but has no runtime consumer yet, so it currently has no effect\n  (see `validate_memory_semantics` in `schema.rs` for the current list).\n- `security_audit_disabled_drops_certificate_record`:\n  `security.audit.enabled` is `false`, so certificate issuance and renewal\n  have no audit-log record. Command execution is not audited under either\n  value, because no production path records tool commands.\n- `peer_group_channel_dangling`: a `peer_groups.<name>.channel` dotted\n  alias (`<type>.<alias>`) does not resolve to any configured\n  `[channels.<type>.<alias>]` block — typically a typo that silently\n  authorizes nobody. `Config::validate()` already hard-errors this exact\n  condition (see `classify_peer_group_channel_ref` in `schema.rs`); this\n  warning is the non-fatal surface for callers (channel doctor,\n  config-load tracing) that need the diagnostic even when a config that\n  failed `validate()` is still allowed to boot.\n- `context_compression_unsupported`: a `runtime_profiles.<alias>.context_compression`\n  knob (`enabled = true`, or any other field set to a non-default value)\n  has no runtime consumer — the context compressor was removed —\n  so it currently has no effect. One warning per non-default field (see\n  `collect_context_compression_ignored_warnings` in `schema.rs`).\n- `proxy_conflicts_with_dns_pinned_tools`: the configured proxy scope\n  selects `http_request` and/or `web_fetch`, whose validated DNS answers\n  require direct transport and therefore make the selected tool fail.\n- `verifiable_intent_tool_withheld`: `verifiable_intent.enabled` is set, but\n  the `vi_verify` tool is withheld from the model-visible registry until a\n  credential chain verifier exists, so enabling the section does not enable\n  credential verification. The runtime also traces this at config load, and\n  that trace has no sink under `observability.log_persistence = \"none\"`;\n  this warning is the channel that survives, since `zeroclaw doctor` and the\n  config API read the structured list rather than the log.",
+        "properties": {
+          "code": {
+            "description": "Stable machine-readable identifier for the warning class.",
+            "type": "string"
+          },
+          "message": {
+            "description": "Stable English fallback for logs and consumers without a localization catalog.\nUser-facing surfaces should localize from `code` and use this only for unknown codes.",
+            "type": "string"
+          },
+          "path": {
+            "description": "Dotted property path the warning concerns\n(e.g. `\"agents.researcher.model_provider\"`).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "code",
+          "message",
+          "path"
+        ],
+        "type": "object"
       }
     }
   },
@@ -5795,9 +5909,32 @@
       "paramStructure": "by-name",
       "params": [
         {
-          "name": "sets",
-          "required": true,
+          "name": "drift_guard",
+          "required": false,
           "schema": {
+            "description": "Refuse the batch when the config file on disk differs from the\nrunning configuration at any path the batch names, as an edit\nmade outside the daemon would leave it.",
+            "type": "boolean"
+          }
+        },
+        {
+          "name": "ops",
+          "required": false,
+          "schema": {
+            "description": "JSON Patch operations (RFC 6902 `add`, `replace`, `remove` and\n`test`, plus `comment`), applied in order; the first that fails\nrefuses the whole batch, naming its index. Present but empty, the\nbatch writes nothing and reports the configuration's warnings.",
+            "items": {
+              "$ref": "#/components/schemas/ConfigPatchOp"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "sets",
+          "required": false,
+          "schema": {
+            "default": [],
             "items": {
               "$ref": "#/components/schemas/ConfigSetParams"
             },
@@ -5845,7 +5982,16 @@
     {
       "name": "config/reload",
       "paramStructure": "by-name",
-      "params": [],
+      "params": [
+        {
+          "name": "remote_admin",
+          "required": false,
+          "schema": {
+            "description": "Set by the HTTP edge when the caller is not on loopback. The\ncore checks its live remote-admin flag and pairing guard before\nenqueuing the reload. Omitted, existing local callers are unchanged.",
+            "type": "boolean"
+          }
+        }
+      ],
       "result": {
         "name": "result",
         "schema": {
@@ -5859,7 +6005,8 @@
         "verb": "update"
       },
       "x-zeroclaw-params": {
-        "shape": "none"
+        "shape": "typed",
+        "type": "ConfigReloadParams"
       }
     },
     {
