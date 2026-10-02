@@ -3344,7 +3344,7 @@
             ]
           },
           "session_created_at": {
-            "description": "When the row read was created (RFC 3339). A row removed and\nrecreated under the same key has a new one, so a change between\npages means the pages came from different rows.",
+            "description": "When the row read was created (RFC 3339). Filesystem timestamps\ncan repeat across rapid replacements; also compare session_revision\nwhen binding a paged transcript read.",
             "type": [
               "string",
               "null"
@@ -3355,6 +3355,13 @@
           },
           "session_key": {
             "description": "The exact chat-store key read, when the call named\n`session_keys`. A caller paging back through one transcript sends\nonly this key for the following pages, so a preferred key that\nappears meanwhile cannot switch rows under it.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "session_revision": {
+            "description": "Opaque digest of the complete projected history for index paging.\nA changed revision requires restarting the paged read. Omitted in\nACP cursor mode, which never projects the complete history.",
             "type": [
               "string",
               "null"

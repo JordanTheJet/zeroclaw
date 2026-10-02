@@ -149,6 +149,8 @@ pub struct SessionRecord {
     /// Creation time obtained from the authorized chat row. This request
     /// identity is derived from the backend, never an independent cache.
     pub durable_created_at: Option<String>,
+    /// Request-scoped borrow of the canonical JSONL file incarnation.
+    pub durable_file_identity: Option<Arc<zeroclaw_infra::session_backend::SessionFileIdentity>>,
     /// The durable row, when one exists.
     pub durable: Option<DurableSession>,
     /// The owning principal; `None` for legacy / unscoped-creator records.

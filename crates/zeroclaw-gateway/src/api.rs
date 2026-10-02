@@ -2103,7 +2103,7 @@ enum TranscriptReadError {
         index: u64,
         bytes: u64,
     },
-    /// The transcript kept shrinking between pages.
+    /// The projected transcript kept changing between pages.
     Changed,
 }
 
@@ -2111,10 +2111,10 @@ enum TranscriptReadError {
 /// fetches one page: `row` is `None` for the newest page, which the core
 /// resolves from the candidate keys, and afterwards the exact key that page
 /// read, so every later page comes from the same row; `before_index` is the
-/// index the page ends before. Indices count from the oldest entry, so
-/// messages appended during the walk leave the older pages in place. A later
-/// page from a different row (recreated under the key) or with fewer entries
-/// than the first (history rewritten) starts the walk over.
+/// index the page ends before. Indices count from the oldest entry. The
+/// derived whole-history revision binds every page to the same projection.
+/// A changed revision, different row, or shorter history starts the walk over.
+/// A core without revision support is refused before assembling a response.
 async fn read_transcript_pages<F, Fut>(
     mut page: F,
 ) -> Result<Vec<MessageEntry>, TranscriptReadError>
@@ -2124,9 +2124,20 @@ where
 {
     'attempt: for _ in 0..CORE_MESSAGE_READ_ATTEMPTS {
         let newest = page(None, None).await.map_err(page_error)?;
+        if newest.session_revision.as_deref().is_none_or(str::is_empty) {
+            return Err(TranscriptReadError::Core(CoreError::Rpc(JsonRpcError {
+                code: zeroclaw_api::jsonrpc::error_codes::METHOD_NOT_FOUND,
+                message: "session/messages lacks transcript revision support".to_owned(),
+                data: None,
+            })));
+        }
         let first_total = newest.total;
         let mut start = newest.start;
-        let row = (newest.session_key, newest.session_created_at);
+        let row = (
+            newest.session_key,
+            newest.session_created_at,
+            newest.session_revision,
+        );
         let mut pages = vec![newest.messages];
         while start > 0 {
             let Some(key) = row.0.clone() else {
@@ -2137,7 +2148,13 @@ where
                 })));
             };
             let older = page(Some(key), Some(start)).await.map_err(page_error)?;
-            if older.total < first_total || (older.session_key, older.session_created_at) != row {
+            if older.total < first_total
+                || (
+                    older.session_key,
+                    older.session_created_at,
+                    older.session_revision,
+                ) != row
+            {
                 continue 'attempt;
             }
             if older.start >= start {

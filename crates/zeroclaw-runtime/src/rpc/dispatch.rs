@@ -873,6 +873,30 @@ fn write_personality_file(
         .map(|d| d.as_millis() as i64))
 }
 
+/// Materialize a revision from the one canonical projected history without
+/// allocating another transcript buffer or storing a parallel identity.
+fn transcript_revision(messages: &[MessageEntry]) -> Result<String, JsonRpcError> {
+    use sha2::{Digest, Sha256};
+    struct DigestWriter(Sha256);
+    impl std::io::Write for DigestWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.update(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut writer = DigestWriter(Sha256::new());
+    serde_json::to_writer(&mut writer, messages).map_err(|error| {
+        rpc_err(
+            INTERNAL_ERROR,
+            format!("Failed to derive transcript revision: {error}"),
+        )
+    })?;
+    Ok(format!("{:x}", writer.0.finalize()))
+}
+
 impl RpcDispatcher {
     pub fn new(ctx: Arc<RpcContext>, writer_tx: mpsc::Sender<String>, peer_label: String) -> Self {
         Self::new_with_connection_cancel(ctx, writer_tx, peer_label, CancellationToken::new())
@@ -1609,7 +1633,8 @@ impl RpcDispatcher {
             }
             match (&snapshot, record) {
                 (Some(value), Some(record))
-                    if value.metadata.principal_id == record.owner
+                    if value.metadata.file_identity == record.durable_file_identity
+                        && value.metadata.principal_id == record.owner
                         && Some(value.metadata.created_at.to_rfc3339()).as_ref()
                             == record.durable_created_at.as_ref() =>
                 {
@@ -2386,6 +2411,7 @@ impl RpcDispatcher {
         }
         let mut chat_durable: Option<DurableSession> = None;
         let mut chat_created_at = None;
+        let mut chat_file_identity = None;
         let mut has_acp = false;
         if let Some(backend) = self.ctx.session_backend.as_ref() {
             for key in [
@@ -2400,6 +2426,7 @@ impl RpcDispatcher {
                     owners.push(meta.principal_id);
                     if chat_durable.is_none() {
                         chat_created_at = Some(meta.created_at.to_rfc3339());
+                        chat_file_identity = meta.file_identity;
                         chat_durable = Some(DurableSession::Chat { key });
                     }
                 }
@@ -2463,6 +2490,9 @@ impl RpcDispatcher {
         };
         Ok(Some(SessionRecord {
             live_generation: live.map(|(_, generation, _)| generation),
+            durable_file_identity: matches!(&durable, Some(DurableSession::Chat { .. }))
+                .then_some(chat_file_identity)
+                .flatten(),
             durable_created_at: matches!(&durable, Some(DurableSession::Chat { .. }))
                 .then_some(chat_created_at)
                 .flatten(),
@@ -2532,6 +2562,7 @@ impl RpcDispatcher {
         Ok(Some(SessionRecord {
             live_generation: live.map(|(_, generation, _)| generation),
             durable_created_at: meta.as_ref().map(|meta| meta.created_at.to_rfc3339()),
+            durable_file_identity: meta.as_ref().and_then(|meta| meta.file_identity.clone()),
             durable: meta.map(|_| DurableSession::Chat {
                 key: key.to_owned(),
             }),
@@ -2775,10 +2806,14 @@ impl RpcDispatcher {
             .await?;
         let scope = self.scoped_principal_id();
         if let Some(created) = authorized.and_then(|record| record.durable_created_at.as_deref())
-            && Some(created)
+            && (Some(created)
                 != current
                     .as_ref()
                     .and_then(|record| record.durable_created_at.as_deref())
+                || authorized.and_then(|record| record.durable_file_identity.as_deref())
+                    != current
+                        .as_ref()
+                        .and_then(|record| record.durable_file_identity.as_deref()))
         {
             return Err(match scope {
                 Some(_) => rpc_err(
@@ -8212,6 +8247,7 @@ impl RpcDispatcher {
             );
         }
 
+        let session_revision = Some(transcript_revision(&messages)?);
         let total = messages.len();
         let limit = req.limit.unwrap_or(total);
         let end = req.before_index.map(|i| i.min(total)).unwrap_or(total);
@@ -8255,6 +8291,7 @@ impl RpcDispatcher {
                         SessionAddress::Id(_) => None,
                     },
                     session_created_at: row_created_at,
+                    session_revision,
                 })
             },
         )
@@ -8575,6 +8612,9 @@ impl RpcDispatcher {
                                     &key,
                                     created_at,
                                     expected_owner.as_deref(),
+                                    record
+                                        .as_ref()
+                                        .and_then(|record| record.durable_file_identity.as_deref()),
                                     &|metadata| {
                                         self.inspection_metadata_permitted(
                                             grants, &config, metadata,
@@ -8646,6 +8686,9 @@ impl RpcDispatcher {
                                         key,
                                         created,
                                         expected_owner.as_deref(),
+                                        record.as_ref().and_then(|record| {
+                                            record.durable_file_identity.as_deref()
+                                        }),
                                         &|metadata| {
                                             self.inspection_metadata_permitted(
                                                 grants.as_ref(),
@@ -43670,6 +43713,30 @@ mod tests {
                 first
             );
         }
+        let original_revision = dispatcher
+            .handle_session_messages(&json!({"session_id":"alpha"}))
+            .await
+            .unwrap()["session_revision"]
+            .clone();
+        backend
+            .append(
+                "rpc_alpha",
+                &zeroclaw_api::model_provider::ChatMessage::user("appended history"),
+            )
+            .unwrap();
+        let newest = dispatcher
+            .handle_session_messages(
+                &json!({"session_id":"alpha", "session_keys":["rpc_alpha"], "limit":1}),
+            )
+            .await
+            .unwrap();
+        let older = dispatcher.handle_session_messages(&json!({"session_id":"alpha", "session_keys":["rpc_alpha"], "limit":1, "before_index":1})).await.unwrap();
+        assert_ne!(newest["session_revision"], original_revision);
+        assert_eq!(
+            newest["session_revision"], older["session_revision"],
+            "revision covers the whole history, not the returned slice"
+        );
+        assert_eq!(newest["session_revision"].as_str().unwrap().len(), 64);
         std::fs::write(corrupt, "not a JSON message\n").unwrap();
         for params in [
             json!({"session_id":"broken"}),

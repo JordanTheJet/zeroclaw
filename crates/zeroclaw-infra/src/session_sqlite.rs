@@ -84,6 +84,7 @@ impl SqliteSessionBackend {
 
                 #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
                 Ok(SessionMetadata {
+                    file_identity: None,
                     key,
                     name,
                     created_at: created,
@@ -1003,6 +1004,7 @@ impl SessionBackend for SqliteSessionBackend {
         session_key: &str,
         created_at: &str,
         owner: Option<&str>,
+        _file_identity: Option<&crate::session_backend::SessionFileIdentity>,
         can_delete: &dyn Fn(&crate::session_backend::SessionMetadata) -> bool,
     ) -> io::Result<bool> {
         let mut conn = self.conn.lock();
@@ -1220,6 +1222,7 @@ impl SessionBackend for SqliteSessionBackend {
 
             #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
             Ok(SessionMetadata {
+                file_identity: None,
                 key,
                 name,
                 created_at: created,
@@ -1506,6 +1509,7 @@ impl SessionBackend for SqliteSessionBackend {
                 .unwrap_or_else(|_| Utc::now());
             #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
             Ok(SessionMetadata {
+                file_identity: None,
                 key,
                 name,
                 created_at: created,
@@ -1558,6 +1562,7 @@ impl SessionBackend for SqliteSessionBackend {
                 .unwrap_or_else(|_| Utc::now());
             #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
             Ok(SessionMetadata {
+                file_identity: None,
                 key,
                 name,
                 created_at: created,
@@ -1626,6 +1631,7 @@ impl SessionBackend for SqliteSessionBackend {
                         let sender_id: Option<String> = row.get(7)?;
                         let principal_id: Option<String> = row.get(8)?;
                         Ok(SessionMetadata {
+                            file_identity: None,
                             key: key.clone(),
                             name,
                             created_at: DateTime::parse_from_rfc3339(&created_str)
@@ -1817,7 +1823,7 @@ mod tests {
             .to_rfc3339();
         assert!(
             !backend
-                .delete_session_matching("boundary", &created, Some("user:bob"), &|_| true)
+                .delete_session_matching("boundary", &created, Some("user:bob"), None, &|_| true)
                 .unwrap()
         );
         backend.delete_session("boundary").unwrap();
@@ -1829,7 +1835,7 @@ mod tests {
             .unwrap();
         assert!(
             !backend
-                .delete_session_matching("boundary", &created, Some("user:alice"), &|_| true)
+                .delete_session_matching("boundary", &created, Some("user:alice"), None, &|_| true)
                 .unwrap()
         );
         assert_eq!(backend.load("boundary")[0].content, "replacement");
@@ -1840,7 +1846,7 @@ mod tests {
             .to_rfc3339();
         assert!(
             backend
-                .delete_session_matching("boundary", &created, Some("user:alice"), &|_| true)
+                .delete_session_matching("boundary", &created, Some("user:alice"), None, &|_| true)
                 .unwrap()
         );
     }
