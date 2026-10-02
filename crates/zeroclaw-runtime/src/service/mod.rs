@@ -11,7 +11,7 @@ use std::process::Command;
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 use std::process::Stdio;
 use std::str::FromStr;
-#[cfg(any(windows, test))]
+#[cfg(any(windows, all(test, target_os = "linux")))]
 use std::sync::mpsc;
 #[cfg(windows)]
 use std::sync::mpsc::Receiver;
