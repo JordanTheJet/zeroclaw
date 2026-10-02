@@ -3786,6 +3786,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn real_http_reads_withhold_persisted_malformed_url_credentials() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut exposures = Vec::new();
+        for (case, raw) in [
+            (
+                "canonical",
+                "custom:http://reader:http-invalid-password@valid.example.invalid/v1?key=http-invalid-query",
+            ),
+            (
+                "wrapped_bad_host",
+                "custom:h\tttp://reader:http-invalid-password@bad host.invalid/v1?key=http-invalid-query",
+            ),
+            (
+                "plain_bad_host",
+                "h\tttp://reader:http-invalid-password@bad host.invalid/v1?key=http-invalid-query",
+            ),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut config = temp_config(&tmp);
+            config
+                .set_prop_persistent("memory.embedding_provider", raw)
+                .unwrap();
+            config.save_dirty().await.unwrap();
+            let saved = tokio::fs::read_to_string(&config.config_path)
+                .await
+                .unwrap();
+            let mut loaded: zeroclaw_config::schema::Config = toml::from_str(&saved).unwrap();
+            loaded.config_path = config.config_path.clone();
+            loaded.data_dir = config.data_dir.clone();
+            assert_eq!(loaded.memory.embedding_provider, raw);
+            let app = axum::Router::new()
+                .route("/api/config", axum::routing::get(handle_config_get))
+                .route("/api/config/prop", axum::routing::get(handle_prop_get))
+                .route("/api/config/list", axum::routing::get(handle_list))
+                .with_state(test_state(loaded));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+            let server = ::zeroclaw_spawn::spawn!(async move {
+                axum::serve(listener, app)
+                    .with_graceful_shutdown(async {
+                        let _ = stopped.await;
+                    })
+                    .await
+                    .unwrap();
+            });
+            for route in [
+                "/api/config",
+                "/api/config/prop?path=memory.embedding_provider",
+                "/api/config/list?prefix=memory",
+            ] {
+                let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+                let request =
+                    format!("GET {route} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+                client.write_all(request.as_bytes()).await.unwrap();
+                let mut response = Vec::new();
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    client.read_to_end(&mut response),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                let response = String::from_utf8(response).unwrap();
+                assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+                let (_, body) = response.split_once("\r\n\r\n").unwrap();
+                let json: serde_json::Value = serde_json::from_str(body).unwrap();
+                if ["http-invalid-password", "http-invalid-query"]
+                    .iter()
+                    .any(|marker| json.to_string().contains(marker))
+                {
+                    exposures.push((case, route));
+                }
+                if route == "/api/config" && case == "canonical" {
+                    assert_eq!(
+                        json["memory"]["embedding_provider"],
+                        "custom:http://***MASKED***@valid.example.invalid/v1?***MASKED***"
+                    );
+                }
+            }
+            stop.send(()).unwrap();
+            server.await.unwrap();
+        }
+        assert!(
+            exposures.is_empty(),
+            "real HTTP password exposure boundaries: {exposures:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn prop_get_surfaces_disabled_audit_warning() {
         let tmp = tempfile::tempdir().unwrap();
         let mut config = temp_config(&tmp);

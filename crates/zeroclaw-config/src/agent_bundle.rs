@@ -2048,6 +2048,42 @@ mod tests {
     }
 
     #[test]
+    fn malformed_url_credentials_are_omitted_from_exported_endpoints() {
+        let mut config = fixture();
+        config.providers.models.anthropic.get_mut("main").unwrap().base.uri = Some("custom:h\tttp://reader:export-invalid-password@bad host.invalid/v1?key=export-invalid-query".into());
+        let plan = plan_export(&config, "researcher").unwrap();
+        assert_eq!(
+            lookup(
+                &plan.config,
+                &["providers", "models", "anthropic", "main", "uri"]
+            )
+            .and_then(toml::Value::as_str),
+            Some("")
+        );
+        let rendered = render_config_toml(&plan).unwrap();
+        for marker in [
+            "export-invalid-password",
+            "export-invalid-query",
+            "bad host.invalid",
+            "***MASKED***",
+        ] {
+            assert!(!rendered.contains(marker), "export retained {marker}");
+        }
+        assert!(
+            plan.required_secrets
+                .contains(&"providers.models.anthropic.main.uri".to_string())
+        );
+        assert_eq!(
+            lookup(
+                &plan.config,
+                &["providers", "models", "anthropic", "main", "uri"]
+            )
+            .and_then(toml::Value::as_str),
+            Some("")
+        );
+    }
+
+    #[test]
     fn host_specific_and_relational_fields_are_dropped_and_reported() {
         let mut config = fixture();
         if let Some(agent) = config.agents.get_mut("researcher") {

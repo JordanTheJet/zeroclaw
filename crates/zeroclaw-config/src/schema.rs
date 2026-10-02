@@ -43037,6 +43037,154 @@ stream_tool_arguments = [
         );
     }
 
+    #[tokio::test]
+    async fn malformed_url_persistence_withholds_all_five_read_boundaries() {
+        use crate::traits::{MASKED_SECRET, MaskSecrets};
+        let mut exposures = Vec::new();
+        for (case, raw) in [
+            (
+                "wrapped_tab",
+                "custom:h\tttp://reader:persist-invalid-password@bad host.invalid/v1?key=persist-invalid-query#persist-invalid-fragment",
+            ),
+            (
+                "wrapped_nul",
+                "custom:\0http://reader:persist-invalid-password@bad host.invalid/v1?key=persist-invalid-query",
+            ),
+            (
+                "wrapped_vt",
+                "custom:\x0bhttp://reader:persist-invalid-password@bad host.invalid/v1",
+            ),
+            (
+                "plain_tab",
+                "h\tttp://reader:persist-invalid-password@bad host.invalid/v1",
+            ),
+        ] {
+            assert!(reqwest::Url::parse(raw.strip_prefix("custom:").unwrap_or(raw)).is_err());
+            let dir = tempfile::tempdir().unwrap();
+            let mut config = Config {
+                config_path: dir.path().join("config.toml"),
+                data_dir: dir.path().join("data"),
+                ..Default::default()
+            };
+            config
+                .set_prop_persistent("memory.embedding_provider", raw)
+                .unwrap();
+            config.save_dirty().await.unwrap();
+            let saved = tokio::fs::read_to_string(&config.config_path)
+                .await
+                .unwrap();
+            let mut loaded: Config = toml::from_str(&saved).unwrap();
+            loaded.config_path = config.config_path.clone();
+            loaded.data_dir = config.data_dir.clone();
+            assert_eq!(loaded.memory.embedding_provider, raw);
+            let shown = loaded.get_prop("memory.embedding_provider").unwrap();
+            let listed = loaded
+                .prop_fields()
+                .into_iter()
+                .find(|field| field.name == "memory.embedding_provider")
+                .unwrap()
+                .display_value;
+            let mut projection = loaded.clone();
+            projection.mask_secrets();
+            let reads = [
+                ("helper", crate::url_credentials::mask(raw)),
+                ("endpoint", crate::url_credentials::endpoint(raw)),
+                ("getter", shown.clone()),
+                ("listing", listed),
+                ("whole", serde_json::to_string(&projection).unwrap()),
+            ];
+            for (boundary, value) in reads {
+                if [
+                    "persist-invalid-password",
+                    "persist-invalid-query",
+                    "persist-invalid-fragment",
+                ]
+                .iter()
+                .any(|marker| value.contains(marker))
+                {
+                    exposures.push((case, boundary));
+                }
+            }
+            // An existing malformed operational value is preserved by a
+            // backed whole-mask echo; this fix changes only its projection.
+            loaded
+                .set_prop_persistent("memory.embedding_provider", MASKED_SECRET)
+                .unwrap();
+            assert_eq!(loaded.memory.embedding_provider, raw);
+            loaded.save_dirty().await.unwrap();
+            let saved = tokio::fs::read_to_string(&loaded.config_path)
+                .await
+                .unwrap();
+            let reloaded: Config = toml::from_str(&saved).unwrap();
+            assert_eq!(reloaded.memory.embedding_provider, raw);
+            projection.restore_secrets_from(&loaded);
+            assert_eq!(projection.memory.embedding_provider, raw);
+        }
+        assert!(
+            exposures.is_empty(),
+            "password exposure boundaries: {exposures:?}"
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn accepted_url_controls_keep_all_twenty_four_native_round_trips() {
+        use crate::traits::MaskSecrets;
+        let mut cases = 0;
+        for start in [
+            "http://",
+            "http:///",
+            "http:/",
+            "http:////",
+            "https:\\\\",
+            "h\tttp://",
+            "ht\ntps://",
+            "\0http://",
+            "\x0bhttp://",
+            "\x01http://",
+            "\thttp://",
+            " \r\nhttp://",
+        ] {
+            for wrapper in ["", "custom:"] {
+                let tail = format!(
+                    "{start}reader:accepted-password@example.invalid/v1?key=accepted-query#accepted-fragment"
+                );
+                assert_eq!(
+                    reqwest::Url::parse(&tail).unwrap().password(),
+                    Some("accepted-password")
+                );
+                let raw = format!("{wrapper}{tail}");
+                let mut config = Config::default();
+                config.set_prop("memory.embedding_provider", &raw).unwrap();
+                let shown = config.get_prop("memory.embedding_provider").unwrap();
+                let listed = config
+                    .prop_fields()
+                    .into_iter()
+                    .find(|field| field.name == "memory.embedding_provider")
+                    .unwrap()
+                    .display_value;
+                let mut projected = config.clone();
+                projected.mask_secrets();
+                for read in [
+                    crate::url_credentials::mask(&raw),
+                    crate::url_credentials::endpoint(&raw),
+                    shown.clone(),
+                    listed,
+                    serde_json::to_string(&projected).unwrap(),
+                ] {
+                    for marker in ["accepted-password", "accepted-query", "accepted-fragment"] {
+                        assert!(!read.contains(marker), "{raw:?}: {read:?}");
+                    }
+                }
+                config
+                    .set_prop("memory.embedding_provider", &shown)
+                    .unwrap();
+                assert_eq!(config.memory.embedding_provider, raw);
+                cases += 1;
+            }
+        }
+        assert_eq!(cases, 24);
+    }
+
     /// The credential URLs declared outside this module: the A2A server's
     /// public base and a peer's base, the email OAuth endpoints (members of
     /// one opaque `oauth2` property), the Gmail push webhook and the voice

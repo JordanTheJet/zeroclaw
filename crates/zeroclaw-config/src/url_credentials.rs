@@ -160,9 +160,8 @@ fn scheme_len(s: &str) -> Option<usize> {
 /// `url` with its userinfo, query and fragment, each when present and not
 /// empty, shown as [`MASKED_SECRET`]:
 /// `https://***MASKED***@host/v1?***MASKED***`. A URL without any of them
-/// comes back unchanged. Should the runtime's URL parser still find a
-/// credential in the result, which [`split`] is built never to allow, the
-/// whole value is masked instead.
+/// comes back unchanged when the runtime parser proves its components safe.
+/// A remaining credential or indeterminate parsing masks the whole value.
 #[must_use]
 pub fn mask(url: &str) -> String {
     let parts = split(url);
@@ -171,33 +170,38 @@ pub fn mask(url: &str) -> String {
         masked(parts.query),
         masked(parts.fragment),
     );
-    if parser_finds_credentials(&masked) {
+    if parser_credential_evidence(&masked) != Some(false) {
         return MASKED_SECRET.to_string();
     }
     masked
 }
 
 /// `url` without its userinfo, query and fragment: the bare endpoint, which
-/// keeps none of the components [`mask`] hides. Empty should the runtime's
-/// URL parser still find a credential in it.
+/// keeps none of the components [`mask`] hides. Empty when the runtime parser
+/// finds a remaining credential or cannot prove the endpoint safe.
 #[must_use]
 pub fn endpoint(url: &str) -> String {
     let endpoint = split(url).join(None, None, None);
-    if parser_finds_credentials(&endpoint) {
+    if parser_credential_evidence(&endpoint) != Some(false) {
         return String::new();
     }
     endpoint
 }
 
-/// Whether the runtime's URL parser finds a userinfo, query or fragment in
-/// `url` that is neither empty nor the placeholder. The parse starts at the
-/// scheme, past a prefix such as `custom:`. A value that parses without a
-/// host is read again with `http://` in front, as reqwest reads a proxy
-/// written without a scheme.
-fn parser_finds_credentials(url: &str) -> bool {
-    // The embedding factory strips this wrapper before the WHATWG parser
-    // normalizes controls. Do not reuse the display splitter's offset here:
-    // an inner scheme containing a tab can be valid to the parser alone.
+/// `Some(false)` proves the parsed components are credential-free;
+/// `Some(true)` finds a remaining credential; `None` is indeterminate.
+/// Only a scheme-less value may use reqwest's `http://` proxy fallback.
+/// Reinterpreting a broken absolute URL as a proxy can move its userinfo
+/// into the path and produce a false credential-free result.
+fn parser_credential_evidence(url: &str) -> Option<bool> {
+    if url.is_empty() {
+        return Some(false);
+    }
+    if url == MASKED_SECRET {
+        return None;
+    }
+    // The embedding factory removes this wrapper before URL parsing.
+    // Scheme normalization belongs to the parser, not the display splitter.
     let candidate = url.strip_prefix("custom:").unwrap_or(url);
     let candidate = if url.starts_with("custom:") {
         candidate
@@ -205,13 +209,16 @@ fn parser_finds_credentials(url: &str) -> bool {
         &candidate[locate(candidate).scheme..]
     };
     let parsed = match reqwest::Url::parse(candidate) {
-        Ok(parsed) if parsed.has_host() => Some(parsed),
-        _ => reqwest::Url::parse(&format!("http://{candidate}")).ok(),
+        Ok(parsed) => Some(parsed),
+        Err(url::ParseError::RelativeUrlWithoutBase) => {
+            reqwest::Url::parse(&format!("http://{candidate}")).ok()
+        }
+        Err(_) => None,
     };
     let sensitive = |component: Option<&str>| {
         component.is_some_and(|value| !value.is_empty() && value != MASKED_SECRET)
     };
-    parsed.is_some_and(|parsed| {
+    parsed.map(|parsed| {
         sensitive(Some(parsed.username()))
             || sensitive(parsed.password())
             || sensitive(parsed.query())
@@ -573,6 +580,38 @@ mod tests {
         assert_eq!(restore(MASKED_SECRET, Some(stored)).unwrap(), stored);
         assert!(restore(MASKED_SECRET, None).is_err());
         assert!(restore(MASKED_SECRET, Some(MASKED_SECRET)).is_err());
+    }
+
+    #[test]
+    fn indeterminate_urls_are_withheld() {
+        for raw in [
+            "custom:h\tttp://reader:invalid-password@bad host.invalid/v1",
+            "custom:\0http://reader:invalid-password@bad host.invalid/v1",
+            "h\tttp://reader:invalid-password@bad host.invalid/v1",
+        ] {
+            assert!(reqwest::Url::parse(raw.strip_prefix("custom:").unwrap_or(raw)).is_err());
+            assert_eq!(mask(raw), MASKED_SECRET, "{raw:?}");
+            assert_eq!(endpoint(raw), "", "{raw:?}");
+            assert_eq!(restore(MASKED_SECRET, Some(raw)).unwrap(), raw);
+        }
+    }
+
+    #[test]
+    fn credential_free_urls_and_selectors_keep_exact_bytes() {
+        // Empty values and real selectors carry no credential. Valid URLs
+        // without credential components retain the operator's exact spelling.
+        for raw in [
+            "",
+            "none",
+            "openai",
+            "openrouter",
+            "https://EXAMPLE.invalid:443/a%2Fb",
+            "custom:https://example.invalid/v1",
+            "file:///C:/example",
+            "socks5:///u:pw@h",
+        ] {
+            assert_eq!(mask(raw), raw, "{raw:?}");
+        }
     }
 
     #[test]
