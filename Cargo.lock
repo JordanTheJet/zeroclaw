@@ -14393,6 +14393,7 @@ dependencies = [
  "parking_lot",
  "portable-atomic",
  "rusqlite",
+ "same-file",
  "serde",
  "serde_json",
  "sha2 0.10.9",

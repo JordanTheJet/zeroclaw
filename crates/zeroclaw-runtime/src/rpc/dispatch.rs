@@ -1490,7 +1490,8 @@ impl RpcDispatcher {
             })?;
             match (&snapshot, record) {
                 (Some(value), Some(record))
-                    if value.metadata.principal_id == record.owner
+                    if value.metadata.file_identity == record.durable_file_identity
+                        && value.metadata.principal_id == record.owner
                         && Some(value.metadata.created_at.to_rfc3339()).as_ref()
                             == record.durable_created_at.as_ref() =>
                 {
@@ -2267,6 +2268,7 @@ impl RpcDispatcher {
         }
         let mut chat_durable: Option<DurableSession> = None;
         let mut chat_created_at = None;
+        let mut chat_file_identity = None;
         let mut has_acp = false;
         if let Some(backend) = self.ctx.session_backend.as_ref() {
             for key in [
@@ -2281,6 +2283,7 @@ impl RpcDispatcher {
                     owners.push(meta.principal_id);
                     if chat_durable.is_none() {
                         chat_created_at = Some(meta.created_at.to_rfc3339());
+                        chat_file_identity = meta.file_identity;
                         chat_durable = Some(DurableSession::Chat { key });
                     }
                 }
@@ -2344,6 +2347,9 @@ impl RpcDispatcher {
         };
         Ok(Some(SessionRecord {
             live_generation: live.map(|(_, generation, _)| generation),
+            durable_file_identity: matches!(&durable, Some(DurableSession::Chat { .. }))
+                .then_some(chat_file_identity)
+                .flatten(),
             durable_created_at: matches!(&durable, Some(DurableSession::Chat { .. }))
                 .then_some(chat_created_at)
                 .flatten(),
@@ -2413,6 +2419,7 @@ impl RpcDispatcher {
         Ok(Some(SessionRecord {
             live_generation: live.map(|(_, generation, _)| generation),
             durable_created_at: meta.as_ref().map(|meta| meta.created_at.to_rfc3339()),
+            durable_file_identity: meta.as_ref().and_then(|meta| meta.file_identity.clone()),
             durable: meta.map(|_| DurableSession::Chat {
                 key: key.to_owned(),
             }),
@@ -2608,10 +2615,14 @@ impl RpcDispatcher {
             .await?;
         let scope = self.scoped_principal_id();
         if let Some(created) = authorized.and_then(|record| record.durable_created_at.as_deref())
-            && Some(created)
+            && (Some(created)
                 != current
                     .as_ref()
                     .and_then(|record| record.durable_created_at.as_deref())
+                || authorized.and_then(|record| record.durable_file_identity.as_deref())
+                    != current
+                        .as_ref()
+                        .and_then(|record| record.durable_file_identity.as_deref()))
         {
             return Err(match scope {
                 Some(_) => rpc_err(
@@ -8228,6 +8239,9 @@ impl RpcDispatcher {
                                     &key,
                                     created_at,
                                     expected_owner.as_deref(),
+                                    record
+                                        .as_ref()
+                                        .and_then(|record| record.durable_file_identity.as_deref()),
                                 )
                                 .map_err(|e| {
                                     rpc_err(
@@ -8289,6 +8303,9 @@ impl RpcDispatcher {
                                         key,
                                         created,
                                         expected_owner.as_deref(),
+                                        record.as_ref().and_then(|record| {
+                                            record.durable_file_identity.as_deref()
+                                        }),
                                     )
                                     .map_err(|error| {
                                         rpc_err(

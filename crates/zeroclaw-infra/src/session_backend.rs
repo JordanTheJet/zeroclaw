@@ -3,6 +3,12 @@
 use chrono::{DateTime, Utc};
 use zeroclaw_api::model_provider::ChatMessage;
 
+/// A borrowed operating-system file identity. Keeping the canonical file open
+/// prevents inode reuse while an admitted request waits; this creates no stored
+/// identity, cache or sidecar. Comparisons use the platform file identifier.
+#[derive(Debug, PartialEq, Eq)]
+pub struct SessionFileIdentity(pub(crate) same_file::Handle);
+
 /// Metadata about a persisted session.
 #[derive(Debug, Clone)]
 pub struct SessionMetadata {
@@ -12,6 +18,9 @@ pub struct SessionMetadata {
     pub name: Option<String>,
     /// When the session was first created.
     pub created_at: DateTime<Utc>,
+    /// Canonical file handle for JSONL incarnation checks. SQL-backed rows
+    /// use their persisted creation identity and return `None`.
+    pub file_identity: Option<std::sync::Arc<SessionFileIdentity>>,
     /// When the last message was appended.
     pub last_activity: DateTime<Utc>,
     /// Total number of messages in the session.
@@ -120,13 +129,14 @@ pub trait SessionBackend: Send + Sync {
         ))
     }
 
-    /// Delete only the row whose creation time and owner were authorized.
+    /// Delete only the row whose creation time, owner and file identity were authorized.
     /// The comparison and deletion share the backend's write boundary.
     fn delete_session_matching(
         &self,
         _session_key: &str,
         _created_at: &str,
         _owner: Option<&str>,
+        _file_identity: Option<&SessionFileIdentity>,
     ) -> std::io::Result<bool> {
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
@@ -178,6 +188,7 @@ pub trait SessionBackend: Send + Sync {
             .map(|key| {
                 let messages = self.load(&key);
                 SessionMetadata {
+                    file_identity: None,
                     key,
                     name: None,
                     created_at: Utc::now(),
@@ -370,6 +381,7 @@ pub trait SessionBackend: Send + Sync {
             return None;
         }
         Some(SessionMetadata {
+            file_identity: None,
             key: session_key.to_string(),
             name: self.get_session_name(session_key).ok().flatten(),
             created_at: Utc::now(),
@@ -458,6 +470,7 @@ mod tests {
     #[test]
     fn session_metadata_is_constructible() {
         let meta = SessionMetadata {
+            file_identity: None,
             key: "test".into(),
             name: None,
             created_at: Utc::now(),
