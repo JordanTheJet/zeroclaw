@@ -141,10 +141,15 @@ impl Pair {
             let core = self.ctx.config.read().get_prop(path).ok();
             assert_eq!(in_process, core, "{case}: live {path}");
         }
+        // Incremental saves may insert equal tables in a different order.
+        // TOML values retain array ordering; comments are pinned by the cases
+        // that write them below rather than treated as configuration values.
+        let in_process: toml::Value = toml::from_str(&self.in_process.saved()).expect("saved TOML");
+        let through_core: toml::Value =
+            toml::from_str(&self.core_side.saved()).expect("saved TOML");
         assert_eq!(
-            self.in_process.saved(),
-            self.core_side.saved(),
-            "{case}: the saved config.toml"
+            in_process, through_core,
+            "{case}: the saved config.toml values"
         );
     }
 }
@@ -187,11 +192,11 @@ async fn patch_both(pair: &Pair, headers: HeaderMap, body: Value) -> (Response, 
 async fn a_patch_answers_and_saves_alike() {
     let pair = Pair::new(|_| {}).await;
     let body = json!([
-        {"op": "replace", "path": "/memory/backend", "value": "none", "comment": "kept small"},
-        {"op": "test", "path": "memory.backend", "value": "none"},
+        {"op": "replace", "path": "/memory/auto_save", "value": false, "comment": "kept small"},
+        {"op": "test", "path": "memory.auto_save", "value": false},
         {"op": "add", "path": "/scheduler/max_run_history", "value": 7},
-        {"op": "remove", "path": "/scheduler/max_run_history"},
-        {"op": "comment", "path": "memory.auto_save", "comment": "why"},
+        {"op": "remove", "path": "/memory/backend"},
+        {"op": "comment", "path": "scheduler.max_run_history", "comment": "why"},
     ]);
     let (in_process, through_core) = patch_both(&pair, HeaderMap::new(), body).await;
     let answered = assert_parity("a mixed patch", StatusCode::OK, in_process, through_core).await;
@@ -202,12 +207,22 @@ async fn a_patch_answers_and_saves_alike() {
     assert!(body["results"][3].get("value").is_some(), "{body}");
     pair.assert_same_config(
         "a mixed patch",
-        &["memory.backend", "scheduler.max_run_history"],
+        &[
+            "memory.backend",
+            "memory.auto_save",
+            "scheduler.max_run_history",
+        ],
     );
-    assert!(
-        pair.core_side.saved().contains("kept small"),
-        "the comment is written"
-    );
+    for comment in ["kept small", "why"] {
+        assert!(
+            pair.in_process.saved().contains(comment),
+            "in-process comment is written"
+        );
+        assert!(
+            pair.core_side.saved().contains(comment),
+            "core comment is written"
+        );
+    }
 }
 
 #[tokio::test]
@@ -237,6 +252,14 @@ async fn a_refused_patch_answers_alike_and_saves_nothing() {
             "a path the schema does not define",
             StatusCode::NOT_FOUND,
             json!([{"op": "replace", "path": "/memory/no_such_field", "value": "x"}]),
+        ),
+        (
+            "an integer cannot be cleared with an empty string",
+            StatusCode::BAD_REQUEST,
+            json!([
+                {"op": "replace", "path": "/scheduler/max_run_history", "value": 7},
+                {"op": "remove", "path": "/scheduler/max_run_history"},
+            ]),
         ),
         (
             "a value of the wrong kind",
