@@ -9,6 +9,7 @@
 //! never approximated: steering a running turn, and SOP approvals, whose
 //! decision the core would record under the wrong approver.
 
+use std::collections::BTreeSet;
 use std::time::Duration;
 
 use axum::Json;
@@ -50,6 +51,7 @@ pub(crate) async fn ws_chat_through_core(
     headers: &HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Result<Response, CoreError> {
+    require_chat_features(&core)?;
     let Some(agent_alias) = params.agent_alias.filter(|s| !s.trim().is_empty()) else {
         return Ok((
             StatusCode::BAD_REQUEST,
@@ -89,9 +91,39 @@ pub(crate) async fn ws_chat_through_core(
 /// `POST /api/sessions/{id}/abort` through the core: cancel the session's
 /// running turn. As on the in-process gateway, a session with no running turn
 /// answers `no_active_response`.
-pub(crate) async fn abort_through_core(core: &CoreCall, id: &str) -> Result<Response, CoreError> {
+#[derive(Clone, Copy, Default, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum AbortAddress {
+    #[default]
+    Auto,
+    Raw,
+    Key,
+}
+
+pub(crate) async fn abort_through_core(
+    core: &CoreCall,
+    id: &str,
+    address: AbortAddress,
+) -> Result<Response, CoreError> {
+    if !core
+        .core_features()
+        .iter()
+        .any(|f| f == zeroclaw_rpc_proto::feature::SESSION_CANCEL_CHAT_KEY)
+    {
+        return Err(CoreError::MissingFeature(
+            zeroclaw_rpc_proto::feature::SESSION_CANCEL_CHAT_KEY,
+        ));
+    }
+    let exact = matches!(address, AbortAddress::Key)
+        || matches!(address, AbortAddress::Auto)
+            && (id.starts_with("rpc_") || id.starts_with("gw_"));
+    let params = if exact {
+        json!({"session_id": id, "session_key": id})
+    } else {
+        json!({"session_id": id})
+    };
     let status = match core
-        .call::<SessionCancelResult>(Method::SessionCancel, json!({ "session_id": id }))
+        .call::<SessionCancelResult>(Method::SessionCancel, params)
         .await
     {
         Ok(result) if result.cancelled => "aborted",
@@ -323,6 +355,7 @@ async fn run_turn(
         generation,
         client_gone: false,
         meter: ContextMeter::default(),
+        approval_receipts: BTreeSet::new(),
     };
 
     loop {
@@ -385,13 +418,13 @@ async fn run_turn(
                     Some(Ok(Message::Text(text))) => text,
                     Some(Ok(Message::Ping(payload))) => {
                         if sender.send(Message::Pong(payload)).await.is_err() {
-                            turn.client_gone = true;
+                            turn.disconnect().await;
                         }
                         continue;
                     }
                     Some(Ok(Message::Pong(_) | Message::Binary(_))) => continue,
                     Some(Ok(Message::Close(_)) | Err(_)) | None => {
-                        turn.client_gone = true;
+                        turn.disconnect().await;
                         continue;
                     }
                 };
@@ -401,13 +434,13 @@ async fn run_turn(
                         "message": "Invalid JSON. Send {\"type\":\"message\",\"content\":\"your text\"}",
                         "code": "INVALID_JSON",
                     });
-                    let _ = send(sender, &error).await;
+                    if send(sender, &error).await.is_err() { turn.disconnect().await; }
                     continue;
                 };
                 match parsed["type"].as_str() {
                     Some("approval_response") => {
                         if is_sop_approval(&parsed) {
-                            let _ = send(sender, &sop_approval_refusal()).await;
+                            if send(sender, &sop_approval_refusal()).await.is_err() { turn.disconnect().await; }
                         } else if let Some((request_id, decision)) = approval_decision(&parsed) {
                             approve(core, session_id, request_id, decision).await;
                         }
@@ -418,14 +451,14 @@ async fn run_turn(
                             "message": "this gateway cannot steer a running turn yet; send the message when the turn ends",
                             "code": "CAPABILITY_MISSING",
                         });
-                        let _ = send(sender, &error).await;
+                        if send(sender, &error).await.is_err() { turn.disconnect().await; }
                     }
                     _ => {}
                 }
             },
             _ = ping.tick(), if !turn.client_gone => {
                 if sender.send(Message::Ping(Vec::new().into())).await.is_err() {
-                    turn.client_gone = true;
+                    turn.disconnect().await;
                 }
             },
         }
@@ -445,9 +478,18 @@ struct TurnRelay<'a> {
     generation: u64,
     client_gone: bool,
     meter: ContextMeter,
+    // Delivered request identities for this socket/turn, not pending approval state.
+    approval_receipts: BTreeSet<String>,
 }
 
 impl TurnRelay<'_> {
+    async fn disconnect(&mut self) {
+        self.client_gone = true;
+        for request_id in std::mem::take(&mut self.approval_receipts) {
+            unreachable(self.core, self.session_id, &request_id, self.generation).await;
+        }
+    }
+
     async fn relay(&mut self, sender: &mut Sender, note: Notification) -> Relayed {
         if note.method != SESSION_UPDATE {
             return Relayed::Continue;
@@ -485,14 +527,18 @@ impl TurnRelay<'_> {
                 return Relayed::TurnEnded;
             }
             SessionUpdateEvent::ApprovalRequest {
+                client_turn_generation,
                 request_id,
                 tool_name,
                 arguments_summary,
                 timeout_secs,
                 ..
             } => {
+                if client_turn_generation != Some(self.generation) {
+                    return Relayed::Continue;
+                }
                 if self.client_gone {
-                    approve(self.core, self.session_id, &request_id, "reject").await;
+                    unreachable(self.core, self.session_id, &request_id, self.generation).await;
                     return Relayed::Continue;
                 }
                 let frame = json!({
@@ -502,9 +548,9 @@ impl TurnRelay<'_> {
                     "arguments_summary": arguments_summary,
                     "timeout_secs": timeout_secs,
                 });
+                self.approval_receipts.insert(request_id);
                 if send(sender, &frame).await.is_err() {
-                    self.client_gone = true;
-                    approve(self.core, self.session_id, &request_id, "reject").await;
+                    self.disconnect().await;
                 }
                 return Relayed::Continue;
             }
@@ -569,7 +615,7 @@ impl TurnRelay<'_> {
             ),
         };
         if !self.client_gone && send(sender, &frame).await.is_err() {
-            self.client_gone = true;
+            self.disconnect().await;
         }
         Relayed::Continue
     }
@@ -580,7 +626,7 @@ impl TurnRelay<'_> {
         }
         let error = json!({ "type": "error", "message": message, "code": code });
         if send(sender, &error).await.is_err() {
-            self.client_gone = true;
+            self.disconnect().await;
         }
     }
 }
@@ -673,6 +719,39 @@ fn approval_decision(parsed: &Value) -> Option<(&str, &'static str)> {
     Some((request_id, decision))
 }
 
+fn require_chat_features(core: &CoreCall) -> Result<(), CoreError> {
+    let required = [
+        zeroclaw_rpc_proto::feature::SESSION_NEW_VALIDATES_AGENT,
+        zeroclaw_rpc_proto::feature::SESSION_TURN_ERRORS,
+        zeroclaw_rpc_proto::feature::SESSION_APPROVAL_UNREACHABLE,
+    ];
+    for feature in required {
+        if !core
+            .core_features()
+            .iter()
+            .any(|advertised| advertised == feature)
+        {
+            return Err(CoreError::MissingFeature(feature));
+        }
+    }
+    Ok(())
+}
+
+async fn unreachable(core: &CoreCall, session_id: &str, request_id: &str, generation: u64) {
+    let answer = json!({
+        "session_id": session_id, "request_id": request_id,
+        "decision": "unreachable", "client_turn_generation": generation,
+    });
+    if let Err(error) = core.request(Method::SessionApprove, answer).await {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_attrs(json!({ "session_id": session_id, "request_id": request_id, "error": format!("{error:?}") })),
+            "chat approval viewer cleanup was refused"
+        );
+    }
+}
+
 async fn approve(core: &CoreCall, session_id: &str, request_id: &str, decision: &str) {
     let answer = json!({
         "session_id": session_id,
@@ -703,6 +782,10 @@ fn core_error_message(error: &CoreError) -> String {
         CoreError::Busy => "every core connection this gateway may hold is in use".into(),
         CoreError::Timeout => "the core did not answer in time".into(),
         CoreError::Rpc(error) => error.message.clone(),
+        CoreError::MissingFeature(feature) => format!("the core lacks required feature {feature}"),
+        CoreError::VersionMismatch { core, gateway } => {
+            format!("core version {core} differs from gateway {gateway}")
+        }
     }
 }
 

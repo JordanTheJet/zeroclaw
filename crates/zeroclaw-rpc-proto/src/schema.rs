@@ -41,7 +41,7 @@ catalog! {
     // Sessions
     SessionIdParams, ChatMode, SessionNewResult, SessionCloseResult, SessionKillParams,
     SessionKillResult, SessionPromptParams, SessionPromptResult, SessionConfigureParams,
-    SessionConfigureResult, SessionCancelResult, SessionGitBranchResult, SessionListParams,
+    SessionConfigureResult, SessionCancelParams, SessionCancelResult, SessionGitBranchResult, SessionListParams,
     SessionListResult, SessionEntry, SessionMessagesResult, SessionMessagesParams,
     MessageEntryKind, MessageEntry, SessionStateResult, SessionDeleteResult, SessionOverrides,
     // Memory

@@ -3,7 +3,7 @@
 use super::context::{ConfigWriteGuard, RpcContext};
 use super::session::DurableSession;
 use super::transport::RpcTransport;
-use super::turn::{TurnAttribution, TurnOutcome, execute_turn};
+use super::turn::{TurnAttribution, TurnOutcome, execute_admitted_turn};
 use super::types::*;
 
 const RPC_RELOAD_REPLY_FLUSH_DELAY: std::time::Duration = std::time::Duration::from_millis(200);
@@ -325,7 +325,13 @@ fn principal_tool_ceiling(grants: &zeroclaw_api::grants::ResolvedGrants) -> Opti
 ///
 /// - `tui.client_kind`: `tui/list` reports the kind a connection declared
 ///   (`tui_list_labels_only_a_declared_gateway_connection`).
-pub const ADVERTISED_FEATURES: &[&str] = &[zeroclaw_rpc_proto::feature::TUI_CLIENT_KIND];
+pub const ADVERTISED_FEATURES: &[&str] = &[
+    zeroclaw_rpc_proto::feature::TUI_CLIENT_KIND,
+    zeroclaw_rpc_proto::feature::SESSION_CANCEL_CHAT_KEY,
+    zeroclaw_rpc_proto::feature::SESSION_NEW_VALIDATES_AGENT,
+    zeroclaw_rpc_proto::feature::SESSION_TURN_ERRORS,
+    zeroclaw_rpc_proto::feature::SESSION_APPROVAL_UNREACHABLE,
+];
 
 fn declared_client_kind(capabilities: Option<&Value>) -> Option<String> {
     capabilities?
@@ -881,6 +887,31 @@ fn write_personality_file(
 }
 
 impl RpcDispatcher {
+    fn cancel_target_id(params: &SessionCancelParams) -> Result<&str, JsonRpcError> {
+        match params.session_key.as_deref() {
+            Some(key) => key
+                .strip_prefix("rpc_")
+                .filter(|id| !id.is_empty())
+                .ok_or_else(|| {
+                    rpc_err(
+                        SESSION_NOT_FOUND,
+                        "No active RPC chat for this exact row key",
+                    )
+                }),
+            None => Ok(&params.session_id),
+        }
+    }
+
+    fn session_emission_authority(&self) -> super::session_emission::SessionEmissionAuthority {
+        super::session_emission::SessionEmissionAuthority::new(
+            &self.ctx,
+            self.auth.clone(),
+            self.connection_cancel.clone(),
+            self.access_policy == RpcAccessPolicy::RemoteSessionOwner,
+            self.tui_id.clone(),
+        )
+    }
+
     pub fn new(ctx: Arc<RpcContext>, writer_tx: mpsc::Sender<String>, peer_label: String) -> Self {
         Self::new_with_connection_cancel(ctx, writer_tx, peer_label, CancellationToken::new())
     }
@@ -1134,7 +1165,7 @@ impl RpcDispatcher {
 }
 
 /// Record one authorization denial for the connection bound to `auth`.
-fn audit_denial(
+pub(crate) fn audit_denial(
     auth: Option<&crate::rpc::auth::ConnectionAuth>,
     method: Method,
     denied: &crate::rpc::auth::AuthDenied,
@@ -1187,7 +1218,7 @@ fn current_authority(
 /// decision stays in force until the lease is dropped.
 ///
 /// [`AuthorityLease`]: crate::rpc::auth::AuthorityLease
-fn current_authority_under(
+pub(crate) fn current_authority_under(
     lease: &crate::rpc::auth::AuthorityLease<'_>,
     auth: &crate::rpc::auth::ConnectionAuth,
     method: Method,
@@ -2451,6 +2482,12 @@ impl RpcDispatcher {
         ) {
             return Ok(());
         }
+        if method == Method::SessionCancel {
+            let req: SessionCancelParams = parse_params(params)?;
+            return self
+                .ensure_session_access(Self::cancel_target_id(&req)?)
+                .await;
+        }
         let session_id = params
             .get("session_id")
             .and_then(Value::as_str)
@@ -3162,7 +3199,9 @@ impl RpcDispatcher {
                 let is_notif = is_notification;
                 self.prompt_tasks.retain(|task| !task.is_finished());
                 let task = zeroclaw_spawn::spawn!(async move {
-                    let result = handle.handle_session_prompt(&params_clone).await;
+                    let result =
+                        super::session_emission::scope(handle.handle_session_prompt(&params_clone))
+                            .await;
                     if !is_notif {
                         match result {
                             Ok(_) => handle.send_result(id_clone, serde_json::json!({})).await,
@@ -3805,13 +3844,16 @@ impl RpcDispatcher {
         agent: Arc<tokio::sync::Mutex<crate::agent::agent::Agent>>,
         session_id: String,
     ) -> Result<(), JsonRpcError> {
-        let approval_channel = Arc::new(crate::rpc::approval_channel::RpcApprovalChannel::new(
-            "rpc",
-            session_id,
-            Arc::clone(&self.rpc),
-            Arc::clone(&self.ctx.approval_pending),
-            self.client_elicitation_caps,
-        ));
+        let approval_channel = Arc::new(
+            crate::rpc::approval_channel::RpcApprovalChannel::new(
+                "rpc",
+                session_id,
+                Arc::clone(&self.rpc),
+                Arc::clone(&self.ctx.approval_pending),
+                self.client_elicitation_caps,
+            )
+            .with_emission_authority(self.session_emission_authority()),
+        );
         if self.access_policy == RpcAccessPolicy::RemoteSessionOwner {
             // Live channel refresh uses this mutex, not session admission.
             // Keep eligibility and registration under the same Agent guard.
@@ -4490,13 +4532,16 @@ impl RpcDispatcher {
             resolved_interaction_surface.map(crate::agent::prompt::InteractionSurface::resolve),
         );
 
-        let approval_ch = Arc::new(crate::rpc::approval_channel::RpcApprovalChannel::new(
-            "rpc",
-            session_id.clone(),
-            Arc::clone(&self.rpc),
-            Arc::clone(&self.ctx.approval_pending),
-            self.client_elicitation_caps,
-        ));
+        let approval_ch = Arc::new(
+            crate::rpc::approval_channel::RpcApprovalChannel::new(
+                "rpc",
+                session_id.clone(),
+                Arc::clone(&self.rpc),
+                Arc::clone(&self.ctx.approval_pending),
+                self.client_elicitation_caps,
+            )
+            .with_emission_authority(self.session_emission_authority()),
+        );
         // Align agent.channel_name with the registered back-channel key so
         // ask_user/poll/escalate default to this conversation (not an arbitrary
         // external channel from the seeded channel map).
@@ -5573,13 +5618,16 @@ impl RpcDispatcher {
         };
         agent.set_interaction_context(interaction_context);
 
-        let approval_ch = Arc::new(crate::rpc::approval_channel::RpcApprovalChannel::new(
-            "rpc",
-            sid.to_string(),
-            Arc::clone(&self.rpc),
-            Arc::clone(&self.ctx.approval_pending),
-            self.client_elicitation_caps,
-        ));
+        let approval_ch = Arc::new(
+            crate::rpc::approval_channel::RpcApprovalChannel::new(
+                "rpc",
+                sid.to_string(),
+                Arc::clone(&self.rpc),
+                Arc::clone(&self.ctx.approval_pending),
+                self.client_elicitation_caps,
+            )
+            .with_emission_authority(self.session_emission_authority()),
+        );
         // See session/new: channel_name must match the registered back-channel
         // key so interactive tools default to this conversation.
         agent.set_channel_name("rpc".to_string());
@@ -5865,6 +5913,11 @@ impl RpcDispatcher {
         }
 
         let live_generation_at_entry = self.ctx.sessions.get_generation(sid).await;
+        let output = super::session_emission::SessionOutput {
+            authority: self.session_emission_authority(),
+            generation: live_generation_at_entry,
+        };
+        super::session_emission::bind(output.clone());
         if live_generation_at_entry.is_some() {
             self.capture_session_access(sid).await?;
         }
@@ -6267,27 +6320,6 @@ impl RpcDispatcher {
                 .await);
         }
 
-        // The grants were re-resolved after admission, so apply that posture
-        // to this session's static and already-activated deferred tools. It is
-        // judged by those fresh grants rather than the connection's stamped
-        // copy, so a prompt that queued before its principal was narrowed
-        // executes under the narrowed ceiling. It runs on the canonical
-        // handle, not the pre-reconciliation one, so a replaced incarnation
-        // cannot carry a stale ceiling, and it runs before any prompt-side
-        // effect. Direct unit handlers bind no connection and keep their
-        // fixture semantics.
-        if let Some(grants) = grants.as_ref() {
-            // Owner isolation (this slice) replaced the parent's blanket
-            // refusal of a constrained principal here: the session is stamped
-            // with its owner and every resume/rehydration is owner-predicated,
-            // so a constrained principal's grants can only ever re-narrow ITS
-            // OWN session's Agent, never a shared victim's. A prompt whose
-            // principal was narrowed since creation therefore executes under
-            // the narrowed ceiling, applied on the canonical handle here.
-            let mut guard = agent.lock().await;
-            self.apply_principal_grants_to_agent(grants, &mut guard);
-        }
-
         // Mark the durable row running only after every preflight wait has
         // passed. The generation waits and the canonical Agent lookup above
         // can all still fail this prompt (SESSION_BUSY / SESSION_NOT_FOUND)
@@ -6314,9 +6346,6 @@ impl RpcDispatcher {
         let persist_session_state = !matches!(chat_mode, crate::rpc::types::ChatMode::Acp);
         let session_key = format!("rpc_{sid}");
         let turn_id = uuid::Uuid::new_v4().to_string();
-        if persist_session_state && let Some(ref backend) = self.ctx.session_backend {
-            let _ = backend.set_session_state(&session_key, "running", Some(&turn_id));
-        }
 
         self.ctx.sessions.touch(sid).await;
         ::zeroclaw_log::record!(
@@ -6371,21 +6400,12 @@ impl RpcDispatcher {
         // (Master's precomputed `max_context_tokens` injection is
         // deliberately NOT carried over: the route-aware contract resolves
         // capacity from the serving provider/model at call time.)
-        let (agent_alias, model_provider, model) = {
-            let alias = self
-                .ctx
-                .sessions
-                .get_agent_alias(sid)
-                .await
-                .unwrap_or_default();
-            let (mp, m) = if let Some(agent) = self.ctx.sessions.get_agent(sid).await {
-                let (_, model_provider, model) = agent.lock().await.attribution_fields();
-                (model_provider, model)
-            } else {
-                (String::new(), String::new())
-            };
-            (alias, mp, m)
-        };
+        let agent_alias = self
+            .ctx
+            .sessions
+            .get_agent_alias(sid)
+            .await
+            .unwrap_or_default();
 
         let rpc = self.rpc.clone();
         let sid_owned = sid.to_string();
@@ -6402,8 +6422,6 @@ impl RpcDispatcher {
             None
         };
         let attribution_agent_alias = agent_alias.clone();
-        let attribution_model_provider = model_provider.clone();
-        let attribution_model = model.clone();
         // Cost-tracking context for this turn. Built from the daemon-scoped
         // tracker + the live pricing map and stamped with the agent alias so
         // `execute_turn` can persist token usage and attribute spend. `None`
@@ -6417,67 +6435,150 @@ impl RpcDispatcher {
             )
             .with_agent_alias(&attribution_agent_alias)
         });
-        let turn = execute_turn(
-            agent,
-            prompt.clone(),
-            cancel.clone(),
-            TurnAttribution {
-                session_key: Some(sid.to_string()),
-                agent_alias,
-                model_provider,
-                model,
-                channel: "rpc",
-            },
-            cost_context,
-            self.connection_activity.clone(),
-            move |event| {
-                let rpc = rpc.clone();
-                let sid = sid_owned.clone();
-                let acp_token_store = acp_token_store.clone();
-                let sessions_for_plan = sessions_for_plan.clone();
-                let checkpoint_turn_id = checkpoint_turn_id_for_events.clone();
-                let checkpoint_error = Arc::clone(&checkpoint_error_for_events);
-                let checkpoint_cancel = checkpoint_cancel.clone();
-                async move {
-                    if let (
-                        Some(store),
-                        TurnEvent::Usage {
-                            input_tokens,
-                            accepted,
-                            ..
-                        },
-                    ) = (acp_token_store.as_ref(), &event)
-                    {
-                        let store = store.clone();
-                        let sid = sid.clone();
-                        let (tokens, is_accepted) = (*input_tokens, *accepted);
-                        let _ = tokio::task::spawn_blocking(move || {
-                            store.persist_usage_snapshot(&sid, tokens, is_accepted)
-                        })
-                        .await;
-                    }
-                    persist_plan_if_any(&sessions_for_plan, acp_token_store.as_ref(), &sid, &event)
-                        .await;
-                    // Usage already carries the serving call's context limits.
-                    // Keep checkpoint persistence ahead of the same projection.
-                    if checkpoint_error.lock().await.is_some() {
-                        return;
-                    }
-                    if let Err(error) = persist_checkpoint_event_before_notification(
-                        acp_token_store.as_ref(),
-                        checkpoint_turn_id.as_deref(),
-                        &sid,
-                        &event,
-                        &rpc,
-                    )
-                    .await
-                    {
-                        *checkpoint_error.lock().await = Some(error);
-                        checkpoint_cancel.cancel();
-                    }
+        // Acquire the last Agent guard before resolving authority. No
+        // stamped grants or unchecked Agent acquisition reaches execution.
+        let mut agent_guard = agent.lock_owned().await;
+        self.revalidate_admitted_session(sid, authorized.as_ref())
+            .await?;
+        let effect_guard = self.ctx.sessions.effect_guard().await;
+        let admitted = {
+            let lease = self.ctx.auth.hold_authority();
+            (|| {
+                let live = effect_guard
+                    .session(sid)
+                    .filter(|session| Some(session.generation) == live_generation_at_entry)
+                    .ok_or_else(|| self.stale_session_incarnation_error())?;
+                let current_grants = self
+                    .auth
+                    .as_ref()
+                    .map(|auth| {
+                        current_authority_under(&lease, auth, Method::SessionPrompt).map_err(
+                            |denied| {
+                                self.audit_auth_denial(Method::SessionPrompt, &denied);
+                                rpc_err(denied.code, denied.message)
+                            },
+                        )
+                    })
+                    .transpose()?;
+                if let (Some(auth), Some(grants)) = (self.auth.as_ref(), current_grants.as_ref())
+                    && !grants.admin
+                    && auth.principal.is_authenticated()
+                    && live.owner_principal_id.as_deref() != Some(auth.principal.id.as_str())
+                {
+                    return Err(rpc_err(
+                        FORBIDDEN,
+                        "Session not found or not owned by this principal",
+                    ));
                 }
-            },
-        );
+                self.authorize_live_session_binding(
+                    Method::SessionPrompt,
+                    current_grants.as_ref(),
+                    &self.ctx.config.read(),
+                    &live.agent_alias,
+                    &live.workspace_dir,
+                )?;
+                self.authorize_session_environment(
+                    Method::SessionPrompt,
+                    current_grants.as_ref(),
+                    live.has_forwarded_environment(),
+                )?;
+                if self.access_policy != RpcAccessPolicy::TrustedLocal {
+                    self.ensure_session_agent_channel_access(&agent_guard)?;
+                }
+                if let Some(grants) = current_grants.as_ref() {
+                    self.apply_principal_grants_to_agent(grants, &mut agent_guard);
+                }
+                let (_, model_provider, model) = agent_guard.attribution_fields();
+                let attribution_model_provider = model_provider.clone();
+                let attribution_model = model.clone();
+                if persist_session_state && let Some(ref backend) = self.ctx.session_backend {
+                    let _ = backend.set_session_state(&session_key, "running", Some(&turn_id));
+                }
+                Ok((
+                    execute_admitted_turn(
+                        agent_guard,
+                        prompt.clone(),
+                        cancel.clone(),
+                        TurnAttribution {
+                            live_generation: live_generation_at_entry,
+                            client_turn_generation: req.client_turn_generation,
+                            session_key: Some(sid.to_string()),
+                            agent_alias,
+                            model_provider,
+                            model,
+                            channel: "rpc",
+                        },
+                        cost_context,
+                        self.connection_activity.clone(),
+                        move |event| {
+                            let rpc = rpc.clone();
+                            let output = output.clone();
+                            let sid = sid_owned.clone();
+                            let acp_token_store = acp_token_store.clone();
+                            let sessions_for_plan = sessions_for_plan.clone();
+                            let checkpoint_turn_id = checkpoint_turn_id_for_events.clone();
+                            let checkpoint_error = Arc::clone(&checkpoint_error_for_events);
+                            let checkpoint_cancel = checkpoint_cancel.clone();
+                            async move {
+                                if let (
+                                    Some(store),
+                                    TurnEvent::Usage {
+                                        input_tokens,
+                                        accepted,
+                                        ..
+                                    },
+                                ) = (acp_token_store.as_ref(), &event)
+                                {
+                                    let store = store.clone();
+                                    let sid = sid.clone();
+                                    let (tokens, is_accepted) = (*input_tokens, *accepted);
+                                    let _ = tokio::task::spawn_blocking(move || {
+                                        store.persist_usage_snapshot(&sid, tokens, is_accepted)
+                                    })
+                                    .await;
+                                }
+                                persist_plan_if_any(
+                                    &sessions_for_plan,
+                                    acp_token_store.as_ref(),
+                                    &sid,
+                                    &event,
+                                )
+                                .await;
+                                // Usage already carries the serving call's context limits.
+                                // Keep checkpoint persistence ahead of the same projection.
+                                if checkpoint_error.lock().await.is_some() {
+                                    return;
+                                }
+                                if let Err(error) = persist_checkpoint_event_before_notification(
+                                    acp_token_store.as_ref(),
+                                    checkpoint_turn_id.as_deref(),
+                                    &sid,
+                                    &event,
+                                    &rpc,
+                                    Some(&output),
+                                )
+                                .await
+                                {
+                                    *checkpoint_error.lock().await = Some(error);
+                                    checkpoint_cancel.cancel();
+                                }
+                            }
+                        },
+                    ),
+                    attribution_model_provider,
+                    attribution_model,
+                ))
+            })()
+        };
+        drop(effect_guard);
+        let (turn, attribution_model_provider, attribution_model) = match admitted {
+            Ok(turn) => turn,
+            Err(denied) => {
+                return Err(self
+                    .refuse_admitted_prompt(sid, req.client_turn_generation, denied)
+                    .await);
+            }
+        };
         tokio::pin!(turn);
         let mut outcome = tokio::select! {
             biased;
@@ -6875,6 +6976,8 @@ impl RpcDispatcher {
             Some(report) => (Some(report.code.to_string()), Some(report.message)),
             None => (None, None),
         };
+        let is_data = !matches!(outcome, crate::rpc::types::TurnCompletionOutcome::Failed)
+            || error_code.is_some();
         let update = SessionUpdateEvent::TurnComplete {
             session_id: session_id.to_string(),
             outcome,
@@ -6887,7 +6990,17 @@ impl RpcDispatcher {
         if let Ok(params) = serde_json::to_value(update) {
             let n = JsonRpcNotification::new(notification::SESSION_UPDATE, params);
             if let Ok(s) = serde_json::to_string(&n) {
-                let _ = self.rpc.send_raw(s).await;
+                let output = match super::session_emission::current() {
+                    Some(output) => output,
+                    None => super::session_emission::SessionOutput {
+                        authority: self.session_emission_authority(),
+                        generation: self.ctx.sessions.get_generation(session_id).await,
+                    },
+                };
+                let _ = output
+                    .authority
+                    .send(&self.rpc, session_id, output.generation, is_data, s)
+                    .await;
             }
         }
     }
@@ -7083,21 +7196,20 @@ impl RpcDispatcher {
     }
 
     async fn handle_session_cancel(&self, params: &Value) -> RpcResult {
-        let req: SessionIdParams = parse_params(params)?;
-        self.authorize_session_owner(&req.session_id, Method::SessionCancel)
-            .await?;
-        let owner = self
-            .ctx
-            .sessions
-            .session_owner_tui_id(&req.session_id)
-            .await;
-        let expected_generation = match self.capture_session_access(&req.session_id).await {
+        let req: SessionCancelParams = parse_params(params)?;
+        let session_id = Self::cancel_target_id(&req)?.to_owned();
+        if req.session_key.is_none() {
+            self.authorize_session_owner(&session_id, Method::SessionCancel)
+                .await?;
+        }
+        let owner = self.ctx.sessions.session_owner_tui_id(&session_id).await;
+        let expected_generation = match self.capture_session_access(&session_id).await {
             Ok(generation) => generation,
             Err(error) => {
                 // A running turn holds the agent. The refusal must not wait
                 // for that turn to end just to label its log line.
                 let (agent_alias, model_provider, model) =
-                    match self.ctx.sessions.get_agent(&req.session_id).await {
+                    match self.ctx.sessions.get_agent(&session_id).await {
                         Some(agent) => agent
                             .try_lock()
                             .map(|agent| agent.attribution_fields())
@@ -7107,7 +7219,7 @@ impl RpcDispatcher {
                 let span = ::zeroclaw_log::info_span!(
                     target: "zeroclaw_log_internal_scope",
                     "zeroclaw_scope",
-                    session_key = %req.session_id,
+                    session_key = %session_id,
                     agent_alias = %agent_alias,
                     model_provider = %model_provider,
                     model = %model,
@@ -7132,27 +7244,58 @@ impl RpcDispatcher {
                 return Err(error);
             }
         };
-        match self
-            .ctx
-            .sessions
-            .signal_cancellation_for_incarnation(
-                &req.session_id,
-                expected_generation,
-                crate::rpc::session::CancelCause::ClientRpc,
-            )
-            .await
+        let guard = self.ctx.sessions.effect_guard().await;
+        let live = guard.session(&session_id);
+        if live.map(|s| s.generation) != expected_generation {
+            return Err(self.stale_session_incarnation_error());
+        }
+        if req.session_key.is_some() && !live.is_some_and(|s| matches!(s.chat_mode, ChatMode::Chat))
         {
-            None => return Err(self.stale_session_incarnation_error()),
-            Some(true) => {}
-            Some(false) => {
+            return Err(rpc_err(
+                SESSION_NOT_FOUND,
+                "No active RPC chat for this exact row key",
+            ));
+        }
+        if self.access_policy == RpcAccessPolicy::RemoteSessionOwner
+            && !matches!(live.and_then(|s| s.owner_tui_id.as_deref()), Some(owner) if self.tui_id.as_deref() == Some(owner))
+        {
+            return Err(rpc_err(
+                SESSION_NOT_OWNED,
+                "Caller does not own this session",
+            ));
+        }
+        let lease = self.ctx.auth.hold_authority();
+        if let Some(auth) = self.auth.as_ref() {
+            let grants = current_authority_under(&lease, auth, Method::SessionCancel)
+                .map_err(|denied| rpc_err(denied.code, denied.message))?;
+            if !grants.admin
+                && auth.principal.is_authenticated()
+                && live.and_then(|s| s.owner_principal_id.as_deref())
+                    != Some(auth.principal.id.as_str())
+            {
                 return Err(rpc_err(
-                    SESSION_NOT_FOUND,
-                    "No active turn for this session",
+                    FORBIDDEN,
+                    "Session not found or not owned by this principal",
                 ));
             }
         }
+        let cancelled = guard
+            .signal_cancel(
+                &session_id,
+                expected_generation,
+                crate::rpc::session::CancelCause::ClientRpc,
+            )
+            .ok_or_else(|| self.stale_session_incarnation_error())?;
+        drop(lease);
+        drop(guard);
+        if !cancelled {
+            return Err(rpc_err(
+                SESSION_NOT_FOUND,
+                "No active turn for this session",
+            ));
+        }
         to_result(SessionCancelResult {
-            session_id: req.session_id,
+            session_id: session_id.clone(),
             cancelled: true,
         })
     }
@@ -7758,6 +7901,36 @@ impl RpcDispatcher {
         if let Some(bound_session) = self.ctx.approval_pending.session_for(&p.request_id) {
             self.authorize_session_owner(&bound_session, Method::SessionApprove)
                 .await?;
+        }
+
+        if p.decision == "unreachable" {
+            let generation = p.client_turn_generation.ok_or_else(|| {
+                rpc_err(
+                    INVALID_PARAMS,
+                    "unreachable requires client_turn_generation",
+                )
+            })?;
+            let lease = self.ctx.auth.hold_authority();
+            if let Some(auth) = self.auth.as_ref() {
+                current_authority_under(&lease, auth, Method::SessionApprove).map_err(
+                    |denied| {
+                        self.audit_auth_denial(Method::SessionApprove, &denied);
+                        rpc_err(denied.code, denied.message)
+                    },
+                )?;
+            }
+            let acknowledged = self.ctx.approval_pending.unreachable(
+                &p.request_id,
+                &p.session_id,
+                &self.rpc,
+                generation,
+            );
+            drop(lease);
+            return to_result(SessionApproveResult {
+                session_id: p.session_id,
+                request_id: p.request_id,
+                acknowledged,
+            });
         }
 
         let response = match p.decision.as_str() {
@@ -11881,7 +12054,7 @@ async fn deliver_subscription(delivery: SubscriptionDelivery) {
 ///
 /// [`RpcInboundAuth`]: crate::rpc::auth::RpcInboundAuth
 /// [`RpcInboundAuth::hold_authority`]: crate::rpc::auth::RpcInboundAuth::hold_authority
-async fn deliver_frame(
+pub(crate) async fn deliver_frame(
     rpc: &RpcOutbound,
     cancel: &CancellationToken,
     authority: &crate::rpc::auth::RpcInboundAuth,
@@ -12271,6 +12444,7 @@ async fn persist_checkpoint_event_before_notification(
     session_id: &str,
     event: &TurnEvent,
     rpc: &Arc<RpcOutbound>,
+    output: Option<&super::session_emission::SessionOutput>,
 ) -> Result<(), String> {
     let notification = notification_for_turn_event(session_id, event);
     let checkpoint_write = async {
@@ -12341,17 +12515,33 @@ async fn persist_checkpoint_event_before_notification(
         }
         Ok(())
     };
-    send_after_checkpoint_write(checkpoint_write, notification, Arc::clone(rpc)).await
+    send_after_checkpoint_write(
+        checkpoint_write,
+        notification,
+        Arc::clone(rpc),
+        session_id,
+        output,
+    )
+    .await
 }
 
 async fn send_after_checkpoint_write(
     checkpoint_write: impl std::future::Future<Output = Result<(), String>>,
     notification: Option<String>,
     rpc: Arc<RpcOutbound>,
+    session_id: &str,
+    output: Option<&super::session_emission::SessionOutput>,
 ) -> Result<(), String> {
     checkpoint_write.await?;
     if let Some(notification) = notification {
-        let _ = rpc.send_raw(notification).await;
+        if let Some(output) = output {
+            let _ = output
+                .authority
+                .send(&rpc, session_id, output.generation, true, notification)
+                .await;
+        } else {
+            let _ = rpc.send_raw(notification).await;
+        }
     }
     Ok(())
 }
@@ -12443,6 +12633,7 @@ fn notification_for_turn_event(session_id: &str, event: &TurnEvent) -> Option<St
             arguments_summary,
             timeout_secs,
         } => SessionUpdateEvent::ApprovalRequest {
+            client_turn_generation: super::approval_channel::current_turn_generation(),
             session_id: session_id.to_string(),
             request_id: request_id.clone(),
             tool_name: tool_name.clone(),
@@ -15371,6 +15562,107 @@ mod tests {
             let created = result.expect("an unchanged principal is still admitted");
             assert_eq!(created["session_id"], json!("s-parked"));
         });
+    }
+
+    #[tokio::test]
+    async fn session_output_rechecks_after_writer_wait_and_refuses_a_replaced_incarnation() {
+        for replace in [false, true] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config = session_cwd_config(&tmp, 4242, None);
+            let workspace = config.agent_workspace_dir("test-agent");
+            let (ctx, backend, _acp_store) = persistence_enforcement_ctx(config);
+            let (provider, _started, _release) = gated_provider();
+            let sid = "writer-held-session";
+            install_state_test_session_owned_at(
+                &ctx.sessions,
+                &backend,
+                sid,
+                provider,
+                None,
+                Some("user:alice"),
+                &workspace,
+            )
+            .await;
+            let (alice, _wire) = roster_peer(&ctx, 4242).await;
+            let generation = ctx.sessions.get_generation(sid).await;
+            let authority = alice.session_emission_authority();
+            let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+            let rpc = RpcOutbound::new(tx);
+            assert!(rpc.send_raw("held".into()).await);
+            let send = authority.send(&rpc, sid, generation, true, "private-frame".into());
+            tokio::pin!(send);
+            tokio::select! {
+                biased;
+                _ = &mut send => panic!("writer capacity must be awaited"),
+                () = std::future::ready(()) => {}
+            }
+            if replace {
+                let (provider, _started, _release) = gated_provider();
+                install_state_test_session_owned_at(
+                    &ctx.sessions,
+                    &backend,
+                    sid,
+                    provider,
+                    None,
+                    Some("user:alice"),
+                    &workspace,
+                )
+                .await;
+                assert_ne!(ctx.sessions.get_generation(sid).await, generation);
+            } else {
+                narrow_alice_to_no_agents(&ctx);
+            }
+            assert_eq!(rx.recv().await.as_deref(), Some("held"));
+            assert!(
+                !send.await,
+                "authority/incarnation must be checked after capacity arrives"
+            );
+            assert!(
+                rx.try_recv().is_err(),
+                "a refused frame must not occupy the returned room"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn session_prompt_rechecks_agent_entitlement_after_the_final_agent_wait() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = session_cwd_config(&tmp, 4242, None);
+        let workspace = config.agent_workspace_dir("test-agent");
+        let (ctx, backend, _acp_store) = persistence_enforcement_ctx(config);
+        let (provider, mut started, _release) = gated_provider();
+        let sid = "final-agent-entitlement";
+        install_state_test_session_owned_at(
+            &ctx.sessions,
+            &backend,
+            sid,
+            provider,
+            None,
+            Some("user:alice"),
+            &workspace,
+        )
+        .await;
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+        let agent = ctx.sessions.get_agent(sid).await.unwrap();
+        let held = agent.lock().await;
+        send_prompt(&mut alice, 7, sid, 3).await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while ctx.sessions.session_queue.queue_depth(sid).await == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the prompt holds admission while waiting for the Agent");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        narrow_alice_to_no_agents(&ctx);
+        drop(held);
+        let (response, notifications) = response_and_notifications(&mut rx, 7).await;
+        assert_eq!(response["error"]["code"], json!(FORBIDDEN), "{response}");
+        assert_turn_refused(&notifications, sid, 3);
+        assert!(
+            started.try_recv().is_err(),
+            "the narrowed principal must never reach the provider"
+        );
     }
 
     #[tokio::test]
@@ -26051,7 +26343,7 @@ mod tests {
             *context_token_budget = Some(max_ctx);
             *model_context_window = Some(model_ctx);
         }
-        persist_checkpoint_event_before_notification(None, None, "s1", &event, &rpc)
+        persist_checkpoint_event_before_notification(None, None, "s1", &event, &rpc, None)
             .await
             .unwrap();
         let json = rx.try_recv().expect("usage must reach the RPC writer");
@@ -29592,6 +29884,8 @@ mod tests {
             checkpoint_write,
             Some(r#"{"type":"ready"}"#.into()),
             Arc::clone(&rpc),
+            "test-session",
+            None
         ));
         started_rx.await.unwrap();
         assert!(
@@ -29647,6 +29941,7 @@ mod tests {
                 session_id,
                 event,
                 &rpc,
+                None,
             )
             .await
             .unwrap();
@@ -29765,6 +30060,7 @@ mod tests {
                 delta: "must-not-emit".into(),
             },
             &rpc,
+            None,
         )
         .await
         .expect_err("a stale turn ID must fail the checkpoint append");
@@ -29824,6 +30120,7 @@ mod tests {
                 sid,
                 &event,
                 &rpc,
+                None,
             )
             .await
             .expect_err("stale identity must reject the write");
@@ -29838,6 +30135,7 @@ mod tests {
                 sid,
                 &event,
                 &rpc,
+                None,
             )
             .await
             .unwrap();
@@ -29860,6 +30158,7 @@ mod tests {
                 delta: "later progress".into(),
             },
             &rpc,
+            None,
         )
         .await
         .unwrap();

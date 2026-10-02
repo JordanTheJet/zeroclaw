@@ -3012,6 +3012,15 @@
       },
       "SessionApproveParams": {
         "properties": {
+          "client_turn_generation": {
+            "description": "For `unreachable`, identifies the presenting turn. The core drops\nonly that connection/turn's responder and supplies runtime provenance.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "decision": {
             "type": "string"
           },
@@ -3051,6 +3060,24 @@
           "session_id",
           "request_id",
           "acknowledged"
+        ],
+        "type": "object"
+      },
+      "SessionCancelParams": {
+        "description": "Cancellation keeps the legacy raw id. An exact RPC chat row key\nselects its own namespace and takes precedence over the legacy id.",
+        "properties": {
+          "session_id": {
+            "type": "string"
+          },
+          "session_key": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "session_id"
         ],
         "type": "object"
       },
@@ -3593,6 +3620,15 @@
             "properties": {
               "arguments_summary": {
                 "type": "string"
+              },
+              "client_turn_generation": {
+                "description": "The prompt correlation for the turn that owns this approval.",
+                "format": "uint64",
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
               },
               "request_id": {
                 "type": "string"
@@ -4577,6 +4613,16 @@
           "schema": {
             "type": "string"
           }
+        },
+        {
+          "name": "session_key",
+          "required": false,
+          "schema": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
         }
       ],
       "result": {
@@ -4593,7 +4639,7 @@
       },
       "x-zeroclaw-params": {
         "shape": "typed",
-        "type": "SessionIdParams"
+        "type": "SessionCancelParams"
       }
     },
     {
@@ -4837,6 +4883,19 @@
           "required": true,
           "schema": {
             "type": "string"
+          }
+        },
+        {
+          "name": "client_turn_generation",
+          "required": false,
+          "schema": {
+            "description": "For `unreachable`, identifies the presenting turn. The core drops\nonly that connection/turn's responder and supplies runtime provenance.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
           }
         },
         {

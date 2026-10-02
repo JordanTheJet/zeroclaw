@@ -300,6 +300,8 @@ pub enum CoreError {
     /// The core reports another version than this gateway's, and version
     /// skew is refused. Nothing but the handshake was sent to it.
     VersionMismatch { core: String, gateway: String },
+    /// The core lacks a semantic extension this route requires.
+    MissingFeature(&'static str),
     /// Any other refusal from the core, mapped by its code.
     Rpc(JsonRpcError),
 }
@@ -327,6 +329,7 @@ impl CoreError {
             Self::VersionMismatch { .. } => {
                 (StatusCode::SERVICE_UNAVAILABLE, "core_version_mismatch")
             }
+            Self::MissingFeature(_) => (StatusCode::SERVICE_UNAVAILABLE, "core_capability_missing"),
             Self::Rpc(error) => rpc_status(error.code),
         }
     }
@@ -361,6 +364,9 @@ impl IntoResponse for CoreError {
             Self::Busy => "every core connection is in use; retry shortly".to_owned(),
             Self::Timeout => "the core did not answer in time".to_owned(),
             Self::VersionMismatch { core, gateway } => version_mismatch_message(&core, &gateway),
+            Self::MissingFeature(feature) => {
+                format!("the core lacks required semantic feature {feature}")
+            }
             Self::Rpc(error) => error.message,
         };
         (

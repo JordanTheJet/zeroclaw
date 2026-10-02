@@ -683,6 +683,9 @@ fn explain(error: CoreError) -> Response {
             versions = Some(json!({ "core": core, "gateway": gateway }));
             message
         }
+        CoreError::MissingFeature(feature) => {
+            format!("the core lacks required semantic feature {feature}")
+        }
         CoreError::Rpc(error) => error.message,
     };
     let hint = match code {
@@ -945,12 +948,20 @@ async fn ws_chat(
 }
 
 /// `POST /api/sessions/{id}/abort`: cancel the session's running turn.
+#[derive(Default, serde::Deserialize)]
+struct AbortQuery {
+    #[serde(default)]
+    address: crate::chat_core::AbortAddress,
+}
+
 async fn api_session_abort(
     axum::extract::Path(id): axum::extract::Path<String>,
+    Query(query): Query<AbortQuery>,
     access: Result<CoreAccess, CoreError>,
+    _body: axum::body::Bytes,
 ) -> Response {
     served(access, |call| async move {
-        crate::chat_core::abort_through_core(&call, &id).await
+        crate::chat_core::abort_through_core(&call, &id, query.address).await
     })
     .await
 }

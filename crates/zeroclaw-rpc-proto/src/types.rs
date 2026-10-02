@@ -217,6 +217,16 @@ rpc_type! {
 }
 
 rpc_type! {
+    /// Cancellation keeps the legacy raw id. An exact RPC chat row key
+    /// selects its own namespace and takes precedence over the legacy id.
+    pub struct SessionCancelParams {
+        pub session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub session_key: Option<String>,
+    }
+}
+
+rpc_type! {
     #[derive(PartialEq, Eq)]
     pub enum ChatMode {
         Chat,
@@ -1353,6 +1363,10 @@ rpc_type! {
         pub session_id: String,
         pub request_id: String,
         pub decision: String,
+        /// For `unreachable`, identifies the presenting turn. The core drops
+        /// only that connection/turn's responder and supplies runtime provenance.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub client_turn_generation: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub replacement: Option<String>,
     }
@@ -1565,6 +1579,9 @@ pub enum SessionUpdateEvent {
     },
     ApprovalRequest {
         session_id: String,
+        /// The prompt correlation for the turn that owns this approval.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_turn_generation: Option<u64>,
         request_id: String,
         tool_name: String,
         arguments_summary: String,
@@ -1906,6 +1923,7 @@ mod tests {
         assert_eq!(v["text"], json!("t"));
 
         let evt = SessionUpdateEvent::ApprovalRequest {
+            client_turn_generation: None,
             session_id: "s".into(),
             request_id: "r".into(),
             tool_name: "shell".into(),

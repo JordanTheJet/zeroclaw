@@ -2363,6 +2363,19 @@ pub async fn handle_api_session_state(
 
 // ── Session abort endpoint ────────────────────────────────────────
 
+/// Consume the body through the router's canonical size/deadline layers
+/// before cancellation. An ignored chunked body would never poll its limit.
+pub(crate) async fn handle_api_session_abort_request(
+    state: State<AppState>,
+    headers: HeaderMap,
+    id: Path<String>,
+    _body: axum::body::Bytes,
+) -> axum::response::Response {
+    handle_api_session_abort(state, headers, id)
+        .await
+        .into_response()
+}
+
 pub async fn handle_api_session_abort(
     State(state): State<AppState>,
     headers: HeaderMap,

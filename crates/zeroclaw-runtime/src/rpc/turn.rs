@@ -75,6 +75,8 @@ impl TurnError {
 #[derive(Clone, Default)]
 pub struct TurnAttribution {
     pub session_key: Option<String>,
+    pub client_turn_generation: Option<u64>,
+    pub live_generation: Option<u64>,
     pub agent_alias: String,
     pub model_provider: String,
     pub model: String,
@@ -94,6 +96,59 @@ where
     F: Fn(TurnEvent) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = ()> + Send,
 {
+    spawn_turn(
+        async move { agent.lock_owned().await },
+        prompt,
+        cancel,
+        attribution,
+        cost_context,
+        connection_activity,
+        on_event,
+    )
+    .await
+}
+
+/// Enqueue an already-authorized Agent guard synchronously. The caller keeps
+/// its canonical authority lease through this call; there is no later Agent
+/// acquisition between that admission and execution.
+pub(crate) fn execute_admitted_turn<F, Fut>(
+    agent: tokio::sync::OwnedMutexGuard<Agent>,
+    prompt: String,
+    cancel: CancellationToken,
+    attribution: TurnAttribution,
+    cost_context: Option<ToolLoopCostTrackingContext>,
+    connection_activity: Option<crate::rpc::ConnectionActivity>,
+    on_event: F,
+) -> impl std::future::Future<Output = Result<TurnOutcome, TurnError>>
+where
+    F: Fn(TurnEvent) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send,
+{
+    spawn_turn(
+        std::future::ready(agent),
+        prompt,
+        cancel,
+        attribution,
+        cost_context,
+        connection_activity,
+        on_event,
+    )
+}
+
+fn spawn_turn<G, F, Fut>(
+    agent: G,
+    prompt: String,
+    cancel: CancellationToken,
+    attribution: TurnAttribution,
+    cost_context: Option<ToolLoopCostTrackingContext>,
+    connection_activity: Option<crate::rpc::ConnectionActivity>,
+    on_event: F,
+) -> impl std::future::Future<Output = Result<TurnOutcome, TurnError>>
+where
+    G: std::future::Future<Output = tokio::sync::OwnedMutexGuard<Agent>> + Send + 'static,
+    F: Fn(TurnEvent) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send,
+{
     let (event_tx, mut event_rx) = mpsc::channel::<TurnEvent>(64);
     let cancel_clone = cancel.clone();
     let session_key = attribution.session_key.clone();
@@ -104,84 +159,92 @@ where
         // only schedules that drop; provider and tool cleanup still runs after
         // it, and the reload drain must not read zero while it does.
         let _connection_activity = connection_activity;
-        let mut guard = agent.lock().await;
+        let mut guard = agent.await;
         let sk = attribution.session_key.clone();
-        crate::agent::loop_::scope_session_key(attribution.session_key, async move {
-            use ::zeroclaw_log::Instrument as _;
-            let span = ::zeroclaw_log::info_span!(
-                target: "zeroclaw_log_internal_scope",
-                "zeroclaw_scope",
-                session_key = %sk.as_deref().unwrap_or(""),
-                agent_alias = %attribution.agent_alias,
-                model_provider = %attribution.model_provider,
-                model = %attribution.model,
-                channel = %attribution.channel,
-            );
-            TOOL_LOOP_COST_TRACKING_CONTEXT
-                .scope(
-                    cost_context,
-                    guard
-                        .turn_streamed_with_steering_state(
-                            &prompt,
-                            event_tx,
-                            Some(cancel_clone),
-                            None,
-                        )
-                        .instrument(span),
-                )
-                .await
-        })
+        super::approval_channel::scope_turn_generation(
+            attribution.client_turn_generation,
+            attribution.live_generation,
+            crate::agent::loop_::scope_session_key(attribution.session_key, async move {
+                use ::zeroclaw_log::Instrument as _;
+                let span = ::zeroclaw_log::info_span!(
+                    target: "zeroclaw_log_internal_scope",
+                    "zeroclaw_scope",
+                    session_key = %sk.as_deref().unwrap_or(""),
+                    agent_alias = %attribution.agent_alias,
+                    model_provider = %attribution.model_provider,
+                    model = %attribution.model,
+                    channel = %attribution.channel,
+                );
+                TOOL_LOOP_COST_TRACKING_CONTEXT
+                    .scope(
+                        cost_context,
+                        guard
+                            .turn_streamed_with_steering_state(
+                                &prompt,
+                                event_tx,
+                                Some(cancel_clone),
+                                None,
+                            )
+                            .instrument(span),
+                    )
+                    .await
+            }),
+        )
         .await
     });
 
     let mut turn_handle_guard = TurnHandleGuard(Some(turn_handle));
 
-    let mut accumulated_text = String::new();
+    async move {
+        let mut accumulated_text = String::new();
 
-    let drain =
-        drain_until_done_or_cancelled(&mut event_rx, &cancel, &mut accumulated_text, &on_event)
-            .await;
-    let _ = session_key; // consumed above
+        let drain =
+            drain_until_done_or_cancelled(&mut event_rx, &cancel, &mut accumulated_text, &on_event)
+                .await;
+        let _ = session_key; // consumed above
 
-    match drain {
-        DrainOutcome::Completed => {
-            let joined = {
-                let handle = turn_handle_guard.handle()?;
-                handle
-                    .await
-                    .map_err(|e| TurnError::Panicked(format!("{e}")))?
-            };
-            outcome_from_task_result(joined, accumulated_text)
-        }
-        DrainOutcome::ExplicitCancel => {
-            let graced = {
-                let handle = turn_handle_guard.handle()?;
-                join_with_draining_grace(
-                    handle,
-                    &mut event_rx,
-                    &mut accumulated_text,
-                    &on_event,
-                    CANCEL_GRACE,
-                )
-                .await
-            };
-            match graced {
-                Some(joined) => outcome_from_task_result(
-                    joined.map_err(|e| TurnError::Panicked(format!("cancelled turn join: {e}")))?,
-                    accumulated_text,
-                ),
-                None => {
+        match drain {
+            DrainOutcome::Completed => {
+                let joined = {
                     let handle = turn_handle_guard.handle()?;
-                    handle.abort();
-                    // Joined through the guard rather than a moved-out handle:
-                    // if this future is dropped while the abort is still being
-                    // processed, the guard aborts what it still owns instead of
-                    // leaving a detached task behind.
-                    let _ = handle.await;
-                    Ok(TurnOutcome::Cancelled {
-                        partial_text: accumulated_text,
-                        messages: Vec::new(),
-                    })
+                    handle
+                        .await
+                        .map_err(|e| TurnError::Panicked(format!("{e}")))?
+                };
+                outcome_from_task_result(joined, accumulated_text)
+            }
+            DrainOutcome::ExplicitCancel => {
+                let graced = {
+                    let handle = turn_handle_guard.handle()?;
+                    join_with_draining_grace(
+                        handle,
+                        &mut event_rx,
+                        &mut accumulated_text,
+                        &on_event,
+                        CANCEL_GRACE,
+                    )
+                    .await
+                };
+                match graced {
+                    Some(joined) => outcome_from_task_result(
+                        joined.map_err(|e| {
+                            TurnError::Panicked(format!("cancelled turn join: {e}"))
+                        })?,
+                        accumulated_text,
+                    ),
+                    None => {
+                        let handle = turn_handle_guard.handle()?;
+                        handle.abort();
+                        // Joined through the guard rather than a moved-out handle:
+                        // if this future is dropped while the abort is still being
+                        // processed, the guard aborts what it still owns instead of
+                        // leaving a detached task behind.
+                        let _ = handle.await;
+                        Ok(TurnOutcome::Cancelled {
+                            partial_text: accumulated_text,
+                            messages: Vec::new(),
+                        })
+                    }
                 }
             }
         }
@@ -1067,6 +1130,8 @@ mod tests {
             "hello".to_string(),
             CancellationToken::new(),
             TurnAttribution {
+                live_generation: None,
+                client_turn_generation: None,
                 session_key: Some("s1".into()),
                 agent_alias: "rpc-agent".into(),
                 model_provider: "mock-provider".into(),
@@ -1221,6 +1286,8 @@ mod tests {
             "hello".to_string(),
             CancellationToken::new(),
             TurnAttribution {
+                live_generation: None,
+                client_turn_generation: None,
                 session_key: Some("drain-test".into()),
                 agent_alias: "rpc-agent".into(),
                 model_provider: "openai.default".into(),
@@ -1394,6 +1461,8 @@ mod tests {
                 "matrix".to_string(),
                 CancellationToken::new(),
                 TurnAttribution {
+                    live_generation: None,
+                    client_turn_generation: None,
                     session_key: Some("drain-matrix-test".into()),
                     agent_alias: "rpc-matrix".into(),
                     model_provider: cell.provider_ref.into(),
@@ -1658,6 +1727,8 @@ mod tests {
             "w1".to_string(),
             CancellationToken::new(),
             TurnAttribution {
+                live_generation: None,
+                client_turn_generation: None,
                 session_key: Some("w1-test".into()),
                 agent_alias: "rpc-w1".into(),
                 model_provider: "openai.default".into(),
@@ -1935,6 +2006,8 @@ mod tests {
                 "hold".to_string(),
                 turn_cancel,
                 TurnAttribution {
+                    live_generation: None,
+                    client_turn_generation: None,
                     session_key: Some("forced-drop".into()),
                     agent_alias: "rpc-agent".into(),
                     model_provider: "held-provider".into(),

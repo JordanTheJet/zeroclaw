@@ -11,6 +11,7 @@ pub mod inproc;
 pub mod local;
 pub mod locales;
 pub mod session;
+pub(crate) mod session_emission;
 pub mod subscription;
 pub mod transport;
 pub mod tui_identity;

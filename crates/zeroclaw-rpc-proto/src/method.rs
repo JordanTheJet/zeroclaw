@@ -312,7 +312,7 @@ impl Method {
                 Typed("SessionConfigureParams"),
                 Typed("SessionConfigureResult"),
             ),
-            M::SessionCancel => (Typed("SessionIdParams"), Typed("SessionCancelResult")),
+            M::SessionCancel => (Typed("SessionCancelParams"), Typed("SessionCancelResult")),
             M::SessionGitBranch => (Typed("SessionIdParams"), Typed("SessionGitBranchResult")),
             M::SessionList => (Typed("SessionListParams"), Typed("SessionListResult")),
             M::SessionListAcp => (None, Typed("SessionListResult")),

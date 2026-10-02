@@ -96,7 +96,18 @@ pub mod feature {
 
     /// Every extension name this protocol defines. A core advertises only
     /// the ones it implements, from its own list beside the handlers.
-    pub const KNOWN: &[&str] = &[TUI_CLIENT_KIND];
+    pub const SESSION_CANCEL_CHAT_KEY: &str = "session.cancel_chat_key";
+    pub const SESSION_NEW_VALIDATES_AGENT: &str = "session.new_validates_agent";
+    pub const SESSION_TURN_ERRORS: &str = "session.turn_error_fields";
+    pub const SESSION_APPROVAL_UNREACHABLE: &str = "session.approval_unreachable";
+
+    pub const KNOWN: &[&str] = &[
+        TUI_CLIENT_KIND,
+        SESSION_CANCEL_CHAT_KEY,
+        SESSION_NEW_VALIDATES_AGENT,
+        SESSION_TURN_ERRORS,
+        SESSION_APPROVAL_UNREACHABLE,
+    ];
 
     #[cfg(test)]
     mod tests {

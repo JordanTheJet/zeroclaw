@@ -2212,7 +2212,7 @@ export function deleteSession(
  */
 export function abortSession(id: string): Promise<{ status: string }> {
   return apiFetch<{ status: string }>(
-    `/api/sessions/${encodeURIComponent(id)}/abort`,
+    `/api/sessions/${encodeURIComponent(id)}/abort?address=raw`,
     { method: "POST" },
   );
 }
