@@ -682,7 +682,8 @@ rpc_type! {
     /// One JSON Patch operation of `config/set-many`'s `ops`. `path` is a
     /// JSON Pointer (`/agents/main/model_provider`) or a dotted property path.
     /// `add`, `replace` and `test` need `value`; `comment` needs `comment`
-    /// and writes only the comment above the property.
+    /// and writes only the comment above the property. `test` also needs
+    /// Config read; every operation obeys the config write-path selectors.
     pub struct ConfigPatchOp {
         pub op: String,
         pub path: String,

@@ -8703,6 +8703,16 @@ impl RpcDispatcher {
         let grants = current_authority_under(authority, auth, method).map_err(refuse)?;
         for op in ops {
             let path = crate::config_ops::patch::json_pointer_to_dotted(&op.path);
+            if op.op == "test"
+                && !grants.permits(
+                    zeroclaw_api::grants::Resource::Config,
+                    zeroclaw_api::grants::Verb::Read,
+                )
+            {
+                return Err(refuse(AuthDenied::forbidden(format!(
+                    "Principal lacks the config read grant needed to compare `{path}`"
+                ))));
+            }
             if !grants.may_write_config(&path) {
                 return Err(refuse(AuthDenied::forbidden(format!(
                     "Principal's config path selectors do not cover `{path}`"
@@ -40067,6 +40077,86 @@ mod tests {
                 .expect_err("opt-in without actual pairing must be refused");
             assert_eq!(denied.code, FORBIDDEN);
             assert_eq!(denied.message, REMOTE_ADMIN_RELOAD_NO_PAIRING);
+        });
+    }
+
+    #[test]
+    fn config_patch_comparisons_require_read_without_blocking_writes() {
+        use zeroclaw_api::grants::Verb;
+        run_on_a_large_stack(|| async move {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config =
+                config_write_roster_config_with(&tmp, 4242, &["memory.*"], &[Verb::Update]);
+            config.save().await.unwrap();
+            let ctx = enforcement_ctx(config);
+            let (alice, _rx) = roster_peer(&ctx, 4242).await;
+            alice
+                .handle_config_set_many(&json!({"ops": [{
+                    "op": "replace", "path": "memory.backend", "value": "none"
+                }]}))
+                .await
+                .expect("an update-only principal can still write its path");
+            let before = std::fs::read_to_string(&ctx.config.read().config_path).unwrap();
+            let error = alice
+                .handle_config_set_many(&json!({"ops": [{
+                    "op": "test", "path": "memory.backend", "value": "none"
+                }]}))
+                .await
+                .expect_err("comparisons must not reveal values without Config read");
+            assert_eq!(error.code, FORBIDDEN, "{error:?}");
+            assert!(error.message.contains("config read"));
+            assert_eq!(
+                std::fs::read_to_string(&ctx.config.read().config_path).unwrap(),
+                before
+            );
+        });
+    }
+
+    #[test]
+    fn config_patch_read_revoked_after_preparation_is_refused() {
+        use zeroclaw_api::grants::{Resource, Verb};
+        run_on_a_large_stack(|| async move {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config = config_write_roster_config(&tmp, 4242, &["memory.*"]);
+            let value = config.get_prop("memory.backend").unwrap();
+            config.save().await.unwrap();
+            let before = std::fs::read_to_string(&config.config_path).unwrap();
+            let pause = Arc::new(crate::rpc::context::ConfigCommitPause::default());
+            let mut inner = Arc::try_unwrap(enforcement_ctx(config))
+                .unwrap_or_else(|_| panic!("fresh context is uniquely owned"));
+            inner.config_commit_pause = Some(Arc::clone(&pause));
+            let ctx = Arc::new(inner);
+            let (alice, _rx) = roster_peer(&ctx, 4242).await;
+            let task = zeroclaw_spawn::spawn!(async move {
+                alice
+                    .handle_config_set_many(&json!({"ops": [{
+                        "op": "test", "path": "memory.backend", "value": value
+                    }]}))
+                    .await
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(10), pause.arrived.notified())
+                .await
+                .expect("comparison reaches preparation boundary");
+            let mut narrowed = ctx.config.read().clone();
+            narrowed
+                .permission_profiles
+                .get_mut("config-writer")
+                .unwrap()
+                .grants
+                .get_mut(&Resource::Config)
+                .unwrap()
+                .retain(|verb| *verb != Verb::Read);
+            ctx.auth.refresh_from_config(&narrowed).unwrap();
+            pause.release.notify_one();
+            let error = task
+                .await
+                .unwrap()
+                .expect_err("revoked read must refuse the comparison result");
+            assert_eq!(error.code, FORBIDDEN, "{error:?}");
+            assert_eq!(
+                std::fs::read_to_string(&ctx.config.read().config_path).unwrap(),
+                before
+            );
         });
     }
 
