@@ -325,7 +325,21 @@ fn principal_tool_ceiling(grants: &zeroclaw_api::grants::ResolvedGrants) -> Opti
 ///
 /// - `tui.client_kind`: `tui/list` reports the kind a connection declared
 ///   (`tui_list_labels_only_a_declared_gateway_connection`).
-pub const ADVERTISED_FEATURES: &[&str] = &[zeroclaw_rpc_proto::feature::TUI_CLIENT_KIND];
+/// - `doctor.static_only`: static checks exclude provider probes
+///   (`doctor_run_static_only_runs_only_the_static_checks`).
+/// - `logs.field_eq`: attribution equality filters are applied
+///   (`logs_query_filters_by_attribution_fields`).
+/// - `logs.report_disabled`: requested disabled persistence returns a page
+///   (`logs_query_reports_disabled_persistence_only_when_asked`).
+/// - `logs.query_metadata`: dashboard persistence/start/attribution metadata
+///   is returned (the gateway's real-core logs parity test).
+pub const ADVERTISED_FEATURES: &[&str] = &[
+    zeroclaw_rpc_proto::feature::TUI_CLIENT_KIND,
+    zeroclaw_rpc_proto::feature::DOCTOR_STATIC_ONLY,
+    zeroclaw_rpc_proto::feature::LOGS_FIELD_EQ,
+    zeroclaw_rpc_proto::feature::LOGS_REPORT_DISABLED,
+    zeroclaw_rpc_proto::feature::LOGS_QUERY_METADATA,
+];
 
 fn declared_client_kind(capabilities: Option<&Value>) -> Option<String> {
     capabilities?

@@ -213,6 +213,11 @@ pub(crate) async fn api_logs_through_core(
         field_eq,
         report_disabled: true,
     };
+    crate::api::require_core_feature(core, zeroclaw_rpc_proto::feature::LOGS_REPORT_DISABLED)?;
+    crate::api::require_core_feature(core, zeroclaw_rpc_proto::feature::LOGS_QUERY_METADATA)?;
+    if !query.field_eq.is_empty() {
+        crate::api::require_core_feature(core, zeroclaw_rpc_proto::feature::LOGS_FIELD_EQ)?;
+    }
     let params = serde_json::to_value(&query).map_err(|error| {
         CoreError::Rpc(JsonRpcError {
             code: INTERNAL_ERROR,
@@ -226,8 +231,8 @@ pub(crate) async fn api_logs_through_core(
     let Some(daemon_started_at) = page.daemon_started_at else {
         return Err(CoreError::Rpc(JsonRpcError {
             code: METHOD_NOT_FOUND,
-            message: "the core does not filter its log by attribution; run a core of this \
-                      gateway's version"
+            message: "the core did not return dashboard log metadata; install a core that \
+                      supports this route"
                 .into(),
             data: None,
         }));

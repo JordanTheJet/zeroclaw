@@ -94,9 +94,30 @@ pub mod feature {
     /// client declared on `initialize`.
     pub const TUI_CLIENT_KIND: &str = "tui.client_kind";
 
+    /// `doctor/run` honours `static_only: true` without running live
+    /// provider probes.
+    pub const DOCTOR_STATIC_ONLY: &str = "doctor.static_only";
+
+    /// `logs/query` applies the `field_eq` attribution equality filters.
+    pub const LOGS_FIELD_EQ: &str = "logs.field_eq";
+
+    /// `logs/query` honours `report_disabled: true` by returning an empty
+    /// page with `persistence_enabled: false` when persistence is disabled.
+    pub const LOGS_REPORT_DISABLED: &str = "logs.report_disabled";
+
+    /// `logs/query` reports `daemon_started_at`, `attribution_keys` and
+    /// `persistence_enabled` for the dashboard page.
+    pub const LOGS_QUERY_METADATA: &str = "logs.query_metadata";
+
     /// Every extension name this protocol defines. A core advertises only
     /// the ones it implements, from its own list beside the handlers.
-    pub const KNOWN: &[&str] = &[TUI_CLIENT_KIND];
+    pub const KNOWN: &[&str] = &[
+        TUI_CLIENT_KIND,
+        DOCTOR_STATIC_ONLY,
+        LOGS_FIELD_EQ,
+        LOGS_REPORT_DISABLED,
+        LOGS_QUERY_METADATA,
+    ];
 
     #[cfg(test)]
     mod tests {

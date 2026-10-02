@@ -1067,10 +1067,28 @@ pub async fn handle_api_doctor(
     .into_response()
 }
 
+/// Require a method extension from the serving connection's canonical
+/// initialize result before relying on added request or response fields.
+/// Features describe immutable implementation support;
+/// the core still checks the caller's authority for every method.
+pub(crate) fn require_core_feature(core: &CoreCall, feature: &str) -> Result<(), CoreError> {
+    if core.core_features().iter().any(|name| name == feature) {
+        return Ok(());
+    }
+    Err(CoreError::Rpc(JsonRpcError {
+        code: METHOD_NOT_FOUND,
+        message: format!(
+            "the core does not advertise {feature}; install a core that supports this route"
+        ),
+        data: None,
+    }))
+}
+
 /// `GET`/`POST /api/doctor` through the core, the body every router serves
 /// for it: the core's static checks, without the live provider probes the
 /// full `doctor/run` suite adds.
 pub(crate) async fn api_doctor_through_core(core: &CoreCall) -> Result<Response, CoreError> {
+    require_core_feature(core, zeroclaw_rpc_proto::feature::DOCTOR_STATIC_ONLY)?;
     let run = core
         .request(
             Method::DoctorRun,

@@ -854,3 +854,371 @@ async fn an_oversized_doctor_post_is_refused_by_both_routers() {
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 }
+
+#[cfg(unix)]
+mod same_version_compatibility {
+    use super::*;
+    use std::sync::Mutex;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use zeroclaw_rpc_client::{EndpointOwner, Method};
+
+    use zeroclaw_rpc_proto::feature::{
+        DOCTOR_STATIC_ONLY, LOGS_FIELD_EQ, LOGS_QUERY_METADATA, LOGS_REPORT_DISABLED,
+    };
+
+    #[derive(Clone)]
+    enum Advertisement {
+        Omitted,
+        TuiOnly,
+        Without(&'static str),
+    }
+
+    impl Advertisement {
+        fn lacks(&self, name: &str) -> bool {
+            match self {
+                Self::Omitted | Self::TuiOnly => name != "tui.client_kind",
+                Self::Without(missing) => *missing == name,
+            }
+        }
+    }
+
+    struct LegacyCore {
+        rpc: CoreRpc,
+        methods: Arc<Mutex<Vec<String>>>,
+        cancel: tokio_util::sync::CancellationToken,
+        listener: tokio::task::JoinHandle<()>,
+    }
+
+    impl Drop for LegacyCore {
+        fn drop(&mut self) {
+            self.cancel.cancel();
+            self.listener.abort();
+        }
+    }
+
+    impl LegacyCore {
+        fn serve(harness: &Harness, advertisement: Advertisement) -> Self {
+            let endpoint = harness._dir.path().join("legacy.sock");
+            let listener = tokio::net::UnixListener::bind(&endpoint).unwrap();
+            let connector = InprocConnector::new(harness.cancel.clone());
+            connector.bind(Arc::clone(&harness.ctx));
+            let methods = Arc::new(Mutex::new(Vec::new()));
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let listener = {
+                let methods = Arc::clone(&methods);
+                let cancel = cancel.clone();
+                zeroclaw_spawn::spawn!(async move {
+                    loop {
+                        let accepted = tokio::select! {
+                            biased;
+                            _ = cancel.cancelled() => break,
+                            accepted = listener.accept() => accepted,
+                        };
+                        let Ok((gateway, _)) = accepted else { break };
+                        let Some(core) = crate::core_rpc::Dial::dial(&connector).await else {
+                            break;
+                        };
+                        let (advertisement, methods, cancel) =
+                            (advertisement.clone(), Arc::clone(&methods), cancel.clone());
+                        zeroclaw_spawn::spawn!(async move {
+                            tokio::select! {
+                                _ = cancel.cancelled() => {},
+                                _ = relay(gateway, core, advertisement, methods) => {},
+                            }
+                        });
+                    }
+                })
+            };
+            Self {
+                rpc: CoreRpc::local(
+                    endpoint,
+                    EndpointOwner::SameAccount,
+                    crate::core_rpc::VersionSkew::Refuse,
+                ),
+                methods,
+                cancel,
+                listener,
+            }
+        }
+
+        async fn access(&self) -> CoreAccess {
+            let access = self.rpc.access(&Harness::headers()).await.unwrap();
+            let CoreAccess::Core(call) = &access else {
+                panic!("in-process fallback")
+            };
+            let status = call.request(Method::Status, json!({})).await.unwrap();
+            assert_eq!(status["server_version"], env!("CARGO_PKG_VERSION"));
+            access
+        }
+
+        fn calls(&self, method: &str) -> usize {
+            self.methods
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|m| m.as_str() == method)
+                .count()
+        }
+    }
+
+    async fn relay(
+        gateway: tokio::net::UnixStream,
+        core: tokio::io::DuplexStream,
+        advertisement: Advertisement,
+        methods: Arc<Mutex<Vec<String>>>,
+    ) {
+        let (gateway_reader, mut gateway_writer) = tokio::io::split(gateway);
+        let (core_reader, mut core_writer) = tokio::io::split(core);
+        let upstream_advertisement = advertisement.clone();
+        let upstream = async move {
+            let mut lines = BufReader::new(gateway_reader).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let mut frame: Value = serde_json::from_str(&line).unwrap();
+                let method = frame["method"].as_str().unwrap_or_default().to_owned();
+                methods.lock().unwrap().push(method.clone());
+                if let Some(params) = frame["params"].as_object_mut() {
+                    match method.as_str() {
+                        "doctor/run" if upstream_advertisement.lacks(DOCTOR_STATIC_ONLY) => {
+                            params.remove("static_only");
+                        }
+                        "status" => {
+                            params.remove("overview");
+                            params.remove("agent");
+                        }
+                        "logs/query" => {
+                            if upstream_advertisement.lacks(LOGS_FIELD_EQ) {
+                                params.remove("field_eq");
+                            }
+                            if upstream_advertisement.lacks(LOGS_REPORT_DISABLED) {
+                                params.remove("report_disabled");
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if core_writer
+                    .write_all(format!("{frame}\n").as_bytes())
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            let _ = core_writer.shutdown().await;
+        };
+        let downstream = async move {
+            let mut lines = BufReader::new(core_reader).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let mut frame: Value = serde_json::from_str(&line).unwrap();
+                if frame["result"]["server_version"].is_string()
+                    && frame["result"].get("tui_id").is_some()
+                    && let Some(result) = frame["result"].as_object_mut()
+                {
+                    // Keep the real package version, so the real local pool's
+                    // default version gate accepts this older implementation.
+                    match &advertisement {
+                        Advertisement::Omitted => {
+                            result.remove("features");
+                        }
+                        Advertisement::TuiOnly => {
+                            result.insert("features".into(), json!(["tui.client_kind"]));
+                        }
+                        Advertisement::Without(missing) => {
+                            if let Some(features) =
+                                result.get_mut("features").and_then(Value::as_array_mut)
+                            {
+                                features.retain(|name| name.as_str() != Some(missing));
+                            }
+                        }
+                    }
+                }
+                if frame["result"]["events"].is_array()
+                    && advertisement.lacks(LOGS_QUERY_METADATA)
+                    && let Some(result) = frame["result"].as_object_mut()
+                {
+                    result.remove("persistence_enabled");
+                    result.remove("daemon_started_at");
+                    result.remove("attribution_keys");
+                }
+                if gateway_writer
+                    .write_all(format!("{frame}\n").as_bytes())
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        };
+        tokio::join!(upstream, downstream);
+    }
+
+    #[tokio::test]
+    async fn an_older_core_cannot_turn_static_doctor_into_live_probes() {
+        let provider = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::any())
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(json!({"data":[{"id":"probe-model"}]})),
+            )
+            .mount(&provider)
+            .await;
+        let harness = Harness::configured(None, |config| {
+            let entry = config.providers.models.ensure("openai", "probe").unwrap();
+            entry.uri = Some(format!("{}/v1/responses", provider.uri()));
+            entry.wire_api = Some(zeroclaw_config::schema::WireApi::Responses);
+            entry.api_key = Some("probe-fixture".into());
+            entry.model = Some("probe-model".into());
+        });
+        let current = body_of(
+            crate::api::handle_api_doctor(
+                State(harness.state.clone()),
+                Harness::headers(),
+                harness.through_core().await,
+            )
+            .await
+            .into_response(),
+        )
+        .await;
+        assert_eq!(current.0, StatusCode::OK);
+        assert!(provider.received_requests().await.unwrap().is_empty());
+        let old = LegacyCore::serve(&harness, Advertisement::Omitted);
+        let answer = body_of(
+            crate::api::handle_api_doctor(
+                State(harness.state.clone()),
+                Harness::headers(),
+                old.access().await,
+            )
+            .await
+            .into_response(),
+        )
+        .await;
+        assert_eq!(
+            (answer.0, provider.received_requests().await.unwrap().len()),
+            (StatusCode::SERVICE_UNAVAILABLE, 0)
+        );
+        assert_eq!(answer.1["code"], "core_capability_missing");
+        assert_eq!(old.calls("doctor/run"), 0);
+        use tower::ServiceExt as _;
+        let router = crate::preview::router(
+            old.rpc.clone(),
+            harness._dir.path().join("legacy.sock"),
+            None,
+            tokio::sync::watch::channel(false).0,
+            std::time::Duration::from_secs(crate::REQUEST_TIMEOUT_SECS),
+        );
+        let posted = body_of(
+            router
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri("/api/doctor")
+                        .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(posted.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(posted.1["code"], "core_capability_missing");
+        assert_eq!(old.calls("doctor/run"), 0);
+        assert!(provider.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_older_core_with_persistence_off_reports_a_capability_gap() {
+        let _writer = zeroclaw_log::__private_test_writer_lock();
+        let dir = tempfile::tempdir().unwrap();
+        install_log_writer(dir.path(), "none");
+        let harness = Harness::new(None);
+        let old = LegacyCore::serve(&harness, Advertisement::TuiOnly);
+        let answer = body_of(
+            crate::api_logs::handle_api_logs(
+                State(harness.state.clone()),
+                Harness::headers(),
+                Query(HashMap::new()),
+                old.access().await,
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(answer.0, StatusCode::SERVICE_UNAVAILABLE, "{}", answer.1);
+        assert_eq!(answer.1["code"], "core_capability_missing");
+        assert_eq!(old.calls("logs/query"), 0);
+    }
+
+    #[tokio::test]
+    async fn each_requested_log_extension_is_proved_before_dispatch() {
+        let _writer = zeroclaw_log::__private_test_writer_lock();
+        let dir = tempfile::tempdir().unwrap();
+        install_log_writer(dir.path(), "none");
+        for missing in [LOGS_REPORT_DISABLED, LOGS_QUERY_METADATA, LOGS_FIELD_EQ] {
+            let harness = Harness::new(None);
+            let old = LegacyCore::serve(&harness, Advertisement::Without(missing));
+            let params = if missing == LOGS_FIELD_EQ {
+                HashMap::from([("agent_alias".into(), "alpha".into())])
+            } else {
+                HashMap::new()
+            };
+            let answer = body_of(
+                crate::api_logs::handle_api_logs(
+                    State(harness.state.clone()),
+                    Harness::headers(),
+                    Query(params),
+                    old.access().await,
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(
+                answer.0,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{missing}: {}",
+                answer.1
+            );
+            assert_eq!(answer.1["code"], "core_capability_missing");
+            assert_eq!(old.calls("logs/query"), 0, "{missing}");
+        }
+    }
+
+    #[tokio::test]
+    async fn unused_log_filter_support_is_not_required_for_an_empty_page() {
+        let _writer = zeroclaw_log::__private_test_writer_lock();
+        let dir = tempfile::tempdir().unwrap();
+        install_log_writer(dir.path(), "none");
+        let harness = Harness::new(None);
+        let old = LegacyCore::serve(&harness, Advertisement::Without(LOGS_FIELD_EQ));
+        let answer = body_of(
+            crate::api_logs::handle_api_logs(
+                State(harness.state.clone()),
+                Harness::headers(),
+                Query(HashMap::new()),
+                old.access().await,
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(answer.0, StatusCode::OK, "{}", answer.1);
+        assert_eq!(answer.1["persistence_enabled"], false);
+        assert_eq!(old.calls("logs/query"), 1);
+    }
+
+    #[tokio::test]
+    async fn invalid_log_queries_keep_their_status_without_extension_support() {
+        let harness = Harness::new(None);
+        let old = LegacyCore::serve(&harness, Advertisement::TuiOnly);
+        let answer = body_of(
+            crate::api_logs::handle_api_logs(
+                State(harness.state.clone()),
+                Harness::headers(),
+                Query(HashMap::from([("no_such".into(), "x".into())])),
+                old.access().await,
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(answer.0, StatusCode::BAD_REQUEST);
+        assert_eq!(old.calls("logs/query"), 0);
+    }
+}
