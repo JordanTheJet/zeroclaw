@@ -2557,6 +2557,21 @@ fn override_drift(headers: &HeaderMap) -> bool {
 // with the route's own response type; a refusal carries the route's config
 // error. The in-process gateway keeps its own write path.
 
+/// A unary HTTP property operation has no batch position. Preserve the
+/// core's reason and config error while projecting away that RPC context.
+fn unary_config_refusal(mut error: CoreError) -> CoreError {
+    if let CoreError::Rpc(rpc_error) = &mut error
+        && let Some(config_error) = rpc_error
+            .data
+            .as_mut()
+            .and_then(|data| data.get_mut("config_error"))
+            .and_then(serde_json::Value::as_object_mut)
+    {
+        config_error.remove("op_index");
+    }
+    error
+}
+
 /// The core's answer to a one-operation patch: that operation's result and
 /// the warnings.
 async fn patch_one_through_core(
@@ -2565,7 +2580,8 @@ async fn patch_one_through_core(
 ) -> Result<(ConfigPatchOpResult, Vec<ValidationWarning>), CoreError> {
     let patched: ConfigSetManyResult = core
         .call(Method::ConfigSetMany, serde_json::json!({ "ops": [op] }))
-        .await?;
+        .await
+        .map_err(unary_config_refusal)?;
     let result = patched.results.into_iter().next().ok_or_else(|| {
         CoreError::Rpc(zeroclaw_api::jsonrpc::JsonRpcError {
             code: zeroclaw_api::jsonrpc::error_codes::INTERNAL_ERROR,
