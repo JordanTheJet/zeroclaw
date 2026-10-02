@@ -950,8 +950,8 @@ async fn claude_code_hook(
 /// as a `Result` so a route checks the caller's credential first, as the
 /// in-process routes do behind their auth layer, and only then answers a
 /// malformed query or body exactly as their extractor rejects it.
-fn accepted<T>(extracted: Result<T, impl IntoResponse>) -> Result<T, Response> {
-    extracted.map_err(IntoResponse::into_response)
+fn accepted<T>(extracted: Result<T, impl IntoResponse>) -> Result<T, Box<Response>> {
+    extracted.map_err(|error| Box::new(error.into_response()))
 }
 
 /// `PATCH /api/config`
@@ -963,7 +963,7 @@ async fn api_config_patch(
     served(access, |call| async move {
         match accepted(body) {
             Ok(Json(body)) => crate::api_config::patch_through_core(&call, &headers, body).await,
-            Err(rejected) => Ok(rejected),
+            Err(rejected) => Ok(*rejected),
         }
     })
     .await
@@ -977,7 +977,7 @@ async fn api_config_prop_put(
     served(access, |call| async move {
         match accepted(body) {
             Ok(Json(body)) => crate::api_config::prop_put_through_core(&call, body).await,
-            Err(rejected) => Ok(rejected),
+            Err(rejected) => Ok(*rejected),
         }
     })
     .await
@@ -991,7 +991,7 @@ async fn api_config_prop_delete(
     served(access, |call| async move {
         match accepted(query) {
             Ok(Query(q)) => crate::api_config::prop_delete_through_core(&call, q).await,
-            Err(rejected) => Ok(rejected),
+            Err(rejected) => Ok(*rejected),
         }
     })
     .await
@@ -1005,7 +1005,7 @@ async fn api_config_map_key_create(
     served(access, |call| async move {
         match accepted(query) {
             Ok(Query(q)) => crate::api_config::map_key_create_through_core(&call, q).await,
-            Err(rejected) => Ok(rejected),
+            Err(rejected) => Ok(*rejected),
         }
     })
     .await
@@ -1019,7 +1019,7 @@ async fn api_config_rename_map_key(
     served(access, |call| async move {
         match accepted(body) {
             Ok(Json(body)) => crate::api_config::rename_map_key_through_core(&call, body).await,
-            Err(rejected) => Ok(rejected),
+            Err(rejected) => Ok(*rejected),
         }
     })
     .await
@@ -1041,7 +1041,7 @@ async fn api_quickstart_fields(
     served(access, |call| async move {
         match accepted(body) {
             Ok(Json(req)) => crate::api_quickstart::fields_through_core(&call, req).await,
-            Err(rejected) => Ok(rejected),
+            Err(rejected) => Ok(*rejected),
         }
     })
     .await
@@ -1057,7 +1057,7 @@ async fn api_quickstart_validate(
             Ok(Json(submission)) => {
                 crate::api_quickstart::validate_through_core(&call, submission).await
             }
-            Err(rejected) => Ok(rejected),
+            Err(rejected) => Ok(*rejected),
         }
     })
     .await
@@ -1073,7 +1073,7 @@ async fn api_quickstart_apply(
             Ok(Json(submission)) => {
                 crate::api_quickstart::apply_through_core(&call, submission).await
             }
-            Err(rejected) => Ok(rejected),
+            Err(rejected) => Ok(*rejected),
         }
     })
     .await
@@ -1087,7 +1087,7 @@ async fn api_quickstart_dismiss(
     served(access, |call| async move {
         match accepted(body) {
             Ok(Json(req)) => crate::api_quickstart::dismiss_through_core(&call, req).await,
-            Err(rejected) => Ok(rejected),
+            Err(rejected) => Ok(*rejected),
         }
     })
     .await
