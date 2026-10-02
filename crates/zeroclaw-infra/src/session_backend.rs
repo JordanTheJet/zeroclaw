@@ -127,6 +127,7 @@ pub trait SessionBackend: Send + Sync {
         _session_key: &str,
         _created_at: &str,
         _owner: Option<&str>,
+        _can_delete: &dyn Fn(&crate::session_backend::SessionMetadata) -> bool,
     ) -> std::io::Result<bool> {
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,

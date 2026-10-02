@@ -1861,31 +1861,23 @@ fn health_response(mut health: serde_json::Value) -> serde_json::Value {
 
 // ── Session API handlers ─────────────────────────────────────────
 //
-// Every session route stays in-process for now.
-// - `GET /api/sessions`: the core lists, for a non-local caller, only the
-//   sessions that caller's own connection opened, so the gateway's
-//   credential-bound connection would list none of the dashboard's sessions.
-//   The listing moves to the core once the core scopes such a connection's
-//   view by its principal. The rows already take the core's `SessionEntry`
-//   shape, so that move changes only where they come from. The standalone
-//   preview gateway serves it through the core already
-//   (`api_sessions_list_through_core`).
-// - The routes that address one session by id: the core takes the exact
-//   stored keys this gateway's resolver tries (`session_keys`), and the
-//   standalone preview gateway serves messages, state and delete that way
-//   (`api_session_*_through_core`). This gateway keeps its own bodies: its
-//   core connection sees only the sessions it opened itself, as for the
-//   listing, and its delete must settle its own turns first (below).
-// - A delete must first cancel and wait for the gateway's own chat turn,
-//   which only the gateway can do, while only the core can authorize the
-//   delete. Until those turns run in the core, the two cannot be made one
-//   authorized step.
+// Listing follows the caller's principal through the core. Per-session
+// routes here still use the gateway's local store: deletion must settle
+// gateway-owned turns, whose admission the core cannot observe. The
+// standalone gateway reads messages/state and deletes by exact stored key.
 
 /// GET /api/sessions — list gateway sessions
 pub async fn handle_api_sessions_list(
     State(state): State<AppState>,
     headers: HeaderMap,
+    access: CoreAccess,
 ) -> impl IntoResponse {
+    if let CoreAccess::Core(core) = access {
+        return match api_sessions_list_through_core(&core).await {
+            Ok(response) => response,
+            Err(error) => error.into_response(),
+        };
+    }
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }

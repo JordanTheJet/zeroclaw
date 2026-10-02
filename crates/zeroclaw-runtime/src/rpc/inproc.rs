@@ -562,7 +562,7 @@ mod tests {
         writer
             .write_all(
                 rpc_request(
-                    Method::SessionState,
+                    Method::SessionCancel,
                     &serde_json::json!({ "session_id": "not-owned-by-this-connection" }),
                     3,
                 )
@@ -574,7 +574,7 @@ mod tests {
         assert_eq!(
             frame["error"]["code"],
             zeroclaw_api::jsonrpc::error_codes::SESSION_NOT_OWNED,
-            "an authenticated duplex must use the non-local session owner gate"
+            "non-inspection methods retain the duplex session owner gate"
         );
 
         cancel.cancel();

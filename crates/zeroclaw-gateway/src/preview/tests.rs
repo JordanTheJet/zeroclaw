@@ -668,7 +668,7 @@ mod against_a_core {
                 .await
                 .into_response(),
             // Served from the gateway's own store even with a core attached.
-            "/api/sessions" => handle_api_sessions_list(state, headers)
+            "/api/sessions" => handle_api_sessions_list(state, headers, access)
                 .await
                 .into_response(),
             other => panic!("no in-process handler for {other}"),
@@ -892,6 +892,7 @@ mod against_a_core {
                 .append(key, &zeroclaw_providers::ChatMessage::user(*content))
                 .unwrap();
         }
+        backend.set_session_agent_alias(key, "main").unwrap();
     }
 
     fn transcript(body: &serde_json::Value) -> Vec<String> {
@@ -1104,7 +1105,7 @@ mod against_a_core {
                     "sub": user,
                     "aud": "zeroclaw",
                     "exp": now + 600,
-                    "groups": ["sessions"],
+                    "groups": [if *user == "no-read" { "no-sessions" } else { "sessions" }],
                 })))
                 .mount(&server)
                 .await;
@@ -1137,6 +1138,7 @@ mod against_a_core {
             config.permission_profiles.insert(
                 "session-user".into(),
                 PermissionProfileConfig {
+                    allowed_agents: vec!["*".into()],
                     // System:Read is what the core-link check asks for.
                     grants: HashMap::from([
                         (Resource::Sessions, vec![Verb::Read, Verb::Delete]),
@@ -1166,6 +1168,220 @@ mod against_a_core {
         let status = response.status();
         let body = response.into_body().collect().await.unwrap().to_bytes();
         (status, json_of(&String::from_utf8_lossy(&body)))
+    }
+
+    /// Both daemon transports apply the same principal and agent selectors;
+    /// a pool connection does not acquire access to another principal's rows.
+    #[tokio::test]
+    async fn credential_bound_session_visibility_matches_on_both_transports() {
+        use zeroclaw_api::grants::{Resource, Verb};
+        use zeroclaw_config::schema::PermissionProfileConfig;
+        use zeroclaw_runtime::rpc::inproc::InprocConnector;
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join(".secret_key"), "42".repeat(32)).unwrap();
+        let idp = session_users_idp(&["alice", "bob", "no-read"]).await;
+        let (core, local_preview, state, backend) = sessions_fixture(tmp.path(), |config| {
+            scoped_session_users(idp.uri())(config);
+            config.create_map_key("agents", "main").unwrap();
+            config.create_map_key("agents", "other").unwrap();
+            config.agents.get_mut("main").unwrap().channels = vec!["discord.ops".into()];
+            config
+                .permission_profiles
+                .get_mut("session-user")
+                .unwrap()
+                .allowed_agents = vec!["main".into()];
+            config.permission_profiles.insert(
+                "no-sessions".into(),
+                PermissionProfileConfig {
+                    grants: std::collections::HashMap::from([(Resource::System, vec![Verb::Read])]),
+                    ..Default::default()
+                },
+            );
+            config
+                .oidc
+                .get_mut("test")
+                .unwrap()
+                .profile_map
+                .insert("no-sessions".into(), "no-sessions".into());
+        })
+        .await;
+        assert!(core.ctx.tui_registry.signing_is_enabled());
+        let stop = CancellationToken::new();
+        let connector = InprocConnector::new(stop.clone());
+        connector.bind(Arc::clone(&core.ctx));
+        let inproc = CoreRpc::inproc(connector, || true);
+        let inproc_preview = router(inproc.clone(), core.endpoint.clone(), None);
+        let mut principals = std::collections::HashMap::new();
+        for user in ["alice", "bob"] {
+            let (status, link) = send_as(&inproc_preview, "GET", CORE_LINK_PATH, user).await;
+            assert_eq!(status, StatusCode::OK, "{link}");
+            principals.insert(user, link["principal_id"].as_str().unwrap().to_owned());
+        }
+        for (key, owner, alias) in [
+            ("gw_alice", Some("alice"), "main"),
+            ("gw_bob", Some("bob"), "main"),
+            ("gw_disallowed", Some("alice"), "other"),
+            ("gw_operator", None, "main"),
+        ] {
+            append(&backend, key, &[key]);
+            backend.set_session_agent_alias(key, alias).unwrap();
+            backend.set_session_state(key, "idle", None).unwrap();
+            if let Some(owner) = owner {
+                backend
+                    .set_session_principal(key, &principals[owner])
+                    .unwrap();
+            }
+        }
+        backend
+            .append(
+                "discord_owned",
+                &zeroclaw_providers::ChatMessage::user("channel-owned"),
+            )
+            .unwrap();
+        backend
+            .set_session_context(
+                "discord_owned",
+                zeroclaw_infra::session_backend::SessionContext {
+                    channel_id: Some("discord.ops"),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        backend
+            .set_session_principal("discord_owned", &principals["alice"])
+            .unwrap();
+        let acp = core.ctx.acp_session_store.as_ref().unwrap();
+        for (sid, owner, alias) in [
+            ("acp-alice", Some("alice"), "main"),
+            ("acp-bob", Some("bob"), "main"),
+            ("acp-disallowed", Some("alice"), "other"),
+            ("acp-operator", None, "main"),
+        ] {
+            acp.create_session(
+                sid,
+                alias,
+                "/fixture-workspace",
+                owner.map(|owner| principals[owner].as_str()),
+            )
+            .unwrap();
+        }
+        let local_rpc = CoreRpc::local(core.endpoint.clone(), EndpointOwner::SameAccount);
+        for user in ["alice", "bob"] {
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert(
+                axum::http::header::AUTHORIZATION,
+                format!("Bearer {user}-token").parse().unwrap(),
+            );
+            headers.insert(
+                crate::principal_gate::AUTH_PROVIDER_HEADER,
+                "oidc.test".parse().unwrap(),
+            );
+            let CoreAccess::Core(local_call) = local_rpc.access(&headers).await.unwrap() else {
+                unreachable!()
+            };
+            let CoreAccess::Core(duplex_call) = inproc.access(&headers).await.unwrap() else {
+                unreachable!()
+            };
+            let local = local_call
+                .request(Method::SessionListAcp, json!({}))
+                .await
+                .unwrap();
+            let duplex = duplex_call
+                .request(Method::SessionListAcp, json!({}))
+                .await
+                .unwrap();
+            assert_eq!(duplex, local);
+            assert_eq!(duplex["sessions"].as_array().unwrap().len(), 1, "{duplex}");
+            assert_eq!(duplex["sessions"][0]["session_id"], format!("acp-{user}"));
+            for method in [
+                Method::SessionMessages,
+                Method::SessionState,
+                Method::SessionDelete,
+            ] {
+                let denied = duplex_call
+                    .request(method, json!({"session_id":"acp-disallowed"}))
+                    .await
+                    .unwrap_err();
+                assert!(matches!(denied, CoreError::Forbidden(_)), "{denied:?}");
+            }
+        }
+        for user in ["alice", "bob"] {
+            let (local_status, local) = send_as(&local_preview, "GET", "/api/sessions", user).await;
+            let (inproc_status, duplex) =
+                send_as(&inproc_preview, "GET", "/api/sessions", user).await;
+            assert_eq!(local_status, StatusCode::OK, "{local}");
+            assert_eq!(inproc_status, local_status);
+            assert_eq!(duplex, local);
+            let mut keys: Vec<_> = duplex["sessions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|row| row["session_key"].as_str().unwrap())
+                .collect();
+            keys.sort_unstable();
+            let expected = if user == "alice" {
+                vec!["discord_owned", "gw_alice"]
+            } else {
+                vec!["gw_bob"]
+            };
+            assert_eq!(keys, expected);
+        }
+        let (status, local_operator) = get(&local_preview, "/api/sessions", Some(TOKEN)).await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, duplex_operator) = get(&inproc_preview, "/api/sessions", Some(TOKEN)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json_of(&duplex_operator), json_of(&local_operator));
+        let local_body = crate::api::handle_api_sessions_list(
+            axum::extract::State(state.clone()),
+            {
+                let mut headers = axum::http::HeaderMap::new();
+                headers.insert(
+                    axum::http::header::AUTHORIZATION,
+                    format!("Bearer {TOKEN}").parse().unwrap(),
+                );
+                headers
+            },
+            CoreAccess::InProcess,
+        )
+        .await
+        .into_response()
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
+        assert_eq!(
+            json_of(&local_operator),
+            serde_json::from_slice::<serde_json::Value>(&local_body).unwrap()
+        );
+        for preview in [&local_preview, &inproc_preview] {
+            for path in [
+                "/api/sessions/disallowed/messages",
+                "/api/sessions/disallowed/state",
+            ] {
+                let (denied_status, denied) = send_as(preview, "GET", path, "alice").await;
+                let (missing_status, missing) =
+                    send_as(preview, "GET", "/api/sessions/missing/messages", "alice").await;
+                assert_eq!(denied_status, StatusCode::FORBIDDEN, "{denied}");
+                assert_eq!(denied_status, missing_status);
+                assert_eq!(denied["error"], missing["error"]);
+            }
+            let (status, body) =
+                send_as(preview, "DELETE", "/api/sessions/disallowed", "alice").await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+            assert!(backend.session_exists("gw_disallowed"));
+            let (status, body) = get(preview, "/api/sessions", None).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+            let (status, body) = send_as(preview, "GET", "/api/sessions", "no-read").await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        }
+        assert!(core.ctx.auth.pairing().revoke_token(TOKEN));
+        for preview in [&local_preview, &inproc_preview] {
+            let (status, body) = get(preview, "/api/sessions", Some(TOKEN)).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+        }
+        stop.cancel();
+        core.stop().await;
     }
 
     /// A scoped principal can neither read, inspect nor delete another

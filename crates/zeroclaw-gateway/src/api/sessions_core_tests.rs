@@ -23,7 +23,6 @@ use axum::http::HeaderValue;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream};
 use tokio_util::sync::CancellationToken;
-use zeroclaw_api::jsonrpc::error_codes::SESSION_NOT_OWNED;
 use zeroclaw_config::schema::Config;
 use zeroclaw_infra::session_backend::{SessionBackend, SessionContext};
 use zeroclaw_providers::ChatMessage;
@@ -32,7 +31,7 @@ use zeroclaw_rpc_proto::types::SessionListResult;
 use zeroclaw_runtime::rpc::context::RpcContext;
 use zeroclaw_runtime::rpc::inproc::InprocConnector;
 
-use crate::core_rpc::{CoreAccess, CoreError, CoreRpc, Dial, DialFuture};
+use crate::core_rpc::{CoreAccess, CoreRpc, Dial, DialFuture};
 
 const OPERATOR_TOKEN: &str = "zc_gw_operator";
 
@@ -176,14 +175,12 @@ fn register_turn(state: &AppState, cancel_key: &str) -> CancellationToken {
     token
 }
 
-// ── Why the listing stays in-process ──────────────────────────────
+// ── Listing through the credential-bound core connection ──────────
 
-/// `GET /api/sessions` lists every attributable session from the gateway's
-/// own store while a core is attached. The core would list none of them for
-/// the gateway's credential-bound connection: for a non-local caller it
-/// lists only the sessions that connection opened.
+/// The credential-bound duplex and the gateway's local store list the same
+/// attributable rows for the operator, including sessions opened elsewhere.
 #[tokio::test]
-async fn the_listing_stays_in_process_with_a_core_attached() {
+async fn the_listing_is_the_same_through_the_core() {
     let stores = stores().with_shared_pairing();
     seed(&*stores.backend);
 
@@ -195,14 +192,20 @@ async fn the_listing_stays_in_process_with_a_core_attached() {
         .await
         .expect("the core lists");
     assert!(
-        core_listed.sessions.is_empty(),
-        "the core lists only this connection's own sessions: {:?}",
+        core_listed.sessions.len() == 3,
+        "the operator lists every attributable row: {:?}",
         core_listed.sessions
     );
 
-    let (status, body) =
-        answer(handle_api_sessions_list(State(stores.state.clone()), bearer(OPERATOR_TOKEN)).await)
-            .await;
+    let (status, body) = answer(
+        handle_api_sessions_list(
+            State(stores.state.clone()),
+            bearer(OPERATOR_TOKEN),
+            through(&stores.core, OPERATOR_TOKEN).await,
+        )
+        .await,
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "{body}");
 
     let rows = body["sessions"].as_array().expect("a sessions array");
@@ -279,19 +282,14 @@ async fn a_competing_rpc_row_never_answers_for_the_gateway_row() {
     let CoreAccess::Core(call) = through(&stores.core, OPERATOR_TOKEN).await else {
         unreachable!()
     };
-    match call
-        .request(Method::SessionMessages, json!({ "session_id": "gw_alpha" }))
+    let core_read = call
+        .request(Method::SessionMessages, json!({"session_id": "gw_alpha"}))
         .await
-    {
-        Ok(core_read) => assert_eq!(
-            core_read["messages"][0]["content"], "different RPC conversation",
-            "the core's resolver prefers the rpc_ row"
-        ),
-        Err(CoreError::Rpc(refused)) => {
-            assert_eq!(refused.code, SESSION_NOT_OWNED, "{refused:?}");
-        }
-        Err(other) => panic!("the core neither read nor refused the id: {other:?}"),
-    }
+        .unwrap();
+    assert_eq!(
+        core_read["messages"][0]["content"],
+        "different RPC conversation"
+    );
 
     let (status, body) = answer(
         handle_api_session_messages(

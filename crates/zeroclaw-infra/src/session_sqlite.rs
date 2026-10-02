@@ -1003,6 +1003,7 @@ impl SessionBackend for SqliteSessionBackend {
         session_key: &str,
         created_at: &str,
         owner: Option<&str>,
+        can_delete: &dyn Fn(&crate::session_backend::SessionMetadata) -> bool,
     ) -> io::Result<bool> {
         let mut conn = self.conn.lock();
         let tx = conn
@@ -1011,7 +1012,9 @@ impl SessionBackend for SqliteSessionBackend {
         let matches = Self::metadata_on(&tx, session_key)
             .map_err(io::Error::other)?
             .is_some_and(|meta| {
-                meta.created_at.to_rfc3339() == created_at && meta.principal_id.as_deref() == owner
+                meta.created_at.to_rfc3339() == created_at
+                    && meta.principal_id.as_deref() == owner
+                    && can_delete(&meta)
             });
         if !matches {
             return Ok(false);
@@ -1814,7 +1817,7 @@ mod tests {
             .to_rfc3339();
         assert!(
             !backend
-                .delete_session_matching("boundary", &created, Some("user:bob"))
+                .delete_session_matching("boundary", &created, Some("user:bob"), &|_| true)
                 .unwrap()
         );
         backend.delete_session("boundary").unwrap();
@@ -1826,7 +1829,7 @@ mod tests {
             .unwrap();
         assert!(
             !backend
-                .delete_session_matching("boundary", &created, Some("user:alice"))
+                .delete_session_matching("boundary", &created, Some("user:alice"), &|_| true)
                 .unwrap()
         );
         assert_eq!(backend.load("boundary")[0].content, "replacement");
@@ -1837,7 +1840,7 @@ mod tests {
             .to_rfc3339();
         assert!(
             backend
-                .delete_session_matching("boundary", &created, Some("user:alice"))
+                .delete_session_matching("boundary", &created, Some("user:alice"), &|_| true)
                 .unwrap()
         );
     }

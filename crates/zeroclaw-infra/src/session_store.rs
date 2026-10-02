@@ -546,11 +546,13 @@ impl SessionBackend for SessionStore {
         key: &str,
         created_at: &str,
         owner: Option<&str>,
+        can_delete: &dyn Fn(&crate::session_backend::SessionMetadata) -> bool,
     ) -> std::io::Result<bool> {
         let _guard = self.mutation_guard()?;
         let matches = self.snapshot_unlocked(key)?.is_some_and(|snapshot| {
             snapshot.metadata.created_at.to_rfc3339() == created_at
                 && snapshot.metadata.principal_id.as_deref() == owner
+                && can_delete(&snapshot.metadata)
         });
         if !matches {
             return Ok(false);
@@ -719,7 +721,7 @@ mod tests {
             .to_rfc3339();
         assert!(
             !store
-                .delete_session_matching("boundary", &created, Some("user:alice"))
+                .delete_session_matching("boundary", &created, Some("user:alice"), &|_| true)
                 .unwrap()
         );
         store.delete_session("boundary").unwrap();
@@ -728,7 +730,7 @@ mod tests {
             .unwrap();
         assert!(
             !store
-                .delete_session_matching("boundary", &created, None)
+                .delete_session_matching("boundary", &created, None, &|_| true)
                 .unwrap()
         );
         let snapshot = store.read_session_snapshot("boundary").unwrap().unwrap();
@@ -742,7 +744,8 @@ mod tests {
                 .delete_session_matching(
                     "boundary",
                     &snapshot.metadata.created_at.to_rfc3339(),
-                    None
+                    None,
+                    &|_| true,
                 )
                 .unwrap()
         );
