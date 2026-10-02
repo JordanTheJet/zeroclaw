@@ -2750,21 +2750,33 @@ fn all_tools_with_runtime_on_thread(
         } else {
             register_tool!(
                 "sop_execute",
-                Arc::new(SopExecuteTool::new(Arc::clone(sop_engine)).with_initiator(agent_alias),)
+                Arc::new(
+                    SopExecuteTool::new(Arc::clone(sop_engine))
+                        .with_session_memory(Arc::clone(&session_memory))
+                        .with_initiator(agent_alias),
+                )
             );
             register_tool!(
                 "sop_advance",
-                Arc::new(SopAdvanceTool::new(Arc::clone(sop_engine)))
+                Arc::new(
+                    SopAdvanceTool::new(Arc::clone(sop_engine))
+                        .with_session_memory(Arc::clone(&session_memory)),
+                )
             );
             register_tool!(
                 "sop_approve",
-                Arc::new(SopApproveTool::new(Arc::clone(sop_engine)).with_agent_alias(agent_alias),)
+                Arc::new(
+                    SopApproveTool::new(Arc::clone(sop_engine))
+                        .with_session_memory(Arc::clone(&session_memory))
+                        .with_agent_alias(agent_alias),
+                )
             );
         }
         register_tool!(
             "sop_status",
             Arc::new(
                 SopStatusTool::new(Arc::clone(sop_engine))
+                    .with_session_memory(Arc::clone(&session_memory))
                     .with_collector(crate::sop::SopMetricsCollector::shared()),
             )
         );

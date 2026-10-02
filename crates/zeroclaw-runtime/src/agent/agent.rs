@@ -6453,7 +6453,34 @@ mod tests {
         Arc<std::sync::Mutex<crate::sop::SopEngine>>,
         Arc<dyn Memory>,
     ) {
-        use zeroclaw_api::memory_traits::PrincipalScope;
+        sop_session_fixture(
+            tmp,
+            pipeline_allows,
+            mode,
+            Some(zeroclaw_api::memory_traits::PrincipalScope::new(
+                "user:alice",
+            )),
+            None,
+            true,
+        )
+        .await
+    }
+
+    async fn sop_session_fixture(
+        tmp: &tempfile::TempDir,
+        pipeline_allows: &[&str],
+        mode: crate::sop::types::SopExecutionMode,
+        owner: Option<zeroclaw_api::memory_traits::PrincipalScope>,
+        existing: Option<(
+            Arc<std::sync::Mutex<crate::sop::SopEngine>>,
+            Arc<dyn Memory>,
+        )>,
+        with_audit: bool,
+    ) -> (
+        Agent,
+        Arc<std::sync::Mutex<crate::sop::SopEngine>>,
+        Arc<dyn Memory>,
+    ) {
         let mut config = factory_test_config();
         config.pipeline.allowed_tools = pipeline_allows.iter().map(|t| t.to_string()).collect();
         let shared: Arc<dyn Memory> = Arc::new(
@@ -6462,7 +6489,9 @@ mod tests {
         let mut engine = crate::sop::SopEngine::new(zeroclaw_config::schema::SopConfig::default());
         engine.set_sops_for_test(vec![audit_test_sop(mode)]);
         let engine = Arc::new(std::sync::Mutex::new(engine));
-        let shared_audit = Arc::new(crate::sop::SopAuditLogger::new(Arc::clone(&shared)));
+        let (engine, shared) = existing.unwrap_or((engine, shared));
+        let shared_audit =
+            with_audit.then(|| Arc::new(crate::sop::SopAuditLogger::new(Arc::clone(&shared))));
         let security = Arc::new(crate::security::SecurityPolicy::default());
         let built = crate::tools::all_tools_with_runtime(
             Arc::new(config.clone()),
@@ -6484,7 +6513,7 @@ mod tests {
             false,
             None,
             Some(Arc::clone(&engine)),
-            Some(shared_audit),
+            shared_audit,
             None,
         )
         .expect("the tool factory builds");
@@ -6521,9 +6550,11 @@ mod tests {
             .workspace_dir(tmp.path().to_path_buf())
             .build()
             .expect("agent builds");
-        agent
-            .route_memory_to_principal(PrincipalScope::new("user:alice"))
-            .expect("an assembled registry carries its owner");
+        if let Some(owner) = owner {
+            agent
+                .route_memory_to_principal(owner)
+                .expect("an assembled registry carries its owner");
+        }
         (agent, engine, shared)
     }
 
@@ -6776,6 +6807,307 @@ mod tests {
             on_alice.contains("P-PIPELINE-SOP-MARKER"),
             "the pipeline's run start is audited on the owner's plane:\n{on_alice}"
         );
+    }
+
+    /// Exercise the real registry and the pipeline's captured tools, including
+    /// registries without audit logging. Both consume the pinned session route.
+    #[tokio::test]
+    async fn sop_private_runs_are_hidden_from_foreign_factory_sessions() {
+        use crate::sop::types::SopExecutionMode;
+        use zeroclaw_api::memory_traits::PrincipalScope;
+        for with_audit in [false, true] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let (alice, engine, shared) = sop_session_fixture(
+                &tmp,
+                &[],
+                SopExecutionMode::Auto,
+                Some(PrincipalScope::new("user:alice")),
+                None,
+                with_audit,
+            )
+            .await;
+            let started = alice
+                .execute_tool_for_test(
+                    "sop_execute",
+                    serde_json::json!({"name":"audit-sop", "payload":"PRIVATE-PAYLOAD"}),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(started.success, "{started:?}");
+            let run_id = engine
+                .lock()
+                .unwrap()
+                .active_runs()
+                .keys()
+                .next()
+                .unwrap()
+                .clone();
+            let advanced = alice
+                .execute_tool_for_test(
+                    "sop_advance",
+                    serde_json::json!({
+                        "run_id":run_id,"status":"completed","output":"PRIVATE-STEP-RESULT"
+                    }),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(advanced.success, "{advanced:?}");
+            for owner in [
+                PrincipalScope::new("user:bob"),
+                PrincipalScope::new("user:alice").with_namespace(Some("foreign".into())),
+                PrincipalScope::new("user:alice").with_tenant(Some("foreign".into())),
+                PrincipalScope::new("user:alice").with_agent(Some("foreign".into())),
+            ] {
+                let (foreign, _, _) = sop_session_fixture(
+                    &tmp,
+                    &["sop_status"],
+                    SopExecutionMode::Auto,
+                    Some(owner),
+                    Some((engine.clone(), shared.clone())),
+                    with_audit,
+                )
+                .await;
+                for args in [
+                    serde_json::json!({}),
+                    serde_json::json!({"sop_name":"audit-sop","include_metrics":true}),
+                    serde_json::json!({"run_id":run_id}),
+                ] {
+                    let result = foreign
+                        .execute_tool_for_test("sop_status", args.clone())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert!(!result.output.contains("PRIVATE-STEP-RESULT"), "{result:?}");
+                    assert!(
+                        !result.output.contains(&format!("Run: {run_id}")),
+                        "{result:?}"
+                    );
+                    assert!(!result.output.contains("Active runs (1)"), "{result:?}");
+                    assert!(
+                        !result.output.contains("runs_completed:"),
+                        "global metrics leak: {result:?}"
+                    );
+                    let pipeline = foreign
+                        .execute_tool_for_test(
+                            "execute_pipeline",
+                            serde_json::json!({
+                                "steps":[{"tool":"sop_status","args":args}]
+                            }),
+                        )
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert!(
+                        !pipeline.output.contains("PRIVATE-STEP-RESULT"),
+                        "{pipeline:?}"
+                    );
+                }
+                let absent = foreign
+                    .execute_tool_for_test("sop_status", serde_json::json!({"run_id":"missing"}))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let hidden = foreign
+                    .execute_tool_for_test("sop_status", serde_json::json!({"run_id":run_id}))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    hidden.output.to_string().replace(&run_id, "missing"),
+                    absent.output.to_string()
+                );
+            }
+            let own = alice
+                .execute_tool_for_test("sop_status", serde_json::json!({"run_id":run_id}))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(own.output.contains("PRIVATE-STEP-RESULT"), "{own:?}");
+            let finished = alice
+                .execute_tool_for_test(
+                    "sop_advance",
+                    serde_json::json!({
+                        "run_id":run_id,"status":"completed","output":"PRIVATE-FINAL-RESULT"
+                    }),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(finished.success, "{finished:?}");
+            let (bob, _, _) = sop_session_fixture(
+                &tmp,
+                &[],
+                SopExecutionMode::Auto,
+                Some(PrincipalScope::new("user:bob")),
+                Some((engine.clone(), shared.clone())),
+                with_audit,
+            )
+            .await;
+            let history = bob
+                .execute_tool_for_test("sop_status", serde_json::json!({"sop_name":"audit-sop"}))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                !history.output.contains(&run_id),
+                "finished run leaked: {history:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn sop_foreign_resume_is_refused_before_gate_or_queue_mutation() {
+        use crate::sop::types::SopExecutionMode;
+        use zeroclaw_api::memory_traits::PrincipalScope;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (alice, engine, shared) =
+            owned_session_with_sop_audit(&tmp, &[], SopExecutionMode::Supervised).await;
+        let started = alice
+            .execute_tool_for_test(
+                "sop_execute",
+                serde_json::json!({"name":"audit-sop", "payload":"PRIVATE-GATE"}),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(started.success, "{started:?}");
+        let run_id = engine
+            .lock()
+            .unwrap()
+            .active_runs()
+            .keys()
+            .next()
+            .unwrap()
+            .clone();
+        let before =
+            serde_json::to_value(engine.lock().unwrap().get_run(&run_id).unwrap()).unwrap();
+        let (bob, _, _) = sop_session_fixture(
+            &tmp,
+            &["sop_approve", "sop_advance"],
+            SopExecutionMode::Supervised,
+            Some(PrincipalScope::new("user:bob")),
+            Some((engine.clone(), shared.clone())),
+            true,
+        )
+        .await;
+        for (name, args) in [
+            ("sop_approve", serde_json::json!({"run_id":run_id})),
+            (
+                "sop_advance",
+                serde_json::json!({"run_id":run_id,"status":"completed","output":"BOB-OUTPUT"}),
+            ),
+        ] {
+            let queue = crate::sop::executor::new_live_action_queue();
+            let refused = crate::sop::executor::scope_live_action_queue(
+                queue.clone(),
+                bob.execute_tool_for_test(name, args.clone()),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(!refused.success, "{refused:?}");
+            assert!(refused.output.is_empty(), "{refused:?}");
+            assert!(crate::sop::executor::drain_live_actions(&queue).is_empty());
+            let absent = bob
+                .execute_tool_for_test(name, {
+                    let mut absent = args.clone();
+                    absent["run_id"] = serde_json::json!("missing");
+                    absent
+                })
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                refused.error, absent.error,
+                "foreign existence must be opaque"
+            );
+            let pipeline = bob
+                .execute_tool_for_test(
+                    "execute_pipeline",
+                    serde_json::json!({"steps":[{"tool":name,"args":args}]}),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(!pipeline.success, "{pipeline:?}");
+            assert_eq!(
+                serde_json::to_value(engine.lock().unwrap().get_run(&run_id).unwrap()).unwrap(),
+                before
+            );
+        }
+        assert!(
+            sop_audit_rows(&shared, Some(&PrincipalScope::new("user:bob")))
+                .await
+                .is_empty()
+        );
+        let queue = crate::sop::executor::new_live_action_queue();
+        let own = crate::sop::executor::scope_live_action_queue(
+            queue.clone(),
+            alice.execute_tool_for_test("sop_approve", serde_json::json!({"run_id":run_id})),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(own.success, "{own:?}");
+        assert_eq!(crate::sop::executor::drain_live_actions(&queue).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn sop_operator_completion_audits_the_original_owner_only() {
+        use crate::sop::types::SopExecutionMode;
+        use zeroclaw_api::memory_traits::PrincipalScope;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (alice, engine, shared) =
+            owned_session_with_sop_audit(&tmp, &[], SopExecutionMode::Auto).await;
+        let started = alice
+            .execute_tool_for_test(
+                "sop_execute",
+                serde_json::json!({"name":"audit-sop","payload":"PRIVATE-OPERATOR-PAYLOAD"}),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(started.success, "{started:?}");
+        let run_id = engine
+            .lock()
+            .unwrap()
+            .active_runs()
+            .keys()
+            .next()
+            .unwrap()
+            .clone();
+        let advance = alice.execute_tool_for_test("sop_advance", serde_json::json!({"run_id":run_id,"status":"completed","output":"PRIVATE-EARLIER-OUTPUT"})).await.unwrap().unwrap();
+        assert!(advance.success, "{advance:?}");
+        let (operator, _, _) = sop_session_fixture(
+            &tmp,
+            &[],
+            SopExecutionMode::Auto,
+            None,
+            Some((engine.clone(), shared.clone())),
+            true,
+        )
+        .await;
+        let completed = operator.execute_tool_for_test("sop_advance", serde_json::json!({"run_id":run_id,"status":"completed","output":"OPERATOR-FINAL-OUTPUT"})).await.unwrap().unwrap();
+        assert!(completed.success, "{completed:?}");
+        let shared_rows = sop_audit_rows(&shared, None).await;
+        let private_rows = sop_audit_rows(&shared, Some(&PrincipalScope::new("user:alice"))).await;
+        for marker in [
+            "PRIVATE-OPERATOR-PAYLOAD",
+            "PRIVATE-EARLIER-OUTPUT",
+            "OPERATOR-FINAL-OUTPUT",
+        ] {
+            assert!(
+                !shared_rows.contains(marker),
+                "shared audit leaked {marker}: {shared_rows}"
+            );
+            assert!(
+                private_rows.contains(marker),
+                "missing owner audit {marker}: {private_rows}"
+            );
+        }
+        assert!(private_rows.contains("completed"));
     }
 
     #[tokio::test]

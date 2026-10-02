@@ -926,6 +926,18 @@ pub struct SopRunSummary {
     pub active: bool,
 }
 
+impl SopRun {
+    /// Owned sessions may access only the exact private plane recorded at
+    /// admission. Legacy/unowned runs are not public. Unowned operator paths
+    /// retain their administrative access; an agent alias is not a user owner.
+    pub(crate) fn is_accessible_from(
+        &self,
+        owner: Option<&zeroclaw_api::memory_traits::PrincipalScope>,
+    ) -> bool {
+        owner.is_none_or(|owner| self.memory_owner.as_ref() == Some(owner))
+    }
+}
+
 impl SopRunSummary {
     pub fn from_run(run: &SopRun, active: bool) -> Self {
         Self {

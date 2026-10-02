@@ -139,7 +139,13 @@ impl Tool for SopAdvanceTool {
         };
 
         // Lock engine, advance step, snapshot data for audit, then drop lock
-        let (action, step_result_ok, finished_run) = {
+        let owner = self
+            .session_memory
+            .as_ref()
+            .and_then(|route| route.routed())
+            .and_then(|routed| routed.memory.principal_scope());
+
+        let (action, step_result_ok, finished_run, memory_owner) = {
             let mut engine = self.engine.lock().map_err(|e| {
                 ::zeroclaw_log::record!(
                     ERROR,
@@ -152,19 +158,21 @@ impl Tool for SopAdvanceTool {
                 anyhow::Error::msg(format!("Engine lock poisoned: {e}"))
             })?;
 
-            let current_step = engine
+            let Some(run) = engine
                 .get_run(run_id)
-                .map(|r| r.current_step)
-                .ok_or_else(|| {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({"run_id": run_id})),
-                        "sop_advance tool: run not found"
-                    );
-                    anyhow::Error::msg(format!("Run not found: {run_id}"))
-                })?;
+                .filter(|run| run.is_accessible_from(owner.as_ref()))
+            else {
+                return Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(crate::i18n::get_required_cli_string(
+                        "cli-sop-run-unavailable",
+                    )),
+                });
+            };
+            let memory_owner = run.memory_owner.clone();
+
+            let current_step = run.current_step;
 
             let now = now_iso8601();
             let step_result = SopStepResult {
@@ -190,14 +198,14 @@ impl Tool for SopAdvanceTool {
                         _ => None,
                     };
                     // Only audit step result when advance succeeded
-                    (Ok(action), Some(step_result_clone), finished)
+                    (Ok(action), Some(step_result_clone), finished, memory_owner)
                 }
-                Err(e) => (Err(e), None, None),
+                Err(e) => (Err(e), None, None, memory_owner),
             }
         };
 
         // Audit logging (engine lock dropped, safe to await)
-        let audit = self.audit();
+        let audit = crate::sop::audit::audit_for_run(self.audit(), memory_owner.as_ref());
         if let Some(ref audit) = audit {
             if let Some(ref sr) = step_result_ok
                 && let Err(e) = audit.log_step_result(run_id, sr).await
