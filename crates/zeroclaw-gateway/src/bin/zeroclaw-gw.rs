@@ -7,6 +7,10 @@ use zeroclaw_gateway::preview::{Invocation, USAGE, parse_args, serve};
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    // Pin preview diagnostics to embedded English so locale detection cannot
+    // consult the daemon's config.toml.
+    zeroclaw_runtime::i18n::init("en");
+
     let invocation = parse_args(
         std::env::args().skip(1),
         std::env::var("ZEROCLAW_SOCKET").ok(),
