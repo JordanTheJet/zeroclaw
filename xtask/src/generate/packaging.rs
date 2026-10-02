@@ -418,14 +418,25 @@ mod tests {
 
     #[test]
     fn pkgbuild_features_are_lean_dist_channels() {
-        let f = spec::resolve_feature_list(&root(), &Selection::Dist)
-            .unwrap()
-            .join(",");
+        let current = std::fs::read_to_string(root().join("dist/aur/PKGBUILD")).unwrap();
+        let pkgbuild = render_pkgbuild(&root(), &current).unwrap();
+        let build = pkgbuild
+            .lines()
+            .find(|line| line.trim_start().starts_with("cargo build "))
+            .unwrap();
+        let (_, features) = build.split_once("--features ").unwrap();
+        let f: Vec<_> = features.split(',').collect();
         for feature in spec::resolve_feature_list(&root(), &Selection::Dist).unwrap() {
-            assert!(f.contains(&feature), "dist feature {feature} not rendered");
+            assert!(
+                f.contains(&feature.as_str()),
+                "dist feature {feature} not rendered"
+            );
         }
         for feature in spec::features_outside_dist(&root()).unwrap() {
-            assert!(!f.contains(&feature), "{feature} leaked into lean dist");
+            assert!(
+                !f.contains(&feature.as_str()),
+                "{feature} leaked into lean dist"
+            );
         }
     }
 }

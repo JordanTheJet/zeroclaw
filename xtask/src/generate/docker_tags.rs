@@ -205,18 +205,18 @@ mod tests {
             .iter()
             .find(|t| t["stem"].as_str() == Some("all-features"))
             .unwrap();
-        let dist_features = dist["features"].as_str().unwrap();
+        let dist_features: Vec<_> = dist["features"].as_str().unwrap().split(',').collect();
         for feature in
             crate::generate::spec::resolve_feature_list(&root(), &Selection::Dist).unwrap()
         {
             assert!(
-                dist_features.contains(&feature),
+                dist_features.contains(&feature.as_str()),
                 "dist feature {feature} not rendered"
             );
         }
         for feature in crate::generate::spec::features_outside_dist(&root()).unwrap() {
             assert!(
-                !dist_features.contains(&feature),
+                !dist_features.contains(&feature.as_str()),
                 "{feature} leaked into lean dist"
             );
         }

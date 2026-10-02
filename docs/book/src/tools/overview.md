@@ -53,6 +53,17 @@ built-in list. No replacement plugin is required or claimed here.
 | Homebrew source build | Cargo defaults: the same eleven-tool policy; optional external adapters compiled out | Use the platform compatibility archive alongside the package-managed binary; adding config cannot change a bottle's compiled features |
 | Docker | `dist`: the same eleven-tool policy | Use the `compat-tools` image tag, then select the tools and configure their dependencies |
 
+Standard `dist` and `dist-compat` retain the portable WASM plugin host through
+`plugins-wasm-cranelift` on the seven supported native 64-bit targets: GNU and
+musl Linux on x86_64 and aarch64, both macOS architectures, and x86_64 Windows
+MSVC. ARMv6/ARMv7 builds omit Cranelift and Prometheus; experimental Android
+builds omit Cranelift and WhatsApp Web. Cargo defaults do not include a plugin
+host. Compiling the host leaves `plugins.enabled` and `plugins.auto_discover`
+false; configured plugin activation, consent, trust and grants still apply.
+Runtime-only precompiled `.cwasm` support and Pulley alone do not replace the
+portable registry `.wasm` compilation contract. Distribution features and
+platform exclusions come from `package.metadata.zeroclaw` in `Cargo.toml`.
+
 `dist-compat` adds the `tools-compat` Cargo bundle: `tools-saas`,
 `tools-coding-cli`, and `tools-external`. Source users can select an individual
 existing `tool-*` feature or the bundle. The compatibility build does not

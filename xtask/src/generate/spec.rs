@@ -1381,6 +1381,51 @@ mod tests {
     }
 
     #[test]
+    fn distributions_keep_supported_portable_plugin_hosts_without_default_activation() {
+        let defaults = resolve_feature_list(&root(), &Selection::Full).unwrap();
+        assert!(
+            !defaults
+                .iter()
+                .any(|feature| feature.starts_with("plugins-wasm"))
+        );
+        let config = zeroclaw_config::schema::Config::default();
+        assert!(!config.plugins.enabled);
+        assert!(!config.plugins.auto_discover);
+
+        for selection in [Selection::Dist, Selection::DistCompat] {
+            for target in [
+                "x86_64-unknown-linux-gnu",
+                "x86_64-unknown-linux-musl",
+                "aarch64-unknown-linux-gnu",
+                "aarch64-unknown-linux-musl",
+                "aarch64-apple-darwin",
+                "x86_64-apple-darwin",
+                "x86_64-pc-windows-msvc",
+            ] {
+                let features =
+                    resolve_feature_list_for_target(&root(), &selection, Some(target)).unwrap();
+                assert!(features.contains(&"agent-runtime".into()));
+                assert!(
+                    features.contains(&"plugins-wasm-cranelift".into()),
+                    "{target}"
+                );
+            }
+            for target in [
+                "arm-unknown-linux-gnueabihf",
+                "armv7-unknown-linux-gnueabihf",
+                "aarch64-linux-android",
+            ] {
+                let features =
+                    resolve_feature_list_for_target(&root(), &selection, Some(target)).unwrap();
+                assert!(
+                    !features.contains(&"plugins-wasm-cranelift".into()),
+                    "{target}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn install_route_contract_rejects_duplicate_platforms() {
         let routes = install_routes().unwrap();
         let fast = route(&routes, RouteId::UnixFast);
@@ -1482,6 +1527,7 @@ mod tests {
                 "channel-lark",
                 "channel-git",
                 "whatsapp-web",
+                "plugins-wasm-cranelift",
             ]
             .map(str::to_owned),
         );
@@ -1607,7 +1653,7 @@ mod tests {
             .unwrap();
         let exclusions = dist_target_exclusions(workspace_root_package(&meta).unwrap()).unwrap();
 
-        for selection in [Selection::Dist, Selection::DistBroad] {
+        for selection in [Selection::Dist, Selection::DistBroad, Selection::DistCompat] {
             let unfiltered = resolve_feature_list(&root(), &selection).unwrap();
             for (target, excluded) in &exclusions {
                 let resolved =
@@ -1649,14 +1695,17 @@ mod tests {
             .unwrap();
         let exclusions = dist_target_exclusions(workspace_root_package(&meta).unwrap()).unwrap();
 
-        assert_eq!(exclusions["aarch64-linux-android"], vec!["whatsapp-web"]);
+        assert_eq!(
+            exclusions["aarch64-linux-android"],
+            vec!["whatsapp-web", "plugins-wasm-cranelift"]
+        );
         assert_eq!(
             exclusions["arm-unknown-linux-gnueabihf"],
-            vec!["observability-prometheus"]
+            vec!["observability-prometheus", "plugins-wasm-cranelift"]
         );
         assert_eq!(
             exclusions["armv7-unknown-linux-gnueabihf"],
-            vec!["observability-prometheus"]
+            vec!["observability-prometheus", "plugins-wasm-cranelift"]
         );
     }
 
