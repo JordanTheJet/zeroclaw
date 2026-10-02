@@ -873,6 +873,30 @@ fn write_personality_file(
         .map(|d| d.as_millis() as i64))
 }
 
+/// Materialize a revision from the one canonical projected history without
+/// allocating another transcript buffer or storing a parallel identity.
+fn transcript_revision(messages: &[MessageEntry]) -> Result<String, JsonRpcError> {
+    use sha2::{Digest, Sha256};
+    struct DigestWriter(Sha256);
+    impl std::io::Write for DigestWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.update(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut writer = DigestWriter(Sha256::new());
+    serde_json::to_writer(&mut writer, messages).map_err(|error| {
+        rpc_err(
+            INTERNAL_ERROR,
+            format!("Failed to derive transcript revision: {error}"),
+        )
+    })?;
+    Ok(format!("{:x}", writer.0.finalize()))
+}
+
 impl RpcDispatcher {
     pub fn new(ctx: Arc<RpcContext>, writer_tx: mpsc::Sender<String>, peer_label: String) -> Self {
         Self::new_with_connection_cancel(ctx, writer_tx, peer_label, CancellationToken::new())
@@ -7929,6 +7953,7 @@ impl RpcDispatcher {
             );
         }
 
+        let session_revision = Some(transcript_revision(&messages)?);
         let total = messages.len();
         let limit = req.limit.unwrap_or(total);
         let end = req.before_index.map(|i| i.min(total)).unwrap_or(total);
@@ -7968,6 +7993,7 @@ impl RpcDispatcher {
                         SessionAddress::Id(_) => None,
                     },
                     session_created_at: row_created_at,
+                    session_revision,
                 })
             },
         )
@@ -43317,6 +43343,30 @@ mod tests {
                 first
             );
         }
+        let original_revision = dispatcher
+            .handle_session_messages(&json!({"session_id":"alpha"}))
+            .await
+            .unwrap()["session_revision"]
+            .clone();
+        backend
+            .append(
+                "rpc_alpha",
+                &zeroclaw_api::model_provider::ChatMessage::user("appended history"),
+            )
+            .unwrap();
+        let newest = dispatcher
+            .handle_session_messages(
+                &json!({"session_id":"alpha", "session_keys":["rpc_alpha"], "limit":1}),
+            )
+            .await
+            .unwrap();
+        let older = dispatcher.handle_session_messages(&json!({"session_id":"alpha", "session_keys":["rpc_alpha"], "limit":1, "before_index":1})).await.unwrap();
+        assert_ne!(newest["session_revision"], original_revision);
+        assert_eq!(
+            newest["session_revision"], older["session_revision"],
+            "revision covers the whole history, not the returned slice"
+        );
+        assert_eq!(newest["session_revision"].as_str().unwrap().len(), 64);
         std::fs::write(corrupt, "not a JSON message\n").unwrap();
         for params in [
             json!({"session_id":"broken"}),

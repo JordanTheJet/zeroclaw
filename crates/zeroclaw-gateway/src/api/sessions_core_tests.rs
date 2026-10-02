@@ -506,6 +506,7 @@ fn page_of(row: (&str, &str), total: usize, start: usize, contents: &[&str]) -> 
     json!({"result": {
         "session_id": "alpha", "messages": messages, "total": total, "start": start,
         "session_key": row.0, "session_created_at": row.1,
+        "session_revision": "scripted-complete-history",
     }})
 }
 
@@ -537,6 +538,37 @@ fn contents(body: &Value) -> Vec<&str> {
         .iter()
         .map(|row| row["content"].as_str().expect("content"))
         .collect()
+}
+
+#[tokio::test]
+async fn a_core_without_transcript_revision_support_is_refused() {
+    for revision in [Value::Null, json!("")] {
+        let mut page = transcript_page(2, 0, &["a", "b"]);
+        page["result"]["session_revision"] = revision;
+        let (scripted, (status, body)) = read_scripted(vec![page]).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert_eq!(body["code"], "core_capability_missing");
+        assert_eq!(scripted.params.lock().unwrap().len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn a_same_timestamp_transcript_replacement_restarts_paging() {
+    fn revision_page(revision: &str, start: usize, contents: &[&str]) -> Value {
+        let mut page = page_of(ROW, 4, start, contents);
+        page["result"]["session_revision"] = json!(revision);
+        page
+    }
+    let (scripted, (status, body)) = read_scripted(vec![
+        revision_page("original", 2, &["old-c", "old-d"]),
+        revision_page("replacement", 0, &["new-a", "new-b"]),
+        revision_page("replacement", 2, &["new-c", "new-d"]),
+        revision_page("replacement", 0, &["new-a", "new-b"]),
+    ])
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(contents(&body), ["new-a", "new-b", "new-c", "new-d"]);
+    assert_eq!(scripted.params.lock().unwrap().len(), 4);
 }
 
 #[tokio::test]

@@ -380,11 +380,16 @@ rpc_type! {
         /// appears meanwhile cannot switch rows under it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub session_key: Option<String>,
-        /// When the row read was created (RFC 3339). A row removed and
-        /// recreated under the same key has a new one, so a change between
-        /// pages means the pages came from different rows.
+        /// When the row read was created (RFC 3339). Filesystem timestamps
+        /// can repeat across rapid replacements; also compare session_revision
+        /// when binding a paged transcript read.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub session_created_at: Option<String>,
+        /// Opaque digest of the complete projected history for index paging.
+        /// A changed revision requires restarting the paged read. Omitted in
+        /// ACP cursor mode, which never projects the complete history.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub session_revision: Option<String>,
     }
 }
 
