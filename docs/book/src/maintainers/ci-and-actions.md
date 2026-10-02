@@ -133,6 +133,12 @@ Phase 2 is report-only: the workflow has `contents: read` and `pull-requests: re
 
 The classifier defaults uncertain evidence upward. Docs, fixtures, and known mechanical metadata may be `risk:low`; ordinary behavior changes are `risk:medium`; configured trust, credential, compatibility, governance, release-authority, security, or toolchain-floor paths are `risk:high`. The checked-in policy also carries deterministic changed-line escalation rules for workflow permission expansion, secret access, OIDC, artifact publication, release behavior, elevated `pull_request_target`, toolchain install or container baselines, release-floor changes, and likely WIT contracts. If one of those content-sensitive files changes but the patch is unavailable or malformed, the report stays high instead of guessing medium. The #9530 exception can recommend `risk:medium` only when a complete Rust patch and matching base/head source prove that every high-risk Rust change remains inside existing `#[cfg(test)]` code; missing, truncated, malformed, mixed, conditional-compilation, rename, add, and remove evidence stays high.
 
+### PR Queue Hygiene (`pr-queue-hygiene.yml`)
+
+Applies the [queue hygiene rules](./pr-workflow.md#queue-hygiene-automation). It runs through `pull_request_target` when a pull request is opened, reopened, or marked ready; through `workflow_run` when a pull-request Quality Gate run fails; weekly for idle drafts; and on manual dispatch for one pull request or the idle-draft sweep.
+
+It fetches `scripts/github/pr_queue_hygiene.py` from the trusted workflow or default-branch revision and never checks out, builds, imports, sources, or executes pull-request code. Event fields reach the script only through environment variables. It holds `pull-requests: write` and `issues: write` so it can move a pull request to draft and post or update its single explanation comment, and it makes no change unless the repository variable `PR_QUEUE_HYGIENE_ENFORCE` is `true`.
+
 ### Project Dashboard Planner (`project-dashboard-plan.yml`)
 
 Runs manually for a single issue number. It reads issue state and labels, then writes a report-only step summary proposing the existing Project Status value that best matches the issue.

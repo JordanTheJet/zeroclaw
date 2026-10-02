@@ -225,6 +225,19 @@ For replacements, require explicit `Supersedes #...`. See [Superseding PRs](./su
 
 The reviewer-side queue management, backlog pruning order, stale handling, label hygiene, is in [Reviewer Playbook](./reviewer-playbook.md).
 
+### Queue hygiene automation
+
+A ready pull request asks a reviewer for time, so `pr-queue-hygiene.yml` keeps the ready queue to work a reviewer can act on. It applies the same rules to every author:
+
+- **Linked work.** A pull request that is opened, reopened, or marked ready must link an issue, with a closing keyword or a `#N` reference to an issue in its description, or carry a `release:*` label. Bots, `ZeroClaw-Bot`, and Markdown-only changes of 50 lines or fewer are exempt.
+- **Ready limit.** An author may have at most 15 ready pull requests without a `release:*` label. Release-labeled work does not count toward the limit and is never held by it.
+- **Green before review.** When the Quality Gate fails on a pull request's current head, and that head has no later green run, the pull request returns to draft. Nothing moves while master's own latest Quality Gate is red, because a red master turns every pull request red.
+- **Idle drafts.** A weekly sweep comments once on drafts with no activity for 21 days, skipping `status:no-stale`. It does not close anything.
+
+A pull request held by the first three rules moves to draft with one comment that names the rule and the next step. The author marks it ready again after fixing the cause. The rules run only on those events, so existing ready pull requests are checked the next time they become ready.
+
+The workflow is report-only until a maintainer sets the repository variable `PR_QUEUE_HYGIENE_ENFORCE` to `true`. In report-only mode, it writes what it would do to the run summary and changes nothing. Retire a rule when the review queue no longer needs it, or replace it with a ruleset or check that enforces the same expectation.
+
 ## Security and stability rules
 
 Review these paths attentively because they often contain boundary-relevant behavior:
