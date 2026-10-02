@@ -146,6 +146,9 @@ pub struct SessionRecord {
     /// Generation of the live incarnation, when one is present. Operations
     /// re-validate this exact value at their admission boundary.
     pub live_generation: Option<u64>,
+    /// Creation time obtained from the authorized chat row. This request
+    /// identity is derived from the backend, never an independent cache.
+    pub durable_created_at: Option<String>,
     /// The durable row, when one exists.
     pub durable: Option<DurableSession>,
     /// The owning principal; `None` for legacy / unscoped-creator records.
@@ -1590,10 +1593,29 @@ impl SessionStore {
     /// caller authorized its predecessor is left untouched, and the caller
     /// learns the removal did not happen.
     pub async fn remove_generation(&self, id: &str, generation: u64) -> bool {
-        let mut sessions = self.sessions.lock().await;
-        if sessions.get(id).is_none_or(|s| s.generation != generation) {
-            return false;
+        match self
+            .remove_generation_authorized(id, generation, |_| Ok::<_, std::convert::Infallible>(()))
+            .await
+        {
+            Ok(removed) => removed.is_some(),
+            Err(never) => match never {},
         }
+    }
+
+    /// Authorize under the live map lock and retain the returned authority
+    /// through removal. The callback must be synchronous and must not acquire
+    /// the session map again.
+    pub(crate) async fn remove_generation_authorized<G, E>(
+        &self,
+        id: &str,
+        generation: u64,
+        authorize: impl FnOnce(&RpcSession) -> Result<G, E>,
+    ) -> Result<Option<Arc<Mutex<Agent>>>, E> {
+        let mut sessions = self.sessions.lock().await;
+        let Some(session) = sessions.get(id).filter(|s| s.generation == generation) else {
+            return Ok(None);
+        };
+        let authority = authorize(session)?;
         let mut tokens = self.cancel_tokens.lock().unwrap_or_else(|e| e.into_inner());
         let token = if tokens
             .get(id)
@@ -1608,14 +1630,17 @@ impl SessionStore {
             self.record_cancel_cause(id, CancelCause::SessionRemoved);
             token.cancel();
         }
-        let pending = sessions
-            .remove(id)
-            .and_then(|session| session.pending_generation);
+        let removed = sessions.remove(id);
+        let (agent, pending) = match removed {
+            Some(session) => (Some(session.agent), session.pending_generation),
+            None => (None, None),
+        };
+        drop(authority);
         drop(sessions);
         if let Some(notify) = pending {
             notify.notify_waiters();
         }
-        true
+        Ok(agent)
     }
 
     pub async fn evict_same_mode_sibling(
@@ -1973,18 +1998,39 @@ impl SessionStore {
         expected_generation: Option<u64>,
         cause: CancelCause,
     ) -> Option<bool> {
+        match self
+            .signal_cancellation_for_incarnation_authorized(id, expected_generation, cause, |_| {
+                Ok::<_, std::convert::Infallible>(())
+            })
+            .await
+        {
+            Ok(signalled) => signalled,
+            Err(never) => match never {},
+        }
+    }
+
+    /// Retain synchronous authority through the incarnation's cancellation
+    /// signal, under the same session map lock as its generation check.
+    pub(crate) async fn signal_cancellation_for_incarnation_authorized<G, E>(
+        &self,
+        id: &str,
+        expected_generation: Option<u64>,
+        cause: CancelCause,
+        authorize: impl FnOnce(Option<&RpcSession>) -> Result<G, E>,
+    ) -> Result<Option<bool>, E> {
         let sessions = self.sessions.lock().await;
         let current_generation = sessions.get(id).map(|session| session.generation);
         if current_generation != expected_generation {
-            return None;
+            return Ok(None);
         }
-        Some(
-            if cause == CancelCause::ClientRpc && expected_generation.is_none() {
-                self.signal_cancellation(id, cause)
-            } else {
-                self.signal_cancellation_for_generation(id, expected_generation, cause)
-            },
-        )
+        let authority = authorize(sessions.get(id))?;
+        let signalled = if cause == CancelCause::ClientRpc && expected_generation.is_none() {
+            self.signal_cancellation(id, cause)
+        } else {
+            self.signal_cancellation_for_generation(id, expected_generation, cause)
+        };
+        drop(authority);
+        Ok(Some(signalled))
     }
 
     /// Signal an in-flight turn before a close/delete handler waits for the

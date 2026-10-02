@@ -69,6 +69,14 @@ pub struct TimestampedMessage {
     pub created_at: Option<DateTime<Utc>>,
 }
 
+/// One consistent read of a durable chat row. Metadata, transcript and state
+/// come from the same backend transaction or mutation guard.
+pub struct SessionSnapshot {
+    pub metadata: SessionMetadata,
+    pub messages: Vec<TimestampedMessage>,
+    pub state: Option<SessionState>,
+}
+
 /// Trait for session persistence backends.
 /// Implementations must be `Send + Sync` for sharing across async tasks.
 pub trait SessionBackend: Send + Sync {
@@ -97,6 +105,33 @@ pub trait SessionBackend: Send + Sync {
                 created_at: None,
             })
             .collect()
+    }
+
+    /// Read metadata, transcript and state from one storage snapshot. A
+    /// backend without this boundary refuses rather than composing unrelated
+    /// owner and transcript reads.
+    fn read_session_snapshot(
+        &self,
+        _session_key: &str,
+    ) -> std::io::Result<Option<SessionSnapshot>> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "Session snapshots are unsupported",
+        ))
+    }
+
+    /// Delete only the row whose creation time and owner were authorized.
+    /// The comparison and deletion share the backend's write boundary.
+    fn delete_session_matching(
+        &self,
+        _session_key: &str,
+        _created_at: &str,
+        _owner: Option<&str>,
+    ) -> std::io::Result<bool> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "Conditional session deletion is unsupported",
+        ))
     }
 
     /// Append a single message to a session.
@@ -319,6 +354,14 @@ pub trait SessionBackend: Send + Sync {
         _context: SessionContext<'_>,
     ) -> std::io::Result<()> {
         Ok(())
+    }
+
+    /// Resolve metadata without treating a storage or parse failure as absence.
+    fn try_get_session_metadata(
+        &self,
+        session_key: &str,
+    ) -> std::io::Result<Option<SessionMetadata>> {
+        Ok(self.get_session_metadata(session_key))
     }
 
     fn get_session_metadata(&self, session_key: &str) -> Option<SessionMetadata> {

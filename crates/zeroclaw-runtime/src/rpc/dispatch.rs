@@ -1352,6 +1352,61 @@ impl RpcDispatcher {
         }
     }
 
+    fn replaced_session_error_with_grants(
+        &self,
+        grants: Option<&zeroclaw_api::grants::ResolvedGrants>,
+    ) -> JsonRpcError {
+        if self
+            .auth
+            .as_ref()
+            .is_some_and(|auth| auth.principal.is_authenticated())
+            && grants.is_some_and(|grants| !grants.admin)
+        {
+            rpc_err(
+                FORBIDDEN,
+                "Session not found or not owned by this principal",
+            )
+        } else {
+            rpc_err(SESSION_NOT_FOUND, "Session was replaced while it was read")
+        }
+    }
+
+    fn session_storage_error_with_grants(
+        &self,
+        message: String,
+        grants: Option<&zeroclaw_api::grants::ResolvedGrants>,
+    ) -> JsonRpcError {
+        if self
+            .auth
+            .as_ref()
+            .is_some_and(|auth| auth.principal.is_authenticated())
+            && grants.is_some_and(|grants| !grants.admin)
+        {
+            rpc_err(
+                FORBIDDEN,
+                "Session not found or not owned by this principal",
+            )
+        } else {
+            rpc_err(INTERNAL_ERROR, message)
+        }
+    }
+
+    fn resolve_session_metadata_error(&self, error: std::io::Error) -> JsonRpcError {
+        let lease = self.ctx.auth.hold_authority();
+        let grants = self
+            .auth
+            .as_ref()
+            .map(|auth| lease.current_grants(auth))
+            .transpose();
+        match grants {
+            Ok(grants) => self.session_storage_error_with_grants(
+                format!("Failed to resolve session metadata: {error}"),
+                grants.as_ref(),
+            ),
+            Err(denied) => rpc_err(denied.code, denied.message),
+        }
+    }
+
     /// The ownership decision for a session operation that awaited anything
     /// (its admission, the session lookups) between its authorization and
     /// its effect, made at the effect with the grants in force now.
@@ -1369,26 +1424,82 @@ impl RpcDispatcher {
         record: Option<&SessionRecord>,
         authorized: Option<&SessionRecord>,
     ) -> Result<(), JsonRpcError> {
-        // Only the direct unit-test handlers run unbound.
-        let (Some(grants), Some(auth)) = (
-            self.recheck_authority_after_admission(method)?,
-            self.auth.as_ref(),
-        ) else {
-            return Ok(());
+        let lease = self.ctx.auth.hold_authority();
+        self.authorize_admitted_owner_under(method, record, authorized, &lease)
+            .map(|_| ())
+    }
+
+    fn authorize_admitted_owner_under(
+        &self,
+        method: Method,
+        record: Option<&SessionRecord>,
+        authorized: Option<&SessionRecord>,
+        lease: &crate::rpc::auth::AuthorityLease<'_>,
+    ) -> Result<Option<zeroclaw_api::grants::ResolvedGrants>, JsonRpcError> {
+        let Some(auth) = self.auth.as_ref() else {
+            return Ok(None);
         };
+        let grants = current_authority_under(lease, auth, method).map_err(|denied| {
+            self.audit_auth_denial(method, &denied);
+            rpc_err(denied.code, denied.message)
+        })?;
         if grants.admin || !auth.principal.is_authenticated() {
-            return Ok(());
+            return Ok(Some(grants));
         }
         let mine = auth.principal.id.as_str();
         let owned = record.is_some_and(|record| record.owner.as_deref() == Some(mine));
         if owned || (record.is_none() && authorized.is_none()) {
-            return Ok(());
+            return Ok(Some(grants));
         }
         let denied = crate::rpc::auth::AuthDenied::forbidden(
             "Session not found or not owned by this principal",
         );
         self.audit_auth_denial(method, &denied);
         Err(rpc_err(denied.code, denied.message))
+    }
+
+    fn with_session_effect<T>(
+        &self,
+        method: Method,
+        record: Option<&SessionRecord>,
+        authorized: Option<&SessionRecord>,
+        effect: impl FnOnce(Option<&zeroclaw_api::grants::ResolvedGrants>) -> Result<T, JsonRpcError>,
+    ) -> Result<T, JsonRpcError> {
+        let lease = self.ctx.auth.hold_authority();
+        let grants = self.authorize_admitted_owner_under(method, record, authorized, &lease)?;
+        effect(grants.as_ref())
+    }
+
+    fn read_chat_snapshot(
+        &self,
+        key: &str,
+        record: Option<&SessionRecord>,
+        method: Method,
+    ) -> Result<Option<zeroclaw_infra::session_backend::SessionSnapshot>, JsonRpcError> {
+        self.with_session_effect(method, record, record, |grants| {
+            let backend = self
+                .ctx
+                .session_backend
+                .as_ref()
+                .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Session persistence is disabled"))?;
+            let snapshot = backend.read_session_snapshot(key).map_err(|error| {
+                self.session_storage_error_with_grants(
+                    format!("Failed to read session snapshot: {error}"),
+                    grants,
+                )
+            })?;
+            match (&snapshot, record) {
+                (Some(value), Some(record))
+                    if value.metadata.principal_id == record.owner
+                        && Some(value.metadata.created_at.to_rfc3339()).as_ref()
+                            == record.durable_created_at.as_ref() =>
+                {
+                    Ok(snapshot)
+                }
+                (None, None) => Ok(None),
+                _ => Err(self.replaced_session_error_with_grants(grants)),
+            }
+        })
     }
 
     /// Re-establish the caller's authority to write `path` after the config
@@ -2155,6 +2266,7 @@ impl RpcDispatcher {
             owners.push(owner.clone());
         }
         let mut chat_durable: Option<DurableSession> = None;
+        let mut chat_created_at = None;
         let mut has_acp = false;
         if let Some(backend) = self.ctx.session_backend.as_ref() {
             for key in [
@@ -2162,9 +2274,13 @@ impl RpcDispatcher {
                 format!("gw_{session_id}"),
                 session_id.to_string(),
             ] {
-                if let Some(meta) = backend.get_session_metadata(&key) {
+                if let Some(meta) = backend
+                    .try_get_session_metadata(&key)
+                    .map_err(|error| self.resolve_session_metadata_error(error))?
+                {
                     owners.push(meta.principal_id);
                     if chat_durable.is_none() {
+                        chat_created_at = Some(meta.created_at.to_rfc3339());
                         chat_durable = Some(DurableSession::Chat { key });
                     }
                 }
@@ -2228,6 +2344,9 @@ impl RpcDispatcher {
         };
         Ok(Some(SessionRecord {
             live_generation: live.map(|(_, generation, _)| generation),
+            durable_created_at: matches!(&durable, Some(DurableSession::Chat { .. }))
+                .then_some(chat_created_at)
+                .flatten(),
             durable,
             owner: first,
         }))
@@ -2274,11 +2393,12 @@ impl RpcDispatcher {
                 .filter(|(_, _, mode)| address.covers(mode)),
             None => None,
         };
-        let meta = self
-            .ctx
-            .session_backend
-            .as_ref()
-            .and_then(|backend| backend.get_session_metadata(key));
+        let meta = match self.ctx.session_backend.as_ref() {
+            Some(backend) => backend
+                .try_get_session_metadata(key)
+                .map_err(|error| self.resolve_session_metadata_error(error))?,
+            None => None,
+        };
         let owners: Vec<Option<String>> = live
             .iter()
             .map(|(owner, _, _)| owner.clone())
@@ -2292,6 +2412,7 @@ impl RpcDispatcher {
         }
         Ok(Some(SessionRecord {
             live_generation: live.map(|(_, generation, _)| generation),
+            durable_created_at: meta.as_ref().map(|meta| meta.created_at.to_rfc3339()),
             durable: meta.map(|_| DurableSession::Chat {
                 key: key.to_owned(),
             }),
@@ -2486,6 +2607,20 @@ impl RpcDispatcher {
             .resolve_address(address, selected_mode.as_ref())
             .await?;
         let scope = self.scoped_principal_id();
+        if let Some(created) = authorized.and_then(|record| record.durable_created_at.as_deref())
+            && Some(created)
+                != current
+                    .as_ref()
+                    .and_then(|record| record.durable_created_at.as_deref())
+        {
+            return Err(match scope {
+                Some(_) => rpc_err(
+                    FORBIDDEN,
+                    "Session not found or not owned by this principal",
+                ),
+                None => self.stale_session_incarnation_error(),
+            });
+        }
         if let Some(mine) = scope.as_deref()
             && current
                 .as_ref()
@@ -7603,26 +7738,60 @@ impl RpcDispatcher {
                     )
                     .await?;
                     if supported {
-                        recover_acp_checkpoint(
-                            Arc::clone(store),
-                            &req.session_id,
-                            expected_owner.clone(),
-                        )
+                        let store = Arc::clone(store);
+                        let authority = Arc::clone(&self.ctx.auth);
+                        let auth = self.auth.clone();
+                        let sid = req.session_id.clone();
+                        let owner = expected_owner.clone();
+                        let marker =
+                            crate::i18n::get_required_cli_string("turn-stream-interrupted");
+                        tokio::task::spawn_blocking(move || {
+                            let lease = authority.hold_authority();
+                            if let Some(auth) = auth.as_ref() {
+                                let grants =
+                                    current_authority_under(&lease, auth, Method::SessionMessages)
+                                        .map_err(|denied| rpc_err(denied.code, denied.message))?;
+                                if !grants.admin
+                                    && auth.principal.is_authenticated()
+                                    && owner.as_deref() != Some(auth.principal.id.as_str())
+                                {
+                                    return Err(rpc_err(
+                                        FORBIDDEN,
+                                        "Session not found or not owned by this principal",
+                                    ));
+                                }
+                            }
+                            store
+                                .recover_turn_checkpoint_for_owner(&sid, &marker, owner.as_deref())
+                                .map_err(|error| {
+                                    rpc_err(
+                                        INTERNAL_ERROR,
+                                        format!("Failed to recover interrupted ACP turn: {error}"),
+                                    )
+                                })
+                        })
                         .await
-                        .map_err(|error| {
+                        .map_err(|join| {
                             rpc_err(
                                 INTERNAL_ERROR,
-                                format!("Failed to recover interrupted ACP turn: {error}"),
+                                format!("Failed to recover interrupted ACP turn: {join}"),
                             )
-                        })?;
+                        })??;
                     }
                 }
                 if cursor_mode {
-                    match store.load_message_page(
-                        &req.session_id,
-                        req.limit.unwrap_or(100),
-                        req.cursor.as_deref(),
-                    ) {
+                    match self.with_session_effect(
+                        Method::SessionMessages,
+                        record.as_ref(),
+                        authorized.as_ref(),
+                        |_grants| {
+                            Ok(store.load_message_page(
+                                &req.session_id,
+                                req.limit.unwrap_or(100),
+                                req.cursor.as_deref(),
+                            ))
+                        },
+                    )? {
                         Ok(page) => {
                             if page.principal_id != expected_owner {
                                 return Err(rpc_err(
@@ -7681,24 +7850,14 @@ impl RpcDispatcher {
                         "cursor pagination requires an ACP session",
                     ));
                 }
-                let backend =
-                    self.ctx.session_backend.as_ref().ok_or_else(|| {
-                        rpc_err(INTERNAL_ERROR, "Session persistence is disabled")
-                    })?;
-                // The row's creation time names this row: a row removed and
-                // recreated under the same key has a new one. Read it on both
-                // sides of the load, so a replacement during the read is
-                // refused rather than reported under the old row's name.
-                let created_at = |key: &str| {
-                    backend
-                        .get_session_metadata(key)
-                        .map(|meta| meta.created_at.to_rfc3339())
-                };
-                row_created_at = created_at(&key);
-                let rows = backend.load_with_timestamps(&key);
-                if created_at(&key) != row_created_at {
-                    return Err(self.replaced_session_error());
-                }
+                let snapshot =
+                    self.read_chat_snapshot(&key, record.as_ref(), Method::SessionMessages)?;
+                row_created_at = snapshot
+                    .as_ref()
+                    .map(|snapshot| snapshot.metadata.created_at.to_rfc3339());
+                let rows = snapshot
+                    .map(|snapshot| snapshot.messages)
+                    .unwrap_or_default();
                 rows.into_iter()
                     .map(|row| MessageEntry {
                         role: row.message.role,
@@ -7744,12 +7903,19 @@ impl RpcDispatcher {
             // Cursor mode intentionally does not serialize legacy `total` or
             // `start`: obtaining either exact value would require an
             // unbounded full-history projection.
-            return to_result(serde_json::json!({
-                "session_id": req.session_id,
-                "messages": messages,
-                "next_cursor": next_cursor,
-                "has_older": has_older,
-            }));
+            return self.with_session_effect(
+                Method::SessionMessages,
+                record.as_ref(),
+                authorized.as_ref(),
+                |_grants| {
+                    to_result(serde_json::json!({
+                        "session_id": req.session_id,
+                        "messages": messages,
+                        "next_cursor": next_cursor,
+                        "has_older": has_older,
+                    }))
+                },
+            );
         }
 
         let total = messages.len();
@@ -7774,19 +7940,26 @@ impl RpcDispatcher {
         }
         let messages = messages[start..end].to_vec();
 
-        to_result(SessionMessagesResult {
-            session_id: req.session_id,
-            messages,
-            total,
-            start,
-            next_cursor: None,
-            has_older: None,
-            session_key: match &address {
-                SessionAddress::ChatKey(key) => Some(key.clone()),
-                SessionAddress::Id(_) => None,
+        self.with_session_effect(
+            Method::SessionMessages,
+            record.as_ref(),
+            authorized.as_ref(),
+            |_grants| {
+                to_result(SessionMessagesResult {
+                    session_id: req.session_id,
+                    messages,
+                    total,
+                    start,
+                    next_cursor: None,
+                    has_older: None,
+                    session_key: match &address {
+                        SessionAddress::ChatKey(key) => Some(key.clone()),
+                        SessionAddress::Id(_) => None,
+                    },
+                    session_created_at: row_created_at,
+                })
             },
-            session_created_at: row_created_at,
-        })
+        )
     }
 
     async fn handle_session_state(&self, params: &Value) -> RpcResult {
@@ -7823,51 +7996,53 @@ impl RpcDispatcher {
             }
             self.ensure_address_incarnation(&address, expected_generation)
                 .await?;
-            return to_result(SessionStateResult {
-                session_id: req.session_id,
-                state: if turn_generation.is_some() || queued {
-                    "running"
-                } else {
-                    "idle"
-                }
-                .to_string(),
-                turn_id: turn_generation.map(|generation| generation.to_string()),
-                turn_started_at: None,
-                plan,
-            });
+            return self.with_session_effect(
+                Method::SessionState,
+                record.as_ref(),
+                record.as_ref(),
+                |_grants| {
+                    to_result(SessionStateResult {
+                        session_id: req.session_id,
+                        state: if turn_generation.is_some() || queued {
+                            "running"
+                        } else {
+                            "idle"
+                        }
+                        .to_string(),
+                        turn_id: turn_generation.map(|generation| generation.to_string()),
+                        turn_started_at: None,
+                        plan,
+                    })
+                },
+            );
         }
 
-        // Gateway/legacy sessions that are not live in the RPC session store
-        // retain their persisted-state fallback, read from exactly the chat
-        // row the resolver authorized. Chat and ACP sessions above must never
-        // use this metadata as a live-turn barrier.
-        let backend = self
-            .ctx
-            .session_backend
-            .as_ref()
-            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Session persistence is disabled"))?;
-        if let Some(DurableSession::Chat { key }) = record.and_then(|r| r.durable) {
-            match backend.get_session_state(&key) {
-                Ok(Some(ss)) => {
-                    self.ensure_address_incarnation(&address, expected_generation)
-                        .await?;
-                    return to_result(SessionStateResult {
-                        session_id: req.session_id,
-                        state: ss.state,
-                        turn_id: ss.turn_id,
-                        turn_started_at: ss.turn_started_at.map(|t| t.to_rfc3339()),
-                        plan: None,
-                    });
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    return Err(rpc_err(
-                        INTERNAL_ERROR,
-                        format!("Failed to get session state: {e}"),
-                    ));
-                }
+        if self.ctx.session_backend.is_none() {
+            return Err(rpc_err(INTERNAL_ERROR, "Session persistence is disabled"));
+        }
+        if let Some(DurableSession::Chat { key }) = record.as_ref().and_then(|r| r.durable.as_ref())
+        {
+            let snapshot = self.read_chat_snapshot(key, record.as_ref(), Method::SessionState)?;
+            if let Some(ss) = snapshot.and_then(|snapshot| snapshot.state) {
+                self.ensure_address_incarnation(&address, expected_generation)
+                    .await?;
+                return self.with_session_effect(
+                    Method::SessionState,
+                    record.as_ref(),
+                    record.as_ref(),
+                    |_grants| {
+                        to_result(SessionStateResult {
+                            session_id: req.session_id,
+                            state: ss.state,
+                            turn_id: ss.turn_id,
+                            turn_started_at: ss.turn_started_at.map(|t| t.to_rfc3339()),
+                            plan: None,
+                        })
+                    },
+                );
             }
         }
+
         Err(rpc_err(SESSION_NOT_FOUND, "Session not found"))
     }
 
@@ -7900,12 +8075,32 @@ impl RpcDispatcher {
         if let Some(live_id) = self.covered_live_id(&address).await {
             self.ctx
                 .sessions
-                .signal_cancellation_for_incarnation(
+                .signal_cancellation_for_incarnation_authorized(
                     live_id,
                     expected_generation,
                     crate::rpc::session::CancelCause::SessionRemoved,
+                    |session| {
+                        if session.is_some_and(|session| {
+                            Some(&session.owner_principal_id)
+                                != authorized.as_ref().map(|record| &record.owner)
+                        }) {
+                            return Err(self.replaced_session_error());
+                        }
+                        let lease = self.ctx.auth.hold_authority();
+                        self.authorize_admitted_owner_under(
+                            Method::SessionDelete,
+                            authorized.as_ref(),
+                            authorized.as_ref(),
+                            &lease,
+                        )?;
+                        self.admit_session_snapshot(
+                            session
+                                .map(|session| (session.generation, session.owner_tui_id.clone())),
+                        )?;
+                        Ok(lease)
+                    },
                 )
-                .await
+                .await?
                 .ok_or_else(|| self.stale_session_incarnation_error())?;
         }
         self.ctx.sessions.notify_test_removal_signal_attempted();
@@ -7966,65 +8161,187 @@ impl RpcDispatcher {
         // Delete the durable record first. A storage failure must leave the
         // live session available rather than silently dropping its owner.
         let expected_owner = record.as_ref().and_then(|record| record.owner.clone());
-        let durable_deleted = match record.as_ref().and_then(|r| r.durable.clone()) {
-            Some(DurableSession::Acp) => {
-                let store =
-                    self.ctx.acp_session_store.clone().ok_or_else(|| {
+        let durable_deleted = if record
+            .as_ref()
+            .and_then(|record| record.live_generation)
+            .is_none()
+        {
+            match record.as_ref().and_then(|r| r.durable.clone()) {
+                Some(DurableSession::Acp) => {
+                    let store = self.ctx.acp_session_store.clone().ok_or_else(|| {
                         rpc_err(INTERNAL_ERROR, "ACP session store is not available")
                     })?;
-                let sid = req.session_id.clone();
-                let owner = expected_owner.clone();
-                tokio::task::spawn_blocking(move || match owner.as_deref() {
-                    Some(owner) => store.delete_session_owned(&sid, owner),
-                    None => store.delete_session(&sid),
-                })
-                .await
-                .map_err(|join| {
-                    rpc_err(
-                        INTERNAL_ERROR,
-                        format!("Failed to delete ACP session: {join}"),
-                    )
-                })?
-                .map_err(|e| {
-                    rpc_err(INTERNAL_ERROR, format!("Failed to delete ACP session: {e}"))
-                })?
-            }
-            Some(DurableSession::Chat { key }) => {
-                let backend =
-                    self.ctx.session_backend.as_ref().ok_or_else(|| {
+                    let sid = req.session_id.clone();
+                    let owner = expected_owner.clone();
+                    let authority = Arc::clone(&self.ctx.auth);
+                    let auth = self.auth.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let lease = authority.hold_authority();
+                        if let Some(auth) = auth.as_ref() {
+                            let grants =
+                                current_authority_under(&lease, auth, Method::SessionDelete)
+                                    .map_err(|denied| rpc_err(denied.code, denied.message))?;
+                            if !grants.admin
+                                && auth.principal.is_authenticated()
+                                && owner.as_deref() != Some(auth.principal.id.as_str())
+                            {
+                                return Err(rpc_err(
+                                    FORBIDDEN,
+                                    "Session not found or not owned by this principal",
+                                ));
+                            }
+                        }
+                        match owner.as_deref() {
+                            Some(owner) => store.delete_session_owned(&sid, owner),
+                            None => store.delete_session(&sid),
+                        }
+                        .map_err(|error| {
+                            rpc_err(
+                                INTERNAL_ERROR,
+                                format!("Failed to delete ACP session: {error}"),
+                            )
+                        })
+                    })
+                    .await
+                    .map_err(|join| {
+                        rpc_err(
+                            INTERNAL_ERROR,
+                            format!("Failed to delete ACP session: {join}"),
+                        )
+                    })??
+                }
+                Some(DurableSession::Chat { key }) => {
+                    let backend = self.ctx.session_backend.as_ref().ok_or_else(|| {
                         rpc_err(INTERNAL_ERROR, "Session persistence is disabled")
                     })?;
-                match expected_owner.as_deref() {
-                    Some(owner) => backend.delete_session_owned(&key, owner),
-                    None => backend.delete_session(&key),
+                    let created_at = record
+                        .as_ref()
+                        .and_then(|record| record.durable_created_at.as_deref())
+                        .ok_or_else(|| self.replaced_session_error())?;
+                    self.with_session_effect(
+                        Method::SessionDelete,
+                        record.as_ref(),
+                        authorized.as_ref(),
+                        |grants| {
+                            let deleted = backend
+                                .delete_session_matching(
+                                    &key,
+                                    created_at,
+                                    expected_owner.as_deref(),
+                                )
+                                .map_err(|e| {
+                                    rpc_err(
+                                        INTERNAL_ERROR,
+                                        format!("Failed to delete session: {e}"),
+                                    )
+                                })?;
+                            if deleted {
+                                Ok(true)
+                            } else {
+                                Err(self.replaced_session_error_with_grants(grants))
+                            }
+                        },
+                    )?
                 }
-                .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Failed to delete session: {e}")))?
+                None => false,
             }
-            None => false,
+        } else {
+            false
         };
         // A live generation is only ever resolved for an address that covers
         // a live session, so it has a live id here.
         let live_id = address.live_id().unwrap_or_default();
         let live_removed = match record.as_ref().and_then(|r| r.live_generation) {
             Some(generation) => {
-                if let Some(agent) = self.ctx.sessions.get_agent(live_id).await {
-                    agent
-                        .lock()
-                        .await
-                        .channel_handles()
-                        .unregister_channel("rpc");
-                }
                 self.ctx
                     .sessions
-                    .remove_generation(live_id, generation)
-                    .await
+                    .remove_generation_authorized(live_id, generation, |session| {
+                        if Some(&session.owner_principal_id)
+                            != record.as_ref().map(|record| &record.owner)
+                        {
+                            return Err(self.replaced_session_error());
+                        }
+                        let lease = self.ctx.auth.hold_authority();
+                        self.authorize_admitted_owner_under(
+                            Method::SessionDelete,
+                            record.as_ref(),
+                            authorized.as_ref(),
+                            &lease,
+                        )?;
+                        self.admit_session_snapshot(Some((
+                            session.generation,
+                            session.owner_tui_id.clone(),
+                        )))?;
+                        // Storage and live-map removal commit under this one
+                        // authority hold, after the map's generation check.
+                        match record.as_ref().and_then(|record| record.durable.as_ref()) {
+                            Some(DurableSession::Chat { key }) => {
+                                let backend =
+                                    self.ctx.session_backend.as_ref().ok_or_else(|| {
+                                        rpc_err(INTERNAL_ERROR, "Session persistence is disabled")
+                                    })?;
+                                let created = record
+                                    .as_ref()
+                                    .and_then(|record| record.durable_created_at.as_deref())
+                                    .ok_or_else(|| self.replaced_session_error())?;
+                                let deleted = backend
+                                    .delete_session_matching(
+                                        key,
+                                        created,
+                                        expected_owner.as_deref(),
+                                    )
+                                    .map_err(|error| {
+                                        rpc_err(
+                                            INTERNAL_ERROR,
+                                            format!("Failed to delete session: {error}"),
+                                        )
+                                    })?;
+                                if !deleted {
+                                    return Err(self.replaced_session_error());
+                                }
+                            }
+                            Some(DurableSession::Acp) => {
+                                let store =
+                                    self.ctx.acp_session_store.as_ref().ok_or_else(|| {
+                                        rpc_err(
+                                            INTERNAL_ERROR,
+                                            "ACP session store is not available",
+                                        )
+                                    })?;
+                                match expected_owner.as_deref() {
+                                    Some(owner) => {
+                                        store.delete_session_owned(&req.session_id, owner)
+                                    }
+                                    None => store.delete_session(&req.session_id),
+                                }
+                                .map_err(|error| {
+                                    rpc_err(
+                                        INTERNAL_ERROR,
+                                        format!("Failed to delete ACP session: {error}"),
+                                    )
+                                })?;
+                            }
+                            None => {}
+                        }
+                        Ok(lease)
+                    })
+                    .await?
             }
-            None => false,
+            None => None,
         };
-        if live_removed && let Some(ref hooks) = self.ctx.hooks {
+        if let Some(agent) = &live_removed {
+            agent
+                .lock()
+                .await
+                .channel_handles()
+                .unregister_channel("rpc");
+        }
+        if live_removed.is_some()
+            && let Some(ref hooks) = self.ctx.hooks
+        {
             hooks.fire_session_end(live_id, "rpc").await;
         }
-        if !live_removed && !durable_deleted {
+        if live_removed.is_none() && !durable_deleted {
             return Err(rpc_err(SESSION_NOT_FOUND, "Session not found"));
         }
         to_result(SessionDeleteResult {
@@ -42901,6 +43218,331 @@ mod tests {
             .await
             .expect("an aborted shutdown must still end the prompt it was joining")
             .expect_err("the prompt must be aborted rather than run to completion");
+    }
+
+    struct SnapshotHookBackend {
+        inner: Arc<dyn zeroclaw_infra::session_backend::SessionBackend>,
+        hook: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    }
+    impl zeroclaw_infra::session_backend::SessionBackend for SnapshotHookBackend {
+        fn load(&self, key: &str) -> Vec<zeroclaw_api::model_provider::ChatMessage> {
+            self.inner.load(key)
+        }
+        fn append(
+            &self,
+            key: &str,
+            message: &zeroclaw_api::model_provider::ChatMessage,
+        ) -> std::io::Result<()> {
+            self.inner.append(key, message)
+        }
+        fn remove_last(&self, key: &str) -> std::io::Result<bool> {
+            self.inner.remove_last(key)
+        }
+        fn list_sessions(&self) -> Vec<String> {
+            self.inner.list_sessions()
+        }
+        fn get_session_metadata(
+            &self,
+            key: &str,
+        ) -> Option<zeroclaw_infra::session_backend::SessionMetadata> {
+            self.inner.get_session_metadata(key)
+        }
+        fn read_session_snapshot(
+            &self,
+            key: &str,
+        ) -> std::io::Result<Option<zeroclaw_infra::session_backend::SessionSnapshot>> {
+            if let Some(hook) = self.hook.lock().unwrap().take() {
+                hook();
+            }
+            self.inner.read_session_snapshot(key)
+        }
+    }
+
+    #[tokio::test]
+    async fn unchanged_jsonl_transcripts_work_by_id_and_exact_key() {
+        use zeroclaw_infra::session_backend::SessionBackend as _;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let corrupt = config.data_dir.join("sessions/rpc_broken.jsonl");
+        let backend =
+            Arc::new(zeroclaw_infra::session_store::SessionStore::new(&config.data_dir).unwrap());
+        backend
+            .append(
+                "rpc_alpha",
+                &zeroclaw_api::model_provider::ChatMessage::user("unchanged JSONL"),
+            )
+            .unwrap();
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(
+            16,
+            Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
+                4, 10, 60,
+            )),
+        ));
+        let ctx = RpcContext::for_persistence_tests(config, sessions, Some(backend.clone()), None);
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let mut dispatcher = RpcDispatcher::new(ctx, tx, "unix:jsonl".into());
+        dispatcher.set_authenticated_for_test();
+        let first = backend
+            .get_session_metadata("rpc_alpha")
+            .unwrap()
+            .created_at;
+        for params in [
+            json!({"session_id":"alpha"}),
+            json!({"session_id":"alpha", "session_keys":["rpc_alpha"]}),
+        ] {
+            let result = dispatcher.handle_session_messages(&params).await.unwrap();
+            assert_eq!(result["messages"][0]["content"], "unchanged JSONL");
+            assert_eq!(
+                backend
+                    .get_session_metadata("rpc_alpha")
+                    .unwrap()
+                    .created_at,
+                first
+            );
+        }
+        std::fs::write(corrupt, "not a JSON message\n").unwrap();
+        for params in [
+            json!({"session_id":"broken"}),
+            json!({"session_id":"broken", "session_keys":["rpc_broken"]}),
+        ] {
+            assert_eq!(
+                dispatcher
+                    .handle_session_messages(&params)
+                    .await
+                    .unwrap_err()
+                    .code,
+                INTERNAL_ERROR,
+                "corruption is not an empty transcript"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_key_delete_rechecks_tui_ownership_when_the_generation_is_unchanged() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (local_seed, sessions, backend, _) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        let ctx = Arc::clone(&local_seed.ctx);
+        let (remote, _rx) = make_remote_dispatcher(Arc::clone(&ctx), "old-owner");
+        let sid = remote
+            .handle_session_new_for_test(&json!({"agent_alias":"test-agent"}))
+            .await
+            .unwrap()["session_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let generation = sessions.get_generation(&sid).await.unwrap();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (captured, release, _) = sessions.set_test_removal_signal_pause();
+        let deletion_sid = sid.clone();
+        let deletion = zeroclaw_spawn::spawn!(async move {
+            remote
+                .handle_session_delete(
+                    &json!({"session_id":deletion_sid, "session_keys":[format!("rpc_{deletion_sid}")]}),
+                )
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), captured.notified())
+            .await
+            .unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let mut local = RpcDispatcher::new(ctx, tx, "unix:new-owner".into());
+        local.set_authenticated_for_test();
+        local.set_tui_id_for_test(Some("new-owner".into()));
+        local
+            .handle_session_new_for_test(&json!({"agent_alias":"test-agent", "session_id":sid}))
+            .await
+            .unwrap();
+        assert_eq!(sessions.get_generation(&sid).await, Some(generation));
+        assert_eq!(
+            sessions.session_owner_tui_id(&sid).await,
+            Some(Some("new-owner".into()))
+        );
+        sessions.register_cancel_token_for_generation_for_test(&sid, generation, cancel.clone());
+        release.notify_one();
+        assert_eq!(deletion.await.unwrap().unwrap_err().code, SESSION_NOT_OWNED);
+        assert!(!cancel.is_cancelled());
+        assert!(sessions.get_agent(&sid).await.is_some());
+        assert!(
+            zeroclaw_infra::session_backend::SessionBackend::session_exists(
+                &*backend,
+                &format!("rpc_{sid}")
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn corrupt_foreign_metadata_is_indistinguishable_from_a_missing_session() {
+        use zeroclaw_infra::session_backend::SessionBackend as _;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = two_user_config(&tmp);
+        let backend = Arc::new(
+            zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(&config.data_dir).unwrap(),
+        );
+        backend
+            .append(
+                "gw_hidden",
+                &zeroclaw_api::model_provider::ChatMessage::user("bob's message"),
+            )
+            .unwrap();
+        backend
+            .set_session_principal("gw_hidden", "user:bob")
+            .unwrap();
+        let conn =
+            rusqlite::Connection::open(config.data_dir.join("sessions/sessions.db")).unwrap();
+        conn.execute("UPDATE session_metadata SET created_at = 'not a timestamp' WHERE session_key = 'gw_hidden'", []).unwrap();
+        drop(conn);
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(
+            16,
+            Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
+                4, 10, 60,
+            )),
+        ));
+        let ctx = RpcContext::for_persistence_tests(config, sessions, Some(backend.clone()), None);
+        let alice = scoped_dispatcher(&ctx, 4242).await;
+        for params in [
+            json!({"session_id":"hidden"}),
+            json!({"session_id":"hidden", "session_keys":["gw_hidden"]}),
+            json!({"session_id":"missing"}),
+        ] {
+            let denied = alice.handle_session_messages(&params).await.unwrap_err();
+            assert_eq!(denied.code, FORBIDDEN);
+            assert_eq!(
+                denied.message,
+                "Session not found or not owned by this principal"
+            );
+        }
+        assert_eq!(backend.load("gw_hidden")[0].content, "bob's message");
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_refuses_a_durable_row_replaced_after_authorization() {
+        use zeroclaw_infra::session_backend::SessionBackend as _;
+        for method in [Method::SessionMessages, Method::SessionState] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config = two_user_config(&tmp);
+            let backend = Arc::new(
+                zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(&config.data_dir)
+                    .unwrap(),
+            );
+            backend
+                .append(
+                    "gw_boundary",
+                    &zeroclaw_api::model_provider::ChatMessage::user("alice's message"),
+                )
+                .unwrap();
+            backend
+                .set_session_principal("gw_boundary", "user:alice")
+                .unwrap();
+            backend
+                .set_session_state("gw_boundary", "idle", None)
+                .unwrap();
+            let writer = backend.clone();
+            let wrapped = Arc::new(SnapshotHookBackend {
+                inner: backend.clone(),
+                hook: std::sync::Mutex::new(Some(Box::new(move || {
+                    writer.delete_session("gw_boundary").unwrap();
+                    writer
+                        .append(
+                            "gw_boundary",
+                            &zeroclaw_api::model_provider::ChatMessage::user("bob's replacement"),
+                        )
+                        .unwrap();
+                    writer
+                        .set_session_principal("gw_boundary", "user:bob")
+                        .unwrap();
+                    writer
+                        .set_session_state("gw_boundary", "running", Some("bob-turn"))
+                        .unwrap();
+                }))),
+            });
+            let sessions = Arc::new(crate::rpc::session::SessionStore::new(
+                16,
+                Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
+                    4, 10, 60,
+                )),
+            ));
+            let ctx = RpcContext::for_persistence_tests(config, sessions, Some(wrapped), None);
+            let alice = scoped_dispatcher(&ctx, 4242).await;
+            let params = json!({"session_id":"boundary", "session_keys":["gw_boundary"]});
+            let result = match method {
+                Method::SessionMessages => alice.handle_session_messages(&params).await,
+                _ => alice.handle_session_state(&params).await,
+            };
+            let denied = result.expect_err("the replacement's contents and state stay private");
+            assert_eq!(denied.code, FORBIDDEN, "{method:?}: {denied:?}");
+            assert_eq!(
+                denied.message,
+                "Session not found or not owned by this principal"
+            );
+            assert_eq!(backend.load("gw_boundary")[0].content, "bob's replacement");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_holds_authority_until_the_storage_effect_completes() {
+        use zeroclaw_infra::session_backend::SessionBackend as _;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = admin_roster_config(&tmp);
+        let backend = Arc::new(
+            zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(&config.data_dir).unwrap(),
+        );
+        backend
+            .append(
+                "gw_boundary",
+                &zeroclaw_api::model_provider::ChatMessage::user("alice's message"),
+            )
+            .unwrap();
+        backend
+            .set_session_principal("gw_boundary", "user:alice")
+            .unwrap();
+        let wrapped = Arc::new(SnapshotHookBackend {
+            inner: backend,
+            hook: std::sync::Mutex::new(None),
+        });
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(
+            16,
+            Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
+                4, 10, 60,
+            )),
+        ));
+        let ctx = RpcContext::for_persistence_tests(config, sessions, Some(wrapped.clone()), None);
+        let carol = scoped_dispatcher(&ctx, 4545).await;
+        let auth = Arc::clone(&ctx.auth);
+        let mut narrower = ctx.config.read().clone();
+        narrower.permission_profiles.get_mut("lead").unwrap().admin = false;
+        let worker = Arc::new(std::sync::Mutex::new(None));
+        let join = worker.clone();
+        *wrapped.hook.lock().unwrap() = Some(Box::new(move || {
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            *join.lock().unwrap() = Some(std::thread::spawn(move || {
+                started_tx.send(()).unwrap();
+                auth.refresh_from_config(&narrower).unwrap();
+                let _ = done_tx.send(());
+            }));
+            started_rx.recv().unwrap();
+            assert!(
+                matches!(
+                    done_rx.recv_timeout(std::time::Duration::from_millis(200)),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                ),
+                "policy publication cannot complete inside the storage effect"
+            );
+        }));
+        let result = carol
+            .handle_session_messages(
+                &json!({"session_id":"boundary", "session_keys":["gw_boundary"]}),
+            )
+            .await;
+        worker.lock().unwrap().take().unwrap().join().unwrap();
+        assert_eq!(
+            result.unwrap_err().code,
+            FORBIDDEN,
+            "the completed demotion also gates the final response"
+        );
     }
 
     // ── Exact chat-row addressing (`session_keys`) ───────────────────
