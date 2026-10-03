@@ -170,7 +170,7 @@ docker build -t zeroclaw:local -f Dockerfile.debian .
   [wsl2]
   networkingMode=mirrored
   ```
-- **Daemon under Docker, not Task Scheduler.** Inside the container there is no Windows Task Scheduler. Use Docker's [restart policy](https://docs.docker.com/engine/containers/start-containers-automatically/), `--restart=unless-stopped` as in the example above, for daemon-mode startup. The published image runs as PID 1 / nonroot user; the container *is* the service; don't run `zeroclaw service install` inside it.
+- **Daemon under Docker, not Task Scheduler.** Inside the container there is no Windows Task Scheduler. Use Docker's [restart policy](https://docs.docker.com/engine/containers/start-containers-automatically/), `--restart=unless-stopped` as in the example above, for daemon-mode startup. The published image runs as PID 1 / nonroot user; the container _is_ the service; don't run `zeroclaw service install` inside it.
 - **Skill sandbox via host Docker socket.** ZeroClaw's skill-execution sandbox can shell out to Docker. If you're running ZeroClaw itself in a container and want skill sandboxing to also use Docker, mount the host Docker socket so child containers run on the host daemon rather than nesting Docker-in-Docker:
   ```
   # PowerShell / cmd.exe: use a single leading slash.
