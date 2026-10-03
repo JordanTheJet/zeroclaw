@@ -162,8 +162,8 @@ fn render_docker_arg(root: &Path, current: &str) -> anyhow::Result<String> {
     container_base::splice_zones(root, &spliced)
 }
 
-/// Containerfile surface: standard image ships lean Dist; fat image ships All
-/// (kitchen sink). Selections, not literals.
+/// Containerfile surface: standard image ships Dist for minimal/full tools;
+/// fat image ships All (kitchen sink). Selections, not literals.
 fn containerfile_surface() -> ContainerSurface {
     ContainerSurface {
         file: "Containerfile",

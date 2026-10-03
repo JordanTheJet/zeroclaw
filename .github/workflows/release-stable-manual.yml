@@ -319,8 +319,8 @@ jobs:
           fi
           # Resolve the feature set from the canonical registry
           # (`cargo generate features`), the single source of truth that
-          # install.sh and packaging surfaces also consume. `dist` is the lean
-          # standard distribution set and carries the default leaves, so every
+          # install.sh and packaging surfaces also consume. `dist` carries
+          # default leaves and adapters for minimal/full runtime selection. Every
           # target builds with --no-default-features against the explicit list,
           # with no implicit feature drift.
           FEATURES="$(cargo run --quiet -p xtask --bin generate -- features --selection "${{ matrix.distribution }}" --target "${{ matrix.target }}")"

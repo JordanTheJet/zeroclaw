@@ -300,10 +300,10 @@ channels-full = [
     "channel-whatsapp-cloud", "channel-voice-call",
 ]
 
-# Opt-in native adapters. Standard distributions omit external integrations;
-# the compatibility bundle keeps them available for explicit selection.
+# Native adapters are opt-in for Cargo-default source builds. Standard
+# distributions carry their implementations for minimal/full runtime selection.
 tools-external = ["zeroclaw-runtime/tools-external", "zeroclaw-tools/tools-external"]
-# Source/on-demand compatibility bundle; registration still requires [tools].optional.
+# Standard/source adapter bundle; registration still requires [tools].optional.
 tools-compat = ["tools-saas", "tools-coding-cli", "tools-external"]
 tools-saas = [
     "tool-jira",
