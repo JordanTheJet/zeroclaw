@@ -154,7 +154,7 @@ fn registry() -> Vec<Surface> {
     ]
 }
 
-/// Dockerfile-family ARG default: ships the lean standard Dist selection,
+/// Dockerfile-family ARG default: ships the standard Dist selection,
 /// build-time overridable via --build-arg.
 fn render_docker_arg(root: &Path, current: &str) -> anyhow::Result<String> {
     let body = container::render_features_arg(root, &Sel::Dist)?;

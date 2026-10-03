@@ -211,7 +211,7 @@ libc = "0.2"
 # both read this; neither shadows it with its own list.
 [package.metadata.zeroclaw]
 # Published CLI archives use this selection across the release target matrix.
-# Native compatibility remains a source/on-demand build, not a second archive.
+# Every archive carries adapters for both runtime tool settings; no second archive.
 release_distributions = ["dist"]
 non_row_features = [
     "default",
@@ -235,6 +235,7 @@ dist_extra_features = [
     "channel-git",
     "whatsapp-web",
     "plugins-wasm-cranelift",
+    "tools-compat",
 ]
 
 # Features whose build needs system C libraries or tooling the minimal static

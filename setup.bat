@@ -140,7 +140,7 @@ echo %BOLD%[2/5] Choose installation method:%RESET%
 echo.
 echo   1) Prebuilt binary - Download pre-compiled release (fastest)
 echo   2) minimal build - core only, no default features
-echo   3) dist build - lean standard distribution (recommended)
+echo   3) dist build - standard distribution, minimal/full tools (recommended)
 echo   4) default build - default feature set
 echo   5) all build - every feature including hardware and browser
 echo.
@@ -218,8 +218,8 @@ set "BUILD_DESC=minimal (core only, no default features)"
 goto :do_build
 
 :build_dist
-set "FEATURES=--no-default-features --features acp-bridge,agent-runtime,channel-acp-server,channel-discord,channel-email,channel-filesystem,channel-git,channel-lark,channel-matrix,channel-telegram,channel-webhook,gateway,observability-prometheus,plugins-wasm-cranelift,schema-export,whatsapp-web"
-set "BUILD_DESC=dist (lean standard distribution (recommended))"
+set "FEATURES=--no-default-features --features acp-bridge,agent-runtime,channel-acp-server,channel-discord,channel-email,channel-filesystem,channel-git,channel-lark,channel-matrix,channel-telegram,channel-webhook,gateway,observability-prometheus,plugins-wasm-cranelift,schema-export,tool-claude-code,tool-claude-code-runner,tool-codex-cli,tool-composio,tool-gemini-cli,tool-google-workspace,tool-jira,tool-linkedin,tool-microsoft365,tool-notion,tool-opencode-cli,tool-project-intel,tools-external,whatsapp-web"
+set "BUILD_DESC=dist (standard distribution, minimal/full tools (recommended))"
 goto :do_build
 
 :build_default
@@ -407,7 +407,7 @@ echo.
 echo Options:
 echo   --prebuilt    Download pre-compiled binary (fastest)
 echo   --minimal     Build core only ^(--no-default-features^)
-echo   --dist        Build lean standard distribution (recommended)
+echo   --dist        Build standard distribution, minimal/full tools (recommended)
 echo   --default     Build the default feature set
 echo   --all         Build every feature including hardware and browser
 echo   --dry-run     Show what would happen without building or installing

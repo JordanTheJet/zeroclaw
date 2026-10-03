@@ -24,7 +24,7 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
-    fn published_cli_matrix_is_ten_lean_archives_with_stable_names() {
+    fn published_cli_matrix_is_ten_target_legs_with_stable_names() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .unwrap()

@@ -108,12 +108,14 @@ Full details: [Service management](./service.md).
 
 ## Update
 
-Standard updates install the lean build with eleven default tools. Before
-upgrading an existing configuration, select any required extras in
-`[tools].optional`. Vendor/CLI/external native adapters also need a
-source/on-demand compatibility build; standard updates do not supply a separate
-compatibility download. See [tool selection and recovery](../tools/overview.md#builds-and-upgrade-path)
-for the exact build commands and runtime prerequisites.
+Standard release updates carry the native adapters for both minimal and full
+tool settings. Existing schema-3 configurations without `[tools]` now use minimal
+by default: eleven tools in Chat, eight in Code/ACP. To retain the previous
+built-in selection, add `optional = ["*"]` under `[tools]`; named entries select
+individual extras. Full preserves existing integration prerequisites and
+permission gates. Plain Cargo-default source builds, including a Homebrew formula
+that uses only those defaults, can still omit adapters. See
+[minimal/full tools and build recovery](../tools/overview.md#builds-and-upgrade-path).
 
 Re-run the installer, it detects the existing install and upgrades in place:
 

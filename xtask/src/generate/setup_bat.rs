@@ -265,7 +265,7 @@ mod tests {
     }
 
     #[test]
-    fn dist_preset_ships_lean_release_channels() {
+    fn dist_preset_ships_standard_distribution_features() {
         let presets = render_presets(&root()).unwrap();
         let (_, dist_and_rest) = presets.split_once(":build_dist").unwrap();
         let (dist, _) = dist_and_rest.split_once("goto :do_build").unwrap();
@@ -281,15 +281,15 @@ mod tests {
         for feature in spec::features_outside_dist(&root()).unwrap() {
             assert!(
                 !dist.contains(&feature.as_str()),
-                "{feature} leaked into lean dist"
+                "{feature} leaked into standard dist"
             );
         }
     }
 
     #[test]
-    fn real_setup_bat_help_describes_dist_as_lean() {
+    fn real_setup_bat_help_describes_minimal_full_distribution() {
         let setup = std::fs::read_to_string(root().join("setup.bat")).unwrap();
-        assert!(setup.contains("--dist        Build lean standard distribution"));
+        assert!(setup.contains("--dist        Build standard distribution, minimal/full tools"));
         assert!(!setup.contains("--dist        Build all channels"));
     }
 

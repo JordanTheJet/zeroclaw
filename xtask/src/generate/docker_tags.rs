@@ -191,7 +191,7 @@ mod tests {
     }
 
     #[test]
-    fn dist_tag_is_lean_while_all_tag_is_kitchen_sink() {
+    fn dist_tag_carries_adapters_while_all_tag_is_kitchen_sink() {
         let s = render(&root()).unwrap();
         let v: toml::Value = toml::from_str(&s).unwrap();
         let tags = v["tags"].as_array().unwrap();
@@ -215,7 +215,7 @@ mod tests {
         for feature in crate::generate::spec::features_outside_dist(&root()).unwrap() {
             assert!(
                 !dist_features.contains(&feature.as_str()),
-                "{feature} leaked into lean dist"
+                "{feature} leaked into standard dist"
             );
         }
         assert!(all["features"].as_str().unwrap().contains("hardware"));

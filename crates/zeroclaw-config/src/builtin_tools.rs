@@ -38,9 +38,9 @@ pub const EXTERNAL_TOOL_NAMES: &[&str] = &[
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(default, deny_unknown_fields)]
 pub struct BuiltinToolsConfig {
-    /// Additional built-in names to construct. Empty selects only the eleven
-    /// core tools. `"*"` restores the previous built-in selection, subject to
-    /// compiled features, each tool's own config, and execution policy.
+    /// Built-in selection: empty is minimal (eleven core tools); `"*"` is
+    /// full (every compiled-in built-in permitted by its config and policy).
+    /// Named entries add tools to minimal and are redundant alongside `"*"`.
     #[serde(default)]
     pub optional: Vec<String>,
 }
@@ -97,5 +97,56 @@ mod tests {
             optional: vec!["*".into()],
         };
         assert!(compatibility.is_enabled("cron_list"));
+    }
+    #[test]
+    fn existing_schema_three_config_defaults_to_minimal_without_migration() {
+        let mut config: crate::schema::Config =
+            toml::from_str("schema_version = 3\nlocale = \"en\"\n").unwrap();
+        assert_eq!(config.schema_version, 3);
+        assert!(config.tools.optional.is_empty());
+        assert!(!config.tools.is_enabled("calculator"));
+        assert!(!config.plugins.enabled);
+        assert!(!config.plugins.auto_discover);
+        config.set_prop("tools.optional", "[\"*\"]").unwrap();
+        assert!(config.tools.is_enabled("calculator"));
+        let saved = toml::to_string(&config).unwrap();
+        let restored: crate::schema::Config = toml::from_str(&saved).unwrap();
+        assert_eq!(restored.schema_version, 3);
+        assert_eq!(restored.tools.optional, ["*"]);
+        assert!(!restored.plugins.enabled);
+        assert!(!restored.plugins.auto_discover);
+    }
+
+    #[test]
+    fn full_wildcard_reports_each_compiled_out_external_adapter() {
+        let mut config = crate::schema::Config::default();
+        config.tools.optional = vec!["*".into(), "calculator".into(), "weather".into()];
+        let warnings: Vec<_> = config
+            .collect_warnings()
+            .into_iter()
+            .filter(|warning| {
+                warning.code == crate::validation_warnings::TOOL_COMPILED_OUT
+                    && warning.path == "tools.optional"
+            })
+            .collect();
+        if cfg!(feature = "tools-external") {
+            assert!(warnings.is_empty());
+        } else {
+            assert_eq!(warnings.len(), EXTERNAL_TOOL_NAMES.len());
+            for name in EXTERNAL_TOOL_NAMES {
+                assert_eq!(
+                    warnings
+                        .iter()
+                        .filter(|warning| {
+                            warning.message.starts_with(&format!("{name} was selected"))
+                                && warning.message.contains("tools-compat")
+                                && warning.message.contains("cannot add compiled-out code")
+                        })
+                        .count(),
+                    1,
+                    "missing or duplicated diagnostic for {name}"
+                );
+            }
+        }
     }
 }

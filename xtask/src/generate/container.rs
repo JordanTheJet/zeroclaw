@@ -89,7 +89,7 @@ mod tests {
     }
 
     #[test]
-    fn dist_renders_lean_release_channels() {
+    fn dist_renders_standard_distribution_features() {
         let b = render_features(&root(), &Selection::Dist, "        ").unwrap();
         let (_, quoted_features) = b.split_once('"').unwrap();
         let rendered: Vec<_> = quoted_features.trim_end_matches('"').split(',').collect();
@@ -104,7 +104,7 @@ mod tests {
         for feature in crate::generate::spec::features_outside_dist(&root()).unwrap() {
             assert!(
                 !rendered.contains(&feature.as_str()),
-                "{feature} leaked into lean dist"
+                "{feature} leaked into standard dist"
             );
         }
     }

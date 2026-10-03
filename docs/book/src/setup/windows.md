@@ -69,7 +69,7 @@ Flags:
 |---|---|
 | `--prebuilt` | Download prebuilt binary from GitHub Releases (fastest once reached; current script still checks for `cargo` first) |
 | `--minimal`  | Build core only (no channels, no hardware) |
-| `--dist`     | Build the lean release distribution feature set |
+| `--dist`     | Build the standard distribution for minimal/full runtime tools |
 | `--default`  | Build with Cargo's default feature set |
 | `--all`      | Build with every registered feature |
 

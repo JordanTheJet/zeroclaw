@@ -417,7 +417,7 @@ mod tests {
     }
 
     #[test]
-    fn pkgbuild_features_are_lean_dist_channels() {
+    fn pkgbuild_features_are_standard_distribution_features() {
         let current = std::fs::read_to_string(root().join("dist/aur/PKGBUILD")).unwrap();
         let pkgbuild = render_pkgbuild(&root(), &current).unwrap();
         let build = pkgbuild
@@ -435,7 +435,7 @@ mod tests {
         for feature in spec::features_outside_dist(&root()).unwrap() {
             assert!(
                 !f.contains(&feature.as_str()),
-                "{feature} leaked into lean dist"
+                "{feature} leaked into standard dist"
             );
         }
     }

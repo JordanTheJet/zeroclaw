@@ -44,6 +44,18 @@ async fn assemble(
     excluded: Option<Vec<String>>,
     caller_allowed: Option<&[String]>,
 ) -> ScopedAssembled {
+    assemble_context(tmp, config, allowed, excluded, caller_allowed, false, false).await
+}
+
+async fn assemble_context(
+    tmp: &TempDir,
+    config: &Config,
+    allowed: Option<Vec<String>>,
+    excluded: Option<Vec<String>>,
+    caller_allowed: Option<&[String]>,
+    exclude_memory: bool,
+    acp_delivery: bool,
+) -> ScopedAssembled {
     let workspace = tmp.path().join("workspace");
     let security = Arc::new(SecurityPolicy {
         workspace_dir: workspace.clone(),
@@ -87,8 +99,8 @@ async fn assemble(
         caller_allowed,
         connect_mcp: false,
         connect_peripherals: false,
-        exclude_memory: false,
-        acp_delivery: false,
+        exclude_memory,
+        acp_delivery,
         list_deferred_mcp_specs: false,
         emit_assembly_logs: false,
         mcp_registry: None,
@@ -197,4 +209,143 @@ async fn selected_knowledge_still_requires_its_canonical_enabled_setting() {
         .await
         .unwrap();
     assert!(result.success, "{result:?}");
+}
+
+// Exact historical Chat fixture from accepted 080b/d6074ef1 (no configured
+// optional integrations); the five native adapters omitted there are restored
+// only when tools-external is compiled. This is a fixture, not a universal count.
+fn full_chat_fixture_names() -> BTreeSet<String> {
+    let mut names: BTreeSet<_> = [
+        "TodoWrite",
+        "ask_user",
+        "backup",
+        "calculator",
+        "canvas",
+        "channel_room",
+        "content_search",
+        "cron_add",
+        "cron_list",
+        "cron_remove",
+        "cron_run",
+        "cron_runs",
+        "cron_update",
+        "delegate",
+        "escalate_to_human",
+        "file_edit",
+        "file_read",
+        "file_write",
+        "git_forge",
+        "git_operations",
+        "glob_search",
+        "http_request",
+        "image_info",
+        "llm_task",
+        "memory_export",
+        "memory_forget",
+        "memory_purge",
+        "memory_recall",
+        "memory_store",
+        "model_routing_config",
+        "model_switch",
+        "poll",
+        "proxy_config",
+        "reaction",
+        "schedule",
+        "send_message_to_peer",
+        "send_via",
+        "sessions_current",
+        "sessions_history",
+        "sessions_list",
+        "sessions_send",
+        "shell",
+        "spawn_subagent",
+        "web_fetch",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect();
+    if cfg!(feature = "tools-external") {
+        names.extend(
+            [
+                "browser_open",
+                "pushover",
+                "screenshot",
+                "weather",
+                "web_search_tool",
+            ]
+            .map(str::to_string),
+        );
+    }
+    names
+}
+
+#[tokio::test]
+async fn minimal_acp_catalog_is_eight_without_optional_preparation() {
+    let tmp = TempDir::new().unwrap();
+    let config = fixture(&tmp);
+    let assembled = assemble_context(&tmp, &config, None, None, None, true, true).await;
+    let expected = CORE_TOOL_NAMES
+        .iter()
+        .filter(|name| !zeroclaw_tools::MEMORY_TOOL_NAMES.contains(name))
+        .map(|name| (*name).to_string())
+        .collect();
+    assert_eq!(names(&assembled), expected);
+    assert_eq!(assembled.registry.len(), 8);
+    assert!(!config.data_dir.exists());
+}
+
+#[tokio::test]
+async fn full_chat_and_acp_restore_the_matching_builtin_fixture() {
+    for acp in [false, true] {
+        let tmp = TempDir::new().unwrap();
+        let mut config = fixture(&tmp);
+        config.tools.optional = vec!["*".into()];
+        let assembled = assemble_context(&tmp, &config, None, None, None, acp, acp).await;
+        let mut expected = full_chat_fixture_names();
+        if acp {
+            expected.retain(|name| !zeroclaw_tools::MEMORY_TOOL_NAMES.contains(&name.as_str()));
+            expected.insert("deliver_file".into());
+        }
+        assert_eq!(names(&assembled), expected);
+        assert!(assembled.delegate_handle.is_some());
+        assert!(assembled.ask_user_handle.is_some());
+        assert!(!tmp.path().join("optional-knowledge.db").exists());
+        for tool in zeroclaw_config::opt_in_tools::OptInTool::ALL {
+            assert!(
+                !names(&assembled).contains(tool.section()),
+                "full must not enable {}",
+                tool.section()
+            );
+        }
+        let calculator = assembled
+            .registry
+            .iter()
+            .find(|tool| tool.name() == "calculator")
+            .unwrap();
+        let result = calculator
+            .execute(serde_json::json!({"function":"multiply","values":[6,7]}))
+            .await
+            .unwrap();
+        assert!(result.success && result.output.contains("42"), "{result:?}");
+        println!(
+            "full fixture ACP={acp}: {}",
+            serde_json::to_string(&names(&assembled)).unwrap()
+        );
+    }
+}
+
+#[tokio::test]
+async fn full_wildcard_with_names_does_not_expand_permission() {
+    let tmp = TempDir::new().unwrap();
+    let mut config = fixture(&tmp);
+    config.tools.optional = vec!["*".into(), "calculator".into(), "weather".into()];
+    let shell_only = vec!["shell".to_string()];
+    let agent = assemble(&tmp, &config, Some(shell_only.clone()), None, None).await;
+    assert_eq!(names(&agent), BTreeSet::from(["shell".into()]));
+    let caller = assemble(&tmp, &config, None, None, Some(&shell_only)).await;
+    assert_eq!(names(&caller), BTreeSet::from(["shell".into()]));
+    let excluded = assemble(&tmp, &config, None, Some(vec!["calculator".into()]), None).await;
+    let mut expected = full_chat_fixture_names();
+    expected.remove("calculator");
+    assert_eq!(names(&excluded), expected);
 }

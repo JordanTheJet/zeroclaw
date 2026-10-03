@@ -568,7 +568,7 @@ pub fn release_distributions(pkg: &cargo_metadata::Package) -> anyhow::Result<Ve
     for id in &selections {
         anyhow::ensure!(
             matches!(Selection::from_id(id), Some(Selection::Dist)),
-            "release_distributions supports the lean `dist` selection; `{id}` is on-demand only"
+            "release_distributions supports the standard `dist` selection; `{id}` is on-demand only"
         );
     }
     Ok(selections)
@@ -984,15 +984,15 @@ pub enum Selection {
     Full,
     /// Kernel only (`--no-default-features`).
     Minimal,
-    /// Standard binary distribution: lean Cargo defaults plus the explicit
-    /// registry-owned distribution additions. The set a single-artifact
-    /// package manager ships.
+    /// Standard binary distribution: Cargo defaults plus registry-owned
+    /// channels, plugin hosts and native adapters. Runtime tool selection
+    /// defaults to minimal; full uses the same artifact.
     Dist,
     /// Measurement-only broad distribution: `Dist` plus the canonical
     /// `channels-full` aggregate. Not offered by installer menus until a
     /// stable broad artifact lifecycle exists.
     DistBroad,
-    /// Standard channels plus the explicit native compatibility bundle.
+    /// Compatibility alias for the standard distribution.
     DistCompat,
     /// Every selectable feature (all − non_row − pure-alias). The docker
     /// `:all-features` kitchen sink.
@@ -1022,9 +1022,9 @@ impl Selection {
         match self {
             Selection::Full => "default feature set",
             Selection::Minimal => "core only, no default features",
-            Selection::Dist => "lean standard distribution (recommended)",
+            Selection::Dist => "standard distribution, minimal/full tools (recommended)",
             Selection::DistBroad => "broad-channel distribution measurement build",
-            Selection::DistCompat => "native optional-tool compatibility distribution",
+            Selection::DistCompat => "standard distribution compatibility alias",
             Selection::All => "every feature including hardware and browser",
             Selection::Features(_) => "custom feature selection",
         }
@@ -1079,10 +1079,11 @@ impl Selection {
                         ctx.all.contains(feature),
                         "unknown dist_extra_features entry `{feature}` (not in [features])"
                     );
-                    s.push(feature.clone());
-                }
-                if matches!(self, Selection::DistCompat) {
-                    s.extend(ctx.expand("tools-compat"));
+                    if ctx.non_row.contains(feature) {
+                        s.extend(ctx.expand(feature));
+                    } else {
+                        s.push(feature.clone());
+                    }
                 }
                 if matches!(self, Selection::DistBroad) {
                     s.extend(ctx.expand("channels-full"));
@@ -1360,21 +1361,23 @@ mod tests {
     }
 
     #[test]
-    fn lean_and_compatibility_distributions_resolve_tool_availability() {
-        let lean = resolve_feature_list(&root(), &Selection::Dist).unwrap();
+    fn standard_distribution_carries_full_adapters_and_compat_is_an_alias() {
+        let dist = resolve_feature_list(&root(), &Selection::Dist).unwrap();
         let compat = resolve_feature_list(&root(), &Selection::DistCompat).unwrap();
         let optional =
             resolve_feature_list(&root(), &Selection::Features(vec!["tools-compat".into()]))
                 .unwrap();
         assert!(
-            lean.iter()
+            resolve_feature_list(&root(), &Selection::Full)
+                .unwrap()
+                .iter()
                 .all(|feature| !feature.starts_with("tool-") && feature != "tools-external")
         );
         for tool in zeroclaw_config::opt_in_tools::OptInTool::ALL {
             assert!(compat.iter().any(|candidate| candidate == tool.feature()));
         }
         assert!(compat.contains(&"tools-external".to_string()));
-        assert!(lean.iter().all(|feature| compat.contains(feature)));
+        assert_eq!(dist, compat);
         assert!(optional.contains(&"tools-compat".to_string()));
         for target in [
             "x86_64-unknown-linux-gnu",
@@ -1525,12 +1528,12 @@ mod tests {
         );
     }
 
-    /// Pins the lean contract by name on purpose: widening `dist` must be a
+    /// Pins the shipping contract by name on purpose: widening `dist` must be a
     /// deliberate, reviewed edit here, not a silent consequence of a registry
     /// change. The generator suites derive their expectations from the
     /// registry; this one stays the policy tripwire.
     #[test]
-    fn dist_matches_lean_release_contract() {
+    fn dist_matches_minimal_full_release_contract() {
         let features = resolve_feature_list(&root(), &Selection::Dist).unwrap();
         assert!(features.contains(&"channel-git".to_string()));
         let mut expected = resolve_feature_list(&root(), &Selection::Full).unwrap();
@@ -1544,6 +1547,10 @@ mod tests {
             ]
             .map(str::to_owned),
         );
+        expected.extend(
+            zeroclaw_config::opt_in_tools::OptInTool::ALL.map(|tool| tool.feature().to_string()),
+        );
+        expected.push("tools-external".into());
         expected.sort();
         expected.dedup();
         assert_eq!(features, expected);
@@ -1599,7 +1606,7 @@ mod tests {
     fn all_is_superset_of_dist() {
         let dist = resolve(&root(), &Selection::Dist).unwrap();
         let all = resolve(&root(), &Selection::All).unwrap();
-        // All includes optional features outside the lean distribution.
+        // All includes optional features outside the standard distribution.
         assert!(
             all.cargo_flags.contains("hardware"),
             "all is the kitchen sink"

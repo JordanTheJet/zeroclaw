@@ -19,89 +19,107 @@ recorded in the inventory's
 [Replacement-First Policy](../developing/tool-inventory.md#replacement-first-policy)
 section.
 
-## Selecting optional tools
+## Minimal and full tools
 
-New and existing schema-3 configurations expose eleven built-ins by default:
-`shell`, `file_read`, `file_write`, `file_edit`, `glob_search`, `content_search`,
-`memory_recall`, `memory_store`, `memory_forget`, `web_fetch`, and
-`git_operations`. The canonical set is `CORE_TOOL_NAMES` in
-`zeroclaw-config/src/builtin_tools.rs`. Existing policy can narrow this set.
+New and existing schema-3 configurations use **minimal** unless they explicitly
+select extras: eleven built-ins in Chat, or eight in Code/ACP, which retains its
+exclusion of persistent-memory tools. Chat's eleven are `shell`, `file_read`,
+`file_write`, `file_edit`, `glob_search`, `content_search`, `memory_recall`,
+`memory_store`, `memory_forget`, `web_fetch`, and `git_operations`. Existing
+policy can narrow either catalog.
 
-Select additional built-ins by their callable names:
+Both settings use the same configuration field:
+
+```toml
+[tools]
+optional = [] # minimal, also the default when this section is absent
+```
+
+For **full**, restore all built-ins carried by this binary and allowed by their
+existing configuration, prerequisites and permission rules:
+
+```toml
+[tools]
+optional = ["*"] # full
+```
+
+For minimal plus selected extras, use their callable names:
 
 ```toml
 [tools]
 optional = ["calculator", "cron_list", "sessions_history"]
 ```
 
-Selection happens before constructors run. An unselected tool contributes no
-schema or tool-catalog prompt text. Selection does not grant permissions:
-the tool's own settings, runtime capabilities, risk profile, caller narrowing,
-approval, path/network policy and receipts still apply. Reload the daemon
-after changing selection. Config schema remains version 3.
+The wildcard is a union with named entries: `["*", "calculator"]` has the same
+selection as `["*"]`, with no duplicate tool. Full is not a fixed tool count;
+configured integrations, runtime capabilities and policy determine the effective
+catalog. It does not enable every integration. Selecting a tool does not install
+a browser or vendor CLI, supply credentials, enable a disabled integration or
+grant permission. Full also preserves Code/ACP's existing memory exclusion.
 
-Explicitly configured MCP servers, skills, plugins and peripherals keep their
-existing activation and permission paths; they are not selected through this
-built-in list. No replacement plugin is required or claimed here.
+Selection happens before constructors run. An unselected tool contributes no
+schema or tool-catalog prompt text. Risk profiles, caller narrowing, approval,
+path/network policy and receipts still apply. Explicit MCP servers, skills,
+plugins and peripherals retain their existing activation and authority paths.
+Progressive schema disclosure is a separate feature, not part of these settings.
+
+To opt out of the new minimal default when upgrading, set `optional = ["*"]` in
+`[tools]`, or run:
+
+```sh
+zeroclaw config set tools.optional '["*"]' --no-interactive
+```
+
+Reload the daemon after changing selection. Config schema stays version 3;
+existing configurations without `[tools]` take the minimal default without a
+migration. Return to minimal by setting `optional = []`.
 
 ### Builds and upgrade path
 
-| Channel | Standard build | Recovering optional native adapters |
+| Channel | Compiled capability | Runtime selection |
 | --- | --- | --- |
-| Release archive | `dist`: eleven defaults; vendor/CLI/external adapters compiled out | Build `dist-compat` from source/on demand, then select the tools; standard releases publish ten lean CLI archives |
-| Desktop sidecar | `dist`, resolved for each target, plus requested desktop features | Build a compatibility sidecar with `scripts/desktop/prepare-kernel.sh --distribution dist-compat`, or connect the desktop to your source-built compatibility daemon |
-| Homebrew source build | Cargo defaults: the same eleven-tool policy; optional external adapters compiled out | Run a source-built compatibility binary alongside the package-managed binary; adding config cannot change a bottle's compiled features |
-| Docker | `dist`: the same eleven-tool policy | Build an image on demand with the `dist-compat` feature list below, then select the tools and configure their dependencies |
+| Release archive | Standard `dist` includes the native `tools-compat` adapters | Minimal by default; full and named extras work without another download |
+| Desktop sidecar | The same target-resolved `dist` CLI, plus requested desktop features | The same minimal/full settings and prerequisites |
+| Homebrew source build | Depends on the formula's feature selection; a Cargo-default build omits native adapters | Full reports missing adapters; use the standard source build below when the formula does not carry them |
+| Docker `dist` image | Standard `dist`, including native adapters | The same minimal/full settings; configure dependencies explicitly |
 
-Standard `dist` and `dist-compat` retain the portable WASM plugin host through
-`plugins-wasm-cranelift` on the seven supported native 64-bit targets: GNU and
-musl Linux on x86_64 and aarch64, both macOS architectures, and x86_64 Windows
-MSVC. ARMv6/ARMv7 builds omit Cranelift and Prometheus; experimental Android
-builds omit Cranelift and WhatsApp Web. Cargo defaults do not include a plugin
-host. Compiling the host leaves `plugins.enabled` and `plugins.auto_discover`
-false; configured plugin activation, consent, trust and grants still apply.
-Runtime-only precompiled `.cwasm` support and Pulley alone do not replace the
-portable registry `.wasm` compilation contract. Distribution features and
-platform exclusions come from `package.metadata.zeroclaw` in `Cargo.toml`.
+One release matrix has ten target legs, with unchanged archive names. Android is
+experimental and allowed to fail; publication requires the other nine targets.
+There is no second compatibility archive matrix or dedicated `compat-tools`
+image. The historical `all-features` Docker image remains broader than `dist`,
+including additional channels and hardware features.
 
-Compatibility archives and a `compat-tools` image are not published by default.
-The compatibility selection remains available for source and on-demand builds:
+`dist` includes `tools-compat` (`tools-saas`, `tools-coding-cli`, `tools-external`).
+`dist-compat` is a compatibility alias for the same build. Plain Cargo defaults
+remain smaller: custom source builds can omit adapters. With full or named
+selection, each compiled-out external adapter gets a clear diagnostic; enabled
+vendor/CLI sections retain their existing missing-feature diagnostic. Runtime
+configuration cannot add compiled-out code. Build the standard selection to
+recover it:
 
 ```sh
-# Run from a source checkout; choose the target you intend to run.
+# From a source checkout; use the target you intend to run.
 TARGET=x86_64-unknown-linux-gnu
-FEATURES="$(cargo run --quiet --locked -p xtask --bin generate -- features --selection dist-compat --target "$TARGET")"
+FEATURES="$(cargo run --quiet --locked -p xtask --bin generate -- features --selection dist --target "$TARGET")"
 cargo build --release --locked --bin zeroclaw --target "$TARGET" --no-default-features --features "$FEATURES"
 # For a local Linux image, resolve features for its build target.
-docker build --build-arg "ZEROCLAW_CARGO_FLAGS=--no-default-features --features $FEATURES" -t zeroclaw-compat-local .
+docker build -t zeroclaw-dist-local .
 ```
 
-`dist-compat` adds the `tools-compat` Cargo bundle: `tools-saas`,
-`tools-coding-cli`, and `tools-external`. Source users can select an individual
-existing `tool-*` feature or the bundle. The compatibility build does not
-install vendor CLIs, browsers or credentials. Existing integration `enabled`
-settings and dependencies remain necessary. First-party extras such as cron,
-sessions and calculator are compiled into both builds and need only runtime
-selection plus their existing prerequisites.
+For a Homebrew installation whose formula omits adapters, run the standard
+source-built binary alongside the package-managed binary and use its own
+config, data and service paths. A config setting cannot change a bottle's
+compiled features. Source users can also select individual existing `tool-*`
+features or `tools-compat`; they still need the runtime selection.
 
-The default change is intentional for desktop and Homebrew as well as archives
-and Docker. Existing users who need the previous built-ins can select them
-individually, or explicitly request the previous selection:
-
-```toml
-[tools]
-optional = ["*"]
-```
-
-Use a compatibility build for vendor/CLI/external adapters. A lean build reports
-selected but compiled-out adapters through config validation warnings; it cannot
-activate code it does not contain. The wildcard restores availability according
-to the previous config and runtime gates, including caller-specific exceptions;
-it does not enable disabled integrations, grant permissions, or expose withheld
-tools. For ACP attachment delivery, select `deliver_file`; for compact skills,
-select `read_skill`; for model-driven scheduling/SOP/delegation, select the
-corresponding tool names. Operator scheduling, SOP and approval services retain
-their existing lifecycle independently of model-visible selection.
+Standard `dist` retains `plugins-wasm-cranelift` on the seven supported native
+64-bit targets: GNU and musl Linux on x86_64 and aarch64, both macOS architectures,
+and x86_64 Windows MSVC. ARMv6/ARMv7 omit Cranelift and Prometheus; experimental
+Android omits Cranelift and WhatsApp Web. Cargo defaults do not include a plugin
+host. Compiling the host leaves `plugins.enabled` and `plugins.auto_discover`
+false; consent, trust, grants and configured activation still apply. Runtime-only
+precompiled `.cwasm` support and Pulley do not replace portable registry `.wasm`
+compilation. Target policy comes from `package.metadata.zeroclaw` in `Cargo.toml`.
 
 ## Built-in tools
 
@@ -148,7 +166,7 @@ Additional first-party built-ins require selection:
 |---|---|
 | `cron_*` | Manage scheduled jobs: `cron_add`, `cron_list`, `cron_remove`, `cron_update`, `cron_run`, `cron_runs` |
 | `schedule` | Shell-only one-shot/recurring scheduling |
-| `memory_forget`, `memory_export`, `memory_purge` | Long-term memory management |
+| `memory_export`, `memory_purge` | Long-term memory management |
 | `spawn_subagent`, `delegate` | Run a subtask in a child agent |
 
 Selected tools also retain these prerequisites:
