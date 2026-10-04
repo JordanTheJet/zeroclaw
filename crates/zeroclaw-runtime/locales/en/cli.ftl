@@ -457,6 +457,7 @@ channel-discord-delivery-failure-note-many = (note: I couldn't deliver {$count} 
 channel-whatsapp-web-delivery-failure-note-one = (note: I could not deliver {$count} WhatsApp media attachment.)
 channel-whatsapp-web-delivery-failure-note-many = (note: I could not deliver {$count} WhatsApp media attachments.)
 channel-line-bind-success = ✅ Paired! You can now chat.
+channel-line-bind-persist-failed = Pairing could not be saved. Ask the bot administrator for a new pairing code and try again.
 channel-line-bind-invalid-code = ❌ Invalid code. Please try again.
 channel-line-bind-rate-limited = ⏳ Too many attempts. Retry in { $secs }s.
 channel-line-bind-denied = ❌ This account is blocked by an `ignore` entry. Ask the operator to remove it, then retry.
@@ -517,6 +518,7 @@ cli-self-test-web-dist-dir-fail-expansion = WARNING: {$path} — {$reason}; gate
 
 # Service lifecycle warnings.
 cli-service-systemd-linger-disabled-warning = systemd user lingering is disabled. ZeroClaw's user service may stop after logout. Enable it with: loginctl enable-linger {$user}
+cli-standalone-daemon-owned = Cannot run `zeroclaw {$command}` while another ZeroClaw process owns the config state at {$path}. Stop the owning process or use its daemon-backed interface, then retry. No agent work was started.
 
 # ── peripherals (zeroclaw peripheral) ──
 cli-peripherals-none = No peripherals configured.
@@ -882,6 +884,7 @@ cli-desktop-not-installed = ZeroClaw companion app is not installed.
 cli-desktop-blurb1 = The companion app is a lightweight menu bar app that
 cli-desktop-blurb2 = connects to the same gateway as the CLI.
 cli-config-all-configured = All sections already configured.
+cli-config-initialized-sections = Initialized {$count} section(s) with defaults:
 cli-config-schema-current = Config already at current schema version.
 cli-config-applied-ops = Applied {$count} operation(s):
 cli-plugins-none = No plugins installed.
@@ -1266,6 +1269,8 @@ cli-daemon-started-stop = Ctrl+C or SIGTERM to stop
 
 # ── daemon mTLS and enrollment operator output ──
 cli-relay-rotation-requested = Requested a relay node-id rotation. A running daemon will rotate within ~{$secs}s; the new id reaches clients in-band on their next certificate renewal.
+cli-relay-claim-ok = Daemon claimed as node-id {$node_id} on relay {$relay}. Wrote [relay] to your config; start (or restart) the daemon to register against the relay.
+cli-relay-claim-wss-disabled = Note: [wss] is disabled, and the relay refuses registration until it is enabled. The claim above is saved and stays valid - enable the WSS listener (see the secure-transport guide) and the binding takes effect on the next start.
 cli-mtls-issued-client-cert = Issued client certificate for '{$name}':
 cli-mtls-issued-cert-path = {"  "}cert: {$path}
 cli-mtls-issued-key-path = {"  "}key:  {$path}
@@ -1403,6 +1408,10 @@ channel-approval-opt-allow-once = Allow once
 channel-approval-opt-allow-always = Always allow
 channel-approval-opt-reject = Reject
 channel-approval-opt-reject-with-edit = Reject with edit
+# ── Peer-agent delivery ──
+peer-delivery-control-plane-unavailable = in-process peer delivery requires an available durable task store: {$error}
+peer-delivery-registration-failed = peer delivery rejected: {$error}
+peer-delivery-accepted = accepted for in-process delivery to peer agent "{$recipient}" (task_id={$task_id})
 tool-git-operations-error-docker-runtime-write-unsupported = Git write commands are unavailable with the Docker runtime because they cannot be confined to its container.
 
 # ── RPC inbound authentication ──
