@@ -140,7 +140,7 @@ pub async fn run(runtime: Runtime) -> anyhow::Result<DaemonExit>;
 
 The issue requires resolved security policy to remain explicit across the boundary. The rule is:
 
-- The runtime resolves each agent's `SecurityPolicy` and `RuntimeAdapter` and passes them *into* `ToolRequest`. A source cannot supply its own.
+- The runtime resolves each agent's `SecurityPolicy` and `RuntimeAdapter` and passes them *into* `ToolRequest`. Native sources are trusted implementations required to build tools against those supplied values. Passing them into a Rust trait does not mechanically confine in-process code: a source can return arbitrary native tools, so runtime admission, policy filtering, and per-call gating and approval remain independent requirements.
 - Building a tool against a policy authorizes nothing. The runtime still gates and approves every call after construction, exactly as today.
 - The runtime may add core tools and remove tools the policy excludes. It never adds a tool the policy forbids because a source returned it.
 
@@ -170,9 +170,9 @@ The contract needs `Config` and `SecurityPolicy`, which live in `zeroclaw-config
 | B. A new contract crate depending on api and config | Clean boundary; application wiring can depend on it without the runtime | A new crate ahead of the planned kernel extraction; the ADR-016 record already notes the risk of establishing boundaries early |
 | C. The planned `zeroclaw-kernel` | The destination both active runtime exceptions already name | Does not exist; extracting it first would block this work on the agent-loop extraction |
 
-**Decision: option A.** The contract lives in `zeroclaw-runtime`, under a holding-crate exception recorded per ADR-016. The exception row is proposed separately, as ADR-016 requires, in [#11092](https://github.com/zeroclaw-labs/zeroclaw/pull/11092): scope `src/composition.rs`, the entry-point adapters that consume it, and the capability-carrying `DaemonRegistry` starter signatures; destination `zeroclaw-kernel`; reviewed at the agent-loop extraction design review.
+**Decision: option A.** The contract lives in `zeroclaw-runtime`, under the bounded holding-crate exception recorded separately in [#11092](https://github.com/zeroclaw-labs/zeroclaw/pull/11092), which received [Core Team approval](https://github.com/zeroclaw-labs/zeroclaw/pull/11092#pullrequestreview-5311449661) and merged on 2026-09-28. The scope covers `src/composition.rs`, the `*_with_capabilities` entry-point adapters that consume it in `src/agent/{loop_.rs,agent.rs,turn/mod.rs}`, and the capability-carrying `DaemonRegistry` starter signatures in `src/daemon/{registry.rs,mod.rs}`, limited to the #10993 composition API and this page's migration steps. It does not cover moving concrete provider, memory, or tool construction into this crate.
 
-**The exception is pending Core Team review.** The placement was chosen under a delegated code call, which is not the Core Team approval ADR-016 requires. Until a Core Team member approves #11092, no exception exists, and the skeleton that accompanies this page must not merge.
+The intended destination is the composition owner in the planned `zeroclaw-kernel` extraction. The exception comes up for review at the agent-loop extraction design review, or before the contract adds a capability kind beyond providers, memory, tools, outbound channels, and the observer. The placement prerequisite is satisfied within that recorded scope; it does not approve broader runtime additions or establish implementation acceptance.
 
 ## Migration order for callers
 
@@ -202,7 +202,7 @@ The issue asks for any retained dependency to be explained rather than hidden be
 | #10993 acceptance item | Delivered by |
 | --- | --- |
 | Document the public composition API, ownership and lifetime rules, `DaemonRegistry`, relevant part of #6864 | This page (step 0) |
-| Independent consumer runs a real agent turn with supplied capabilities | Step 7, through `Runtime::run_turn` |
+| Independent consumer runs a real agent turn with supplied capabilities, without concrete provider/channel/tool construction inside the runtime | Partial under the proposed step 7: `Runtime::run_turn` would exercise supplied capabilities, but tier-1 core and tier-2 host-coupled tools would remain runtime-constructed. This staged retained-tool design does not fully satisfy the criterion; the remaining construction boundary must be implemented and proved, or the criterion explicitly reconciled in #10993, before acceptance is complete |
 | Dependency checks demonstrate the boundary; retained dependencies explained | Step 7 ratchet and the section above |
 | CLI and daemon use the shared contract, with policy, startup, cancellation, and shutdown coverage | Steps 2 and 3 |
 | Implementation PRs and evidence linked to #7432 R1 | Each step's PR |

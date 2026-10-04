@@ -83,8 +83,11 @@ pub trait MemorySource: Send + Sync {
 /// What the runtime is asking a [`ToolSource`] for.
 ///
 /// Every field that carries authority is resolved by the runtime before the
-/// request is made. A source builds tools against these values and has no way
-/// to substitute its own.
+/// request is made. Native sources are trusted implementations required to
+/// build tools against the supplied policy and runtime adapter. These inputs
+/// do not mechanically confine in-process code: a source can return arbitrary
+/// native tools. Runtime admission, policy filtering, and per-call gating and
+/// approval remain independent requirements.
 pub struct ToolRequest<'a> {
     /// The config generation the request belongs to.
     pub config: &'a Arc<Config>,
