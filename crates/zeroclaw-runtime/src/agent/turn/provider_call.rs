@@ -15,6 +15,7 @@ use crate::cost::types::BudgetCheck;
 use crate::observability::ObserverEvent;
 use crate::tools::ToolSpec;
 use anyhow::Result;
+use sha2::{Digest, Sha256};
 use std::time::{Duration, Instant};
 use zeroclaw_config::schema::StreamReasoningMode;
 use zeroclaw_providers::dispatch::{AcceptedRoute, AccountedAttempt, with_exact_dispatch_route};
@@ -31,9 +32,63 @@ pub(crate) struct ProviderCallOutcome {
     pub(crate) streamed_visible_text: String,
 }
 
+/// Fingerprints of a request's cacheable prompt prefix: the contiguous
+/// leading system messages and the tool list. Hashes are the first 16 hex
+/// chars of SHA-256, enough to compare two `llm_request` trace rows without
+/// capturing request bodies.
+struct PrefixFingerprint {
+    /// Char count of the contiguous leading system message contents, summed
+    /// over the whole run, 0 when there are none.
+    system_chars: usize,
+    /// Hash of the leading system message contents serialized as a JSON
+    /// array, absent when there are no leading system messages. The whole
+    /// run is hashed, not just the first message: a before-call hook may
+    /// insert or edit a later leading system message, and provider adapters
+    /// then keep, merge, or drop it, which is outside the hashed bytes.
+    system_sha256: Option<String>,
+    /// Number of tool specs, 0 when the request carries no tools.
+    tools_count: usize,
+    /// Hash of the tool specs serialized as a JSON array (order-preserving,
+    /// so a reordered tool set fingerprints differently), absent when the
+    /// request carries no tools.
+    tools_sha256: Option<String>,
+}
+
+fn prefix_fingerprint(
+    request_messages: &[ChatMessage],
+    request_tools: Option<&[ToolSpec]>,
+) -> PrefixFingerprint {
+    let leading_system: Vec<&str> = request_messages
+        .iter()
+        .take_while(|message| message.role == "system")
+        .map(|message| message.content.as_str())
+        .collect();
+    PrefixFingerprint {
+        system_chars: leading_system
+            .iter()
+            .map(|content| content.chars().count())
+            .sum(),
+        system_sha256: if leading_system.is_empty() {
+            None
+        } else {
+            Some(short_sha256_prefix(
+                &::serde_json::to_vec(&leading_system).unwrap_or_default(),
+            ))
+        },
+        tools_count: request_tools.map_or(0, <[ToolSpec]>::len),
+        tools_sha256: request_tools
+            .map(|tools| short_sha256_prefix(&::serde_json::to_vec(tools).unwrap_or_default())),
+    }
+}
+
+fn short_sha256_prefix(bytes: &[u8]) -> String {
+    hex::encode(&Sha256::digest(bytes)[..8])
+}
+
 pub(crate) async fn announce_llm_request(
     ctx: &TurnCtx<'_>,
     request_messages: &[ChatMessage],
+    request_tools: Option<&[ToolSpec]>,
     active_model_provider: &dyn ModelProvider,
     active_model_provider_name: &str,
     active_model: &str,
@@ -59,12 +114,26 @@ pub(crate) async fn announce_llm_request(
     });
     {
         let _provider_guard = ::zeroclaw_log::attribution_span!(active_model_provider).entered();
+        // Prefix fingerprints are hashes and counts, not content: they carry
+        // no credentials or message text, so unlike the payload capture
+        // below they are emitted on every event, whatever the policy.
+        let fingerprint = prefix_fingerprint(request_messages, request_tools);
         let mut attrs = ::serde_json::json!({
             "iteration": iteration + 1,
             "messages_count": request_messages.len(),
+            "system_chars": fingerprint.system_chars,
+            "tools_count": fingerprint.tools_count,
             "model": active_model,
             "trace_id": ctx.turn_id,
         });
+        if let ::serde_json::Value::Object(map) = &mut attrs {
+            if let Some(system_sha256) = fingerprint.system_sha256.as_deref() {
+                map.insert("system_sha256".to_string(), system_sha256.into());
+            }
+            if let Some(tools_sha256) = fingerprint.tools_sha256.as_deref() {
+                map.insert("tools_sha256".to_string(), tools_sha256.into());
+            }
+        }
         // Opt-in request payload capture (observability.log_llm_request_payload,
         // default off). When enabled, attach the scrubbed + truncated message
         // history; when off (or no writer installed) `attrs` is unchanged.
@@ -121,6 +190,7 @@ pub(crate) fn enforce_tool_loop_budget() -> Result<()> {
         current_usd,
         limit_usd,
         period,
+        agent_alias,
     }) = check_tool_loop_budget()
     {
         ::zeroclaw_log::record!(
@@ -132,9 +202,17 @@ pub(crate) fn enforce_tool_loop_budget() -> Result<()> {
                     "current_usd": current_usd,
                     "limit_usd": limit_usd,
                     "period": format!("{period:?}"),
+                    "agent_alias": agent_alias,
                 })),
             "tool-call loop budget exceeded"
         );
+        if let Some(agent_alias) = agent_alias {
+            anyhow::bail!(
+                "Budget exceeded for agent `{agent_alias}`: ${current_usd:.4} of \
+                 ${limit_usd:.2} {period:?} daily ceiling. Cannot make further API \
+                 calls until the budget resets.",
+            );
+        }
         anyhow::bail!(
             "Budget exceeded: ${:.4} of ${:.2} {:?} limit. Cannot make further API calls until the budget resets.",
             current_usd,
@@ -273,62 +351,97 @@ pub(crate) async fn call_provider(
                                 scope.mark_stream_recovery_semantic_empty();
                             }
                             scope.record_stream_recovery_failure(&stream_err);
-                            ::zeroclaw_log::record!(
-                                WARN,
-                                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                                    .with_category(::zeroclaw_log::EventCategory::Provider)
-                                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                                    .with_attrs(::serde_json::json!({
-                                        "model": active_model,
-                                        "iteration": iteration + 1,
-                                        "error": scrub_credentials(&stream_err.to_string()),
-                                        "trace_id": ctx.turn_id,
-                                    })),
-                                "llm_stream_fallback: provider stream failed, falling back to non-streaming chat"
-                            );
-                            scope.clear_provisional_provider_route();
-                            let dispatcher = ProviderDispatch::from_ref(active_model_provider);
-                            let request = ChatRequest {
-                                messages: prepared_messages,
-                                tools: request_tools,
-                                thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
-                                    .try_with(Clone::clone)
-                                    .ok()
-                                    .flatten(),
-                            };
-                            let recovery = with_exact_dispatch_route(
-                                active_model_provider_name.to_string(),
-                                active_model.to_string(),
-                                async {
-                                    match streamed_refusal {
-                                        Some(refusal) => {
-                                            dispatcher
-                                                .chat_after_stream_refusal(
-                                                    request,
-                                                    active_dispatch_model,
-                                                    ctx.temperature,
-                                                    refusal,
-                                                )
-                                                .await
-                                        }
-                                        None => {
-                                            dispatcher
-                                                .chat(request, active_dispatch_model, ctx.temperature)
-                                                .await
-                                        }
-                                    }
-                                },
-                            );
-                            let result = if let Some(token) = ctx.cancellation_token {
-                                tokio::select! {
-                                    biased;
-                                    () = token.cancelled() => Err(ToolLoopCancelled.into()),
-                                    result = recovery => result,
-                                }
+                            // A terminal stream error means the provider already
+                            // exhausted its own retry/fallback budget producing
+                            // it (the synthesized non-streaming call completed
+                            // with this failure). Re-running the non-streaming
+                            // call would repeat that whole budget, so the error
+                            // becomes the turn's provider error directly: the
+                            // same shape a failed non-streaming chat produces.
+                            if stream_err.downcast_ref::<StreamErrorWithUsage>()
+                                .is_some_and(|error| {
+                                    matches!(
+                                        &error.source,
+                                        zeroclaw_providers::traits::StreamError::Terminal(_)
+                                    )
+                                })
+                            {
+                                ::zeroclaw_log::record!(
+                                    WARN,
+                                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                                        .with_category(::zeroclaw_log::EventCategory::Provider)
+                                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                        .with_attrs(::serde_json::json!({
+                                            "model": active_model,
+                                            "iteration": iteration + 1,
+                                            "error": scrub_credentials(&stream_err.to_string()),
+                                            "trace_id": ctx.turn_id,
+                                        })),
+                                    "llm_stream_terminal: provider stream error is terminal, not falling back to non-streaming chat"
+                                );
+                                (Err(stream_err), false, false, String::new())
                             } else {
-                                recovery.await
-                            };
-                            (result, false, false, String::new())
+                                ::zeroclaw_log::record!(
+                                    WARN,
+                                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                                        .with_category(::zeroclaw_log::EventCategory::Provider)
+                                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                        .with_attrs(::serde_json::json!({
+                                            "model": active_model,
+                                            "iteration": iteration + 1,
+                                            "error": scrub_credentials(&stream_err.to_string()),
+                                            "trace_id": ctx.turn_id,
+                                        })),
+                                    "llm_stream_fallback: provider stream failed, falling back to non-streaming chat"
+                                );
+                                scope.clear_provisional_provider_route();
+                                let dispatcher = ProviderDispatch::from_ref(active_model_provider);
+                                let request = ChatRequest {
+                                    messages: prepared_messages,
+                                    tools: request_tools,
+                                    thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                                        .try_with(Clone::clone)
+                                        .ok()
+                                        .flatten(),
+                                };
+                                let recovery = with_exact_dispatch_route(
+                                    active_model_provider_name.to_string(),
+                                    active_model.to_string(),
+                                    async {
+                                        match streamed_refusal {
+                                            Some(refusal) => {
+                                                dispatcher
+                                                    .chat_after_stream_refusal(
+                                                        request,
+                                                        active_dispatch_model,
+                                                        ctx.temperature,
+                                                        refusal,
+                                                    )
+                                                    .await
+                                            }
+                                            None => {
+                                                dispatcher
+                                                    .chat(
+                                                        request,
+                                                        active_dispatch_model,
+                                                        ctx.temperature,
+                                                    )
+                                                    .await
+                                            }
+                                        }
+                                    },
+                                );
+                                let result = if let Some(token) = ctx.cancellation_token {
+                                    tokio::select! {
+                                        biased;
+                                        () = token.cancelled() => Err(ToolLoopCancelled.into()),
+                                        result = recovery => result,
+                                    }
+                                } else {
+                                    recovery.await
+                                };
+                                (result, false, false, String::new())
+                            }
                         }
                     }
                 }))))
@@ -419,8 +532,10 @@ pub(crate) async fn call_provider(
 mod payload_capture_tests {
     use super::super::context::TurnCtx;
     use super::super::events::{ProgressEvent, StreamDelta, thinking_status_text};
-    use super::announce_llm_request;
+    use super::{announce_llm_request, prefix_fingerprint};
+    use crate::hooks::{HookHandler, HookResult, HookRunner};
     use crate::observability::NoopObserver;
+    use crate::tools::ToolSpec;
     use async_trait::async_trait;
     use zeroclaw_api::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
     use zeroclaw_config::schema::{PacingConfig, StreamReasoningMode};
@@ -505,7 +620,8 @@ mod payload_capture_tests {
         for mode in [StreamReasoningMode::Off, StreamReasoningMode::Full] {
             let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamDelta>(4);
             let ctx = test_ctx_with_delta(&observer, &pacing, Some(&tx), mode);
-            let _ = announce_llm_request(&ctx, &history, &provider, "stub", "stub-model", 0).await;
+            let _ = announce_llm_request(&ctx, &history, None, &provider, "stub", "stub-model", 0)
+                .await;
             drop(tx);
             assert!(matches!(
                 rx.recv().await,
@@ -519,7 +635,8 @@ mod payload_capture_tests {
 
         let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamDelta>(4);
         let ctx = test_ctx_with_delta(&observer, &pacing, Some(&tx), StreamReasoningMode::Status);
-        let _ = announce_llm_request(&ctx, &history, &provider, "stub", "stub-model", 3).await;
+        let _ =
+            announce_llm_request(&ctx, &history, None, &provider, "stub", "stub-model", 3).await;
         drop(tx);
         assert!(matches!(
             rx.recv().await,
@@ -599,7 +716,8 @@ mod payload_capture_tests {
         while rx.try_recv().is_ok() {}
 
         let ctx = test_ctx(&observer, &pacing);
-        let _ = announce_llm_request(&ctx, &history, &provider, "stub", "stub-model", 0).await;
+        let _ =
+            announce_llm_request(&ctx, &history, None, &provider, "stub", "stub-model", 0).await;
         let on_record = next_llm_request(&mut rx).await;
 
         let attrs = on_record
@@ -638,7 +756,8 @@ mod payload_capture_tests {
         while rx.try_recv().is_ok() {}
 
         let ctx = test_ctx(&observer, &pacing);
-        let _ = announce_llm_request(&ctx, &history, &provider, "stub", "stub-model", 0).await;
+        let _ =
+            announce_llm_request(&ctx, &history, None, &provider, "stub", "stub-model", 0).await;
         let off_record = next_llm_request(&mut rx).await;
 
         let off_attrs = off_record
@@ -655,6 +774,257 @@ mod payload_capture_tests {
         assert!(
             off_attrs.get("messages_count").is_some(),
             "messages_count is present regardless of payload policy"
+        );
+
+        zeroclaw_log::clear_broadcast_hook();
+    }
+
+    fn test_tool_spec(name: &str) -> ToolSpec {
+        ToolSpec::new(name, "test tool", serde_json::json!({}))
+    }
+
+    #[test]
+    fn prefix_fingerprint_tracks_system_and_tools_separately() {
+        let messages = vec![
+            ChatMessage::system("You are a helpful assistant."),
+            ChatMessage::user("hello"),
+        ];
+        let tools = vec![test_tool_spec("alpha"), test_tool_spec("beta")];
+
+        // Same messages and same tools produce identical fingerprints.
+        let base = prefix_fingerprint(&messages, Some(&tools));
+        let repeat = prefix_fingerprint(&messages, Some(&tools));
+        assert_eq!(
+            base.system_chars,
+            "You are a helpful assistant.".chars().count()
+        );
+        assert_eq!(base.system_sha256, repeat.system_sha256);
+        assert_eq!(base.tools_count, 2);
+        assert_eq!(base.tools_sha256, repeat.tools_sha256);
+
+        // Changing one char of the system message moves only the system
+        // hash, not the tools hash.
+        let mut edited_system = messages.clone();
+        edited_system[0].content.pop();
+        edited_system[0].content.push('!');
+        let system_changed = prefix_fingerprint(&edited_system, Some(&tools));
+        assert_ne!(system_changed.system_sha256, base.system_sha256);
+        assert_eq!(system_changed.tools_sha256, base.tools_sha256);
+
+        // Reordering the tool list moves only the tools hash: the specs are
+        // serialized as a JSON array, so order is part of the fingerprint a
+        // provider caches.
+        let reordered_tools = vec![test_tool_spec("beta"), test_tool_spec("alpha")];
+        let tools_changed = prefix_fingerprint(&messages, Some(&reordered_tools));
+        assert_ne!(tools_changed.tools_sha256, base.tools_sha256);
+        assert_eq!(tools_changed.system_sha256, base.system_sha256);
+
+        // No leading system message: zero chars and no system hash at all.
+        let no_system = prefix_fingerprint(&[ChatMessage::user("hello")], Some(&tools));
+        assert_eq!(no_system.system_chars, 0);
+        assert!(no_system.system_sha256.is_none());
+
+        // No tools: zero count and no tools hash at all.
+        let no_tools = prefix_fingerprint(&messages, None);
+        assert_eq!(no_tools.tools_count, 0);
+        assert!(no_tools.tools_sha256.is_none());
+    }
+
+    #[test]
+    fn prefix_fingerprint_covers_every_leading_system_message() {
+        let tools = vec![test_tool_spec("alpha"), test_tool_spec("beta")];
+        let single = vec![
+            ChatMessage::system("You are a helpful assistant."),
+            ChatMessage::user("hello"),
+        ];
+        let base = prefix_fingerprint(&single, Some(&tools));
+
+        // Two leading system messages: the char count is the sum over the
+        // whole run, and the hash differs from the single-message case.
+        let doubled = vec![
+            ChatMessage::system("You are a helpful assistant."),
+            ChatMessage::system("Always cite your sources."),
+            ChatMessage::user("hello"),
+        ];
+        let two_leading = prefix_fingerprint(&doubled, Some(&tools));
+        assert_eq!(
+            two_leading.system_chars,
+            "You are a helpful assistant.".chars().count()
+                + "Always cite your sources.".chars().count()
+        );
+        assert_ne!(two_leading.system_sha256, base.system_sha256);
+
+        // Editing the SECOND leading system message moves the system hash
+        // and leaves the tools hash unchanged.
+        let mut edited_second = doubled.clone();
+        edited_second[1].content.push('!');
+        let second_changed = prefix_fingerprint(&edited_second, Some(&tools));
+        assert_ne!(second_changed.system_sha256, two_leading.system_sha256);
+        assert_eq!(second_changed.tools_sha256, two_leading.tools_sha256);
+
+        // A system message placed after the first user message is not part
+        // of the prefix: neither hash moves relative to the base.
+        let trailing = vec![
+            ChatMessage::system("You are a helpful assistant."),
+            ChatMessage::user("hello"),
+            ChatMessage::system("mid-conversation reminder"),
+        ];
+        let non_leading = prefix_fingerprint(&trailing, Some(&tools));
+        assert_eq!(non_leading.system_chars, base.system_chars);
+        assert_eq!(non_leading.system_sha256, base.system_sha256);
+        assert_eq!(non_leading.tools_sha256, base.tools_sha256);
+
+        // The JSON-array serialization keeps one message "a\n\nb" distinct
+        // from two messages "a", "b": merging with a separator would not.
+        let joined = vec![ChatMessage::system("a\n\nb"), ChatMessage::user("hello")];
+        let split = vec![
+            ChatMessage::system("a"),
+            ChatMessage::system("b"),
+            ChatMessage::user("hello"),
+        ];
+        assert_ne!(
+            prefix_fingerprint(&joined, Some(&tools)).system_sha256,
+            prefix_fingerprint(&split, Some(&tools)).system_sha256
+        );
+    }
+
+    /// Inserts a second leading system message at index 1, the way a
+    /// before-call hook may mutate the request messages.
+    struct SystemInjectingHook;
+
+    #[async_trait]
+    impl HookHandler for SystemInjectingHook {
+        fn name(&self) -> &str {
+            "inject-second-system"
+        }
+        fn priority(&self) -> i32 {
+            0
+        }
+        async fn before_llm_call(
+            &self,
+            messages: &mut Vec<ChatMessage>,
+            _model: &mut String,
+        ) -> HookResult<()> {
+            messages.insert(1, ChatMessage::system("injected guidance"));
+            HookResult::Continue(())
+        }
+    }
+
+    #[tokio::test]
+    async fn before_llm_call_hook_inserting_system_message_moves_system_fingerprint() {
+        let tools = vec![test_tool_spec("alpha")];
+        let mut messages = vec![
+            ChatMessage::system("You are a helpful assistant."),
+            ChatMessage::user("hello"),
+        ];
+        let before = prefix_fingerprint(&messages, Some(&tools));
+
+        let mut runner = HookRunner::new();
+        runner.register(Box::new(SystemInjectingHook));
+        let mut model = String::from("stub-model");
+        let result = runner.run_before_llm_call(&mut messages, &mut model).await;
+        assert!(matches!(result, HookResult::Continue(())));
+
+        // The hook inserted a second leading system message, so the runtime
+        // prefix the provider sees changed: the system fingerprint must move
+        // with it while the tools fingerprint stays put.
+        assert_eq!(messages.len(), 3);
+        let after = prefix_fingerprint(&messages, Some(&tools));
+        assert_ne!(after.system_sha256, before.system_sha256);
+        assert_eq!(
+            after.system_chars,
+            before.system_chars + "injected guidance".chars().count()
+        );
+        assert_eq!(after.tools_sha256, before.tools_sha256);
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn llm_request_payload_off_still_carries_prefix_fingerprints() {
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut rx = zeroclaw_log::subscribe_or_install();
+
+        install_writer("off");
+        while rx.try_recv().is_ok() {}
+
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let provider = StubProvider;
+        let history = vec![
+            ChatMessage::system("You are a helpful assistant."),
+            ChatMessage::user("hello"),
+        ];
+        let tools = vec![test_tool_spec("alpha"), test_tool_spec("beta")];
+        let expected = prefix_fingerprint(&history, Some(&tools));
+
+        let ctx = test_ctx(&observer, &pacing);
+        let _ = announce_llm_request(
+            &ctx,
+            &history,
+            Some(&tools),
+            &provider,
+            "stub",
+            "stub-model",
+            0,
+        )
+        .await;
+        let record = next_llm_request(&mut rx).await;
+
+        let attrs = record
+            .get("attributes")
+            .expect("llm_request record carries attributes");
+        assert!(
+            attrs.get("request_messages").is_none(),
+            "payload capture stays off: no message content may be recorded"
+        );
+        assert_eq!(
+            attrs.get("system_chars").and_then(|v| v.as_u64()),
+            Some(expected.system_chars as u64),
+            "system_chars counts the leading system message content"
+        );
+        let system_sha256 = attrs
+            .get("system_sha256")
+            .and_then(|v| v.as_str())
+            .expect("system_sha256 is present with a leading system message");
+        assert_eq!(system_sha256.len(), 16, "hash is truncated to 16 hex chars");
+        assert!(
+            system_sha256
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "hash is lowercase hex"
+        );
+        assert_eq!(
+            system_sha256,
+            expected
+                .system_sha256
+                .as_deref()
+                .expect("helper computes a system hash")
+        );
+        assert_eq!(
+            attrs.get("tools_count").and_then(|v| v.as_u64()),
+            Some(expected.tools_count as u64),
+            "tools_count counts the requested tool specs"
+        );
+        let tools_sha256 = attrs
+            .get("tools_sha256")
+            .and_then(|v| v.as_str())
+            .expect("tools_sha256 is present when tools are sent");
+        assert_eq!(tools_sha256.len(), 16, "hash is truncated to 16 hex chars");
+        assert!(
+            tools_sha256
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "hash is lowercase hex"
+        );
+        assert_eq!(
+            tools_sha256,
+            expected
+                .tools_sha256
+                .as_deref()
+                .expect("helper computes a tools hash")
         );
 
         zeroclaw_log::clear_broadcast_hook();
@@ -1840,5 +2210,594 @@ mod streaming_fallback_tests {
             zeroclaw_providers::dispatch::AttemptUsageOutcome::Complete(usage)
                 if usage.input_tokens == Some(10) && usage.output_tokens == Some(5)
         ));
+    }
+
+    /// Non-streaming leaf whose every request fails with a fixed error text.
+    /// Counts physical requests across both surfaces so a test can catch an
+    /// unexpected streaming leg too.
+    struct SynthesizedLadderCountingLeaf {
+        physical_requests: Arc<AtomicUsize>,
+        error_text: &'static str,
+    }
+
+    impl Attributable for SynthesizedLadderCountingLeaf {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+
+        fn alias(&self) -> &str {
+            "SynthesizedLadderCountingLeaf"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for SynthesizedLadderCountingLeaf {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            anyhow::bail!("unused")
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<ChatResponse> {
+            self.physical_requests.fetch_add(1, Ordering::Relaxed);
+            anyhow::bail!("{}", self.error_text)
+        }
+
+        fn supports_streaming(&self) -> bool {
+            false
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+        ) -> BoxStream<'static, StreamResult<StreamEvent>> {
+            self.physical_requests.fetch_add(1, Ordering::Relaxed);
+            Box::pin(futures_util::stream::iter(vec![Err(
+                zeroclaw_providers::traits::StreamError::ModelProvider(self.error_text.to_string()),
+            )]))
+        }
+    }
+
+    /// Router over Reliable over the counting leaf: the production composition
+    /// for a resolved reliability domain whose served route is non-streaming.
+    fn router_over_reliable(
+        leaf: Box<dyn ModelProvider>,
+        max_retries: u32,
+    ) -> zeroclaw_providers::router::RouterModelProvider {
+        let reliable = ReliableModelProvider::new(
+            "reliable",
+            vec![("leaf".to_string(), leaf)],
+            max_retries,
+            1,
+        );
+        zeroclaw_providers::router::RouterModelProvider::new(
+            "router-test",
+            vec![("reliable".to_string(), Box::new(reliable))],
+            vec![],
+            "test-model".to_string(),
+        )
+    }
+
+    #[tokio::test]
+    async fn synthesized_stream_auth_failure_walks_ladder_once() {
+        let physical_requests = Arc::new(AtomicUsize::new(0));
+        let provider = router_over_reliable(
+            Box::new(SynthesizedLadderCountingLeaf {
+                physical_requests: Arc::clone(&physical_requests),
+                error_text: "401 Unauthorized: invalid api key",
+            }),
+            0,
+        );
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let cost_context = ToolLoopCostTrackingContext::usage_only();
+        let turn_usage = std::sync::Arc::new(parking_lot::Mutex::new(TurnUsage::default()));
+        let ctx = TurnCtx {
+            observer: &observer,
+            provider_name: "router-test",
+            model: "test-model",
+            context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0),
+            temperature: Some(0.0),
+            approval: None,
+            channel_name: "test",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            event_tx: None,
+            hooks: None,
+            dedup_exempt_tools: &[],
+            pacing: &pacing,
+            strict_tool_parsing: false,
+            channel: None,
+            draft_reasoning: StreamReasoningMode::Status,
+            turn_id: "test-turn",
+            agent_alias: None,
+            parent_agent_alias: None,
+            serving_provider_name: None,
+            serving_model: None,
+        };
+
+        let outcome = TOOL_LOOP_TURN_USAGE
+            .scope(
+                Some(std::sync::Arc::clone(&turn_usage)),
+                TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
+                    Some(cost_context),
+                    call_provider(
+                        &ctx,
+                        &provider,
+                        "router-test",
+                        "test-model",
+                        "test-model",
+                        &[ChatMessage::user("go")],
+                        None,
+                        true,
+                        0,
+                    ),
+                ),
+            )
+            .await
+            .expect("provider call returns its terminal outcome");
+
+        let auth_error = outcome
+            .chat_result
+            .expect_err("the persistent 401 must fail the turn");
+        assert!(
+            auth_error
+                .to_string()
+                .contains("All model providers/models failed after 1 failure event(s)"),
+            "the reliability domain's terminal cause must survive synthesis, got: {auth_error}"
+        );
+        assert_eq!(
+            physical_requests.load(Ordering::Relaxed),
+            1,
+            "the reliability domain already walked its ladder inside the synthesized \
+             call; the runtime must not re-walk it"
+        );
+        // The typed terminal failure must ride the synthesized stream error's
+        // chain: the router boxes the completed call's failure, so the
+        // runtime's downcast walks through to the reliability classification
+        // instead of seeing only a flat string.
+        let terminal_failure = auth_error
+            .chain()
+            .find_map(|source| {
+                source.downcast_ref::<zeroclaw_providers::ReliableProviderTerminalFailure>()
+            })
+            .expect("the typed terminal failure must survive the synthesized stream");
+        assert_eq!(
+            terminal_failure.kind(),
+            zeroclaw_providers::ReliableProviderTerminalFailureKind::Authentication,
+            "the persistent 401 must classify as an authentication failure"
+        );
+        let projection = crate::agent::turn::outcome::terminal_completion_error_message_in_english(
+            &auth_error,
+            None,
+        )
+        .expect("the typed failure must project to auth guidance, not the generic terminal string");
+        assert!(
+            projection.contains("rejected its credentials"),
+            "the authentication projection must be selected by kind, got: {projection}"
+        );
+    }
+
+    #[tokio::test]
+    async fn synthesized_stream_server_failure_walks_ladder_once() {
+        let physical_requests = Arc::new(AtomicUsize::new(0));
+        let provider = router_over_reliable(
+            Box::new(SynthesizedLadderCountingLeaf {
+                physical_requests: Arc::clone(&physical_requests),
+                // The classifier recognizes status codes in the wire shapes
+                // leaves actually surface ("modelprovider error: <code> ...")
+                // or as structured reqwest statuses; a bare "503 ..." string
+                // is not a promised classification input.
+                error_text: "modelprovider error: 503 Service Unavailable",
+            }),
+            2,
+        );
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let cost_context = ToolLoopCostTrackingContext::usage_only();
+        let turn_usage = std::sync::Arc::new(parking_lot::Mutex::new(TurnUsage::default()));
+        let ctx = TurnCtx {
+            observer: &observer,
+            provider_name: "router-test",
+            model: "test-model",
+            context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0),
+            temperature: Some(0.0),
+            approval: None,
+            channel_name: "test",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            event_tx: None,
+            hooks: None,
+            dedup_exempt_tools: &[],
+            pacing: &pacing,
+            strict_tool_parsing: false,
+            channel: None,
+            draft_reasoning: StreamReasoningMode::Status,
+            turn_id: "test-turn",
+            agent_alias: None,
+            parent_agent_alias: None,
+            serving_provider_name: None,
+            serving_model: None,
+        };
+
+        let outcome = TOOL_LOOP_TURN_USAGE
+            .scope(
+                Some(std::sync::Arc::clone(&turn_usage)),
+                TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
+                    Some(cost_context),
+                    call_provider(
+                        &ctx,
+                        &provider,
+                        "router-test",
+                        "test-model",
+                        "test-model",
+                        &[ChatMessage::user("go")],
+                        None,
+                        true,
+                        0,
+                    ),
+                ),
+            )
+            .await
+            .expect("provider call returns its terminal outcome");
+
+        let server_error = outcome
+            .chat_result
+            .expect_err("the persistent 503 must fail the turn");
+        assert!(
+            server_error
+                .to_string()
+                .contains("All model providers/models failed after 3 failure event(s)"),
+            "the reliability domain's terminal cause must survive synthesis, got: {server_error}"
+        );
+        assert_eq!(
+            physical_requests.load(Ordering::Relaxed),
+            3,
+            "retries=2 means the ladder makes 3 physical requests; the runtime must \
+             not double them"
+        );
+        // Same chain requirement on the server-error shape: the typed
+        // classification and its projection must survive synthesis.
+        let terminal_failure = server_error
+            .chain()
+            .find_map(|source| {
+                source.downcast_ref::<zeroclaw_providers::ReliableProviderTerminalFailure>()
+            })
+            .expect("the typed terminal failure must survive the synthesized stream");
+        assert_eq!(
+            terminal_failure.kind(),
+            zeroclaw_providers::ReliableProviderTerminalFailureKind::ProviderServer,
+            "the persistent 503 must classify as a provider-server failure"
+        );
+        let projection = crate::agent::turn::outcome::terminal_completion_error_message_in_english(
+            &server_error,
+            None,
+        )
+        .expect(
+            "the typed failure must project to server guidance, not the generic terminal string",
+        );
+        assert!(
+            projection.contains("returned a server error"),
+            "the provider-server projection must be selected by kind, got: {projection}"
+        );
+    }
+
+    /// Non-streaming leaf that always succeeds: the R4 success control.
+    struct SynthesizedSuccessLeaf {
+        physical_requests: Arc<AtomicUsize>,
+    }
+
+    impl Attributable for SynthesizedSuccessLeaf {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+
+        fn alias(&self) -> &str {
+            "SynthesizedSuccessLeaf"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for SynthesizedSuccessLeaf {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            anyhow::bail!("unused")
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<ChatResponse> {
+            self.physical_requests.fetch_add(1, Ordering::Relaxed);
+            Ok(ChatResponse {
+                text: Some("synthesized ok".to_string()),
+                tool_calls: Vec::new(),
+                usage: Some(TokenUsage {
+                    input_tokens: Some(3),
+                    output_tokens: Some(2),
+                    cached_input_tokens: None,
+                    cache_creation_input_tokens: None,
+                }),
+                reasoning_content: None,
+            })
+        }
+
+        fn supports_streaming(&self) -> bool {
+            false
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+        ) -> BoxStream<'static, StreamResult<StreamEvent>> {
+            self.physical_requests.fetch_add(1, Ordering::Relaxed);
+            Box::pin(futures_util::stream::iter(vec![Err(
+                zeroclaw_providers::traits::StreamError::ModelProvider(
+                    "non-streaming leaf must never be streamed".to_string(),
+                ),
+            )]))
+        }
+    }
+
+    /// Streaming leaf that emits a usage event and then fails mid-stream,
+    /// before any visible output. Its non-streaming surface recovers.
+    struct MidStreamFailingStreamingLeaf {
+        physical_requests: Arc<AtomicUsize>,
+    }
+
+    impl Attributable for MidStreamFailingStreamingLeaf {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+
+        fn alias(&self) -> &str {
+            "MidStreamFailingStreamingLeaf"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for MidStreamFailingStreamingLeaf {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            anyhow::bail!("unused")
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<ChatResponse> {
+            self.physical_requests.fetch_add(1, Ordering::Relaxed);
+            Ok(ChatResponse {
+                text: Some("recovered via non-streaming fallback".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+        ) -> BoxStream<'static, StreamResult<StreamEvent>> {
+            self.physical_requests.fetch_add(1, Ordering::Relaxed);
+            Box::pin(futures_util::stream::iter(vec![
+                Ok(StreamEvent::Usage(TokenUsage {
+                    input_tokens: Some(1),
+                    output_tokens: Some(1),
+                    cached_input_tokens: None,
+                    cache_creation_input_tokens: None,
+                })),
+                Err(zeroclaw_providers::traits::StreamError::ModelProvider(
+                    "503 Service Unavailable".to_string(),
+                )),
+            ]))
+        }
+    }
+
+    /// Router over a bare streaming-capable leaf: the composition for the
+    /// genuine-streaming-leg controls (no reliability domain involved).
+    fn router_over_leaf(
+        leaf: Box<dyn ModelProvider>,
+    ) -> zeroclaw_providers::router::RouterModelProvider {
+        zeroclaw_providers::router::RouterModelProvider::new(
+            "router-test",
+            vec![("leaf".to_string(), leaf)],
+            vec![],
+            "test-model".to_string(),
+        )
+    }
+
+    #[tokio::test]
+    async fn synthesized_stream_success_makes_exactly_one_request() {
+        // R4 success control: a resolved non-streaming route serves the turn
+        // from the single completed call. One physical request proves the
+        // fallback branch (whose log line and second request live together)
+        // never ran; the synthesized sequence's Final event is pinned at the
+        // router surface (router.rs stream_chat_serves_non_streaming_...).
+        let physical_requests = Arc::new(AtomicUsize::new(0));
+        let provider = router_over_reliable(
+            Box::new(SynthesizedSuccessLeaf {
+                physical_requests: Arc::clone(&physical_requests),
+            }),
+            0,
+        );
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let cost_context = ToolLoopCostTrackingContext::usage_only();
+        let turn_usage = std::sync::Arc::new(parking_lot::Mutex::new(TurnUsage::default()));
+        let ctx = TurnCtx {
+            observer: &observer,
+            provider_name: "router-test",
+            model: "test-model",
+            context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0),
+            temperature: Some(0.0),
+            approval: None,
+            channel_name: "test",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            event_tx: None,
+            hooks: None,
+            dedup_exempt_tools: &[],
+            pacing: &pacing,
+            strict_tool_parsing: false,
+            channel: None,
+            draft_reasoning: StreamReasoningMode::Status,
+            turn_id: "test-turn",
+            agent_alias: None,
+            parent_agent_alias: None,
+            serving_provider_name: None,
+            serving_model: None,
+        };
+
+        let outcome = TOOL_LOOP_TURN_USAGE
+            .scope(
+                Some(std::sync::Arc::clone(&turn_usage)),
+                TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
+                    Some(cost_context),
+                    call_provider(
+                        &ctx,
+                        &provider,
+                        "router-test",
+                        "test-model",
+                        "test-model",
+                        &[ChatMessage::user("go")],
+                        None,
+                        true,
+                        0,
+                    ),
+                ),
+            )
+            .await
+            .expect("provider call returns its terminal outcome");
+
+        let response = outcome
+            .chat_result
+            .expect("the synthesized success must complete the turn");
+        assert_eq!(response.text.as_deref(), Some("synthesized ok"));
+        assert_eq!(
+            physical_requests.load(Ordering::Relaxed),
+            1,
+            "the success control must serve the turn with exactly one physical \
+             request: no stream leg, no non-streaming fallback"
+        );
+    }
+
+    #[tokio::test]
+    async fn genuine_streaming_leaf_mid_stream_failure_still_falls_back() {
+        // R4 scoping control: a GENUINE streaming leg keeps today's fallback.
+        // The leaf fails after a usage event, before visible output; the
+        // stream error is not terminal, so the runtime recovers with one
+        // non-streaming call: 2 physical requests total. (A bare leaf under
+        // the router isolates this from Reliable's stream-resume ledger,
+        // which deliberately skips the failed entry on recovery; that shape
+        // is pinned by stream_failure_without_fallback_keeps_typed_terminal_
+        // cause.)
+        let physical_requests = Arc::new(AtomicUsize::new(0));
+        let provider = router_over_leaf(Box::new(MidStreamFailingStreamingLeaf {
+            physical_requests: Arc::clone(&physical_requests),
+        }));
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let cost_context = ToolLoopCostTrackingContext::usage_only();
+        let turn_usage = std::sync::Arc::new(parking_lot::Mutex::new(TurnUsage::default()));
+        let ctx = TurnCtx {
+            observer: &observer,
+            provider_name: "router-test",
+            model: "test-model",
+            context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0),
+            temperature: Some(0.0),
+            approval: None,
+            channel_name: "test",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            event_tx: None,
+            hooks: None,
+            dedup_exempt_tools: &[],
+            pacing: &pacing,
+            strict_tool_parsing: false,
+            channel: None,
+            draft_reasoning: StreamReasoningMode::Status,
+            turn_id: "test-turn",
+            agent_alias: None,
+            parent_agent_alias: None,
+            serving_provider_name: None,
+            serving_model: None,
+        };
+
+        let outcome = TOOL_LOOP_TURN_USAGE
+            .scope(
+                Some(std::sync::Arc::clone(&turn_usage)),
+                TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
+                    Some(cost_context),
+                    call_provider(
+                        &ctx,
+                        &provider,
+                        "router-test",
+                        "test-model",
+                        "test-model",
+                        &[ChatMessage::user("go")],
+                        None,
+                        true,
+                        0,
+                    ),
+                ),
+            )
+            .await
+            .expect("provider call returns its terminal outcome");
+
+        let response = outcome
+            .chat_result
+            .expect("the pre-output stream failure must fall back and recover");
+        assert_eq!(
+            response.text.as_deref(),
+            Some("recovered via non-streaming fallback"),
+            "the recovery must come from the leaf's non-streaming surface"
+        );
+        assert_eq!(
+            physical_requests.load(Ordering::Relaxed),
+            2,
+            "one genuine stream request + one non-streaming recovery: the \
+             fallback must still fire for non-terminal stream errors"
+        );
     }
 }
