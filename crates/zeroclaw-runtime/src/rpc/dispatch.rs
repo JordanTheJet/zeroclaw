@@ -4328,7 +4328,7 @@ impl RpcDispatcher {
     }
 
     async fn handle_session_new(&self, params: &Value) -> RpcResult {
-        self.session_new_with_mode(params, None).await
+        Box::pin(self.session_new_with_mode(params, None)).await
     }
 
     /// `session/new`, or with `create_only` set, a create that never resumes:
@@ -5350,7 +5350,7 @@ impl RpcDispatcher {
     }
 
     async fn handle_session_close(&self, params: &Value) -> RpcResult {
-        self.handle_session_close_bound(params, None).await
+        Box::pin(self.handle_session_close_bound(params, None)).await
     }
 
     /// `session/close`, optionally bound to one incarnation: with
