@@ -15790,6 +15790,7 @@ Let me check the result."#;
         let risk_profile = RiskProfileConfig::default();
         let built = crate::tools::AllToolsResult {
             tools: vec![mock_tool("shell")],
+            reserved_host_names: std::collections::HashSet::new(),
             delegate_handle: None,
             ask_user_handle: None,
             reaction_handle: Arc::new(parking_lot::RwLock::new(HashMap::new())),

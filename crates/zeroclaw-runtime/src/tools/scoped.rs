@@ -270,20 +270,50 @@ impl ScopedToolRegistry {
         } = spec;
 
         let AllToolsResult {
-            tools: mut tools_registry,
+            tools: tools_registry,
+            reserved_host_names: mut host_tool_names,
             delegate_handle,
             ask_user_handle,
             reaction_handle,
             poll_handle,
             escalate_handle,
             channel_room_handle,
-            unfiltered_tool_arcs,
+            mut unfiltered_tool_arcs,
             // Test-only capture of the concrete delegate instance; `assemble`
             // has no use for it and must keep destructuring exhaustively so a
             // new field cannot be silently dropped here.
             #[cfg(test)]
                 delegate_tool: _,
         } = built;
+
+        // Builtin declarations own their names independently of whether the
+        // current selection constructed them. Prebuilt inputs also retain the
+        // canonical deferred/context-withdrawn owners.
+        let is_guest = |tool: &dyn Tool| {
+            matches!(
+                tool.role(),
+                zeroclaw_api::attribution::Role::Tool(
+                    zeroclaw_api::attribution::ToolKind::WasmPlugin
+                )
+            )
+        };
+        let (plugin_tools, mut tools_registry): (Vec<_>, Vec<_>) = tools_registry
+            .into_iter()
+            .partition(|tool| is_guest(tool.as_ref()));
+        host_tool_names.extend(tools_registry.iter().map(|tool| tool.name().to_string()));
+        tools::reserve_deferred_host_names(config, &mut host_tool_names);
+        tools_registry.extend(
+            plugin_tools
+                .into_iter()
+                .filter(|tool| !host_tool_names.contains(tool.name())),
+        );
+        unfiltered_tool_arcs
+            .retain(|tool| !is_guest(tool.as_ref()) || !host_tool_names.contains(tool.name()));
+        if let Some(parent) = delegate_handle.as_ref() {
+            parent
+                .write()
+                .retain(|tool| !is_guest(tool.as_ref()) || !host_tool_names.contains(tool.name()));
+        }
 
         // 1. Peripherals. Loading CONNECTS hardware (serial opens are exclusive for
         //    real devices), so this is gated: execution surfaces pass
@@ -782,6 +812,7 @@ mod tests {
     fn built_with(tools: Vec<Box<dyn Tool>>) -> AllToolsResult {
         AllToolsResult {
             tools,
+            reserved_host_names: HashSet::new(),
             delegate_handle: None,
             ask_user_handle: None,
             reaction_handle: Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
@@ -813,6 +844,7 @@ mod tests {
             .collect();
         AllToolsResult {
             tools,
+            reserved_host_names: HashSet::new(),
             delegate_handle: None,
             ask_user_handle: None,
             reaction_handle: Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
