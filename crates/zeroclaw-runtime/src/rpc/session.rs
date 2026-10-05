@@ -105,6 +105,9 @@ pub struct RpcSession {
     /// The same immutable map the Agent's shell tool executes with. Sharing
     /// it lets admission inspect the incarnation without locking an active turn.
     forwarded_environment: Option<crate::tools::ForwardedEnvironment>,
+    /// Share the Agent's canonical channel map so steering can recheck live
+    /// capabilities without acquiring the Agent mutex held by its turn.
+    reaction_channels: crate::tools::PerToolChannelHandle,
     /// Orders provider refreshes and configuration within this session.
     model_provider_update: Arc<Mutex<()>>,
     pub created_at: Instant,
@@ -216,6 +219,7 @@ impl RpcSession {
     ) -> Self {
         Self {
             forwarded_environment: agent.forwarded_environment(),
+            reaction_channels: Arc::clone(&agent.channel_handles().reaction),
             agent: Arc::new(Mutex::new(agent)),
             lifecycle_lease: None,
             model_provider_update: Arc::new(Mutex::new(())),
@@ -773,14 +777,14 @@ impl SessionStore {
         })
     }
 
-    /// Read immutable execution facts from the exact authorized incarnation,
+    /// Read execution facts and its live channel map from the authorized incarnation,
     /// without acquiring the Agent mutex held by its running turn.
     pub(crate) async fn steering_binding_for_generation(
         &self,
         id: &str,
         generation: u64,
         owner: Option<&str>,
-    ) -> Option<(String, String, bool)> {
+    ) -> Option<(String, String, bool, crate::tools::PerToolChannelHandle)> {
         let sessions = self.sessions.lock().await;
         let session = sessions
             .get(id)
@@ -792,6 +796,7 @@ impl SessionStore {
                 .forwarded_environment
                 .as_ref()
                 .is_some_and(|env| !env.is_empty()),
+            Arc::clone(&session.reaction_channels),
         ))
     }
 

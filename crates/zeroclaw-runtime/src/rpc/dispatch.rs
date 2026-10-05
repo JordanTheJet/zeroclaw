@@ -1296,12 +1296,13 @@ impl RpcDispatcher {
         &self,
         agent: &crate::agent::agent::Agent,
     ) -> Result<(), JsonRpcError> {
-        let has_local_session_channels = agent
-            .channel_handles()
-            .reaction
-            .read()
-            .keys()
-            .any(|name| name != "rpc");
+        Self::ensure_session_channel_access(&agent.channel_handles().reaction)
+    }
+
+    fn ensure_session_channel_access(
+        channels: &crate::tools::PerToolChannelHandle,
+    ) -> Result<(), JsonRpcError> {
+        let has_local_session_channels = channels.read().keys().any(|name| name != "rpc");
         if has_local_session_channels {
             return Err(rpc_err(
                 SESSION_NOT_OWNED,
@@ -7827,11 +7828,13 @@ impl RpcDispatcher {
     }
 
     /// The authority check a steering message carries into the running
-    /// turn, for a bound connection (`None` for an unbound dispatcher). It
+    /// turn (`None` only for an unbound trusted-local dispatcher). It
     /// re-resolves the sender each time it runs: credential and
     /// `sessions:execute` (`current_authority`), ownership of the authorized
     /// incarnation for a principal that is not admin, the agent and current
-    /// workspace binding, and forwarded-environment eligibility. An admitted sender's current tool ceiling is handed
+    /// workspace binding, and forwarded-environment eligibility. Remote callers
+    /// also recheck the canonical live channel map, independently of auth.
+    /// An admitted sender's current tool ceiling is handed
     /// back for the agent to apply before the steered round, as a new prompt
     /// applies it.
     async fn steering_admission(
@@ -7839,14 +7842,15 @@ impl RpcDispatcher {
         session_id: &str,
         record: Option<&crate::rpc::session::SessionRecord>,
     ) -> Result<Option<crate::agent::SteeringAdmit>, JsonRpcError> {
-        let Some(binding) = self.auth.clone() else {
+        let binding = self.auth.clone();
+        if binding.is_none() && self.access_policy == RpcAccessPolicy::TrustedLocal {
             return Ok(None);
-        };
+        }
         let inbound = Arc::clone(&self.ctx.auth);
         let generation = record
             .and_then(|rec| rec.live_generation)
             .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "No active turn for this session"))?;
-        let (agent_alias, workspace, has_environment) = self
+        let (agent_alias, workspace, has_environment, reaction_channels) = self
             .ctx
             .sessions
             .steering_binding_for_generation(
@@ -7862,13 +7866,21 @@ impl RpcDispatcher {
             use crate::agent::{SteeringAdmission, SteeringPosture};
             let refuse = |message: String| {
                 let denied = crate::rpc::auth::AuthDenied::forbidden(message.clone());
-                audit_denial(Some(&binding), Method::SessionSteer, &denied);
+                audit_denial(binding.as_ref(), Method::SessionSteer, &denied);
                 SteeringAdmission::Refused(message)
             };
-            let grants = match current_authority(&inbound, &binding, Method::SessionSteer) {
+            if dispatcher.access_policy != RpcAccessPolicy::TrustedLocal
+                && let Err(denied) = Self::ensure_session_channel_access(&reaction_channels)
+            {
+                return refuse(denied.message);
+            }
+            let Some(binding) = binding.as_ref() else {
+                return SteeringAdmission::Admitted(SteeringPosture::default());
+            };
+            let grants = match current_authority(&inbound, binding, Method::SessionSteer) {
                 Ok(grants) => grants,
                 Err(denied) => {
-                    audit_denial(Some(&binding), Method::SessionSteer, &denied);
+                    audit_denial(Some(binding), Method::SessionSteer, &denied);
                     return SteeringAdmission::Refused(denied.message);
                 }
             };
@@ -45028,6 +45040,7 @@ mod tests {
         auto_save_memory: Option<Arc<dyn zeroclaw_api::memory_traits::Memory>>,
         /// A provisional binding the session's prompts wait on.
         pending_generation: Option<Arc<tokio::sync::Notify>>,
+        owner_tui_id: Option<String>,
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -45070,7 +45083,8 @@ mod tests {
             workspace.to_str().unwrap(),
             mode,
         )
-        .with_owner_principal(Some(owner.to_string()));
+        .with_owner_principal(Some(owner.to_string()))
+        .with_owner(extras.owner_tui_id);
         let session = match extras.pending_generation {
             Some(pending) => session.with_pending_generation(pending),
             None => session,
@@ -45282,6 +45296,155 @@ mod tests {
                     .iter()
                     .any(|entry| entry.content.contains(STEER_TEXT)),
                 !has_environment
+            );
+        }
+    }
+
+    fn channel_steering_dispatcher(
+        ctx: &Arc<RpcContext>,
+        remote: bool,
+        bound: bool,
+    ) -> (RpcDispatcher, tokio::sync::mpsc::Receiver<String>) {
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let mut dispatcher = RpcDispatcher::new_with_access_policy(
+            Arc::clone(ctx),
+            tx,
+            "steering-channel-test".into(),
+            if remote {
+                RpcAccessPolicy::RemoteSessionOwner
+            } else {
+                RpcAccessPolicy::TrustedLocal
+            },
+            None,
+        );
+        if remote {
+            dispatcher = dispatcher.with_transport(
+                crate::rpc::transport::TransportKind::Wss,
+                crate::security::auth_provider::Credential::None,
+            );
+        }
+        dispatcher.set_tui_id_for_test(Some("tui-steering-channel".into()));
+        if bound {
+            dispatcher.set_authenticated_for_test();
+        }
+        (dispatcher, rx)
+    }
+
+    async fn channel_steer(
+        dispatcher: &mut RpcDispatcher,
+        rx: &mut tokio::sync::mpsc::Receiver<String>,
+        id: u64,
+        params: Value,
+    ) -> Value {
+        if dispatcher.auth.is_some() {
+            rpc(dispatcher, rx, id, "session/steer", params).await
+        } else {
+            // Unbound handlers are a supported test posture; the wire requires auth.
+            match dispatcher.handle_session_steer(&params).await {
+                Ok(result) => json!({"result": result}),
+                Err(error) => json!({"error": error}),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn steering_binding_channel_access_is_checked_before_enqueue_and_consumption() {
+        for (remote, bound, local_channels, add_after_enqueue) in [
+            (true, false, true, false),
+            (true, true, true, false),
+            (true, false, false, false),
+            (true, true, false, false),
+            (false, false, true, false),
+            (false, true, true, false),
+            (true, false, false, true),
+            (true, true, false, true),
+        ] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let sid = "s-steering-channels";
+            let mut config = make_acp_test_config(&tmp);
+            config.memory.backend = "sqlite".into();
+            config.memory.auto_save = true;
+            let memory = zeroclaw_memory::create_memory_for_agent(&config, "test-agent", None)
+                .await
+                .unwrap();
+            let (ctx, backend, _) = persistence_enforcement_ctx(config);
+            let (mut local, mut local_rx) = channel_steering_dispatcher(&ctx, false, true);
+            if local_channels {
+                local.local_session_channel_factory = Some(session_factory_stub());
+            }
+            let created = rpc(
+                &mut local,
+                &mut local_rx,
+                1,
+                "session/new",
+                json!({"agent_alias": "test-agent", "session_id": sid}),
+            )
+            .await;
+            assert_eq!(created["result"]["session_id"], sid, "{created}");
+            assert_eq!(
+                ctx.sessions.has_forwarded_environment(sid).await,
+                Some(false)
+            );
+            let (provider, mut handles) = recording_provider(true);
+            let channels = {
+                let agent = ctx.sessions.get_agent(sid).await.unwrap();
+                let mut agent = agent.lock().await;
+                agent.set_model_provider(Box::new(provider));
+                Arc::clone(&agent.channel_handles().reaction)
+            };
+            assert!(channels.read().contains_key("rpc"));
+            assert_eq!(channels.read().contains_key("git.main"), local_channels);
+            let (mut steerer, mut steerer_rx) = channel_steering_dispatcher(&ctx, remote, bound);
+
+            send_prompt(&mut local, 2, sid, 1).await;
+            handles.await_start().await;
+            let response = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                channel_steer(
+                    &mut steerer,
+                    &mut steerer_rx,
+                    3,
+                    json!({"session_id": sid, "content": STEER_TEXT}),
+                ),
+            )
+            .await
+            .expect("steering must not wait for the active Agent lock");
+            if remote && local_channels {
+                assert_eq!(response["error"]["code"], FORBIDDEN, "{response}");
+                assert!(
+                    response["error"]["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains("local capabilities")
+                );
+            } else {
+                assert_eq!(response["result"]["accepted"], true, "{response}");
+            }
+            if add_after_enqueue {
+                channels
+                    .write()
+                    .insert("git.main".into(), Arc::new(SessionFactoryStubChannel));
+            }
+            handles.release();
+            let (response, _) = response_and_notifications(&mut local_rx, 2).await;
+            assert!(response.get("error").is_none(), "{response}");
+            let permitted = !(remote && (local_channels || add_after_enqueue));
+            let calls = handles.calls().await;
+            assert_eq!(calls.len(), if permitted { 2 } else { 1 }, "{calls:?}");
+            assert_eq!(steered(&calls), permitted);
+            assert_eq!(live_holds(&ctx, sid, STEER_TEXT).await, permitted);
+            assert_eq!(
+                durable_holds(&backend, &format!("rpc_{sid}"), STEER_TEXT),
+                permitted
+            );
+            assert_eq!(
+                memory
+                    .list(None, None)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|entry| entry.content.contains(STEER_TEXT)),
+                permitted
             );
         }
     }
@@ -45707,12 +45870,13 @@ mod tests {
     const FIRST_STEER: &str = "first steer: check the deploy logs";
     const SECOND_STEER: &str = "second steer: check the error budget";
 
-    /// Who sends a steer: Alice's second connection, which her policy
-    /// governs, or the shared local operator, which it does not.
+    /// Who sends a steer: Alice's scoped connection, the local operator,
+    /// or a remote connection with or without optional authentication.
     #[derive(Clone, Copy)]
     enum Steerer {
         Alice,
         Operator,
+        Remote { bound: bool },
     }
 
     /// Which steer's memory write parks.
@@ -45741,7 +45905,7 @@ mod tests {
         parked: ParkedWrite,
         change: impl FnOnce(&mut zeroclaw_config::schema::PermissionProfileConfig),
     ) -> TwoSteers {
-        two_steers_with_a_parked_write_and_context_change(first, second, parked, |ctx| {
+        two_steers_with_a_parked_write_and_context_change(first, second, parked, |ctx, _| {
             republish_session_scoped(ctx, change);
         })
         .await
@@ -45751,7 +45915,7 @@ mod tests {
         first: Steerer,
         second: Steerer,
         parked: ParkedWrite,
-        change: impl FnOnce(&Arc<RpcContext>),
+        change: impl FnOnce(&Arc<RpcContext>, &crate::tools::PerToolChannelHandle),
     ) -> TwoSteers {
         let tmp = tempfile::TempDir::new().unwrap();
         let sid = "s-steer-batch";
@@ -45779,13 +45943,24 @@ mod tests {
             true,
             SessionExtras {
                 auto_save_memory: Some(Arc::new(memory)),
+                owner_tui_id: Some("tui-steering-channel".into()),
                 ..SessionExtras::default()
             },
         )
         .await;
+        let channels = {
+            let agent = ctx.sessions.get_agent(sid).await.unwrap();
+            let agent = agent.lock().await;
+            Arc::clone(&agent.channel_handles().reaction)
+        };
         let (mut prompter, mut prompter_rx) = roster_peer(&ctx, 4242).await;
         let (mut alice, mut alice_rx) = roster_peer(&ctx, 4242).await;
         let (mut operator, mut operator_rx) = local_operator(&ctx).await;
+        let remote_bound = match (first, second) {
+            (Steerer::Remote { bound }, _) | (_, Steerer::Remote { bound }) => bound,
+            _ => false,
+        };
+        let (mut remote, mut remote_rx) = channel_steering_dispatcher(&ctx, true, remote_bound);
 
         send_prompt(&mut prompter, 1, sid, 1).await;
         handles.await_start().await;
@@ -45796,6 +45971,9 @@ mod tests {
                 Steerer::Operator => {
                     rpc(&mut operator, &mut operator_rx, id, "session/steer", params).await
                 }
+                Steerer::Remote { .. } => {
+                    channel_steer(&mut remote, &mut remote_rx, id, params).await
+                }
             };
             assert_eq!(response["result"]["accepted"], json!(true), "{response}");
         }
@@ -45804,7 +45982,7 @@ mod tests {
             .await
             .expect("the parked steer's memory write starts")
             .expect("the memory stays alive");
-        change(&ctx);
+        change(&ctx, &channels);
         let _ = release_write.send(());
         let (response, _) = response_and_notifications(&mut prompter_rx, 1).await;
         assert!(
@@ -45863,7 +46041,7 @@ mod tests {
             Steerer::Operator,
             Steerer::Alice,
             ParkedWrite::First,
-            forbid_steering_workspace,
+            |ctx, _| forbid_steering_workspace(ctx),
         )
         .await;
         assert!(wrote(&outcome, FIRST_STEER));
@@ -45881,7 +46059,7 @@ mod tests {
             Steerer::Alice,
             Steerer::Operator,
             ParkedWrite::Second,
-            forbid_steering_workspace,
+            |ctx, _| forbid_steering_workspace(ctx),
         )
         .await;
         assert!(wrote(&outcome, FIRST_STEER) && wrote(&outcome, SECOND_STEER));
@@ -45890,6 +46068,53 @@ mod tests {
         assert!(sent(&outcome.calls[1], SECOND_STEER));
         assert_eq!(outcome.live, (false, true));
         assert_eq!(outcome.durable, (false, true));
+    }
+
+    #[tokio::test]
+    async fn steering_binding_channel_added_before_write_reaches_nothing() {
+        for bound in [false, true] {
+            let outcome = two_steers_with_a_parked_write_and_context_change(
+                Steerer::Operator,
+                Steerer::Remote { bound },
+                ParkedWrite::First,
+                |_, channels| {
+                    channels
+                        .write()
+                        .insert("git.main".into(), Arc::new(SessionFactoryStubChannel));
+                },
+            )
+            .await;
+            assert!(wrote(&outcome, FIRST_STEER));
+            assert!(!wrote(&outcome, SECOND_STEER));
+            assert_eq!(outcome.calls.len(), 2, "{:?}", outcome.calls);
+            assert!(sent(&outcome.calls[1], FIRST_STEER));
+            assert!(!sent(&outcome.calls[1], SECOND_STEER));
+            assert_eq!(outcome.live, (true, false));
+            assert_eq!(outcome.durable, (true, false));
+        }
+    }
+
+    #[tokio::test]
+    async fn steering_binding_channel_added_after_write_does_not_reach_model() {
+        for bound in [false, true] {
+            let outcome = two_steers_with_a_parked_write_and_context_change(
+                Steerer::Remote { bound },
+                Steerer::Operator,
+                ParkedWrite::Second,
+                |_, channels| {
+                    channels
+                        .write()
+                        .insert("git.main".into(), Arc::new(SessionFactoryStubChannel));
+                },
+            )
+            .await;
+            assert!(wrote(&outcome, FIRST_STEER) && wrote(&outcome, SECOND_STEER));
+            assert_eq!(outcome.calls.len(), 2, "{:?}", outcome.calls);
+            assert!(!sent(&outcome.calls[1], FIRST_STEER));
+            assert!(sent(&outcome.calls[1], SECOND_STEER));
+            assert_eq!(outcome.live, (false, true));
+            assert_eq!(outcome.durable, (false, true));
+        }
     }
 
     #[tokio::test]
