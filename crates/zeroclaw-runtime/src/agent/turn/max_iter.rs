@@ -6,11 +6,12 @@ use super::StreamDelta;
 use super::execution::SettledAttemptSummary;
 use super::knobs::{LoopKnobs, MaxIterationBehavior};
 use super::outcome::ToolLoopCancelled;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::time::Duration;
 use tokio::sync::mpsc::Sender;
 use tokio_util::sync::CancellationToken;
 use zeroclaw_api::agent::TurnEvent;
+use zeroclaw_api::turn_stop::{TurnStop, TurnStopCode};
 use zeroclaw_config::schema::{Config, MultimodalConfig, PacingConfig, ResolvedContextLimits};
 use zeroclaw_providers::{ChatMessage, ModelProvider};
 use zeroclaw_tool_call_parser::{strip_think_tags, strip_trailing_terminal_markers};
@@ -29,6 +30,12 @@ impl CompletionLimit {
             }
             Self::ExecutionTree => "Agent exhausted the execution-tree iteration budget".into(),
         }
+    }
+
+    /// The iteration-cap stop, shared by the `ErrorAtCap` exit and the
+    /// graceful-summary failure paths so all of them carry one code and one message.
+    fn stop(self) -> TurnStop {
+        TurnStop::close_out(TurnStopCode::MaxIterations, self.explanation())
     }
 }
 
@@ -104,7 +111,7 @@ pub(crate) async fn finish_after_max_iterations(
     // ErrorAtCap callers (embedders driving Agent::turn) treat the cap as a
     // control signal: bail instead of spending another LLM call on a summary.
     if knobs.max_iteration_behavior == MaxIterationBehavior::ErrorAtCap {
-        anyhow::bail!("{exhaustion}")
+        return Err(limit.stop().into());
     }
 
     // Graceful shutdown: ask the LLM for a final summary without tools
@@ -379,7 +386,11 @@ pub(crate) async fn finish_after_max_iterations(
             return Err(ToolLoopCancelled.into());
         }
         SummaryCall::TimedOut(step_secs) => {
-            anyhow::bail!("Final summary LLM call timed out after {step_secs}s (step_timeout_secs)")
+            return Err(TurnStop::close_out(
+                TurnStopCode::MaxIterations,
+                format!("Final summary LLM call timed out after {step_secs}s (step_timeout_secs)"),
+            )
+            .into());
         }
         SummaryCall::Done(Err(e)) => {
             ::zeroclaw_log::record!(
@@ -397,7 +408,12 @@ pub(crate) async fn finish_after_max_iterations(
                 "final summary LLM call failed after iteration exhaustion; bailing"
             );
             emit_summary_attempt_usage(event_tx, &summary_attempts).await;
-            return Err(e).context(exhaustion);
+            // The provider error stays the source; the stop rides alongside
+            // it so the exit is typed without losing what actually failed.
+            return Err(zeroclaw_api::turn_stop::tag(
+                e.context(exhaustion),
+                limit.stop(),
+            ));
         }
         SummaryCall::Done(Ok(resp)) => {
             emit_summary_attempt_usage(event_tx, &summary_attempts).await;
@@ -407,7 +423,7 @@ pub(crate) async fn finish_after_max_iterations(
 
     let raw_text = resp.text.unwrap_or_default();
     if raw_text.is_empty() {
-        anyhow::bail!("{exhaustion}")
+        return Err(limit.stop().into());
     }
     // The summary is raw provider text, and emitting it as a chunk makes this
     // a new automatic display sink: ACP renders `agent_message_chunk` live,
@@ -441,7 +457,7 @@ pub(crate) async fn finish_after_max_iterations(
         display_text
     };
     if display_text.trim().is_empty() {
-        anyhow::bail!("{exhaustion}")
+        return Err(limit.stop().into());
     }
     // History and result payloads keep the unmodified provider text; only the
     // display path is normalized, matching the final-response contract.
@@ -1605,6 +1621,29 @@ mod graceful_summary_metering_tests {
         );
     }
 
+    // A summary that is only a terminal marker passes the semantic-empty
+    // check (which strips think tags, not markers) and is emptied by display
+    // cleanup; that exit must carry the same typed stop as the other cap exits.
+    #[tokio::test]
+    async fn graceful_summary_of_only_a_terminal_marker_is_a_typed_max_iterations_stop() {
+        let provider = RawTextProvider {
+            text: "<|eom|>".to_string(),
+        };
+        let error = run_summary(&provider)
+            .await
+            .expect_err("a marker-only summary is not a terminal answer");
+        assert_eq!(
+            zeroclaw_api::turn_stop::turn_stop(&error)
+                .expect("marker-only exit must carry the typed stop")
+                .code,
+            zeroclaw_api::turn_stop::TurnStopCode::MaxIterations
+        );
+        assert_eq!(
+            error.to_string(),
+            "Agent exceeded maximum tool iterations (2)"
+        );
+    }
+
     #[tokio::test]
     async fn graceful_summary_chunk_suppresses_internal_tool_protocol_envelope() {
         let delta = emitted_chunk_for_raw_summary(
@@ -1651,6 +1690,36 @@ mod i18n_message_tests {
         assert!(
             msg.contains("maximum tool iterations"),
             "message should describe the limit: {msg}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zeroclaw_api::turn_stop::turn_stop;
+
+    #[test]
+    fn the_iteration_cap_stop_is_typed_and_says_what_it_always_said() {
+        let stop = CompletionLimit::LocalIterations(10).stop();
+        assert_eq!(stop.code, TurnStopCode::MaxIterations);
+        assert_eq!(
+            stop.to_string(),
+            "Agent exceeded maximum tool iterations (10)"
+        );
+        let err: anyhow::Error = stop.into();
+        assert_eq!(
+            turn_stop(&err)
+                .expect("stop must survive the anyhow hop")
+                .code,
+            TurnStopCode::MaxIterations
+        );
+
+        let tree = CompletionLimit::ExecutionTree.stop();
+        assert_eq!(tree.code, TurnStopCode::MaxIterations);
+        assert_eq!(
+            tree.to_string(),
+            "Agent exhausted the execution-tree iteration budget"
         );
     }
 }
