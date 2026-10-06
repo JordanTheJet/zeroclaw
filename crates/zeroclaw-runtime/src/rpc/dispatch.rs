@@ -44098,13 +44098,14 @@ mod tests {
             turn_parity_fixture(&tmp, sid, Some("owning-tui")).await;
         let (mut driver, mut driver_rx) = local_operator(&ctx).await;
         let (mut operator, mut operator_rx) = local_operator(&ctx).await;
+        let (mut other, mut other_rx) = make_remote_dispatcher(Arc::clone(&ctx), "other-tui");
 
         send_prompt(&mut driver, 1, sid, 1).await;
         await_provider_start(&mut started).await;
 
         let refused = rpc(
-            &mut operator,
-            &mut operator_rx,
+            &mut other,
+            &mut other_rx,
             2,
             "session/cancel",
             json!({"session_id": sid}),
@@ -44113,7 +44114,7 @@ mod tests {
         assert_eq!(
             refused["error"]["code"],
             json!(SESSION_NOT_OWNED),
-            "session/cancel keeps its owning-client rule: {refused}"
+            "remote session/cancel keeps its owning-client rule: {refused}"
         );
 
         let aborted = rpc(
