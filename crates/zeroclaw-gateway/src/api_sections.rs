@@ -2163,7 +2163,10 @@ mod tests {
 
         let mut disk_cfg = state.config.read().clone();
         disk_cfg.memory.backend = "postgres".to_string();
-        disk_cfg.save().await.expect("write external memory drift");
+        disk_cfg
+            .force_save()
+            .await
+            .expect("write intentional external memory drift");
         let disk_before = tokio::fs::read(&config_path)
             .await
             .expect("read drifted memory config");
@@ -2224,7 +2227,10 @@ mod tests {
             .as_mut()
             .expect("tailscale defaults")
             .funnel = true;
-        disk_cfg.save().await.expect("write external tunnel drift");
+        disk_cfg
+            .force_save()
+            .await
+            .expect("write intentional external tunnel drift");
         let disk_before = tokio::fs::read(&config_path)
             .await
             .expect("read drifted tunnel config");

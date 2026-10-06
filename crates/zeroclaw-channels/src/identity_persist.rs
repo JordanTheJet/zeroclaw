@@ -1109,7 +1109,10 @@ mod tests {
             );
         }
         let competing = shared.read().clone();
-        competing.save().await.expect("the competing save lands");
+        competing
+            .force_save()
+            .await
+            .expect("the competing save lands");
 
         drop(guard);
         pairing
@@ -1171,7 +1174,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        gateway.save().await.expect("the deny save lands");
+        gateway.force_save().await.expect("the deny save lands");
 
         // The channel handle is stale, which is the whole point.
         assert!(
@@ -1254,7 +1257,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        gateway.save().await.expect("the gateway save lands");
+        gateway.force_save().await.expect("the gateway save lands");
 
         assert!(
             !channel.read().channels.whatsapp.contains_key("ops"),
@@ -1337,7 +1340,10 @@ mod tests {
         // Bound before the await: a `parking_lot` read guard must not be held
         // across one.
         let competing = shared.read().clone();
-        competing.save().await.expect("the competing save lands");
+        competing
+            .force_save()
+            .await
+            .expect("the competing save lands");
 
         drop(guard);
         let err = pairing

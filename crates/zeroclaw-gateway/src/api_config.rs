@@ -3072,6 +3072,9 @@ pub async fn handle_migrate(
                 let _ = dir.sync_all().await;
             }
 
+            // The migrated value now represents the file successfully replaced
+            // above, so later full saves retain that target's load provenance.
+            new_cfg.loaded_from = Some(config_path.clone());
             authorization.publish_persisted(&new_cfg);
             *state.config.write() = new_cfg;
             state
