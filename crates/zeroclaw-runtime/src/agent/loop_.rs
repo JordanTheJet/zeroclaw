@@ -6646,7 +6646,10 @@ mod tests {
 
     struct ImageRecoveryContinuationProvider {
         image_counts: Mutex<Vec<usize>>,
-        resubmission: Option<(tokio::sync::mpsc::Sender<String>, String)>,
+        resubmission: Option<(
+            tokio::sync::mpsc::Sender<crate::agent::SteeringInput>,
+            String,
+        )>,
     }
 
     impl ::zeroclaw_api::attribution::Attributable for ImageRecoveryContinuationProvider {
@@ -6709,7 +6712,7 @@ mod tests {
             }
             let text = if call == 1 {
                 if let Some((tx, message)) = &self.resubmission {
-                    tx.send(message.clone()).await.unwrap();
+                    tx.send(message.clone().into()).await.unwrap();
                 }
                 r#"<tool_call>
 {"name":"probe","arguments":{"value":"ok"}}
