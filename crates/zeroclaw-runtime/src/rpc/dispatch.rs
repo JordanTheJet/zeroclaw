@@ -24830,7 +24830,19 @@ mod tests {
         Arc<std::sync::Mutex<crate::sop::SopEngine>>,
         tempfile::TempDir,
     ) {
-        let mut engine = crate::sop::SopEngine::new(zeroclaw_config::schema::SopConfig::default());
+        sops_run_dispatcher_with_config(zeroclaw_config::schema::Config::default(), sop, handles)
+    }
+
+    fn sops_run_dispatcher_with_config(
+        config: zeroclaw_config::schema::Config,
+        sop: crate::sop::types::Sop,
+        handles: Option<crate::sop::SopDriverHandles>,
+    ) -> (
+        RpcDispatcher,
+        Arc<std::sync::Mutex<crate::sop::SopEngine>>,
+        tempfile::TempDir,
+    ) {
+        let mut engine = crate::sop::SopEngine::new(config.sop.clone());
         engine.set_sops_for_test(vec![sop]);
         let engine = Arc::new(std::sync::Mutex::new(engine));
         let sessions = Arc::new(crate::rpc::session::SessionStore::new(
@@ -24848,7 +24860,7 @@ mod tests {
             Arc::from(zeroclaw_memory::create_memory(&mem_cfg, temp.path(), None).unwrap());
         let audit = Arc::new(crate::sop::SopAuditLogger::new(memory));
         let ctx = RpcContext::minimal_with_sop_engine_and_audit(
-            zeroclaw_config::schema::Config::default(),
+            config,
             sessions,
             Arc::clone(&engine),
             audit,
@@ -24860,6 +24872,78 @@ mod tests {
             engine,
             temp,
         )
+    }
+
+    struct ScriptedSopToolResponder {
+        calls: std::sync::atomic::AtomicUsize,
+        denied_shell_command: String,
+    }
+
+    impl wiremock::Respond for ScriptedSopToolResponder {
+        fn respond(&self, _request: &wiremock::Request) -> wiremock::ResponseTemplate {
+            use std::sync::atomic::Ordering;
+
+            let (message, finish_reason) = match self.calls.fetch_add(1, Ordering::SeqCst) {
+                0 => (
+                    serde_json::json!({
+                        "role": "assistant",
+                        "content": null,
+                        "tool_calls": [{
+                            "id": "denied-shell-call",
+                            "type": "function",
+                            "function": {
+                                "name": "shell",
+                                "arguments": serde_json::json!({
+                                    "command": self.denied_shell_command.clone()
+                                })
+                                .to_string(),
+                            },
+                        }],
+                    }),
+                    "tool_calls",
+                ),
+                1 => (
+                    serde_json::json!({
+                        "role": "assistant",
+                        "content": null,
+                        "tool_calls": [{
+                            "id": "allowed-file-write-call",
+                            "type": "function",
+                            "function": {
+                                "name": "file_write",
+                                "arguments": serde_json::json!({
+                                    "path": "allowed.txt",
+                                    "content": "file_write ran within the step scope",
+                                })
+                                .to_string(),
+                            },
+                        }],
+                    }),
+                    "tool_calls",
+                ),
+                _ => (
+                    serde_json::json!({
+                        "role": "assistant",
+                        "content": "The allowed step completed.",
+                        "tool_calls": [],
+                    }),
+                    "stop",
+                ),
+            };
+
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "chatcmpl-sop-step-scope",
+                "object": "chat.completion",
+                "created": 1,
+                "model": "rpc-test-model",
+                "choices": [{
+                    "index": 0,
+                    "message": message,
+                    "finish_reason": finish_reason,
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            }))
+        }
     }
 
     fn manual_sop(
@@ -24993,6 +25077,168 @@ mod tests {
             None,
             "the producer key must not point at a run nothing will advance"
         );
+    }
+
+    /// A manual RPC run resolves its declared agent and applies the run's
+    /// per-step allowlist before dispatching any model-requested tool. The
+    /// scripted provider still asks for `shell` even though it is not offered;
+    /// that call must not execute, while the allowed `file_write` step can
+    /// complete under the same configured agent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sops_run_uses_configured_agent_and_enforces_step_tool_scope() {
+        use std::sync::atomic::AtomicUsize;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer};
+
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("rpc-ops-workspace");
+        let shell_marker = workspace.join("shell-denied.txt");
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ScriptedSopToolResponder {
+                calls: AtomicUsize::new(0),
+                denied_shell_command: format!("touch '{}'", shell_marker.display()),
+            })
+            .mount(&server)
+            .await;
+
+        let mut config = zeroclaw_config::schema::Config {
+            config_path: temp.path().join("config.toml"),
+            data_dir: temp.path().join("data"),
+            sop: zeroclaw_config::schema::SopConfig {
+                step_scope_enforce: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let provider = config
+            .providers
+            .models
+            .ensure("openai", "rpc-test")
+            .unwrap();
+        provider.api_key = Some("unit-test-key".into());
+        provider.uri = Some(server.uri());
+        provider.model = Some("rpc-test-model".into());
+        provider.wire_api = Some(zeroclaw_config::schema::WireApi::ChatCompletions);
+
+        let risk = zeroclaw_config::schema::RiskProfileConfig {
+            level: zeroclaw_config::autonomy::AutonomyLevel::Full,
+            workspace_only: true,
+            allowed_commands: vec!["touch".into()],
+            allowed_tools: vec!["shell".into(), "file_write".into()],
+            auto_approve: vec!["shell".into(), "file_write".into()],
+            always_ask: Vec::new(),
+            require_approval_for_medium_risk: false,
+            block_high_risk_commands: false,
+            ..Default::default()
+        };
+        config.risk_profiles.insert("sop-rpc-test".into(), risk);
+
+        let runtime = zeroclaw_config::schema::RuntimeProfileConfig {
+            agentic: true,
+            max_tool_iterations: 5,
+            parallel_tools: Some(false),
+            ..Default::default()
+        };
+        config
+            .runtime_profiles
+            .insert("sop-rpc-test".into(), runtime);
+
+        let agent = zeroclaw_config::schema::AliasedAgentConfig {
+            model_provider: zeroclaw_config::providers::ModelProviderRef::new("openai.rpc-test"),
+            risk_profile: zeroclaw_config::providers::RiskProfileRef::new("sop-rpc-test"),
+            runtime_profile: zeroclaw_config::providers::RuntimeProfileRef::new("sop-rpc-test"),
+            workspace: zeroclaw_config::multi_agent::AgentWorkspaceConfig {
+                path: Some(workspace.clone()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        config.agents.insert("ops".into(), agent);
+
+        let step = crate::sop::types::SopStep {
+            number: 1,
+            title: "Write within the allowed scope".into(),
+            body: "Write the allowed file after handling the unavailable shell call.".into(),
+            scope: Some(crate::sop::StepToolScope {
+                allow: Some(vec!["file_write".into()]),
+                deny: vec!["shell".into()],
+            }),
+            ..crate::sop::types::SopStep::default()
+        };
+        let mut sop = manual_sop("rpc-step-scope", false, step);
+        sop.agent = Some("ops".into());
+
+        let handles = crate::sop::SopDriverHandles::default();
+        let (dispatcher, engine, _audit_temp) =
+            sops_run_dispatcher_with_config(config, sop, Some(handles));
+        let run_id = start_with_key(&dispatcher, "rpc-step-scope", "rpc-step-scope-test").await;
+
+        let status = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                let status = engine
+                    .lock()
+                    .unwrap()
+                    .get_run(&run_id)
+                    .map(|run| run.status);
+                if matches!(
+                    status,
+                    Some(crate::sop::types::SopRunStatus::Completed)
+                        | Some(crate::sop::types::SopRunStatus::Failed)
+                ) {
+                    break status;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the generation-owned RPC driver should finish the scripted step");
+        assert_eq!(
+            status,
+            Some(crate::sop::types::SopRunStatus::Completed),
+            "the configured agent should recover from the refused shell call and finish the allowed step"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(workspace.join("allowed.txt"))
+                .await
+                .expect("the allowed file_write call should execute"),
+            "file_write ran within the step scope"
+        );
+        assert!(
+            !shell_marker.exists(),
+            "the scripted but out-of-scope shell call must never execute"
+        );
+
+        let requests = server
+            .received_requests()
+            .await
+            .expect("the scripted provider should record its requests");
+        assert!(
+            requests.len() >= 3,
+            "expected denied, allowed, and final model turns"
+        );
+        for request in &requests {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            let offered = body["tools"]
+                .as_array()
+                .expect("the agentic request should carry its configured tool set");
+            let names: Vec<&str> = offered
+                .iter()
+                .filter_map(|tool| {
+                    tool.pointer("/function/name")
+                        .and_then(|name| name.as_str())
+                })
+                .collect();
+            assert!(
+                names.contains(&"file_write"),
+                "the allowed tool was omitted: {names:?}"
+            );
+            assert!(
+                !names.contains(&"shell"),
+                "the denied tool was offered: {names:?}"
+            );
+        }
     }
 
     #[tokio::test]
