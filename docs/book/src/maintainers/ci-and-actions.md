@@ -70,7 +70,7 @@ For `scoped`, the Windows job passes explicit `-p` arguments to `cargo nextest`;
 
 ### Scheduled Platform Tests (`platform-tests.yml`)
 
-Runs `cargo nextest run --locked --workspace --exclude zeroclaw-desktop --no-fail-fast` on `macos-14` and `windows-latest` after a cheap Linux formatting check. This nightly full-workspace run is the backstop for label-selected Windows coverage and inventories failures with `--no-fail-fast`. The matrix runs for:
+Runs `cargo nextest run --locked --workspace --exclude zeroclaw-desktop --no-fail-fast` on `macos-15` and `windows-latest` after a cheap Linux formatting check. This nightly full-workspace run is the backstop for label-selected Windows coverage and inventories failures with `--no-fail-fast`. The matrix runs for:
 
 - pull requests that change `platform-tests.yml` itself;
 - manual dispatches; and

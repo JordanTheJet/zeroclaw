@@ -1302,7 +1302,7 @@ impl<'a> TurnState<'a> {
         &mut self,
         assistant_history_content: String,
         native_tool_calls: &[zeroclaw_providers::ToolCall],
-        individual_results: &[(Option<String>, String)],
+        individual_results: &[results_collect::ToolRoundResult],
         tool_results: &str,
         use_native_tools: bool,
     ) {
@@ -1546,6 +1546,13 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
     // Accumulated display text across all tool-loop calls.
     let mut accumulated_display_text = String::new();
     let mut malformed_tool_protocol_retries: usize = 0;
+    // Text withheld by the streaming text guard on a previous attempt,
+    // stored with its trailing whitespace trimmed. A repeat that is
+    // identical up to trailing whitespace means the model produced the same
+    // protocol-shaped prose again; another retry would suppress it again,
+    // so the turn ends with a notice instead of spending more provider
+    // calls.
+    let mut last_guard_suppressed_text: Option<String> = None;
     let mut prompt_approval_tool_signatures: HashSet<(String, String)> = HashSet::new();
 
     // Shared-ref context for the turn step functions. Every `&mut` the loop
@@ -2573,6 +2580,34 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 "tool_call_parse_feedback_details"
             );
 
+            if protocol_suppressed {
+                // Trailing whitespace is not a semantic difference: the same
+                // suppressed envelope with or without a final newline is
+                // still the same reply, so compare trimmed ends and store
+                // the trimmed form. The delivered text is not rewritten.
+                let suppressed_text = response_text.trim_end().to_string();
+                if last_guard_suppressed_text.as_deref() == Some(suppressed_text.as_str()) {
+                    // The guard withheld the same text twice: retrying cannot
+                    // recover prose the guard keeps suppressing, so end the
+                    // turn with a notice instead of another provider call.
+                    let notice = crate::i18n::get_required_cli_string(
+                        "cli-agent-error-protocol-guard-withheld",
+                    );
+                    accumulated_display_text.push_str(&notice);
+                    // The notice is synthesized here, never streamed live: an
+                    // event consumer that already flushed streamed prose
+                    // would otherwise hide it, like the malformed fallback.
+                    events::emit_posthoc_turn_chunk(event_tx.as_ref(), &notice).await;
+                    if let Some(ref tx) = on_delta {
+                        let _ = tx.send(StreamDelta::Text(notice.to_string())).await;
+                    }
+                    let msg = ChatMessage::assistant(notice.to_string());
+                    turn_state.push_dual(msg);
+                    return Ok(accumulated_display_text);
+                }
+                last_guard_suppressed_text = Some(suppressed_text);
+            }
+
             if malformed_tool_protocol_retries <= MAX_MALFORMED_TOOL_PROTOCOL_RETRIES {
                 // This is model feedback, not a tool result: malformed protocol
                 // output has no valid tool_call_id to attach a role=tool message to.
@@ -2778,8 +2813,8 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 !native_tool_calls.is_empty(),
             )
             .await;
-            // `protocol_suppressed` withholds the whole turn; the empty-remainder
-            // skip below handles the guard-passed case where the live stream already forwarded every byte.
+            // `protocol_suppressed` withholds from the suppressed candidate onward; the prose
+            // ahead of it is already delivered, and the empty-remainder skip below handles the guard-passed case where the live stream already forwarded every byte.
             if !native_tool_calls.is_empty()
                 && !protocol_suppressed
                 && !remainder.is_empty()
@@ -2953,6 +2988,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                             output: crate::i18n::get_required_cli_string(
                                 "turn-tool-interrupted-before-result",
                             ),
+                            attachments: Vec::new(),
                             success: false,
                             error_reason: None,
                             duration: std::time::Duration::ZERO,
@@ -2978,6 +3014,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                         output: crate::i18n::get_required_cli_string(
                             "turn-tool-interrupted-before-result",
                         ),
+                        attachments: Vec::new(),
                         success: false,
                         error_reason: None,
                         duration: std::time::Duration::ZERO,
@@ -3254,7 +3291,7 @@ fn sop_step_excluded_tools(
 #[derive(Clone)]
 pub struct SopStepReassembly<'a> {
     pub config: &'a zeroclaw_config::schema::Config,
-    pub live_config: Option<Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
+    pub live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
 }
 
 /// The re-assembly gate: a step needs its own agent context re-assembled when
@@ -3346,7 +3383,7 @@ impl OwnedAgentExecution {
 #[cfg(test)]
 pub(crate) async fn assemble_owned_execution(
     config: &zeroclaw_config::schema::Config,
-    live_config: Option<Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
+    live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
     alias: &str,
     sop_engine: Arc<std::sync::Mutex<crate::sop::SopEngine>>,
     sop_audit: Option<Arc<crate::sop::SopAuditLogger>>,
@@ -3366,7 +3403,7 @@ pub(crate) async fn assemble_owned_execution(
 
 pub(crate) async fn assemble_owned_execution_with_admission(
     config: &zeroclaw_config::schema::Config,
-    live_config: Option<Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
+    live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
     alias: &str,
     sop_engine: Arc<std::sync::Mutex<crate::sop::SopEngine>>,
     sop_audit: Option<Arc<crate::sop::SopAuditLogger>>,
@@ -5840,7 +5877,7 @@ mod active_route_context_tests {
             axum::serve(listener, app).await.expect("vision serves");
         });
 
-        // A tempfile PNG the injected marker points at, so image preparation
+        // A tempfile PNG the declared attachment points at, so image preparation
         // has a real file to load.
         let temp = tempfile::tempdir().expect("tempdir");
         let image_path = temp.path().join("shot.png");
@@ -5877,7 +5914,7 @@ vision_model_provider = "custom.vision"
         // Text primary: iteration 0 emits a native tool call; iteration 1 (after
         // the tool injects an image and the route switches to vision) ends the
         // turn. `ProviderCapabilities::default()` has `vision = false`, so the
-        // image marker forces the vision route.
+        // declared image forces the vision route.
         struct TextPrimary {
             calls: Arc<AtomicUsize>,
         }
@@ -5885,7 +5922,7 @@ vision_model_provider = "custom.vision"
         impl ModelProvider for TextPrimary {
             fn capabilities(&self) -> zeroclaw_api::model_provider::ProviderCapabilities {
                 // Native tool calling so the structured `tool_calls` below are
-                // honored; vision stays false so an image marker forces routing.
+                // honored; vision stays false so a declared image forces routing.
                 zeroclaw_api::model_provider::ProviderCapabilities {
                     native_tool_calling: true,
                     ..Default::default()
@@ -5959,7 +5996,14 @@ vision_model_provider = "custom.vision"
                 serde_json::json!({"type": "object", "properties": {}})
             }
             async fn execute(&self, _args: serde_json::Value) -> Result<ToolResult> {
-                Ok(ToolResult::ok(format!("here it is [IMAGE:{}]", self.path)))
+                // The producer declares its image; under the attachment
+                // contract nothing in the result text is promoted.
+                Ok(ToolResult::ok("here it is").with_attachment(
+                    zeroclaw_api::media::RenderedMarker {
+                        target: self.path.clone(),
+                        kind: zeroclaw_api::media::MarkerKind::Image,
+                    },
+                ))
             }
         }
         impl zeroclaw_api::attribution::Attributable for AttachImage {
@@ -6427,14 +6471,14 @@ mod sop_step_reassembly_tests {
                 ..AliasedAgentConfig::default()
             },
         );
-        let live_config = Arc::new(parking_lot::RwLock::new(config.clone()));
+        let live_config = zeroclaw_config::live::LiveConfig::new(config.clone());
         let engine = Arc::new(std::sync::Mutex::new(crate::sop::SopEngine::new(
             SopConfig::default(),
         )));
 
         let owned = assemble_owned_execution(
             &config,
-            Some(Arc::clone(&live_config)),
+            Some(live_config.handle()),
             "stepper",
             Arc::clone(&engine),
             None,
@@ -6455,11 +6499,11 @@ mod sop_step_reassembly_tests {
             .expect("first run");
         assert!(first.success, "allowlisted local endpoint should pass");
 
+        let mut reloaded = live_config.snapshot();
+        reloaded.file_download.allowed_private_hosts.clear();
         live_config
-            .write()
-            .file_download
-            .allowed_private_hosts
-            .clear();
+            .publish(live_config.next_revision().unwrap(), reloaded)
+            .unwrap();
 
         let second = file_download.execute(args).await.expect("second run");
         assert!(

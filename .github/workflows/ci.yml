@@ -514,7 +514,7 @@ jobs:
             target: x86_64-unknown-linux-gnu
             cmd: build
             label: Build
-          - os: macos-14
+          - os: macos-15
             target: aarch64-apple-darwin
             cmd: check
             label: Check

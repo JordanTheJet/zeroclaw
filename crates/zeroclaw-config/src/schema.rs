@@ -838,17 +838,18 @@ impl WireApi {
     }
 }
 
-/// Policy for image markers embedded in native tool-result content.
+/// Policy for images a native tool-result carrier declared in its
+/// `attachments` array.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
 )]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum ToolResultImagePolicy {
-    /// Preserve tool-result image markers as structured `image_url` parts.
+    /// Send declared tool-result images as structured `image_url` parts.
     #[default]
     ImageUrl,
-    /// Remove tool-result image payloads and leave a fixed notice for the model.
+    /// Drop declared tool-result images and leave a fixed notice for the model.
     Omit,
 }
 
@@ -1111,10 +1112,14 @@ pub struct ModelProviderConfig {
     #[tab(Advanced)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vision: Option<bool>,
-    /// How native compatible chat-completions providers handle image markers in
-    /// role=`tool` results. `image_url` preserves structured image parts;
-    /// `omit` removes their payloads and appends a fixed notice. This does not
-    /// affect direct user image content or OpenAI Responses providers.
+    /// How native compatible chat-completions providers handle images a
+    /// role=`tool` result declared in its `attachments` array. `image_url`
+    /// sends them as structured image parts; `omit` drops them and appends a
+    /// fixed notice, keeping the result text verbatim. Legacy tool results
+    /// (no array key) pass verbatim under both settings: they declare
+    /// nothing and their bodies are text, so literal marker syntax in a
+    /// tool's output never drives this policy. This does not affect direct
+    /// user image content or OpenAI Responses providers.
     #[tab(Advanced)]
     #[serde(default, skip_serializing_if = "is_default_tool_result_image_policy")]
     pub tool_result_image_policy: ToolResultImagePolicy,
@@ -7173,16 +7178,17 @@ impl Default for PipelineConfig {
 ///
 /// # Privacy and cost note
 ///
-/// Tool results that print real local image paths (e.g. shell tools doing
-/// `ls /pictures` or `find . -name '*.png'`) are canonicalized into
-/// `[IMAGE:...]` markers and base64-inlined into the next provider request.
-/// This means image bytes that previously stayed local will be uploaded to
-/// the configured provider when surfaced by a tool.
+/// Tool text is never scanned for image paths: a tool result that merely
+/// prints a local path (e.g. shell tools doing `ls /pictures` or
+/// `find . -name '*.png'`) stays text. Image bytes are uploaded only when a
+/// tool explicitly declares an attachment, and a declared attachment is
+/// base64-inlined into the next provider request, so operators running
+/// tools that declare image attachments over personal or sensitive files
+/// should be aware of the upload semantics.
 ///
 /// `max_images` (and the `trim_old_images` LRU policy) bounds the per-request
-/// image budget, but operators running shell-style tools over directories of
-/// personal or sensitive images should be aware of the upload semantics. See
-/// `docs/book/src/contributing/privacy.md` for the project's privacy stance.
+/// image budget. See `docs/book/src/contributing/privacy.md` for the
+/// project's privacy stance.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "multimodal"]
@@ -15791,6 +15797,22 @@ pub struct CustomTunnelConfig {
 
 // ── Channels ─────────────────────────────────────────────────────
 
+/// Notice policy for ordinary same-family, different-model channel fallback.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum ModelFallbackNotice {
+    /// Omit ordinary same-family model fallback notices.
+    #[default]
+    Off,
+    /// Report fallback without exposing provider or model identifiers.
+    Redacted,
+    /// Include requested and served provider/model identifiers.
+    Detailed,
+}
+
 /// Top-level channel configurations (`[channels]` section).
 ///
 /// each channel type is a keyed table of named instances (aliases).
@@ -15972,6 +15994,13 @@ pub struct ChannelsConfig {
     /// not forwarded as individual channel messages. Default: `false`.
     #[serde(default = "default_false")]
     pub show_tool_calls: bool,
+    /// Notice mode for ordinary same-family, different-model fallback: `off`
+    /// (default), `redacted`, or `detailed`. Applies globally to all orchestrated
+    /// channels and is read from live config at outbound delivery. Detailed
+    /// notices expose requested and served provider/model identifiers to the
+    /// channel audience. Cross-family and safeguard notices are unchanged.
+    #[serde(default)]
+    pub model_fallback_notice: ModelFallbackNotice,
     /// Persist channel conversation history to JSONL files so sessions survive
     /// daemon restarts. Files are stored in `{workspace}/sessions/`. Default: `true`.
     #[serde(default = "default_true")]
@@ -16435,6 +16464,7 @@ impl Default for ChannelsConfig {
             max_concurrent_per_channel: default_channel_max_concurrent_per_channel(),
             ack_reactions: true,
             show_tool_calls: false,
+            model_fallback_notice: ModelFallbackNotice::default(),
             session_persistence: true,
             session_backend: default_session_backend(),
             session_ttl_hours: 0,
@@ -22974,6 +23004,66 @@ impl Config {
             ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"path": config.config_path.display().to_string(), "workspace": config.data_dir.display().to_string(), "source": resolution_source.as_str(), "initialized": true})), "Config loaded");
             Ok(config)
         }
+    }
+
+    /// Hydrate one already-migrated config body exactly as a reload would,
+    /// without replacing the config file.
+    ///
+    /// This is the preparation step for config migration (see the
+    /// gateway's migrate endpoint): the candidate must be fully hydrated
+    /// — strict parse into the current schema, computed paths attached,
+    /// secrets decrypted through the install's store, env overrides
+    /// applied with their save-masking snapshots captured — and must pass
+    /// strict validation *before* the migrated file is allowed to replace
+    /// the live one. Any failure (parse, secret, unresolvable env path,
+    /// validation) refuses the migration with the original config file
+    /// untouched and nothing published. Migration acceptance is stricter
+    /// than resilient boot ([`Config::load_or_init`] warns and serves);
+    /// an operator-driven replacement may not install a config the
+    /// current schema rejects.
+    ///
+    /// The caller supplies the canonical `config_path` and `data_dir`
+    /// (from the currently published config) so the prepared candidate is
+    /// exactly the config the next daemon generation would load from the
+    /// migrated file.
+    pub async fn prepare_from_migrated_toml(
+        content: &str,
+        config_path: &std::path::Path,
+        data_dir: &std::path::Path,
+    ) -> Result<Self> {
+        let mut config = crate::migration::migrate_to_current(content)
+            .context("migrated config failed to hydrate as the current schema")?;
+        config.config_path = config_path.to_path_buf();
+        config.data_dir = data_dir.to_path_buf();
+
+        if let Some(default_profile) = config.risk_profiles.get_mut("default") {
+            default_profile.ensure_default_auto_approve();
+        }
+
+        let zeroclaw_dir = config_path
+            .parent()
+            .context("config path must have a parent directory")?;
+        let store = crate::secrets::SecretStore::new(zeroclaw_dir, config.secrets.encrypt);
+        config.onepassword_reference_snapshots = collect_onepassword_reference_snapshots(&config);
+        config = tokio::task::spawn_blocking(move || {
+            config.decrypt_secrets(&store)?;
+            Ok::<_, anyhow::Error>(config)
+        })
+        .await
+        .context("migrated config secret decryption task failed")??;
+
+        let applied = crate::env_overrides::apply_env_overrides(&mut config)?;
+        config.env_overridden_paths = applied.paths;
+        config.pre_override_snapshots = applied.snapshots;
+
+        // Strict validation: unlike resilient boot, an operator-driven
+        // migration refuses a candidate the current schema rejects. The
+        // refusal happens before any disk replacement, so the original
+        // file and the published pair are unchanged.
+        config
+            .validate()
+            .context("migrated config failed strict validation")?;
+        Ok(config)
     }
 
     /// Report that opting into `[verifiable_intent]` does not currently enable
@@ -32896,6 +32986,7 @@ auto_save = true
                 max_concurrent_per_channel: default_channel_max_concurrent_per_channel(),
                 ack_reactions: true,
                 show_tool_calls: true,
+                model_fallback_notice: ModelFallbackNotice::default(),
                 session_persistence: true,
                 session_backend: default_session_backend(),
                 session_ttl_hours: 0,
@@ -35075,6 +35166,7 @@ allowed_users = ["@u:matrix.org"]
             max_concurrent_per_channel: default_channel_max_concurrent_per_channel(),
             ack_reactions: true,
             show_tool_calls: true,
+            model_fallback_notice: ModelFallbackNotice::default(),
             session_persistence: true,
             session_backend: default_session_backend(),
             session_ttl_hours: 0,
@@ -35095,6 +35187,68 @@ allowed_users = ["@u:matrix.org"]
         let c = ChannelsConfig::default();
         assert!(c.imessage.is_empty());
         assert!(c.matrix.is_empty());
+    }
+
+    #[test]
+    async fn model_fallback_notice_defaults_round_trips_and_configurable_values() {
+        let parsed: Config = toml::from_str("[channels]").unwrap();
+        assert_eq!(
+            parsed.channels.model_fallback_notice,
+            ModelFallbackNotice::Off
+        );
+        assert_eq!(
+            ChannelsConfig::default().model_fallback_notice,
+            ModelFallbackNotice::Off
+        );
+
+        let mut config = Config::default();
+        for (value, mode) in [
+            ("off", ModelFallbackNotice::Off),
+            ("redacted", ModelFallbackNotice::Redacted),
+            ("detailed", ModelFallbackNotice::Detailed),
+        ] {
+            config
+                .set_prop("channels.model_fallback_notice", value)
+                .unwrap();
+            assert_eq!(config.channels.model_fallback_notice, mode);
+            assert_eq!(
+                config.get_prop("channels.model_fallback_notice").unwrap(),
+                value
+            );
+
+            let serialized = toml::to_string(&config.channels).unwrap();
+            assert!(serialized.contains(&format!("model_fallback_notice = \"{value}\"")));
+            let round_trip: ChannelsConfig = toml::from_str(&serialized).unwrap();
+            assert_eq!(round_trip.model_fallback_notice, mode);
+        }
+
+        assert!(toml::from_str::<ChannelsConfig>("model_fallback_notice = \"verbose\"").is_err());
+        assert!(
+            config
+                .set_prop("channels.model_fallback_notice", "verbose")
+                .is_err()
+        );
+        assert_eq!(
+            config.channels.model_fallback_notice,
+            ModelFallbackNotice::Detailed
+        );
+
+        #[cfg(feature = "schema-export")]
+        {
+            let field = config
+                .prop_fields()
+                .into_iter()
+                .find(|field| field.name == "channels.model_fallback_notice")
+                .unwrap();
+            assert_eq!(
+                field.enum_variants.unwrap()(),
+                vec![
+                    "off".to_string(),
+                    "redacted".to_string(),
+                    "detailed".to_string()
+                ]
+            );
+        }
     }
 
     // ── Edge cases: serde(default) for non-secret optional fields ─────
@@ -35631,6 +35785,7 @@ allowed_numbers = ["+1", "+2"]
             max_concurrent_per_channel: default_channel_max_concurrent_per_channel(),
             ack_reactions: true,
             show_tool_calls: true,
+            model_fallback_notice: ModelFallbackNotice::default(),
             session_persistence: true,
             session_backend: default_session_backend(),
             session_ttl_hours: 0,
