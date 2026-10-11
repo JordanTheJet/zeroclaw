@@ -30172,11 +30172,7 @@ zeroclaw-operators = "operator"
             .into_owned();
         assert!(legacy_plugin_dirs_with_entries(&config).is_empty());
 
-        config.plugins.plugins_dir = tmp
-            .path()
-            .join("managed")
-            .to_string_lossy()
-            .into_owned();
+        config.plugins.plugins_dir = tmp.path().join("managed").to_string_lossy().into_owned();
         config.data_dir = config.install_root_dir().join("workspace");
         let legacy = config.data_dir.join("plugins");
         write_plugin(&legacy, "legacy");
