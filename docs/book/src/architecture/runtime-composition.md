@@ -140,6 +140,8 @@ pub async fn run(runtime: Runtime) -> anyhow::Result<DaemonExit>;
 5. **The observer is process-level per generation.** It is an instance, not a source, because it is not resolved per agent.
 6. **Outbound only.** `ChannelSource` covers channels the runtime sends through: replies by alias, scheduled delivery, and approval prompts. Inbound turns arrive through `RuntimeIngress`, not through this contract.
 
+Retained sources can receive newer config snapshots during a live model refresh or newly admitted child work. Config-backed sources resolve each request against the supplied snapshot. Hosts must keep retained sources compatible with those snapshots, or rebuild affected sessions and registries when construction wiring changes. A full daemon reload drains old work before replacing its capability set.
+
 ### Which principal each caller passes
 
 `ProviderRequest.principal` is the principal the entry point resolved for the turn, and `None` when it has none. It never widens what a turn may do; a source may use it only to choose credentials or quotas. As callers move onto the contract, each passes:
@@ -158,7 +160,7 @@ With config-backed sources, a `None` principal constructs and switches exactly a
 
 The issue requires resolved security policy to remain explicit across the boundary. The rule is:
 
-- The runtime resolves each agent's `SecurityPolicy` and `RuntimeAdapter` and passes them *into* `ToolRequest`. A source cannot supply its own.
+- The runtime resolves each agent's `SecurityPolicy` and `RuntimeAdapter` and passes them *into* `ToolRequest`. Native tool sources are trusted in-process implementations expected to use those values; the type boundary does not prevent a native implementation from constructing other objects.
 - Building a tool against a policy authorizes nothing. The runtime still gates and approves every call after construction, exactly as today.
 - The runtime may add core tools and remove tools the policy excludes. It never adds a tool the policy forbids because a source returned it.
 

@@ -584,7 +584,7 @@ pub struct AllToolsResult {
     /// skill-scoped builtin elevation to resolve targets at registration.
     pub unfiltered_tool_arcs: Vec<Arc<dyn Tool>>,
     /// The capability slots of the tools this factory registered that start
-    /// child operations (delegate, `spawn_subagent`, `send_message_to_peer`),
+    /// child operations (delegate, `spawn_subagent`, `send_message_to_peer`, `cron_run`),
     /// so the entry point that owns the registry can bind its capabilities
     /// and principal (`RuntimeCapabilities::bind_registry`) and those
     /// children run through them.
@@ -1349,9 +1349,17 @@ fn all_tools_with_runtime_on_thread(
         live_config.clone(),
         execution_capability.clone(),
     );
+    let cron_run_tool = CronRunTool::new_with_runtime_and_capability(
+        config.clone(),
+        security.clone(),
+        agent_alias,
+        runtime.clone(),
+        execution_capability.clone(),
+    );
     let mut capability_slots: Vec<crate::composition::CapabilitySlot> = vec![
         spawn_subagent_tool.capabilities_slot(),
         send_message_to_peer_tool.capabilities_slot(),
+        cron_run_tool.capabilities_slot(),
     ];
     let mut tool_arcs: Vec<Arc<dyn Tool>> = vec![
         Arc::new(RateLimitedTool::new(
@@ -1416,13 +1424,7 @@ fn all_tools_with_runtime_on_thread(
             agent_alias,
             runtime.clone(),
         )),
-        Arc::new(CronRunTool::new_with_runtime_and_capability(
-            config.clone(),
-            security.clone(),
-            agent_alias,
-            runtime.clone(),
-            execution_capability.clone(),
-        )),
+        Arc::new(cron_run_tool),
         Arc::new(CronRunsTool::new(config.clone(), agent_alias)),
         Arc::new(MemoryStoreTool::new(memory.clone(), security.clone())),
         Arc::new(MemoryRecallTool::new(memory.clone())),
