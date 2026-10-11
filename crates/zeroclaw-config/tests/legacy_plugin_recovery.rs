@@ -261,6 +261,22 @@ async fn loader_keeps_legacy_plugin_recovery_in_each_install_layout() {
             hint_config.data_dir = container_data.clone();
             assert_ne!(hint_config.data_dir.join("plugins"), migrated);
             assert!(legacy_plugin_dirs_with_entries(&hint_config).contains(&migrated));
+            #[cfg(unix)]
+            {
+                // The actual producer/loader bytes remain recoverable through
+                // a supported data-root alias, deduplicated with the producer path.
+                let alias = hint_config.data_dir.join("plugins");
+                std::fs::create_dir_all(&hint_config.data_dir).unwrap();
+                std::os::unix::fs::symlink(&migrated, &alias).unwrap();
+                assert_eq!(
+                    legacy_plugin_dirs_with_entries(&hint_config),
+                    vec![alias.clone()]
+                );
+                assert_eq!(
+                    std::fs::read(alias.join("synthetic-package/payload")).unwrap(),
+                    b"retained-package-bytes"
+                );
+            }
         }
         if state == "configured-target" {
             assert!(

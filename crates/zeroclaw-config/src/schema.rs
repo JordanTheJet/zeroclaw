@@ -21368,14 +21368,26 @@ fn paths_equal_lexically(a: &Path, b: &Path) -> bool {
 /// splits route packages to host data. An older split's live agent workspace
 /// is not an automatic recovery source: compatible packages there require
 /// explicit operator adoption through `zeroclaw plugin install <path>`.
-/// Candidate roots must be real directories with at least one real package
-/// manifest, differ from the target even after canonicalization, and occur
-/// once. This root selection does not bind the packages a later mover rescans.
+/// Supported legacy root aliases are followed, but roots overlapping a known
+/// agent workspace in either direction are excluded. Target aliases are
+/// excluded and duplicate roots occur once. This selection does not bind the
+/// packages a later mover rescans or authenticate their historical origin.
 /// Used to surface a migration hint and to drive `zeroclaw plugin migrate`.
 #[must_use]
 pub fn legacy_plugin_dirs_with_entries(config: &Config) -> Vec<PathBuf> {
     let target = config.plugins.resolved_plugins_dir();
     let canonical_target = std::fs::canonicalize(&target).ok();
+    let workspaces: Vec<PathBuf> = std::iter::once(config.agent_workspace_dir("default"))
+        .chain(
+            config
+                .agents
+                .keys()
+                .map(|alias| config.agent_workspace_dir(alias)),
+        )
+        .chain(std::iter::once(
+            config.install_root_dir().join("agents/default/workspace"),
+        ))
+        .collect();
     let mut seen = std::collections::HashSet::new();
     [
         config.data_dir.join("plugins"),
@@ -21390,25 +21402,81 @@ pub fn legacy_plugin_dirs_with_entries(config: &Config) -> Vec<PathBuf> {
         let Ok(canonical) = std::fs::canonicalize(legacy) else {
             return false;
         };
+        if workspaces
+            .iter()
+            .any(|workspace| legacy_root_overlaps_workspace(legacy, &canonical, workspace))
+        {
+            return false;
+        }
         canonical_target.as_ref() != Some(&canonical) && seen.insert(canonical)
     })
     .collect()
 }
 
+fn legacy_root_overlaps_workspace(legacy: &Path, canonical: &Path, workspace: &Path) -> bool {
+    let overlaps = |a: &Path, b: &Path| a.starts_with(b) || b.starts_with(a);
+    if let Ok(workspace) = std::fs::canonicalize(workspace) {
+        return overlaps(canonical, &workspace);
+    }
+    // An absent declared workspace is still a known role. Compare normalized
+    // lexical paths conservatively; do not create it or attest it as present.
+    let Some(lexical_workspace) = legacy_lexical_absolute_path(workspace) else {
+        return true;
+    };
+    let Some(legacy) = legacy_lexical_absolute_path(legacy) else {
+        return true;
+    };
+    if overlaps(&legacy, &lexical_workspace) || overlaps(canonical, &lexical_workspace) {
+        return true;
+    }
+    // A declared absent child may be reached through an existing parent alias.
+    // Resolve only that existing ancestor, then compare the remaining declared
+    // path lexically. This does not attest the missing workspace as present.
+    for ancestor in workspace.ancestors().skip(1) {
+        if let Ok(parent) = std::fs::canonicalize(ancestor) {
+            let Ok(suffix) = workspace.strip_prefix(ancestor) else {
+                return true;
+            };
+            let Some(projected) = legacy_lexical_absolute_path(&parent.join(suffix)) else {
+                return true;
+            };
+            return overlaps(canonical, &projected);
+        }
+    }
+    false
+}
+
+fn legacy_lexical_absolute_path(path: &Path) -> Option<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().ok()?.join(path)
+    };
+    if !absolute.is_absolute() {
+        return None;
+    }
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            _ => normalized.push(component.as_os_str()),
+        }
+    }
+    Some(normalized)
+}
+
 /// Returns `true` if `dir` holds at least one plugin (a subdirectory containing a
 /// `manifest.toml`).
 fn dir_has_plugin(dir: &Path) -> bool {
-    if !std::fs::symlink_metadata(dir).is_ok_and(|metadata| metadata.is_dir()) {
-        return false;
-    }
     let Ok(entries) = std::fs::read_dir(dir) else {
         return false;
     };
-    entries.flatten().any(|entry| {
-        entry.file_type().is_ok_and(|kind| kind.is_dir())
-            && std::fs::symlink_metadata(entry.path().join("manifest.toml"))
-                .is_ok_and(|metadata| metadata.is_file())
-    })
+    entries
+        .flatten()
+        .any(|entry| entry.path().join("manifest.toml").exists())
 }
 
 /// Detect if an executable path lives under a macOS Homebrew prefix and return
@@ -30181,7 +30249,7 @@ zeroclaw-operators = "operator"
 
     #[cfg(unix)]
     #[test]
-    async fn legacy_plugin_dirs_rejects_linked_roots_and_link_only_candidates() {
+    async fn legacy_plugin_dirs_follows_supported_alias_candidates() {
         use std::os::unix::fs::symlink;
 
         let tmp = TempDir::new().unwrap();
@@ -30189,7 +30257,8 @@ zeroclaw-operators = "operator"
         let outside = tmp.path().join("outside");
         write_plugin(&outside, "unselected");
         std::fs::create_dir_all(&config.data_dir).unwrap();
-        symlink(&outside, config.data_dir.join("plugins")).unwrap();
+        let data_alias = config.data_dir.join("plugins");
+        symlink(&outside, &data_alias).unwrap();
         let legacy = config.install_root_dir().join("workspace/plugins");
         std::fs::create_dir_all(legacy.join("linked-manifest")).unwrap();
         symlink(outside.join("unselected"), legacy.join("linked-package")).unwrap();
@@ -30198,11 +30267,10 @@ zeroclaw-operators = "operator"
             legacy.join("linked-manifest/manifest.toml"),
         )
         .unwrap();
-        assert!(legacy_plugin_dirs_with_entries(&config).is_empty());
-        // One regular package makes the root eligible; selection is not a
-        // per-package filter for the unchanged migration consumer.
-        write_plugin(&legacy, "regular");
-        assert_eq!(legacy_plugin_dirs_with_entries(&config), vec![legacy]);
+        assert_eq!(
+            legacy_plugin_dirs_with_entries(&config),
+            vec![data_alias, legacy]
+        );
     }
 
     // ── Defaults ─────────────────────────────────────────────

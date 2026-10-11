@@ -78,12 +78,21 @@ not necessarily the configured runtime plugins directory; `plugin migrate`
 performs that later relocation. The configured target and canonical aliases of
 it are excluded, and duplicate roots are reported once.
 
-The resolver skips linked candidate roots and roots containing only linked
-packages or manifests. This is a root eligibility check: the existing mover
-rescans an eligible root with its own package checks. It does not create a
-per-package no-follow guarantee, an authenticated snapshot, or a new concurrent
-no-clobber contract. Its existing same-name destination check leaves colliding
-packages at the source for operator resolution and retry.
+Supported aliases of these legacy roots are followed. Canonical target aliases
+are excluded and aliases of the same root are deduplicated. A root overlapping
+a known agent workspace is excluded whether it lies inside that workspace or
+contains it, including aliases. Known roles come from each configured agent's
+actual workspace path, the implicit default, and the historical default
+workspace. Existing paths are compared canonically; absent declared workspaces
+are conservatively compared as normalized lexical paths, resolving an existing
+ancestor alias when available. Selection does not create a missing workspace
+or treat the declared path as evidence of old migration.
+
+This is root selection: the existing mover still rescans an eligible root with
+its own package checks. It does not create a per-package no-follow guarantee,
+an authenticated snapshot, or a new concurrent no-clobber contract. Its existing
+same-name destination check leaves colliding packages at the source for
+operator resolution and retry.
 
 The directory-migration helper does not edit plugin configuration, grants,
 publisher trust or enablement. Config loading before the command retains its

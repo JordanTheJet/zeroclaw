@@ -232,3 +232,225 @@ fn explicit_historical_install_preserves_strict_signature_refusal() {
     assert!(!target.join("unsigned").exists());
     assert_eq!(std::fs::read(source.join("manifest.toml")).unwrap(), before);
 }
+
+#[cfg(unix)]
+#[test]
+fn linked_producer_root_recovers_bytes_without_clobber_or_config_changes() {
+    use std::os::unix::fs::symlink;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let install = tmp.path().join("install");
+    let target = tmp.path().join("managed");
+    let mut config = historical_config(&install, &target);
+    // A sibling with a matching string prefix is not workspace containment.
+    let workspace = tmp.path().join("workspace");
+    config
+        .agents
+        .entry("worker".into())
+        .or_default()
+        .workspace
+        .path = Some(workspace.clone());
+    let legacy = install.join("workspace/plugins");
+    let alpha = skill_package(&legacy, "alpha");
+    let beta = skill_package(&legacy, "beta");
+    std::fs::write(alpha.join("payload"), b"alpha-legacy").unwrap();
+    std::fs::write(beta.join("payload"), b"beta-legacy").unwrap();
+    let report = migrate_v2_to_v3_install_filesystem(&install).unwrap();
+    assert!(report.entries_relocated > 0);
+    assert_eq!(
+        std::fs::read(report.backup_dir.unwrap().join("legacy-workspace/plugins/alpha/payload"))
+            .unwrap(),
+        b"alpha-legacy"
+    );
+    let produced = install.join("data/plugins");
+    assert_eq!(
+        std::fs::read(produced.join("alpha/payload")).unwrap(),
+        b"alpha-legacy"
+    );
+    // Arrange a supported linked-root layout using actual producer bytes.
+    let external = tmp.path().join("workspace-sibling");
+    std::fs::rename(&produced, &external).unwrap();
+    symlink(&external, &produced).unwrap();
+    std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+    symlink(&external, &legacy).unwrap();
+    let current_beta = skill_package(&target, "beta");
+    std::fs::write(current_beta.join("payload"), b"beta-current").unwrap();
+    let authority = serde_json::to_value(&config.plugins).unwrap();
+    let recovery = legacy_plugin_dirs_with_entries(&config);
+    assert_eq!(recovery, vec![produced.clone()]);
+    let moved: usize = recovery
+        .iter()
+        .map(|source| migrate_plugins_dir(source, &target).unwrap())
+        .sum();
+    assert_eq!(moved, 1);
+    assert_eq!(
+        std::fs::read(target.join("alpha/payload")).unwrap(),
+        b"alpha-legacy"
+    );
+    assert_eq!(
+        std::fs::read(target.join("beta/payload")).unwrap(),
+        b"beta-current"
+    );
+    assert_eq!(
+        std::fs::read(external.join("beta/payload")).unwrap(),
+        b"beta-legacy"
+    );
+    assert!(!external.join("alpha").exists());
+    assert!(std::fs::symlink_metadata(&produced).unwrap().is_symlink());
+    assert!(std::fs::symlink_metadata(&legacy).unwrap().is_symlink());
+    assert_eq!(serde_json::to_value(&config.plugins).unwrap(), authority);
+    assert_eq!(migrate_plugins_dir(&produced, &target).unwrap(), 0);
+    assert!(
+        !workspace.exists(),
+        "selection must not create an absent workspace"
+    );
+
+    let mut same_target = config.clone();
+    same_target.plugins.plugins_dir = legacy.to_string_lossy().into_owned();
+    assert!(legacy_plugin_dirs_with_entries(&same_target).is_empty());
+    assert_eq!(
+        std::fs::read(external.join("beta/payload")).unwrap(),
+        b"beta-legacy"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn aliases_into_known_agent_workspaces_are_not_automatically_promoted() {
+    use std::os::unix::fs::symlink;
+
+    for kind in ["default", "historical", "configured"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let install = tmp.path().join("install");
+        let target = tmp.path().join("managed");
+        let mut config = historical_config(&install, &target);
+        let workspace = match kind {
+            "historical" => {
+                config.agents.entry("default".into()).or_default().workspace.path =
+                    Some(tmp.path().join("new-default"));
+                install.join("agents/default/workspace")
+            }
+            "configured" => {
+                let agent = config.agents.entry("worker".into()).or_default();
+                agent.enabled = false;
+                agent.workspace.path = Some(tmp.path().join("custom-workspace"));
+                config.agent_workspace_dir("worker")
+            }
+            _ => config.agent_workspace_dir("default"),
+        };
+        let packages = workspace.join("plugins");
+        let package = skill_package(&packages, "ordinary");
+        let before = std::fs::read(package.join("manifest.toml")).unwrap();
+        let skill = std::fs::read(package.join("skills/fixture/SKILL.md")).unwrap();
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        symlink(&packages, config.data_dir.join("plugins")).unwrap();
+        let authority = serde_json::to_value(&config.plugins).unwrap();
+        let recovery = legacy_plugin_dirs_with_entries(&config);
+        let moved: usize = recovery
+            .iter()
+            .map(|source| migrate_plugins_dir(source, &target).unwrap())
+            .sum();
+        assert!(recovery.is_empty(), "{kind}: workspace alias selected");
+        assert_eq!(moved, 0);
+        assert!(!target.join("ordinary").exists());
+        assert_eq!(
+            std::fs::read(package.join("manifest.toml")).unwrap(),
+            before
+        );
+        assert_eq!(
+            std::fs::read(package.join("skills/fixture/SKILL.md")).unwrap(),
+            skill
+        );
+        assert_eq!(serde_json::to_value(&config.plugins).unwrap(), authority);
+    }
+}
+
+#[test]
+fn roots_containing_known_or_absent_agent_workspaces_are_not_promoted() {
+    for present in [true, false] {
+        let tmp = tempfile::tempdir().unwrap();
+        let install = tmp.path().join("install");
+        let target = tmp.path().join("managed");
+        let mut config = historical_config(&install, &target);
+        let candidate = config.data_dir.join("plugins");
+        let package = skill_package(&candidate, "ordinary");
+        let workspace = if present {
+            skill_package(&candidate, "agent-package")
+        } else {
+            candidate
+                .join("not-created")
+                .join("..")
+                .join("future-workspace")
+        };
+        config.agents.entry("worker".into()).or_default().workspace.path =
+            Some(workspace.clone());
+        let before = std::fs::read(package.join("manifest.toml")).unwrap();
+        let skill = std::fs::read(package.join("skills/fixture/SKILL.md")).unwrap();
+        let authority = serde_json::to_value(&config.plugins).unwrap();
+        let recovery = legacy_plugin_dirs_with_entries(&config);
+        let moved: usize = recovery
+            .iter()
+            .map(|source| migrate_plugins_dir(source, &target).unwrap())
+            .sum();
+        assert!(
+            recovery.is_empty(),
+            "an ancestor of a known workspace was selected"
+        );
+        assert_eq!(moved, 0);
+        assert!(!target.join("ordinary").exists());
+        assert!(!target.join("agent-package").exists());
+        assert_eq!(
+            std::fs::read(package.join("manifest.toml")).unwrap(),
+            before
+        );
+        assert_eq!(
+            std::fs::read(package.join("skills/fixture/SKILL.md")).unwrap(),
+            skill
+        );
+        if present {
+            assert!(workspace.join("manifest.toml").is_file());
+        } else {
+            assert!(!candidate.join("not-created").exists());
+            assert!(!candidate.join("future-workspace").exists());
+        }
+        assert_eq!(serde_json::to_value(&config.plugins).unwrap(), authority);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn absent_workspace_under_existing_parent_alias_is_not_promoted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let install = tmp.path().join("install");
+    let target = tmp.path().join("managed");
+    let mut config = historical_config(&install, &target);
+    let candidate = config.data_dir.join("plugins");
+    let package = skill_package(&candidate, "ordinary");
+    let parent_alias = tmp.path().join("workspace-parent-alias");
+    std::os::unix::fs::symlink(&candidate, &parent_alias).unwrap();
+    let workspace = parent_alias.join("not-created");
+    config
+        .agents
+        .entry("worker".into())
+        .or_default()
+        .workspace
+        .path = Some(workspace.clone());
+    let before = std::fs::read(package.join("manifest.toml")).unwrap();
+    let authority = serde_json::to_value(&config.plugins).unwrap();
+    let recovery = legacy_plugin_dirs_with_entries(&config);
+    let moved: usize = recovery
+        .iter()
+        .map(|source| migrate_plugins_dir(source, &target).unwrap())
+        .sum();
+    assert!(recovery.is_empty());
+    assert_eq!(moved, 0);
+    assert!(!target.join("ordinary").exists());
+    assert_eq!(
+        std::fs::read(package.join("manifest.toml")).unwrap(),
+        before
+    );
+    assert!(!workspace.exists());
+    assert!(!candidate.join("not-created").exists());
+    assert!(std::fs::symlink_metadata(parent_alias).unwrap().is_symlink());
+    assert_eq!(serde_json::to_value(&config.plugins).unwrap(), authority);
+}
