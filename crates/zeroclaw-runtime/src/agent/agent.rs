@@ -19864,7 +19864,10 @@ mod capability_construction_tests {
         assert_eq!(revision, refreshed_revision);
         assert_ne!(revision, previous_revision);
         assert_eq!(
-            published.providers.models.openai["smart"].base.model.as_deref(),
+            published.providers.models.openai["smart"]
+                .base
+                .model
+                .as_deref(),
             Some("gpt-4.1")
         );
         agent.sync_config_generation();

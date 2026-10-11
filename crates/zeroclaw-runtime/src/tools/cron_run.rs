@@ -550,14 +550,42 @@ mod tests {
         (Arc::new(config), job)
     }
 
+    /// Match the scheduler's same-binary isolation for process-global state.
+    /// A successful child must report this exact test, not an empty filter.
+    async fn run_cron_test_in_isolated_process(test_name: &str) -> bool {
+        const CHILD_ENV: &str = "ZEROCLAW_CRON_CAPABILITY_TEST_CHILD";
+        if std::env::var(CHILD_ENV).as_deref() == Ok(test_name) {
+            return false;
+        }
+        let output = tokio::process::Command::new(std::env::current_exe().unwrap())
+            .arg(test_name)
+            .arg("--exact")
+            .arg("--test-threads=1")
+            .env(CHILD_ENV, test_name)
+            .output()
+            .await
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "isolated cron test failed: {test_name}\n{stdout}\n{stderr}"
+        );
+        assert!(
+            stdout.contains("running 1 test") && stdout.contains(test_name),
+            "the child must execute exactly the selected test: {test_name}\n{stdout}\n{stderr}"
+        );
+        true
+    }
+
     /// Drive the factory's actual registered tool, not a separately built
     /// CronRunTool. Serving and refusing sources must both keep the child off
     /// the configured endpoint, and refusal must not escape via the adapter.
     #[tokio::test]
     async fn registered_cron_run_keeps_supplied_sources_and_lifecycle() {
         use crate::composition::test_support::{
-            NoTools, RecordingMemory, STUB_REPLY, StubProvider, counting_endpoint,
-            capabilities_with_providers,
+            NoTools, RecordingMemory, STUB_REPLY, StubProvider, capabilities_with_providers,
+            counting_endpoint,
         };
         use crate::composition::{ProviderRequest, ProviderSource};
         use zeroclaw_api::model_provider::ModelProvider;
@@ -573,7 +601,10 @@ mod tests {
                 &self,
                 request: &ProviderRequest<'_>,
             ) -> anyhow::Result<Arc<dyn ModelProvider>> {
-                assert_eq!(request.principal, None, "cron retains its internal provenance");
+                assert_eq!(
+                    request.principal, None,
+                    "cron retains its internal provenance"
+                );
                 self.seen.lock().push((
                     request.agent_alias.into(),
                     self.lifecycle.active_turn_count(request.agent_alias),
@@ -585,9 +616,13 @@ mod tests {
             }
         }
 
-        let _cost_tracker_lock = crate::agent::cost::GLOBAL_COST_TRACKER_TEST_LOCK
-            .lock()
-            .await;
+        if run_cron_test_in_isolated_process(
+            "tools::cron_run::tests::registered_cron_run_keeps_supplied_sources_and_lifecycle",
+        )
+        .await
+        {
+            return;
+        }
         for refuse in [false, true] {
             let endpoint = counting_endpoint().await;
             let tmp = TempDir::new().unwrap();
@@ -604,11 +639,8 @@ mod tests {
                 tools: Arc::new(NoTools),
                 ..capabilities_with_providers(providers.clone())
             };
-            let built = registered_cron_tools(
-                &cfg,
-                authority.execution_capability(),
-                Some(&capabilities),
-            );
+            let built =
+                registered_cron_tools(&cfg, authority.execution_capability(), Some(&capabilities));
             let tool = built
                 .tools
                 .iter()
@@ -637,7 +669,9 @@ mod tests {
             let runs = cron::list_runs(&cfg, &job.id, 10).unwrap();
             assert_eq!(runs.len(), 1);
             assert_eq!(runs[0].status, if refuse { "error" } else { "ok" });
-            assert!(cron::claim_job_for_agent(&cfg, &job.id, TEST_AGENT, chrono::Utc::now()).unwrap());
+            assert!(
+                cron::claim_job_for_agent(&cfg, &job.id, TEST_AGENT, chrono::Utc::now()).unwrap()
+            );
             cron::release_job(&cfg, &job.id).unwrap();
 
             authority.close_agent_lifecycle();
@@ -648,7 +682,9 @@ mod tests {
             assert_eq!(memory.agents.lock().len(), memory_seen.len());
             assert_eq!(endpoint.connections(), 0);
             assert_eq!(cron::list_runs(&cfg, &job.id, 10).unwrap().len(), 1);
-            assert!(cron::claim_job_for_agent(&cfg, &job.id, TEST_AGENT, chrono::Utc::now()).unwrap());
+            assert!(
+                cron::claim_job_for_agent(&cfg, &job.id, TEST_AGENT, chrono::Utc::now()).unwrap()
+            );
             cron::release_job(&cfg, &job.id).unwrap();
         }
     }
@@ -658,9 +694,13 @@ mod tests {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
-        let _cost_tracker_lock = crate::agent::cost::GLOBAL_COST_TRACKER_TEST_LOCK
-            .lock()
-            .await;
+        if run_cron_test_in_isolated_process(
+            "tools::cron_run::tests::unbound_registered_cron_run_keeps_config_backed_agent_adapter",
+        )
+        .await
+        {
+            return;
+        }
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/chat/completions"))

@@ -1783,6 +1783,7 @@ model = "vision-model"
             "primary-model",
             "primary-model",
             None,
+            None,
         )
         .await
         .expect("no capability error on a plain degrade");
@@ -1828,6 +1829,7 @@ model = "vision-model"
             "primary",
             "primary-model",
             "primary-model",
+            None,
             None,
         )
         .await

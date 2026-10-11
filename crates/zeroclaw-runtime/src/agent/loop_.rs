@@ -6985,6 +6985,7 @@ mod tests {
                 parent_agent_alias: None,
                 served_route_sink: None,
                 sop_reassembly: None,
+                capability_binding: None,
                 exec: ResolvedAgentExecution {
                     model_access: ResolvedModelAccess {
                         model_provider: &model_provider,
@@ -11301,6 +11302,7 @@ mod tests {
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
@@ -11429,6 +11431,7 @@ mod tests {
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
@@ -20720,6 +20723,7 @@ Let me check the result."#;
                     parent_agent_alias: None,
                     served_route_sink: None,
                     sop_reassembly: None,
+                    capability_binding: None,
                     exec: ResolvedAgentExecution {
                         model_access: ResolvedModelAccess {
                             model_provider: &model_provider,
