@@ -68,15 +68,69 @@ understanding on its own.
 ## Recovering legacy installations
 
 Run `zeroclaw plugin migrate` to relocate legacy package directories into
-`[plugins] plugins_dir`. Recovery looks in the older data and workspace
-locations and in the workspace-split destination used by V2 migration. This
-also finds packages after an interrupted split has resumed, or after the
-default agent's workspace has been changed. Packages already in the configured
-plugins directory are excluded, and an existing same-name target is preserved.
+`[plugins] plugins_dir`. Automatic recovery searches the configured data root's
+`plugins/`, the unsplit `<install>/workspace/plugins`, and the actual V2
+producer's `<install>/data/plugins` destination even if the data field differs.
+New V2 filesystem splits move plugins to host data, so fresh and resumed splits
+stay reachable without using
+the default agent's live writable workspace as a recovery source. Host data is
+not necessarily the configured runtime plugins directory; `plugin migrate`
+performs that later relocation. The configured target and canonical aliases of
+it are excluded, and duplicate roots are reported once.
 
-Directory recovery relocates package files. It does not enable plugins, grant
-permissions, trust a publisher, or certify that a package can load or execute.
-The normal manifest, signature, component and configuration checks still apply.
+The resolver skips linked candidate roots and roots containing only linked
+packages or manifests. This is a root eligibility check: the existing mover
+rescans an eligible root with its own package checks. It does not create a
+per-package no-follow guarantee, an authenticated snapshot, or a new concurrent
+no-clobber contract. Its existing same-name destination check leaves colliding
+packages at the source for operator resolution and retry.
+
+The directory-migration helper does not edit plugin configuration, grants,
+publisher trust or enablement. Config loading before the command retains its
+normal initialization and migration effects. Moving packages makes them
+eligible for normal discovery: tool and skill plugins may become available
+when plugins are enabled and `auto_discover = true`, subject to admission.
+Relocation itself neither verifies ABI compatibility nor authenticates origin.
+
+### Packages already split into an agent workspace
+
+Earlier versions could move packages to
+`<install>/agents/default/workspace/plugins`. That historical location and a
+custom live agent workspace are no longer automatic sources for
+`plugin migrate`. A manifest, matching backup name, or caller-written marker
+does not authorize directory-wide adoption. Inspect each package you intend to
+adopt, then select its individual directory with the existing install command:
+
+```sh
+zeroclaw --config-dir '/operator/install' plugin install \
+  '/operator/install/agents/default/workspace/plugins/package-name'
+```
+
+Use your actual install and package paths; do not pass the entire `plugins/`
+directory. A package in a backup can likewise be selected explicitly by its
+actual path. The operator's install action supplies the authority, not the
+path's apparent history. This requires a build with plugin CLI support.
+
+This is a fresh installation of a compatible package. The host applies the
+current manifest, signature, payload and config-schema rules, and the CLI
+load-checks executable packages against its WIT ABI and limits by default.
+Unsigned/untrusted packages under strict policy, incomplete old manifests,
+incompatible components, or unsupported legacy config rows may be refused;
+follow the diagnostic and [typed-config migration guidance](../plugins/migrating-to-typed-config.md)
+before retrying. No historical-format conversion or signing-policy bypass is
+provided. Existing same-name installed packages are refused rather than
+silently replaced.
+
+Explicit install retains the source directory. It writes the admitted manifest
+and executable payload and copies declared skill content; arbitrary auxiliary
+files are not a full-directory recovery contract, and skill copying is not an
+immutable generation snapshot. For tool bindings needing host-owned state,
+install can create missing typed config rows and seed declared HTTP egress
+destinations into new rows. Existing rows and grants are not automatically
+extended, and old package-name rows are not silently converted. Review these
+installation effects and configure required values before enabling runtime
+use. Explicit adoption is therefore separate from the automatic migration
+helper's unchanged-config/grant behavior.
 
 ## Signature policy
 

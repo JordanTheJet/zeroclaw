@@ -1,8 +1,11 @@
-//! The loader must leave legacy package recovery reachable after a resumed split.
+//! Future splits keep host-data recovery reachable without trusting live workspaces.
 
 use std::ffi::OsString;
 use std::path::Path;
-use zeroclaw_config::schema::v2::workspace_toplevel_v3_path;
+use zeroclaw_config::migration::CURRENT_SCHEMA_VERSION;
+use zeroclaw_config::schema::v2::{
+    migrate_v2_to_v3_install_filesystem, workspace_toplevel_v3_path,
+};
 use zeroclaw_config::schema::{Config, legacy_plugin_dirs_with_entries, resolve_runtime_dirs};
 
 struct EnvGuard(Vec<(&'static str, Option<OsString>)>);
@@ -71,6 +74,75 @@ fn package(dir: &Path, payload: &str) {
     std::fs::write(dir.join("synthetic-package/payload"), payload).unwrap();
 }
 
+/// Live workspace and forged metadata are not automatic recovery authority.
+/// Keep these in the sole loader test so its global environment stays serialized.
+fn live_workspace_and_lookalike_metadata_do_not_authorize_recovery() {
+    let root = tempfile::tempdir().unwrap();
+    let install = root.path().join("install");
+    let config = Config {
+        config_path: install.join("config.toml"),
+        data_dir: install.join("data"),
+        plugins: zeroclaw_config::schema::PluginsConfig {
+            plugins_dir: root
+                .path()
+                .join("managed-plugins")
+                .to_string_lossy()
+                .into_owned(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let live = config.agent_workspace_dir("default").join("plugins");
+    assert_ne!(live, workspace_toplevel_v3_path(&install, "plugins"));
+    // Constructed historical/collision layout, not output from the new producer.
+    let unsplit = install.join("workspace/plugins");
+    package(&unsplit, "unmoved-legacy-bytes");
+    package(&live, "ordinary-live-workspace-bytes");
+    std::fs::write(
+        live.join("synthetic-package/manifest.toml"),
+        "name = \"synthetic-package\"\nversion = \"0.1.0\"\ncapabilities = [\"skill\"]\n",
+    )
+    .unwrap();
+    assert!(
+        !legacy_plugin_dirs_with_entries(&config).contains(&live),
+        "an ordinary package in the live agent workspace is not migration provenance"
+    );
+
+    // The real producer does not create this receipt. The agent can fabricate
+    // both it and a backup-shaped subtree within its own writable workspace.
+    let workspace = config.agent_workspace_dir("default");
+    let lookalike = workspace.join("backup-20000101T000000/legacy-workspace/plugins");
+    package(&lookalike, "ordinary-live-workspace-bytes");
+    std::fs::copy(
+        live.join("synthetic-package/manifest.toml"),
+        lookalike.join("synthetic-package/manifest.toml"),
+    )
+    .unwrap();
+    std::fs::write(
+        live.join(".v2-workspace-split-receipt.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "producer": "zeroclaw",
+            "schema_version": CURRENT_SCHEMA_VERSION,
+            "moved_packages": ["synthetic-package"],
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        legacy_plugin_dirs_with_entries(&config),
+        vec![unsplit.clone()],
+        "matching names and forged metadata do not authorize the live collision"
+    );
+    assert_eq!(
+        std::fs::read(unsplit.join("synthetic-package/payload")).unwrap(),
+        b"unmoved-legacy-bytes"
+    );
+    assert_eq!(
+        std::fs::read(live.join("synthetic-package/payload")).unwrap(),
+        b"ordinary-live-workspace-bytes"
+    );
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn loader_keeps_legacy_plugin_recovery_in_each_install_layout() {
     let mut checked = 0;
@@ -92,7 +164,8 @@ async fn loader_keeps_legacy_plugin_recovery_in_each_install_layout() {
             home.join(".zeroclaw")
         };
         let old = install.join("workspace/plugins");
-        let migrated = workspace_toplevel_v3_path(&install, "plugins");
+        // Independent expected destination, not derived from the producer mapping.
+        let migrated = install.join("data/plugins");
         let resumed = state == "resumed";
         std::fs::create_dir_all(install.join("agents/default/workspace")).unwrap();
         std::fs::write(
@@ -100,10 +173,18 @@ async fn loader_keeps_legacy_plugin_recovery_in_each_install_layout() {
             "already-moved",
         )
         .unwrap();
-        package(
-            if resumed { &migrated } else { &old },
-            "retained-package-bytes",
-        );
+        package(&old, "retained-package-bytes");
+        if resumed {
+            // The actual new producer creates this future resumed DataDir
+            // layout; this is not a constructed historical agent-workspace fixture.
+            let report = migrate_v2_to_v3_install_filesystem(&install).unwrap();
+            assert!(report.entries_relocated > 0);
+            let backup = report.backup_dir.unwrap().join("legacy-workspace");
+            assert_eq!(
+                std::fs::read(backup.join("plugins/synthetic-package/payload")).unwrap(),
+                b"retained-package-bytes"
+            );
+        }
         if state == "collision" {
             package(&migrated, "operator-package-bytes");
         }
@@ -112,7 +193,7 @@ async fn loader_keeps_legacy_plugin_recovery_in_each_install_layout() {
         } else {
             root.path().join("explicit-current-plugins")
         };
-        let schema = if resumed { 3 } else { 2 };
+        let schema = if resumed { CURRENT_SCHEMA_VERSION } else { 2 };
         std::fs::write(
             install.join("config.toml"),
             format!(
@@ -122,6 +203,7 @@ async fn loader_keeps_legacy_plugin_recovery_in_each_install_layout() {
         )
         .unwrap();
         let container_data = home.join("data");
+        assert_ne!(container_data, install.join("data"));
         let _env = EnvGuard::isolated(
             &home,
             (layout == "explicit").then_some(install.as_path()),
@@ -152,7 +234,7 @@ async fn loader_keeps_legacy_plugin_recovery_in_each_install_layout() {
             loaded.data_dir, prelock,
             "{layout}/{state}: loader/lock disagree"
         );
-        assert_eq!(loaded.schema_version, 3);
+        assert_eq!(loaded.schema_version, CURRENT_SCHEMA_VERSION);
         assert_eq!(loaded.plugins.resolved_plugins_dir(), configured);
         assert_eq!(marker(&loaded.data_dir.join("devices.db")), "retained-row");
         assert_eq!(
@@ -168,7 +250,18 @@ async fn loader_keeps_legacy_plugin_recovery_in_each_install_layout() {
             std::fs::read(expected.join("synthetic-package/payload")).unwrap(),
             b"retained-package-bytes"
         );
+        assert_eq!(workspace_toplevel_v3_path(&install, "plugins"), migrated);
+        assert!(!install.join("agents/default/workspace/plugins").exists());
         let recovery = legacy_plugin_dirs_with_entries(&loaded);
+        if layout == "container" {
+            // Retain the real loader/lock path above. Also exercise its loaded
+            // install with a distinct public Config data override: the producer
+            // destination must remain reachable independently of that field.
+            let mut hint_config = loaded.clone();
+            hint_config.data_dir = container_data.clone();
+            assert_ne!(hint_config.data_dir.join("plugins"), migrated);
+            assert!(legacy_plugin_dirs_with_entries(&hint_config).contains(&migrated));
+        }
         if state == "configured-target" {
             assert!(
                 recovery.is_empty(),
@@ -180,7 +273,10 @@ async fn loader_keeps_legacy_plugin_recovery_in_each_install_layout() {
                 "{layout}/{state}: recovery missing"
             );
             if state == "collision" {
-                assert!(recovery.contains(&migrated));
+                assert!(
+                    recovery.contains(&migrated),
+                    "existing host-data bytes remain a legacy source without clobbering"
+                );
                 assert_eq!(
                     std::fs::read(migrated.join("synthetic-package/payload")).unwrap(),
                     b"operator-package-bytes"
@@ -205,9 +301,10 @@ async fn loader_keeps_legacy_plugin_recovery_in_each_install_layout() {
         rival.try_lock().unwrap();
         checked += 1;
         println!(
-            "PASS {layout}/{state}: recovery={}, schema3/SQLite/backup/lock preserved",
+            "PASS {layout}/{state}: recovery={}, schema{CURRENT_SCHEMA_VERSION}/SQLite/backup/lock preserved",
             recovery.len()
         );
     }
     assert_eq!(checked, 8);
+    live_workspace_and_lookalike_metadata_do_not_authorize_recovery();
 }

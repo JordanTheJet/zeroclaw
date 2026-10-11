@@ -21364,34 +21364,51 @@ fn paths_equal_lexically(a: &Path, b: &Path) -> bool {
 /// visible to the runtime, which now scans [`PluginsConfig::resolved_plugins_dir`].
 ///
 /// Historically `zeroclaw plugin install` wrote to `<data_dir>/plugins` (and,
-/// before the data-dir rename, `<install_root>/workspace/plugins`). A resumed
-/// V2 split may have already relocated that directory; its destination comes
-/// from the same migration resolver rather than the agent's live workspace.
-/// A directory is reported only when it differs from the configured plugins dir and contains
-/// at least one plugin (a subdirectory with a `manifest.toml`). Used to surface a
-/// migration hint and to drive `zeroclaw plugin migrate`.
+/// before the data-dir rename, `<install_root>/workspace/plugins`). New V2
+/// splits route packages to host data. An older split's live agent workspace
+/// is not an automatic recovery source: compatible packages there require
+/// explicit operator adoption through `zeroclaw plugin install <path>`.
+/// Candidate roots must be real directories with at least one real package
+/// manifest, differ from the target even after canonicalization, and occur
+/// once. This root selection does not bind the packages a later mover rescans.
+/// Used to surface a migration hint and to drive `zeroclaw plugin migrate`.
 #[must_use]
 pub fn legacy_plugin_dirs_with_entries(config: &Config) -> Vec<PathBuf> {
     let target = config.plugins.resolved_plugins_dir();
+    let canonical_target = std::fs::canonicalize(&target).ok();
+    let mut seen = std::collections::HashSet::new();
     [
         config.data_dir.join("plugins"),
         config.install_root_dir().join("workspace").join("plugins"),
         v2::workspace_toplevel_v3_path(&config.install_root_dir(), "plugins"),
     ]
     .into_iter()
-    .filter(|legacy| *legacy != target && dir_has_plugin(legacy))
+    .filter(|legacy| {
+        if paths_equal_lexically(legacy, &target) || !dir_has_plugin(legacy) {
+            return false;
+        }
+        let Ok(canonical) = std::fs::canonicalize(legacy) else {
+            return false;
+        };
+        canonical_target.as_ref() != Some(&canonical) && seen.insert(canonical)
+    })
     .collect()
 }
 
 /// Returns `true` if `dir` holds at least one plugin (a subdirectory containing a
 /// `manifest.toml`).
 fn dir_has_plugin(dir: &Path) -> bool {
+    if !std::fs::symlink_metadata(dir).is_ok_and(|metadata| metadata.is_dir()) {
+        return false;
+    }
     let Ok(entries) = std::fs::read_dir(dir) else {
         return false;
     };
-    entries
-        .flatten()
-        .any(|entry| entry.path().join("manifest.toml").exists())
+    entries.flatten().any(|entry| {
+        entry.file_type().is_ok_and(|kind| kind.is_dir())
+            && std::fs::symlink_metadata(entry.path().join("manifest.toml"))
+                .is_ok_and(|metadata| metadata.is_file())
+    })
 }
 
 /// Detect if an executable path lives under a macOS Homebrew prefix and return
@@ -30068,10 +30085,12 @@ zeroclaw-operators = "operator"
     }
 
     #[test]
-    async fn legacy_plugin_dirs_detects_resumed_destination_after_workspace_override() {
+    async fn legacy_plugin_dirs_detects_data_destination_after_workspace_override() {
         let tmp = TempDir::new().unwrap();
         let mut config = config_with_dirs(tmp.path());
         let migrated = v2::workspace_toplevel_v3_path(&config.install_root_dir(), "plugins");
+        assert_eq!(migrated, config.install_root_dir().join("data/plugins"));
+        assert_ne!(migrated, config.data_dir.join("plugins"));
         write_plugin(&migrated, "resumed");
         config
             .agents
@@ -30119,6 +30138,75 @@ zeroclaw-operators = "operator"
 
         // The data-dir candidate now equals the target → not a "legacy" dir.
         assert!(legacy_plugin_dirs_with_entries(&config).is_empty());
+    }
+
+    #[test]
+    async fn legacy_plugin_dirs_excludes_historical_and_live_agent_workspaces() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = config_with_dirs(tmp.path());
+        let historical = config.agent_workspace_dir("default").join("plugins");
+        write_plugin(&historical, "historical");
+        config
+            .agents
+            .entry("default".into())
+            .or_default()
+            .workspace
+            .path = Some(tmp.path().join("custom-workspace"));
+        write_plugin(
+            &config.agent_workspace_dir("default").join("plugins"),
+            "live",
+        );
+        assert!(legacy_plugin_dirs_with_entries(&config).is_empty());
+    }
+
+    #[test]
+    async fn legacy_plugin_dirs_skips_canonical_target_and_duplicate_candidates() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = config_with_dirs(tmp.path());
+        let data = config.data_dir.join("plugins");
+        write_plugin(&data, "current");
+        config.plugins.plugins_dir = data
+            .join("..")
+            .join("plugins")
+            .to_string_lossy()
+            .into_owned();
+        assert!(legacy_plugin_dirs_with_entries(&config).is_empty());
+
+        config.plugins.plugins_dir = tmp
+            .path()
+            .join("managed")
+            .to_string_lossy()
+            .into_owned();
+        config.data_dir = config.install_root_dir().join("workspace");
+        let legacy = config.data_dir.join("plugins");
+        write_plugin(&legacy, "legacy");
+        assert_eq!(legacy_plugin_dirs_with_entries(&config), vec![legacy]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    async fn legacy_plugin_dirs_rejects_linked_roots_and_link_only_candidates() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let config = config_with_dirs(tmp.path());
+        let outside = tmp.path().join("outside");
+        write_plugin(&outside, "unselected");
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        symlink(&outside, config.data_dir.join("plugins")).unwrap();
+        let legacy = config.install_root_dir().join("workspace/plugins");
+        std::fs::create_dir_all(legacy.join("linked-manifest")).unwrap();
+        symlink(outside.join("unselected"), legacy.join("linked-package")).unwrap();
+        symlink(
+            outside.join("unselected/manifest.toml"),
+            legacy.join("linked-manifest/manifest.toml"),
+        )
+        .unwrap();
+        assert!(legacy_plugin_dirs_with_entries(&config).is_empty());
+        // One regular package makes the root eligible; selection is not a
+        // per-package filter for the unchanged migration consumer.
+        write_plugin(&legacy, "regular");
+        assert_eq!(legacy_plugin_dirs_with_entries(&config), vec![legacy]);
     }
 
     // ── Defaults ─────────────────────────────────────────────
