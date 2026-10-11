@@ -1011,7 +1011,9 @@ pub fn migrate_plugins_dir(from: &Path, to: &Path) -> Result<usize, PluginError>
     let mut moved = 0usize;
     for entry in entries.flatten() {
         let src = entry.path();
-        if !src.is_dir() || !src.join("manifest.toml").exists() {
+        // Discovery skips linked child packages; leave those links at source.
+        // The root itself may still be a supported legacy-directory alias.
+        if !entry.file_type()?.is_dir() || !src.join("manifest.toml").exists() {
             continue;
         }
         let Some(name) = src.file_name() else {

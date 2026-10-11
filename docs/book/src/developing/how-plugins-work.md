@@ -89,8 +89,14 @@ ancestor alias when available. Selection does not create a missing workspace
 or treat the declared path as evidence of old migration.
 
 This is root selection: the existing mover still rescans an eligible root with
-its own package checks. It does not create a per-package no-follow guarantee,
-an authenticated snapshot, or a new concurrent no-clobber contract. Its existing
+its own package checks. Both the recovery hint and mover require an ordinary
+child package directory, matching runtime discovery. Child directory symlinks
+stay at the source; they are neither moved nor materialized, even in a root
+with ordinary packages. A manifest alias inside an ordinary package directory
+still uses the existing manifest-loading and admission checks.
+
+This does not create a global no-follow guarantee, an authenticated snapshot,
+or a new concurrent no-clobber contract. Its existing
 same-name destination check leaves colliding packages at the source for
 operator resolution and retry.
 

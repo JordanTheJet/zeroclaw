@@ -21468,15 +21468,16 @@ fn legacy_lexical_absolute_path(path: &Path) -> Option<PathBuf> {
     Some(normalized)
 }
 
-/// Returns `true` if `dir` holds at least one plugin (a subdirectory containing a
-/// `manifest.toml`).
+/// Returns `true` if `dir` holds at least one ordinary child directory containing
+/// a `manifest.toml`, matching the runtime's package-directory eligibility.
 fn dir_has_plugin(dir: &Path) -> bool {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return false;
     };
-    entries
-        .flatten()
-        .any(|entry| entry.path().join("manifest.toml").exists())
+    entries.flatten().any(|entry| {
+        entry.file_type().is_ok_and(|kind| kind.is_dir())
+            && entry.path().join("manifest.toml").exists()
+    })
 }
 
 /// Detect if an executable path lives under a macOS Homebrew prefix and return
@@ -30260,8 +30261,12 @@ zeroclaw-operators = "operator"
         let data_alias = config.data_dir.join("plugins");
         symlink(&outside, &data_alias).unwrap();
         let legacy = config.install_root_dir().join("workspace/plugins");
-        std::fs::create_dir_all(legacy.join("linked-manifest")).unwrap();
+        std::fs::create_dir_all(&legacy).unwrap();
         symlink(outside.join("unselected"), legacy.join("linked-package")).unwrap();
+        assert_eq!(legacy_plugin_dirs_with_entries(&config), vec![data_alias.clone()]);
+        // An ordinary package directory can still use a manifest alias under
+        // the existing runtime manifest-loading contract.
+        std::fs::create_dir_all(legacy.join("linked-manifest")).unwrap();
         symlink(
             outside.join("unselected/manifest.toml"),
             legacy.join("linked-manifest/manifest.toml"),

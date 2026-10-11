@@ -471,3 +471,152 @@ fn absent_workspace_under_existing_parent_alias_is_not_promoted() {
     );
     assert_eq!(serde_json::to_value(&config.plugins).unwrap(), authority);
 }
+
+#[cfg(unix)]
+fn skill_bytes(dir: &std::path::Path) -> (Vec<u8>, Vec<u8>) {
+    (
+        std::fs::read(dir.join("manifest.toml")).unwrap(),
+        std::fs::read(dir.join("skills/fixture/SKILL.md")).unwrap(),
+    )
+}
+
+#[cfg(unix)]
+#[test]
+fn linked_child_package_is_left_at_source_without_a_recovery_hint() {
+    use std::os::unix::fs::symlink;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let install = tmp.path().join("install");
+    let target = tmp.path().join("managed");
+    let config = historical_config(&install, &target);
+    let source = config.data_dir.join("plugins");
+    let canonical = skill_package(&tmp.path().join("external"), "linked");
+    let before = skill_bytes(&canonical);
+    let authority = serde_json::to_value(&config.plugins).unwrap();
+    std::fs::create_dir_all(&source).unwrap();
+    let link = source.join("linked");
+    symlink(&canonical, &link).unwrap();
+
+    assert!(legacy_plugin_dirs_with_entries(&config).is_empty());
+    // Call the actual mover independently of the hint: mixed roots also reach it.
+    assert_eq!(migrate_plugins_dir(&source, &target).unwrap(), 0);
+    assert!(std::fs::symlink_metadata(&link).unwrap().is_symlink());
+    assert_eq!(std::fs::read_link(&link).unwrap(), canonical);
+    assert_eq!(skill_bytes(&canonical), before);
+    assert!(!target.exists());
+    assert!(
+        PluginHost::from_plugins_dir(&source)
+            .unwrap()
+            .list_plugins()
+            .is_empty()
+    );
+    assert_eq!(serde_json::to_value(&config.plugins).unwrap(), authority);
+    assert_eq!(migrate_plugins_dir(&source, &target).unwrap(), 0);
+    assert!(!target.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn mixed_root_alias_moves_only_ordinary_packages_and_preserves_retry() {
+    use std::os::unix::fs::symlink;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let install = tmp.path().join("install");
+    let target = tmp.path().join("managed");
+    let config = historical_config(&install, &target);
+    let source = tmp.path().join("external-legacy-root");
+    let regular = skill_package(&source, "regular");
+    let regular_before = skill_bytes(&regular);
+    let collision = skill_package(&source, "collision");
+    std::fs::write(collision.join("payload"), b"legacy-collision").unwrap();
+    let collision_before = skill_bytes(&collision);
+    let current = skill_package(&target, "collision");
+    std::fs::write(current.join("payload"), b"current-collision").unwrap();
+    let current_before = skill_bytes(&current);
+    let canonical = skill_package(&tmp.path().join("external-package"), "linked");
+    let linked_before = skill_bytes(&canonical);
+    let child_link = source.join("linked");
+    symlink(&canonical, &child_link).unwrap();
+    std::fs::create_dir_all(&config.data_dir).unwrap();
+    let root_alias = config.data_dir.join("plugins");
+    symlink(&source, &root_alias).unwrap();
+    let authority = serde_json::to_value(&config.plugins).unwrap();
+    let resolved_target = config.plugins.resolved_plugins_dir();
+    assert_eq!(resolved_target, target);
+
+    let recovery = legacy_plugin_dirs_with_entries(&config);
+    assert_eq!(recovery, vec![root_alias.clone()]);
+    let moved: usize = recovery
+        .iter()
+        .map(|dir| migrate_plugins_dir(dir, &resolved_target).unwrap())
+        .sum();
+    assert_eq!(moved, 1);
+    assert_eq!(skill_bytes(&target.join("regular")), regular_before);
+    assert!(!regular.exists());
+    assert_eq!(skill_bytes(&collision), collision_before);
+    assert_eq!(skill_bytes(&current), current_before);
+    assert_eq!(
+        std::fs::read(collision.join("payload")).unwrap(),
+        b"legacy-collision"
+    );
+    assert_eq!(
+        std::fs::read(current.join("payload")).unwrap(),
+        b"current-collision"
+    );
+    assert!(std::fs::symlink_metadata(&child_link).unwrap().is_symlink());
+    assert_eq!(std::fs::read_link(&child_link).unwrap(), canonical);
+    assert_eq!(skill_bytes(&canonical), linked_before);
+    assert!(!target.join("linked").exists());
+    assert_eq!(std::fs::read_link(&root_alias).unwrap(), source);
+    assert_eq!(serde_json::to_value(&config.plugins).unwrap(), authority);
+    let names: Vec<_> = PluginHost::from_plugins_dir(&resolved_target)
+        .unwrap()
+        .list_plugins()
+        .into_iter()
+        .map(|plugin| plugin.name)
+        .collect();
+    assert_eq!(names, vec!["collision", "regular"]);
+    assert_eq!(migrate_plugins_dir(&root_alias, &resolved_target).unwrap(), 0);
+    assert_eq!(legacy_plugin_dirs_with_entries(&config), vec![root_alias]);
+    assert_eq!(skill_bytes(&canonical), linked_before);
+    assert!(std::fs::symlink_metadata(&child_link).unwrap().is_symlink());
+    assert!(!target.join("linked").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn ordinary_child_with_manifest_alias_remains_discoverable_after_migration() {
+    use std::os::unix::fs::symlink;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let install = tmp.path().join("install");
+    let target = tmp.path().join("managed");
+    let config = historical_config(&install, &target);
+    let source = config.data_dir.join("plugins");
+    let package = skill_package(&source, "manifest-alias");
+    let canonical_manifest = tmp.path().join("shared-manifest.toml");
+    std::fs::rename(package.join("manifest.toml"), &canonical_manifest).unwrap();
+    symlink(&canonical_manifest, package.join("manifest.toml")).unwrap();
+    let before = skill_bytes(&package);
+    let authority = serde_json::to_value(&config.plugins).unwrap();
+    assert_eq!(legacy_plugin_dirs_with_entries(&config), vec![source.clone()]);
+    assert_eq!(migrate_plugins_dir(&source, &target).unwrap(), 1);
+    let moved = target.join("manifest-alias");
+    assert_eq!(skill_bytes(&moved), before);
+    assert_eq!(
+        std::fs::read_link(moved.join("manifest.toml")).unwrap(),
+        canonical_manifest
+    );
+    assert!(!package.exists());
+    let names: Vec<_> = PluginHost::from_plugins_dir(&config.plugins.resolved_plugins_dir())
+        .unwrap()
+        .list_plugins()
+        .into_iter()
+        .map(|plugin| plugin.name)
+        .collect();
+    assert_eq!(names, vec!["manifest-alias"]);
+    assert_eq!(serde_json::to_value(&config.plugins).unwrap(), authority);
+    assert_eq!(migrate_plugins_dir(&source, &target).unwrap(), 0);
+    assert!(legacy_plugin_dirs_with_entries(&config).is_empty());
+    assert_eq!(std::fs::read(&canonical_manifest).unwrap(), before.0);
+}
