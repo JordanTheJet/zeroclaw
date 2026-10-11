@@ -258,8 +258,13 @@ fn linked_producer_root_recovers_bytes_without_clobber_or_config_changes() {
     let report = migrate_v2_to_v3_install_filesystem(&install).unwrap();
     assert!(report.entries_relocated > 0);
     assert_eq!(
-        std::fs::read(report.backup_dir.unwrap().join("legacy-workspace/plugins/alpha/payload"))
-            .unwrap(),
+        std::fs::read(
+            report
+                .backup_dir
+                .unwrap()
+                .join("legacy-workspace/plugins/alpha/payload")
+        )
+        .unwrap(),
         b"alpha-legacy"
     );
     let produced = install.join("data/plugins");
@@ -326,8 +331,12 @@ fn aliases_into_known_agent_workspaces_are_not_automatically_promoted() {
         let mut config = historical_config(&install, &target);
         let workspace = match kind {
             "historical" => {
-                config.agents.entry("default".into()).or_default().workspace.path =
-                    Some(tmp.path().join("new-default"));
+                config
+                    .agents
+                    .entry("default".into())
+                    .or_default()
+                    .workspace
+                    .path = Some(tmp.path().join("new-default"));
                 install.join("agents/default/workspace")
             }
             "configured" => {
@@ -382,8 +391,12 @@ fn roots_containing_known_or_absent_agent_workspaces_are_not_promoted() {
                 .join("..")
                 .join("future-workspace")
         };
-        config.agents.entry("worker".into()).or_default().workspace.path =
-            Some(workspace.clone());
+        config
+            .agents
+            .entry("worker".into())
+            .or_default()
+            .workspace
+            .path = Some(workspace.clone());
         let before = std::fs::read(package.join("manifest.toml")).unwrap();
         let skill = std::fs::read(package.join("skills/fixture/SKILL.md")).unwrap();
         let authority = serde_json::to_value(&config.plugins).unwrap();
@@ -451,6 +464,10 @@ fn absent_workspace_under_existing_parent_alias_is_not_promoted() {
     );
     assert!(!workspace.exists());
     assert!(!candidate.join("not-created").exists());
-    assert!(std::fs::symlink_metadata(parent_alias).unwrap().is_symlink());
+    assert!(
+        std::fs::symlink_metadata(parent_alias)
+            .unwrap()
+            .is_symlink()
+    );
     assert_eq!(serde_json::to_value(&config.plugins).unwrap(), authority);
 }
