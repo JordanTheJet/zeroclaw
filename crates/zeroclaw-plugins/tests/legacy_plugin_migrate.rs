@@ -576,7 +576,10 @@ fn mixed_root_alias_moves_only_ordinary_packages_and_preserves_retry() {
         .map(|plugin| plugin.name)
         .collect();
     assert_eq!(names, vec!["collision", "regular"]);
-    assert_eq!(migrate_plugins_dir(&root_alias, &resolved_target).unwrap(), 0);
+    assert_eq!(
+        migrate_plugins_dir(&root_alias, &resolved_target).unwrap(),
+        0
+    );
     assert_eq!(legacy_plugin_dirs_with_entries(&config), vec![root_alias]);
     assert_eq!(skill_bytes(&canonical), linked_before);
     assert!(std::fs::symlink_metadata(&child_link).unwrap().is_symlink());
@@ -599,7 +602,10 @@ fn ordinary_child_with_manifest_alias_remains_discoverable_after_migration() {
     symlink(&canonical_manifest, package.join("manifest.toml")).unwrap();
     let before = skill_bytes(&package);
     let authority = serde_json::to_value(&config.plugins).unwrap();
-    assert_eq!(legacy_plugin_dirs_with_entries(&config), vec![source.clone()]);
+    assert_eq!(
+        legacy_plugin_dirs_with_entries(&config),
+        vec![source.clone()]
+    );
     assert_eq!(migrate_plugins_dir(&source, &target).unwrap(), 1);
     let moved = target.join("manifest-alias");
     assert_eq!(skill_bytes(&moved), before);

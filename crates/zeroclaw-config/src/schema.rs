@@ -30263,7 +30263,10 @@ zeroclaw-operators = "operator"
         let legacy = config.install_root_dir().join("workspace/plugins");
         std::fs::create_dir_all(&legacy).unwrap();
         symlink(outside.join("unselected"), legacy.join("linked-package")).unwrap();
-        assert_eq!(legacy_plugin_dirs_with_entries(&config), vec![data_alias.clone()]);
+        assert_eq!(
+            legacy_plugin_dirs_with_entries(&config),
+            vec![data_alias.clone()]
+        );
         // An ordinary package directory can still use a manifest alias under
         // the existing runtime manifest-loading contract.
         std::fs::create_dir_all(legacy.join("linked-manifest")).unwrap();
