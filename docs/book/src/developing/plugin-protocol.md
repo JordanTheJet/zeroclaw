@@ -253,6 +253,15 @@ without `Content-Length` cannot force ZeroClaw to buffer an oversized archive.
 Extraction is also capped, so a compressed archive cannot expand without bound
 in the temporary install area.
 
+Registry requests are bounded in time. Connecting to the registry or archive
+host may take at most 10 seconds, and a response may go at most 30 seconds
+without delivering data, both before its headers arrive and between reads of
+its body. Fetching the index must finish within 30 seconds, and downloading an
+archive within 30 minutes. A stalled registry or archive host therefore fails
+`zeroclaw plugin search` or `zeroclaw plugin install` instead of leaving it
+waiting, while a slow archive download that keeps delivering data is limited
+only by the 30-minute bound.
+
 Search is unauthenticated discovery. Install is the security boundary: registry
 installs use the configured plugin signature policy and trusted publisher keys,
 the same as local plugin installs through `PluginHost::install`.
@@ -821,8 +830,11 @@ The five bounds are operator-tunable and every value is validated as non-zero:
 (default 100,000), and `plugins.limits.max_instances` (default 64). A store can
 only be built with explicit limits, so no load path can construct an
 unsandboxed plugin. Guest `wasi:http` request options may end a call sooner but
-cannot extend the host deadline. An interrupted warm store is never resumed:
-channels recreate it from host-owned inputs on the next call, while memory
+cannot extend the host deadline. An interrupted warm store is never resumed,
+and a channel never reuses a store whose call trapped: channels recreate the
+instance from host-owned inputs on the next call, waiting when traps and
+missed deadlines, other than in approval and choice prompts, outrun a rebuild
+budget of three at once and one per five minutes after that, while memory
 instances remain unavailable until their owner rebuilds them. The canonical
 fields and defaults live in the
 [Config reference](../reference/index.md).

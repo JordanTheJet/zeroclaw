@@ -301,9 +301,9 @@ pub(crate) async fn run_manual_job_with_runtime_and_selection(
     .await
 }
 
-/// [`run_manual_job_with_runtime_and_selection`] for a caller that holds capabilities, such
-/// as a `cron_run` tool bound by a supplied-capability turn: an agent job runs
-/// on `capabilities` instead of building a config-backed set.
+/// Manual dispatch for a tool bound to the owning entry point's sources.
+/// Lifecycle selection, policy resolution, retries and history remain shared
+/// with the unbound config-backed adapter.
 pub(crate) async fn run_manual_job_with_capabilities(
     config: &Config,
     job: &CronJob,
@@ -977,13 +977,8 @@ async fn execute_job_with_retry(
     (false, last_output)
 }
 
-/// An agent job's run, on the supplied capabilities or, without them, through
-/// the config-backed adapter.
-///
-/// Boxed as `dyn Future + Send`: the daemon spawns the scheduler, and proving
-/// the job future `Send` from inside the scheduler's state machine exceeds the
-/// auto-trait recursion limit. Erasing the type here proves it once, at this
-/// shallow boundary.
+/// Erase the recursive tool/agent future at the existing job boundary so its
+/// `Send` proof does not grow with the scheduler or registered tool future.
 fn agent_job_turn<'a>(
     config: &'a Config,
     capabilities: Option<&'a crate::composition::RuntimeCapabilities>,
@@ -2195,6 +2190,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn cron_agent_default_excluded_tools_are_inventoried() {
+        let missing: Vec<&str> = CRON_AGENT_DEFAULT_EXCLUDED_TOOLS
+            .iter()
+            .copied()
+            .filter(|name| !zeroclaw_tools::inventory::is_builtin_tool_name(name))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "CRON_AGENT_DEFAULT_EXCLUDED_TOOLS names tools missing from the built-in inventory: {missing:?}"
+        );
+    }
+
     #[tokio::test]
     #[cfg(not(target_os = "windows"))]
     async fn run_job_command_success() {
@@ -3292,21 +3300,22 @@ mod tests {
             let (old_alias, mut delete) = {
                 let lifecycle = authority.agent_lifecycle();
                 let delete = lifecycle.begin_delete(TEST_AGENT).unwrap();
-                let old_alias = authority
-                    .config()
-                    .write()
-                    .agents
-                    .remove(TEST_AGENT)
-                    .unwrap();
+                let commit = authority.begin_config_commit().await.unwrap();
+                let mut published = commit.current_config();
+                let old_alias = published.agents.remove(TEST_AGENT).unwrap();
+                let revision = commit.next_revision().unwrap();
+                commit.publish(revision, published).unwrap();
                 (old_alias, delete)
             };
             delete.commit_destructive_mutation();
             drop(delete);
-            authority
-                .config()
-                .write()
-                .agents
-                .insert(TEST_AGENT.into(), old_alias);
+            {
+                let commit = authority.begin_config_commit().await.unwrap();
+                let mut published = commit.current_config();
+                published.agents.insert(TEST_AGENT.into(), old_alias);
+                let revision = commit.next_revision().unwrap();
+                commit.publish(revision, published).unwrap();
+            }
             let (tx, mut rx) = tokio::sync::broadcast::channel(4);
             let events = Some(tx);
 
@@ -3365,19 +3374,26 @@ mod tests {
         config.agents.insert("other".into(), Default::default());
         let authority = crate::LiveConfigAuthority::new(config.clone());
         let selection = authority.execution_capability().capture_selection();
-        let selected_config = authority.config().read().clone();
+        let selected_config = authority.snapshot_config();
         let selected_job = cron::get_job(&selected_config, &job.id).unwrap();
         {
-            let handle = authority.config();
-            let mut live = handle.write();
-            // Disable the stored owner so the moved claim becomes effective.
-            live.agents.get_mut(TEST_AGENT).unwrap().cron_jobs.clear();
-            live.agents.get_mut(TEST_AGENT).unwrap().enabled = false;
-            live.agents
+            let mut published = authority.snapshot_config();
+            published
+                .agents
+                .get_mut(TEST_AGENT)
+                .unwrap()
+                .cron_jobs
+                .clear();
+            published.agents.get_mut(TEST_AGENT).unwrap().enabled = false;
+            published
+                .agents
                 .get_mut("other")
                 .unwrap()
                 .cron_jobs
                 .push(job.id.clone());
+            let commit = authority.begin_config_commit().await.unwrap();
+            let revision = commit.next_revision().unwrap();
+            commit.publish(revision, published).unwrap();
         }
         let (tx, mut rx) = tokio::sync::broadcast::channel(4);
         let result = run_manual_job_with_selection(

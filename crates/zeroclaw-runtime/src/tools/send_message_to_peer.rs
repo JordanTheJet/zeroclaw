@@ -16,7 +16,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use chrono::Utc;
 use futures_util::FutureExt;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::Mutex;
 use serde_json::json;
 use std::any::Any;
 use std::future::Future;
@@ -42,7 +42,7 @@ struct PeerInboxTask {
 /// agent's resolved peer set.
 pub struct SendMessageToPeerTool {
     config: Arc<Config>,
-    live_config: Option<Arc<RwLock<Config>>>,
+    live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
     sender_alias: String,
     description: String,
     /// The capabilities and principal the sending turn was built from. When
@@ -70,7 +70,7 @@ impl SendMessageToPeerTool {
     pub(crate) fn new_with_live_config_and_capability(
         config: Arc<Config>,
         sender_alias: impl Into<String>,
-        live_config: Option<Arc<RwLock<Config>>>,
+        live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
         execution_capability: Option<AgentExecutionCapability>,
     ) -> Self {
         let sender_alias = sender_alias.into();
@@ -344,43 +344,21 @@ impl Tool for SendMessageToPeerTool {
             let task_owner_pid = task.owner_pid;
             let task_owner_boot_id = task.owner_boot_id.clone();
             zeroclaw_spawn::spawn!(async move {
-                // Keep the admitted recipient turn out of the cost-scope wrappers.
-                // A bound sender also hands the recipient its capabilities and
-                // principal, so the peer turn stays on the sender's sources; the
-                // admission and the live tool-policy source are kept either way.
-                let turn: Pin<Box<dyn Future<Output = Result<String>> + Send + '_>> =
-                    match bound {
-                        Some(bound) => Box::pin(
-                            crate::agent::loop_::process_message_shared_with_capabilities(
-                                cfg,
-                                live_config,
-                                bound.capabilities,
-                                bound.principal,
-                                &turn_recipient_alias,
-                                &body,
-                                None,
-                                zeroclaw_api::ingress::TurnOrigin::AgentDirect,
-                                admission,
-                                Some(zeroclaw_api::ingress::InternalPrincipal::PeerAgent {
-                                    sender_alias: sender.clone(),
-                                }),
-                            ),
-                        ),
-                        None => Box::pin(
-                            crate::agent::loop_::process_message_shared_with_live_config_and_admission_and_principal(
-                                cfg,
-                                live_config,
-                                &turn_recipient_alias,
-                                &body,
-                                None,
-                                zeroclaw_api::ingress::TurnOrigin::AgentDirect,
-                                admission,
-                                Some(zeroclaw_api::ingress::InternalPrincipal::PeerAgent {
-                                    sender_alias: sender.clone(),
-                                }),
-                            ),
-                        ),
-                    };
+                let internal_principal =
+                    Some(zeroclaw_api::ingress::InternalPrincipal::PeerAgent {
+                        sender_alias: sender.clone(),
+                    });
+                let turn: Pin<Box<dyn Future<Output = Result<String>> + Send + '_>> = match bound {
+                    Some(bound) => Box::pin(crate::agent::loop_::process_message_shared_with_capabilities(
+                        cfg, live_config, bound.capabilities, bound.principal,
+                        &turn_recipient_alias, &body, None,
+                        zeroclaw_api::ingress::TurnOrigin::AgentDirect, admission, internal_principal,
+                    )),
+                    None => Box::pin(crate::agent::loop_::process_message_shared_with_live_config_and_admission_and_principal(
+                        cfg, live_config, &turn_recipient_alias, &body, None,
+                        zeroclaw_api::ingress::TurnOrigin::AgentDirect, admission, internal_principal,
+                    )),
+                };
                 let result = run_peer_turn_with_panic_recovery(cost_ctx, turn_usage, turn).await;
                 if let Err(error) = settle_peer_inbox_task(
                     task_store.as_ref(),

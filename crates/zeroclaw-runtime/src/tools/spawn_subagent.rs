@@ -309,6 +309,7 @@ impl Tool for SpawnSubagentTool {
         // so the child cannot reach a provider or memory store the parent's
         // sources would not have returned.
         let bound = self.capabilities.get().cloned();
+        let config = (*config).clone();
         let run_result = Box::pin(scope!(
             agent_alias: parent_alias,
             session_key: run_id,
@@ -317,7 +318,7 @@ impl Tool for SpawnSubagentTool {
                 match bound {
                     Some(bound) => {
                         crate::agent::run_with_capabilities(
-                            (*config).clone(),
+                            config,
                             bound.capabilities,
                             bound.principal,
                             &self.parent_alias,
@@ -336,7 +337,7 @@ impl Tool for SpawnSubagentTool {
                     }
                     None => {
                         crate::agent::run(
-                            (*config).clone(),
+                            config,
                             &self.parent_alias,
                             Some(prompt),
                             None,
