@@ -19853,7 +19853,7 @@ mod capability_construction_tests {
             let authority = crate::LiveConfigAuthority::new(config.clone());
             let agent = Agent::from_snapshot_with_tui_env_bound(
                 &config,
-                authority.config(),
+                authority.live_handle(),
                 "test-agent",
                 None,
                 true,
