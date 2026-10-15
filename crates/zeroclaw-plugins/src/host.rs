@@ -1013,7 +1013,8 @@ pub fn migrate_plugins_dir(from: &Path, to: &Path) -> Result<usize, PluginError>
         let src = entry.path();
         // Discovery skips linked child packages; leave those links at source.
         // The root itself may still be a supported legacy-directory alias.
-        if !entry.file_type()?.is_dir() || !src.join("manifest.toml").exists() {
+        if !entry.file_type().is_ok_and(|kind| kind.is_dir()) || !src.join("manifest.toml").exists()
+        {
             continue;
         }
         let Some(name) = src.file_name() else {
