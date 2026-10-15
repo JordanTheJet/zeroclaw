@@ -810,14 +810,43 @@ pub(crate) fn build_system_prompt_for_turn(
         activated_tools,
     )?;
     let excluded_tool_names: HashSet<&str> = excluded_tools.iter().map(String::as_str).collect();
+    let builtin_discovery = activated_tools.filter(|_| {
+        !excluded_tool_names.contains("tool_search")
+            && tools_registry
+                .iter()
+                .any(|tool| tool.name() == "tool_search")
+    });
+    let hidden_builtin_names = builtin_discovery.map_or_else(HashSet::new, |state| {
+        state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .hidden_builtin_names()
+    });
     let effective_tool_names: HashSet<&str> = tools_registry
         .iter()
         .map(|tool| tool.name())
         .filter(|name| !excluded_tool_names.contains(*name))
         .collect();
+    let prompt_tool_names: HashSet<&str> = effective_tool_names
+        .iter()
+        .copied()
+        .filter(|name| !hidden_builtin_names.contains(*name))
+        .collect();
     let mut turn_tool_descs = tool_descs.to_vec();
-    turn_tool_descs.retain(|(name, _)| effective_tool_names.contains(name));
+    turn_tool_descs.retain(|(name, _)| prompt_tool_names.contains(name));
     let mut turn_deferred_section = deferred_section.to_string();
+    if let Some(state) = builtin_discovery {
+        let section = state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .deferred_builtin_prompt_section_filtered(|name| effective_tool_names.contains(name));
+        if !section.is_empty() {
+            if !turn_deferred_section.is_empty() {
+                turn_deferred_section.push_str("\n\n");
+            }
+            turn_deferred_section.push_str(&section);
+        }
+    }
     let expose_text_tool_protocol = apply_text_tool_prompt_policy(
         native_tools,
         strict_tool_parsing,
@@ -830,7 +859,7 @@ pub(crate) fn build_system_prompt_for_turn(
             agent_workspace,
             model_name,
             &turn_tool_descs,
-            |name| skill_tools_protocol_exposed && effective_tool_names.contains(name),
+            |name| skill_tools_protocol_exposed && prompt_tool_names.contains(name),
             skills,
             identity_config,
             bootstrap_max_chars,
@@ -847,7 +876,7 @@ pub(crate) fn build_system_prompt_for_turn(
     if expose_text_tool_protocol {
         system_prompt.push_str(&build_tool_instructions_for_names(
             tools_registry,
-            &effective_tool_names,
+            &prompt_tool_names,
         ));
     }
     if !turn_deferred_section.is_empty() {
@@ -2415,7 +2444,7 @@ async fn run_inner(
                                 )
                             );
 
-                            model_provider = capabilities.model_provider(
+                            model_provider = Box::new(capabilities.providers.switched_model_provider(
                                 &crate::composition::ProviderRequest {
                                     config: &config,
                                     agent_alias,
@@ -2423,7 +2452,7 @@ async fn run_inner(
                                     model: Some(&new_model),
                                     principal: principal.as_ref(),
                                 },
-                            )?;
+                            )?);
 
                             provider_name = new_model_provider;
                             model_name = new_model;
@@ -3021,7 +3050,7 @@ async fn run_inner(
                                     )
                                 );
 
-                                model_provider = capabilities.model_provider(
+                                model_provider = Box::new(capabilities.providers.switched_model_provider(
                                     &crate::composition::ProviderRequest {
                                         config: &config,
                                         agent_alias,
@@ -3029,7 +3058,7 @@ async fn run_inner(
                                         model: Some(&new_model),
                                         principal: principal.as_ref(),
                                     },
-                                )?;
+                                )?);
 
                                 provider_name = new_model_provider;
                                 model_name = new_model;
@@ -3922,7 +3951,31 @@ async fn process_message_inner(
             .map(|tool| tool.name())
             .filter(|name| !excluded_tools.iter().any(|ex| ex == *name))
             .collect();
-        tool_descs.retain(|(name, _)| effective_tool_names.contains(name));
+        let builtin_discovery = activated_handle_pm
+            .as_ref()
+            .filter(|_| effective_tool_names.contains("tool_search"));
+        let hidden_builtin_names = builtin_discovery.map_or_else(HashSet::new, |state| {
+            state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .hidden_builtin_names()
+        });
+        let prompt_tool_names: HashSet<&str> = effective_tool_names
+            .iter()
+            .copied()
+            .filter(|name| !hidden_builtin_names.contains(*name))
+            .collect();
+        tool_descs.retain(|(name, _)| prompt_tool_names.contains(name));
+        if let Some(state) = builtin_discovery {
+            deferred_section.push_str(
+                &state
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .deferred_builtin_prompt_section_filtered(|name| {
+                        effective_tool_names.contains(name)
+                    }),
+            );
+        }
 
         let bootstrap_max_chars = if eff_compact_context {
             Some(crate::agent::system_prompt::COMPACT_BOOTSTRAP_MAX_CHARS)
@@ -3952,7 +4005,7 @@ async fn process_message_inner(
                 &agent_workspace,
                 &model_name,
                 &tool_descs,
-                |name| skill_tools_protocol_exposed && effective_tool_names.contains(name),
+                |name| skill_tools_protocol_exposed && prompt_tool_names.contains(name),
                 &skills,
                 Some(&agent.identity),
                 bootstrap_max_chars,
@@ -3968,7 +4021,7 @@ async fn process_message_inner(
         if expose_text_tool_protocol {
             system_prompt.push_str(&build_tool_instructions_for_names(
                 &tools_registry,
-                &effective_tool_names,
+                &prompt_tool_names,
             ));
         }
         if !deferred_section.is_empty() {
@@ -8559,9 +8612,59 @@ mod tests {
 
     #[tokio::test]
     async fn run_tool_call_loop_enforces_sop_step_tool_scope() {
-        let turn_id = uuid::Uuid::new_v4().to_string();
-        let model_provider = ScriptedModelProvider {
-            responses: Arc::new(Mutex::new(VecDeque::from(vec![
+        struct ScopeCaptureProvider {
+            inner: ScriptedModelProvider,
+            requests: Arc<Mutex<Vec<Vec<ChatMessage>>>>,
+        }
+
+        impl zeroclaw_api::attribution::Attributable for ScopeCaptureProvider {
+            fn role(&self) -> zeroclaw_api::attribution::Role {
+                zeroclaw_api::attribution::Attributable::role(&self.inner)
+            }
+            fn alias(&self) -> &str {
+                "sop-scope-capture"
+            }
+        }
+
+        #[async_trait]
+        impl ModelProvider for ScopeCaptureProvider {
+            fn capabilities(&self) -> ProviderCapabilities {
+                self.inner.capabilities()
+            }
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                unreachable!("structured requests are used")
+            }
+            async fn chat(
+                &self,
+                request: ChatRequest<'_>,
+                model: &str,
+                temperature: Option<f64>,
+            ) -> anyhow::Result<ChatResponse> {
+                self.requests
+                    .lock()
+                    .unwrap()
+                    .push(request.messages.to_vec());
+                self.inner.chat(request, model, temperature).await
+            }
+        }
+
+        for (native, allow_search, cap, configless) in [
+            (false, false, 0, false),
+            (true, false, 0, false),
+            (false, true, 0, false),
+            (true, true, 0, false),
+            (false, false, 900, false),
+            (false, false, 10_000, false),
+            (false, false, 900, true),
+        ] {
+            let turn_id = uuid::Uuid::new_v4().to_string();
+            let mut responses = vec![
                 ChatResponse {
                     text: None,
                     tool_calls: vec![ToolCall {
@@ -8596,143 +8699,294 @@ mod tests {
                     usage: None,
                     reasoning_content: None,
                 },
-            ]))),
-            capabilities: ProviderCapabilities {
-                native_tool_calling: true,
-                ..ProviderCapabilities::default()
-            },
-        };
-
-        let sop = crate::sop::Sop {
-            name: "scoped-sop".to_string(),
-            description: "scoped sop".to_string(),
-            version: "1".to_string(),
-            priority: crate::sop::SopPriority::Normal,
-            execution_mode: crate::sop::SopExecutionMode::Auto,
-            triggers: vec![crate::sop::SopTrigger::Manual],
-            steps: vec![crate::sop::SopStep {
-                number: 1,
-                title: "Scoped".to_string(),
-                body: "Use only allowed tools".to_string(),
-                scope: Some(crate::sop::StepToolScope {
-                    allow: Some(vec!["allowed_tool".to_string()]),
-                    deny: Vec::new(),
-                }),
-                ..crate::sop::SopStep::default()
-            }],
-            cooldown_secs: 0,
-            max_concurrent: 1,
-            location: None,
-            deterministic: false,
-            admission_policy: crate::sop::types::SopAdmissionPolicy::Parallel,
-            max_pending_approvals: 0,
-            agent: None,
-            decision: None,
-        };
-        let mut engine = crate::sop::SopEngine::new(zeroclaw_config::schema::SopConfig {
-            step_scope_enforce: true,
-            ..zeroclaw_config::schema::SopConfig::default()
-        });
-        engine.replace_sops_for_test(vec![sop]);
-        let engine = Arc::new(Mutex::new(engine));
-
-        let allowed_invocations = Arc::new(AtomicUsize::new(0));
-        let denied_invocations = Arc::new(AtomicUsize::new(0));
-        let tools_registry = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![
-            Box::new(crate::tools::SopExecuteTool::new(Arc::clone(&engine))),
-            Box::new(CountingTool::new(
-                "allowed_tool",
-                Arc::clone(&allowed_invocations),
-            )),
-            Box::new(CountingTool::new(
-                "denied_tool",
-                Arc::clone(&denied_invocations),
-            )),
-        ]);
-
-        let mut history = vec![
-            ChatMessage::system("test-system"),
-            ChatMessage::user("start the scoped sop"),
-        ];
-        let observer = NoopObserver;
-
-        let result = run_tool_call_loop(ToolLoop {
-            parent_agent_alias: None,
-            served_route_sink: None,
-            sop_reassembly: None,
-            capability_binding: None,
-            exec: ResolvedAgentExecution {
-                model_access: ResolvedModelAccess {
-                    model_provider: &model_provider,
-                    provider_name: "mock-provider",
-                    model: "mock-model",
-                    dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+            ];
+            if !native {
+                for response in &mut responses {
+                    if !response.tool_calls.is_empty() {
+                        let call = &response.tool_calls[0];
+                        response.text = Some(format!(
+                            "<tool_call>{{\"name\":\"{}\",\"arguments\":{}}}</tool_call>",
+                            call.name, call.arguments
+                        ));
+                        response.tool_calls.clear();
+                    }
+                }
+            }
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let model_provider = ScopeCaptureProvider {
+                inner: ScriptedModelProvider {
+                    responses: Arc::new(Mutex::new(VecDeque::from(responses))),
+                    capabilities: ProviderCapabilities {
+                        native_tool_calling: native,
+                        ..ProviderCapabilities::default()
+                    },
                 },
-                tools_registry: &tools_registry,
-                observer: &observer,
-                silent: true,
-                approval: None,
-                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
-                config: None,
-                max_tool_iterations: 6,
-                hooks: None,
-                excluded_tools: &[],
-                dedup_exempt_tools: &[],
-                activated_tools: None,
-                model_switch_callback: None,
-                pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                strict_tool_parsing: false,
-                parallel_tools: false,
-                max_tool_result_chars: 0,
-                context_limits: test_context_limits(0),
-                context_limits_resolver: None,
-                receipt_generator: None,
-                knobs: &LoopKnobs::default(),
-                security: None,
-            },
-            history: &mut history,
-            // Test transcripts start fresh: no prior trim, no crumb.
-            history_has_trim_breadcrumb: &mut false,
-            injected_memory_preamble: &mut None,
-            channel_name: "agent",
-            channel_reply_target: None,
-            cancellation_token: None,
-            on_delta: None,
-            shared_budget: None,
-            channel: None,
-            collected_receipts: None,
-            event_tx: None,
-            steering: None,
-            new_messages_out: None,
-            image_cache: None,
-            memory: None,
-            ingress: IngressContext::sub_turn(),
-            agent_alias: Some("test-agent"),
-            turn_id: &turn_id,
-        })
-        .await
-        .expect("scoped SOP execution should complete");
+                requests: Arc::clone(&requests),
+            };
 
-        assert_eq!(result, "outer done");
-        assert_eq!(allowed_invocations.load(Ordering::SeqCst), 0);
-        assert_eq!(denied_invocations.load(Ordering::SeqCst), 0);
-        assert!(
-            history.iter().any(|msg| msg
-                .content
-                .contains("Tool not available in this turn: denied_tool")),
-            "denied tool call should be recorded as unavailable in history: {history:?}"
-        );
+            let sop = crate::sop::Sop {
+                name: "scoped-sop".to_string(),
+                description: "scoped sop".to_string(),
+                version: "1".to_string(),
+                priority: crate::sop::SopPriority::Normal,
+                execution_mode: crate::sop::SopExecutionMode::Auto,
+                triggers: vec![crate::sop::SopTrigger::Manual],
+                steps: vec![crate::sop::SopStep {
+                    number: 1,
+                    title: "Scoped".to_string(),
+                    body: "Use only allowed tools".to_string(),
+                    scope: Some(crate::sop::StepToolScope {
+                        allow: Some(if allow_search {
+                            vec!["allowed_tool".to_string(), "tool_search".to_string()]
+                        } else {
+                            vec!["allowed_tool".to_string()]
+                        }),
+                        deny: Vec::new(),
+                    }),
+                    ..crate::sop::SopStep::default()
+                }],
+                cooldown_secs: 0,
+                max_concurrent: 1,
+                location: None,
+                deterministic: false,
+                admission_policy: crate::sop::types::SopAdmissionPolicy::Parallel,
+                max_pending_approvals: 0,
+                agent: None,
+                decision: None,
+            };
+            let mut engine = crate::sop::SopEngine::new(zeroclaw_config::schema::SopConfig {
+                step_scope_enforce: true,
+                ..zeroclaw_config::schema::SopConfig::default()
+            });
+            engine.replace_sops_for_test(vec![sop]);
+            let engine = Arc::new(Mutex::new(engine));
 
-        let started = sop_started_run_id_from_history(&history)
-            .expect("sop_execute tool result should include a run id");
-        let engine = engine.lock().unwrap();
-        let run = engine
-            .get_run(&started)
-            .expect("run should remain queryable after completion");
-        assert_eq!(run.status, crate::sop::SopRunStatus::Completed);
-        assert_eq!(run.step_results.len(), 1);
-        assert_eq!(run.step_results[0].output, "step recovered");
+            let allowed_invocations = Arc::new(AtomicUsize::new(0));
+            let denied_invocations = Arc::new(AtomicUsize::new(0));
+            let tools_registry = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![
+                Box::new(crate::tools::SopExecuteTool::new(Arc::clone(&engine))),
+                mock_tool("tool_search"),
+                Box::new(CountingTool::new(
+                    "allowed_tool",
+                    Arc::clone(&allowed_invocations),
+                )),
+                Box::new(CountingTool::new(
+                    "denied_tool",
+                    Arc::clone(&denied_invocations),
+                )),
+            ]);
+            let activated = Arc::new(Mutex::new(crate::tools::ActivatedToolSet::new()));
+            activated.lock().unwrap().set_deferred_builtin_specs(
+                tools_registry
+                    .iter()
+                    .filter(|tool| matches!(tool.name(), "allowed_tool" | "denied_tool"))
+                    .map(|tool| tool.spec())
+                    .collect(),
+            );
+            let workspace = tempdir().unwrap();
+            let mut config = zeroclaw_config::schema::Config::default();
+            config.runtime_profiles.insert(
+                "scoped".to_string(),
+                zeroclaw_config::schema::RuntimeProfileConfig {
+                    max_system_prompt_chars: Some(cap),
+                    ..Default::default()
+                },
+            );
+            config.agents.insert(
+                "test-agent".to_string(),
+                zeroclaw_config::schema::AliasedAgentConfig {
+                    runtime_profile: zeroclaw_config::providers::RuntimeProfileRef::new("scoped"),
+                    ..Default::default()
+                },
+            );
+            let parent_prompt = super::build_system_prompt_for_turn(
+                workspace.path(),
+                "mock-model",
+                &[],
+                "",
+                &[],
+                None,
+                None,
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
+                &model_provider,
+                &tools_registry,
+                &[],
+                Some(&activated),
+                false,
+                zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
+                false,
+                0,
+                true,
+                true,
+                None,
+                None,
+            )
+            .unwrap();
+
+            let parent_prompt = parent_prompt.replacen(
+                "## Safety",
+                "## Hardware Access\nRetain hardware guidance.\n\n## Safety",
+                1,
+            );
+            let parent_prompt =
+                crate::agent::system_prompt::finalize_system_prompt(parent_prompt, cap);
+            let scoped_prompts = Arc::new(crate::agent::turn::ToolProtocolPrompts::with_max_chars(
+                parent_prompt.clone(),
+                parent_prompt.clone(),
+                cap,
+            ));
+            let mut history = vec![
+                ChatMessage::system(&parent_prompt),
+                ChatMessage::user("start the scoped sop"),
+            ];
+            let observer = NoopObserver;
+
+            let multimodal_config = zeroclaw_config::schema::MultimodalConfig::default();
+            let pacing = zeroclaw_config::schema::PacingConfig::default();
+            let knobs = LoopKnobs::default();
+            let mut history_has_trim_breadcrumb = false;
+            let mut injected_memory_preamble = None;
+            let turn = run_tool_call_loop(ToolLoop {
+                parent_agent_alias: None,
+                served_route_sink: None,
+                sop_reassembly: None,
+                capability_binding: None,
+                exec: ResolvedAgentExecution {
+                    model_access: ResolvedModelAccess {
+                        model_provider: &model_provider,
+                        provider_name: "mock-provider",
+                        model: "mock-model",
+                        dispatch_model: "mock-model",
+                        temperature: Some(0.0),
+                    },
+                    tools_registry: &tools_registry,
+                    observer: &observer,
+                    silent: true,
+                    approval: None,
+                    multimodal_config: &multimodal_config,
+                    config: (!configless).then_some(&config),
+                    max_tool_iterations: 6,
+                    hooks: None,
+                    excluded_tools: &[],
+                    dedup_exempt_tools: &[],
+                    activated_tools: Some(&activated),
+                    model_switch_callback: None,
+                    pacing: &pacing,
+                    strict_tool_parsing: false,
+                    parallel_tools: false,
+                    max_tool_result_chars: 0,
+                    context_limits: test_context_limits(0),
+                    context_limits_resolver: None,
+                    receipt_generator: None,
+                    knobs: &knobs,
+                    security: None,
+                },
+                history: &mut history,
+                // Test transcripts start fresh: no prior trim, no crumb.
+                history_has_trim_breadcrumb: &mut history_has_trim_breadcrumb,
+                injected_memory_preamble: &mut injected_memory_preamble,
+                channel_name: "agent",
+                channel_reply_target: None,
+                cancellation_token: None,
+                on_delta: None,
+                shared_budget: None,
+                channel: None,
+                collected_receipts: None,
+                event_tx: None,
+                steering: None,
+                new_messages_out: None,
+                image_cache: None,
+                memory: None,
+                ingress: IngressContext::sub_turn(),
+                agent_alias: Some("test-agent"),
+                turn_id: &turn_id,
+            });
+            let result = if configless {
+                crate::agent::turn::scope_tool_protocol_prompts(scoped_prompts, turn).await
+            } else {
+                turn.await
+            }
+            .expect("scoped SOP execution should complete");
+
+            assert_eq!(result, "outer done");
+            assert_eq!(allowed_invocations.load(Ordering::SeqCst), 0);
+            assert_eq!(denied_invocations.load(Ordering::SeqCst), 0);
+            let denial = if native {
+                "Tool not available in this turn: denied_tool"
+            } else {
+                "[Tool call parse error]"
+            };
+            assert!(
+                history.iter().any(|msg| msg.content.contains(denial)),
+                "denied tool call must be rejected before execution: {history:?}"
+            );
+
+            let started = sop_started_run_id_from_history(&history)
+                .expect("sop_execute tool result should include a run id");
+            let engine = engine.lock().unwrap();
+            let run = engine
+                .get_run(&started)
+                .expect("run should remain queryable after completion");
+            assert_eq!(run.status, crate::sop::SopRunStatus::Completed);
+            assert_eq!(run.step_results.len(), 1);
+            assert_eq!(run.step_results[0].output, "step recovered");
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests.len(), 4);
+            let prompt = |index: usize| {
+                requests[index]
+                    .iter()
+                    .find(|message| message.role == "system")
+                    .unwrap()
+                    .content
+                    .as_str()
+            };
+            if cap == 0 || cap == 10_000 {
+                assert!(prompt(0).contains("<available-deferred-builtin-tools>"));
+            }
+            for index in [1, 2] {
+                if cap > 0 {
+                    assert!(prompt(index).chars().count() <= cap);
+                    assert!(
+                        prompt(index)
+                            .trim_end()
+                            .ends_with(crate::agent::prompt::TIMESTAMP_ORIENTATION.trim_end()),
+                        "orientation missing: cap={cap}, configless={configless}, request={index}"
+                    );
+                    assert_eq!(
+                        prompt(index)
+                            .matches(crate::agent::prompt::TIMESTAMP_ORIENTATION)
+                            .count(),
+                        1
+                    );
+                }
+                assert_eq!(
+                    prompt(index).contains("<available-deferred-builtin-tools>"),
+                    allow_search
+                );
+                assert!(!prompt(index).contains("denied_tool - "));
+                if allow_search {
+                    assert!(prompt(index).contains("allowed_tool - "));
+                    assert!(!prompt(index).contains("**allowed_tool**"));
+                }
+                if cap == 0 || cap == 10_000 {
+                    assert!(prompt(index).contains("Retain hardware guidance."));
+                }
+                if !native && !allow_search && (cap == 0 || cap == 10_000) {
+                    assert_eq!(prompt(index).matches("## Tool Use Protocol").count(), 1);
+                    assert!(prompt(index).contains("**allowed_tool**"));
+                    assert!(prompt(index).contains("Parameters:"));
+                    assert!(!prompt(index).contains("**denied_tool**"));
+                    assert!(!prompt(index).contains("**tool_search**"));
+                }
+            }
+            assert_eq!(
+                prompt(0),
+                prompt(3),
+                "step fallback must not mutate the parent prompt"
+            );
+            assert_eq!(history[0].content, prompt(3));
+            assert_eq!(activated.lock().unwrap().hidden_builtin_names().len(), 2);
+        }
     }
 
     /// Activates a deferred tool into the shared set when called, standing in
@@ -10777,6 +11031,137 @@ mod tests {
             1,
             "non-exempt tool should still be deduped"
         );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_browser_and_search_preserve_tool_boundaries() {
+        for (requested_name, registered_name, parameter, value) in [
+            ("browser_open", "browser_open", "url", "https://example.com"),
+            ("browser", "browser", "action", "snapshot"),
+            (
+                "web_search",
+                "web_search_tool",
+                "query",
+                "rust release notes",
+            ),
+        ] {
+            let arguments = serde_json::json!({ parameter: value });
+            for response in [
+                format!("{requested_name}/{parameter}>{value}"),
+                format!(
+                    "<tool_call>{}</tool_call>",
+                    serde_json::json!({"name": requested_name, "arguments": arguments})
+                ),
+            ] {
+                for availability in ["registered", "missing", "excluded"] {
+                    let model_provider =
+                        ScriptedModelProvider::from_text_responses(vec![response.as_str(), "done"]);
+                    let recorded_args = Arc::new(Mutex::new(Vec::new()));
+                    let shell_args = Arc::new(Mutex::new(Vec::new()));
+                    let mut tools: Vec<Box<dyn Tool>> = Vec::new();
+                    if availability != "missing" {
+                        tools.push(Box::new(RecordingArgsTool::new(
+                            registered_name,
+                            Arc::clone(&recorded_args),
+                        )));
+                    }
+                    // An available browser/search tool must work without shell;
+                    // an unavailable one must not borrow shell's authority.
+                    if availability != "registered" {
+                        tools.push(Box::new(RecordingArgsTool::new(
+                            "shell",
+                            Arc::clone(&shell_args),
+                        )));
+                    }
+                    let tools_registry =
+                        crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(tools);
+                    let excluded_tools = if availability == "excluded" {
+                        vec![registered_name.to_string()]
+                    } else {
+                        Vec::new()
+                    };
+                    let mut history = vec![
+                        ChatMessage::system("test-system"),
+                        ChatMessage::user("run the requested tool"),
+                    ];
+                    let observer = NoopObserver;
+                    let turn_id = uuid::Uuid::new_v4().to_string();
+                    let result = run_tool_call_loop(ToolLoop {
+                        parent_agent_alias: None,
+                        served_route_sink: None,
+                        sop_reassembly: None,
+                        capability_binding: None,
+                        exec: ResolvedAgentExecution {
+                            model_access: ResolvedModelAccess {
+                                model_provider: &model_provider,
+                                provider_name: "mock-provider",
+                                model: "mock-model",
+                                dispatch_model: "mock-model",
+                                temperature: Some(0.0),
+                            },
+                            tools_registry: &tools_registry,
+                            observer: &observer,
+                            silent: true,
+                            approval: None,
+                            security: None,
+                            multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(
+                            ),
+                            config: None,
+                            max_tool_iterations: 4,
+                            hooks: None,
+                            excluded_tools: &excluded_tools,
+                            dedup_exempt_tools: &[],
+                            activated_tools: None,
+                            model_switch_callback: None,
+                            pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                            strict_tool_parsing: false,
+                            parallel_tools: false,
+                            max_tool_result_chars: 0,
+                            context_limits: test_context_limits(0),
+                            context_limits_resolver: None,
+                            receipt_generator: None,
+                            knobs: &LoopKnobs::default(),
+                        },
+                        history: &mut history,
+                        history_has_trim_breadcrumb: &mut false,
+                        injected_memory_preamble: &mut None,
+                        channel_name: "cli",
+                        channel_reply_target: None,
+                        cancellation_token: None,
+                        on_delta: None,
+                        shared_budget: None,
+                        channel: None,
+                        collected_receipts: None,
+                        event_tx: None,
+                        steering: None,
+                        new_messages_out: None,
+                        image_cache: None,
+                        memory: None,
+                        ingress: IngressContext::sub_turn(),
+                        agent_alias: None,
+                        turn_id: &turn_id,
+                    })
+                    .await
+                    .expect("browser/search boundary turn should complete");
+
+                    let expected = if availability == "registered" {
+                        assert!(result.ends_with("done"), "{response}: {result}");
+                        vec![arguments.clone()]
+                    } else {
+                        Vec::new()
+                    };
+                    assert_eq!(
+                        *recorded_args.lock().unwrap(),
+                        expected,
+                        "{availability}: {response}"
+                    );
+                    assert!(
+                        shell_args.lock().unwrap().is_empty(),
+                        "browser/search must never execute shell: {availability}: {response}"
+                    );
+                }
+            }
+        }
     }
 
     #[tokio::test]
@@ -13541,14 +13926,15 @@ This is an example, not an invocation."#;
         let messages = vec![ChatMessage::user("hi")];
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(8);
 
+        let tools = [crate::tools::ToolSpec::new(
+            "count_tool".to_string(),
+            "Count values".to_string(),
+            serde_json::json!({"type": "object"}),
+        )];
         let outcome = consume_provider_streaming_response(
             &provider,
             &messages,
-            Some(&[crate::tools::ToolSpec::new(
-                "count_tool".to_string(),
-                "Count values".to_string(),
-                serde_json::json!({"type": "object"}),
-            )]),
+            Some(&tools),
             "mock-model",
             Some(0.0),
             None,
@@ -13556,6 +13942,7 @@ This is an example, not an invocation."#;
             None, // event_tx
             false,
             zeroclaw_config::schema::StreamReasoningMode::Status,
+            Some(&tools),
         )
         .await
         .expect("streaming should finish");
@@ -13628,14 +14015,15 @@ This is an example, not an invocation."#;
         let messages = vec![ChatMessage::user("hi")];
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(8);
 
+        let tools = [crate::tools::ToolSpec::new(
+            "count_tool".to_string(),
+            "Count values".to_string(),
+            serde_json::json!({"type": "object"}),
+        )];
         let outcome = consume_provider_streaming_response(
             &provider,
             &messages,
-            Some(&[crate::tools::ToolSpec::new(
-                "count_tool".to_string(),
-                "Count values".to_string(),
-                serde_json::json!({"type": "object"}),
-            )]),
+            Some(&tools),
             "mock-model",
             Some(0.0),
             None,
@@ -13643,6 +14031,7 @@ This is an example, not an invocation."#;
             None, // event_tx
             false,
             zeroclaw_config::schema::StreamReasoningMode::Status,
+            Some(&tools),
         )
         .await
         .expect("streaming should finish");
@@ -13681,6 +14070,7 @@ This is an example, not an invocation."#;
             None, // event_tx
             false,
             zeroclaw_config::schema::StreamReasoningMode::Status,
+            None,
         )
         .await
         .expect("streaming should finish");
@@ -13707,14 +14097,15 @@ This is an example, not an invocation."#;
         let messages = vec![ChatMessage::user("return a support case JSON object")];
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(8);
 
+        let tools = [crate::tools::ToolSpec::new(
+            "count_tool".to_string(),
+            "Count values".to_string(),
+            serde_json::json!({"type": "object"}),
+        )];
         let outcome = consume_provider_streaming_response(
             &provider,
             &messages,
-            Some(&[crate::tools::ToolSpec::new(
-                "count_tool".to_string(),
-                "Count values".to_string(),
-                serde_json::json!({"type": "object"}),
-            )]),
+            Some(&tools),
             "mock-model",
             Some(0.0),
             None,
@@ -13722,6 +14113,7 @@ This is an example, not an invocation."#;
             None, // event_tx
             false,
             zeroclaw_config::schema::StreamReasoningMode::Status,
+            Some(&tools),
         )
         .await
         .expect("streaming should finish");
@@ -13748,14 +14140,15 @@ This is an example, not an invocation."#;
         )];
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(8);
 
+        let tools = [crate::tools::ToolSpec::new(
+            "count_tool".to_string(),
+            "Count values".to_string(),
+            serde_json::json!({"type": "object"}),
+        )];
         let outcome = consume_provider_streaming_response(
             &provider,
             &messages,
-            Some(&[crate::tools::ToolSpec::new(
-                "count_tool".to_string(),
-                "Count values".to_string(),
-                serde_json::json!({"type": "object"}),
-            )]),
+            Some(&tools),
             "mock-model",
             Some(0.0),
             None,
@@ -13763,6 +14156,7 @@ This is an example, not an invocation."#;
             None, // event_tx
             false,
             zeroclaw_config::schema::StreamReasoningMode::Status,
+            Some(&tools),
         )
         .await
         .expect("streaming should finish");
@@ -13848,6 +14242,7 @@ This is an example, not an invocation."#;
             None, // event_tx
             false,
             zeroclaw_config::schema::StreamReasoningMode::Status,
+            None,
         )
         .await
         .expect("streaming should finish");
@@ -13931,6 +14326,7 @@ This is an example, not an invocation."#;
             None, // event_tx
             false,
             zeroclaw_config::schema::StreamReasoningMode::Status,
+            None,
         )
         .await
         .expect("streaming should finish");
@@ -14017,6 +14413,7 @@ This is an example, not an invocation."#;
             None, // event_tx
             false,
             zeroclaw_config::schema::StreamReasoningMode::Status,
+            None,
         )
         .await
         .expect("streaming should finish");
@@ -14091,14 +14488,15 @@ This is an example, not an invocation."#;
         let messages = vec![ChatMessage::user("hi")];
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(8);
 
+        let tools = [crate::tools::ToolSpec::new(
+            "count_tool".to_string(),
+            "Count values".to_string(),
+            serde_json::json!({"type": "object"}),
+        )];
         let outcome = consume_provider_streaming_response(
             &provider,
             &messages,
-            Some(&[crate::tools::ToolSpec::new(
-                "count_tool".to_string(),
-                "Count values".to_string(),
-                serde_json::json!({"type": "object"}),
-            )]),
+            Some(&tools),
             "mock-model",
             Some(0.0),
             None,
@@ -14106,6 +14504,7 @@ This is an example, not an invocation."#;
             None, // event_tx
             false,
             zeroclaw_config::schema::StreamReasoningMode::Status,
+            Some(&tools),
         )
         .await
         .expect("streaming should finish");
@@ -14190,6 +14589,7 @@ This is an example, not an invocation."#;
             None, // event_tx
             false,
             zeroclaw_config::schema::StreamReasoningMode::Status,
+            None,
         )
         .await
         .expect("streaming should finish");
@@ -14277,6 +14677,7 @@ This is an example, not an invocation."#;
             None, // event_tx
             false,
             zeroclaw_config::schema::StreamReasoningMode::Status,
+            None,
         )
         .await
         .expect("streaming should finish");
@@ -14773,6 +15174,7 @@ This is an example, not an invocation."#;
             None, // event_tx
             true,
             zeroclaw_config::schema::StreamReasoningMode::Status,
+            Some(&tools),
         )
         .await
         .expect("streaming should finish");
@@ -16464,6 +16866,76 @@ Let me check the result."#;
         );
     }
 
+    #[tokio::test]
+    async fn turn_prompt_defers_builtin_definition_until_search_selection() {
+        use zeroclaw_config::schema::{RiskProfileConfig, SkillsPromptInjectionMode};
+
+        let workspace = tempdir().unwrap();
+        let provider = ScriptedModelProvider::from_text_responses(vec!["ok"]);
+        let tools = vec![
+            mock_tool("shell"),
+            mock_tool("catalog_probe"),
+            mock_tool("tool_search"),
+        ];
+        let activated = Arc::new(Mutex::new(crate::tools::ActivatedToolSet::new()));
+        activated
+            .lock()
+            .unwrap()
+            .set_deferred_builtin_specs(vec![tools[1].spec()]);
+        let build = |excluded: &[String]| {
+            super::build_system_prompt_for_turn(
+                workspace.path(),
+                "test-model",
+                &[],
+                "",
+                &[],
+                None,
+                None,
+                &RiskProfileConfig::default(),
+                &provider,
+                &tools,
+                excluded,
+                Some(&activated),
+                false,
+                SkillsPromptInjectionMode::Full,
+                false,
+                usize::MAX,
+                false,
+                false,
+                None,
+                None,
+            )
+            .unwrap()
+        };
+        let initial = build(&[]);
+        assert!(initial.contains("catalog_probe - "));
+        assert!(!initial.contains("**catalog_probe**"));
+        let search_allowed = build(&["catalog_probe".into()]);
+        assert!(!search_allowed.contains("catalog_probe"));
+        assert!(!search_allowed.contains("<available-deferred-builtin-tools>"));
+        assert!(search_allowed.contains("tool_search"));
+        assert_eq!(activated.lock().unwrap().hidden_builtin_names().len(), 1);
+        let eager = build(&["tool_search".into()]);
+        assert!(eager.contains("**catalog_probe**"));
+        assert!(!eager.contains("catalog_probe - "));
+        assert!(!eager.contains("tool_search"));
+        let excluded = build(&["tool_search".into(), "catalog_probe".into()]);
+        assert!(!excluded.contains("catalog_probe"));
+        let search = crate::tools::ToolSearchTool::for_builtin_schemas(Arc::clone(&activated));
+        let result = search
+            .execute(serde_json::json!({"query": "select:catalog_probe"}))
+            .await
+            .unwrap();
+        assert!(result.output.contains("\"name\": \"catalog_probe\""));
+        let selected = build(&[]);
+        assert!(selected.contains(&format!(
+            "**catalog_probe**: {}\nParameters: `{}`\n",
+            tools[1].description(),
+            tools[1].parameters_schema()
+        )));
+        assert!(!selected.contains("catalog_probe - "));
+    }
+
     #[test]
     fn turn_prompt_budget_applies_after_deferred_and_thinking_sections() {
         use zeroclaw_config::schema::{RiskProfileConfig, SkillsPromptInjectionMode};
@@ -17115,6 +17587,7 @@ Let me check the result."#;
             None, // event_tx
             false,
             zeroclaw_config::schema::StreamReasoningMode::Status,
+            None,
         )
         .await
         .expect("streaming should succeed");
@@ -17210,6 +17683,7 @@ Let me check the result."#;
             None, // event_tx
             false,
             zeroclaw_config::schema::StreamReasoningMode::Status,
+            None,
         )
         .await
         .expect("streaming should succeed");
@@ -23692,5 +24166,609 @@ mod capability_entry_point_tests {
                 .iter()
                 .any(|alias| alias == "test-agent")
         );
+    }
+
+    const SWITCH_AGENT: &str = "supplied-cli-switch-agent";
+    const START_REF: &str = "openai.initial";
+    const START_MODEL: &str = "initial-model";
+    const SWITCH_REF: &str = "openai.switched";
+    const SWITCH_MODEL: &str = "switched-model";
+    const SWITCH_REPLY: &str = "distinct supplied switch reply";
+    const SWITCH_REFUSAL: &str = "supplied CLI switch refused";
+    const STARTUP_REUSED: &str = "startup source was reused for a switch";
+    const SWITCH_CHILD: &str =
+        "agent::loop_::capability_entry_point_tests::supplied_cli_switch_child";
+    const SWITCH_CASE_ENV: &str = "ZEROCLAW_TEST_SUPPLIED_CLI_SWITCH_CASE";
+
+    #[derive(Default)]
+    struct SwitchSeen {
+        startup: std::sync::Mutex<Vec<SeenProviderRequest>>,
+        switches: std::sync::Mutex<Vec<SeenProviderRequest>>,
+        chats: std::sync::Mutex<Vec<(bool, String)>>,
+        context_windows: std::sync::Mutex<Vec<usize>>,
+    }
+
+    struct SwitchSource {
+        seen: Arc<SwitchSeen>,
+        refuse: bool,
+    }
+
+    fn switch_request(request: &crate::composition::ProviderRequest<'_>) -> SeenProviderRequest {
+        SeenProviderRequest {
+            agent_alias: request.agent_alias.to_owned(),
+            provider_ref: request.provider_ref.map(str::to_owned),
+            model: request.model.map(str::to_owned),
+            principal: request.principal.cloned(),
+        }
+    }
+
+    impl crate::composition::ProviderSource for SwitchSource {
+        fn model_provider(
+            &self,
+            request: &crate::composition::ProviderRequest<'_>,
+        ) -> anyhow::Result<Arc<dyn zeroclaw_api::model_provider::ModelProvider>> {
+            let mut startup = self.seen.startup.lock().unwrap();
+            startup.push(switch_request(request));
+            if startup.len() != 1
+                || request.provider_ref != Some(START_REF)
+                || request.model != Some(START_MODEL)
+            {
+                anyhow::bail!(STARTUP_REUSED);
+            }
+            self.seen.context_windows.lock().unwrap().push(
+                request
+                    .config
+                    .resolved_context_limits_for_route(request.agent_alias, START_REF, START_MODEL)
+                    .model_context_window,
+            );
+            Ok(Arc::new(SwitchProvider {
+                switched: false,
+                seen: self.seen.clone(),
+            }))
+        }
+
+        fn switched_model_provider(
+            &self,
+            request: &crate::composition::ProviderRequest<'_>,
+        ) -> anyhow::Result<Arc<dyn zeroclaw_api::model_provider::ModelProvider>> {
+            self.seen
+                .switches
+                .lock()
+                .unwrap()
+                .push(switch_request(request));
+            self.seen.context_windows.lock().unwrap().push(
+                request
+                    .config
+                    .resolved_context_limits_for_route(
+                        request.agent_alias,
+                        request.provider_ref.expect("explicit switch target"),
+                        request.model.expect("explicit switch model"),
+                    )
+                    .model_context_window,
+            );
+            if self.refuse {
+                anyhow::bail!(SWITCH_REFUSAL);
+            }
+            Ok(Arc::new(SwitchProvider {
+                switched: true,
+                seen: self.seen.clone(),
+            }))
+        }
+    }
+
+    struct SwitchProvider {
+        switched: bool,
+        seen: Arc<SwitchSeen>,
+    }
+
+    impl zeroclaw_api::attribution::Attributable for SwitchProvider {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            use zeroclaw_api::attribution::{ModelProviderKind, ProviderKind, Role};
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+        fn alias(&self) -> &str {
+            if self.switched {
+                "supplied-switched"
+            } else {
+                "supplied-initial"
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl zeroclaw_api::model_provider::ModelProvider for SwitchProvider {
+        fn capabilities(&self) -> zeroclaw_api::model_provider::ProviderCapabilities {
+            zeroclaw_api::model_provider::ProviderCapabilities {
+                native_tool_calling: true,
+                ..Default::default()
+            }
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("unexpected unstructured chat in CLI switch control")
+        }
+
+        async fn chat(
+            &self,
+            request: zeroclaw_api::model_provider::ChatRequest<'_>,
+            model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<zeroclaw_api::model_provider::ChatResponse> {
+            use zeroclaw_api::model_provider::{ChatResponse, ToolCall};
+            {
+                let mut chats = self.seen.chats.lock().unwrap();
+                assert_eq!(
+                    chats.len(),
+                    usize::from(self.switched),
+                    "unexpected provider retry"
+                );
+                chats.push((self.switched, model.to_owned()));
+            }
+            if self.switched {
+                assert_eq!(model, SWITCH_MODEL);
+                Ok(ChatResponse {
+                    text: Some(SWITCH_REPLY.into()),
+                    tool_calls: vec![],
+                    usage: None,
+                    reasoning_content: None,
+                })
+            } else {
+                assert_eq!(model, START_MODEL);
+                let tools = request
+                    .tools
+                    .expect("the actual native tool must be advertised");
+                assert_eq!(tools.len(), 1);
+                assert_eq!(tools[0].name, "model_switch");
+                Ok(ChatResponse {
+                    text: None,
+                    tool_calls: vec![ToolCall {
+                        id: "supplied-cli-switch-call".into(),
+                        name: "model_switch".into(),
+                        arguments: serde_json::json!({
+                            "action": "set", "model_provider": SWITCH_REF, "model": SWITCH_MODEL,
+                        })
+                        .to_string(),
+                        extra_content: None,
+                    }],
+                    usage: None,
+                    reasoning_content: None,
+                })
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct SwitchObserver(std::sync::Mutex<Vec<zeroclaw_api::observability_traits::ObserverEvent>>);
+
+    impl zeroclaw_api::observability_traits::Observer for SwitchObserver {
+        fn record_event(&self, event: &zeroclaw_api::observability_traits::ObserverEvent) {
+            self.0.lock().unwrap().push(event.clone());
+        }
+        fn record_metric(&self, _metric: &zeroclaw_api::observability_traits::ObserverMetric) {}
+        fn name(&self) -> &str {
+            "supplied-cli-switch-control"
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    struct SwitchCli(Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl zeroclaw_api::attribution::Attributable for SwitchCli {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            use zeroclaw_api::attribution::{ChannelKind, Role};
+            Role::Channel(ChannelKind::Cli)
+        }
+        fn alias(&self) -> &str {
+            "cli"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl zeroclaw_api::channel::Channel for SwitchCli {
+        fn name(&self) -> &str {
+            "cli"
+        }
+        async fn send(&self, message: &zeroclaw_api::channel::SendMessage) -> anyhow::Result<()> {
+            self.0.lock().unwrap().push(message.content.clone());
+            println!("{}", message.content);
+            Ok(())
+        }
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            panic!("run_inner must read the child's actual stdin")
+        }
+    }
+
+    async fn switch_endpoint_probe(
+        endpoint: &crate::composition::test_support::CountingEndpoint,
+        expected: usize,
+    ) {
+        use tokio::io::AsyncReadExt as _;
+
+        assert_eq!(
+            endpoint.connections(),
+            expected - 1,
+            "unexpected configured-provider connection before probe"
+        );
+        let address = endpoint
+            .url
+            .strip_prefix("http://")
+            .unwrap()
+            .split('/')
+            .next()
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let mut probe = tokio::net::TcpStream::connect(address).await.unwrap();
+            let mut acknowledgment = [0_u8; 1];
+            assert_eq!(
+                probe.read(&mut acknowledgment).await.unwrap(),
+                0,
+                "counting endpoint must close its accepted probe"
+            );
+        })
+        .await
+        .expect("the independent sentinel probe must be accepted");
+        assert_eq!(
+            endpoint.connections(),
+            expected,
+            "unexpected configured-provider connection"
+        );
+    }
+
+    async fn exercise_cli_switch(interactive: bool, refuse: bool) {
+        use crate::composition::test_support::{capabilities_with_providers, counting_endpoint};
+        use zeroclaw_api::observability_traits::ObserverEvent;
+
+        let endpoint = counting_endpoint().await;
+        switch_endpoint_probe(&endpoint, 1).await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Default::default()
+        };
+        config.memory.backend = "none".into();
+        config.memory.auto_save = false;
+        config.plugins.enabled = false;
+        config.plugins.auto_discover = false;
+        config.mcp.enabled = false;
+        config.skills.skill_creation.enabled = false;
+        config.risk_profiles.insert(
+            "switch-control".into(),
+            RiskProfileConfig {
+                allowed_tools: vec!["model_switch".into()],
+                auto_approve: vec!["model_switch".into()],
+                ..Default::default()
+            },
+        );
+        config.runtime_profiles.insert(
+            "switch-control".into(),
+            zeroclaw_config::schema::RuntimeProfileConfig {
+                deferred_builtin_tools: false,
+                ..Default::default()
+            },
+        );
+        for (alias, model, window) in [
+            ("initial", START_MODEL, 64_000),
+            ("switched", SWITCH_MODEL, 128_000),
+        ] {
+            config.providers.models.openai.insert(
+                alias.into(),
+                OpenAIModelProviderConfig {
+                    base: ModelProviderConfig {
+                        model: Some(model.into()),
+                        uri: Some(endpoint.url.clone()),
+                        api_key: Some("synthetic-switch-control".into()),
+                        context_window: Some(window),
+                        ..Default::default()
+                    },
+                },
+            );
+        }
+        config.agents.insert(
+            SWITCH_AGENT.into(),
+            AliasedAgentConfig {
+                model_provider: START_REF.into(),
+                risk_profile: "switch-control".into(),
+                runtime_profile: "switch-control".into(),
+                ..Default::default()
+            },
+        );
+        let principal = PrincipalId::for_oidc("https://issuer.example", "cli-switch-control");
+        let source = Arc::new(SwitchSource {
+            seen: Arc::new(SwitchSeen::default()),
+            refuse,
+        });
+        let observer = Arc::new(SwitchObserver::default());
+        let mut capabilities = capabilities_with_providers(source.clone());
+        capabilities.observer = observer.clone();
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let channel_messages = sent.clone();
+        assert!(super::CLI_CHANNEL_FN.get().is_none());
+        super::register_cli_channel_fn(Box::new(move || {
+            Box::new(SwitchCli(channel_messages.clone()))
+        }));
+        let result = super::run_with_capabilities(
+            config,
+            capabilities,
+            Some(principal.clone()),
+            SWITCH_AGENT,
+            (!interactive).then(|| "please switch models".to_owned()),
+            None,
+            None,
+            None,
+            Vec::new(),
+            true,
+            None,
+            Some(vec!["model_switch".into()]),
+            TurnOrigin::Interactive,
+            super::AgentRunOverrides::default(),
+        )
+        .await;
+        // A second independently accepted probe fences the zero-production-attempt assertion.
+        switch_endpoint_probe(&endpoint, 2).await;
+        let events = observer.0.lock().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, ObserverEvent::ToolCall {
+            tool, success: true, agent_alias, ..
+        } if tool == "model_switch" && agent_alias.as_deref() == Some(SWITCH_AGENT)))
+                .count(),
+            1
+        );
+        println!("SUPPLIED_CLI_SWITCH_TOOL_COMPLETED");
+        if refuse {
+            let error =
+                result.expect_err("the supplied switch source must refuse the actual CLI turn");
+            assert!(
+                error
+                    .chain()
+                    .any(|cause| cause.to_string() == SWITCH_REFUSAL),
+                "{error:#}"
+            );
+        } else {
+            assert_eq!(
+                result.expect("the distinct supplied provider must serve the switched turn"),
+                SWITCH_REPLY
+            );
+        }
+        assert!(
+            sent.lock().unwrap().is_empty(),
+            "CLI response must use actual stdout"
+        );
+        assert_eq!(
+            *source.seen.startup.lock().unwrap(),
+            vec![SeenProviderRequest {
+                agent_alias: SWITCH_AGENT.into(),
+                provider_ref: Some(START_REF.into()),
+                model: Some(START_MODEL.into()),
+                principal: Some(principal.clone()),
+            }]
+        );
+        assert_eq!(
+            *source.seen.switches.lock().unwrap(),
+            vec![SeenProviderRequest {
+                agent_alias: SWITCH_AGENT.into(),
+                provider_ref: Some(SWITCH_REF.into()),
+                model: Some(SWITCH_MODEL.into()),
+                principal: Some(principal),
+            }]
+        );
+        let expected_chats: Vec<(bool, String)> = if refuse {
+            vec![(false, START_MODEL.into())]
+        } else {
+            vec![(false, START_MODEL.into()), (true, SWITCH_MODEL.into())]
+        };
+        assert_eq!(*source.seen.chats.lock().unwrap(), expected_chats);
+        assert_eq!(
+            *source.seen.context_windows.lock().unwrap(),
+            vec![64_000, 128_000]
+        );
+        let brackets: Vec<_> = events.iter().filter(|e| matches!(e,
+            ObserverEvent::AgentStart { agent_alias, .. } | ObserverEvent::AgentEnd { agent_alias, .. }
+            if agent_alias.as_deref() == Some(SWITCH_AGENT))).collect();
+        assert_eq!(brackets.len(), 2, "{events:?}");
+        assert!(matches!(brackets[0], ObserverEvent::AgentStart { .. }));
+        match brackets[1] {
+            ObserverEvent::AgentEnd {
+                model_provider,
+                model,
+                ..
+            } => {
+                assert_eq!(model_provider, if refuse { START_REF } else { SWITCH_REF });
+                assert_eq!(model, if refuse { START_MODEL } else { SWITCH_MODEL });
+            }
+            event => panic!("unbalanced CLI switch lifecycle: {event:?}"),
+        }
+    }
+
+    // Only this explicitly selected child registers the process-global CLI factory.
+    #[test]
+    #[ignore = "private same-executable fixture, invoked by the four parent controls"]
+    fn supplied_cli_switch_child() {
+        let case = std::env::var(SWITCH_CASE_ENV).expect("explicit private CLI switch case");
+        let (interactive, refuse) = match case.as_str() {
+            "one-shot-serve" => (false, false),
+            "one-shot-refuse" => (false, true),
+            "interactive-serve" => (true, false),
+            "interactive-refuse" => (true, true),
+            _ => panic!("unknown private CLI switch case"),
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(15),
+                exercise_cli_switch(interactive, refuse),
+            )
+            .await
+            .expect("bounded actual CLI switch case");
+        });
+        println!("SUPPLIED_CLI_SWITCH_PASSED:{case}");
+    }
+
+    struct SwitchChild {
+        child: std::process::Child,
+        reaped: bool,
+    }
+
+    impl SwitchChild {
+        fn wait_until(&mut self, deadline: std::time::Instant) -> Option<std::process::ExitStatus> {
+            loop {
+                if let Some(status) = self.child.try_wait().expect("poll owned switch child") {
+                    self.reaped = true;
+                    return Some(status);
+                }
+                if std::time::Instant::now() >= deadline {
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+    }
+
+    impl Drop for SwitchChild {
+        fn drop(&mut self) {
+            if !self.reaped {
+                // A direct Child remains unreaped here; never signal a stored numeric PID/group.
+                match self.child.try_wait() {
+                    Ok(Some(_)) => {
+                        self.reaped = true;
+                        return;
+                    }
+                    Ok(None) => {}
+                    Err(_) => return, // Uncertain waitability never authorizes a signal.
+                }
+                let _ = self.child.kill();
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                while std::time::Instant::now() < deadline {
+                    if let Ok(Some(_)) = self.child.try_wait() {
+                        self.reaped = true;
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+        }
+    }
+
+    fn switch_child_output(
+        reader: impl std::io::Read + Send + 'static,
+    ) -> (
+        std::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>,
+        std::thread::JoinHandle<()>,
+    ) {
+        use std::io::Read as _;
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let handle = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let result = reader.take(65_537).read_to_end(&mut bytes).and_then(|_| {
+                if bytes.len() > 65_536 {
+                    Err(std::io::Error::other(
+                        "CLI switch child output exceeded its cap",
+                    ))
+                } else {
+                    Ok(bytes)
+                }
+            });
+            let _ = tx.send(result);
+        });
+        (rx, handle)
+    }
+
+    fn run_switch_child(case: &str) {
+        use std::io::Write as _;
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                SWITCH_CHILD,
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(SWITCH_CASE_ENV, case)
+            .env_remove("ZEROCLAW_OPEN_SKILLS_ENABLED")
+            .env_remove("ZEROCLAW_OPEN_SKILLS_DIR")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let mut owned = SwitchChild {
+            child: command.spawn().unwrap(),
+            reaped: false,
+        };
+        let (stdout, out_thread) = switch_child_output(owned.child.stdout.take().unwrap());
+        let (stderr, err_thread) = switch_child_output(owned.child.stderr.take().unwrap());
+        let mut input = owned.child.stdin.take().unwrap();
+        let _ = input.write_all(b"please switch models\n");
+        drop(input); // EOF is delivered through the real child's stdin, without fd mutation.
+        let status = owned
+            .wait_until(std::time::Instant::now() + std::time::Duration::from_secs(30))
+            .expect("actual CLI switch child exceeded the parent deadline");
+        let output = stdout
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        let errors = stderr
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        out_thread.join().unwrap();
+        err_thread.join().unwrap();
+        let output = String::from_utf8(output).unwrap();
+        let errors = String::from_utf8(errors).unwrap();
+        assert!(status.success(), "{case}: {status}\n{output}\n{errors}");
+        assert_eq!(
+            output.matches("SUPPLIED_CLI_SWITCH_TOOL_COMPLETED").count(),
+            1
+        );
+        assert_eq!(
+            output
+                .matches(&format!("SUPPLIED_CLI_SWITCH_PASSED:{case}"))
+                .count(),
+            1
+        );
+        assert!(
+            output.contains("1 passed; 0 failed"),
+            "private fixture must actually execute: {output}"
+        );
+        assert_eq!(
+            output.contains(SWITCH_REPLY),
+            case.ends_with("-serve"),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn run_supplied_one_shot_switch_uses_switch_source() {
+        run_switch_child("one-shot-serve");
+    }
+
+    #[test]
+    fn run_supplied_one_shot_switch_refusal_has_no_startup_fallback() {
+        run_switch_child("one-shot-refuse");
+    }
+
+    #[test]
+    fn run_supplied_interactive_switch_uses_switch_source() {
+        run_switch_child("interactive-serve");
+    }
+
+    #[test]
+    fn run_supplied_interactive_switch_refusal_has_no_startup_fallback() {
+        run_switch_child("interactive-refuse");
     }
 }

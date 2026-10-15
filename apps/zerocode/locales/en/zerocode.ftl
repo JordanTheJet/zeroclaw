@@ -190,6 +190,7 @@ zc-queue-help-enqueue = Queue message
 zc-queue-help-inject = Send now (skip queue)
 zc-queue-edit-busy = Finish or clear the current message before editing a queued one.
 zc-queue-dispatch-failed = Could not send queued message: { $error }
+zc-queue-dispatch-requeued = Session busy; your message is back in the queue (paused): { $error }
 
 zc-logs-label-timestamp = Timestamp
 zc-logs-label-severity = Severity
@@ -324,8 +325,8 @@ zc-dashboard-section-content = Content
 zc-dashboard-section-process = Process
 zc-dashboard-section-components = Components
 zc-dashboard-section-details = Details
-zc-dashboard-section-summary = Summary
-zc-dashboard-section-by-period = By Period (your account)
+zc-dashboard-section-summary = Summary (UTC)
+zc-dashboard-section-by-period = By Period (your account, UTC)
 zc-dashboard-section-org = Organization (billed)
 zc-dashboard-period-today = Today
 zc-dashboard-period-month = Month
@@ -610,6 +611,15 @@ zc-config-skills-help-blurb = Skills in this bundle. { $enter_chord } to edit SK
 zc-config-field-type-prefix = Type:
 zc-config-field-type-secret-suffix = (secret — input hidden)
 zc-config-field-type-string-array-suffix = (one entry per line; { $newline_chord }=new line, { $save_chord }=save)
+
+# Secret key/value maps (MCP env/headers, provider extra_headers, …)
+zc-config-secret-map-add = [+ Add entry]
+zc-config-secret-map-key-prompt = New entry name (e.g. API_TOKEN), then Enter
+zc-config-secret-map-value-prompt = Value for { $key } (secret — input hidden), then Enter
+zc-config-secret-map-key-empty = Entry name cannot be empty
+zc-config-secret-map-key-invalid = Entry name cannot contain spaces, control characters, or "="
+zc-config-secret-map-value-empty = Value cannot be empty — to remove an entry, select its row and delete it
+zc-config-secret-map-delete-hint = Select an entry row below to delete it; this row only adds entries
 
 zc-config-help-navigate = Navigate
 zc-config-help-switch-section = Switch config section

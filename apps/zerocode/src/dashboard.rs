@@ -2759,17 +2759,20 @@ fn format_tokens(tokens: u64) -> String {
     }
 }
 
-/// `(label, from, to)` RFC3339 windows for day / month / quarter / YTD in local
-/// time, period-to-date. Matches the conventional CLI report windows so the
-/// dashboard and CLI agree on what each period means. The daemon parses these
-/// bounds and converts to UTC.
+/// `(label, from, to)` RFC3339 windows for day / month / quarter / YTD,
+/// period-to-date, in UTC. UTC on purpose: the daemon's cost tracker buckets
+/// the Summary's Daily / Monthly totals and enforces `daily_limit_usd` /
+/// `monthly_limit_usd` on UTC days and months, so local-midnight windows here
+/// would show a different "today" on the same screen.
 fn cost_period_windows() -> Vec<(String, String, String)> {
-    use chrono::{Datelike, Local, TimeZone};
-    let now = Local::now();
+    cost_period_windows_at(chrono::Utc::now())
+}
+
+fn cost_period_windows_at(now: chrono::DateTime<chrono::Utc>) -> Vec<(String, String, String)> {
+    use chrono::{Datelike, TimeZone, Utc};
     let to = now.to_rfc3339();
     let start = |month: u32, day: u32| -> String {
-        Local
-            .with_ymd_and_hms(now.year(), month, day, 0, 0, 0)
+        Utc.with_ymd_and_hms(now.year(), month, day, 0, 0, 0)
             .single()
             .unwrap_or(now)
             .to_rfc3339()
@@ -3301,6 +3304,33 @@ fn format_bytes(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cost_period_windows_start_at_utc_midnight_like_the_tracker() {
+        use chrono::TimeZone;
+        // 2026-10-13 01:24Z is 09:24 at UTC+8: local "today" would start at
+        // 2026-10-12T16:00Z and disagree with the tracker's UTC day.
+        let now = chrono::Utc
+            .with_ymd_and_hms(2026, 10, 13, 1, 24, 0)
+            .unwrap();
+        let windows = cost_period_windows_at(now);
+        let starts: Vec<&str> = windows.iter().map(|(_, from, _)| from.as_str()).collect();
+        assert_eq!(
+            starts,
+            [
+                "2026-10-13T00:00:00+00:00",
+                "2026-10-01T00:00:00+00:00",
+                "2026-10-01T00:00:00+00:00",
+                "2026-01-01T00:00:00+00:00",
+            ]
+        );
+        assert!(
+            windows
+                .iter()
+                .all(|(_, _, to)| to == "2026-10-13T01:24:00+00:00")
+        );
+        assert!(windows[2].0.ends_with('4'), "{}", windows[2].0);
+    }
 
     #[tokio::test]
     async fn disconnect_invalidation_drops_daemon_data() {
