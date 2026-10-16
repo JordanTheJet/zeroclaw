@@ -3305,7 +3305,18 @@ impl DelegateTool {
         let max_delegation_depth = self.max_delegation_depth;
         let background_task_management = self.background_task_management;
         let operator_approval_available = self.operator_approval_available;
-        let parent_tools = Arc::clone(&self.parent_tools);
+        // The rebuilt worker runs as the target (`security` above), so its
+        // bounded assembly cannot apply this caller's name filter itself.
+        // Hand it only the inherited tools this caller may use: the filter
+        // the synchronous path applies with the caller's own policy.
+        let parent_tools = Arc::new(RwLock::new(
+            self.parent_tools
+                .read()
+                .iter()
+                .filter(|tool| self.security.is_tool_allowed(tool.name()))
+                .cloned()
+                .collect::<Vec<_>>(),
+        ));
         let runtime = self.runtime.clone();
         let multimodal_config = self.multimodal_config.clone();
         let delegate_config = self.delegate_config.clone();
@@ -10613,7 +10624,8 @@ mod tests {
                 delegation_policy: DelegationPolicy {
                     mode: DelegationMode::Allow,
                 },
-                allowed_tools: vec![DelegateTool::NAME.to_string()],
+                // The bounded child inherits only what its caller holds.
+                allowed_tools: vec![DelegateTool::NAME.to_string(), "echo_tool".to_string()],
                 ..RiskProfileConfig::default()
             },
         );
@@ -10952,7 +10964,8 @@ mod tests {
                 delegation_policy: DelegationPolicy {
                     mode: DelegationMode::Allow,
                 },
-                allowed_tools: vec![DelegateTool::NAME.to_string()],
+                // The bounded child inherits only what its caller holds.
+                allowed_tools: vec![DelegateTool::NAME.to_string(), "gate_tool".to_string()],
                 ..RiskProfileConfig::default()
             },
         );
@@ -18518,6 +18531,222 @@ command = "rm independent-delegate-marker"
         fn alias(&self) -> &str {
             "ToolListInspector"
         }
+    }
+
+    /// A bounded child never holds a tool its caller is denied by name, in
+    /// either execution mode. The caller allows only `delegate` and the
+    /// target also allows `file_read`; the real factory, scoped caller
+    /// registry and builtin stack run, and the scripted provider records
+    /// what the child was offered and what its `file_read` calls returned.
+    #[tokio::test]
+    async fn bounded_background_delegate_applies_caller_tool_name_filter() {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            for background in [false, true] {
+                let temp = TempDir::new().unwrap();
+                let outside = temp.path().join("outside-caller.txt");
+                std::fs::write(&outside, "outside-caller-text").unwrap();
+                let (server, captured) = start_scripted_chat_server(&[
+                    chat_completion_tool_call(
+                        "file_read",
+                        "call_inside",
+                        json!({"path": "caller-name-filter.txt"}),
+                    ),
+                    chat_completion_tool_call(
+                        "file_read",
+                        "call_outside",
+                        json!({"path": outside.to_str().unwrap()}),
+                    ),
+                    json!({"choices": [{"message": {"content": "child finished"}}]}),
+                ])
+                .await;
+                let mut config = bounded_depth_matrix_fixture(
+                    &temp,
+                    &server.uri,
+                    &[("caller", &["target"], "loop"), ("target", &[], "loop")],
+                    &[("loop", 3, 100)],
+                );
+                {
+                    let config = Arc::get_mut(&mut config).unwrap();
+                    for alias in ["caller", "target"] {
+                        let profile = config.risk_profiles.get_mut(alias).unwrap();
+                        profile.level = zeroclaw_config::autonomy::AutonomyLevel::Full;
+                        profile.allowed_tools = vec![DelegateTool::NAME.to_string()];
+                        profile.auto_approve = vec![DelegateTool::NAME.to_string()];
+                    }
+                    config
+                        .risk_profiles
+                        .get_mut("target")
+                        .unwrap()
+                        .allowed_tools
+                        .push("file_read".to_string());
+                    config.plugins.enabled = false;
+                }
+                let caller = Arc::new(SecurityPolicy::for_agent(&config, "caller").unwrap());
+                assert!(caller.is_tool_allowed(DelegateTool::NAME));
+                assert!(!caller.is_tool_allowed("file_read"));
+                let canary = "caller-workspace-name-filter-canary";
+                std::fs::write(caller.workspace_dir.join("caller-name-filter.txt"), canary)
+                    .unwrap();
+                let memory: Arc<dyn zeroclaw_api::memory_traits::Memory> =
+                    Arc::new(zeroclaw_memory::none::NoneMemory::new("caller"));
+                let runtime: Arc<dyn crate::platform::RuntimeAdapter> =
+                    Arc::new(crate::platform::NativeRuntime::new());
+                let built = crate::tools::all_tools_with_runtime(
+                    Arc::clone(&config),
+                    &caller,
+                    config.risk_profiles.get("caller").unwrap(),
+                    "caller",
+                    Arc::clone(&runtime),
+                    memory,
+                    None,
+                    None,
+                    &config.browser,
+                    &config.http_request,
+                    &config.web_fetch,
+                    &caller.workspace_dir,
+                    &config.agents,
+                    None,
+                    &config,
+                    None,
+                    false,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap();
+                let delegate = Arc::clone(built.delegate_tool.as_ref().unwrap());
+                assert!(
+                    delegate
+                        .task_control_plane
+                        .set(task_control_plane(Arc::new(
+                            SqliteTaskStore::new_in_memory().unwrap(),
+                        )))
+                        .is_ok()
+                );
+                let scoped = crate::tools::scoped::ScopedToolRegistry::assemble(
+                    crate::tools::scoped::ScopedAssembly {
+                        config: &config,
+                        agent_alias: "caller",
+                        security: &caller,
+                        built,
+                        skills: &[],
+                        runtime,
+                        caller_allowed: None,
+                        connect_mcp: false,
+                        connect_peripherals: false,
+                        exclude_memory: false,
+                        acp_delivery: false,
+                        list_deferred_mcp_specs: false,
+                        emit_assembly_logs: false,
+                        mcp_registry: None,
+                    },
+                )
+                .await;
+                // The caller's own registry is name-filtered, the target's
+                // policy admits `file_read`, and the inherited source still
+                // holds the builtin: only the caller filter can drop it.
+                assert!(
+                    scoped
+                        .registry
+                        .iter()
+                        .any(|tool| tool.name() == DelegateTool::NAME)
+                );
+                assert!(
+                    !scoped
+                        .registry
+                        .iter()
+                        .any(|tool| tool.name() == "file_read")
+                );
+                assert!(
+                    delegate
+                        .policy_for_target("target")
+                        .unwrap()
+                        .is_tool_allowed("file_read")
+                );
+                assert!(
+                    delegate
+                        .parent_tools
+                        .read()
+                        .iter()
+                        .any(|tool| tool.name() == "file_read")
+                );
+
+                let result = delegate
+                    .execute(json!({
+                        "agent": "target",
+                        "prompt": "read the files",
+                        "background": background,
+                    }))
+                    .await
+                    .unwrap();
+                assert!(result.success, "background={background}: {result:?}");
+                if background {
+                    let task_id = result
+                        .output
+                        .lines()
+                        .find_map(|line| line.strip_prefix("task_id: "))
+                        .unwrap();
+                    let terminal = wait_for_terminal_background_result(&delegate, task_id).await;
+                    assert_eq!(
+                        terminal.status,
+                        BackgroundTaskStatus::Completed,
+                        "{terminal:?}"
+                    );
+                }
+                server._task.abort();
+                assert!(server._task.await.unwrap_err().is_cancelled());
+
+                let bodies = captured.lock().unwrap().clone();
+                assert_eq!(bodies.len(), 3, "background={background}: {bodies:?}");
+                let requests: Vec<serde_json::Value> = bodies
+                    .iter()
+                    .map(|body| {
+                        serde_json::from_str(body.split_once("\r\n\r\n").unwrap().1).unwrap()
+                    })
+                    .collect();
+                let names: Vec<&str> = requests[0]["tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|tool| tool["function"]["name"].as_str().unwrap())
+                    .collect();
+                assert_eq!(
+                    names,
+                    [DelegateTool::NAME],
+                    "background={background}: child offered a caller-denied tool"
+                );
+                let outputs: Vec<String> = requests[1..]
+                    .iter()
+                    .map(|request| {
+                        let message = request["messages"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .rev()
+                            .find(|message| message["role"] == "tool")
+                            .unwrap();
+                        decoded_tool_message(message["content"].as_str().unwrap())
+                    })
+                    .collect();
+                for output in &outputs {
+                    assert!(
+                        output.contains("Unknown tool: file_read"),
+                        "background={background}: {outputs:?}"
+                    );
+                    assert!(
+                        !output.contains(canary),
+                        "background={background}: {outputs:?}"
+                    );
+                    assert!(
+                        !output.contains("outside-caller-text"),
+                        "background={background}: {outputs:?}"
+                    );
+                }
+            }
+        })
+        .await
+        .expect("both bounded delegations must finish within thirty seconds");
     }
 
     #[tokio::test]
