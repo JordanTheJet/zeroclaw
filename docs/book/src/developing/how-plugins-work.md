@@ -112,16 +112,19 @@ one twice:
    only by instantiating the component to read its metadata. A plugin whose
    tool name matches an already registered tool is not registered. The host
    logs a `WARN` event with `error_key` `plugin_tool_name_conflict` in its
-   `attributes`.
+   `attributes`. A tool name that contains `__` is refused even when nothing
+   holds it yet, because MCP tools are named `<server>__<tool>` and register
+   after plugin tools. That refusal carries `error_key`
+   `plugin_tool_name_reserved`.
 
 The names checked are the tools that registry build has already registered,
 including plugin tools accepted earlier in the same pass, plus
 `execute_pipeline` when `[pipeline] enabled = true`. This is not a fixed list
 of every built-in name: a built-in that a build does not register, for example
-because its config section is disabled, is not reserved in that build. Tools
-that join the registry after plugin registration are outside this check. Give
-plugin packages and tools names that are unique outright rather than relying
-on it.
+because its config section is disabled, is not reserved in that build. Apart
+from the MCP namespace, tools that join the registry after plugin registration
+are outside this check. Give plugin packages and tools names that are unique
+outright rather than relying on it.
 
 ## Capabilities and permissions
 
