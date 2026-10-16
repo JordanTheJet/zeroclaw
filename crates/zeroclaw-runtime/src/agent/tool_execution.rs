@@ -16,6 +16,30 @@ use zeroclaw_api::attribution::Attributable;
 use super::loop_::{ParsedToolCall, ToolLoopCancelled, is_tool_loop_cancelled, scrub_credentials};
 use super::turn::{ModelSwitchCallback, TurnMeta, scope_model_switch_state};
 
+tokio::task_local! {
+    /// The running turn's cancellation token, scoped around each tool's
+    /// `execute`. A tool that starts work its own future does not own (the
+    /// delegate fan-out spawns children) reads it to bind that work to the
+    /// turn, so aborting the turn reaches what the turn started.
+    static TURN_CANCELLATION: CancellationToken;
+}
+
+/// The cancellation token of the turn executing the current tool, when a
+/// turn is executing one. `None` outside a tool execution or when the turn
+/// runs without a token.
+pub(crate) fn current_turn_cancellation() -> Option<CancellationToken> {
+    TURN_CANCELLATION.try_with(Clone::clone).ok()
+}
+
+/// Scope `future` as running under `token`'s turn, so tools it executes see
+/// it through [`current_turn_cancellation`].
+pub(crate) async fn scope_turn_cancellation<F: std::future::Future>(
+    token: CancellationToken,
+    future: F,
+) -> F::Output {
+    TURN_CANCELLATION.scope(token, future).await
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────────
 
 /// If a just-completed tool call was a successful `TodoWrite`, build the
@@ -105,6 +129,7 @@ fn unavailable_tool_outcome(
         duration,
         receipt: None,
         output_data: None,
+        attachments: Vec::new(),
     }
 }
 
@@ -116,6 +141,10 @@ pub struct ToolExecutionOutcome {
     /// fold a tool's detailed error body (which can reflect a token or signed
     /// URL) into this text and credential-scrub it before storing it here.
     pub output: String,
+    /// Attachments the tool declared for this result (`ToolOutput::attachments`).
+    /// They reach history through the carrier grammar and are never recovered
+    /// by scanning `output`.
+    pub attachments: Vec<zeroclaw_api::media::RenderedMarker>,
     /// Structured output when the tool declared one (`ToolOutput::data`).
     /// Feeds SOP step capture and data-flow surfaces; the LLM sees only
     /// `output`. Stored raw — consumers scrub at their own rendering boundary.
@@ -223,6 +252,7 @@ pub(crate) async fn execute_one_tool(
             duration,
             receipt: None,
             output_data: None,
+            attachments: Vec::new(),
         });
     };
 
@@ -286,7 +316,7 @@ pub(crate) async fn execute_one_tool(
         if let Some(token) = cancellation_token {
             tokio::select! {
                 () = token.cancelled() => Err::<_, anyhow::Error>(ToolLoopCancelled.into()),
-                result = tool_future => Ok(result),
+                result = scope_turn_cancellation(token.clone(), tool_future) => Ok(result),
             }
         } else {
             Ok(tool_future.await)
@@ -361,6 +391,7 @@ pub(crate) async fn execute_one_tool(
                     });
                     Ok(ToolExecutionOutcome {
                         output: normalized_output.to_string(),
+                        attachments: r.output.attachments().to_vec(),
                         output_data: r.output.into_data(),
                         success: true,
                         error_reason: None,
@@ -378,6 +409,7 @@ pub(crate) async fn execute_one_tool(
                     // it. Tools that already put everything into `error` and
                     // leave `output` empty (the common case) are unaffected.
                     let output_text = r.output.as_str().to_string();
+                    let attachments = r.output.attachments().to_vec();
                     let output_data = r.output.into_data();
                     let reason = r.error.unwrap_or_else(|| output_text.clone());
                     let full_output = if !output_text.is_empty() && output_text != reason {
@@ -414,6 +446,7 @@ pub(crate) async fn execute_one_tool(
                         error_reason: Some(reason),
                         duration,
                         receipt: None,
+                        attachments,
                         output_data,
                     })
                 }
@@ -460,6 +493,7 @@ pub(crate) async fn execute_one_tool(
                     duration,
                     receipt: None,
                     output_data: None,
+                    attachments: Vec::new(),
                 })
             }
         }
@@ -2174,6 +2208,7 @@ mod tests {
     async fn failed_tool_credential_is_scrubbed_in_provider_history() {
         use crate::agent::loop_detector::{LoopDetector, LoopDetectorConfig};
         use crate::agent::turn::history_append::append_tool_round_to_history;
+        use crate::agent::turn::results_collect::ToolRoundResult;
         use crate::agent::turn::results_collect::collect_tool_results;
         use std::collections::HashSet;
         use zeroclaw_providers::ChatMessage;
@@ -2242,10 +2277,11 @@ mod tests {
             "prompt-mode <tool_result> block must be scrubbed: {}",
             collected.tool_results
         );
-        for (_, result) in &collected.individual_results {
+        for result in &collected.individual_results {
             assert!(
-                !result.contains(secret) && result.contains("[REDACTED]"),
-                "native role=tool content must be scrubbed: {result}"
+                !result.output.contains(secret) && result.output.contains("[REDACTED]"),
+                "native role=tool content must be scrubbed: {}",
+                result.output
             );
         }
 
@@ -2270,7 +2306,11 @@ mod tests {
             "the native tool-result message must carry the scrubbed body"
         );
 
-        let prompt_results = vec![(None, collected.individual_results[0].1.clone())];
+        let prompt_results = vec![ToolRoundResult {
+            tool_call_id: None,
+            output: collected.individual_results[0].output.clone(),
+            attachments: Vec::new(),
+        }];
         let mut prompt_history: Vec<ChatMessage> = Vec::new();
         append_tool_round_to_history(
             &mut prompt_history,
@@ -2558,5 +2598,92 @@ mod tests {
                 _ => panic!("expected an empty Plan event (clear)"),
             }
         }
+    }
+
+    struct TurnTokenProbe {
+        saw_turn_token: Arc<Mutex<Option<bool>>>,
+    }
+
+    impl zeroclaw_api::attribution::Attributable for TurnTokenProbe {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::System
+        }
+        fn alias(&self) -> &str {
+            "test-turn-token-probe"
+        }
+    }
+
+    #[async_trait]
+    impl Tool for TurnTokenProbe {
+        fn name(&self) -> &str {
+            "turn_token_probe"
+        }
+
+        fn description(&self) -> &str {
+            "Records whether the running turn's cancellation token is visible"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}, "required": []})
+        }
+
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            *self.saw_turn_token.lock().unwrap() =
+                Some(super::current_turn_cancellation().is_some());
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: crate::tools::ToolOutput::from("probed"),
+                error: None,
+            })
+        }
+    }
+
+    async fn probe_turn_token(token: Option<&tokio_util::sync::CancellationToken>) -> bool {
+        let saw = Arc::new(Mutex::new(None));
+        let probe: Box<dyn Tool> = Box::new(TurnTokenProbe {
+            saw_turn_token: Arc::clone(&saw),
+        });
+        let registry = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![probe]);
+        let meta = crate::agent::turn::TurnMeta {
+            parent_agent_alias: None,
+            agent_alias: None,
+            turn_id: "test-turn-id",
+            channel_name: "test",
+        };
+        let outcome = execute_one_tool(
+            "turn_token_probe",
+            serde_json::json!({}),
+            None,
+            ToolDispatchContext {
+                tools_registry: &registry,
+                activated_tools: None,
+                excluded_tools: &[],
+                model_switch_callback: None,
+            },
+            &meta,
+            &NoopObserver,
+            token,
+            None,
+            None,
+        )
+        .await
+        .expect("probe executes");
+        assert!(outcome.success);
+        let seen = saw.lock().unwrap();
+        seen.expect("the probe ran")
+    }
+
+    #[tokio::test]
+    async fn tools_see_the_running_turn_token_only_while_the_turn_runs_with_one() {
+        let token = tokio_util::sync::CancellationToken::new();
+        assert!(probe_turn_token(Some(&token)).await);
+        assert!(!probe_turn_token(None).await);
+        assert!(
+            super::current_turn_cancellation().is_none(),
+            "the token must not leak past the tool execution"
+        );
     }
 }

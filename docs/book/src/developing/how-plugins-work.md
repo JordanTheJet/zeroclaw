@@ -48,9 +48,17 @@ one.
 5. **Admit executable bytes.** The host opens the confined component once,
    verifies any declared `wasm_sha256`, and retains those exact bytes. In
    `strict` mode the signed manifest must declare this digest. Adapters compile
-   the admitted buffer rather than reopening its path. This is an execution
-   identity guarantee for the retained bytes, not a claim of race-free
-   filesystem namespace resolution.
+   the admitted buffer rather than reopening its path. On Unix the host opens
+   the package directory once and reaches the component from that handle one
+   path component at a time, never following a symlink, so moving or replacing
+   a directory during admission either fails it or leaves the read inside the
+   package that was confined. The component must be a regular file, and a FIFO
+   or device fails at once instead of blocking. The package directory and the
+   manifest are still found by pathname when admission starts; in `strict`
+   mode the signed `wasm_sha256` is what binds the manifest to the bytes. Other
+   platforms keep pathname checks, which refuse a replacement still in place
+   when they run but do not make the lookup atomic or keep a FIFO from blocking
+   the open.
 6. **Register tools.** Surviving tool plugins are wrapped as agent tools and
    appended after the built-ins. A plugin whose package name or tool name
    conflicts with an already registered tool is refused with a warning instead
@@ -59,8 +67,8 @@ one.
    enumeration happens only when `[plugins] auto_discover = true` (default
    `false`, fail-closed): with `enabled = true` but `auto_discover = false`, no
    plugin tools or skills load, though channels you declare under
-   `[channels.plugin.<alias>]` still activate. The skill loader applies the same
-   `auto_discover` gate.
+   `[channels.plugin.<alias>]`, by hand or with `zeroclaw plugin bind`, still
+   activate. The skill loader applies the same `auto_discover` gate.
 
 The signature stage is the one most easily misconfigured, so it is worth
 understanding on its own.
@@ -246,6 +254,17 @@ it is `false` by default, so `enabled = true` alone activates only the channels
 you declare under `[channels.plugin.<alias>]` and no plugin tools or skills. A
 host that runs only plugins you build yourself can leave `signature_mode` at its
 `disabled` default during development and tighten it before the host is shared.
+
+A channel binding lives outside `plugins.*`, under `[channels.plugin.<alias>]`.
+You can write that table by hand, or let `zeroclaw plugin bind <package>
+--channel-alias <alias>` write it for an installed channel package. The command
+also seeds the instance's `[[plugins.entries]]` row, requires an explicit
+`--egress declared` or `--egress none` flag before it creates that row from a
+manifest that declares destinations and holds a transport that can reach them
+(`http_client`, `websocket_client`, or `socket_client`), and reports what the
+instance still needs before it can start. It never sets `plugins.enabled` and
+never edits an agent's `channels`. See
+[Binding a channel instance](../plugins/index.md#binding-a-channel-instance).
 
 ## What a plugin still cannot do
 

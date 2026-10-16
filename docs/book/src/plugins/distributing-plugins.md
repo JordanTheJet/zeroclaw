@@ -45,15 +45,61 @@ The signature is base64url (no padding); the public key is hex-encoded. The
 crate exposes the full toolchain (`signature.rs`): `generate_signing_key`
 produces a PKCS#8 keypair and its hex public key, `sign_manifest` produces
 the base64url signature over the canonical bytes, and `public_key_hex`
-recovers the public key from a stored private key. There is no CLI wrapper
-for signing today; publishers drive these functions from a short Rust helper
-in their release pipeline.
+recovers the public key from a stored private key. `sign_manifest_document`
+does both steps and returns the signed manifest with the two root fields
+already in place. There is no `zeroclaw plugin sign` command; publishers call
+these functions from their release pipeline. The crate ships a ready-made
+helper, `crates/zeroclaw-plugins/examples/sign_manifest.rs`. Run it from a
+ZeroClaw checkout with paths into your plugin's directory, and keep the private
+key outside both trees. Use a new, separate package directory and a new archive
+path for each release;
+the helper creates it when it writes the signed manifest:
+
+```bash
+cargo run -p zeroclaw-plugins --example sign_manifest -- keygen ~/.keys/my-plugin.pk8
+cargo run -p zeroclaw-plugins --example sign_manifest -- \
+    sign path/to/my-plugin/manifest.toml path/to/my-plugin-package/manifest.toml \
+    --key ~/.keys/my-plugin.pk8 --payload path/to/my-plugin/my-plugin.wasm
+cp path/to/my-plugin/my-plugin.wasm path/to/my-plugin-package/my-plugin.wasm
+(cd path/to/my-plugin-package && zip -r ../my-plugin.zip .)
+```
+
+This recipe assumes `wasm_path = "my-plugin.wasm"`. `--payload` hashes the
+component but does not copy it. Copy those exact bytes, and any other required
+assets, to the paths the manifest declares relative to the package directory
+before making the zip. Archive only that directory, containing the signed
+`manifest.toml`; do not include the unsigned source manifest or edit the signed
+manifest after signing.
+
+`keygen` writes a new private key, creating its directory when needed
+(readable by the owner only on Unix), refuses to overwrite an existing file,
+and prints the hex public key. `sign` records the component's SHA-256 in
+`wasm_sha256` when `--payload` is given, signs, checks the signature with the
+host's verifier, writes the signed manifest, and prints the same public key.
+For a manifest that declares `wasm_path`, it warns when no `wasm_sha256` is
+recorded, because strict mode refuses such a package. A manifest without
+`wasm_path`, such as a skill bundle, takes no `--payload`: the host rejects a
+digest there.
+
+On Windows the key file inherits its directory's ACL. Keep the private key
+in a directory that only the publisher can read.
 
 The signed manifest then carries two extra **root** fields: `signature` (the
 base64url value) and `publisher_key` (your hex public key). Put both before the
 first table header, including `[config_schema]`; appending them after a table
 header makes them members of that table under TOML rules and the host will see
 an unsigned manifest.
+
+If you embed the fields by hand after signing, place them directly after
+another root field. The host's TOML editor attaches a blank line or comment to
+the entry or table header below it. If the fields land directly under a blank line or comment
+that was already in the manifest you signed, verification removes that line
+together with the fields, the remaining bytes no longer match what you signed,
+and strict mode rejects the package. A blank line or comment you add directly
+above the fields is removed together with them and is harmless. Anything you
+add below them attaches to the next entry or table header and changes the
+signed bytes, so add nothing there. `sign_manifest_document` and the helper place the fields before
+they sign, so the question does not arise.
 
 ```toml
 name = "my-plugin"
@@ -114,7 +160,10 @@ environment variable, resolved in that order per `registry_url` in
 A registry entry (`PluginRegistryEntry` in
 `crates/zeroclaw-plugins/src/registry.rs`) carries: `name`, `version`,
 optional `description` and `author`, `capabilities`, the archive `url`, and
-an optional `sha256` digest of the zip.
+an optional `sha256` digest of the zip. The digest is optional only for
+`zeroclaw plugin install`, which verifies it when it is present: the Plugins
+step of `zeroclaw quickstart` refuses an entry without one, so publish a digest
+for every entry.
 
 ### The archive contract
 
@@ -162,7 +211,7 @@ accordingly: assume everything before install is untrusted transport.
    `SKILL.md` (discovery enforces `name` and `description`).
 3. Sign: generate or load your Ed25519 key, sign the canonical manifest
    bytes, embed `signature` and `publisher_key`.
-4. Zip the plugin directory (one manifest, no path tricks, under {{#include ../_snippets/plugin-archive-max-mib.md}} MiB).
+4. Zip the assembled package directory (one signed manifest, its referenced component and required assets, no path tricks, under {{#include ../_snippets/plugin-archive-max-mib.md}} MiB).
 5. Compute the zip's SHA-256 and publish the registry entry with the digest.
 6. Publish your public key hex somewhere operators can verify independently
    of the registry (your repository, your site). The key, not the registry,

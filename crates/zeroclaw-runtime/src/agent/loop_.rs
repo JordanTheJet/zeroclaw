@@ -254,8 +254,7 @@ pub use super::cost::{
 
 // History management moved to `super::history`.
 pub use super::history::{
-    append_or_merge_system_message, canonicalize_tool_result_media_markers,
-    estimate_history_tokens, load_interactive_session_history,
+    append_or_merge_system_message, estimate_history_tokens, load_interactive_session_history,
     load_interactive_session_history_with_crumb, normalize_system_messages,
     save_interactive_session_history, save_interactive_session_history_with_crumb, trim_history,
     truncate_tool_result,
@@ -617,7 +616,7 @@ where
     TOOL_LOOP_THREAD_ID.scope(thread_id, future).await
 }
 
-/// Run a future with the session key set in task-local storage.
+/// Run a future with the session key in task-local storage and log attribution.
 /// The scope wraps the entire agent turn, so all tools invoked during
 /// the turn (including nested calls) see the same session key.
 /// SessionsCurrentTool reads this to identify the active session.
@@ -625,7 +624,13 @@ pub async fn scope_session_key<F>(session_key: Option<String>, future: F) -> F::
 where
     F: std::future::Future,
 {
-    TOOL_LOOP_SESSION_KEY.scope(session_key, future).await
+    match session_key {
+        Some(key) => {
+            let future = ::zeroclaw_log::scope!(session_key: key.as_str() => future);
+            TOOL_LOOP_SESSION_KEY.scope(Some(key), future).await
+        }
+        None => TOOL_LOOP_SESSION_KEY.scope(None, future).await,
+    }
 }
 
 pub(crate) fn compute_excluded_mcp_tools(
@@ -803,14 +808,43 @@ pub(crate) fn build_system_prompt_for_turn(
         activated_tools,
     )?;
     let excluded_tool_names: HashSet<&str> = excluded_tools.iter().map(String::as_str).collect();
+    let builtin_discovery = activated_tools.filter(|_| {
+        !excluded_tool_names.contains("tool_search")
+            && tools_registry
+                .iter()
+                .any(|tool| tool.name() == "tool_search")
+    });
+    let hidden_builtin_names = builtin_discovery.map_or_else(HashSet::new, |state| {
+        state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .hidden_builtin_names()
+    });
     let effective_tool_names: HashSet<&str> = tools_registry
         .iter()
         .map(|tool| tool.name())
         .filter(|name| !excluded_tool_names.contains(*name))
         .collect();
+    let prompt_tool_names: HashSet<&str> = effective_tool_names
+        .iter()
+        .copied()
+        .filter(|name| !hidden_builtin_names.contains(*name))
+        .collect();
     let mut turn_tool_descs = tool_descs.to_vec();
-    turn_tool_descs.retain(|(name, _)| effective_tool_names.contains(name));
+    turn_tool_descs.retain(|(name, _)| prompt_tool_names.contains(name));
     let mut turn_deferred_section = deferred_section.to_string();
+    if let Some(state) = builtin_discovery {
+        let section = state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .deferred_builtin_prompt_section_filtered(|name| effective_tool_names.contains(name));
+        if !section.is_empty() {
+            if !turn_deferred_section.is_empty() {
+                turn_deferred_section.push_str("\n\n");
+            }
+            turn_deferred_section.push_str(&section);
+        }
+    }
     let expose_text_tool_protocol = apply_text_tool_prompt_policy(
         native_tools,
         strict_tool_parsing,
@@ -823,7 +857,7 @@ pub(crate) fn build_system_prompt_for_turn(
             agent_workspace,
             model_name,
             &turn_tool_descs,
-            |name| skill_tools_protocol_exposed && effective_tool_names.contains(name),
+            |name| skill_tools_protocol_exposed && prompt_tool_names.contains(name),
             skills,
             identity_config,
             bootstrap_max_chars,
@@ -840,7 +874,7 @@ pub(crate) fn build_system_prompt_for_turn(
     if expose_text_tool_protocol {
         system_prompt.push_str(&build_tool_instructions_for_names(
             tools_registry,
-            &effective_tool_names,
+            &prompt_tool_names,
         ));
     }
     if !turn_deferred_section.is_empty() {
@@ -2513,6 +2547,8 @@ pub async fn run(
                 } else {
                     (vec![ChatMessage::system(&system_prompt)], false)
                 };
+            let mut image_cache = zeroclaw_providers::multimodal::LocalImageCache::new();
+            let mut provider_image_state = crate::agent::turn::ProviderImageState::default();
 
             loop {
                 print!("> ");
@@ -2578,6 +2614,8 @@ pub async fn run(
 
                         history.clear();
                         history.push(ChatMessage::system(&system_prompt));
+                        image_cache = zeroclaw_providers::multimodal::LocalImageCache::new();
+                        provider_image_state = crate::agent::turn::ProviderImageState::default();
                         history_has_trim_breadcrumb = false;
                         // Clear conversation and daily memory
                         let mut cleared = 0;
@@ -2900,7 +2938,10 @@ pub async fn run(
                                     event_tx: None,
                                     steering: None,
                                     new_messages_out: None,
-                                    image_cache: None,
+                                    image_cache: Some(crate::agent::turn::ToolLoopImageState {
+                                        cache: &mut image_cache,
+                                        provider_state: &mut provider_image_state,
+                                    }),
                                     // Origin is threaded from the entry point;
                                     // source/transport/trust stay phase-1
                                     // placeholders until per-transport stamping.
@@ -3330,7 +3371,7 @@ pub(crate) async fn process_message_shared_with_admission(
 
 pub(crate) async fn process_message_shared_with_live_config_and_admission(
     config: Arc<Config>,
-    live_config: Option<Arc<parking_lot::RwLock<Config>>>,
+    live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
     agent_alias: &str,
     message: &str,
     session_id: Option<&str>,
@@ -3352,7 +3393,7 @@ pub(crate) async fn process_message_shared_with_live_config_and_admission(
 
 pub(crate) async fn process_message_shared_with_live_config_and_admission_and_principal(
     config: Arc<Config>,
-    live_config: Option<Arc<parking_lot::RwLock<Config>>>,
+    live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
     agent_alias: &str,
     message: &str,
     session_id: Option<&str>,
@@ -3377,7 +3418,7 @@ pub(crate) async fn process_message_shared_with_live_config_and_admission_and_pr
 /// source for tools that resolve security policy at execution time.
 pub async fn process_message_with_live_config(
     config: Config,
-    live_config: Arc<parking_lot::RwLock<Config>>,
+    live_config: zeroclaw_config::live::LiveConfigHandle,
     agent_alias: &str,
     message: &str,
     session_id: Option<&str>,
@@ -3397,7 +3438,7 @@ pub async fn process_message_with_live_config(
 
 pub async fn process_message_with_live_config_and_admission(
     config: Config,
-    live_config: Arc<parking_lot::RwLock<Config>>,
+    live_config: zeroclaw_config::live::LiveConfigHandle,
     agent_alias: &str,
     message: &str,
     session_id: Option<&str>,
@@ -3419,7 +3460,7 @@ pub async fn process_message_with_live_config_and_admission(
 
 async fn process_message_inner(
     mut config: Arc<Config>,
-    live_config: Option<Arc<parking_lot::RwLock<Config>>>,
+    live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
     agent_alias: &str,
     message: &str,
     session_id: Option<&str>,
@@ -3789,7 +3830,31 @@ async fn process_message_inner(
             .map(|tool| tool.name())
             .filter(|name| !excluded_tools.iter().any(|ex| ex == *name))
             .collect();
-        tool_descs.retain(|(name, _)| effective_tool_names.contains(name));
+        let builtin_discovery = activated_handle_pm
+            .as_ref()
+            .filter(|_| effective_tool_names.contains("tool_search"));
+        let hidden_builtin_names = builtin_discovery.map_or_else(HashSet::new, |state| {
+            state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .hidden_builtin_names()
+        });
+        let prompt_tool_names: HashSet<&str> = effective_tool_names
+            .iter()
+            .copied()
+            .filter(|name| !hidden_builtin_names.contains(*name))
+            .collect();
+        tool_descs.retain(|(name, _)| prompt_tool_names.contains(name));
+        if let Some(state) = builtin_discovery {
+            deferred_section.push_str(
+                &state
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .deferred_builtin_prompt_section_filtered(|name| {
+                        effective_tool_names.contains(name)
+                    }),
+            );
+        }
 
         let bootstrap_max_chars = if eff_compact_context {
             Some(crate::agent::system_prompt::COMPACT_BOOTSTRAP_MAX_CHARS)
@@ -3819,7 +3884,7 @@ async fn process_message_inner(
                 &agent_workspace,
                 &model_name,
                 &tool_descs,
-                |name| skill_tools_protocol_exposed && effective_tool_names.contains(name),
+                |name| skill_tools_protocol_exposed && prompt_tool_names.contains(name),
                 &skills,
                 Some(&agent.identity),
                 bootstrap_max_chars,
@@ -3835,7 +3900,7 @@ async fn process_message_inner(
         if expose_text_tool_protocol {
             system_prompt.push_str(&build_tool_instructions_for_names(
                 &tools_registry,
-                &effective_tool_names,
+                &prompt_tool_names,
             ));
         }
         if !deferred_section.is_empty() {
@@ -5335,6 +5400,103 @@ mod tests {
         }
     }
 
+    /// Streams the same fixed text on every call and counts the calls, so a
+    /// test can pin exactly how many provider attempts a turn spent. Unlike
+    /// [`StreamingScriptedModelProvider`] it advertises streaming tool
+    /// events, which keeps the live-stream path active while tools are
+    /// registered. From the second call on, `repeat_suffix` is appended, so
+    /// a test can vary only trailing whitespace between attempts.
+    struct RepeatedStreamTextProvider {
+        text: String,
+        repeat_suffix: String,
+        stream_calls: Arc<AtomicUsize>,
+    }
+
+    impl RepeatedStreamTextProvider {
+        fn new(text: String) -> Self {
+            Self {
+                text,
+                repeat_suffix: String::new(),
+                stream_calls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn with_repeat_suffix(text: String, repeat_suffix: &str) -> Self {
+            Self {
+                repeat_suffix: repeat_suffix.to_string(),
+                ..Self::new(text)
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for RepeatedStreamTextProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("chat_with_system should not be used in repeated stream tests")
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            anyhow::bail!("chat should not be called when streaming succeeds")
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn supports_streaming_tool_events(&self) -> bool {
+            true
+        }
+
+        fn stream_chat_with_history(
+            &self,
+            _messages: &[ChatMessage],
+            _model: &str,
+            _temperature: Option<f64>,
+            options: StreamOptions,
+        ) -> futures_util::stream::BoxStream<
+            'static,
+            zeroclaw_providers::traits::StreamResult<StreamChunk>,
+        > {
+            let previous_calls = self.stream_calls.fetch_add(1, Ordering::SeqCst);
+            if !options.enabled {
+                return Box::pin(futures_util::stream::empty());
+            }
+            let mut text = self.text.clone();
+            if previous_calls > 0 {
+                text.push_str(&self.repeat_suffix);
+            }
+            Box::pin(futures_util::stream::iter(vec![
+                Ok(StreamChunk::delta(text)),
+                Ok(StreamChunk::final_chunk()),
+            ]))
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for RepeatedStreamTextProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "RepeatedStreamTextProvider"
+        }
+    }
+
     struct VisibleThenServerStreamFailureModelProvider {
         chat_calls: Arc<AtomicUsize>,
     }
@@ -6635,6 +6797,193 @@ mod tests {
         assert_eq!(result, "done");
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert_eq!(invocations.load(Ordering::SeqCst), 1);
+    }
+
+    struct ImageRecoveryContinuationProvider {
+        image_counts: Mutex<Vec<usize>>,
+        resubmission: Option<(
+            tokio::sync::mpsc::Sender<crate::agent::SteeringInput>,
+            String,
+        )>,
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for ImageRecoveryContinuationProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "image-recovery-continuation"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for ImageRecoveryContinuationProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                vision: true,
+                ..ProviderCapabilities::default()
+            }
+        }
+
+        fn supports_exact_request_replay(&self, _request: ChatRequest<'_>, _model: &str) -> bool {
+            true
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("structured chat is required");
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            let call = {
+                let mut counts = self.image_counts.lock().unwrap();
+                let call = counts.len();
+                counts.push(zeroclaw_providers::multimodal::count_image_markers(
+                    request.messages,
+                ));
+                call
+            };
+            if call == 0 {
+                return Err(zeroclaw_api::model_provider::StreamError::HttpStatus {
+                    status: 400,
+                    message: "request could not be processed".to_string(),
+                }
+                .into());
+            }
+            let text = if call == 1 {
+                if let Some((tx, message)) = &self.resubmission {
+                    tx.send(message.clone().into()).await.unwrap();
+                }
+                r#"<tool_call>
+{"name":"probe","arguments":{"value":"ok"}}
+</tool_call>"#
+            } else {
+                "done"
+            };
+            Ok(ChatResponse {
+                text: Some(text.to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn image_recovery_continuation_requires_new_input_to_restore_images() {
+        for (resubmit, max_tool_iterations) in [(false, 3), (true, 3), (false, 1)] {
+            let image = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
+            let original = format!("inspect [IMAGE:{image}]");
+            let (steering_tx, mut steering_rx) = tokio::sync::mpsc::channel(4);
+            let model_provider = ImageRecoveryContinuationProvider {
+                image_counts: Mutex::new(Vec::new()),
+                resubmission: resubmit.then_some((steering_tx, format!("retry [IMAGE:{image}]"))),
+            };
+            let invocations = Arc::new(AtomicUsize::new(0));
+            let tools_registry =
+                crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+                    CountingTool::new("probe", Arc::clone(&invocations)),
+                )]);
+            let mut history = vec![ChatMessage::user(original.clone())];
+            let mut history_has_trim_breadcrumb = false;
+            let mut injected_memory_preamble = None;
+            let observer = NoopObserver;
+            let mut image_cache = zeroclaw_providers::multimodal::LocalImageCache::new();
+            let mut provider_image_state = crate::agent::turn::ProviderImageState::default();
+
+            let result = run_tool_call_loop(ToolLoop {
+                parent_agent_alias: None,
+                served_route_sink: None,
+                sop_reassembly: None,
+                exec: ResolvedAgentExecution {
+                    model_access: ResolvedModelAccess {
+                        model_provider: &model_provider,
+                        provider_name: "mock-provider",
+                        model: "mock-model",
+                        dispatch_model: "mock-model",
+                        temperature: Some(0.0),
+                    },
+                    tools_registry: &tools_registry,
+                    observer: &observer,
+                    silent: true,
+                    approval: None,
+                    security: None,
+                    multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                    config: None,
+                    max_tool_iterations,
+                    hooks: None,
+                    excluded_tools: &[],
+                    dedup_exempt_tools: &[],
+                    activated_tools: None,
+                    model_switch_callback: None,
+                    pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                    strict_tool_parsing: false,
+                    parallel_tools: false,
+                    max_tool_result_chars: 0,
+                    context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(
+                        0,
+                    ),
+                    context_limits_resolver: None,
+                    receipt_generator: None,
+                    knobs: &LoopKnobs::default(),
+                },
+                history: &mut history,
+                history_has_trim_breadcrumb: &mut history_has_trim_breadcrumb,
+                injected_memory_preamble: &mut injected_memory_preamble,
+                channel_name: "cli",
+                channel_reply_target: None,
+                cancellation_token: None,
+                on_delta: None,
+                shared_budget: None,
+                channel: None,
+                collected_receipts: None,
+                event_tx: None,
+                steering: Some(&mut steering_rx),
+                new_messages_out: None,
+                image_cache: Some(crate::agent::turn::ToolLoopImageState {
+                    cache: &mut image_cache,
+                    provider_state: &mut provider_image_state,
+                }),
+                memory: None,
+                ingress: IngressContext::sub_turn(),
+                agent_alias: None,
+                turn_id: "image-recovery-continuation",
+            })
+            .await
+            .expect("recovery and tool continuation complete");
+
+            assert!(result.contains("done"));
+            if max_tool_iterations == 1 {
+                assert!(
+                    result.contains("Turn stopped: reached maximum tool iterations (1)"),
+                    "third physical request must be the graceful summary: {result}"
+                );
+            }
+            assert_eq!(
+                *model_provider.image_counts.lock().unwrap(),
+                vec![1, 0, usize::from(resubmit)]
+            );
+            assert_eq!(invocations.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                history[0].content, original,
+                "canonical image history is unchanged"
+            );
+        }
     }
 
     #[tokio::test]
@@ -8121,9 +8470,59 @@ mod tests {
 
     #[tokio::test]
     async fn run_tool_call_loop_enforces_sop_step_tool_scope() {
-        let turn_id = uuid::Uuid::new_v4().to_string();
-        let model_provider = ScriptedModelProvider {
-            responses: Arc::new(Mutex::new(VecDeque::from(vec![
+        struct ScopeCaptureProvider {
+            inner: ScriptedModelProvider,
+            requests: Arc<Mutex<Vec<Vec<ChatMessage>>>>,
+        }
+
+        impl zeroclaw_api::attribution::Attributable for ScopeCaptureProvider {
+            fn role(&self) -> zeroclaw_api::attribution::Role {
+                zeroclaw_api::attribution::Attributable::role(&self.inner)
+            }
+            fn alias(&self) -> &str {
+                "sop-scope-capture"
+            }
+        }
+
+        #[async_trait]
+        impl ModelProvider for ScopeCaptureProvider {
+            fn capabilities(&self) -> ProviderCapabilities {
+                self.inner.capabilities()
+            }
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                unreachable!("structured requests are used")
+            }
+            async fn chat(
+                &self,
+                request: ChatRequest<'_>,
+                model: &str,
+                temperature: Option<f64>,
+            ) -> anyhow::Result<ChatResponse> {
+                self.requests
+                    .lock()
+                    .unwrap()
+                    .push(request.messages.to_vec());
+                self.inner.chat(request, model, temperature).await
+            }
+        }
+
+        for (native, allow_search, cap, configless) in [
+            (false, false, 0, false),
+            (true, false, 0, false),
+            (false, true, 0, false),
+            (true, true, 0, false),
+            (false, false, 900, false),
+            (false, false, 10_000, false),
+            (false, false, 900, true),
+        ] {
+            let turn_id = uuid::Uuid::new_v4().to_string();
+            let mut responses = vec![
                 ChatResponse {
                     text: None,
                     tool_calls: vec![ToolCall {
@@ -8158,142 +8557,293 @@ mod tests {
                     usage: None,
                     reasoning_content: None,
                 },
-            ]))),
-            capabilities: ProviderCapabilities {
-                native_tool_calling: true,
-                ..ProviderCapabilities::default()
-            },
-        };
-
-        let sop = crate::sop::Sop {
-            name: "scoped-sop".to_string(),
-            description: "scoped sop".to_string(),
-            version: "1".to_string(),
-            priority: crate::sop::SopPriority::Normal,
-            execution_mode: crate::sop::SopExecutionMode::Auto,
-            triggers: vec![crate::sop::SopTrigger::Manual],
-            steps: vec![crate::sop::SopStep {
-                number: 1,
-                title: "Scoped".to_string(),
-                body: "Use only allowed tools".to_string(),
-                scope: Some(crate::sop::StepToolScope {
-                    allow: Some(vec!["allowed_tool".to_string()]),
-                    deny: Vec::new(),
-                }),
-                ..crate::sop::SopStep::default()
-            }],
-            cooldown_secs: 0,
-            max_concurrent: 1,
-            location: None,
-            deterministic: false,
-            admission_policy: crate::sop::types::SopAdmissionPolicy::Parallel,
-            max_pending_approvals: 0,
-            agent: None,
-            decision: None,
-        };
-        let mut engine = crate::sop::SopEngine::new(zeroclaw_config::schema::SopConfig {
-            step_scope_enforce: true,
-            ..zeroclaw_config::schema::SopConfig::default()
-        });
-        engine.replace_sops_for_test(vec![sop]);
-        let engine = Arc::new(Mutex::new(engine));
-
-        let allowed_invocations = Arc::new(AtomicUsize::new(0));
-        let denied_invocations = Arc::new(AtomicUsize::new(0));
-        let tools_registry = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![
-            Box::new(crate::tools::SopExecuteTool::new(Arc::clone(&engine))),
-            Box::new(CountingTool::new(
-                "allowed_tool",
-                Arc::clone(&allowed_invocations),
-            )),
-            Box::new(CountingTool::new(
-                "denied_tool",
-                Arc::clone(&denied_invocations),
-            )),
-        ]);
-
-        let mut history = vec![
-            ChatMessage::system("test-system"),
-            ChatMessage::user("start the scoped sop"),
-        ];
-        let observer = NoopObserver;
-
-        let result = run_tool_call_loop(ToolLoop {
-            parent_agent_alias: None,
-            served_route_sink: None,
-            sop_reassembly: None,
-            exec: ResolvedAgentExecution {
-                model_access: ResolvedModelAccess {
-                    model_provider: &model_provider,
-                    provider_name: "mock-provider",
-                    model: "mock-model",
-                    dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+            ];
+            if !native {
+                for response in &mut responses {
+                    if !response.tool_calls.is_empty() {
+                        let call = &response.tool_calls[0];
+                        response.text = Some(format!(
+                            "<tool_call>{{\"name\":\"{}\",\"arguments\":{}}}</tool_call>",
+                            call.name, call.arguments
+                        ));
+                        response.tool_calls.clear();
+                    }
+                }
+            }
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let model_provider = ScopeCaptureProvider {
+                inner: ScriptedModelProvider {
+                    responses: Arc::new(Mutex::new(VecDeque::from(responses))),
+                    capabilities: ProviderCapabilities {
+                        native_tool_calling: native,
+                        ..ProviderCapabilities::default()
+                    },
                 },
-                tools_registry: &tools_registry,
-                observer: &observer,
-                silent: true,
-                approval: None,
-                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
-                config: None,
-                max_tool_iterations: 6,
-                hooks: None,
-                excluded_tools: &[],
-                dedup_exempt_tools: &[],
-                activated_tools: None,
-                model_switch_callback: None,
-                pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                strict_tool_parsing: false,
-                parallel_tools: false,
-                max_tool_result_chars: 0,
-                context_limits: test_context_limits(0),
-                context_limits_resolver: None,
-                receipt_generator: None,
-                knobs: &LoopKnobs::default(),
-                security: None,
-            },
-            history: &mut history,
-            // Test transcripts start fresh: no prior trim, no crumb.
-            history_has_trim_breadcrumb: &mut false,
-            injected_memory_preamble: &mut None,
-            channel_name: "agent",
-            channel_reply_target: None,
-            cancellation_token: None,
-            on_delta: None,
-            shared_budget: None,
-            channel: None,
-            collected_receipts: None,
-            event_tx: None,
-            steering: None,
-            new_messages_out: None,
-            image_cache: None,
-            memory: None,
-            ingress: IngressContext::sub_turn(),
-            agent_alias: Some("test-agent"),
-            turn_id: &turn_id,
-        })
-        .await
-        .expect("scoped SOP execution should complete");
+                requests: Arc::clone(&requests),
+            };
 
-        assert_eq!(result, "outer done");
-        assert_eq!(allowed_invocations.load(Ordering::SeqCst), 0);
-        assert_eq!(denied_invocations.load(Ordering::SeqCst), 0);
-        assert!(
-            history.iter().any(|msg| msg
-                .content
-                .contains("Tool not available in this turn: denied_tool")),
-            "denied tool call should be recorded as unavailable in history: {history:?}"
-        );
+            let sop = crate::sop::Sop {
+                name: "scoped-sop".to_string(),
+                description: "scoped sop".to_string(),
+                version: "1".to_string(),
+                priority: crate::sop::SopPriority::Normal,
+                execution_mode: crate::sop::SopExecutionMode::Auto,
+                triggers: vec![crate::sop::SopTrigger::Manual],
+                steps: vec![crate::sop::SopStep {
+                    number: 1,
+                    title: "Scoped".to_string(),
+                    body: "Use only allowed tools".to_string(),
+                    scope: Some(crate::sop::StepToolScope {
+                        allow: Some(if allow_search {
+                            vec!["allowed_tool".to_string(), "tool_search".to_string()]
+                        } else {
+                            vec!["allowed_tool".to_string()]
+                        }),
+                        deny: Vec::new(),
+                    }),
+                    ..crate::sop::SopStep::default()
+                }],
+                cooldown_secs: 0,
+                max_concurrent: 1,
+                location: None,
+                deterministic: false,
+                admission_policy: crate::sop::types::SopAdmissionPolicy::Parallel,
+                max_pending_approvals: 0,
+                agent: None,
+                decision: None,
+            };
+            let mut engine = crate::sop::SopEngine::new(zeroclaw_config::schema::SopConfig {
+                step_scope_enforce: true,
+                ..zeroclaw_config::schema::SopConfig::default()
+            });
+            engine.replace_sops_for_test(vec![sop]);
+            let engine = Arc::new(Mutex::new(engine));
 
-        let started = sop_started_run_id_from_history(&history)
-            .expect("sop_execute tool result should include a run id");
-        let engine = engine.lock().unwrap();
-        let run = engine
-            .get_run(&started)
-            .expect("run should remain queryable after completion");
-        assert_eq!(run.status, crate::sop::SopRunStatus::Completed);
-        assert_eq!(run.step_results.len(), 1);
-        assert_eq!(run.step_results[0].output, "step recovered");
+            let allowed_invocations = Arc::new(AtomicUsize::new(0));
+            let denied_invocations = Arc::new(AtomicUsize::new(0));
+            let tools_registry = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![
+                Box::new(crate::tools::SopExecuteTool::new(Arc::clone(&engine))),
+                mock_tool("tool_search"),
+                Box::new(CountingTool::new(
+                    "allowed_tool",
+                    Arc::clone(&allowed_invocations),
+                )),
+                Box::new(CountingTool::new(
+                    "denied_tool",
+                    Arc::clone(&denied_invocations),
+                )),
+            ]);
+            let activated = Arc::new(Mutex::new(crate::tools::ActivatedToolSet::new()));
+            activated.lock().unwrap().set_deferred_builtin_specs(
+                tools_registry
+                    .iter()
+                    .filter(|tool| matches!(tool.name(), "allowed_tool" | "denied_tool"))
+                    .map(|tool| tool.spec())
+                    .collect(),
+            );
+            let workspace = tempdir().unwrap();
+            let mut config = zeroclaw_config::schema::Config::default();
+            config.runtime_profiles.insert(
+                "scoped".to_string(),
+                zeroclaw_config::schema::RuntimeProfileConfig {
+                    max_system_prompt_chars: Some(cap),
+                    ..Default::default()
+                },
+            );
+            config.agents.insert(
+                "test-agent".to_string(),
+                zeroclaw_config::schema::AliasedAgentConfig {
+                    runtime_profile: zeroclaw_config::providers::RuntimeProfileRef::new("scoped"),
+                    ..Default::default()
+                },
+            );
+            let parent_prompt = super::build_system_prompt_for_turn(
+                workspace.path(),
+                "mock-model",
+                &[],
+                "",
+                &[],
+                None,
+                None,
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
+                &model_provider,
+                &tools_registry,
+                &[],
+                Some(&activated),
+                false,
+                zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
+                false,
+                0,
+                true,
+                true,
+                None,
+                None,
+            )
+            .unwrap();
+
+            let parent_prompt = parent_prompt.replacen(
+                "## Safety",
+                "## Hardware Access\nRetain hardware guidance.\n\n## Safety",
+                1,
+            );
+            let parent_prompt =
+                crate::agent::system_prompt::finalize_system_prompt(parent_prompt, cap);
+            let scoped_prompts = Arc::new(crate::agent::turn::ToolProtocolPrompts::with_max_chars(
+                parent_prompt.clone(),
+                parent_prompt.clone(),
+                cap,
+            ));
+            let mut history = vec![
+                ChatMessage::system(&parent_prompt),
+                ChatMessage::user("start the scoped sop"),
+            ];
+            let observer = NoopObserver;
+
+            let multimodal_config = zeroclaw_config::schema::MultimodalConfig::default();
+            let pacing = zeroclaw_config::schema::PacingConfig::default();
+            let knobs = LoopKnobs::default();
+            let mut history_has_trim_breadcrumb = false;
+            let mut injected_memory_preamble = None;
+            let turn = run_tool_call_loop(ToolLoop {
+                parent_agent_alias: None,
+                served_route_sink: None,
+                sop_reassembly: None,
+                exec: ResolvedAgentExecution {
+                    model_access: ResolvedModelAccess {
+                        model_provider: &model_provider,
+                        provider_name: "mock-provider",
+                        model: "mock-model",
+                        dispatch_model: "mock-model",
+                        temperature: Some(0.0),
+                    },
+                    tools_registry: &tools_registry,
+                    observer: &observer,
+                    silent: true,
+                    approval: None,
+                    multimodal_config: &multimodal_config,
+                    config: (!configless).then_some(&config),
+                    max_tool_iterations: 6,
+                    hooks: None,
+                    excluded_tools: &[],
+                    dedup_exempt_tools: &[],
+                    activated_tools: Some(&activated),
+                    model_switch_callback: None,
+                    pacing: &pacing,
+                    strict_tool_parsing: false,
+                    parallel_tools: false,
+                    max_tool_result_chars: 0,
+                    context_limits: test_context_limits(0),
+                    context_limits_resolver: None,
+                    receipt_generator: None,
+                    knobs: &knobs,
+                    security: None,
+                },
+                history: &mut history,
+                // Test transcripts start fresh: no prior trim, no crumb.
+                history_has_trim_breadcrumb: &mut history_has_trim_breadcrumb,
+                injected_memory_preamble: &mut injected_memory_preamble,
+                channel_name: "agent",
+                channel_reply_target: None,
+                cancellation_token: None,
+                on_delta: None,
+                shared_budget: None,
+                channel: None,
+                collected_receipts: None,
+                event_tx: None,
+                steering: None,
+                new_messages_out: None,
+                image_cache: None,
+                memory: None,
+                ingress: IngressContext::sub_turn(),
+                agent_alias: Some("test-agent"),
+                turn_id: &turn_id,
+            });
+            let result = if configless {
+                crate::agent::turn::scope_tool_protocol_prompts(scoped_prompts, turn).await
+            } else {
+                turn.await
+            }
+            .expect("scoped SOP execution should complete");
+
+            assert_eq!(result, "outer done");
+            assert_eq!(allowed_invocations.load(Ordering::SeqCst), 0);
+            assert_eq!(denied_invocations.load(Ordering::SeqCst), 0);
+            let denial = if native {
+                "Tool not available in this turn: denied_tool"
+            } else {
+                "[Tool call parse error]"
+            };
+            assert!(
+                history.iter().any(|msg| msg.content.contains(denial)),
+                "denied tool call must be rejected before execution: {history:?}"
+            );
+
+            let started = sop_started_run_id_from_history(&history)
+                .expect("sop_execute tool result should include a run id");
+            let engine = engine.lock().unwrap();
+            let run = engine
+                .get_run(&started)
+                .expect("run should remain queryable after completion");
+            assert_eq!(run.status, crate::sop::SopRunStatus::Completed);
+            assert_eq!(run.step_results.len(), 1);
+            assert_eq!(run.step_results[0].output, "step recovered");
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests.len(), 4);
+            let prompt = |index: usize| {
+                requests[index]
+                    .iter()
+                    .find(|message| message.role == "system")
+                    .unwrap()
+                    .content
+                    .as_str()
+            };
+            if cap == 0 || cap == 10_000 {
+                assert!(prompt(0).contains("<available-deferred-builtin-tools>"));
+            }
+            for index in [1, 2] {
+                if cap > 0 {
+                    assert!(prompt(index).chars().count() <= cap);
+                    assert!(
+                        prompt(index)
+                            .trim_end()
+                            .ends_with(crate::agent::prompt::TIMESTAMP_ORIENTATION.trim_end()),
+                        "orientation missing: cap={cap}, configless={configless}, request={index}"
+                    );
+                    assert_eq!(
+                        prompt(index)
+                            .matches(crate::agent::prompt::TIMESTAMP_ORIENTATION)
+                            .count(),
+                        1
+                    );
+                }
+                assert_eq!(
+                    prompt(index).contains("<available-deferred-builtin-tools>"),
+                    allow_search
+                );
+                assert!(!prompt(index).contains("denied_tool - "));
+                if allow_search {
+                    assert!(prompt(index).contains("allowed_tool - "));
+                    assert!(!prompt(index).contains("**allowed_tool**"));
+                }
+                if cap == 0 || cap == 10_000 {
+                    assert!(prompt(index).contains("Retain hardware guidance."));
+                }
+                if !native && !allow_search && (cap == 0 || cap == 10_000) {
+                    assert_eq!(prompt(index).matches("## Tool Use Protocol").count(), 1);
+                    assert!(prompt(index).contains("**allowed_tool**"));
+                    assert!(prompt(index).contains("Parameters:"));
+                    assert!(!prompt(index).contains("**denied_tool**"));
+                    assert!(!prompt(index).contains("**tool_search**"));
+                }
+            }
+            assert_eq!(
+                prompt(0),
+                prompt(3),
+                "step fallback must not mutate the parent prompt"
+            );
+            assert_eq!(history[0].content, prompt(3));
+            assert_eq!(activated.lock().unwrap().hidden_builtin_names().len(), 2);
+        }
     }
 
     /// Activates a deferred tool into the shared set when called, standing in
@@ -9594,8 +10144,58 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn run_tool_call_loop_aborts_repeated_prompt_required_shell_before_reprompting() {
+    /// A channel that answers every approval request with an operator `Deny`
+    /// and counts the requests.
+    struct DenyingChannel {
+        approval_requests: Arc<AtomicUsize>,
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for DenyingChannel {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Channel(
+                ::zeroclaw_api::attribution::ChannelKind::AcpChannel,
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "denying-test"
+        }
+    }
+
+    #[async_trait]
+    impl Channel for DenyingChannel {
+        fn name(&self) -> &str {
+            "denying-test"
+        }
+
+        async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn request_approval(
+            &self,
+            _recipient: &str,
+            _request: &ChannelApprovalRequest,
+        ) -> anyhow::Result<Option<ChannelApprovalResponse>> {
+            self.approval_requests.fetch_add(1, Ordering::SeqCst);
+            Ok(Some(ChannelApprovalResponse::Deny))
+        }
+    }
+
+    /// Run a turn whose model asks for the same prompt-required `shell` call
+    /// in two consecutive iterations, then answers "done". Returns the turn's
+    /// result, the number of approval requests and the number of executions.
+    async fn run_repeated_prompt_required_shell_turn(
+        approve: bool,
+        dedup_enabled: bool,
+    ) -> (anyhow::Result<String>, usize, usize) {
         let turn_id = uuid::Uuid::new_v4().to_string();
         let repeated_shell_call = r#"<tool_call>
 {"name":"shell","arguments":{"command":"pwd"}}
@@ -9603,7 +10203,7 @@ mod tests {
         let model_provider = ScriptedModelProvider::from_text_responses(vec![
             repeated_shell_call,
             repeated_shell_call,
-            "should not reach final response",
+            "done",
         ]);
 
         let invocations = Arc::new(AtomicUsize::new(0));
@@ -9613,7 +10213,15 @@ mod tests {
             )]);
 
         let approval_requests = Arc::new(AtomicUsize::new(0));
-        let channel = ApprovingChannel::new(Arc::clone(&approval_requests));
+        let approving_channel = ApprovingChannel::new(Arc::clone(&approval_requests));
+        let denying_channel = DenyingChannel {
+            approval_requests: Arc::clone(&approval_requests),
+        };
+        let channel: &dyn Channel = if approve {
+            &approving_channel
+        } else {
+            &denying_channel
+        };
         let approval_mgr = ApprovalManager::for_non_interactive_backchannel(
             &zeroclaw_config::schema::RiskProfileConfig::default(),
         );
@@ -9623,11 +10231,11 @@ mod tests {
         ];
         let observer = NoopObserver;
         let knobs = LoopKnobs {
-            dedup_enabled: false,
+            dedup_enabled,
             ..LoopKnobs::default()
         };
 
-        let err = run_tool_call_loop(ToolLoop {
+        let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
@@ -9670,7 +10278,7 @@ mod tests {
             cancellation_token: None,
             on_delta: None,
             shared_budget: None,
-            channel: Some(&channel),
+            channel: Some(channel),
             collected_receipts: None,
             event_tx: None,
             steering: None,
@@ -9681,24 +10289,63 @@ mod tests {
             agent_alias: None,
             turn_id: &turn_id,
         })
-        .await
-        .expect_err("identical prompt-required shell call should abort before another prompt");
+        .await;
 
-        let err = err.to_string();
+        (
+            result,
+            approval_requests.load(Ordering::SeqCst),
+            invocations.load(Ordering::SeqCst),
+        )
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_reprompts_identical_shell_rerun_after_approval() {
+        let (result, approval_requests, invocations) =
+            run_repeated_prompt_required_shell_turn(true, false).await;
+
+        let reply = result.expect("an approved shell call may be rerun later in the same turn");
+        assert_eq!(reply, "done");
+        assert_eq!(
+            approval_requests, 2,
+            "the rerun must ask for a fresh approval instead of reusing the first one"
+        );
+        assert_eq!(invocations, 2, "each approved run executes once");
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_runs_approved_shell_rerun_with_dedup_enabled() {
+        // `LoopKnobs::default()` (what the CLI uses) keeps the turn-scoped
+        // duplicate check on. The second approval must not be wasted on a
+        // call that is then skipped as a duplicate.
+        let (result, approval_requests, invocations) =
+            run_repeated_prompt_required_shell_turn(true, true).await;
+
+        let reply = result.expect("an approved shell rerun must not be dropped as a duplicate");
+        assert_eq!(reply, "done");
+        assert_eq!(approval_requests, 2, "the rerun asks for a fresh approval");
+        assert_eq!(
+            invocations, 2,
+            "the approved rerun executes instead of being skipped as a duplicate"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_aborts_repeated_shell_call_after_denial() {
+        let (result, approval_requests, invocations) =
+            run_repeated_prompt_required_shell_turn(false, false).await;
+
+        let err = result
+            .expect_err("repeating a denied shell call should abort before another prompt")
+            .to_string();
         assert!(
             err.contains("repeated prompt-required tool call 'shell'"),
             "unexpected error: {err}"
         );
         assert_eq!(
-            approval_requests.load(Ordering::SeqCst),
-            1,
-            "the repeated shell call should not issue a second approval request"
+            approval_requests, 1,
+            "the repeated denied shell call should not issue a second approval request"
         );
-        assert_eq!(
-            invocations.load(Ordering::SeqCst),
-            1,
-            "the repeated shell call should not execute a second time"
-        );
+        assert_eq!(invocations, 0, "a denied shell call never executes");
     }
 
     #[tokio::test]
@@ -9831,7 +10478,11 @@ mod tests {
             )]);
 
         let approval_requests = Arc::new(AtomicUsize::new(0));
-        let channel = ApprovingChannel::new(Arc::clone(&approval_requests));
+        // The guard holds the signature of a denied call, so a dedup-exempt
+        // tool repeating it must still abort instead of asking again.
+        let channel = DenyingChannel {
+            approval_requests: Arc::clone(&approval_requests),
+        };
         let approval_mgr = ApprovalManager::for_non_interactive_backchannel(
             &zeroclaw_config::schema::RiskProfileConfig::default(),
         );
@@ -9911,8 +10562,8 @@ mod tests {
         );
         assert_eq!(
             invocations.load(Ordering::SeqCst),
-            1,
-            "dedup-exempt repeated shell should not execute a second time"
+            0,
+            "a denied dedup-exempt shell call should never execute"
         );
     }
 
@@ -10221,6 +10872,136 @@ mod tests {
             1,
             "non-exempt tool should still be deduped"
         );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_browser_and_search_preserve_tool_boundaries() {
+        for (requested_name, registered_name, parameter, value) in [
+            ("browser_open", "browser_open", "url", "https://example.com"),
+            ("browser", "browser", "action", "snapshot"),
+            (
+                "web_search",
+                "web_search_tool",
+                "query",
+                "rust release notes",
+            ),
+        ] {
+            let arguments = serde_json::json!({ parameter: value });
+            for response in [
+                format!("{requested_name}/{parameter}>{value}"),
+                format!(
+                    "<tool_call>{}</tool_call>",
+                    serde_json::json!({"name": requested_name, "arguments": arguments})
+                ),
+            ] {
+                for availability in ["registered", "missing", "excluded"] {
+                    let model_provider =
+                        ScriptedModelProvider::from_text_responses(vec![response.as_str(), "done"]);
+                    let recorded_args = Arc::new(Mutex::new(Vec::new()));
+                    let shell_args = Arc::new(Mutex::new(Vec::new()));
+                    let mut tools: Vec<Box<dyn Tool>> = Vec::new();
+                    if availability != "missing" {
+                        tools.push(Box::new(RecordingArgsTool::new(
+                            registered_name,
+                            Arc::clone(&recorded_args),
+                        )));
+                    }
+                    // An available browser/search tool must work without shell;
+                    // an unavailable one must not borrow shell's authority.
+                    if availability != "registered" {
+                        tools.push(Box::new(RecordingArgsTool::new(
+                            "shell",
+                            Arc::clone(&shell_args),
+                        )));
+                    }
+                    let tools_registry =
+                        crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(tools);
+                    let excluded_tools = if availability == "excluded" {
+                        vec![registered_name.to_string()]
+                    } else {
+                        Vec::new()
+                    };
+                    let mut history = vec![
+                        ChatMessage::system("test-system"),
+                        ChatMessage::user("run the requested tool"),
+                    ];
+                    let observer = NoopObserver;
+                    let turn_id = uuid::Uuid::new_v4().to_string();
+                    let result = run_tool_call_loop(ToolLoop {
+                        parent_agent_alias: None,
+                        served_route_sink: None,
+                        sop_reassembly: None,
+                        exec: ResolvedAgentExecution {
+                            model_access: ResolvedModelAccess {
+                                model_provider: &model_provider,
+                                provider_name: "mock-provider",
+                                model: "mock-model",
+                                dispatch_model: "mock-model",
+                                temperature: Some(0.0),
+                            },
+                            tools_registry: &tools_registry,
+                            observer: &observer,
+                            silent: true,
+                            approval: None,
+                            security: None,
+                            multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(
+                            ),
+                            config: None,
+                            max_tool_iterations: 4,
+                            hooks: None,
+                            excluded_tools: &excluded_tools,
+                            dedup_exempt_tools: &[],
+                            activated_tools: None,
+                            model_switch_callback: None,
+                            pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                            strict_tool_parsing: false,
+                            parallel_tools: false,
+                            max_tool_result_chars: 0,
+                            context_limits: test_context_limits(0),
+                            context_limits_resolver: None,
+                            receipt_generator: None,
+                            knobs: &LoopKnobs::default(),
+                        },
+                        history: &mut history,
+                        history_has_trim_breadcrumb: &mut false,
+                        injected_memory_preamble: &mut None,
+                        channel_name: "cli",
+                        channel_reply_target: None,
+                        cancellation_token: None,
+                        on_delta: None,
+                        shared_budget: None,
+                        channel: None,
+                        collected_receipts: None,
+                        event_tx: None,
+                        steering: None,
+                        new_messages_out: None,
+                        image_cache: None,
+                        memory: None,
+                        ingress: IngressContext::sub_turn(),
+                        agent_alias: None,
+                        turn_id: &turn_id,
+                    })
+                    .await
+                    .expect("browser/search boundary turn should complete");
+
+                    let expected = if availability == "registered" {
+                        assert!(result.ends_with("done"), "{response}: {result}");
+                        vec![arguments.clone()]
+                    } else {
+                        Vec::new()
+                    };
+                    assert_eq!(
+                        *recorded_args.lock().unwrap(),
+                        expected,
+                        "{availability}: {response}"
+                    );
+                    assert!(
+                        shell_args.lock().unwrap().is_empty(),
+                        "browser/search must never execute shell: {availability}: {response}"
+                    );
+                }
+            }
+        }
     }
 
     #[tokio::test]
@@ -10707,6 +11488,264 @@ mod tests {
             }
         }
         assert_eq!(draft_text, vec![fallback]);
+    }
+
+    /// The streaming text guard suppressed a whole-message tool-result
+    /// envelope twice in a row: the second suppression, which differs from
+    /// the first only by one trailing newline, must still end the turn with
+    /// the protocol-guard notice instead of spending the full retry budget
+    /// on the same text. The notice also reaches the event stream, once at
+    /// the end, so a consumer that never drains the deltas still sees the
+    /// turn's visible outcome.
+    #[tokio::test]
+    async fn run_tool_call_loop_stops_retrying_identical_guard_suppressed_text() {
+        let turn_id = uuid::Uuid::new_v4().to_string();
+        let provider = RepeatedStreamTextProvider::with_repeat_suffix(
+            "{\"tool_call_id\": \"call_1\", \"content\": \"ok\"}".to_string(),
+            "\n",
+        );
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+                CountingTool::new("count_tool", Arc::clone(&invocations)),
+            )]);
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("explain the tool result shape"),
+        ];
+        let observer = NoopObserver;
+        let (delta_tx, mut delta_rx) = tokio::sync::mpsc::channel::<DraftEvent>(16);
+        let (event_tx, mut event_rx) =
+            tokio::sync::mpsc::channel::<zeroclaw_api::agent::TurnEvent>(16);
+
+        let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            served_route_sink: None,
+            sop_reassembly: None,
+            exec: ResolvedAgentExecution {
+                model_access: ResolvedModelAccess {
+                    model_provider: &provider,
+                    provider_name: "mock-provider",
+                    model: "mock-model",
+                    dispatch_model: "mock-model",
+                    temperature: Some(0.0),
+                },
+                tools_registry: &tools_registry,
+                observer: &observer,
+                silent: true,
+                approval: None,
+                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
+                max_tool_iterations: 6,
+                hooks: None,
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                activated_tools: None,
+                model_switch_callback: None,
+                pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                strict_tool_parsing: false,
+                parallel_tools: false,
+                max_tool_result_chars: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
+                receipt_generator: None,
+                knobs: &LoopKnobs::default(),
+                security: None,
+            },
+            history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
+            channel_name: "matrix",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: Some(delta_tx),
+            shared_budget: None,
+            channel: None,
+            collected_receipts: None,
+            event_tx: Some(event_tx),
+            steering: None,
+            new_messages_out: None,
+            image_cache: None,
+            memory: None,
+            ingress: IngressContext::sub_turn(),
+            agent_alias: None,
+            turn_id: &turn_id,
+        })
+        .await
+        .expect("identical guard-suppressed text should end the turn with a notice");
+
+        let notice =
+            crate::i18n::get_required_cli_string("cli-agent-error-protocol-guard-withheld");
+        assert_eq!(result, notice);
+        assert_eq!(
+            provider.stream_calls.load(Ordering::SeqCst),
+            2,
+            "a guard suppression repeated up to a trailing newline must stop retries after two provider calls"
+        );
+        assert_eq!(
+            invocations.load(Ordering::SeqCst),
+            0,
+            "suppressed protocol text must never execute as a tool call"
+        );
+        let feedback_count = history
+            .iter()
+            .filter(|msg| msg.role == "user" && msg.content.contains("[Tool call parse error]"))
+            .count();
+        assert_eq!(
+            feedback_count, 1,
+            "only the first suppression earns feedback"
+        );
+        let mut visible_deltas = String::new();
+        while let Some(delta) = delta_rx.recv().await {
+            if let StreamDelta::Text(text) = delta {
+                visible_deltas.push_str(&text);
+            }
+        }
+        assert_eq!(
+            visible_deltas, notice,
+            "the suppressed text must stay withheld and the notice must be the only text delta"
+        );
+        let mut event_chunks = String::new();
+        while let Ok(event) = event_rx.try_recv() {
+            if let zeroclaw_api::agent::TurnEvent::Chunk { delta } = event {
+                event_chunks.push_str(&delta);
+            }
+        }
+        assert_eq!(
+            event_chunks, notice,
+            "the notice must be the event stream's only chunk, at the end"
+        );
+    }
+
+    /// The same identical-suppression stop with a prose prefix in the same
+    /// delta as the envelope: the prefix is ordinary text the guard
+    /// releases ahead of the withheld candidate, so it reaches the deltas
+    /// once per attempt (the envelope itself never does) and the notice
+    /// follows it. The notice text therefore claims nothing about what else
+    /// the reply carried. The event stream mirrors the deltas: the prefix
+    /// once per attempt with the notice at the end.
+    #[tokio::test]
+    async fn run_tool_call_loop_stops_retrying_identical_guard_suppressed_text_with_prose_prefix() {
+        let turn_id = uuid::Uuid::new_v4().to_string();
+        let prefix = "Sure! ";
+        let envelope =
+            "{\"toolcalls\": [{\"call_id\": \"call_1\", \"arguments\": {\"command\": \"ls\"}}";
+        let provider = RepeatedStreamTextProvider::new(format!("{prefix}{envelope}"));
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+                CountingTool::new("count_tool", Arc::clone(&invocations)),
+            )]);
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("run the command"),
+        ];
+        let observer = NoopObserver;
+        let (delta_tx, mut delta_rx) = tokio::sync::mpsc::channel::<DraftEvent>(16);
+        let (event_tx, mut event_rx) =
+            tokio::sync::mpsc::channel::<zeroclaw_api::agent::TurnEvent>(16);
+
+        let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            served_route_sink: None,
+            sop_reassembly: None,
+            exec: ResolvedAgentExecution {
+                model_access: ResolvedModelAccess {
+                    model_provider: &provider,
+                    provider_name: "mock-provider",
+                    model: "mock-model",
+                    dispatch_model: "mock-model",
+                    temperature: Some(0.0),
+                },
+                tools_registry: &tools_registry,
+                observer: &observer,
+                silent: true,
+                approval: None,
+                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
+                max_tool_iterations: 6,
+                hooks: None,
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                activated_tools: None,
+                model_switch_callback: None,
+                pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                strict_tool_parsing: false,
+                parallel_tools: false,
+                max_tool_result_chars: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
+                receipt_generator: None,
+                knobs: &LoopKnobs::default(),
+                security: None,
+            },
+            history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
+            channel_name: "matrix",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: Some(delta_tx),
+            shared_budget: None,
+            channel: None,
+            collected_receipts: None,
+            event_tx: Some(event_tx),
+            steering: None,
+            new_messages_out: None,
+            image_cache: None,
+            memory: None,
+            ingress: IngressContext::sub_turn(),
+            agent_alias: None,
+            turn_id: &turn_id,
+        })
+        .await
+        .expect("guard-suppressed text with a prose prefix should end the turn with a notice");
+
+        let notice =
+            crate::i18n::get_required_cli_string("cli-agent-error-protocol-guard-withheld");
+        assert_eq!(result, notice);
+        assert_eq!(
+            provider.stream_calls.load(Ordering::SeqCst),
+            2,
+            "an identical guard suppression with a released prefix must stop retries after two provider calls"
+        );
+        assert_eq!(
+            invocations.load(Ordering::SeqCst),
+            0,
+            "suppressed protocol text must never execute as a tool call"
+        );
+        let feedback_count = history
+            .iter()
+            .filter(|msg| msg.role == "user" && msg.content.contains("[Tool call parse error]"))
+            .count();
+        assert_eq!(
+            feedback_count, 1,
+            "only the first suppression earns feedback"
+        );
+        let mut visible_deltas = String::new();
+        while let Some(delta) = delta_rx.recv().await {
+            if let StreamDelta::Text(text) = delta {
+                visible_deltas.push_str(&text);
+            }
+        }
+        assert_eq!(
+            visible_deltas,
+            format!("{prefix}{prefix}{notice}"),
+            "the prefix must stream once per attempt with the notice after it, and the envelope must never reach the deltas"
+        );
+        let mut event_chunks = String::new();
+        while let Ok(event) = event_rx.try_recv() {
+            if let zeroclaw_api::agent::TurnEvent::Chunk { delta } = event {
+                event_chunks.push_str(&delta);
+            }
+        }
+        assert_eq!(
+            event_chunks,
+            format!("{prefix}{prefix}{notice}"),
+            "the event stream must mirror the deltas: the prefix once per attempt with the notice at the end"
+        );
     }
 
     #[tokio::test]
@@ -12700,14 +13739,15 @@ This is an example, not an invocation."#;
         let messages = vec![ChatMessage::user("hi")];
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(8);
 
+        let tools = [crate::tools::ToolSpec::new(
+            "count_tool".to_string(),
+            "Count values".to_string(),
+            serde_json::json!({"type": "object"}),
+        )];
         let outcome = consume_provider_streaming_response(
             &provider,
             &messages,
-            Some(&[crate::tools::ToolSpec::new(
-                "count_tool".to_string(),
-                "Count values".to_string(),
-                serde_json::json!({"type": "object"}),
-            )]),
+            Some(&tools),
             "mock-model",
             Some(0.0),
             None,
@@ -12715,6 +13755,7 @@ This is an example, not an invocation."#;
             None, // event_tx
             false,
             zeroclaw_config::schema::StreamReasoningMode::Status,
+            Some(&tools),
         )
         .await
         .expect("streaming should finish");
@@ -12787,14 +13828,15 @@ This is an example, not an invocation."#;
         let messages = vec![ChatMessage::user("hi")];
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(8);
 
+        let tools = [crate::tools::ToolSpec::new(
+            "count_tool".to_string(),
+            "Count values".to_string(),
+            serde_json::json!({"type": "object"}),
+        )];
         let outcome = consume_provider_streaming_response(
             &provider,
             &messages,
-            Some(&[crate::tools::ToolSpec::new(
-                "count_tool".to_string(),
-                "Count values".to_string(),
-                serde_json::json!({"type": "object"}),
-            )]),
+            Some(&tools),
             "mock-model",
             Some(0.0),
             None,
@@ -12802,6 +13844,7 @@ This is an example, not an invocation."#;
             None, // event_tx
             false,
             zeroclaw_config::schema::StreamReasoningMode::Status,
+            Some(&tools),
         )
         .await
         .expect("streaming should finish");
@@ -12840,6 +13883,7 @@ This is an example, not an invocation."#;
             None, // event_tx
             false,
             zeroclaw_config::schema::StreamReasoningMode::Status,
+            None,
         )
         .await
         .expect("streaming should finish");
@@ -12866,14 +13910,15 @@ This is an example, not an invocation."#;
         let messages = vec![ChatMessage::user("return a support case JSON object")];
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(8);
 
+        let tools = [crate::tools::ToolSpec::new(
+            "count_tool".to_string(),
+            "Count values".to_string(),
+            serde_json::json!({"type": "object"}),
+        )];
         let outcome = consume_provider_streaming_response(
             &provider,
             &messages,
-            Some(&[crate::tools::ToolSpec::new(
-                "count_tool".to_string(),
-                "Count values".to_string(),
-                serde_json::json!({"type": "object"}),
-            )]),
+            Some(&tools),
             "mock-model",
             Some(0.0),
             None,
@@ -12881,6 +13926,7 @@ This is an example, not an invocation."#;
             None, // event_tx
             false,
             zeroclaw_config::schema::StreamReasoningMode::Status,
+            Some(&tools),
         )
         .await
         .expect("streaming should finish");
@@ -12907,14 +13953,15 @@ This is an example, not an invocation."#;
         )];
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(8);
 
+        let tools = [crate::tools::ToolSpec::new(
+            "count_tool".to_string(),
+            "Count values".to_string(),
+            serde_json::json!({"type": "object"}),
+        )];
         let outcome = consume_provider_streaming_response(
             &provider,
             &messages,
-            Some(&[crate::tools::ToolSpec::new(
-                "count_tool".to_string(),
-                "Count values".to_string(),
-                serde_json::json!({"type": "object"}),
-            )]),
+            Some(&tools),
             "mock-model",
             Some(0.0),
             None,
@@ -12922,6 +13969,7 @@ This is an example, not an invocation."#;
             None, // event_tx
             false,
             zeroclaw_config::schema::StreamReasoningMode::Status,
+            Some(&tools),
         )
         .await
         .expect("streaming should finish");
@@ -13007,6 +14055,7 @@ This is an example, not an invocation."#;
             None, // event_tx
             false,
             zeroclaw_config::schema::StreamReasoningMode::Status,
+            None,
         )
         .await
         .expect("streaming should finish");
@@ -13090,6 +14139,7 @@ This is an example, not an invocation."#;
             None, // event_tx
             false,
             zeroclaw_config::schema::StreamReasoningMode::Status,
+            None,
         )
         .await
         .expect("streaming should finish");
@@ -13176,6 +14226,7 @@ This is an example, not an invocation."#;
             None, // event_tx
             false,
             zeroclaw_config::schema::StreamReasoningMode::Status,
+            None,
         )
         .await
         .expect("streaming should finish");
@@ -13250,14 +14301,15 @@ This is an example, not an invocation."#;
         let messages = vec![ChatMessage::user("hi")];
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(8);
 
+        let tools = [crate::tools::ToolSpec::new(
+            "count_tool".to_string(),
+            "Count values".to_string(),
+            serde_json::json!({"type": "object"}),
+        )];
         let outcome = consume_provider_streaming_response(
             &provider,
             &messages,
-            Some(&[crate::tools::ToolSpec::new(
-                "count_tool".to_string(),
-                "Count values".to_string(),
-                serde_json::json!({"type": "object"}),
-            )]),
+            Some(&tools),
             "mock-model",
             Some(0.0),
             None,
@@ -13265,6 +14317,7 @@ This is an example, not an invocation."#;
             None, // event_tx
             false,
             zeroclaw_config::schema::StreamReasoningMode::Status,
+            Some(&tools),
         )
         .await
         .expect("streaming should finish");
@@ -13349,6 +14402,7 @@ This is an example, not an invocation."#;
             None, // event_tx
             false,
             zeroclaw_config::schema::StreamReasoningMode::Status,
+            None,
         )
         .await
         .expect("streaming should finish");
@@ -13436,6 +14490,7 @@ This is an example, not an invocation."#;
             None, // event_tx
             false,
             zeroclaw_config::schema::StreamReasoningMode::Status,
+            None,
         )
         .await
         .expect("streaming should finish");
@@ -13928,6 +14983,7 @@ This is an example, not an invocation."#;
             None, // event_tx
             true,
             zeroclaw_config::schema::StreamReasoningMode::Status,
+            Some(&tools),
         )
         .await
         .expect("streaming should finish");
@@ -15618,6 +16674,76 @@ Let me check the result."#;
         );
     }
 
+    #[tokio::test]
+    async fn turn_prompt_defers_builtin_definition_until_search_selection() {
+        use zeroclaw_config::schema::{RiskProfileConfig, SkillsPromptInjectionMode};
+
+        let workspace = tempdir().unwrap();
+        let provider = ScriptedModelProvider::from_text_responses(vec!["ok"]);
+        let tools = vec![
+            mock_tool("shell"),
+            mock_tool("catalog_probe"),
+            mock_tool("tool_search"),
+        ];
+        let activated = Arc::new(Mutex::new(crate::tools::ActivatedToolSet::new()));
+        activated
+            .lock()
+            .unwrap()
+            .set_deferred_builtin_specs(vec![tools[1].spec()]);
+        let build = |excluded: &[String]| {
+            super::build_system_prompt_for_turn(
+                workspace.path(),
+                "test-model",
+                &[],
+                "",
+                &[],
+                None,
+                None,
+                &RiskProfileConfig::default(),
+                &provider,
+                &tools,
+                excluded,
+                Some(&activated),
+                false,
+                SkillsPromptInjectionMode::Full,
+                false,
+                usize::MAX,
+                false,
+                false,
+                None,
+                None,
+            )
+            .unwrap()
+        };
+        let initial = build(&[]);
+        assert!(initial.contains("catalog_probe - "));
+        assert!(!initial.contains("**catalog_probe**"));
+        let search_allowed = build(&["catalog_probe".into()]);
+        assert!(!search_allowed.contains("catalog_probe"));
+        assert!(!search_allowed.contains("<available-deferred-builtin-tools>"));
+        assert!(search_allowed.contains("tool_search"));
+        assert_eq!(activated.lock().unwrap().hidden_builtin_names().len(), 1);
+        let eager = build(&["tool_search".into()]);
+        assert!(eager.contains("**catalog_probe**"));
+        assert!(!eager.contains("catalog_probe - "));
+        assert!(!eager.contains("tool_search"));
+        let excluded = build(&["tool_search".into(), "catalog_probe".into()]);
+        assert!(!excluded.contains("catalog_probe"));
+        let search = crate::tools::ToolSearchTool::for_builtin_schemas(Arc::clone(&activated));
+        let result = search
+            .execute(serde_json::json!({"query": "select:catalog_probe"}))
+            .await
+            .unwrap();
+        assert!(result.output.contains("\"name\": \"catalog_probe\""));
+        let selected = build(&[]);
+        assert!(selected.contains(&format!(
+            "**catalog_probe**: {}\nParameters: `{}`\n",
+            tools[1].description(),
+            tools[1].parameters_schema()
+        )));
+        assert!(!selected.contains("catalog_probe - "));
+    }
+
     #[test]
     fn turn_prompt_budget_applies_after_deferred_and_thinking_sections() {
         use zeroclaw_config::schema::{RiskProfileConfig, SkillsPromptInjectionMode};
@@ -16268,6 +17394,7 @@ Let me check the result."#;
             None, // event_tx
             false,
             zeroclaw_config::schema::StreamReasoningMode::Status,
+            None,
         )
         .await
         .expect("streaming should succeed");
@@ -16363,6 +17490,7 @@ Let me check the result."#;
             None, // event_tx
             false,
             zeroclaw_config::schema::StreamReasoningMode::Status,
+            None,
         )
         .await
         .expect("streaming should succeed");
@@ -19146,10 +20274,10 @@ Let me check the result."#;
             None,
         )
         .await;
-        let live_config = Arc::new(parking_lot::RwLock::new(config.clone()));
+        let live_config = zeroclaw_config::live::LiveConfig::new(config.clone());
         let live_result = super::process_message_with_live_config(
             config,
-            live_config,
+            live_config.handle(),
             "process-message-reassembly-agent",
             "hello",
             Some("session"),
@@ -19300,16 +20428,16 @@ Let me check the result."#;
         std::fs::create_dir_all(config.agent_workspace_dir("live-file-download-agent"))
             .expect("agent workspace directory");
 
-        let live_config = Arc::new(RwLock::new(config.clone()));
+        let live_config = zeroclaw_config::live::LiveConfig::new(config.clone());
+        let mut reloaded = live_config.snapshot();
+        reloaded.file_download.allowed_private_hosts.clear();
         live_config
-            .write()
-            .file_download
-            .allowed_private_hosts
-            .clear();
+            .publish(live_config.next_revision().unwrap(), reloaded)
+            .unwrap();
 
         let result = super::process_message_with_live_config(
             config.clone(),
-            live_config,
+            live_config.handle(),
             "live-file-download-agent",
             "download the private document",
             Some("session"),
@@ -19721,6 +20849,177 @@ Let me check the result."#;
 
         let events = capturing.events.lock();
         assert_all_events_share_turn_id(&events, Some("test-agent"), Some("cli"));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn concurrent_session_scopes_correlate_provider_traces_in_logs() {
+        use crate::hooks::{HookHandler, HookResult, HookRunner};
+
+        struct InterleaveRequests(tokio::sync::Barrier);
+
+        #[async_trait]
+        impl HookHandler for InterleaveRequests {
+            fn name(&self) -> &str {
+                "interleave-requests"
+            }
+
+            async fn before_llm_call(
+                &self,
+                _messages: &mut Vec<ChatMessage>,
+                _model: &mut String,
+            ) -> HookResult<()> {
+                self.0.wait().await;
+                HookResult::Continue(())
+            }
+        }
+
+        async fn run_session(session_key: &str, turn_id: &str, hooks: &HookRunner) {
+            let invocations = Arc::new(AtomicUsize::new(0));
+            let model_provider = ScriptedModelProvider::from_text_responses(vec![
+                r#"<tool_call>
+{"name":"count_tool","arguments":{"value":"X"}}
+</tool_call>"#,
+                "done",
+            ]);
+            let tools_registry =
+                crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+                    CountingTool::new("count_tool", Arc::clone(&invocations)),
+                )]);
+            let mut history = vec![ChatMessage::system("test"), ChatMessage::user("hello")];
+            let result = scope_session_key(
+                Some(session_key.to_string()),
+                run_tool_call_loop(ToolLoop {
+                    parent_agent_alias: None,
+                    served_route_sink: None,
+                    sop_reassembly: None,
+                    exec: ResolvedAgentExecution {
+                        model_access: ResolvedModelAccess {
+                            model_provider: &model_provider,
+                            provider_name: "mock-provider",
+                            model: "mock-model",
+                            dispatch_model: "mock-model",
+                            temperature: Some(0.0),
+                        },
+                        tools_registry: &tools_registry,
+                        observer: &NoopObserver,
+                        silent: true,
+                        approval: None,
+                        multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                        config: None,
+                        max_tool_iterations: 10,
+                        hooks: Some(hooks),
+                        excluded_tools: &[],
+                        dedup_exempt_tools: &[],
+                        activated_tools: None,
+                        model_switch_callback: None,
+                        pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                        strict_tool_parsing: false,
+                        parallel_tools: false,
+                        max_tool_result_chars: 0,
+                        context_limits: test_context_limits(0),
+                        context_limits_resolver: None,
+                        receipt_generator: None,
+                        knobs: &LoopKnobs::default(),
+                        security: None,
+                    },
+                    history: &mut history,
+                    history_has_trim_breadcrumb: &mut false,
+                    injected_memory_preamble: &mut None,
+                    channel_name: "cli",
+                    channel_reply_target: None,
+                    cancellation_token: None,
+                    on_delta: None,
+                    shared_budget: None,
+                    channel: None,
+                    collected_receipts: None,
+                    event_tx: None,
+                    steering: None,
+                    new_messages_out: None,
+                    image_cache: None,
+                    memory: None,
+                    ingress: IngressContext::sub_turn(),
+                    agent_alias: Some("test-agent"),
+                    turn_id,
+                }),
+            )
+            .await
+            .expect("tool loop should succeed");
+            assert_eq!(result, "done");
+            assert_eq!(invocations.load(Ordering::SeqCst), 1);
+        }
+
+        fn assert_correlations(records: &[serde_json::Value], traces: &[String; 2]) {
+            for (trace, session) in traces.iter().zip(["conversation-a", "conversation-b"]) {
+                for message in ["llm_request", "llm_response"] {
+                    let events: Vec<_> = records
+                        .iter()
+                        .filter(|record| {
+                            record["trace_id"].as_str() == Some(trace.as_str())
+                                && record["message"].as_str() == Some(message)
+                        })
+                        .collect();
+                    assert_eq!(events.len(), 2, "both iterations must emit {message}");
+                    for event in events {
+                        assert_eq!(event["zeroclaw"]["session_key"].as_str(), Some(session));
+                    }
+                }
+            }
+        }
+
+        // The capture pipeline and writer are process-global. Keep other log
+        // tests from changing their configuration while these turns interleave.
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut rx = zeroclaw_log::subscribe_or_install();
+        let tmp = tempfile::tempdir().expect("create log workspace");
+        let cfg = zeroclaw_log::LogConfig {
+            log_persistence: "full".into(),
+            ..Default::default()
+        };
+        zeroclaw_log::init_from_config(&cfg, tmp.path());
+        let _reset_writer = scopeguard::guard((), |_| {
+            zeroclaw_log::init_from_config(
+                &zeroclaw_log::LogConfig {
+                    log_persistence: "none".into(),
+                    ..Default::default()
+                },
+                tmp.path(),
+            );
+        });
+        let mut hooks = HookRunner::new();
+        hooks.register(Box::new(InterleaveRequests(tokio::sync::Barrier::new(2))));
+        let traces = [
+            uuid::Uuid::new_v4().to_string(),
+            uuid::Uuid::new_v4().to_string(),
+        ];
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(
+                run_session("conversation-a", &traces[0], &hooks),
+                run_session("conversation-b", &traces[1], &hooks),
+            );
+        })
+        .await
+        .expect("interleaved turns should complete");
+
+        let mut broadcast_records = Vec::new();
+        while let Ok(record) = rx.try_recv() {
+            broadcast_records.push(record);
+        }
+        assert_correlations(&broadcast_records, &traces);
+
+        zeroclaw_log::flush_for_test().expect("flush runtime trace");
+        let persisted = std::fs::read_to_string(
+            zeroclaw_log::runtime_trace_path().expect("runtime trace path"),
+        )
+        .expect("read runtime trace");
+        let persisted_records: Vec<serde_json::Value> = persisted
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("valid trace JSON"))
+            .collect();
+        assert_correlations(&persisted_records, &traces);
     }
 
     #[tokio::test]
@@ -21329,7 +22628,10 @@ Let me check the result."#;
                 event_tx: Some(event_tx),
                 steering: None,
                 new_messages_out: None,
-                image_cache: Some(&mut image_cache),
+                image_cache: Some(crate::agent::turn::ToolLoopImageState {
+                    cache: &mut image_cache,
+                    provider_state: &mut crate::agent::turn::ProviderImageState::default(),
+                }),
                 memory: None,
                 ingress: IngressContext::sub_turn(),
                 agent_alias: None,

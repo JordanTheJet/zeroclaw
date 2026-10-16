@@ -21,7 +21,7 @@ section.
 
 ## Built-in tools
 
-A minimal build ships with:
+Built-in tools include the following. This list is not the core set; see [Tiers and the retained core set](../developing/tool-inventory.md#tiers-and-the-retained-core-set) for the core set and the tier of each tool the runtime registry builds.
 
 | Tool | What it does |
 |---|---|
@@ -75,6 +75,14 @@ Conditionally registered:
 | Hardware probes | `--features hardware`: GPIO reads/writes, device discovery, firmware flashing |
 | `sop_*` tools | Registered when the SOP runtime is enabled (`sop.sops_dir` set to a non-empty value; unset by default, which disables it; the documented value is `shared/sops`): run and inspect SOPs |
 | `discord_search` | Registered when a Discord alias has `archive` enabled |
+
+## Built-in schema discovery
+
+Enable `deferred_builtin_tools` on the agent's runtime profile through the ZeroCode Config editor to reduce the built-in tool catalog sent to the model. It defaults to `false`, which preserves eager schema loading. The setting is independent of MCP's `deferred_loading` option.
+
+When enabled, permitted `shell`, `file_read`, `file_write`, `file_edit`, `memory_recall`, and `memory_store` schemas remain visible. Other enabled built-ins appear in a compact discovery list. The model uses `tool_search` with keywords or `select:<tool_name>` to retrieve full definitions. Selected schemas appear in subsequent native-tool requests; text providers receive the definition in the search result.
+
+Discovery never grants permission or changes tool approval. Agent policy, principal restrictions, and caller allowlists still apply, including after a session narrows its tools. Built-in executables stay in the existing scoped registry, so memory routing does not retain a separate stale tool instance. If policy does not admit `tool_search`, remaining built-in schemas stay eager. Tool-listing endpoints still list the complete admitted registry.
 
 ## Extension protocols
 

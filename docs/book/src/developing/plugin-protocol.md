@@ -253,6 +253,15 @@ without `Content-Length` cannot force ZeroClaw to buffer an oversized archive.
 Extraction is also capped, so a compressed archive cannot expand without bound
 in the temporary install area.
 
+Registry requests are bounded in time. Connecting to the registry or archive
+host may take at most 10 seconds, and a response may go at most 30 seconds
+without delivering data, both before its headers arrive and between reads of
+its body. Fetching the index must finish within 30 seconds, and downloading an
+archive within 30 minutes. A stalled registry or archive host therefore fails
+`zeroclaw plugin search` or `zeroclaw plugin install` instead of leaving it
+waiting, while a slow archive download that keeps delivering data is limited
+only by the 30-minute bound.
+
 Search is unauthenticated discovery. Install is the security boundary: registry
 installs use the configured plugin signature policy and trusted publisher keys,
 the same as local plugin installs through `PluginHost::install`.
@@ -664,6 +673,24 @@ connection is an invalid request. The properties a profile references are
 host-only: `secrets.get` returns `access-denied` for them, so the plugin never
 holds the private key it authenticates with.
 
+The host builds each connection's TLS configuration when that connection
+opens, from the configuration revision of the service frame that opens it, and
+the connection owns it. The frame's transient material is paired only with an
+authorization derived from matching canonical configuration inputs. If policy,
+profile references, or material changes between those views (including while
+DNS is pending), opening the connection fails closed rather than combining
+revisions. The comparison covers the instance's whole configuration entry (its
+grants, its TLS profiles, and every config value) and the deployment's NAT64
+prefixes and connection limit, so any such edit made while a frame runs fails
+that frame's later connections that use a custom CA or client identity. A
+later frame resolves rotated material; already-open connections are unchanged. Egress grants remain checked on each request, so a removed
+profile or grant refuses the next connection. System roots are the exception: a profile that keeps them,
+and a connection without a profile, use the roots plugin HTTPS trusts, which
+are read once per process. A connection that is already open keeps the
+identity it presented in its handshake until it is dropped or closed. Dropping
+it, or cancelling the call that is still opening it, releases the
+configuration together with the connection lease.
+
 ### Per-plugin config (`__config` and `config.get`)
 
 **Permission:** `config_read`
@@ -770,6 +797,15 @@ list` reports the same gap as a standing diagnostic. Declare the destinations
 your code actually contacts, and treat a growing declaration as something every
 operator has to approve on every upgrade.
 
+A channel instance's row is created when an operator binds its alias, with
+`zeroclaw plugin bind <package> --channel-alias <alias>` or with
+`zeroclaw plugin install <source> --channel-alias <alias>`, and the declaration
+is seeded into it only on an explicit `--egress declared`. `--egress none`
+binds with an empty grant instead, and a bind that would create the row with
+neither flag refuses and lists your declared hosts. For a channel instance the
+declaration counts with `websocket_client` or `socket_client` as well as
+`http_client`.
+
 If reinstall finds an unsupported pre-typed-config row keyed by the package
 name, install refuses before creating the derived `zpi1_…` row and prints the
 same ordered update steps as `plugin list`. The package install rolls back and
@@ -821,8 +857,11 @@ The five bounds are operator-tunable and every value is validated as non-zero:
 (default 100,000), and `plugins.limits.max_instances` (default 64). A store can
 only be built with explicit limits, so no load path can construct an
 unsandboxed plugin. Guest `wasi:http` request options may end a call sooner but
-cannot extend the host deadline. An interrupted warm store is never resumed:
-channels recreate it from host-owned inputs on the next call, while memory
+cannot extend the host deadline. An interrupted warm store is never resumed,
+and a channel never reuses a store whose call trapped: channels recreate the
+instance from host-owned inputs on the next call, waiting when traps and
+missed deadlines, other than in approval and choice prompts, outrun a rebuild
+budget of three at once and one per five minutes after that, while memory
 instances remain unavailable until their owner rebuilds them. The canonical
 fields and defaults live in the
 [Config reference](../reference/index.md).
@@ -932,23 +971,26 @@ cp -r my-plugin/ ~/.zeroclaw/plugins/my-plugin/
 ## Configuration
 
 Operator values currently enter through generic string-map storage: edit
-`[[plugins.entries]]` in TOML, or use `zeroclaw config set` after a tool install
-has seeded its default-binding entry. `zeroclaw plugin info <package>` prints
-the same tool key for migration and later edits. These automatic print and seed
-surfaces are tool-only. A channel key depends on its configured alias, which
-install and info do not own. The alias-aware construction that resolves a
-channel's typed config from that configured alias landed in
-[#10146](https://github.com/zeroclaw-labs/zeroclaw/pull/10146); automatic
-display and install-time seeding of the channel key remain manual until the
-grant ceremony in
-[#9584](https://github.com/zeroclaw-labs/zeroclaw/pull/9584), so a channel-only
-package still cannot complete this migration through install and info alone.
+`[[plugins.entries]]` in TOML, or use `zeroclaw config set` once the instance's
+entry exists. A tool install seeds its default-binding entry. A channel key
+depends on its configured alias, so a channel instance's entry is seeded when
+that alias is bound, by `zeroclaw plugin bind <package> --channel-alias <alias>`
+or by `zeroclaw plugin install <source> --channel-alias <alias>`. The
+alias-aware construction that resolves a channel's typed config from that
+configured alias landed in
+[#10146](https://github.com/zeroclaw-labs/zeroclaw/pull/10146).
+`zeroclaw plugin info <package>` prints every key the package owns, for
+migration and later edits: the tool binding's, and one per bound alias when the
+installed version owns instance state and an instance can be named by that
+alias. Each such bound alias also gets that instance's readiness, with or
+without a key line: required keys set or missing, the config and egress
+verdicts, and whether the runtime will admit it.
 Schema-driven forms and inline field help are not
 implemented yet. The current surfaces are:
 
 - **The CLI** handles plugin lifecycle with `list`, `search`, `install`,
-  `remove`, `info`, and `migrate`. `zeroclaw config set` writes individual raw
-  plugin values; it does not interpret the plugin's schema.
+  `bind`, `remove`, `info`, and `migrate`. `zeroclaw config set` writes
+  individual raw plugin values; it does not interpret the plugin's schema.
 - **zerocode** can edit ZeroClaw's static plugin-host settings, but does not yet
   generate per-plugin fields from `config_schema`.
 - **The web gateway** is read-only for plugins: `GET /api/plugins` reports the
