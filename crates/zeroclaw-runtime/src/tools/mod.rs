@@ -2586,12 +2586,32 @@ fn all_tools_with_runtime_on_thread(
     })
 }
 
+/// Why [`claim_plugin_tool_name`] refused a guest-declared tool name.
+#[cfg(feature = "plugins-wasm")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PluginToolNameRefusal {
+    /// A tool this registry build already registered holds the name.
+    Taken,
+    /// The name contains the MCP separator, so it can match an MCP tool's
+    /// `<server>__<tool>` name, which registers only after plugin tools.
+    McpNamespace,
+}
+
+/// Claim a guest-declared tool name for a plugin tool. A refused name
+/// reserves nothing.
 #[cfg(feature = "plugins-wasm")]
 fn claim_plugin_tool_name(
     registered_names: &mut std::collections::HashSet<String>,
     plugin_name: &str,
-) -> bool {
-    registered_names.insert(plugin_name.to_string())
+) -> Result<(), PluginToolNameRefusal> {
+    if plugin_name.contains(zeroclaw_tools::mcp_client::MCP_TOOL_NAME_SEPARATOR) {
+        return Err(PluginToolNameRefusal::McpNamespace);
+    }
+    if registered_names.insert(plugin_name.to_string()) {
+        Ok(())
+    } else {
+        Err(PluginToolNameRefusal::Taken)
+    }
 }
 
 /// Construct and register every tool-plugin instance the activation plan
@@ -2681,19 +2701,43 @@ fn register_plugin_tools(
         );
         match tool {
             Ok(tool) => {
-                if !claim_plugin_tool_name(registered_names, tool.name()) {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Load)
+                match claim_plugin_tool_name(registered_names, tool.name()) {
+                    Ok(()) => {}
+                    Err(PluginToolNameRefusal::Taken) => {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Load
+                            )
                             .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                             .with_attrs(::serde_json::json!({
                                 "plugin": manifest.name,
                                 "tool": tool.name(),
                                 "error_key": "plugin_tool_name_conflict",
                             })),
-                        "Plugin tool conflicts with an already registered tool"
-                    );
-                    continue;
+                            "Plugin tool conflicts with an already registered tool"
+                        );
+                        continue;
+                    }
+                    Err(PluginToolNameRefusal::McpNamespace) => {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Load
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "plugin": manifest.name,
+                                "tool": tool.name(),
+                                "error_key": "plugin_tool_name_reserved",
+                            })),
+                            "Plugin tool name contains the MCP separator `__`, which \
+                             only MCP tool names may use"
+                        );
+                        continue;
+                    }
                 }
                 tool_arcs.push(Arc::new(tool));
                 registered_count += 1;
@@ -3608,7 +3652,7 @@ permissions = ["http_client"]
             std::collections::HashSet::from(["shell".to_string(), PipelineTool::NAME.to_string()]);
         let accepted = ["shell", PipelineTool::NAME, "novel-tool", "novel-tool"]
             .into_iter()
-            .filter(|name| claim_plugin_tool_name(&mut registered_names, name))
+            .filter(|name| claim_plugin_tool_name(&mut registered_names, name).is_ok())
             .collect::<Vec<_>>();
 
         assert_eq!(accepted, vec!["novel-tool"]);
@@ -3619,6 +3663,41 @@ permissions = ["http_client"]
                 PipelineTool::NAME.to_string(),
                 "novel-tool".to_string(),
             ])
+        );
+    }
+
+    /// MCP tool names are not registered yet when plugin tools claim theirs,
+    /// so the separator itself is refused rather than any particular name.
+    #[cfg(feature = "plugins-wasm")]
+    #[test]
+    fn plugin_tool_names_in_the_mcp_namespace_are_refused() {
+        let mut registered_names = std::collections::HashSet::new();
+
+        for name in [
+            "filesystem__read_file",
+            "__leading",
+            "trailing__",
+            "a__b__c",
+        ] {
+            assert_eq!(
+                claim_plugin_tool_name(&mut registered_names, name),
+                Err(PluginToolNameRefusal::McpNamespace),
+                "`{name}` contains the MCP separator"
+            );
+        }
+        assert!(
+            registered_names.is_empty(),
+            "a refused name must reserve nothing: {registered_names:?}"
+        );
+
+        // A single underscore is an ordinary name character.
+        assert_eq!(
+            claim_plugin_tool_name(&mut registered_names, "redact_text"),
+            Ok(())
+        );
+        assert_eq!(
+            claim_plugin_tool_name(&mut registered_names, "redact_text"),
+            Err(PluginToolNameRefusal::Taken)
         );
     }
 
@@ -3730,6 +3809,18 @@ permissions = ["http_client"]
         host: &Arc<zeroclaw_plugins::host::PluginHost>,
         reserved: &[&str],
     ) -> Vec<String> {
+        run_tool_plugin_loader(config, host, reserved).0
+    }
+
+    /// Run the production tool loader once and report, each in sorted order,
+    /// the packages whose guest construction it entered and the names of the
+    /// tools it registered.
+    #[cfg(feature = "plugins-wasm")]
+    fn run_tool_plugin_loader(
+        config: &Config,
+        host: &Arc<zeroclaw_plugins::host::PluginHost>,
+        reserved: &[&str],
+    ) -> (Vec<String>, Vec<String>) {
         let (resolver, probed) = recording_resolver(host);
         let state_dir = tempfile::tempdir().expect("plugin state dir");
         let services = zeroclaw_plugins::services::PluginHostServices::new(
@@ -3752,7 +3843,12 @@ permissions = ["http_client"]
         );
         let mut probed = probed.lock().unwrap().clone();
         probed.sort();
-        probed
+        let mut registered: Vec<String> = tool_arcs
+            .iter()
+            .map(|tool| tool.name().to_string())
+            .collect();
+        registered.sort();
+        (probed, registered)
     }
 
     /// A plugin whose name already belongs to a native, reserved, or
@@ -3804,6 +3900,107 @@ permissions = ["http_client"]
         let probed = tool_packages_reaching_construction(&config, &host, &[]);
 
         assert_eq!(probed, vec!["alpha".to_string(), "beta".to_string()]);
+    }
+
+    /// Build the in-tree tool fixture with `features` and return its component
+    /// bytes. Each variant gets its own target directory, so building one
+    /// cannot overwrite another's artifact, and the nested Cargo invocation
+    /// does not contend with this test process's build lock.
+    #[cfg(feature = "plugins-wasm-cranelift")]
+    fn tool_fixture_component(variant: &str, features: &[&str]) -> Vec<u8> {
+        let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let fixture_dir = manifest_dir.join("../zeroclaw-plugins/tests/fixtures/tool-fixture");
+        let target_dir = std::env::var_os("CARGO_TARGET_DIR")
+            .map_or_else(
+                || manifest_dir.join("../../target"),
+                std::path::PathBuf::from,
+            )
+            .join(format!("tool-plugin-fixture-{variant}"));
+        let mut cargo = std::process::Command::new(env!("CARGO"));
+        cargo
+            .current_dir(&fixture_dir)
+            .args([
+                "build",
+                "--locked",
+                "--quiet",
+                "--package",
+                "zeroclaw-tool-plugin-fixture",
+                "--target",
+                "wasm32-wasip2",
+                "--target-dir",
+            ])
+            .arg(&target_dir);
+        if !features.is_empty() {
+            cargo.arg("--features").arg(features.join(","));
+        }
+        let status = cargo
+            .status()
+            .expect("run Cargo for the tool component fixture");
+        assert!(
+            status.success(),
+            "tool fixture must build; install the wasm32-wasip2 target"
+        );
+        std::fs::read(target_dir.join("wasm32-wasip2/debug/zeroclaw_tool_plugin_fixture.wasm"))
+            .expect("tool fixture WASM was produced")
+    }
+
+    /// Lay out a loadable tool package the way `zeroclaw plugin install` does.
+    #[cfg(feature = "plugins-wasm-cranelift")]
+    fn install_tool_component(root: &std::path::Path, name: &str, component: &[u8]) {
+        let package_dir = root.join(name);
+        std::fs::create_dir_all(&package_dir).unwrap();
+        std::fs::write(
+            package_dir.join("manifest.toml"),
+            format!(
+                "name = \"{name}\"\nversion = \"0.1.0\"\nwasm_path = \"plugin.wasm\"\ncapabilities = [\"tool\"]\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(package_dir.join("plugin.wasm"), component).unwrap();
+    }
+
+    /// MCP tools register as `<server>__<tool>` after plugin registration, so
+    /// no reserved name can stand in for them when plugins load. A guest that
+    /// declares such a name must still not be registered, or it would sit
+    /// ahead of the real MCP tool in first-match dispatch and receive its
+    /// calls.
+    ///
+    /// Both packages run the same real component, so the one with the
+    /// ordinary name is the control: it shows the guests load and register
+    /// through this path, and that only the MCP-shaped name is refused.
+    #[cfg(feature = "plugins-wasm-cranelift")]
+    #[test]
+    fn colliding_plugin_tool_in_the_mcp_namespace_is_not_registered() {
+        let plugins = TempDir::new().unwrap();
+        install_tool_component(
+            plugins.path(),
+            "echo-tool",
+            &tool_fixture_component("default", &[]),
+        );
+        install_tool_component(
+            plugins.path(),
+            "mcp-shaped-tool",
+            &tool_fixture_component("namespace-mcp-tool", &["namespace-mcp-tool"]),
+        );
+
+        let host =
+            Arc::new(zeroclaw_plugins::host::PluginHost::from_plugins_dir(plugins.path()).unwrap());
+        let config = plugin_activation_config(plugins.path());
+
+        // Nothing is reserved: the MCP server that would own the name has not
+        // registered when plugins load.
+        let (constructed, registered) = run_tool_plugin_loader(&config, &host, &[]);
+
+        assert_eq!(
+            constructed,
+            vec!["echo-tool".to_string(), "mcp-shaped-tool".to_string()],
+            "both guests must be constructed so their declared names are known"
+        );
+        assert_eq!(
+            registered,
+            vec!["config-echo".to_string()],
+            "a plugin tool named like an MCP tool must not be registered"
+        );
     }
 
     /// A mixed channel/tool/skill candidate set that exceeds the shared

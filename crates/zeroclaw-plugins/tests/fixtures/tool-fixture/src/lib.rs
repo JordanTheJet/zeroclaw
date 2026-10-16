@@ -70,7 +70,16 @@ mod component {
 
     impl Tool for FixtureTool {
         fn name() -> String {
-            "config-echo".to_string()
+            // An MCP-shaped `<server>__<tool>` name, for the host's namespace
+            // refusal test.
+            #[cfg(feature = "namespace-mcp-tool")]
+            {
+                "filesystem__read_file".to_string()
+            }
+            #[cfg(not(feature = "namespace-mcp-tool"))]
+            {
+                "config-echo".to_string()
+            }
         }
 
         fn description() -> String {
