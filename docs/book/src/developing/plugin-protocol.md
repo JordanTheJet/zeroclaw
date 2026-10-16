@@ -673,6 +673,24 @@ connection is an invalid request. The properties a profile references are
 host-only: `secrets.get` returns `access-denied` for them, so the plugin never
 holds the private key it authenticates with.
 
+The host builds each connection's TLS configuration when that connection
+opens, from the configuration revision of the service frame that opens it, and
+the connection owns it. The frame's transient material is paired only with an
+authorization derived from matching canonical configuration inputs. If policy,
+profile references, or material changes between those views (including while
+DNS is pending), opening the connection fails closed rather than combining
+revisions. The comparison covers the instance's whole configuration entry (its
+grants, its TLS profiles, and every config value) and the deployment's NAT64
+prefixes and connection limit, so any such edit made while a frame runs fails
+that frame's later connections that use a custom CA or client identity. A
+later frame resolves rotated material; already-open connections are unchanged. Egress grants remain checked on each request, so a removed
+profile or grant refuses the next connection. System roots are the exception: a profile that keeps them,
+and a connection without a profile, use the roots plugin HTTPS trusts, which
+are read once per process. A connection that is already open keeps the
+identity it presented in its handshake until it is dropped or closed. Dropping
+it, or cancelling the call that is still opening it, releases the
+configuration together with the connection lease.
+
 ### Per-plugin config (`__config` and `config.get`)
 
 **Permission:** `config_read`
@@ -1020,3 +1038,47 @@ These delegate to the `zeroclaw-plugins` crate features
 up `wasmtime`. The load path keys off whether the Cranelift compiler is in the
 build, as described under WASI Component Host. Read the feature comments in the
 workspace `Cargo.toml` for the authoritative descriptions.
+
+### Interrupted installation recovery
+
+`zeroclaw plugin remove <name>` can recover an unloaded, empty or structurally
+incomplete package directory that holds only what an install writes: a
+manifest naming that package, the component file at `wasm_path` with the
+folders on its way, and, for a skill plugin, a `skills/` tree of folders and
+files. Signature-policy refusals, healthy packages, loaded aliases, symlinks,
+uninspectable contents, and directories holding anything else remain
+protected. Recovery claims a single directory generation before admission and
+deletion; it never uses a stale verdict to recursively delete a replacement at
+the package name.
+
+Install and recovery coordinate through a persistent hidden OS lock under the
+plugins root. Only install and remove open that root and its lock, so a host
+that only discovers plugins, such as one the daemon keeps, holds nothing in the
+plugins directory. On Windows an open root pins the plugins directory and its
+ancestors against rename until its host drops. A process that cannot take the
+lock within 60 seconds gives up and names the lock file. Any account that can
+read that file can hold the lock, and where the operating system or filesystem
+offers no file locking, install and remove refuse. New staging directories use
+unique generations and an OS-held lease, rather than a PID as ownership
+evidence. Recovery cleans an abandoned protocol stage only while recovering an
+actual final package, or while finishing the delete of one an earlier remove
+had judged. Legacy PID-only stages without proof of abandonment are retained
+and their paths are printed; they do not prevent a new install from using fresh
+staging.
+
+A refused claimed package is restored without overwriting a concurrent
+occupant. If restoration cannot complete, the error names its retained hidden
+transaction location. Preserve that directory, resolve the reported conflict,
+and retry `plugin remove`: retry restores the package before applying normal
+admission policy. A claim whose delete had begun is marked, and a retry
+finishes that delete instead of restoring it. A hidden transaction is never, by its name alone, evidence
+that a healthy package can be deleted. Filesystem namespace changes and
+unsupported locking refuse recovery safely. Package moves require an atomic
+rename that refuses every existing destination, including an empty directory.
+Where the platform or filesystem cannot provide it (other Unix platforms such
+as FreeBSD, an NFS mount without no-replace support, or Linux before 3.15),
+installation and recovery refuse the move. A failed claim leaves the final
+entry unmoved. An install refused this way removes the copy it staged and
+says the move is unsupported; any other failed publication, and a failed
+restoration, retains the package in its hidden transaction and reports that
+path. No plain replacing rename is used.

@@ -785,6 +785,14 @@ jobs:
             features: plugins-wasmtime
             suite: check
             cache-key: check-plugin-backends
+          # Own leg and key: the smoke runs the `zeroclaw` binary, built
+          # without the runtime crate's test-only features. The test legs
+          # build the runtime with them and cannot share that compile, so a
+          # separate leg keeps their duration unchanged.
+          - name: plugin artifact smoke
+            features: plugins-wasm-cranelift
+            suite: smoke
+            cache-key: plugins-artifact-smoke
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -814,11 +822,11 @@ jobs:
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Check
-        if: steps.changed.outputs.run == 'true' && matrix.suite != 'runtime'
+        if: steps.changed.outputs.run == 'true' && matrix.suite != 'runtime' && matrix.suite != 'smoke'
         run: cargo check --locked -p zeroclaw-plugins --no-default-features --features ${{ matrix.features }}
       - name: Run plugin component tests
         if: steps.changed.outputs.run == 'true' && matrix.suite == 'components'
-        run: cargo test --locked -p zeroclaw-plugins --features plugins-wasm-cranelift --test channel_plugin_e2e --test egress_plugin_e2e --test tool_plugin_timeout_e2e --test reference_plugin --test reference_plugin_e2e --test tool_plugin_e2e
+        run: cargo test --locked -p zeroclaw-plugins --features plugins-wasm-cranelift --test channel_plugin_e2e --test egress_plugin_e2e --test tool_plugin_timeout_e2e --test reference_plugin --test reference_plugin_e2e --test tool_plugin_e2e --test socket_plugin_e2e --test websocket_plugin_e2e
       - name: Run plugins lib unit tests
         if: steps.changed.outputs.run == 'true' && matrix.suite == 'components'
         run: cargo test --locked -p zeroclaw-plugins --no-default-features --features plugins-wasm-cranelift --lib
@@ -840,7 +848,7 @@ jobs:
       # `cargo test` accepts only one positional TESTNAME; the harness ORs them.
       - name: Run runtime plugin admission regressions
         if: steps.changed.outputs.run == 'true' && matrix.suite == 'runtime'
-        run: 'cargo test --locked -p zeroclaw-runtime --features plugins-wasm-cranelift --lib -- plugin_runtime:: tools::tests::shared_ceiling tools::tests::repeated_loader tools::tests::auto_discover tools::tests::colliding_plugin'
+        run: 'cargo test --locked -p zeroclaw-runtime --features plugins-wasm-cranelift --lib -- plugin_runtime:: tools::tests::shared_ceiling tools::tests::repeated_loader tools::tests::auto_discover tools::tests::colliding_plugin tools::tests::plugin_tls_coherence'
       # Cross-crate activation proof. This lives in the root `zeroclaw` package
       # rather than the line above because it drives `zeroclaw-runtime`, which
       # `zeroclaw-plugins` cannot depend on without inverting the crate graph.
@@ -853,7 +861,7 @@ jobs:
       # proves a granted destination is reached and an ungranted or wrong-host
       # destination never sees a packet.
       - name: Run channel egress boundary e2e
-        if: steps.changed.outputs.run == 'true' && matrix.features == 'plugins-wasm-cranelift'
+        if: steps.changed.outputs.run == 'true' && matrix.features == 'plugins-wasm-cranelift' && matrix.suite != 'smoke'
         run: cargo test --locked --features plugins-wasm-cranelift --test channel_egress_e2e
       # Channel WebSocket lifecycle proof. A root target for the same
       # crate-graph reason as the two steps above: it drives the production
@@ -877,6 +885,41 @@ jobs:
         run: |
           cargo test --locked --features plugins-wasm-cranelift --bin zeroclaw
           cargo test --locked --features plugins-wasm-cranelift --test component -- plugin_info_cli
+      # Plugin artifact smoke. The harness takes any `zeroclaw` binary, so the
+      # release workflows can point it at a packaged archive; running it here
+      # against the feature-enabled build keeps it working between releases.
+      # It installs and executes a real tool component through the operator's
+      # commands and an agent turn, which no test above reaches. Provenance is
+      # recorded in .github/workflows/README.md.
+      - name: Verify plugin artifact smoke harness
+        if: steps.changed.outputs.run == 'true' && matrix.suite == 'smoke'
+        run: |
+          bash scripts/ci/plugin_artifact_smoke.test.sh
+          python3 scripts/ci/plugin_smoke_provider_test.py
+      - name: Run plugin artifact smoke
+        if: steps.changed.outputs.run == 'true' && matrix.suite == 'smoke'
+        run: |
+          cargo build --locked --features plugins-wasm-cranelift --bin zeroclaw
+          bash scripts/ci/build_plugin_smoke_packages.sh "$RUNNER_TEMP/plugin-smoke-packages"
+          bash scripts/ci/plugin_artifact_smoke.sh \
+            --binary target/debug/zeroclaw \
+            --expect host \
+            --packages "$RUNNER_TEMP/plugin-smoke-packages" \
+            --label "debug build / x86_64-unknown-linux-gnu"
+      # The same binary under the opposite expectation has to fail its one
+      # check, with the status reserved for a failed check. This guards the
+      # host-free expectation only; the contract tests and the run above guard
+      # the rest. Its report stays out of the job summary.
+      - name: Reject a plugin-bearing binary as host-free
+        if: steps.changed.outputs.run == 'true' && matrix.suite == 'smoke'
+        run: |
+          inverted=0
+          GITHUB_STEP_SUMMARY="" bash scripts/ci/plugin_artifact_smoke.sh \
+            --binary target/debug/zeroclaw --expect no-host || inverted=$?
+          if [ "$inverted" -ne 1 ]; then
+            echo "::error::Expected the host-free expectation to fail with status 1, got $inverted."
+            exit 1
+          fi
 
   msrv:
     name: MSRV (declared floor)
