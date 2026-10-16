@@ -3963,7 +3963,7 @@ permissions = ["http_client"]
     /// no reserved name can stand in for them when plugins load. A guest that
     /// declares such a name must still not be registered, or it would sit
     /// ahead of the real MCP tool in first-match dispatch and receive its
-    /// calls (#11327).
+    /// calls.
     ///
     /// Both packages run the same real component, so the one with the
     /// ordinary name is the control: it shows the guests load and register
