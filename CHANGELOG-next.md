@@ -6,7 +6,7 @@ ZeroClaw v0.8.6 is a plugin, identity, and runtime-ownership release spanning **
 
 Plugins now run in the release CLI: install Discord, Telegram, Matrix and ten more by name.
 
-Plus OIDC sign-in, multi-session ZeroCode, daemon-owned live config, and new providers and web search.
+Plus groundwork for OIDC sign-in, multi-session ZeroCode, daemon-owned live config, and new providers and web search.
 
 ## Highlights
 
