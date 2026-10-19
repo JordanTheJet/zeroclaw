@@ -1977,10 +1977,13 @@ async fn run_inner(
         );
 
         // ── Hardware RAG (datasheet retrieval when peripherals + datasheet_dir) ──
+        // Datasheet context describes native peripheral tools, so a
+        // supplied-only registry does not get it.
         let hardware_rag: Option<crate::rag::HardwareRag> = config
             .peripherals
             .datasheet_dir
             .as_ref()
+            .filter(|_| construction == crate::composition::RegistryConstruction::NativeCompat)
             .filter(|d| !d.trim().is_empty())
             .map(|dir| crate::rag::HardwareRag::load(&config.data_dir, dir.trim()))
             .and_then(Result::ok)
@@ -4002,10 +4005,13 @@ async fn process_message_inner(
                 principal: principal.as_ref(),
             })?;
 
+        // Datasheet context describes native peripheral tools, so a
+        // supplied-only registry does not get it.
         let hardware_rag: Option<crate::rag::HardwareRag> = config
             .peripherals
             .datasheet_dir
             .as_ref()
+            .filter(|_| construction == crate::composition::RegistryConstruction::NativeCompat)
             .filter(|d| !d.trim().is_empty())
             .map(|dir| crate::rag::HardwareRag::load(&config.data_dir, dir.trim()))
             .and_then(Result::ok)
@@ -25591,18 +25597,27 @@ mod capability_entry_point_tests {
         run_switch_child("interactive-refuse");
     }
 
-    /// Counts every chat it serves: two XML tool-call rounds for `skill_probe`,
+    /// Counts every chat it serves: two tool-call rounds for `skill_probe`,
     /// then plain text for the turn's answer and for any later request (a
     /// post-turn skill review). XML calls stay in the history text, where the
-    /// skill creator reads them.
+    /// skill creator reads them; native calls produce the `tool` messages the
+    /// skill review counts.
     struct SkillHookProvider {
         chats: Arc<std::sync::atomic::AtomicUsize>,
+        native_calls: bool,
     }
 
     const SKILL_HOOK_REPLY: &str = "skill hook turn answered";
 
     #[async_trait::async_trait]
     impl zeroclaw_api::model_provider::ModelProvider for SkillHookProvider {
+        fn capabilities(&self) -> zeroclaw_api::model_provider::ProviderCapabilities {
+            zeroclaw_api::model_provider::ProviderCapabilities {
+                native_tool_calling: self.native_calls,
+                ..Default::default()
+            }
+        }
+
         async fn chat_with_system(
             &self,
             _system_prompt: Option<&str>,
@@ -25621,16 +25636,27 @@ mod capability_entry_point_tests {
             _temperature: Option<f64>,
         ) -> anyhow::Result<zeroclaw_api::model_provider::ChatResponse> {
             let call = self.chats.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let text = if call < 2 {
-                format!(
-                    r#"<tool_call>{{"name":"skill_probe","arguments":{{"step":{call}}}}}</tool_call>"#
-                )
-            } else {
-                SKILL_HOOK_REPLY.to_string()
+            let (text, tool_calls) = match (call < 2, self.native_calls) {
+                (false, _) => (Some(SKILL_HOOK_REPLY.to_string()), Vec::new()),
+                (true, true) => (
+                    None,
+                    vec![zeroclaw_api::model_provider::ToolCall {
+                        id: format!("probe-{call}"),
+                        name: "skill_probe".into(),
+                        arguments: format!(r#"{{"step":{call}}}"#),
+                        extra_content: None,
+                    }],
+                ),
+                (true, false) => (
+                    Some(format!(
+                        r#"<tool_call>{{"name":"skill_probe","arguments":{{"step":{call}}}}}</tool_call>"#
+                    )),
+                    Vec::new(),
+                ),
             };
             Ok(zeroclaw_api::model_provider::ChatResponse {
-                text: Some(text),
-                tool_calls: Vec::new(),
+                text,
+                tool_calls,
                 usage: None,
                 reasoning_content: None,
             })
@@ -25650,7 +25676,7 @@ mod capability_entry_point_tests {
         }
     }
 
-    struct SkillHookProviders(Arc<std::sync::atomic::AtomicUsize>);
+    struct SkillHookProviders(Arc<std::sync::atomic::AtomicUsize>, bool);
 
     impl crate::composition::ProviderSource for SkillHookProviders {
         fn model_provider(
@@ -25659,6 +25685,7 @@ mod capability_entry_point_tests {
         ) -> anyhow::Result<Arc<dyn zeroclaw_api::model_provider::ModelProvider>> {
             Ok(Arc::new(SkillHookProvider {
                 chats: Arc::clone(&self.0),
+                native_calls: self.1,
             }))
         }
     }
@@ -25737,9 +25764,10 @@ mod capability_entry_point_tests {
     }
 
     /// Runs one CLI turn that makes two supplied tool calls with skill creation
-    /// and skill review both enabled. Returns (provider chats, tool executions,
-    /// skill files under the creator's directory).
-    async fn run_skill_hook_turn(native: bool) -> (usize, usize, usize) {
+    /// and skill review both enabled; `native` selects the native recipe and
+    /// `native_calls` native tool calls instead of XML ones. Returns (provider
+    /// chats, tool executions, skill files under the creator's directory).
+    async fn run_skill_hook_turn(native: bool, native_calls: bool) -> (usize, usize, usize) {
         let tmp = tempfile::TempDir::new().unwrap();
         let mut config = Config {
             data_dir: tmp.path().join("data"),
@@ -25794,7 +25822,7 @@ mod capability_entry_point_tests {
                 native,
             }),
         );
-        capabilities.providers = Arc::new(SkillHookProviders(Arc::clone(&chats)));
+        capabilities.providers = Arc::new(SkillHookProviders(Arc::clone(&chats), native_calls));
 
         let reply = tokio::time::timeout(
             std::time::Duration::from_secs(30),
@@ -25827,22 +25855,38 @@ mod capability_entry_point_tests {
     }
 
     /// A supplied-only CLI turn runs no native skill work after it answers:
-    /// no skill is written and no review asks the provider again.
+    /// no skill is written and no review asks the provider again, whichever
+    /// way the model calls tools.
     #[tokio::test]
     async fn run_supplied_only_turn_skips_post_turn_skill_creation_and_review() {
-        let (chats, executions, skills) = run_skill_hook_turn(false).await;
-        assert_eq!(executions, 2, "the turn made both supplied tool calls");
-        assert_eq!(chats, 3, "two tool rounds and the answer, with no review call");
-        assert_eq!(skills, 0, "no skill is written for a supplied-only turn");
+        for native_calls in [false, true] {
+            let (chats, executions, skills) = run_skill_hook_turn(false, native_calls).await;
+            assert_eq!(
+                executions, 2,
+                "native_calls={native_calls}: both tool calls ran"
+            );
+            assert_eq!(chats, 3, "native_calls={native_calls}: no review call");
+            assert_eq!(skills, 0, "native_calls={native_calls}: no skill written");
+        }
     }
 
-    /// The same turn with the native recipe still creates a skill and runs the
-    /// review, so the supplied-only control above is not passing vacuously.
+    /// The same turns with the native recipe still run both hooks, so the
+    /// supplied-only control above is not passing vacuously. Skill creation
+    /// reads XML calls from the history; skill review counts native tool
+    /// messages, so each hook is shown with the call style it reads.
     #[tokio::test]
     async fn run_native_compat_turn_keeps_post_turn_skill_creation_and_review() {
-        let (chats, executions, skills) = run_skill_hook_turn(true).await;
-        assert_eq!(executions, 2, "the turn made both supplied tool calls");
-        assert!(chats > 3, "the skill review asked the provider again: {chats}");
+        let (_, executions, skills) = run_skill_hook_turn(true, false).await;
+        assert_eq!(executions, 2, "the XML turn made both supplied tool calls");
         assert_eq!(skills, 1, "skill creation wrote one skill");
+        let (chats, executions, _) = run_skill_hook_turn(true, true).await;
+        assert_eq!(
+            executions, 2,
+            "the native turn made both supplied tool calls"
+        );
+        assert!(
+            chats > 3,
+            "the skill review asked the provider again: {chats}"
+        );
     }
 }

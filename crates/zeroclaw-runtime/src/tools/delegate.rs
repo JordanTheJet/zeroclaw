@@ -331,30 +331,48 @@ impl Tool for BoundedMemoryActTool {
         self.inner.spec()
     }
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        // The private constructor always supplies at least its caller. Skip
-        // exactly the final target, whose concrete tool enforces it below.
-        // Bounded policies share the root's sender tracker and the target's
-        // ceiling is no looser than its ancestors'. Check ancestor permission
-        // without charging; the concrete target guard charges that shared
-        // counter exactly once, after validating its operation arguments.
-        for policy in self
-            .policies
+        if let Some(refused) = self.ancestor_refusal() {
+            return Ok(refused);
+        }
+        self.inner.execute(args).await
+    }
+    async fn execute_with_context(
+        &self,
+        args: serde_json::Value,
+        context: &zeroclaw_api::tool::ToolExecutionContext,
+    ) -> anyhow::Result<ToolResult> {
+        if let Some(refused) = self.ancestor_refusal() {
+            return Ok(refused);
+        }
+        self.inner.execute_with_context(args, context).await
+    }
+}
+
+impl BoundedMemoryActTool {
+    /// The first ancestor refusal, if any. The private constructor always
+    /// supplies at least the caller; the final policy is the target's, which
+    /// the concrete tool enforces itself. Bounded policies share the root's
+    /// sender tracker and the target's ceiling is no looser than its
+    /// ancestors', so ancestors are checked without charging; the target guard
+    /// charges the shared counter once, after validating its arguments.
+    fn ancestor_refusal(&self) -> Option<ToolResult> {
+        self.policies
             .0
             .iter()
             .take(self.policies.0.len().saturating_sub(1))
-        {
-            if let Err(error) = policy.authorize_tool_operation(
-                zeroclaw_config::policy::ToolOperation::Act,
-                self.inner.name(),
-            ) {
-                return Ok(ToolResult {
-                    success: false,
-                    output: ToolOutput::default(),
-                    error: Some(error),
-                });
-            }
-        }
-        self.inner.execute(args).await
+            .find_map(|policy| {
+                policy
+                    .authorize_tool_operation(
+                        zeroclaw_config::policy::ToolOperation::Act,
+                        self.inner.name(),
+                    )
+                    .err()
+            })
+            .map(|error| ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(error),
+            })
     }
 }
 
@@ -690,7 +708,16 @@ impl DelegateTool {
     }
 
     /// Attach parent tools used to build sub-agent allowlist registries.
-    pub fn with_parent_tools(mut self, parent_tools: Arc<RwLock<Vec<Arc<dyn Tool>>>>) -> Self {
+    ///
+    /// The handle carries no native-memory provenance, so bounded children
+    /// treat its memory tools as unknown and keep using their stores rather
+    /// than opening the target's memory. Registries built by the runtime use
+    /// `with_owned_parent_tools`, which carries the provenance.
+    #[cfg(test)]
+    pub(crate) fn with_parent_tools(
+        mut self,
+        parent_tools: Arc<RwLock<Vec<Arc<dyn Tool>>>>,
+    ) -> Self {
         self.parent_tools = OwnedParentTools {
             tools: parent_tools,
             origins: Default::default(),
