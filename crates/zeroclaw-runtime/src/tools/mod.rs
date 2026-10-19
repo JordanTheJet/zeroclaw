@@ -624,7 +624,7 @@ pub(crate) fn register_prepared_skill_tools<T>(
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                     .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
                 &format!(
-                    "Skill tool '{}' shadows built-in tool, skipping",
+                    "Skill tool '{}' has the name of a registered native tool, skipping",
                     name(&tool)
                 )
             );
@@ -827,11 +827,17 @@ impl AllToolsResult {
 /// Supplied-only construction warms generic parsers on the existing bounded
 /// builder stack without constructing native tools or integrations.
 pub(crate) fn supplied_registry_base() -> anyhow::Result<AllToolsResult> {
-    std::thread::Builder::new()
-        .stack_size(TOOL_REGISTRY_BUILD_STACK_BYTES)
-        .spawn(warm_lazy_regexes)?
-        .join()
-        .map_err(|_| anyhow::Error::msg("tool parser warmup panicked"))?;
+    // The parsers only need warming once per process. Two first builds may
+    // both warm them; that is harmless and keeps a failed warmup retryable.
+    static WARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !WARMED.load(std::sync::atomic::Ordering::Acquire) {
+        std::thread::Builder::new()
+            .stack_size(TOOL_REGISTRY_BUILD_STACK_BYTES)
+            .spawn(warm_lazy_regexes)?
+            .join()
+            .map_err(|_| anyhow::Error::msg("tool parser warmup panicked"))?;
+        WARMED.store(true, std::sync::atomic::Ordering::Release);
+    }
     Ok(AllToolsResult::from_prebuilt_tools(Vec::new()))
 }
 

@@ -1,25 +1,27 @@
 //! A supplied-only build constructs no native integration at any eager entry
-//! point, even with MCP, peripherals and workspace skills configured.
+//! point, even with MCP, peripherals and workspace skills configured, and in
+//! native compatibility mode those native tools keep their names.
 //!
 //! Each native integration is configured with a trap that leaves evidence when
 //! it is constructed: a real stdio MCP server that writes a launch marker, a
-//! peripheral board the registered peripheral factory counts, and a workspace
-//! skill whose name appears in any prompt that loaded it. The native-recipe
-//! controls show each trap fires, so the supplied-only tests cannot pass
-//! vacuously.
+//! peripheral board the registered peripheral factory counts (and one that
+//! builds a named tool), and a workspace skill that declares a tool. The
+//! native-recipe controls show each trap fires, so the supplied-only tests
+//! cannot pass vacuously.
 
 use super::test_support::{
-    RecordingMemory, RecordingProviders, recording_capabilities,
+    PERIPHERAL_TRAP_TOOL, RecordingMemory, RecordingProviders, peripheral_trap_loads,
+    recording_capabilities, register_peripheral_trap,
 };
 use super::{
-    ProviderRequest, ProviderSource, RuntimeCapabilities, ToolRequest, ToolSource,
+    ProviderRequest, ProviderSource, RegistryConstruction, RuntimeCapabilities, ToolRequest,
+    ToolSource,
 };
 use crate::tools::Tool;
 use async_trait::async_trait;
-use parking_lot::Mutex;
-use std::collections::HashMap;
+use parking_lot::{Mutex, RwLock};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, LazyLock, Once};
+use std::sync::Arc;
 use zeroclaw_api::ingress::TurnOrigin;
 use zeroclaw_api::model_provider::{ChatRequest, ChatResponse, ModelProvider};
 use zeroclaw_api::tool::{ToolOutput, ToolResult};
@@ -30,31 +32,18 @@ use zeroclaw_config::schema::{
 
 const AGENT: &str = "trap-agent";
 const SOURCE_TOOL: &str = "trap_source_tool";
+const SOURCE_DESCRIPTION: &str = "the supplied tool";
 const REPLY: &str = "trap turn answered";
-
-static PERIPHERAL_LOADS: LazyLock<Mutex<HashMap<String, usize>>> =
-    LazyLock::new(Default::default);
-
-/// The process-wide peripheral factory counts loads of trap boards and builds
-/// nothing, so registering it cannot change any other test's registry.
-fn register_peripheral_trap() {
-    static REGISTER: Once = Once::new();
-    REGISTER.call_once(|| {
-        crate::agent::loop_::register_peripheral_tools_fn(Box::new(|config| {
-            for board in &config.boards {
-                if board.board.starts_with("native-trap-") {
-                    *PERIPHERAL_LOADS.lock().entry(board.board.clone()).or_default() += 1;
-                }
-            }
-            Box::pin(async { Ok(Vec::new()) })
-        }));
-    });
-}
 
 struct NativeTraps {
     mcp_marker: PathBuf,
+    /// Counted board: any peripheral load counts it.
     board: String,
+    /// The tool the second trap board makes the peripheral factory build.
+    peripheral_tool: String,
     skill: String,
+    /// The composed name of the tool the trap skill declares.
+    skill_tool: String,
 }
 
 impl NativeTraps {
@@ -94,28 +83,38 @@ impl NativeTraps {
 
         register_peripheral_trap();
         let board = format!("native-trap-{label}");
+        let peripheral_tool = format!("trap_gpio_{label}");
         config.peripherals.enabled = true;
-        config.peripherals.boards.push(PeripheralBoardConfig {
-            board: board.clone(),
-            ..Default::default()
-        });
+        for name in [board.clone(), format!("native-trap-tool-{peripheral_tool}")] {
+            config.peripherals.boards.push(PeripheralBoardConfig {
+                board: name,
+                ..Default::default()
+            });
+        }
 
-        let skill = format!("native-trap-skill-{label}");
+        let skill = format!("trapskill{label}");
         let skill_dir = config
             .agent_workspace_dir(AGENT)
             .join("skills")
             .join(&skill);
         std::fs::create_dir_all(&skill_dir).unwrap();
         std::fs::write(
-            skill_dir.join("SKILL.md"),
-            format!("---\nname: {skill}\ndescription: Native skill loading trap.\n---\nUse {skill}.\n"),
+            skill_dir.join("SKILL.toml"),
+            format!(
+                "[skill]\nname = \"{skill}\"\ndescription = \"Native skill loading trap.\"\n\
+                 version = \"0.1.0\"\n\n[[tools]]\nname = \"probe\"\n\
+                 description = \"Native skill tool trap.\"\nkind = \"shell\"\ncommand = \"true\"\n"
+            ),
         )
         .unwrap();
+        let skill_tool = crate::tools::skill_tool::composed_tool_name(&skill, "probe");
 
         Self {
             mcp_marker,
             board,
+            peripheral_tool,
             skill,
+            skill_tool,
         }
     }
 
@@ -124,11 +123,7 @@ impl NativeTraps {
     }
 
     fn peripheral_loads(&self) -> usize {
-        PERIPHERAL_LOADS.lock().get(&self.board).copied().unwrap_or(0)
-    }
-
-    fn skill_in(&self, prompt: &str) -> bool {
-        prompt.contains(&self.skill)
+        peripheral_trap_loads(&self.board)
     }
 }
 
@@ -172,17 +167,24 @@ fn trap_config(root: &Path) -> Config {
     config
 }
 
-struct SourceTool;
+struct SourceTool(String);
 
-zeroclaw_api::mock_tool_attribution!(SourceTool);
+impl zeroclaw_api::attribution::Attributable for SourceTool {
+    fn role(&self) -> zeroclaw_api::attribution::Role {
+        zeroclaw_api::attribution::Role::Tool(zeroclaw_api::attribution::ToolKind::Plugin)
+    }
+    fn alias(&self) -> &str {
+        &self.0
+    }
+}
 
 #[async_trait]
 impl Tool for SourceTool {
     fn name(&self) -> &str {
-        SOURCE_TOOL
+        &self.0
     }
     fn description(&self) -> &str {
-        "the one supplied tool"
+        SOURCE_DESCRIPTION
     }
     fn parameters_schema(&self) -> serde_json::Value {
         serde_json::json!({"type": "object"})
@@ -212,12 +214,20 @@ impl ToolSource for TrapTools {
     }
 
     fn tools(&self, _request: &ToolRequest<'_>) -> anyhow::Result<Vec<Box<dyn Tool>>> {
-        Ok(vec![Box::new(SourceTool)])
+        Ok(vec![Box::new(SourceTool(SOURCE_TOOL.into()))])
     }
 }
 
-/// Answers every chat and records each system prompt it was sent.
-struct PromptProvider(Arc<Mutex<Vec<String>>>);
+/// What the turn sent the provider: each system prompt, and the names of the
+/// tools each request offered.
+#[derive(Default)]
+struct Sent {
+    prompts: Vec<String>,
+    offered: Vec<Vec<String>>,
+}
+
+/// Answers every chat and records what it was sent.
+struct PromptProvider(Arc<Mutex<Sent>>);
 
 impl zeroclaw_api::attribution::Attributable for PromptProvider {
     fn role(&self) -> zeroclaw_api::attribution::Role {
@@ -232,6 +242,14 @@ impl zeroclaw_api::attribution::Attributable for PromptProvider {
 
 #[async_trait]
 impl ModelProvider for PromptProvider {
+    // Native tool calling, so each request lists the tools it offers.
+    fn capabilities(&self) -> zeroclaw_api::model_provider::ProviderCapabilities {
+        zeroclaw_api::model_provider::ProviderCapabilities {
+            native_tool_calling: true,
+            ..Default::default()
+        }
+    }
+
     async fn chat_with_system(
         &self,
         system_prompt: Option<&str>,
@@ -239,7 +257,10 @@ impl ModelProvider for PromptProvider {
         _model: &str,
         _temperature: Option<f64>,
     ) -> anyhow::Result<String> {
-        self.0.lock().push(system_prompt.unwrap_or_default().to_string());
+        let mut sent = self.0.lock();
+        sent.prompts
+            .push(system_prompt.unwrap_or_default().to_string());
+        sent.offered.push(Vec::new());
         Ok(REPLY.into())
     }
 
@@ -256,7 +277,15 @@ impl ModelProvider for PromptProvider {
             .map(|message| message.content.clone())
             .collect::<Vec<_>>()
             .join("\n");
-        self.0.lock().push(system);
+        let offered = request
+            .tools
+            .unwrap_or_default()
+            .iter()
+            .map(|tool| tool.name.clone())
+            .collect();
+        let mut sent = self.0.lock();
+        sent.prompts.push(system);
+        sent.offered.push(offered);
         Ok(ChatResponse {
             text: Some(REPLY.into()),
             tool_calls: Vec::new(),
@@ -266,7 +295,7 @@ impl ModelProvider for PromptProvider {
     }
 }
 
-struct PromptProviders(Arc<Mutex<Vec<String>>>);
+struct PromptProviders(Arc<Mutex<Sent>>);
 
 impl ProviderSource for PromptProviders {
     fn model_provider(
@@ -277,13 +306,13 @@ impl ProviderSource for PromptProviders {
     }
 }
 
-fn trap_capabilities(native: bool, prompts: &Arc<Mutex<Vec<String>>>) -> RuntimeCapabilities {
+fn trap_capabilities(native: bool, sent: &Arc<Mutex<Sent>>) -> RuntimeCapabilities {
     let mut capabilities = recording_capabilities(
         Arc::new(RecordingProviders::default()),
         Arc::new(RecordingMemory::default()),
         Arc::new(TrapTools { native }),
     );
-    capabilities.providers = Arc::new(PromptProviders(Arc::clone(prompts)));
+    capabilities.providers = Arc::new(PromptProviders(Arc::clone(sent)));
     capabilities
 }
 
@@ -291,37 +320,42 @@ fn trap_capabilities(native: bool, prompts: &Arc<Mutex<Vec<String>>>) -> Runtime
 struct Evidence {
     mcp_launched: bool,
     peripheral_loads: usize,
-    /// The prompts the turn sent, or the agent's prompt, when the entry point
-    /// produces one; `None` for entry points that only assemble a registry.
-    prompts: Option<Vec<String>>,
-    /// The assembled registry's names, for entry points that return one.
-    tools: Option<Vec<String>>,
+    /// The system prompts the turn sent, or the agent's prompt; empty for
+    /// entry points that only assemble a registry.
+    prompts: Vec<String>,
+    /// The registry's names, or for a turn every tool name it offered.
+    tools: Vec<String>,
 }
 
 impl Evidence {
-    fn skill_loaded(&self, traps: &NativeTraps) -> bool {
+    fn skill_in_prompt(&self, traps: &NativeTraps) -> bool {
         self.prompts
-            .as_ref()
-            .is_some_and(|prompts| prompts.iter().any(|prompt| traps.skill_in(prompt)))
+            .iter()
+            .any(|prompt| prompt.contains(&traps.skill))
+    }
+
+    fn has_tool(&self, name: &str) -> bool {
+        self.tools.iter().any(|tool| tool == name)
     }
 
     fn assert_supplied_only(&self, traps: &NativeTraps, entry: &str) {
-        assert!(!self.mcp_launched, "{entry}: a supplied-only build launched the MCP server");
+        assert!(
+            !self.mcp_launched,
+            "{entry}: a supplied-only build launched the MCP server"
+        );
         assert_eq!(
             self.peripheral_loads, 0,
             "{entry}: a supplied-only build loaded peripherals"
         );
         assert!(
-            !self.skill_loaded(traps),
+            !self.skill_in_prompt(traps),
             "{entry}: a supplied-only build loaded workspace skills"
         );
-        if let Some(tools) = &self.tools {
-            assert_eq!(
-                tools,
-                &[SOURCE_TOOL.to_string()],
-                "{entry}: the supplied vector is the whole registry"
-            );
-        }
+        assert_eq!(
+            self.tools,
+            [SOURCE_TOOL.to_string()],
+            "{entry}: the supplied vector is the whole registry"
+        );
     }
 }
 
@@ -330,9 +364,15 @@ async fn exercise(entry: &str, native: bool) -> (Evidence, NativeTraps, tempfile
     let root = tempfile::TempDir::new().unwrap();
     let mut config = trap_config(root.path());
     let traps = NativeTraps::arm(&mut config, root.path());
-    let prompts = Arc::new(Mutex::new(Vec::new()));
-    let capabilities = trap_capabilities(native, &prompts);
-    let (prompt_entry, tools) = match entry {
+    let sent = Arc::new(Mutex::new(Sent::default()));
+    let capabilities = trap_capabilities(native, &sent);
+    let offered = |sent: &Arc<Mutex<Sent>>| {
+        let mut names: Vec<String> = sent.lock().offered.iter().flatten().cloned().collect();
+        names.sort();
+        names.dedup();
+        names
+    };
+    let tools = match entry {
         "agent" => {
             let agent = crate::agent::agent::Agent::from_config_with_capabilities(
                 &config,
@@ -342,11 +382,12 @@ async fn exercise(entry: &str, native: bool) -> (Evidence, NativeTraps, tempfile
             )
             .await
             .expect("the agent builds");
-            prompts
-                .lock()
-                .push(agent.system_prompt_for_test().expect("the agent prompt renders"));
-            let tools = agent.tool_names().into_iter().map(str::to_string).collect();
-            (true, Some(tools))
+            sent.lock().prompts.push(
+                agent
+                    .system_prompt_for_test()
+                    .expect("the agent prompt renders"),
+            );
+            agent.tool_names().into_iter().map(str::to_string).collect()
         }
         "run" => {
             let reply = crate::agent::loop_::run_with_capabilities(
@@ -368,7 +409,7 @@ async fn exercise(entry: &str, native: bool) -> (Evidence, NativeTraps, tempfile
             .await
             .expect("the CLI turn runs");
             assert_eq!(reply, REPLY);
-            (true, None)
+            offered(&sent)
         }
         "process_message" => {
             let reply = crate::agent::loop_::process_message_with_capabilities(
@@ -384,7 +425,7 @@ async fn exercise(entry: &str, native: bool) -> (Evidence, NativeTraps, tempfile
             .await
             .expect("the message turn runs");
             assert_eq!(reply, REPLY);
-            (true, None)
+            offered(&sent)
         }
         "owned_sop" => {
             let engine = Arc::new(std::sync::Mutex::new(crate::sop::SopEngine::new(
@@ -403,12 +444,11 @@ async fn exercise(entry: &str, native: bool) -> (Evidence, NativeTraps, tempfile
             )
             .await
             .expect("the owned SOP step assembles");
-            let tools = owned
+            owned
                 .tools_registry
                 .iter()
                 .map(|tool| tool.name().to_string())
-                .collect();
-            (false, Some(tools))
+                .collect()
         }
         "independent_delegate" => {
             let config = Arc::new(config);
@@ -429,19 +469,18 @@ async fn exercise(entry: &str, native: bool) -> (Evidence, NativeTraps, tempfile
                 .independent_agentic_tools_for_target(AGENT, policy)
                 .await
                 .expect("the independent target registry builds");
-            let tools = target
+            target
                 .tools
                 .iter()
                 .map(|tool| tool.name().to_string())
-                .collect();
-            (false, Some(tools))
+                .collect()
         }
         _ => unreachable!("unknown entry point"),
     };
     let evidence = Evidence {
         mcp_launched: traps.mcp_launched(),
         peripheral_loads: traps.peripheral_loads(),
-        prompts: prompt_entry.then(|| prompts.lock().clone()),
+        prompts: sent.lock().prompts.clone(),
         tools,
     };
     (evidence, traps, root)
@@ -477,11 +516,11 @@ async fn supplied_only_independent_delegate_constructs_no_native_integration() {
     supplied_only("independent_delegate").await;
 }
 
-/// The same builds with the native recipe trip every trap that entry point
-/// can reach, so the supplied-only tests above are not passing vacuously.
+/// The same builds with the native recipe trip every trap their entry point
+/// reaches, so the supplied-only tests above are not passing vacuously.
 #[tokio::test]
 async fn native_recipe_trips_the_construction_traps() {
-    for (entry, peripherals, skills) in [
+    for (entry, peripherals, prompt) in [
         ("agent", false, true),
         ("run", true, true),
         ("process_message", true, true),
@@ -490,17 +529,199 @@ async fn native_recipe_trips_the_construction_traps() {
     ] {
         let (evidence, traps, _root) = exercise(entry, true).await;
         assert!(evidence.mcp_launched, "{entry}: the MCP trap did not fire");
+        assert!(
+            evidence.has_tool(&traps.skill_tool),
+            "{entry}: the skill tool trap did not fire: {:?}",
+            evidence.tools
+        );
+        assert!(
+            evidence.has_tool(SOURCE_TOOL),
+            "{entry}: the source tool is kept alongside native tools"
+        );
         if peripherals {
             assert!(
                 evidence.peripheral_loads > 0,
                 "{entry}: the peripheral trap did not fire"
             );
-        }
-        if skills {
             assert!(
-                evidence.skill_loaded(&traps),
-                "{entry}: the skills trap did not fire"
+                evidence.has_tool(&traps.peripheral_tool),
+                "{entry}: the peripheral tool was not offered: {:?}",
+                evidence.tools
             );
         }
+        if prompt {
+            assert!(
+                evidence.skill_in_prompt(&traps),
+                "{entry}: the skill was not in the prompt"
+            );
+        }
+    }
+}
+
+/// Assemble `source` tools in native compatibility mode with peripherals and
+/// the given skills, and a delegate parent handle.
+async fn assemble_native_compat(
+    config: &Config,
+    source: Vec<Box<dyn Tool>>,
+    skills: &[crate::skills::Skill],
+) -> (
+    crate::tools::scoped::ScopedAssembled,
+    crate::tools::DelegateParentToolsHandle,
+) {
+    let tail = 0..source.len();
+    let mut built = crate::tools::AllToolsResult::from_prebuilt_tools(source);
+    let parent: crate::tools::DelegateParentToolsHandle = Arc::new(RwLock::new(Vec::new()));
+    built.delegate_handle = Some(Arc::clone(&parent));
+    let security = Arc::new(
+        zeroclaw_config::policy::SecurityPolicy::for_agent(config, AGENT)
+            .expect("trap policy resolves"),
+    );
+    let assembled = crate::tools::scoped::ScopedToolRegistry::assemble_prepared(
+        crate::tools::scoped::ScopedAssembly {
+            config,
+            agent_alias: AGENT,
+            security: &security,
+            built,
+            skills,
+            runtime: Arc::new(crate::platform::NativeRuntime::new()),
+            caller_allowed: None,
+            connect_mcp: false,
+            connect_peripherals: true,
+            exclude_memory: false,
+            acp_delivery: false,
+            list_deferred_mcp_specs: false,
+            emit_assembly_logs: false,
+            mcp_registry: None,
+        },
+        RegistryConstruction::NativeCompat,
+        tail,
+    )
+    .await;
+    (assembled, parent)
+}
+
+/// One tool owns `name`: it is not the source tool, and the delegate's parent
+/// view holds no source tool with that name either.
+fn assert_native_owns(
+    assembled: &crate::tools::scoped::ScopedAssembled,
+    parent: &crate::tools::DelegateParentToolsHandle,
+    name: &str,
+) -> String {
+    let named: Vec<_> = assembled
+        .registry
+        .iter()
+        .filter(|tool| tool.name() == name)
+        .collect();
+    assert_eq!(named.len(), 1, "{name}: exactly one tool owns the name");
+    let found = crate::agent::tool_execution::find_tool(&assembled.registry, name)
+        .expect("the tool is registered");
+    assert_ne!(
+        found.description(),
+        SOURCE_DESCRIPTION,
+        "{name}: dispatch reaches the native tool"
+    );
+    assert!(
+        !parent
+            .read()
+            .iter()
+            .any(|tool| tool.name() == name && tool.description() == SOURCE_DESCRIPTION),
+        "{name}: the delegate's parent view holds no source tool with the name"
+    );
+    found.description().to_string()
+}
+
+/// A peripheral tool is native: a source tool with its name gives way, in the
+/// registry and in the delegate's parent view.
+#[tokio::test]
+async fn native_compat_peripheral_tool_retires_a_same_name_source_tool() {
+    let root = tempfile::TempDir::new().unwrap();
+    let mut config = trap_config(root.path());
+    let traps = NativeTraps::arm(&mut config, root.path());
+    let (assembled, parent) = assemble_native_compat(
+        &config,
+        vec![Box::new(SourceTool(traps.peripheral_tool.clone()))],
+        &[],
+    )
+    .await;
+    let description = assert_native_owns(&assembled, &parent, &traps.peripheral_tool);
+    assert_eq!(description, PERIPHERAL_TRAP_TOOL);
+}
+
+/// A skill tool is native too: a source tool with its name gives way instead
+/// of making the skill tool get skipped.
+#[tokio::test]
+async fn native_compat_skill_tool_retires_a_same_name_source_tool() {
+    let root = tempfile::TempDir::new().unwrap();
+    let mut config = trap_config(root.path());
+    let traps = NativeTraps::arm(&mut config, root.path());
+    let skills = crate::skills::load_skills_for_agent_from_config(&config, AGENT);
+    assert!(
+        skills.iter().any(|skill| skill.name == traps.skill),
+        "the trap skill loads"
+    );
+    let (assembled, parent) = assemble_native_compat(
+        &config,
+        vec![Box::new(SourceTool(traps.skill_tool.clone()))],
+        &skills,
+    )
+    .await;
+    assert_native_owns(&assembled, &parent, &traps.skill_tool);
+}
+
+/// A source vector with a repeated name keeps the first tool, in both modes.
+#[tokio::test]
+async fn duplicate_source_names_keep_the_first_tool_in_both_modes() {
+    struct Repeated;
+    impl ToolSource for Repeated {
+        fn tools(&self, _request: &ToolRequest<'_>) -> anyhow::Result<Vec<Box<dyn Tool>>> {
+            Ok(vec![
+                Box::new(SourceTool(SOURCE_TOOL.into())),
+                Box::new(SourceTool(SOURCE_TOOL.into())),
+            ])
+        }
+    }
+    let root = tempfile::TempDir::new().unwrap();
+    let config = trap_config(root.path());
+    let capabilities = recording_capabilities(
+        Arc::new(RecordingProviders::default()),
+        Arc::new(RecordingMemory::default()),
+        Arc::new(Repeated),
+    );
+    let policy = Arc::new(
+        zeroclaw_config::policy::SecurityPolicy::for_agent(&config, AGENT)
+            .expect("trap policy resolves"),
+    );
+    let runtime: Arc<dyn zeroclaw_api::runtime_traits::RuntimeAdapter> =
+        Arc::new(crate::platform::NativeRuntime::new());
+    let memory: Arc<dyn zeroclaw_api::memory_traits::Memory> =
+        Arc::new(zeroclaw_memory::NoneMemory::new("none"));
+    let tool_config = Arc::new(config.clone());
+    let request = ToolRequest {
+        config: &tool_config,
+        agent_alias: AGENT,
+        security: &policy,
+        runtime: &runtime,
+        memory: &memory,
+    };
+    for construction in [
+        RegistryConstruction::SuppliedOnly,
+        RegistryConstruction::NativeCompat,
+    ] {
+        let prepared = capabilities
+            .prepare_registry(
+                crate::tools::AllToolsResult::from_prebuilt_tools(Vec::new()),
+                construction,
+                &request,
+                None,
+            )
+            .expect("the registry prepares");
+        let names: Vec<_> = prepared
+            .built
+            .tools
+            .iter()
+            .map(|tool| tool.name())
+            .collect();
+        assert_eq!(names, [SOURCE_TOOL], "{construction:?}: one tool per name");
+        assert_eq!(prepared.supplied_tail, 0..1, "{construction:?}");
     }
 }

@@ -8878,7 +8878,7 @@ mod tests {
                     json!({"key":"first", "content":"allowed", "category":"core"}),
                 ),
                 (Forget, json!({"key":"first"})),
-                (Purge, json!({"namespace":"round4"})),
+                (Purge, json!({"namespace":"bounded"})),
             ]
             .into_iter()
             .enumerate()

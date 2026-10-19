@@ -157,9 +157,11 @@ impl RuntimeCapabilities {
     /// apply to them exactly as to runtime tools. They stay out of
     /// `unfiltered_tool_arcs`, which skill elevation resolves against, so a
     /// skill cannot raise a source tool past that filter. A source tool whose
-    /// name the selected native recipe already registered is dropped in native
-    /// compatibility mode. In supplied-only mode the complete source vector,
-    /// including an empty vector, goes through the ordinary narrowing gates.
+    /// name is already registered is dropped, and the first tool keeps the
+    /// name: in native compatibility mode that is the native recipe's tool,
+    /// and in both modes an earlier source tool wins over a later one. The
+    /// surviving source vector, including an empty one, goes through the
+    /// ordinary narrowing gates.
     pub(crate) fn prepare_registry(
         &self,
         mut built: crate::tools::AllToolsResult,
@@ -176,12 +178,16 @@ impl RuntimeCapabilities {
         let supplied = self.tools.tools(request)?;
         let start = built.tools.len();
         for tool in supplied {
-            if construction == RegistryConstruction::NativeCompat
-                && built
-                    .tools
-                    .iter()
-                    .any(|existing| existing.name() == tool.name())
+            if let Some(index) = built
+                .tools
+                .iter()
+                .position(|existing| existing.name() == tool.name())
             {
+                let kept = if index < start {
+                    "runtime tool"
+                } else {
+                    "earlier source tool"
+                };
                 ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
@@ -189,8 +195,9 @@ impl RuntimeCapabilities {
                         .with_attrs(::serde_json::json!({
                             "agent": request.agent_alias,
                             "tool": tool.name(),
+                            "kept": kept,
                         })),
-                    "tool source supplied a tool whose name the runtime already registered; keeping the runtime tool"
+                    "tool source supplied a tool whose name is already registered; keeping the first"
                 );
                 continue;
             }
@@ -530,6 +537,90 @@ pub(crate) mod test_support {
     impl ToolSource for NoTools {
         fn tools(&self, _request: &ToolRequest<'_>) -> anyhow::Result<Vec<Box<dyn Tool>>> {
             Ok(Vec::new())
+        }
+    }
+
+    // The peripheral trap serves the Unix-only construction-trap tests.
+
+    /// Description of every tool the peripheral trap factory builds.
+    #[cfg(unix)]
+    pub(crate) const PERIPHERAL_TRAP_TOOL: &str = "native peripheral trap tool";
+
+    #[cfg(unix)]
+    static PERIPHERAL_TRAP_LOADS: std::sync::LazyLock<
+        Mutex<std::collections::HashMap<String, usize>>,
+    > = std::sync::LazyLock::new(Default::default);
+
+    /// Registers the process-wide peripheral factory once. It counts each load
+    /// of a board named `native-trap-*` and, for a board named
+    /// `native-trap-tool-<name>`, builds one tool called `<name>`. Other
+    /// boards get nothing, so tests that do not use trap boards see no change.
+    #[cfg(unix)]
+    pub(crate) fn register_peripheral_trap() {
+        static REGISTER: std::sync::Once = std::sync::Once::new();
+        REGISTER.call_once(|| {
+            crate::agent::loop_::register_peripheral_tools_fn(Box::new(|config| {
+                let mut tools: Vec<Box<dyn Tool>> = Vec::new();
+                for board in &config.boards {
+                    if board.board.starts_with("native-trap-") {
+                        *PERIPHERAL_TRAP_LOADS
+                            .lock()
+                            .entry(board.board.clone())
+                            .or_default() += 1;
+                    }
+                    if let Some(name) = board.board.strip_prefix("native-trap-tool-") {
+                        tools.push(Box::new(PeripheralTrapTool(name.to_string())));
+                    }
+                }
+                Box::pin(async move { Ok(tools) })
+            }));
+        });
+    }
+
+    /// How many times the peripheral factory loaded `board`.
+    #[cfg(unix)]
+    pub(crate) fn peripheral_trap_loads(board: &str) -> usize {
+        PERIPHERAL_TRAP_LOADS
+            .lock()
+            .get(board)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    #[cfg(unix)]
+    struct PeripheralTrapTool(String);
+
+    #[cfg(unix)]
+    impl zeroclaw_api::attribution::Attributable for PeripheralTrapTool {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Tool(zeroclaw_api::attribution::ToolKind::Plugin)
+        }
+        fn alias(&self) -> &str {
+            &self.0
+        }
+    }
+
+    #[cfg(unix)]
+    #[async_trait]
+    impl Tool for PeripheralTrapTool {
+        fn name(&self) -> &str {
+            &self.0
+        }
+        fn description(&self) -> &str {
+            PERIPHERAL_TRAP_TOOL
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<zeroclaw_api::tool::ToolResult> {
+            Ok(zeroclaw_api::tool::ToolResult {
+                success: true,
+                output: PERIPHERAL_TRAP_TOOL.into(),
+                error: None,
+            })
         }
     }
 
