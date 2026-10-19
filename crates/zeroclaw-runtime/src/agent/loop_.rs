@@ -1784,20 +1784,20 @@ async fn run_inner(
             (None, None)
         };
         let all_tools_result = match selected_recipe {
-            Some(recipe) => recipe(
-                &tool_request,
-                &config.data_dir,
-                None,
+            Some(recipe) => recipe(crate::composition::NativeRecipeInputs {
+                request: &tool_request,
+                workspace_dir: &config.data_dir,
+                canvas_store: None,
                 is_subagent_caller,
-                None,
+                forwarded_environment: None,
                 sop_engine,
                 sop_audit,
-                execution_capability
+                live_config: execution_capability
                     .as_ref()
                     .map(AgentExecutionCapability::config_handle),
-                execution_capability.clone(),
-                None,
-            )?,
+                execution_capability: execution_capability.clone(),
+                acp_sessions: None,
+            })?,
             None => tools::supplied_registry_base()?,
         };
         let crate::composition::PreparedRegistry {
@@ -3863,18 +3863,18 @@ async fn process_message_inner(
             (None, None)
         };
         let all_tools_result_pm = match selected_recipe {
-            Some(recipe) => recipe(
-                &tool_request,
-                &config.data_dir,
-                None,
-                false,
-                None,
+            Some(recipe) => recipe(crate::composition::NativeRecipeInputs {
+                request: &tool_request,
+                workspace_dir: &config.data_dir,
+                canvas_store: None,
+                is_subagent_caller: false,
+                forwarded_environment: None,
                 sop_engine,
                 sop_audit,
-                live_config.clone(),
-                execution_capability.clone(),
-                None,
-            )?,
+                live_config: live_config.clone(),
+                execution_capability: execution_capability.clone(),
+                acp_sessions: None,
+            })?,
             None => tools::supplied_registry_base()?,
         };
         let crate::composition::PreparedRegistry {

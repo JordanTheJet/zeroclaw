@@ -28,6 +28,8 @@ use zeroclaw_api::tool::Tool;
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::schema::Config;
 
+use crate::tools::AllToolsResult;
+
 mod config_backed;
 #[cfg(all(test, unix))]
 mod supplied_only_traps;
@@ -312,41 +314,63 @@ pub struct ToolRequest<'a> {
     pub security: &'a Arc<SecurityPolicy>,
     /// The execution environment the runtime selected for this agent.
     pub runtime: &'a Arc<dyn RuntimeAdapter>,
-    /// The eager caller's resolved memory. In the bounded inheritance-only
-    /// selection probe this is the existing parent-registry memory handle,
-    /// not an opened target store. Selection may compare identity but must
-    /// not access the store or perform I/O.
+    /// The agent's memory as resolved for this build. During bounded
+    /// delegation's selection it is the parent registry's memory handle, not
+    /// an opened target store, so selection may only compare its identity.
+    /// Principal routing of the session's memory happens after construction
+    /// and does not reach tools a source builds on this handle.
     pub memory: &'a Arc<dyn Memory>,
 }
 
-/// Explicit native compatibility recipe. Ten typed invocation inputs retain
-/// the caller's actual ownership; a stateful source may own a captured callable.
-/// Returned tools may retain their required handles; the recipe must not retain
-/// caller lifecycle handles separately from the tools it returns.
-pub type NativeRegistryRecipe = dyn Fn(
-        &ToolRequest<'_>,
-        &std::path::Path,
-        Option<crate::tools::CanvasStore>,
-        bool,
-        Option<crate::tools::ForwardedEnvironment>,
-        Option<Arc<std::sync::Mutex<crate::sop::SopEngine>>>,
-        Option<Arc<crate::sop::SopAuditLogger>>,
-        Option<zeroclaw_config::live::LiveConfigHandle>,
-        Option<crate::live_config_authority::AgentExecutionCapability>,
-        Option<crate::tools::AcpSessionReadView>,
-    ) -> anyhow::Result<crate::tools::AllToolsResult>
-    + Send
-    + Sync
-    + 'static;
+/// What the runtime hands a native recipe when it builds an eager registry.
+///
+/// The fields are the caller's own handles for this build, not copies; a
+/// recipe may let the tools it returns keep the ones they need, but must not
+/// keep them anywhere else. The struct is `#[non_exhaustive]`: the runtime
+/// builds it, and new inputs can be added without breaking existing recipes.
+#[non_exhaustive]
+pub struct NativeRecipeInputs<'a> {
+    /// The same request the source's selection and `tools()` receive.
+    pub request: &'a ToolRequest<'a>,
+    /// The workspace directory the native tools work in.
+    pub workspace_dir: &'a std::path::Path,
+    /// The canvas store, for entry points that have one.
+    pub canvas_store: Option<crate::tools::CanvasStore>,
+    /// Whether the build is for a spawned subagent.
+    pub is_subagent_caller: bool,
+    /// Environment the caller forwards to native shell tools.
+    pub forwarded_environment: Option<crate::tools::ForwardedEnvironment>,
+    /// The SOP engine the entry point built or was given, if SOPs are on.
+    pub sop_engine: Option<Arc<std::sync::Mutex<crate::sop::SopEngine>>>,
+    /// The SOP audit log that goes with `sop_engine`.
+    pub sop_audit: Option<Arc<crate::sop::SopAuditLogger>>,
+    /// The live config handle, for tools that read the current generation.
+    pub live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
+    /// The caller's execution capability, for tools that start nested work.
+    pub execution_capability: Option<crate::live_config_authority::AgentExecutionCapability>,
+    /// A read view of ACP sessions, for entry points that serve ACP.
+    pub acp_sessions: Option<crate::tools::AcpSessionReadView>,
+}
+
+/// A native compatibility recipe: builds the native registry for one eager
+/// build. [`defaults::native_compat_registry`] is the runtime's own recipe; a
+/// source can wrap it or own a closure that keeps per-instance state.
+pub type NativeRegistryRecipe =
+    dyn Fn(NativeRecipeInputs<'_>) -> anyhow::Result<AllToolsResult> + Send + Sync + 'static;
 
 /// Supplies tool registries.
 pub trait ToolSource: Send + Sync {
-    /// Select once per build, without I/O or touching memory beyond identity.
-    /// `Ok(None)` makes `tools` the complete registry, including empty.
-    /// `Ok(Some(recipe))` explicitly selects native compatibility plus extensions.
-    /// Both selection and recipe errors are terminal. Refusal that also applies
-    /// to bounded inheritance belongs here: bounded probes never invoke a recipe.
-    /// The borrowed result is tied only to this source, never to request fields.
+    /// Chooses how the registry for `request` is built. Called once per build.
+    ///
+    /// Return `Ok(None)` (the default) to make [`ToolSource::tools`] the whole
+    /// registry, even when it is empty. Return `Ok(Some(recipe))` to have the
+    /// runtime build the native registry with `recipe` and add this source's
+    /// tools to it. An error here, or from the recipe, ends the build.
+    ///
+    /// This must not do I/O or use `request.memory` beyond comparing identity.
+    /// Bounded delegation calls only this method, never the recipe or
+    /// `tools()`, so a refusal that must also cover bounded delegation belongs
+    /// here. The returned recipe may borrow from the source, not from `request`.
     fn native_recipe<'s>(
         &'s self,
         _request: &ToolRequest<'_>,
@@ -354,10 +378,18 @@ pub trait ToolSource: Send + Sync {
         Ok(None)
     }
 
-    /// Complete supplied vector by default; native extensions only after an
-    /// explicit recipe choice. Policy/caller/context gates still narrow it.
-    /// This deliberately replaces the old implicit native augmentation contract;
-    /// return the legacy recipe to retain that previous construction behavior.
+    /// The tools this source supplies for `request`.
+    ///
+    /// Without a native recipe they are the whole registry; with one they are
+    /// added to the native tools, and a source tool whose name a native tool
+    /// already has is dropped. If two of these tools share a name, the first
+    /// is kept. Every dropped tool is logged. Either way the agent's policy,
+    /// the caller's allowlist and the memory/delivery context filters still
+    /// apply.
+    ///
+    /// The tools are built before any principal routing of the session's
+    /// memory, so a source memory tool built on `request.memory` keeps using
+    /// that handle; routing applies only to the runtime's native memory tools.
     fn tools(&self, request: &ToolRequest<'_>) -> anyhow::Result<Vec<Box<dyn Tool>>>;
 }
 

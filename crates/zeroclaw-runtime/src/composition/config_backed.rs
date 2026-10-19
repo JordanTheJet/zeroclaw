@@ -186,20 +186,24 @@ impl ToolSource for NoSuppliedTools {
     }
 }
 
-/// Explicit legacy native recipe. It consumes the actual ten typed inputs and
-/// derives only configuration facts; it never recreates policy or live authority.
+/// The runtime's native recipe: builds the native registry from the request's
+/// config with the caller's own handles. It reads configuration facts only;
+/// the policy, runtime and memory come from the request unchanged.
 pub fn native_compat_registry(
-    request: &ToolRequest<'_>,
-    workspace_dir: &std::path::Path,
-    canvas_store: Option<crate::tools::CanvasStore>,
-    is_subagent_caller: bool,
-    tui_env: Option<crate::tools::ForwardedEnvironment>,
-    sop_engine: Option<Arc<std::sync::Mutex<crate::sop::SopEngine>>>,
-    sop_audit: Option<Arc<crate::sop::SopAuditLogger>>,
-    live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
-    execution_capability: Option<crate::live_config_authority::AgentExecutionCapability>,
-    acp_sessions: Option<crate::tools::AcpSessionReadView>,
+    inputs: super::NativeRecipeInputs<'_>,
 ) -> anyhow::Result<crate::tools::AllToolsResult> {
+    let super::NativeRecipeInputs {
+        request,
+        workspace_dir,
+        canvas_store,
+        is_subagent_caller,
+        forwarded_environment: tui_env,
+        sop_engine,
+        sop_audit,
+        live_config,
+        execution_capability,
+        acp_sessions,
+    } = inputs;
     let config = request.config.as_ref();
     let risk_profile = config
         .risk_profile_for_agent(request.agent_alias)
@@ -243,7 +247,9 @@ pub fn native_compat_registry(
     )
 }
 
-/// Legacy adapter: CLI is explicitly backed by the registered application factory.
+/// The config-backed channel source. Despite its name it serves one channel:
+/// the `cli` alias, from the CLI channel factory the application registered.
+/// Every other alias is `None`; outbound channels are not routed through it.
 pub struct NoOutboundChannels;
 
 impl ChannelSource for NoOutboundChannels {

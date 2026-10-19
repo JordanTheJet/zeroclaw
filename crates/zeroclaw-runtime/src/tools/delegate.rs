@@ -1686,18 +1686,18 @@ impl DelegateTool {
             crate::composition::RegistryConstruction::SuppliedOnly
         };
         let built = match selected_recipe {
-            Some(recipe) => recipe(
-                &tool_request,
-                &target_policy.workspace_dir,
-                None,
-                false,
-                None,
-                None,
-                None,
-                self.live_config.clone(),
-                self.execution_capability.clone(),
-                None,
-            )?,
+            Some(recipe) => recipe(crate::composition::NativeRecipeInputs {
+                request: &tool_request,
+                workspace_dir: &target_policy.workspace_dir,
+                canvas_store: None,
+                is_subagent_caller: false,
+                forwarded_environment: None,
+                sop_engine: None,
+                sop_audit: None,
+                live_config: self.live_config.clone(),
+                execution_capability: self.execution_capability.clone(),
+                acp_sessions: None,
+            })?,
             None => crate::tools::supplied_registry_base()?,
         };
         let crate::composition::PreparedRegistry {
@@ -8535,29 +8535,14 @@ mod tests {
         ));
         let capture = root.clone();
         let source = Arc::new(OriginSource {
-            root_recipe: Box::new(
-                move |request: &crate::composition::ToolRequest<'_>,
-                      ws,
-                      canvas,
-                      subagent,
-                      env,
-                      sop,
-                      audit,
-                      live,
-                      capability,
-                      acp| {
-                    let built = crate::composition::defaults::native_compat_registry(
-                        request, ws, canvas, subagent, env, sop, audit, live, capability, acp,
-                    )?;
-                    *capture.lock() = Arc::downgrade(built.delegate_tool.as_ref().unwrap());
-                    Ok(built)
-                },
-            ),
-            target_recipe: Box::new(
-                |_: &crate::composition::ToolRequest<'_>, _, _, _, _, _, _, _, _, _| {
-                    panic!("bounded probe must never invoke a native recipe")
-                },
-            ),
+            root_recipe: Box::new(move |inputs: crate::composition::NativeRecipeInputs<'_>| {
+                let built = crate::composition::defaults::native_compat_registry(inputs)?;
+                *capture.lock() = Arc::downgrade(built.delegate_tool.as_ref().unwrap());
+                Ok(built)
+            }),
+            target_recipe: Box::new(|_: crate::composition::NativeRecipeInputs<'_>| {
+                panic!("bounded probe must never invoke a native recipe")
+            }),
             native_a,
             refuse_selection,
             selected: Default::default(),
@@ -9734,16 +9719,18 @@ mod tests {
             memory: &memory,
         };
         let built = crate::composition::defaults::native_compat_registry(
-            &request,
-            &security.workspace_dir,
-            None,
-            false,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
+            crate::composition::NativeRecipeInputs {
+                request: &request,
+                workspace_dir: &security.workspace_dir,
+                canvas_store: None,
+                is_subagent_caller: false,
+                forwarded_environment: None,
+                sop_engine: None,
+                sop_audit: None,
+                live_config: None,
+                execution_capability: None,
+                acp_sessions: None,
+            },
         )
         .unwrap();
         let parent = built

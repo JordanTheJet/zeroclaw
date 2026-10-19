@@ -2125,12 +2125,17 @@ impl Agent {
     ///
     /// Called once at session construction with the session owner's scope,
     /// never with a later caller's: an administrator prompting another
-    /// principal's session must not re-route that session's memory. Every
-    /// memory operation the session's tools and loop issue afterwards goes to
-    /// the backend's principal-scoped forms; a backend without private support
-    /// fails them closed. The shared operator (no owner) keeps the legacy
-    /// shared handle. Idempotent: a second call with the same owner is a no-op,
-    /// and a call with a different owner is refused.
+    /// principal's session must not re-route that session's memory. Afterwards
+    /// the agent's own memory and the runtime's native memory tools use the
+    /// backend's principal-scoped forms; a backend without private support
+    /// fails them closed. Tools a [`ToolSource`](crate::composition::ToolSource)
+    /// supplied keep the memory handle they were built with, so in a
+    /// supplied-only registry routing changes only the agent's own memory.
+    /// The shared operator (no owner) keeps the legacy shared handle.
+    ///
+    /// Idempotent: a second call with the same owner is a no-op, and a call
+    /// with a different owner is refused. Routing after a native memory tool
+    /// has run is refused and leaves the agent unchanged.
     pub fn route_memory_to_principal(
         &mut self,
         scope: zeroclaw_api::memory_traits::PrincipalScope,
@@ -3297,18 +3302,18 @@ impl Agent {
             acp_session_store.map(|store| tools::AcpSessionReadView::new(store, agent_alias));
         let tui_env = tui_env.map(Arc::new);
         let all_tools_result = match selected_recipe {
-            Some(recipe) => recipe(
-                &tool_request,
-                &security.workspace_dir,
+            Some(recipe) => recipe(crate::composition::NativeRecipeInputs {
+                request: &tool_request,
+                workspace_dir: &security.workspace_dir,
                 canvas_store,
-                false,
-                tui_env.clone(),
+                is_subagent_caller: false,
+                forwarded_environment: tui_env.clone(),
                 sop_engine,
                 sop_audit,
-                live_config.clone(),
+                live_config: live_config.clone(),
                 execution_capability,
                 acp_sessions,
-            )?,
+            })?,
             None => tools::supplied_registry_base()?,
         };
         let crate::composition::PreparedRegistry {
@@ -21859,15 +21864,13 @@ mod capability_construction_tests {
         });
         let request_memory = Arc::clone(&actual);
         let source = StatefulRecipe {
-            recipe: Box::new(
-                move |request: &ToolRequest<'_>, _, _, _, _, engine, audit, _, _, _| {
-                    assert!(Arc::ptr_eq(request.memory, &request_memory));
-                    assert!(engine.is_some());
-                    Ok(crate::tools::AllToolsResult::from_prebuilt_tools(vec![
-                        Box::new(AuditProbe(audit.unwrap())),
-                    ]))
-                },
-            ),
+            recipe: Box::new(move |inputs: crate::composition::NativeRecipeInputs<'_>| {
+                assert!(Arc::ptr_eq(inputs.request.memory, &request_memory));
+                assert!(inputs.sop_engine.is_some());
+                Ok(crate::tools::AllToolsResult::from_prebuilt_tools(vec![
+                    Box::new(AuditProbe(inputs.sop_audit.unwrap())),
+                ]))
+            }),
             refuse_selection: false,
         };
         let caps = RuntimeCapabilities {
@@ -21913,19 +21916,17 @@ mod capability_construction_tests {
         let expected_engine = Arc::downgrade(&engine);
         let expected_audit = Arc::downgrade(&audit);
         let source = StatefulRecipe {
-            recipe: Box::new(
-                move |_: &ToolRequest<'_>, _, _, _, _, engine, audit, _, _, _| {
-                    assert!(Arc::ptr_eq(
-                        engine.as_ref().unwrap(),
-                        &expected_engine.upgrade().unwrap()
-                    ));
-                    assert!(Arc::ptr_eq(
-                        audit.as_ref().unwrap(),
-                        &expected_audit.upgrade().unwrap()
-                    ));
-                    Ok(crate::tools::AllToolsResult::from_prebuilt_tools(Vec::new()))
-                },
-            ),
+            recipe: Box::new(move |inputs: crate::composition::NativeRecipeInputs<'_>| {
+                assert!(Arc::ptr_eq(
+                    inputs.sop_engine.as_ref().unwrap(),
+                    &expected_engine.upgrade().unwrap()
+                ));
+                assert!(Arc::ptr_eq(
+                    inputs.sop_audit.as_ref().unwrap(),
+                    &expected_audit.upgrade().unwrap()
+                ));
+                Ok(crate::tools::AllToolsResult::from_prebuilt_tools(Vec::new()))
+            }),
             refuse_selection: false,
         };
         let caps = RuntimeCapabilities {
@@ -22125,7 +22126,7 @@ mod capability_construction_tests {
             let seen = built.clone();
             let dispatched = calls.clone();
             let source = StatefulRecipe {
-                recipe: Box::new(move |_: &ToolRequest<'_>, _, _, _, _, _, _, _, _, _| {
+                recipe: Box::new(move |_: crate::composition::NativeRecipeInputs<'_>| {
                     seen.fetch_add(1, Ordering::SeqCst);
                     Ok(crate::tools::AllToolsResult::from_prebuilt_tools(vec![
                         Box::new(StatefulTool(dispatched.clone(), label)),
@@ -22152,7 +22153,7 @@ mod capability_construction_tests {
             let calls = Arc::new(AtomicUsize::new(0));
             let seen = calls.clone();
             let source = StatefulRecipe {
-                recipe: Box::new(move |_: &ToolRequest<'_>, _, _, _, _, _, _, _, _, _| {
+                recipe: Box::new(move |_: crate::composition::NativeRecipeInputs<'_>| {
                     seen.fetch_add(1, Ordering::SeqCst);
                     anyhow::bail!("source recipe refused")
                 }),

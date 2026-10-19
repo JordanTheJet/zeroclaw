@@ -3896,20 +3896,20 @@ pub(crate) async fn assemble_owned_execution_with_capabilities(
         crate::composition::RegistryConstruction::SuppliedOnly
     };
     let built = match selected_recipe {
-        Some(recipe) => recipe(
-            &tool_request,
-            &config.data_dir,
-            None,
-            false,
-            None,
-            Some(sop_engine),
+        Some(recipe) => recipe(crate::composition::NativeRecipeInputs {
+            request: &tool_request,
+            workspace_dir: &config.data_dir,
+            canvas_store: None,
+            is_subagent_caller: false,
+            forwarded_environment: None,
+            sop_engine: Some(sop_engine),
             sop_audit,
             live_config,
-            execution_admission
+            execution_capability: execution_admission
                 .as_ref()
                 .map(AgentExecutionAdmission::capability),
-            None,
-        )?,
+            acp_sessions: None,
+        })?,
         None => crate::tools::supplied_registry_base()?,
     };
     let crate::composition::PreparedRegistry {
