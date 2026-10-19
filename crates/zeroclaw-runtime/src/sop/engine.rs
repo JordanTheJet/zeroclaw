@@ -1095,27 +1095,24 @@ impl SopEngine {
         Ok(None)
     }
 
-    /// Refuse a transition on a held run whose stored record is newer than
-    /// this engine's copy. The stored record is adopted first, so a retry
-    /// works from current state instead of being refused again.
-    fn refuse_stale_copy(&mut self, run_id: &str) -> Result<()> {
-        match self.adopt_if_stale(run_id)? {
-            Some(stale) => Err(self.refused(stale)),
-            None => Ok(()),
-        }
-    }
-
-    /// `refuse_stale_copy` for a gate decision. When the stored record still
-    /// presents the same gate (same status, step and gate revision), only its
-    /// revision moved (an escalation re-stamp, say), so the decision goes ahead
-    /// against the adopted record instead of being refused once.
+    /// Refuse a gate decision on a held run whose stored record is newer than
+    /// this engine's copy. The stored record is adopted first, so a retry works
+    /// from current state instead of being refused again. When the stored
+    /// record still presents the same gate (same status, step and gate
+    /// revision), only its revision moved (an escalation re-stamp, say), so the
+    /// decision goes ahead against the adopted record instead of being refused.
     fn refuse_stale_gate_copy(&mut self, run_id: &str) -> Result<()> {
         let gate = |run: &SopRun| (run.status, run.current_step, run.revision);
         let Some(before) = self.active_runs.get(run_id).map(gate) else {
             return Ok(());
         };
         match self.adopt_if_stale(run_id)? {
-            Some(_) if self.active_runs.get(run_id).map(gate) == Some(before) => Ok(()),
+            Some(stale)
+                if err_is_stale_run_copy(&stale)
+                    && self.active_runs.get(run_id).map(gate) == Some(before) =>
+            {
+                Ok(())
+            }
             Some(stale) => Err(self.refused(stale)),
             None => Ok(()),
         }
@@ -2468,7 +2465,21 @@ impl SopEngine {
                 // records it, as for any cancellation, and then finishes the
                 // cancellation at this boundary.
                 Some((SopRunStatus::CancelRequested, step)) if step == result.step_number => {}
-                Some((SopRunStatus::CancelRequested, _)) => {
+                Some((SopRunStatus::CancelRequested, current)) => {
+                    // The result is for a step the stored run has left, so it
+                    // is not recorded; leave that on the run's trail.
+                    self.record_transition_event(
+                        run_id,
+                        "step_result_stale",
+                        Some(format!(
+                            "result for step {} arrived while the run is on step {current}",
+                            result.step_number
+                        )),
+                        ::serde_json::json!({
+                            "step": result.step_number,
+                            "current_step": current,
+                        }),
+                    );
                     return match self.finish_requested_cancellation(run_id)? {
                         Some(cancelled) => Ok(cancelled),
                         None => Err(self.refused(stale)),
@@ -6045,8 +6056,9 @@ impl SopEngine {
         let mut actions = Vec::new();
         for run_id in self.overdue_waiting_run_ids() {
             // A gate another writer already resolved or moved on must not time
-            // out here; adopting the stored record drops it from this sweep.
-            if self.refuse_stale_copy(&run_id).is_err() {
+            // out here. Adopting the stored record drops it from this sweep;
+            // nothing was attempted, so no refusal is recorded.
+            if !matches!(self.adopt_if_stale(&run_id), Ok(None)) {
                 continue;
             }
             if let Some(a) =
@@ -9696,12 +9708,11 @@ mod tests {
             SopRunStatus::Running,
             "the sweep adopts the stored record"
         );
+        let events = store.list_events(&run_id).unwrap();
+        assert!(!events.iter().any(|e| e.kind == "gate_timed_out"));
         assert!(
-            !store
-                .list_events(&run_id)
-                .unwrap()
-                .iter()
-                .any(|e| e.kind == "gate_timed_out")
+            !events.iter().any(|e| e.kind == "run_copy_stale"),
+            "skipping a gate that was already resolved is not a refusal"
         );
     }
 
@@ -9844,6 +9855,14 @@ mod tests {
             vec![(1, "one")],
             "only the result the stored run recorded survives"
         );
+        let dropped = store
+            .list_events(&run_id)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.kind == "step_result_stale")
+            .expect("the dropped late result is on the run's trail");
+        assert_eq!(dropped.payload["step"], 1);
+        assert_eq!(dropped.payload["current_step"], 2);
         assert_eq!(store.claim_counts("cancel-later-step").unwrap(), (0, 0));
     }
 
