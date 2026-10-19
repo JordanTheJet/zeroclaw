@@ -2566,7 +2566,10 @@ async fn run_inner(
             }
 
             // After successful multi-step execution, attempt autonomous skill creation.
-            if config.skills.skill_creation.enabled {
+            // Skills are native work: a supplied-only registry never writes them.
+            if construction == crate::composition::RegistryConstruction::NativeCompat
+                && config.skills.skill_creation.enabled
+            {
                 let tool_calls = crate::skills::creator::extract_tool_calls_from_history(&history);
                 if tool_calls.len() >= 2 {
                     let creator = crate::skills::creator::SkillCreator::new(
@@ -2641,7 +2644,10 @@ async fn run_inner(
             }
             observer.record_event(&ObserverEvent::TurnComplete);
 
-            if config.skills.skill_improvement.enabled {
+            // The review builds native skill tools, so it shares the gate above.
+            if construction == crate::composition::RegistryConstruction::NativeCompat
+                && config.skills.skill_improvement.enabled
+            {
                 let review_workspace = config.agent_workspace_dir(agent_alias);
                 let review_config = config.skills.skill_improvement.clone();
                 let failed_slugs: Vec<String> =
@@ -25583,5 +25589,260 @@ mod capability_entry_point_tests {
     #[test]
     fn run_supplied_interactive_switch_refusal_has_no_startup_fallback() {
         run_switch_child("interactive-refuse");
+    }
+
+    /// Counts every chat it serves: two XML tool-call rounds for `skill_probe`,
+    /// then plain text for the turn's answer and for any later request (a
+    /// post-turn skill review). XML calls stay in the history text, where the
+    /// skill creator reads them.
+    struct SkillHookProvider {
+        chats: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    const SKILL_HOOK_REPLY: &str = "skill hook turn answered";
+
+    #[async_trait::async_trait]
+    impl zeroclaw_api::model_provider::ModelProvider for SkillHookProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            self.chats.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(SKILL_HOOK_REPLY.into())
+        }
+
+        async fn chat(
+            &self,
+            _request: zeroclaw_api::model_provider::ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<zeroclaw_api::model_provider::ChatResponse> {
+            let call = self.chats.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let text = if call < 2 {
+                format!(
+                    r#"<tool_call>{{"name":"skill_probe","arguments":{{"step":{call}}}}}</tool_call>"#
+                )
+            } else {
+                SKILL_HOOK_REPLY.to_string()
+            };
+            Ok(zeroclaw_api::model_provider::ChatResponse {
+                text: Some(text),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    impl zeroclaw_api::attribution::Attributable for SkillHookProvider {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Provider(
+                zeroclaw_api::attribution::ProviderKind::Model(
+                    zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "skill-hook"
+        }
+    }
+
+    struct SkillHookProviders(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl crate::composition::ProviderSource for SkillHookProviders {
+        fn model_provider(
+            &self,
+            _request: &crate::composition::ProviderRequest<'_>,
+        ) -> anyhow::Result<Arc<dyn zeroclaw_api::model_provider::ModelProvider>> {
+            Ok(Arc::new(SkillHookProvider {
+                chats: Arc::clone(&self.0),
+            }))
+        }
+    }
+
+    struct SkillProbeTool(Arc<std::sync::atomic::AtomicUsize>);
+
+    zeroclaw_api::mock_tool_attribution!(SkillProbeTool);
+
+    #[async_trait::async_trait]
+    impl crate::tools::Tool for SkillProbeTool {
+        fn name(&self) -> &str {
+            "skill_probe"
+        }
+        fn description(&self) -> &str {
+            "Records that the turn executed a supplied tool."
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<zeroclaw_api::tool::ToolResult> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(zeroclaw_api::tool::ToolResult {
+                success: true,
+                output: zeroclaw_api::tool::ToolOutput::default(),
+                error: None,
+            })
+        }
+    }
+
+    /// Supplies `skill_probe`; `native` selects the native compatibility recipe
+    /// as well, so the same source covers both construction modes.
+    struct SkillProbeTools {
+        executions: Arc<std::sync::atomic::AtomicUsize>,
+        native: bool,
+    }
+
+    impl crate::composition::ToolSource for SkillProbeTools {
+        fn native_recipe<'s>(
+            &'s self,
+            _request: &crate::composition::ToolRequest<'_>,
+        ) -> anyhow::Result<Option<&'s crate::composition::NativeRegistryRecipe>> {
+            Ok(self
+                .native
+                .then_some(&crate::composition::defaults::native_compat_registry))
+        }
+
+        fn tools(
+            &self,
+            _request: &crate::composition::ToolRequest<'_>,
+        ) -> anyhow::Result<Vec<Box<dyn crate::tools::Tool>>> {
+            Ok(vec![Box::new(SkillProbeTool(Arc::clone(&self.executions)))])
+        }
+    }
+
+    fn skill_files(dir: &std::path::Path) -> usize {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return 0;
+        };
+        entries
+            .flatten()
+            .map(|entry| {
+                let path = entry.path();
+                if path.is_dir() {
+                    skill_files(&path)
+                } else {
+                    usize::from(matches!(
+                        path.file_name().and_then(|name| name.to_str()),
+                        Some("SKILL.toml" | "SKILL.md")
+                    ))
+                }
+            })
+            .sum()
+    }
+
+    /// Runs one CLI turn that makes two supplied tool calls with skill creation
+    /// and skill review both enabled. Returns (provider chats, tool executions,
+    /// skill files under the creator's directory).
+    async fn run_skill_hook_turn(native: bool) -> (usize, usize, usize) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Default::default()
+        };
+        config.memory.backend = "none".to_string();
+        config.memory.auto_save = false;
+        config.plugins.enabled = false;
+        config.plugins.auto_discover = false;
+        config.mcp.enabled = false;
+        config.skills.skill_creation.enabled = true;
+        config.skills.skill_creation.reflection_enabled = false;
+        config.skills.skill_improvement.enabled = true;
+        config.skills.skill_improvement.cooldown_secs = 0;
+        config.skills.skill_improvement.nudge_interval_iterations = 1;
+        config.risk_profiles.insert(
+            "skill-hooks".to_string(),
+            RiskProfileConfig {
+                allowed_tools: vec!["skill_probe".into()],
+                auto_approve: vec!["skill_probe".into()],
+                ..Default::default()
+            },
+        );
+        config.providers.models.openai.insert(
+            "fast".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("gpt-4o-mini".to_string()),
+                    // Unroutable: only the supplied provider can answer.
+                    uri: Some("http://127.0.0.1:9".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+        config.agents.insert(
+            "skill-agent".to_string(),
+            AliasedAgentConfig {
+                model_provider: "openai.fast".into(),
+                risk_profile: "skill-hooks".into(),
+                ..Default::default()
+            },
+        );
+        let skills_dir = config.data_dir.join("skills");
+        let chats = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let executions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut capabilities = recording_capabilities(
+            Arc::new(RecordingProviders::default()),
+            Arc::new(RecordingMemory::default()),
+            Arc::new(SkillProbeTools {
+                executions: Arc::clone(&executions),
+                native,
+            }),
+        );
+        capabilities.providers = Arc::new(SkillHookProviders(Arc::clone(&chats)));
+
+        let reply = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            super::run_with_capabilities(
+                config,
+                capabilities,
+                None,
+                "skill-agent",
+                Some("probe the supplied tool twice".to_owned()),
+                None,
+                None,
+                None,
+                Vec::new(),
+                false,
+                None,
+                None,
+                TurnOrigin::Interactive,
+                super::AgentRunOverrides::default(),
+            ),
+        )
+        .await
+        .expect("bounded skill hook turn")
+        .expect("the supplied provider serves the turn");
+        assert_eq!(reply, SKILL_HOOK_REPLY);
+        (
+            chats.load(std::sync::atomic::Ordering::SeqCst),
+            executions.load(std::sync::atomic::Ordering::SeqCst),
+            skill_files(&skills_dir),
+        )
+    }
+
+    /// A supplied-only CLI turn runs no native skill work after it answers:
+    /// no skill is written and no review asks the provider again.
+    #[tokio::test]
+    async fn run_supplied_only_turn_skips_post_turn_skill_creation_and_review() {
+        let (chats, executions, skills) = run_skill_hook_turn(false).await;
+        assert_eq!(executions, 2, "the turn made both supplied tool calls");
+        assert_eq!(chats, 3, "two tool rounds and the answer, with no review call");
+        assert_eq!(skills, 0, "no skill is written for a supplied-only turn");
+    }
+
+    /// The same turn with the native recipe still creates a skill and runs the
+    /// review, so the supplied-only control above is not passing vacuously.
+    #[tokio::test]
+    async fn run_native_compat_turn_keeps_post_turn_skill_creation_and_review() {
+        let (chats, executions, skills) = run_skill_hook_turn(true).await;
+        assert_eq!(executions, 2, "the turn made both supplied tool calls");
+        assert!(chats > 3, "the skill review asked the provider again: {chats}");
+        assert_eq!(skills, 1, "skill creation wrote one skill");
     }
 }
