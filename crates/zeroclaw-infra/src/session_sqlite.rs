@@ -2821,6 +2821,40 @@ mod tests {
         assert!(err.to_string().contains("idx_session_metadata_agent_alias"));
     }
 
+    /// A daemon's gateway, channels and RPC plane open the store together
+    /// when it starts. On a fresh data dir every one of them must get a
+    /// working store, not a lost `ALTER` race or a busy journal-mode switch.
+    #[test]
+    fn concurrent_first_openers_of_a_fresh_store_all_succeed() {
+        const TRIALS: usize = 40;
+        const OPENERS: usize = 4;
+        for trial in 0..TRIALS {
+            let tmp = TempDir::new().unwrap();
+            let start = Arc::new(std::sync::Barrier::new(OPENERS));
+            let openers: Vec<_> = (0..OPENERS)
+                .map(|opener| {
+                    let (dir, start) = (tmp.path().to_path_buf(), Arc::clone(&start));
+                    std::thread::spawn(move || {
+                        start.wait();
+                        let backend = SqliteSessionBackend::new(&dir).map_err(|error| {
+                            format!("trial {trial}, opener {opener}: {error:#}")
+                        })?;
+                        backend
+                            .append(&format!("opener-{opener}"), &ChatMessage::user("hello"))
+                            .map_err(|error| {
+                                format!("trial {trial}, opener {opener} append: {error:#}")
+                            })
+                    })
+                })
+                .collect();
+            for opener in openers {
+                opener.join().unwrap().unwrap();
+            }
+            let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+            assert_eq!(backend.list_sessions().len(), OPENERS);
+        }
+    }
+
     #[test]
     fn set_session_name_persists() {
         let tmp = TempDir::new().unwrap();
