@@ -10675,6 +10675,9 @@ impl RpcDispatcher {
                 AgentStatusEntry {
                     alias: alias.clone(),
                     enabled: agent_cfg.enabled,
+                    runtime_profile: config
+                        .runtime_profile_for_agent(alias)
+                        .map(|_| agent_cfg.runtime_profile.trim().to_string()),
                     live_sessions: rpc,
                     persisted_sessions: persisted,
                     channels: agent_cfg.channels.iter().map(|c| c.to_string()).collect(),
@@ -13791,6 +13794,16 @@ fn notification_for_turn_event(session_id: &str, event: &TurnEvent) -> Option<St
         TurnEvent::Plan { entries } => SessionUpdateEvent::Plan {
             session_id: session_id.to_string(),
             entries: entries.clone(),
+        },
+        TurnEvent::BudgetWarning {
+            current_usd,
+            limit_usd,
+            period,
+        } => SessionUpdateEvent::BudgetWarning {
+            session_id: session_id.to_string(),
+            current_usd: *current_usd,
+            limit_usd: *limit_usd,
+            period: *period,
         },
         _ => return None,
     };
@@ -18628,6 +18641,11 @@ mod tests {
         std::fs::write(&secret, "outside every agent root").unwrap();
         let (ctx, chat_backend, _acp_store) = persistence_enforcement_ctx(config);
         let (provider, started_rx, _release_tx) = gated_provider();
+        // A live session holds the resolved workspace, as `session/new` and
+        // rehydration store it. The raw temp-dir spelling can be an alias
+        // (`/var` on macOS, an 8.3 short name on Windows), and a scoped prompt
+        // refuses a session held under one before it ever judges an attachment
+        // source.
         install_state_test_session_owned_at(
             &ctx.sessions,
             &chat_backend,
@@ -18635,7 +18653,7 @@ mod tests {
             provider,
             None,
             Some("user:alice"),
-            &agent_workspace,
+            &agent_workspace.canonicalize().unwrap(),
         )
         .await;
         (ctx, agent_workspace, inside, secret, started_rx)
@@ -27417,6 +27435,23 @@ mod tests {
     }
 
     #[test]
+    fn budget_warning_notification() {
+        let event = TurnEvent::BudgetWarning {
+            current_usd: 8.25,
+            limit_usd: 10.0,
+            period: zeroclaw_api::agent::BudgetWarningPeriod::Day,
+        };
+        let json = notification_for_turn_event("s1", &event).unwrap();
+        let v = parse(&json);
+        assert_eq!(v["method"], "session/update");
+        assert_eq!(v["params"]["type"], "budget_warning");
+        assert_eq!(v["params"]["session_id"], "s1");
+        assert_eq!(v["params"]["current_usd"], 8.25);
+        assert_eq!(v["params"]["limit_usd"], 10.0);
+        assert_eq!(v["params"]["period"], "day");
+    }
+
+    #[test]
     fn history_trimmed_notification() {
         let event = TurnEvent::HistoryTrimmed {
             dropped_messages: 12,
@@ -28723,6 +28758,39 @@ mod tests {
             risk_profiles,
             ..zeroclaw_config::schema::Config::default()
         }
+    }
+
+    #[tokio::test]
+    async fn agents_status_runtime_profile_resolves_config_and_omits_unresolved_profiles() {
+        use zeroclaw_config::schema::RuntimeProfileConfig;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = make_acp_test_config(&tmp);
+        config
+            .runtime_profiles
+            .insert("coding".into(), RuntimeProfileConfig::default());
+        config.agents.get_mut("test-agent").unwrap().runtime_profile = " coding ".into();
+        let (dispatcher, _) = make_acp_test_dispatcher(config.clone());
+
+        let response = dispatcher.handle_agents_status().await.unwrap();
+        let agent = response["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|agent| agent["alias"] == "test-agent")
+            .unwrap();
+        assert_eq!(agent["runtime_profile"], "coding");
+
+        config.agents.get_mut("test-agent").unwrap().runtime_profile = "missing".into();
+        let (dispatcher, _) = make_acp_test_dispatcher(config);
+        let response = dispatcher.handle_agents_status().await.unwrap();
+        let agent = response["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|agent| agent["alias"] == "test-agent")
+            .unwrap();
+        assert!(agent.get("runtime_profile").is_none());
     }
 
     fn make_acp_test_dispatcher(
@@ -42462,6 +42530,14 @@ mod tests {
     /// meant to reach has to carry that caller's id: an unstamped session is
     /// invisible to it, and the test would exercise the ownership denial
     /// instead of whatever it meant to check.
+    ///
+    /// The session holds `workspace` as given, but `session/new` and
+    /// rehydration hold the resolved path, and a scoped caller's prompt,
+    /// steer, or resume refuses a session held under any other spelling. A
+    /// test that needs one of those to reach the check under test passes the
+    /// canonicalized workspace. The temp dir is not spelled canonically on
+    /// every platform: on macOS it is under `/var`, a link to `/private/var`,
+    /// and on Windows it can go through an 8.3 short name.
     #[allow(clippy::too_many_arguments)]
     async fn install_state_test_session_owned_at(
         sessions: &Arc<crate::rpc::session::SessionStore>,
