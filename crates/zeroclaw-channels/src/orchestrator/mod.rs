@@ -825,6 +825,10 @@ impl ModelPickerDispatchOwnership {
     fn hold(_message_id: &str) -> Self {
         Self
     }
+
+    /// Nothing to settle. Mirrors the Telegram token's `release` so callers
+    /// never `drop()` this type, which has no drop glue.
+    fn release(self) {}
 }
 
 /// A turn waiting for its conversation lane.
@@ -2210,11 +2214,11 @@ fn build_channel_system_prompt(
 ) -> String {
     let mut prompt = base_prompt.to_string();
 
-    // Date refresh stays in the system prompt: the heading is date-only
-    // (no seconds), so within a single day the rendered value is stable and
-    // cache hits; it only changes once per day at midnight. Acceptable for
-    // a 99%+ intra-session cache-hit rate.
-    refresh_channel_prompt_date_section(&mut prompt);
+    // Strip volatile date sections: the per-turn
+    // [turn-context] preamble already carries time/date/weekday/tz, and a
+    // ## Current Date value that changes at midnight busts the prompt cache
+    // for every live channel session.
+    strip_channel_prompt_volatile_date_sections(&mut prompt);
 
     if let Some(instructions) = channel_delivery_instructions(channel_name) {
         if prompt.is_empty() {
@@ -2295,29 +2299,74 @@ fn build_channel_system_prompt_for_message_with_signal(
     }
 }
 
-fn current_date_section() -> String {
-    let now = chrono::Local::now();
-    format!(
-        "{CURRENT_DATE_HEADING}{} ({})",
-        now.format("%Y-%m-%d"),
-        now.format("%:z")
-    )
-}
-
-fn refresh_channel_prompt_date_section(prompt: &mut String) {
-    let runtime_start = prompt
-        .find("\n## Runtime")
-        .map(|i| i + 1)
-        .unwrap_or(prompt.len());
-
-    if let Some((start, heading_len)) = find_latest_date_heading_before(prompt, runtime_start) {
+fn strip_channel_prompt_volatile_date_sections(prompt: &mut String) {
+    // Walk repeatedly so both ## Current Date and ## Current Date & Time
+    // are removed even when both appear. Keep a ## Current Date section
+    // whose body is not a generated date line (e.g. a project note).
+    loop {
+        let runtime_start = prompt
+            .find("\n## Runtime")
+            .map(|i| i + 1)
+            .unwrap_or(prompt.len());
+        let Some((start, heading_len)) = find_latest_date_heading_before(prompt, runtime_start)
+        else {
+            break;
+        };
         let content_start = start + heading_len;
         let section_end = prompt[content_start..]
             .find("\n## ")
             .map(|i| content_start + i)
             .unwrap_or(prompt.len());
-        prompt.replace_range(start..section_end, &current_date_section());
+        let body = prompt[content_start..section_end].trim();
+        if !is_generated_date_line(body) {
+            // Non-date body under ## Current Date — leave it alone and stop
+            // scanning older headings so we do not remove project notes.
+            break;
+        }
+        // Remove the section with the newline that ends it, so the next
+        // heading keeps the blank line in front of it. A section at the end
+        // of the prompt takes the newlines before it instead. Only ASCII
+        // '\n' bytes are stepped over, so the range stays on char boundaries.
+        let (from, to) = if section_end < prompt.len() {
+            (start, section_end + 1)
+        } else {
+            let mut from = start;
+            while from > 0 && prompt.as_bytes()[from - 1] == b'\n' {
+                from -= 1;
+            }
+            (from, section_end)
+        };
+        prompt.replace_range(from..to, "");
     }
+}
+
+/// True when `body` is exactly one date line as the prompt builders used to
+/// emit it: `YYYY-MM-DD (+HH:MM)` or the legacy `YYYY-MM-DD HH:MM:SS (TZ)`.
+/// Anything else (e.g. a workspace note that merely starts with a date) is
+/// project context and must survive the strip.
+fn is_generated_date_line(body: &str) -> bool {
+    let bytes = body.as_bytes();
+    if body.contains('\n') || bytes.len() < 10 {
+        return false;
+    }
+    let date_ok = bytes[..10].iter().enumerate().all(|(i, b)| match i {
+        4 | 7 => *b == b'-',
+        _ => b.is_ascii_digit(),
+    });
+    if !date_ok {
+        return false;
+    }
+    let rest = &body[10..];
+    let Some(open) = rest.find(" (") else {
+        return false;
+    };
+    let time = &rest[..open];
+    let zone = &rest[open + 2..];
+    let time_ok = time.is_empty()
+        || (time.starts_with(' ')
+            && time.len() > 1
+            && time[1..].bytes().all(|b| b.is_ascii_digit() || b == b':'));
+    time_ok && zone.len() > 1 && zone.ends_with(')') && !zone[..zone.len() - 1].contains(['(', ')'])
 }
 
 fn find_latest_date_heading_before(prompt: &str, before: usize) -> Option<(usize, usize)> {
@@ -10895,6 +10944,27 @@ async fn process_channel_message_body(
                                 );
                                 true
                             }
+                            Err(e)
+                                if e
+                                    .downcast_ref::<zeroclaw_api::channel::FinalizeUndelivered>()
+                                    .is_some() =>
+                            {
+                                // Nothing was delivered and the channel asked us
+                                // not to send again yet (e.g. a flood limit).
+                                // Resending would only extend the penalty, and
+                                // the reply must not be reported as sent.
+                                ::zeroclaw_log::record!(
+                                    WARN,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Fail
+                                    )
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                                    "Final answer not delivered; not resending"
+                                );
+                                false
+                            }
                             Err(e) => {
                                 ::zeroclaw_log::record!(
                                     WARN,
@@ -11049,8 +11119,13 @@ async fn process_channel_message_body(
                 } else {
                     zeroclaw_providers::sanitize_api_error(&e.to_string())
                 };
+                // `safe_error` is deliberately empty for a capacity failure, so
+                // the journal needs the typed breakdown instead: without it
+                // this line read "Turn error after Nms:" and nothing else.
+                let journal_error = context_window_exceeded
+                    .map_or_else(|| safe_error.clone(), |exceeded| exceeded.breakdown());
                 eprintln!(
-                    "  ❌ Turn error after {}ms: {safe_error}",
+                    "  ❌ Turn error after {}ms: {journal_error}",
                     started_at.elapsed().as_millis(),
                 );
 
@@ -11088,6 +11163,9 @@ async fn process_channel_message_body(
                     error_attributes["error_kind"] = "context_window_exceeded".into();
                     error_attributes["estimated_tokens"] = exceeded.estimated_tokens.into();
                     error_attributes["model_context_window"] = exceeded.model_context_window.into();
+                    error_attributes["raw_estimated_tokens"] = exceeded.raw_estimated_tokens.into();
+                    error_attributes["system_tokens"] = exceeded.system_tokens.into();
+                    error_attributes["tool_schema_tokens"] = exceeded.tool_schema_tokens.into();
                     error_attributes["provider_attempted"] = false.into();
                 } else {
                     error_attributes["error_kind"] = "provider_error".into();
@@ -11364,7 +11442,7 @@ async fn run_conversation_turn(
             Some(Arc::clone(&turn_lease)),
         )
         .await;
-        drop(dispatch_ownership);
+        dispatch_ownership.release();
         drop(execution_permit);
         drop(pending_work);
         return;
@@ -11374,7 +11452,7 @@ async fn run_conversation_turn(
     // still queued; the slot is released without running it.
     if registration.cancellation.is_cancelled() {
         drop(registration);
-        drop(dispatch_ownership);
+        dispatch_ownership.release();
         drop(execution_permit);
         drop(pending_work);
         return;
@@ -11389,7 +11467,7 @@ async fn run_conversation_turn(
     )
     .await;
     drop(registration);
-    drop(dispatch_ownership);
+    dispatch_ownership.release();
     drop(execution_permit);
     drop(pending_work);
 }
@@ -20060,6 +20138,9 @@ pub(crate) mod tests {
         let error = anyhow::Error::new(zeroclaw_runtime::agent::ContextWindowExceeded {
             estimated_tokens: 65_537,
             model_context_window: 65_536,
+            raw_estimated_tokens: 65_537,
+            system_tokens: 0,
+            tool_schema_tokens: 0,
         })
         .context("maximum context length; private provider diagnostics");
         assert!(!is_context_window_overflow_error(&error));
@@ -21410,6 +21491,187 @@ temperature = 0.3
             err.to_string()
                 .contains("[channels.wecom_ws.removed] not configured"),
             "delivery must fall back to the current empty config: {err:#}"
+        );
+    }
+
+    fn daemon_factory_agent(
+        bindings: &[&str],
+        enabled: bool,
+    ) -> zeroclaw_config::schema::AliasedAgentConfig {
+        zeroclaw_config::schema::AliasedAgentConfig {
+            enabled,
+            channels: bindings
+                .iter()
+                .map(|b| zeroclaw_config::providers::ChannelRef(b.to_string()))
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    fn daemon_factory_config(bindings: &[&str]) -> Config {
+        let mut config = Config::default();
+        config
+            .agents
+            .insert("sales".into(), daemon_factory_agent(bindings, true));
+        config
+    }
+
+    #[tokio::test]
+    async fn daemon_factory_resolves_the_running_instances_for_the_agent() {
+        let _serial = STARTUP_REGISTRY_TEST_LOCK.lock().await;
+        let previous = CRON_CHANNEL_REGISTRY
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let _restore = CronChannelRegistryRestore(previous);
+
+        let running = mock_channel("whatsapp");
+        let sibling = mock_channel("whatsapp");
+        let other = mock_channel("telegram");
+        let (_published, _lease) = publish_cron_channel_registry(&[
+            ConfiguredChannel {
+                display_name: "WhatsApp",
+                alias: Some("ventas".to_string()),
+                channel: Arc::clone(&running),
+            },
+            ConfiguredChannel {
+                display_name: "WhatsApp",
+                alias: Some("soporte".to_string()),
+                channel: Arc::clone(&sibling),
+            },
+            ConfiguredChannel {
+                display_name: "Telegram",
+                alias: Some("ops".to_string()),
+                channel: Arc::clone(&other),
+            },
+        ]);
+
+        let config = daemon_factory_config(&["whatsapp.ventas"]);
+        let map = live_channel_map_for_agent(&config, "sales");
+
+        assert!(
+            Arc::ptr_eq(map.get("whatsapp.ventas").unwrap(), &running),
+            "a daemon turn must get the instance the channel task is running"
+        );
+        assert!(
+            !map.contains_key("whatsapp.soporte"),
+            "an exact binding must not admit another alias of the same type"
+        );
+        // The bare key follows the agent's own bindings, so it stays
+        // unambiguous even though two WhatsApp aliases are running.
+        assert!(Arc::ptr_eq(map.get("whatsapp").unwrap(), &running));
+        assert!(
+            !map.contains_key("telegram.ops") && !map.contains_key("telegram"),
+            "channels the agent is not bound to stay out of its map"
+        );
+        assert!(live_channel_map_for_agent(&config, "unknown").is_empty());
+    }
+
+    #[tokio::test]
+    async fn daemon_factory_is_empty_until_a_channel_task_publishes() {
+        let _serial = STARTUP_REGISTRY_TEST_LOCK.lock().await;
+        let previous = CRON_CHANNEL_REGISTRY
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let _restore = CronChannelRegistryRestore(previous);
+        let config = daemon_factory_config(&["whatsapp.ventas"]);
+
+        prepare_live_channel_registry(true);
+        assert!(live_channel_map_for_agent(&config, "sales").is_empty());
+
+        let running = mock_channel("whatsapp");
+        let (_published, lease) = publish_cron_channel_registry(&[ConfiguredChannel {
+            display_name: "WhatsApp",
+            alias: Some("ventas".to_string()),
+            channel: Arc::clone(&running),
+        }]);
+        assert!(Arc::ptr_eq(
+            live_channel_map_for_agent(&config, "sales")
+                .get("whatsapp.ventas")
+                .unwrap(),
+            &running
+        ));
+
+        drop(lease);
+        assert!(
+            live_channel_map_for_agent(&config, "sales").is_empty(),
+            "a retired channel task must not stay reachable from daemon turns"
+        );
+    }
+
+    #[tokio::test]
+    async fn daemon_factory_applies_type_bindings_singleton_keys_and_fallbacks() {
+        let _serial = STARTUP_REGISTRY_TEST_LOCK.lock().await;
+        let previous = CRON_CHANNEL_REGISTRY
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let _restore = CronChannelRegistryRestore(previous);
+
+        let ops = mock_channel("telegram");
+        let alerts = mock_channel("telegram");
+        let ventas = mock_channel("whatsapp");
+        let (_published, _lease) = publish_cron_channel_registry(&[
+            ConfiguredChannel {
+                display_name: "Telegram",
+                alias: Some("ops".to_string()),
+                channel: Arc::clone(&ops),
+            },
+            ConfiguredChannel {
+                display_name: "Telegram",
+                alias: Some("alerts".to_string()),
+                channel: Arc::clone(&alerts),
+            },
+            ConfiguredChannel {
+                display_name: "WhatsApp",
+                alias: Some("ventas".to_string()),
+                channel: Arc::clone(&ventas),
+            },
+        ]);
+
+        let mut config = Config::default();
+        config
+            .agents
+            .insert("typed".into(), daemon_factory_agent(&["telegram"], true));
+        config.agents.insert(
+            "disabled".into(),
+            daemon_factory_agent(&["whatsapp.ventas"], false),
+        );
+
+        // A type-only binding takes every alias of that type, and two aliases
+        // leave no unambiguous bare key.
+        let map = live_channel_map_for_agent(&config, "typed");
+        assert!(Arc::ptr_eq(map.get("telegram.ops").unwrap(), &ops));
+        assert!(Arc::ptr_eq(map.get("telegram.alerts").unwrap(), &alerts));
+        assert!(
+            !map.contains_key("telegram"),
+            "a bare key would be ambiguous between two aliases"
+        );
+        assert!(!map.contains_key("whatsapp.ventas") && !map.contains_key("whatsapp"));
+
+        assert!(
+            live_channel_map_for_agent(&config, "disabled").is_empty(),
+            "a disabled agent gets no channels"
+        );
+
+        // When no agent binds any channel, an enabled agent sees all of them.
+        let mut unbound = Config::default();
+        unbound
+            .agents
+            .insert("any".into(), daemon_factory_agent(&[], true));
+        let mut keys: Vec<String> = live_channel_map_for_agent(&unbound, "any")
+            .into_keys()
+            .collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            [
+                "telegram.alerts",
+                "telegram.ops",
+                "whatsapp",
+                "whatsapp.ventas"
+            ]
         );
     }
 
@@ -37146,10 +37408,13 @@ BTC is currently around $65,000 based on latest tool output."#
             prompt.contains("## Project Context"),
             "missing Project Context"
         );
-        assert!(prompt.contains("## Current Date"), "missing Date section");
+        assert!(
+            !prompt.contains("## Current Date"),
+            "system prompt must not carry wall-clock date (#11704)"
+        );
         assert!(
             !prompt.contains("## Current Date & Time"),
-            "prompt should use date-only context"
+            "prompt should not use datetime context"
         );
         assert!(prompt.contains("## Runtime"), "missing Runtime section");
     }
@@ -42465,6 +42730,87 @@ BTC is currently around $65,000 based on latest tool output."#
             reply.suppress_voice,
             "a text-origin mirror reply is an explicit suppression, got {reply:?}"
         );
+    }
+
+    /// Debouncing combines a sender's messages into one turn owned by the
+    /// first of them, so a mixed batch is answered in the first message's
+    /// modality, whatever the later ones were.
+    #[tokio::test]
+    async fn matrix_mirror_debounced_batch_answers_in_the_first_messages_modality() {
+        for (first_voice, second_voice) in [(true, false), (false, true)] {
+            let channel_impl = Arc::new(SendMessageRecordingChannel::matrix());
+            let mut peer_groups = HashMap::new();
+            peer_groups.insert(
+                "family".to_string(),
+                mirror_peer_group("matrix.default", &["@alice:server"]),
+            );
+            let ctx = test_runtime_ctx_with_observer_and_tools(
+                channel_impl.clone(),
+                Arc::new(DummyModelProvider),
+                zeroclaw_config::schema::Config {
+                    peer_groups,
+                    channels: zeroclaw_config::schema::ChannelsConfig {
+                        debounce_ms: 60,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                zeroclaw_config::schema::AliasedAgentConfig::default(),
+                "test-provider",
+                None,
+                Arc::new(NoopObserver),
+                Vec::new(),
+            );
+
+            let first = zeroclaw_api::channel::ChannelMessage {
+                content: "first part".to_string(),
+                ..matrix_room_message("@alice:server", first_voice)
+            };
+            let second = zeroclaw_api::channel::ChannelMessage {
+                id: "$event-2:server".to_string(),
+                content: "second part".to_string(),
+                ..matrix_room_message("@alice:server", second_voice)
+            };
+            let history_key = conversation_history_key(&first);
+
+            let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
+            let send_task = zeroclaw_spawn::spawn!(async move {
+                tx.send(first).await.unwrap();
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                tx.send(second).await.unwrap();
+            });
+
+            run_message_dispatch_loop(rx, AgentRouter::single(Arc::clone(&ctx)), 4).await;
+            send_task.await.unwrap();
+
+            let sent = channel_impl.sent_messages.lock().await;
+            assert_eq!(
+                sent.len(),
+                1,
+                "both messages must be answered as one combined turn: {sent:?}"
+            );
+            let reply = delivered_reply(sent.as_slice(), "!room:server");
+            assert_eq!(
+                (reply.force_voice, reply.suppress_voice),
+                (first_voice, !first_voice),
+                "a batch opened by a {} message must be answered in that modality, got {reply:?}",
+                if first_voice { "voice" } else { "text" }
+            );
+            drop(sent);
+
+            let mut histories = ctx
+                .conversation_histories
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let turns = histories
+                .get(&history_key)
+                .expect("the combined turn must create history");
+            assert!(
+                turns[0].content.contains("first part") && turns[0].content.contains("second part"),
+                "the batch must dispatch as one combined turn: {}",
+                turns[0].content
+            );
+        }
     }
 
     #[tokio::test]
@@ -55546,7 +55892,7 @@ Done."#;
     }
 
     #[test]
-    fn build_channel_system_prompt_refreshes_legacy_datetime_section_to_date_only() {
+    fn build_channel_system_prompt_strips_legacy_datetime_keeps_project_note() {
         let prompt = build_channel_system_prompt(
             "Base.\n\n## Current Date\n\nProject note, not generated date context.\n\n## Current Date & Time\n\n2026-01-01 01:02:03 (UTC)\n\n## Runtime\n\nHost: old\n",
             "mattermost",
@@ -55557,43 +55903,66 @@ Done."#;
         assert!(prompt.contains("Project note, not generated date context."));
         assert!(!prompt.contains("## Current Date & Time"));
         assert!(!prompt.contains("01:02:03"));
-        let generated_section = prompt
-            .split("## Runtime")
-            .next()
-            .expect("prompt should contain runtime section before generated date assertion");
-        let date_line = generated_section
-            .rsplit("## Current Date\n\n")
-            .next()
-            .and_then(|rest| rest.lines().next())
-            .expect("current date section should have a date line");
-        assert_eq!(
-            &date_line[..10],
-            &chrono::Local::now().format("%Y-%m-%d").to_string()
-        );
         assert!(
-            date_line[10..].starts_with(" ("),
-            "date line should contain only date plus UTC offset: {date_line}"
+            !prompt.contains(&chrono::Local::now().format("%Y-%m-%d").to_string()),
+            "system prompt must not inject today's date (#11704): {prompt}"
         );
     }
 
     #[test]
-    fn build_channel_system_prompt_refreshes_current_date_section() {
+    fn build_channel_system_prompt_strips_date_after_multibyte_text() {
+        let prompt = build_channel_system_prompt(
+            "\u{e9}\n## Current Date\n\n2026-01-01 (+00:00)\n\n## Runtime\n\nHost: old\n",
+            "mattermost",
+            None,
+        );
+
+        assert!(prompt.starts_with('\u{e9}'));
+        assert!(!prompt.contains("## Current Date"));
+        assert!(!prompt.contains("2026-01-01 (+00:00)"));
+    }
+
+    #[test]
+    fn build_channel_system_prompt_keeps_dated_project_note() {
+        let prompt = build_channel_system_prompt(
+            "Base.\n\n## Current Date\n\n2026-10-16 is the project launch date.\n\n## Runtime\n\nHost: old\n",
+            "mattermost",
+            None,
+        );
+
+        assert!(prompt.contains("## Current Date\n\n2026-10-16 is the project launch date."));
+    }
+
+    #[test]
+    fn generated_date_line_matches_only_builder_output() {
+        assert!(is_generated_date_line("2026-01-01 (+00:00)"));
+        assert!(is_generated_date_line("2026-01-01 01:02:03 (UTC)"));
+        assert!(!is_generated_date_line(
+            "2026-10-16 is the project launch date."
+        ));
+        assert!(!is_generated_date_line("2026-01-01 (+00:00)\nmore notes"));
+        assert!(!is_generated_date_line(
+            "Project note, not generated date context."
+        ));
+    }
+
+    #[test]
+    fn build_channel_system_prompt_strips_generated_current_date_section() {
         let prompt = build_channel_system_prompt(
             "Base.\n\n## Current Date\n\n2026-01-01 (+00:00)\n\n## Runtime\n\nHost: old\n",
             "mattermost",
             None,
         );
 
-        assert!(prompt.contains("## Current Date\n\n"));
+        assert!(!prompt.contains("## Current Date"));
         assert!(!prompt.contains("2026-01-01 (+00:00)"));
-        let date_line = prompt
-            .split("## Current Date\n\n")
-            .nth(1)
-            .and_then(|rest| rest.lines().next())
-            .expect("current date section should have a date line");
-        assert_eq!(
-            &date_line[..10],
-            &chrono::Local::now().format("%Y-%m-%d").to_string()
+        assert!(
+            prompt.starts_with("Base.\n\n## Runtime\n"),
+            "next heading keeps its blank line: {prompt:?}"
+        );
+        assert!(
+            !prompt.contains(&chrono::Local::now().format("%Y-%m-%d").to_string()),
+            "system prompt must not inject today's date (#11704): {prompt}"
         );
     }
 
