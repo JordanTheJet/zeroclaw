@@ -16,8 +16,8 @@ use zeroclaw_api::tool::Tool;
 use zeroclaw_config::schema::Config;
 
 use super::{
-    ChannelSource, MemoryRequest, MemorySource, ProviderRequest, ProviderSource,
-    RuntimeCapabilities, ToolRequest, ToolSource,
+    ChannelSource, MemoryRequest, MemorySource, NativeRegistryRecipe, ProviderRequest,
+    ProviderSource, RuntimeCapabilities, ToolRequest, ToolSource,
 };
 
 pub(super) fn capabilities_with_observer(
@@ -175,16 +175,82 @@ impl MemorySource for ConfigMemory {
 pub struct NoSuppliedTools;
 
 impl ToolSource for NoSuppliedTools {
+    fn native_recipe<'s>(
+        &'s self,
+        _request: &ToolRequest<'_>,
+    ) -> anyhow::Result<Option<&'s NativeRegistryRecipe>> {
+        Ok(Some(&native_compat_registry))
+    }
     fn tools(&self, _request: &ToolRequest<'_>) -> anyhow::Result<Vec<Box<dyn Tool>>> {
         Ok(Vec::new())
     }
 }
 
-/// No entry point sends through `ChannelSource` yet.
+/// Explicit legacy native recipe. It consumes the actual ten typed inputs and
+/// derives only configuration facts; it never recreates policy or live authority.
+pub fn native_compat_registry(
+    request: &ToolRequest<'_>,
+    workspace_dir: &std::path::Path,
+    canvas_store: Option<crate::tools::CanvasStore>,
+    is_subagent_caller: bool,
+    tui_env: Option<crate::tools::ForwardedEnvironment>,
+    sop_engine: Option<Arc<std::sync::Mutex<crate::sop::SopEngine>>>,
+    sop_audit: Option<Arc<crate::sop::SopAuditLogger>>,
+    live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
+    execution_capability: Option<crate::live_config_authority::AgentExecutionCapability>,
+    acp_sessions: Option<crate::tools::AcpSessionReadView>,
+) -> anyhow::Result<crate::tools::AllToolsResult> {
+    let config = request.config.as_ref();
+    let risk_profile = config
+        .risk_profile_for_agent(request.agent_alias)
+        .ok_or_else(|| anyhow::Error::msg("native registry risk profile is not configured"))?;
+    let composio_key = config
+        .composio
+        .enabled
+        .then_some(config.composio.api_key.as_deref())
+        .flatten();
+    let composio_entity = config
+        .composio
+        .enabled
+        .then_some(config.composio.entity_id.as_str());
+    let fallback_key = config
+        .resolved_model_provider_for_agent(request.agent_alias)
+        .and_then(|(_, _, provider)| provider.api_key.as_deref());
+    crate::tools::all_tools_with_runtime_context(
+        Arc::clone(request.config),
+        request.security,
+        risk_profile,
+        request.agent_alias,
+        Arc::clone(request.runtime),
+        Arc::clone(request.memory),
+        composio_key,
+        composio_entity,
+        &config.browser,
+        &config.http_request,
+        &config.web_fetch,
+        workspace_dir,
+        &config.agents,
+        fallback_key,
+        config,
+        canvas_store,
+        is_subagent_caller,
+        tui_env,
+        sop_engine,
+        sop_audit,
+        live_config,
+        execution_capability,
+        acp_sessions,
+    )
+}
+
+/// Legacy adapter: CLI is explicitly backed by the registered application factory.
 pub struct NoOutboundChannels;
 
 impl ChannelSource for NoOutboundChannels {
-    fn channel(&self, _alias: &str) -> Option<Arc<dyn Channel>> {
-        None
+    fn channel(&self, alias: &str) -> Option<Arc<dyn Channel>> {
+        (alias == "cli")
+            .then(|| crate::agent::loop_::CLI_CHANNEL_FN.get())
+            .flatten()
+            .map(|factory| Arc::from(factory()))
     }
 }

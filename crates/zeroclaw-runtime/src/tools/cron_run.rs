@@ -460,8 +460,11 @@ mod tests {
             Arc::from(crate::platform::create_runtime(&config.runtime).unwrap());
         let memory: Arc<dyn Memory> = Arc::new(zeroclaw_memory::NoneMemory::new("none"));
         let workspace = config.agent_workspace_dir(TEST_AGENT);
+        let mut factory_config = (**config).clone();
+        factory_config.tools.optional = vec!["cron_run".into()];
+        let factory_config = Arc::new(factory_config);
         let mut built = crate::tools::all_tools_with_runtime_context(
-            config.clone(),
+            factory_config,
             &security,
             &config.risk_profiles[TEST_AGENT],
             TEST_AGENT,
@@ -487,9 +490,10 @@ mod tests {
         )
         .unwrap();
         if let Some(capabilities) = capabilities {
-            capabilities
-                .bind_registry(
-                    &mut built,
+            built = capabilities
+                .prepare_registry(
+                    built,
+                    crate::composition::RegistryConstruction::NativeCompat,
                     &ToolRequest {
                         config,
                         agent_alias: TEST_AGENT,
@@ -499,7 +503,8 @@ mod tests {
                     },
                     None,
                 )
-                .unwrap();
+                .unwrap()
+                .built;
         }
         built
     }

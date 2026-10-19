@@ -253,19 +253,7 @@ fn a4_policy() -> Arc<SecurityPolicy> {
 /// Minimal `AllToolsResult` around a bare tool list, matching the fixture
 /// `scoped::tests::built_with` uses to drive `assemble()` in isolation.
 fn built_with(tools: Vec<Box<dyn Tool>>) -> AllToolsResult {
-    AllToolsResult {
-        tools,
-        reserved_host_names: std::collections::HashSet::new(),
-        delegate_handle: None,
-        ask_user_handle: None,
-        reaction_handle: Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
-        poll_handle: None,
-        escalate_handle: None,
-        channel_room_handle: None,
-        unfiltered_tool_arcs: Vec::new(),
-        capability_slots: Vec::new(),
-        delegate_tool: None,
-    }
+    AllToolsResult::from_prebuilt_tools(tools)
 }
 
 #[tokio::test]

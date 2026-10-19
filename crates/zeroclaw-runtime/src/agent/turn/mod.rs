@@ -3871,9 +3871,6 @@ pub(crate) async fn assemble_owned_execution_with_capabilities(
                 "SOP step agent '{alias}' has no configured risk profile"
             ))
         })?;
-    let resolved_key = config
-        .resolved_model_provider_for_agent(alias)
-        .and_then(|(_, _, cfg)| cfg.api_key.clone());
     let memory = capabilities.agent_memory(config, alias).await?;
 
     // Mirror a fresh agent turn: the headless SOP driver reaches this agent's
@@ -3884,54 +3881,47 @@ pub(crate) async fn assemble_owned_execution_with_capabilities(
     let runtime: Arc<dyn crate::platform::RuntimeAdapter> =
         Arc::from(crate::platform::create_runtime(&config.runtime)?);
 
-    let (composio_key, composio_entity_id) = if config.composio.enabled {
-        (
-            config.composio.api_key.as_deref(),
-            Some(config.composio.entity_id.as_str()),
-        )
-    } else {
-        (None, None)
-    };
-
     let tool_config = Arc::new(config.clone());
-    let mut built = crate::tools::all_tools_with_runtime_and_execution_capability(
-        Arc::clone(&tool_config),
-        &security,
-        &risk_profile,
-        alias,
-        runtime.clone(),
-        Arc::clone(&memory),
-        composio_key,
-        composio_entity_id,
-        &config.browser,
-        &config.http_request,
-        &config.web_fetch,
-        &config.data_dir,
-        &config.agents,
-        resolved_key.as_deref(),
-        config,
-        None,
-        false,
-        None,
-        Some(sop_engine),
-        sop_audit,
-        live_config,
-        execution_admission
-            .as_ref()
-            .map(AgentExecutionAdmission::capability),
-    )?;
-    capabilities.bind_registry(
-        &mut built,
-        &crate::composition::ToolRequest {
-            config: &tool_config,
-            agent_alias: alias,
-            security: &security,
-            runtime: &runtime,
-            memory: &memory,
-        },
-        principal,
-    )?;
-    let skills = crate::skills::load_skills_for_agent_from_config(config, alias);
+    let tool_request = crate::composition::ToolRequest {
+        config: &tool_config,
+        agent_alias: alias,
+        security: &security,
+        runtime: &runtime,
+        memory: &memory,
+    };
+    let selected_recipe = capabilities.tools.native_recipe(&tool_request)?;
+    let construction = if selected_recipe.is_some() {
+        crate::composition::RegistryConstruction::NativeCompat
+    } else {
+        crate::composition::RegistryConstruction::SuppliedOnly
+    };
+    let built = match selected_recipe {
+        Some(recipe) => recipe(
+            &tool_request,
+            &config.data_dir,
+            None,
+            false,
+            None,
+            Some(sop_engine),
+            sop_audit,
+            live_config,
+            execution_admission
+                .as_ref()
+                .map(AgentExecutionAdmission::capability),
+            None,
+        )?,
+        None => crate::tools::supplied_registry_base()?,
+    };
+    let crate::composition::PreparedRegistry {
+        built,
+        construction,
+        supplied_tail,
+    } = capabilities.prepare_registry(built, construction, &tool_request, principal)?;
+    let skills = if construction == crate::composition::RegistryConstruction::NativeCompat {
+        crate::skills::load_skills_for_agent_from_config(config, alias)
+    } else {
+        Vec::new()
+    };
     // Capture before `runtime` is moved into `ScopedAssembly` below.
     let shell_profile = runtime.shell_profile();
     // The same gated seam run(), process_message, and independent delegation use:
@@ -3939,8 +3929,8 @@ pub(crate) async fn assemble_owned_execution_with_capabilities(
     // this agent's MCP bundles, and its skills register as tools. Peripherals stay
     // disconnected — a nested SOP sub-loop must not seize the serial hardware the
     // live daemon holds exclusively.
-    let assembled =
-        crate::tools::scoped::ScopedToolRegistry::assemble(crate::tools::scoped::ScopedAssembly {
+    let assembled = crate::tools::scoped::ScopedToolRegistry::assemble_prepared(
+        crate::tools::scoped::ScopedAssembly {
             config,
             agent_alias: alias,
             security: &security,
@@ -3959,8 +3949,11 @@ pub(crate) async fn assemble_owned_execution_with_capabilities(
             acp_delivery: false,
             list_deferred_mcp_specs: false,
             emit_assembly_logs: true,
-        })
-        .await;
+        },
+        construction,
+        supplied_tail,
+    )
+    .await;
     let mcp_prompt_section = assembled.combined_mcp_prompt_section();
     let crate::tools::scoped::ScopedAssembled {
         registry,

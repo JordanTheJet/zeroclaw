@@ -1,6 +1,6 @@
 # Runtime composition contract (proposal)
 
-**Status:** proposed; step 2 implemented. This page is the composition-API proposal that [#10993](https://github.com/zeroclaw-labs/zeroclaw/issues/10993) asks for before any caller moves. It delivers the first acceptance item of that issue and the design half of [#7432](https://github.com/zeroclaw-labs/zeroclaw/issues/7432) R1. The contract lives in `crates/zeroclaw-runtime/src/composition.rs`. The runtime entry points listed under step 2 take it through `*_with_capabilities` forms, and their old signatures are adapters over a config-backed set; no caller has moved yet.
+**Status:** proposed; capability entry points and the complete supplied-registry boundary are implemented, with receiving validation and API/owner review still required. This page is the composition-API proposal that [#10993](https://github.com/zeroclaw-labs/zeroclaw/issues/10993) asks for before callers move. The contract lives in `crates/zeroclaw-runtime/src/composition.rs`. The runtime entry points listed under step 2 take it through `*_with_capabilities` forms, and their old signatures remain adapters over an explicitly config-backed set. This is not full [#7432](https://github.com/zeroclaw-labs/zeroclaw/issues/7432) R1 or holding-crate acceptance.
 
 The goal is the one RFC [#5574](https://github.com/zeroclaw-labs/zeroclaw/issues/5574) set for Phase 2 D1: an agent runtime that an embedder can run with capabilities it supplies, where the runtime "has no knowledge of Telegram, Discord, Anthropic, or any specific tool implementation", and where the binary becomes a thin wiring layer.
 
@@ -104,6 +104,10 @@ pub trait MemorySource: Send + Sync {
     async fn memory(&self, request: &MemoryRequest<'_>) -> anyhow::Result<Arc<dyn Memory>>;
 }
 pub trait ToolSource: Send + Sync {
+    // Default Ok(None): the supplied vector is the whole registry.
+    // A source may instead explicitly select a borrowed native recipe.
+    fn native_recipe<'s>(&'s self, request: &ToolRequest<'_>)
+        -> anyhow::Result<Option<&'s NativeRegistryRecipe>> { Ok(None) }
     fn tools(&self, request: &ToolRequest<'_>) -> anyhow::Result<Vec<Box<dyn Tool>>>;
 }
 pub trait ChannelSource: Send + Sync {
@@ -138,7 +142,7 @@ pub async fn run(runtime: Runtime) -> anyhow::Result<DaemonExit>;
 3. **Returned handles are borrowed for a scope.** A provider or memory handle belongs to the session or turn that asked for it. Sources may cache and share instances; callers must not stash them past their session.
 4. **One store per agent per generation.** Two memory requests for the same agent in one generation must reach the same underlying store. Today's code guarantees this implicitly by constructing from the same config; the contract makes it an obligation of the source.
 5. **The observer is process-level per generation.** It is an instance, not a source, because it is not resolved per agent.
-6. **Outbound only.** `ChannelSource` covers channels the runtime sends through: replies by alias, scheduled delivery, and approval prompts. Inbound turns arrive through `RuntimeIngress`, not through this contract.
+6. **Channels belong to the supplied source.** `ChannelSource` covers replies by alias, scheduled delivery, approval prompts, and the `cli` session channel. Supplied `None` is authoritative; it does not fall back to the process-global CLI factory. The config-backed `defaults::NoOutboundChannels` adapter explicitly maps `cli` to that registered application factory. The CLI loop retains its existing stdin reader; this adds no inbound turn transport.
 
 Retained sources can receive newer config snapshots during a live model refresh or newly admitted child work. Config-backed sources resolve each request against the supplied snapshot. Hosts must keep retained sources compatible with those snapshots, or rebuild affected sessions and registries when construction wiring changes. A full daemon reload drains old work before replacing its capability set.
 
@@ -162,7 +166,23 @@ The issue requires resolved security policy to remain explicit across the bounda
 
 - The runtime resolves each agent's `SecurityPolicy` and `RuntimeAdapter` and passes them *into* `ToolRequest`. Native sources are trusted implementations required to build tools against those supplied values. Passing them into a Rust trait does not mechanically confine in-process code: a source can return arbitrary native tools, so runtime admission, policy filtering, and per-call gating and approval remain independent requirements.
 - Building a tool against a policy authorizes nothing. The runtime still gates and approves every call after construction, exactly as today.
-- The runtime may add core tools and remove tools the policy excludes. It never adds a tool the policy forbids because a source returned it.
+- Supplied-only construction does not add core tools. Both construction modes remove tools the policy or caller/context gates exclude. A source cannot widen execution authority by returning a tool.
+
+### Complete supplied registries and explicit native compatibility
+
+`ToolSource::native_recipe` is called once at each eager build, after the caller's existing provider, memory and admission resolution. Its default `Ok(None)` selects **SuppliedOnly**: `tools()` is the entire registry, including an empty vector. This path performs generic parser warmup but does not call the native registry factory, load skills, connect MCP or peripherals, create pipeline/discovery helpers, or self-build an unused SOP engine. Existing caller-provided SOP handles remain caller-owned. Policy, principal, caller and memory/delivery context gates still narrow the supplied tools.
+
+This deliberately changes the previous implicit native augmentation contract. To retain that behavior, implement `native_recipe` with `Ok(Some(&defaults::native_compat_registry))`, or use `defaults::NoSuppliedTools`. **NativeCompat** invokes that recipe with the actual caller-owned handles, then admits source extensions through the same filters. The legacy recipe retains the selected lazy constructors and one final registry seal, including late native namespace retirement across captured pipeline, skill and delegate views. Source tools do not become unfiltered skill-elevation inputs. Native names retain precedence; denied or retired source extensions are not projected into child handles.
+
+`NativeRegistryRecipe` is a public `dyn Fn` alias with ten typed inputs: `ToolRequest`, workspace path, canvas, subagent flag, forwarded environment, SOP engine, SOP audit, live config, execution capability and ACP session view. It is `Send + Sync + 'static`; a source may own a captured callable to preserve per-instance state. `native_recipe<'s>(&'s self, &ToolRequest) -> Result<Option<&'s NativeRegistryRecipe>>` borrows only the source. No request fields are added, and no lifecycle handles are hidden in an argument bag. Selection and invocation errors are terminal. The recipe may retain required handles in the tools it returns, never separately in source state. Native SOP self-build reuses the initial memory Arc and does not make a second memory request.
+
+Selection must perform no I/O and must not access `request.memory` beyond identity. In a bounded delegate's selection-only probe, that field is the existing parent-registry memory handle, not an opened target store. The probe never invokes a recipe or `tools()`. Refusals that must cover bounded inheritance therefore belong in selection's `Err`. An unbound legacy delegate explicitly selects NativeCompat without calling a source; a bound delegate missing its actual runtime or memory refuses.
+
+Bounded delegation proves native memory origin with a creator-stamped typed Weak witness and actual Arc identity. A memory-looking name, tool role, implementation type, selected mode or foreign pointer grants no origin. Only admitted, proven native memory entries cause target memory resolution and typed replacement. SuppliedOnly refuses such entries before opening target memory; unknown/source tools keep their actual objects and backing store. NativeCompat memory failure refuses without parent-plane fallback. A child delegate carries the target-effective objects and the same weak provenance owner, so a second hop opens its own target plane. Background and parallel wrappers carry that pair without changing depth ownership. The provenance metadata retains no executable tool and expires with the last actual object.
+
+Principal-plane routing binds the current build's genuine native memory tools once, before any memory operation starts. The concrete Tool Arcs stay unchanged, so existing pipeline, skill and parent captures use the same routed resource. Unknown supplied handlers keep their own stores. A private forwarding handle carries the actual original Memory and SecurityPolicy identities; its one-time target is local to that build, while family provenance stays Weak metadata. Routing after native memory use refuses and leaves Agent state unchanged; it never retargets an in-flight operation. Each bounded target gets a fresh handle and constructs only the distinct admitted native kinds, in first-occurrence order. This does not change the parent context gates or grant additional tool access.
+
+`AllToolsResult` now carries private provenance transport. External exhaustive struct literals must migrate to the existing `AllToolsResult::from_prebuilt_tools(tools)` constructor and then set any public side-channel fields they own. Prebuilt tools start with unknown provenance; that constructor cannot mint native identity. This is an API migration, not a source-compatibility claim. The public callable, migration, holding-crate placement and owner/Core approval require review independently of source preparation. Compiler, runtime, namespace, CLI, baseline and guard-mutation results must be reported against the actual receiving tree; design approval and older receipts do not qualify it.
 
 Parity tests in the first implementation slice must show that the effective tool set and approval behavior are unchanged for every agent in a representative config.
 
@@ -197,6 +217,8 @@ The intended destination is the composition owner in the planned `zeroclaw-kerne
 ## Migration order for callers
 
 Every step keeps existing configuration and effective permissions. Old entry points stay as compatibility adapters until their last caller moves, as the issue's risk section requires.
+
+The table records the staged migration proposal. Its retained tier-1/tier-2 construction describes NativeCompat. Capability-taking tool construction now also supports the complete SuppliedOnly boundary above; default-`None` source implementations must be reviewed for that deliberate contract change. The historical measurements and proposed `Runtime::run_turn` below are not current execution or dependency-graph evidence.
 
 | Step | Change | Evidence required |
 | --- | --- | --- |

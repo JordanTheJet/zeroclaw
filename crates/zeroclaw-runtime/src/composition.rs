@@ -34,7 +34,7 @@ mod config_backed;
 /// application layer that composes the same recipe.
 pub mod defaults {
     pub use super::config_backed::{
-        ConfigMemory, ConfigProviders, NoOutboundChannels, NoSuppliedTools,
+        ConfigMemory, ConfigProviders, NoOutboundChannels, NoSuppliedTools, native_compat_registry,
     };
 }
 
@@ -78,6 +78,18 @@ pub struct BoundCapabilities {
 /// inherits. Empty until the entry point that owns the tool's registry binds
 /// it; while empty the tool keeps its pre-capability behavior.
 pub type CapabilitySlot = Arc<std::sync::OnceLock<BoundCapabilities>>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RegistryConstruction {
+    SuppliedOnly,
+    NativeCompat,
+}
+
+pub(crate) struct PreparedRegistry {
+    pub(crate) built: crate::tools::AllToolsResult,
+    pub(crate) construction: RegistryConstruction,
+    pub(crate) supplied_tail: std::ops::Range<usize>,
+}
 
 impl RuntimeCapabilities {
     /// The capabilities today's `create_*` factories produce for `config`.
@@ -130,7 +142,7 @@ impl RuntimeCapabilities {
             .await
     }
 
-    /// Bind a registry the runtime built to these capabilities and to
+    /// Bind the selected registry to these capabilities and to
     /// `principal`, before the registry reaches `ScopedToolRegistry::assemble`.
     ///
     /// Every tool in the registry that starts child operations (the delegate,
@@ -143,14 +155,16 @@ impl RuntimeCapabilities {
     /// apply to them exactly as to runtime tools. They stay out of
     /// `unfiltered_tool_arcs`, which skill elevation resolves against, so a
     /// skill cannot raise a source tool past that filter. A source tool whose
-    /// name the runtime already registered is dropped: the runtime's own tool
-    /// keeps the name.
-    pub(crate) fn bind_registry(
+    /// name the selected native recipe already registered is dropped in native
+    /// compatibility mode. In supplied-only mode the complete source vector,
+    /// including an empty vector, goes through the ordinary narrowing gates.
+    pub(crate) fn prepare_registry(
         &self,
-        built: &mut crate::tools::AllToolsResult,
+        mut built: crate::tools::AllToolsResult,
+        construction: RegistryConstruction,
         request: &ToolRequest<'_>,
         principal: Option<&PrincipalId>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<PreparedRegistry> {
         for slot in &built.capability_slots {
             let _ = slot.set(BoundCapabilities {
                 capabilities: self.clone(),
@@ -158,11 +172,13 @@ impl RuntimeCapabilities {
             });
         }
         let supplied = self.tools.tools(request)?;
+        let start = built.tools.len();
         for tool in supplied {
-            if built
-                .tools
-                .iter()
-                .any(|existing| existing.name() == tool.name())
+            if construction == RegistryConstruction::NativeCompat
+                && built
+                    .tools
+                    .iter()
+                    .any(|existing| existing.name() == tool.name())
             {
                 ::zeroclaw_log::record!(
                     WARN,
@@ -178,7 +194,12 @@ impl RuntimeCapabilities {
             }
             built.tools.push(tool);
         }
-        Ok(())
+        let supplied_tail = start..built.tools.len();
+        Ok(PreparedRegistry {
+            built,
+            construction,
+            supplied_tail,
+        })
     }
 }
 
@@ -282,23 +303,60 @@ pub struct ToolRequest<'a> {
     pub security: &'a Arc<SecurityPolicy>,
     /// The execution environment the runtime selected for this agent.
     pub runtime: &'a Arc<dyn RuntimeAdapter>,
-    /// The agent's memory, as returned by the generation's [`MemorySource`].
+    /// The eager caller's resolved memory. In the bounded inheritance-only
+    /// selection probe this is the existing parent-registry memory handle,
+    /// not an opened target store. Selection may compare identity but must
+    /// not access the store or perform I/O.
     pub memory: &'a Arc<dyn Memory>,
 }
 
+/// Explicit native compatibility recipe. Ten typed invocation inputs retain
+/// the caller's actual ownership; a stateful source may own a captured callable.
+/// Returned tools may retain their required handles; the recipe must not retain
+/// caller lifecycle handles separately from the tools it returns.
+pub type NativeRegistryRecipe = dyn Fn(
+        &ToolRequest<'_>,
+        &std::path::Path,
+        Option<crate::tools::CanvasStore>,
+        bool,
+        Option<crate::tools::ForwardedEnvironment>,
+        Option<Arc<std::sync::Mutex<crate::sop::SopEngine>>>,
+        Option<Arc<crate::sop::SopAuditLogger>>,
+        Option<zeroclaw_config::live::LiveConfigHandle>,
+        Option<crate::live_config_authority::AgentExecutionCapability>,
+        Option<crate::tools::AcpSessionReadView>,
+    ) -> anyhow::Result<crate::tools::AllToolsResult>
+    + Send
+    + Sync
+    + 'static;
+
 /// Supplies tool registries.
 pub trait ToolSource: Send + Sync {
-    /// Return the tools for `request`. The runtime may add its own core tools
-    /// and remove any tool the resolved policy excludes; it never adds a tool
-    /// the policy forbids because a source returned it.
+    /// Select once per build, without I/O or touching memory beyond identity.
+    /// `Ok(None)` makes `tools` the complete registry, including empty.
+    /// `Ok(Some(recipe))` explicitly selects native compatibility plus extensions.
+    /// Both selection and recipe errors are terminal. Refusal that also applies
+    /// to bounded inheritance belongs here: bounded probes never invoke a recipe.
+    /// The borrowed result is tied only to this source, never to request fields.
+    fn native_recipe<'s>(
+        &'s self,
+        _request: &ToolRequest<'_>,
+    ) -> anyhow::Result<Option<&'s NativeRegistryRecipe>> {
+        Ok(None)
+    }
+
+    /// Complete supplied vector by default; native extensions only after an
+    /// explicit recipe choice. Policy/caller/context gates still narrow it.
+    /// This deliberately replaces the old implicit native augmentation contract;
+    /// return the legacy recipe to retain that previous construction behavior.
     fn tools(&self, request: &ToolRequest<'_>) -> anyhow::Result<Vec<Box<dyn Tool>>>;
 }
 
 /// Supplies outbound delivery channels.
 ///
-/// Inbound turns do not arrive through this trait. It covers only the channels
-/// the runtime sends through: replies routed by alias, scheduled delivery, and
-/// approval prompts.
+/// It covers replies routed by alias, scheduled delivery, approval prompts and
+/// the CLI session channel (`cli`). The CLI keeps its existing stdin reader;
+/// this source does not introduce an inbound turn transport.
 pub trait ChannelSource: Send + Sync {
     /// Return the channel configured under `alias`, if it is running in this
     /// generation.

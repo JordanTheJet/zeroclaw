@@ -1752,28 +1752,30 @@ async fn run_inner(
         }
 
         // ── Tools (including memory tools and peripherals) ────────────
-        let (composio_key, composio_entity_id) = if config.composio.enabled {
-            (
-                config.composio.api_key.as_deref(),
-                Some(config.composio.entity_id.as_str()),
-            )
-        } else {
-            (None, None)
+        let tool_config = Arc::new(config.clone());
+        let tool_request = crate::composition::ToolRequest {
+            config: &tool_config,
+            agent_alias,
+            security: &security,
+            runtime: &runtime,
+            memory: &mem,
         };
-
-        // Build SOP engine when sops_dir is configured so SOP tools are
-        // available on this path (CLI agent run). No channel map is wired on this
-        // path, so the approval route adapter is the no-op (log-only); the daemon
-        // path injects a real channel-delivering adapter.
-        let (sop_engine, sop_audit) = if config.sop.runtime_enabled() {
-            let sop_mem: Arc<dyn zeroclaw_memory::Memory> =
-                capabilities.agent_memory(&config, agent_alias).await?;
+        let selected_recipe = capabilities.tools.native_recipe(&tool_request)?;
+        let construction = if selected_recipe.is_some() {
+            crate::composition::RegistryConstruction::NativeCompat
+        } else {
+            crate::composition::RegistryConstruction::SuppliedOnly
+        };
+        let (sop_engine, sop_audit) = if construction
+            == crate::composition::RegistryConstruction::NativeCompat
+            && config.sop.runtime_enabled()
+        {
             let (engine, audit) = crate::sop::build_sop_engine_with_capability(
                 config.sop.clone(),
                 &config.decision_models,
                 &config.data_dir,
                 &config.install_root_dir(),
-                sop_mem,
+                Arc::clone(&mem),
                 Default::default(),
                 execution_capability.clone(),
             );
@@ -1781,74 +1783,70 @@ async fn run_inner(
         } else {
             (None, None)
         };
-
-        let tool_config = Arc::new(config.clone());
-        let mut all_tools_result = tools::all_tools_with_runtime_and_execution_capability(
-            Arc::clone(&tool_config),
-            &security,
-            &risk_profile,
-            agent_alias,
-            runtime.clone(),
-            mem.clone(),
-            composio_key,
-            composio_entity_id,
-            &config.browser,
-            &config.http_request,
-            &config.web_fetch,
-            &config.data_dir,
-            &config.agents,
-            agent_model_provider.and_then(|e| e.api_key.as_deref()),
-            &config,
-            None,
-            is_subagent_caller,
-            None,
-            sop_engine,
-            sop_audit,
-            execution_capability
-                .as_ref()
-                .map(AgentExecutionCapability::config_handle),
-            execution_capability.clone(),
-        )?;
-        capabilities.bind_registry(
-            &mut all_tools_result,
-            &crate::composition::ToolRequest {
-                config: &tool_config,
-                agent_alias,
-                security: &security,
-                runtime: &runtime,
-                memory: &mem,
-            },
+        let all_tools_result = match selected_recipe {
+            Some(recipe) => recipe(
+                &tool_request,
+                &config.data_dir,
+                None,
+                is_subagent_caller,
+                None,
+                sop_engine,
+                sop_audit,
+                execution_capability
+                    .as_ref()
+                    .map(AgentExecutionCapability::config_handle),
+                execution_capability.clone(),
+                None,
+            )?,
+            None => tools::supplied_registry_base()?,
+        };
+        let crate::composition::PreparedRegistry {
+            built: all_tools_result,
+            construction,
+            supplied_tail,
+        } = capabilities.prepare_registry(
+            all_tools_result,
+            construction,
+            &tool_request,
             principal.as_ref(),
         )?;
-        let skills = crate::skills::load_skills_for_agent_from_config(&config, agent_alias);
+        let skills = if construction == crate::composition::RegistryConstruction::NativeCompat {
+            crate::skills::load_skills_for_agent_from_config(&config, agent_alias)
+        } else {
+            Vec::new()
+        };
         // Route the per-agent tool registry through the one gated seam
         // (peripherals -> built-in filter -> MCP scope+gate -> skills), identical
         // to the behavior this path hand-rolled. `caller_allowed` carries the
         // run() per-run allowlist; connect_peripherals is true (execution path).
-        let assembled = scoped::ScopedToolRegistry::assemble(scoped::ScopedAssembly {
-            config: &config,
-            agent_alias,
-            security: &security,
-            built: all_tools_result,
-            skills: &skills,
-            runtime: runtime.clone(),
-            caller_allowed: allowed_tools.as_deref(),
-            connect_mcp: true,
-            connect_peripherals: true,
-            // A memory-free run drops the persistent memory tools so the model
-            // cannot read or write memory even though the registry is otherwise
-            // built identically.
-            exclude_memory: memory_free,
-            acp_delivery: false,
-            list_deferred_mcp_specs: false,
-            emit_assembly_logs: true,
-            // Honor the daemon worker's pre-built shared registry so stdio
-            // MCP children live for the daemon's lifetime, not per
-            // `agent::run` call. CLI/one-shot callers leave
-            // `mcp_registry` at its default (`None`) and the seam
-            // falls back to the per-call `connect_all`.
-            mcp_registry: overrides.mcp_registry.as_ref().map(Arc::clone),
-        })
+        let assembled = scoped::ScopedToolRegistry::assemble_prepared(
+            scoped::ScopedAssembly {
+                config: &config,
+                agent_alias,
+                security: &security,
+                built: all_tools_result,
+                skills: &skills,
+                runtime: runtime.clone(),
+                caller_allowed: allowed_tools.as_deref(),
+                connect_mcp: true,
+                connect_peripherals: true,
+                // A memory-free run drops the persistent memory tools so the model
+                // cannot read or write memory even though the registry is otherwise
+                // built identically.
+                exclude_memory: memory_free,
+                acp_delivery: false,
+                list_deferred_mcp_specs: false,
+                emit_assembly_logs: true,
+                // Honor the daemon worker's pre-built shared registry so stdio
+                // MCP children live for the daemon's lifetime, not per
+                // `agent::run` call. CLI/one-shot callers leave
+                // `mcp_registry` at its default (`None`) and the seam
+                // falls back to the per-call `connect_all`.
+                mcp_registry: overrides.mcp_registry.as_ref().map(Arc::clone),
+            },
+            construction,
+            supplied_tail,
+        )
         .await;
         // run injects one combined MCP prompt block: deferred tool-search listing +
         // pinned resources, composed by the harness.
@@ -2679,9 +2677,11 @@ async fn run_inner(
         } else {
             println!("🦀 ZeroClaw Interactive Mode");
             println!("Type /help for commands.\n");
-            let cli = CLI_CHANNEL_FN.get().expect(
-                "CLI channel factory not registered — call register_cli_channel_fn at startup",
-            )();
+            let cli = capabilities.channels.channel("cli").ok_or_else(|| {
+                anyhow::Error::msg(crate::i18n::get_required_cli_string(
+                    "cli-agent-error-channel-unavailable",
+                ))
+            })?;
 
             // Persistent conversation history across turns, with explicit
             // breadcrumb provenance. Legacy v1 files are migrated by inspecting
@@ -3825,28 +3825,30 @@ async fn process_message_inner(
         let approval_manager = ApprovalManager::for_non_interactive(&risk_profile);
         let mem: Arc<dyn Memory> = capabilities.agent_memory(&config, agent_alias).await?;
 
-        let (composio_key, composio_entity_id) = if config.composio.enabled {
-            (
-                config.composio.api_key.as_deref(),
-                Some(config.composio.entity_id.as_str()),
-            )
-        } else {
-            (None, None)
+        let tool_config = Arc::clone(&config);
+        let tool_request = crate::composition::ToolRequest {
+            config: &tool_config,
+            agent_alias,
+            security: &security,
+            runtime: &runtime,
+            memory: &mem,
         };
-
-        // Build SOP engine when sops_dir is configured so SOP tools are
-        // available on this path (process_message CLI agent). No channel map is
-        // wired here, so the approval route adapter is the no-op (log-only); the
-        // daemon path injects a real channel-delivering adapter.
-        let (sop_engine, sop_audit) = if config.sop.runtime_enabled() {
-            let sop_mem: Arc<dyn zeroclaw_memory::Memory> =
-                capabilities.agent_memory(&config, agent_alias).await?;
+        let selected_recipe = capabilities.tools.native_recipe(&tool_request)?;
+        let construction = if selected_recipe.is_some() {
+            crate::composition::RegistryConstruction::NativeCompat
+        } else {
+            crate::composition::RegistryConstruction::SuppliedOnly
+        };
+        let (sop_engine, sop_audit) = if construction
+            == crate::composition::RegistryConstruction::NativeCompat
+            && config.sop.runtime_enabled()
+        {
             let (engine, audit) = crate::sop::build_sop_engine_with_capability(
                 config.sop.clone(),
                 &config.decision_models,
                 &config.data_dir,
                 &config.install_root_dir(),
-                sop_mem,
+                Arc::clone(&mem),
                 Default::default(),
                 execution_capability.clone(),
             );
@@ -3854,67 +3856,62 @@ async fn process_message_inner(
         } else {
             (None, None)
         };
-
-        let mut all_tools_result_pm = tools::all_tools_with_runtime_and_execution_capability(
-            Arc::clone(&config),
-            &security,
-            &risk_profile,
-            agent_alias,
-            runtime.clone(),
-            mem.clone(),
-            composio_key,
-            composio_entity_id,
-            &config.browser,
-            &config.http_request,
-            &config.web_fetch,
-            &config.data_dir,
-            &config.agents,
-            agent_model_provider
-                .as_ref()
-                .and_then(|e| e.api_key.as_deref()),
-            &config,
-            None,
-            false,
-            None,
-            sop_engine,
-            sop_audit,
-            live_config.clone(),
-            execution_capability.clone(),
+        let all_tools_result_pm = match selected_recipe {
+            Some(recipe) => recipe(
+                &tool_request,
+                &config.data_dir,
+                None,
+                false,
+                None,
+                sop_engine,
+                sop_audit,
+                live_config.clone(),
+                execution_capability.clone(),
+                None,
+            )?,
+            None => tools::supplied_registry_base()?,
+        };
+        let crate::composition::PreparedRegistry {
+            built: all_tools_result_pm,
+            construction,
+            supplied_tail,
+        } = capabilities.prepare_registry(
+            all_tools_result_pm,
+            construction,
+            &tool_request,
+            principal.as_ref(),
         )?;
-        capabilities.bind_registry(
-            &mut all_tools_result_pm,
-            &crate::composition::ToolRequest {
+        let skills = if construction == crate::composition::RegistryConstruction::NativeCompat {
+            crate::skills::load_skills_for_agent_from_config(&config, agent_alias)
+        } else {
+            Vec::new()
+        };
+        let assembled = scoped::ScopedToolRegistry::assemble_prepared(
+            scoped::ScopedAssembly {
                 config: &config,
                 agent_alias,
                 security: &security,
-                runtime: &runtime,
-                memory: &mem,
+                built: all_tools_result_pm,
+                skills: &skills,
+                runtime: runtime.clone(),
+                caller_allowed: None,
+                connect_mcp: true,
+                connect_peripherals: true,
+                exclude_memory: false,
+                acp_delivery: false,
+                list_deferred_mcp_specs: false,
+                emit_assembly_logs: true,
+                // `process_message` is the channel/orchestrator live-chat path;
+                // it has no cross-turn reuse contract, so the per-call
+                // `connect_all` path inside `assemble` is the correct choice.
+                // The daemon heartbeat worker — the only caller that has a
+                // reuse contract — passes its own `mcp_registry` through
+                // `agent::run` (`AgentRunOverrides::mcp_registry`).
+                mcp_registry: None,
             },
-            principal.as_ref(),
-        )?;
-        let skills = crate::skills::load_skills_for_agent_from_config(&config, agent_alias);
-        let assembled = scoped::ScopedToolRegistry::assemble(scoped::ScopedAssembly {
-            config: &config,
-            agent_alias,
-            security: &security,
-            built: all_tools_result_pm,
-            skills: &skills,
-            runtime: runtime.clone(),
-            caller_allowed: None,
-            connect_mcp: true,
-            connect_peripherals: true,
-            exclude_memory: false,
-            acp_delivery: false,
-            list_deferred_mcp_specs: false,
-            emit_assembly_logs: true,
-            // `process_message` is the channel/orchestrator live-chat path;
-            // it has no cross-turn reuse contract, so the per-call
-            // `connect_all` path inside `assemble` is the correct choice.
-            // The daemon heartbeat worker — the only caller that has a
-            // reuse contract — passes its own `mcp_registry` through
-            // `agent::run` (`AgentRunOverrides::mcp_registry`).
-            mcp_registry: None,
-        })
+            construction,
+            supplied_tail,
+        )
         .await;
         // process_message injects one combined MCP prompt block: deferred tool-search
         // listing + pinned resources, composed by the harness. `mut` because the
@@ -17369,6 +17366,7 @@ Let me check the result."#;
         });
         let risk_profile = RiskProfileConfig::default();
         let built = crate::tools::AllToolsResult {
+            native_memory: Default::default(),
             tools: vec![mock_tool("shell")],
             reserved_host_names: std::collections::HashSet::new(),
             delegate_handle: None,
@@ -24778,6 +24776,9 @@ mod capability_entry_point_tests {
                 ..Default::default()
             },
         );
+        config.sop.sops_dir = Some(tmp.path().join("sops").display().to_string());
+        let sop_state = config.data_dir.join("sop");
+        assert!(!sop_state.exists());
         let providers = Arc::new(RecordingProviders::default());
         let memory = Arc::new(RecordingMemory::default());
         let principal = PrincipalId::for_oidc("https://issuer.example", "subject-2");
@@ -24800,6 +24801,10 @@ mod capability_entry_point_tests {
         .expect("the turn completes on the supplied provider");
 
         assert!(reply.contains(STUB_REPLY), "unexpected reply: {reply}");
+        assert!(
+            !sop_state.exists(),
+            "SuppliedOnly process_message must not construct a native SOP run store"
+        );
         assert_eq!(
             *providers.seen.lock(),
             vec![SeenProviderRequest {
@@ -25011,6 +25016,16 @@ mod capability_entry_point_tests {
 
     struct SwitchCli(Arc<std::sync::Mutex<Vec<String>>>);
 
+    struct SwitchChannels(Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl crate::composition::ChannelSource for SwitchChannels {
+        fn channel(&self, alias: &str) -> Option<Arc<dyn zeroclaw_api::channel::Channel>> {
+            (alias == "cli").then(|| {
+                Arc::new(SwitchCli(self.0.clone())) as Arc<dyn zeroclaw_api::channel::Channel>
+            })
+        }
+    }
+
     impl zeroclaw_api::attribution::Attributable for SwitchCli {
         fn role(&self) -> zeroclaw_api::attribution::Role {
             use zeroclaw_api::attribution::{ChannelKind, Role};
@@ -25144,6 +25159,9 @@ mod capability_entry_point_tests {
         capabilities.observer = observer.clone();
         let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
         let channel_messages = sent.clone();
+        capabilities.tools = Arc::new(crate::composition::defaults::NoSuppliedTools);
+        capabilities.channels = Arc::new(SwitchChannels(sent.clone()));
+        config.tools.optional = vec!["model_switch".into()];
         assert!(super::CLI_CHANNEL_FN.get().is_none());
         super::register_cli_channel_fn(Box::new(move || {
             Box::new(SwitchCli(channel_messages.clone()))
@@ -25245,9 +25263,129 @@ mod capability_entry_point_tests {
 
     // Only this explicitly selected child registers the process-global CLI factory.
     #[test]
-    #[ignore = "private same-executable fixture, invoked by the four parent controls"]
+    #[ignore = "private same-executable fixture, invoked by the six parent controls"]
     fn supplied_cli_switch_child() {
         let case = std::env::var(SWITCH_CASE_ENV).expect("explicit private CLI switch case");
+        if matches!(case.as_str(), "no-channel" | "config-backed-channel") {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                tokio::time::timeout(std::time::Duration::from_secs(15), async {
+                    let tmp = tempfile::TempDir::new().unwrap();
+                    let mut config = Config {
+                        data_dir: tmp.path().join("data"),
+                        config_path: tmp.path().join("config.toml"),
+                        ..Default::default()
+                    };
+                    config.memory.auto_save = false;
+                    config.sop.sops_dir = Some(tmp.path().join("sops").display().to_string());
+                    let sop_state = config.data_dir.join("sop");
+                    assert!(!sop_state.exists());
+                    config
+                        .risk_profiles
+                        .insert("no-channel".into(), RiskProfileConfig::default());
+                    config.providers.models.openai.insert(
+                        "initial".into(),
+                        OpenAIModelProviderConfig {
+                            base: ModelProviderConfig {
+                                model: Some(START_MODEL.into()),
+                                ..Default::default()
+                            },
+                        },
+                    );
+                    config.agents.insert(
+                        SWITCH_AGENT.into(),
+                        AliasedAgentConfig {
+                            model_provider: START_REF.into(),
+                            risk_profile: "no-channel".into(),
+                            ..Default::default()
+                        },
+                    );
+                    let factory_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                    let observed = factory_calls.clone();
+                    assert!(super::CLI_CHANNEL_FN.get().is_none());
+                    super::register_cli_channel_fn(Box::new(move || {
+                        observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        Box::new(SwitchCli(Default::default()))
+                    }));
+                    let providers = Arc::new(RecordingProviders::default());
+                    let mut caps = recording_capabilities(
+                        providers.clone(),
+                        Arc::new(RecordingMemory::default()),
+                        Arc::new(NoTools),
+                    );
+                    let observer = Arc::new(SwitchObserver::default());
+                    caps.observer = observer.clone();
+                    if case == "config-backed-channel" {
+                        caps.channels = Arc::new(crate::composition::defaults::NoOutboundChannels);
+                    }
+                    let result = super::run_with_capabilities(
+                        config,
+                        caps,
+                        None,
+                        SWITCH_AGENT,
+                        None,
+                        None,
+                        None,
+                        None,
+                        Vec::new(),
+                        true,
+                        None,
+                        None,
+                        TurnOrigin::Interactive,
+                        super::AgentRunOverrides::default(),
+                    )
+                    .await;
+                    if case == "config-backed-channel" {
+                        assert_eq!(
+                            result.expect("the config-backed CLI serves the turn"),
+                            STUB_REPLY
+                        );
+                        assert_eq!(factory_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+                        let events = observer.0.lock().unwrap();
+                        assert_eq!(
+                            events
+                                .iter()
+                                .filter(|event| matches!(event,
+                            zeroclaw_api::observability_traits::ObserverEvent::LlmResponse {
+                                success: true, agent_alias: Some(alias), ..
+                            } if alias == SWITCH_AGENT))
+                                .count(),
+                            1,
+                            "exactly one served turn"
+                        );
+                        println!("CONFIG_BACKED_CLI_ONE_FACTORY_ONE_TURN");
+                    } else {
+                        let error = result.expect_err(
+                            "NoChannels is authoritative even with a registered factory",
+                        );
+                        assert_eq!(
+                            error.to_string(),
+                            crate::i18n::get_required_cli_string(
+                                "cli-agent-error-channel-unavailable"
+                            )
+                        );
+                        assert_eq!(factory_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+                        println!("SUPPLIED_CLI_NO_CHANNEL_REFUSED");
+                    }
+                    assert_eq!(
+                        providers.seen.lock().len(),
+                        1,
+                        "the real CLI reached its channel boundary after provider setup"
+                    );
+                    assert!(
+                        !sop_state.exists(),
+                        "SuppliedOnly run must not construct a native SOP run store"
+                    );
+                })
+                .await
+                .expect("bounded actual channel refusal");
+            });
+            println!("SUPPLIED_CLI_SWITCH_PASSED:{case}");
+            return;
+        }
         let (interactive, refuse) = match case.as_str() {
             "one-shot-serve" => (false, false),
             "one-shot-refuse" => (false, true),
@@ -25383,7 +25521,22 @@ mod capability_entry_point_tests {
         assert!(status.success(), "{case}: {status}\n{output}\n{errors}");
         assert_eq!(
             output.matches("SUPPLIED_CLI_SWITCH_TOOL_COMPLETED").count(),
-            1
+            usize::from(!matches!(case, "no-channel" | "config-backed-channel"))
+        );
+        assert_eq!(
+            output.matches("SUPPLIED_CLI_NO_CHANNEL_REFUSED").count(),
+            usize::from(case == "no-channel")
+        );
+        assert_eq!(
+            output
+                .matches("CONFIG_BACKED_CLI_ONE_FACTORY_ONE_TURN")
+                .count(),
+            usize::from(case == "config-backed-channel")
+        );
+        assert_eq!(
+            output.matches(STUB_REPLY).count(),
+            usize::from(case == "config-backed-channel"),
+            "the real CLI prints the one served response: {output}"
         );
         assert_eq!(
             output
@@ -25405,6 +25558,16 @@ mod capability_entry_point_tests {
     #[test]
     fn run_supplied_one_shot_switch_uses_switch_source() {
         run_switch_child("one-shot-serve");
+    }
+
+    #[test]
+    fn run_supplied_no_channels_refuses_without_global_factory_fallback() {
+        run_switch_child("no-channel");
+    }
+
+    #[test]
+    fn run_config_backed_cli_channel_factory_serves_exactly_one_turn() {
+        run_switch_child("config-backed-channel");
     }
 
     #[test]
