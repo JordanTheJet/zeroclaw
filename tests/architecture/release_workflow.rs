@@ -321,8 +321,7 @@ fn shared_release_recipe() -> String {
 
 /// The Stable build gives both Linux ARM64 targets the bounded memory helper
 /// and two build jobs; the GNU-only qualification job has no musl leg.
-const STABLE_ARM64_TARGETS: &str =
-    "(matrix.target == 'aarch64-unknown-linux-gnu' || matrix.target == 'aarch64-unknown-linux-musl')";
+const STABLE_ARM64_TARGETS: &str = "(matrix.target == 'aarch64-unknown-linux-gnu' || matrix.target == 'aarch64-unknown-linux-musl')";
 const GNU_ARM64_TARGET: &str = "matrix.target == 'aarch64-unknown-linux-gnu'";
 
 fn assert_release_caller(step: &str, emit_features: &str, arm64_targets: &str) {
