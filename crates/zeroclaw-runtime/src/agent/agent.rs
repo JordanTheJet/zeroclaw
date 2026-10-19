@@ -6466,15 +6466,17 @@ mod tests {
         .await
     }
 
+    type SharedSopFixture = (
+        Arc<std::sync::Mutex<crate::sop::SopEngine>>,
+        Arc<dyn Memory>,
+    );
+
     async fn sop_session_fixture(
         tmp: &tempfile::TempDir,
         pipeline_allows: &[&str],
         mode: crate::sop::types::SopExecutionMode,
         owner: Option<zeroclaw_api::memory_traits::PrincipalScope>,
-        existing: Option<(
-            Arc<std::sync::Mutex<crate::sop::SopEngine>>,
-            Arc<dyn Memory>,
-        )>,
+        existing: Option<SharedSopFixture>,
         with_audit: bool,
     ) -> (
         Agent,

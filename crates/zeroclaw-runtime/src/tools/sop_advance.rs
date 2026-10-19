@@ -464,7 +464,13 @@ mod tests {
                 "output": "done"
             }))
             .await;
-        assert!(result.is_err());
+        let result = result.expect("missing and foreign runs use the same tool refusal");
+        assert!(!result.success);
+        assert!(result.output.is_empty());
+        assert_eq!(
+            result.error.as_deref(),
+            Some(crate::i18n::get_required_cli_string("cli-sop-run-unavailable").as_str())
+        );
     }
 
     #[test]
@@ -479,7 +485,7 @@ mod tests {
 
     #[tokio::test]
     async fn advance_error_does_not_write_step_audit() {
-        // Use a run_id that doesn't exist — advance_step will fail
+        // A missing run is refused before the engine transition or audit writes.
         let engine = Arc::new(Mutex::new(SopEngine::new(SopConfig::default())));
         let tmp = tempfile::tempdir().unwrap();
         let mem_cfg = zeroclaw_config::schema::MemoryConfig {
@@ -498,8 +504,13 @@ mod tests {
                 "output": "done"
             }))
             .await;
-        // advance_step on nonexistent run returns Err (anyhow)
-        assert!(result.is_err());
+        let result = result.expect("missing and foreign runs use the same tool refusal");
+        assert!(!result.success);
+        assert!(result.output.is_empty());
+        assert_eq!(
+            result.error.as_deref(),
+            Some(crate::i18n::get_required_cli_string("cli-sop-run-unavailable").as_str())
+        );
 
         // Verify no phantom audit entries were written
         let runs = audit.list_runs().await.unwrap();
