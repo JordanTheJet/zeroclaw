@@ -44,7 +44,6 @@ pub use execution::{
 pub(crate) use history_window::preflight_history_maintenance;
 pub use knobs::{LoopKnobs, MaxIterationBehavior};
 pub(crate) use max_iter::finish_after_max_iterations;
-pub(crate) use outcome::StreamCancelledAfterOutput;
 pub use outcome::{
     ContextWindowExceeded, append_safeguard_fallback_notice, context_window_exceeded_from_error,
     is_semantic_empty_terminal_completion, semantic_empty_terminal_completion_message,
@@ -54,7 +53,11 @@ pub use outcome::{
     ModelSwitchCallback, ModelSwitchRequested, ServedRoute, ServedRouteSink, ToolLoopCancelled,
     is_model_switch_requested, is_tool_loop_cancelled,
 };
-pub(crate) use outcome::{current_model_switch_state, scope_model_switch_state};
+pub(crate) use outcome::{SteeringPending, StreamCancelledAfterOutput};
+pub(crate) use outcome::{
+    current_model_switch_state, model_switch_provider_allowed,
+    scope_model_switch_provider_allowlist, scope_model_switch_state,
+};
 #[cfg(test)]
 pub(crate) use parse_response::build_native_assistant_history;
 pub(crate) use parse_response::{
@@ -77,9 +80,7 @@ pub(crate) use stream_consume::consume_provider_streaming_response;
 #[cfg(test)]
 use tool_specs::IterationToolSpecs;
 pub(crate) use tool_specs::build_iteration_tool_specs;
-pub(crate) use vision_route::{
-    VisionProviderSource, prepare_messages_for_iteration, resolve_vision_provider,
-};
+pub(crate) use vision_route::{VisionProviderSource, prepare_messages_for_iteration};
 
 use crate::agent::execution_tree_budget::{ExecutionTreeBudget, ExecutionTreeReservation};
 use crate::agent::system_prompt::{NATIVE_TOOLS_TASK_FRAMING, NO_TOOLS_TASK_FRAMING};
@@ -88,7 +89,7 @@ use crate::agent::tool_execution::{
     should_execute_tools_in_parallel,
 };
 use crate::live_config_authority::AgentExecutionAdmission;
-use crate::security::ingress::{IngressPolicy, ingress_policy};
+use crate::security::ingress::{IngressPolicy, ingress_policy, steering_policy};
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
 use std::collections::{HashSet, VecDeque};
@@ -691,6 +692,29 @@ fn tool_section_bounds(prompt: &str) -> Option<std::ops::Range<usize>> {
     Some(start..end)
 }
 
+fn single_tool_round_error() -> anyhow::Error {
+    anyhow::Error::new(stream_consume::SingleToolRoundViolation::default())
+}
+
+/// Only adjust the runtime's tool protocol and transient request prompt.
+fn apply_single_tool_round_prompt(messages: &mut Vec<ChatMessage>) -> bool {
+    let instruction = crate::i18n::get_required_cli_string("turn-single-tool-rounds-prompt");
+    if let Some(system) = messages.iter_mut().find(|message| message.role == "system") {
+        system.content = system.content.replace(
+            crate::agent::tool_call_format::TOOL_CALL_PROTOCOL_INSTRUCTIONS,
+            &instruction,
+        );
+        if !system.content.ends_with(&instruction) {
+            system.content.push_str("\n\n");
+            system.content.push_str(&instruction);
+        }
+        false
+    } else {
+        messages.insert(0, ChatMessage::system(instruction));
+        true
+    }
+}
+
 fn replace_tool_protocol_section(
     prompt: &mut String,
     text_tools_section: &str,
@@ -946,6 +970,7 @@ async fn projected_provider_facing_tokens(
         .round() as usize
 }
 
+#[derive(Debug)]
 pub(crate) struct ReportedRequestUsage {
     provider_name: String,
     model: String,
@@ -1555,7 +1580,35 @@ async fn emit_rejected_attempt_usage(
     }
 }
 
-pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
+/// The Agent wrapper admits steering before history insertion. Admit only
+/// the original user message, or skip admission on subsequent rounds.
+pub(crate) enum InitialIngressSubject<'a> {
+    Original(&'a str),
+    AlreadyAdmitted,
+}
+
+/// `reported_usage` is the last provider-reported usage from a run that
+/// yielded with `SteeringPending`, so the resumed run calibrates its first
+/// dispatch exactly as the yielded run would have.
+pub(crate) fn run_tool_call_loop_with_initial_ingress<'a>(
+    p: ToolLoop<'a>,
+    subject: InitialIngressSubject<'a>,
+    reported_usage: Option<ReportedRequestUsage>,
+) -> impl std::future::Future<Output = Result<String>> + 'a {
+    run_tool_call_loop_impl(p, Some(subject), reported_usage)
+}
+
+pub fn run_tool_call_loop(
+    p: ToolLoop<'_>,
+) -> impl std::future::Future<Output = Result<String>> + '_ {
+    run_tool_call_loop_impl(p, None, None)
+}
+
+async fn run_tool_call_loop_impl<'a>(
+    mut p: ToolLoop<'a>,
+    initial_ingress: Option<InitialIngressSubject<'a>>,
+    seed_reported_usage: Option<ReportedRequestUsage>,
+) -> Result<String> {
     let model_switch_state = p
         .exec
         .model_switch_callback
@@ -1666,30 +1719,38 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         );
     }
 
-    let p1_text = turn_state
-        .history
-        .iter()
-        .rev()
-        .find(|m| m.role == "user")
-        .map_or("", |m| m.content.as_str());
-    match ingress_policy(p1_text, &ingress, &ingress_policy_cfg) {
-        // DEFAULT — the only arm reachable under the default policy. Proceed
-        // into the loop exactly as today.
-        IngressDecision::Loop => {}
-        // Phase 3: wrap the message as untrusted data before it enters history.
-        // Until framing exists, proceed as Loop (behavior-identical).
-        IngressDecision::Annotate { .. } => {}
-        // Phase 2: divert the turn into a managed SOP run instead of the loop.
-        // Not reachable under the default policy; proceed-as-loop for now.
-        IngressDecision::Gate { .. } => {
-            // TODO(PR C): hand this turn to the SOP run the gate names.
-        }
-        // Not reachable under the default policy; refuse the turn when it is.
-        IngressDecision::Drop { ref reason } => {
-            return Ok(crate::i18n::get_required_cli_string_with_args(
-                "turn-ingress-dropped",
-                &[("reason", reason.as_str())],
-            ));
+    let p1_text = match &initial_ingress {
+        Some(InitialIngressSubject::Original(text)) => Some(*text),
+        Some(InitialIngressSubject::AlreadyAdmitted) => None,
+        None => Some(
+            turn_state
+                .history
+                .iter()
+                .rev()
+                .find(|m| m.role == "user")
+                .map_or("", |m| m.content.as_str()),
+        ),
+    };
+    if let Some(p1_text) = p1_text {
+        match ingress_policy(p1_text, &ingress, &ingress_policy_cfg) {
+            // DEFAULT — the only arm reachable under the default policy. Proceed
+            // into the loop exactly as today.
+            IngressDecision::Loop => {}
+            // Phase 3: wrap the message as untrusted data before it enters history.
+            // Until framing exists, proceed as Loop (behavior-identical).
+            IngressDecision::Annotate { .. } => {}
+            // Phase 2: divert the turn into a managed SOP run instead of the loop.
+            // Not reachable under the default policy; proceed-as-loop for now.
+            IngressDecision::Gate { .. } => {
+                // TODO(PR C): hand this turn to the SOP run the gate names.
+            }
+            // Not reachable under the default policy; refuse the turn when it is.
+            IngressDecision::Drop { ref reason } => {
+                return Ok(crate::i18n::get_required_cli_string_with_args(
+                    "turn-ingress-dropped",
+                    &[("reason", reason.as_str())],
+                ));
+            }
         }
     }
 
@@ -1762,6 +1823,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
 
     // Accumulated display text across all tool-loop calls.
     let mut accumulated_display_text = String::new();
+    let mut single_tool_limitation_reported = false;
     let mut malformed_tool_protocol_retries: usize = 0;
     // Text withheld by the streaming text guard on a previous attempt,
     // stored with its trailing whitespace trimmed. A repeat that is
@@ -1809,7 +1871,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
 
     // Usage describes the completed request, not a prediction of the next
     // hook-selected model, schemas, or prepared messages.
-    let mut pending_reported_usage: Option<ReportedRequestUsage> = None;
+    let mut pending_reported_usage: Option<ReportedRequestUsage> = seed_reported_usage;
 
     for iteration in 0..max_iterations {
         let mut has_new_user_input = iteration == 0;
@@ -1839,35 +1901,65 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             });
         let excluded_tools: &[String] = step_scoped_excluded.as_deref().unwrap_or(excluded_tools);
 
-        for steering_input in drain_steering_messages(&mut steering) {
-            // This loop cannot narrow its registry mid-run, so it admits only
-            // a sender that is still authorized and whose posture narrows
-            // nothing; anything else is dropped rather than run with more
-            // than the sender now holds.
-            match steering_input.admit() {
-                SteeringAdmission::Admitted(posture) if posture == SteeringPosture::default() => {}
-                _ => continue,
-            }
-            let steering_message = steering_input.into_text();
-            match ingress_policy(&steering_message, &ingress, &ingress_policy_cfg) {
-                // DEFAULT — append the injection to history exactly as today.
-                IngressDecision::Loop => {}
-                // Phase 3: frame as untrusted data; proceed as Loop until
-                // framing exists (behavior-identical).
-                IngressDecision::Annotate { .. } => {}
-                // Phase 2: divert this injection into the SOP run rather than
-                // history. Not reachable under the default policy.
-                IngressDecision::Gate { .. } => {
-                    // TODO(PR C): route this steering message into the gated
-                    // SOP run instead of appending it to history.
+        if knobs.yield_to_steering {
+            // The caller judges steering; this loop only hands control back
+            // once a tool round has finished and a message is waiting. A
+            // model switch queued by that round goes first: the switch check
+            // below returns it, the caller applies it, and the steering is
+            // taken at the top of the caller's next round on the new model.
+            let switch_pending = model_switch_callback.as_ref().is_some_and(|callback| {
+                callback
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .as_ref()
+                    .is_some_and(|(p, m)| p != provider_name || m != model)
+            });
+            if iteration > 0
+                && !switch_pending
+                && steering.as_deref().is_some_and(|rx| !rx.is_empty())
+            {
+                *history_has_trim_breadcrumb = turn_state.crumb_present;
+                return Err(SteeringPending {
+                    display_text: accumulated_display_text,
+                    reported_usage: pending_reported_usage.take(),
                 }
-                // Not reachable under the default policy; drop the injection
-                // (do not append it) when it is.
-                IngressDecision::Drop { .. } => continue,
+                .into());
             }
-            let msg = ChatMessage::user(steering_message);
-            has_new_user_input |= !msg.content.trim_start().starts_with("[Tool results]");
-            turn_state.push_dual(msg);
+        } else {
+            for steering_input in drain_steering_messages(&mut steering) {
+                // This loop cannot narrow its registry mid-run, so it admits only
+                // a sender that is still authorized and whose posture narrows
+                // nothing; anything else is dropped rather than run with more
+                // than the sender now holds.
+                match steering_input.admit() {
+                    SteeringAdmission::Admitted(posture)
+                        if posture == SteeringPosture::default() => {}
+                    _ => continue,
+                }
+                match steering_policy(
+                    steering_input.text(),
+                    steering_input.ingress(),
+                    &ingress_policy_cfg,
+                ) {
+                    // DEFAULT — append the injection to history exactly as today.
+                    IngressDecision::Loop => {}
+                    // Phase 3: frame as untrusted data; proceed as Loop until
+                    // framing exists (behavior-identical).
+                    IngressDecision::Annotate { .. } => {}
+                    // Phase 2: divert this injection into the SOP run rather than
+                    // history. Not reachable under the default policy.
+                    IngressDecision::Gate { .. } => {
+                        // TODO(PR C): route this steering message into the gated
+                        // SOP run instead of appending it to history.
+                    }
+                    // Not reachable under the default policy; drop the injection
+                    // (do not append it) when it is.
+                    IngressDecision::Drop { .. } => continue,
+                }
+                let msg = ChatMessage::user(steering_input.into_text());
+                has_new_user_input |= !msg.content.trim_start().starts_with("[Tool results]");
+                turn_state.push_dual(msg);
+            }
         }
 
         let mut seen_tool_signatures: HashSet<(String, String)> = HashSet::new();
@@ -1976,18 +2068,20 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             .into());
         }
 
-        let (vision_model_provider_box, degrade_strip_images) = resolve_vision_provider(
-            config,
-            model_provider,
-            turn_state.history,
-            multimodal_config,
-            provider_name,
-            model,
-            dispatch_model,
-            security,
-            turn_vision_source,
-        )
-        .await?;
+        let (vision_model_provider_box, degrade_strip_images) =
+            vision_route::resolve_vision_provider_with_allowed_refs(
+                config,
+                model_provider,
+                turn_state.history,
+                multimodal_config,
+                provider_name,
+                model,
+                dispatch_model,
+                security,
+                turn_vision_source,
+                knobs.provider_attempt_allowlist.as_deref(),
+            )
+            .await?;
 
         let (
             active_model_provider,
@@ -2014,7 +2108,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             activated_tools,
         )?;
 
-        let (prepared_messages, prepared_source_rows) =
+        let (prepared_messages, mut prepared_source_rows) =
             vision_route::prepare_messages_with_source_rows(
                 turn_state.history,
                 multimodal_config,
@@ -2157,6 +2251,18 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             })
         });
 
+        let single_tool_rounds_requested = config
+            .zip(agent_alias)
+            .is_some_and(|(config, alias)| config.effective_single_tool_rounds(alias));
+        let policy = if single_tool_rounds_requested
+            && use_native_tools
+            && active_model_provider.supports_single_tool_rounds(provider_dispatch_model)
+        {
+            zeroclaw_api::model_provider::ToolRoundPolicy::Single
+        } else {
+            zeroclaw_api::model_provider::ToolRoundPolicy::Batch
+        };
+
         // Tool protocol selection follows the provider-facing selector. Direct
         // Agent turns also refresh their scoped complete prompt after a hook
         // chooses a different model; unscoped callers retain their own prompt.
@@ -2183,6 +2289,13 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     .map(|message| message.content.as_str()),
             );
         }
+        if policy == zeroclaw_api::model_provider::ToolRoundPolicy::Single
+            && apply_single_tool_round_prompt(&mut provider_request_messages)
+        {
+            // A request-only system row must survive whole-turn trimming.
+            prepared_source_rows.insert(0, usize::MAX);
+        }
+
         if context_token_budget > 0 {
             let system_floor =
                 crate::agent::history::estimate_system_floor_tokens(&provider_request_messages);
@@ -2346,6 +2459,9 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                             .find(|message| message.role == "system")
                             .map(|message| message.content.as_str()),
                     );
+                }
+                if policy == zeroclaw_api::model_provider::ToolRoundPolicy::Single {
+                    apply_single_tool_round_prompt(&mut trimmed_post_hook);
                 }
                 provider_request_messages = trimmed_post_hook;
                 reported_population_estimated =
@@ -2521,6 +2637,22 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         // called.
         enforce_tool_loop_budget()?;
 
+        if single_tool_rounds_requested
+            && !tool_specs.is_empty()
+            && policy == zeroclaw_api::model_provider::ToolRoundPolicy::Batch
+            && !single_tool_limitation_reported
+        {
+            let notice =
+                crate::i18n::get_required_cli_string("turn-single-tool-rounds-unsupported");
+            let notice = format!("{notice}\n\n");
+            accumulated_display_text.push_str(&notice);
+            events::emit_posthoc_turn_chunk(event_tx.as_ref(), &notice).await;
+            if let Some(tx) = on_delta.as_ref() {
+                let _ = tx.send(StreamDelta::Text(notice)).await;
+            }
+            single_tool_limitation_reported = true;
+        }
+
         if strict_tool_parsing
             && !tool_specs.is_empty()
             && active_model_provider.has_mixed_native_tool_support_for_model(protocol_model)
@@ -2600,10 +2732,17 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             active_model_provider_name,
             provider_request_model,
             provider_dispatch_model,
-            &provider_request_messages,
+            zeroclaw_api::model_provider::ChatRequest {
+                messages: &provider_request_messages,
+                tools: request_tools,
+                thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                    .try_with(Clone::clone)
+                    .ok()
+                    .flatten(),
+            },
             image_recovery_messages.as_deref(),
-            request_tools,
             should_consume_provider_stream,
+            policy,
             iteration,
             use_native_tools.then_some(iteration_tool_specs.tool_specs.as_slice()),
         )
@@ -2688,6 +2827,11 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         // success with no final text and no tool calls cannot complete a turn.
         // This runs before response-success telemetry and history mutation.
         let chat_result = chat_result.and_then(|response| {
+            if policy == zeroclaw_api::model_provider::ToolRoundPolicy::Single
+                && iteration_tool_specs.exceeds_single_tool_round(&response, strict_tool_parsing)
+            {
+                return Err(single_tool_round_error());
+            }
             if response.is_semantically_empty_terminal() {
                 return Err(anyhow::Error::new(
                     zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion,
@@ -3176,6 +3320,10 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     .await
                 }
             });
+        let execution = scope_model_switch_provider_allowlist(
+            knobs.provider_attempt_allowlist.clone(),
+            execution,
+        );
         let execution_result = match shared_budget.clone() {
             Some(budget) => ExecutionTreeBudget::scope(budget, Box::pin(execution)).await,
             None => execution.await,
@@ -4684,6 +4832,34 @@ fn refresh_prompt_anchor(history: &mut [ChatMessage], use_native_tools: bool) {
 mod surface3_tests {
     use super::*;
     use crate::agent::system_prompt::{NATIVE_TOOLS_TASK_FRAMING, NO_TOOLS_TASK_FRAMING};
+
+    #[test]
+    fn single_tool_prompt_changes_only_owned_protocol_and_is_idempotent() {
+        let protocol = crate::agent::tool_call_format::TOOL_CALL_PROTOCOL_INSTRUCTIONS;
+        let instruction = crate::i18n::get_required_cli_string("turn-single-tool-rounds-prompt");
+        let user = ChatMessage::user(format!("Quote this unchanged: {protocol}"));
+        let mut messages = vec![
+            ChatMessage::system(format!(
+                "Personality stays.\n{protocol}Other instructions stay."
+            )),
+            user.clone(),
+        ];
+        assert!(!apply_single_tool_round_prompt(&mut messages));
+        assert!(messages[0].content.starts_with("Personality stays.\n"));
+        assert!(messages[0].content.contains("Other instructions stay."));
+        assert!(!messages[0].content.contains(protocol));
+        assert!(messages[0].content.ends_with(&instruction));
+        assert_eq!(messages[1].content, user.content);
+        let once = messages[0].content.clone();
+        assert!(!apply_single_tool_round_prompt(&mut messages));
+        assert_eq!(messages[0].content, once);
+
+        let mut no_system = vec![user.clone()];
+        assert!(apply_single_tool_round_prompt(&mut no_system));
+        assert_eq!(no_system[0].role, "system");
+        assert_eq!(no_system[0].content, instruction);
+        assert_eq!(no_system[1].content, user.content);
+    }
 
     fn make_system_prompt(anchor: &str) -> ChatMessage {
         ChatMessage::system(format!(
@@ -6971,6 +7147,7 @@ mod sop_step_reassembly_tests {
             },
             ..Config::default()
         };
+        config.tools.optional = vec!["file_download".into()];
         config.risk_profiles.insert(
             "stepper".to_string(),
             RiskProfileConfig {

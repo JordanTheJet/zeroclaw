@@ -1945,6 +1945,9 @@ pub async fn run(
             chrome_status.tick(&rpc);
             sidebar.drain_picker_fetch();
         }
+        config_app.tick_application_status(
+            mode == Mode::Config && !matches!(conn_state, ConnectionState::Disconnected { .. }),
+        );
         inbound_router.drain(&mut chat_pane, &mut acp_pane);
         acp_pane.tick_transport_events();
         chat_pane.tick_transport_events();
@@ -2011,9 +2014,10 @@ pub async fn run(
                     let dock_layout = dock.layout(chunks[1], mode, plan_visible);
                     content_area = dock_layout.conversation;
                     dock.draw_shell(frame);
-                    sidebar.clear_geometry();
                     if let Some(sidebar_area) = dock_layout.sessions {
                         sidebar.draw(frame, sidebar_area, &sidebar_rows, &sidebar_ctx);
+                    } else {
+                        sidebar.clear_geometry();
                     }
 
                     match mode {
@@ -2313,6 +2317,7 @@ pub async fn run(
         match input_event {
             Event::Key(key) => {
                 dock.clear_capture();
+                sidebar.cancel_drag();
                 if key.kind == KeyEventKind::Release {
                     continue;
                 }
@@ -2455,6 +2460,43 @@ pub async fn run(
                     continue;
                 }
 
+                if let Some(ordinal) = session_shortcut_ordinal(global) {
+                    let pane_claims_shortcut = match mode {
+                        Mode::Dashboard => {
+                            crate::keymap::DashboardTabAction::from_chord(&key).is_some()
+                                || SearchBoxAction::from_chord(&key).is_some()
+                                || crate::keymap::ConfigEditorAction::from_chord(&key).is_some()
+                        }
+                        Mode::Config => config_app.claims_session_shortcut(&key),
+                        Mode::Doctor => crate::keymap::DoctorTabAction::from_chord(&key).is_some(),
+                        Mode::Acp => acp_pane.claims_session_shortcut(&key),
+                        Mode::Chat => chat_pane.claims_session_shortcut(&key),
+                        Mode::Logs => {
+                            crate::keymap::LogsTabAction::from_chord(&key).is_some()
+                                || SearchBoxAction::from_chord(&key).is_some()
+                        }
+                        Mode::Quickstart => {
+                            crate::keymap::QuickstartTabAction::from_chord(&key).is_some()
+                                || crate::keymap::QuickstartModalAction::from_chord(&key).is_some()
+                        }
+                        Mode::Sop => {
+                            crate::keymap::SopTabAction::from_chord(&key).is_some()
+                                || crate::keymap::SopEditorAction::from_chord(&key).is_some()
+                        }
+                    };
+                    if session_shortcut_is_available(mode, in_text_input, pane_claims_shortcut) {
+                        let sessions = session_summaries_in_sidebar_order(
+                            &sidebar,
+                            acp_pane.session_summaries(),
+                            chat_pane.session_summaries(),
+                        );
+                        if let Some(event) = session_shortcut_event(ordinal, &sessions) {
+                            apply_sidebar_event!(event, dispatch_state);
+                        }
+                        continue;
+                    }
+                }
+
                 let editor_claims_pane_navigation = matches!(
                     global,
                     Some(GlobalAction::PaneNavLeft | GlobalAction::PaneNavRight)
@@ -2577,6 +2619,7 @@ pub async fn run(
             }
             Event::Mouse(mouse) => {
                 if let Some(state) = help_overlay.as_mut() {
+                    sidebar.cancel_drag();
                     match mouse.kind {
                         MouseEventKind::ScrollUp => {
                             state.scroll = state.scroll.saturating_sub(3);
@@ -2619,6 +2662,19 @@ pub async fn run(
                     .unwrap_or(menu_open);
                 if menu_consumed {
                     dock.clear_capture();
+                    sidebar.cancel_drag();
+                    continue;
+                }
+                // A row drag owns its release, including over another dock
+                // section or the transcript. Do not start another gesture there.
+                if sidebar.captures_mouse(&mouse) {
+                    route_agent_sidebar_mouse(
+                        mode,
+                        &mut chat_pane,
+                        &mut acp_pane,
+                        &mut sidebar,
+                        &mouse,
+                    );
                     continue;
                 }
                 let (dock_consumed, dock_action) =
@@ -2748,7 +2804,7 @@ pub async fn run(
                         match mode {
                             Mode::Chat => chat_pane.handle_paste(&text),
                             Mode::Acp => acp_pane.handle_paste(&text),
-                            Mode::Config => config_app.handle_paste(&text),
+                            Mode::Config => config_app.handle_paste(&text).await,
                             Mode::Doctor => doctor_pane.handle_paste(&text),
                             Mode::Quickstart => quickstart.handle_paste(&text),
                             Mode::Dashboard => dashboard_pane.handle_paste(&text),
@@ -2765,7 +2821,10 @@ pub async fn run(
                     })
                     .await;
             }
-            Event::Resize(_, _) => dock.clear_capture(),
+            Event::Resize(_, _) => {
+                dock.clear_capture();
+                sidebar.cancel_drag();
+            }
             _ => {}
         }
     }
@@ -2809,8 +2868,21 @@ fn global_help_entries() -> Vec<HelpEntry> {
     let cycle_keys = action_key_labels(GlobalAction::PaneNavLeft)
         .into_iter()
         .chain(action_key_labels(GlobalAction::PaneNavRight));
+    let session_keys = [
+        GlobalAction::FocusSession1,
+        GlobalAction::FocusSession2,
+        GlobalAction::FocusSession3,
+        GlobalAction::FocusSession4,
+        GlobalAction::FocusSession5,
+        GlobalAction::FocusSession6,
+        GlobalAction::FocusSession7,
+        GlobalAction::FocusSession8,
+    ]
+    .into_iter()
+    .flat_map(action_key_labels);
     vec![
         HelpEntry::new(cycle_keys, crate::i18n::t("zc-app-help-cycle-mode")),
+        HelpEntry::new(session_keys, crate::i18n::t("zc-chat-help-switch-session")),
         HelpEntry::new(
             action_key_labels(GlobalAction::Help),
             crate::i18n::t("zc-app-help-help"),
@@ -2844,6 +2916,52 @@ fn pane_switch_delta(
         Some(GlobalAction::PaneNavRight) => Some(1),
         _ => None,
     }
+}
+
+fn session_shortcut_ordinal(action: Option<GlobalAction>) -> Option<usize> {
+    match action? {
+        GlobalAction::FocusSession1 => Some(0),
+        GlobalAction::FocusSession2 => Some(1),
+        GlobalAction::FocusSession3 => Some(2),
+        GlobalAction::FocusSession4 => Some(3),
+        GlobalAction::FocusSession5 => Some(4),
+        GlobalAction::FocusSession6 => Some(5),
+        GlobalAction::FocusSession7 => Some(6),
+        GlobalAction::FocusSession8 => Some(7),
+        _ => None,
+    }
+}
+
+fn session_shortcut_event(
+    ordinal: usize,
+    sessions: &[chat::SidebarSessionSummary],
+) -> Option<crate::agent_sidebar::SidebarEvent> {
+    sessions
+        .get(ordinal)
+        .map(|session| crate::agent_sidebar::SidebarEvent::FocusSession {
+            pane: session.pane_kind,
+            session_id: session.session_id.clone(),
+        })
+}
+
+fn session_shortcut_is_available(
+    mode: Mode,
+    in_text_input: bool,
+    pane_claims_shortcut: bool,
+) -> bool {
+    !pane_claims_shortcut && (!in_text_input || matches!(mode, Mode::Acp | Mode::Chat))
+}
+
+/// Direct session shortcuts count sessions in the order the sidebar shows
+/// them, so a dragged row keeps the number of the position it was dropped in.
+fn session_summaries_in_sidebar_order(
+    sidebar: &crate::agent_sidebar::AgentSidebar,
+    mut acp_sessions: Vec<chat::SidebarSessionSummary>,
+    chat_sessions: Vec<chat::SidebarSessionSummary>,
+) -> Vec<chat::SidebarSessionSummary> {
+    acp_sessions.extend(chat_sessions);
+    sidebar.sort_in_display_order(&mut acp_sessions);
+    acp_sessions
 }
 
 fn copy_disconnected_composer(
@@ -2892,7 +3010,7 @@ fn route_agent_sidebar_mouse(
     sidebar: &mut crate::agent_sidebar::AgentSidebar,
     mouse: &crossterm::event::MouseEvent,
 ) -> (bool, Option<crate::agent_sidebar::SidebarEvent>) {
-    if !sidebar.contains(mouse.column, mouse.row) {
+    if !sidebar.contains(mouse.column, mouse.row) && !sidebar.captures_mouse(mouse) {
         return (false, None);
     }
 
@@ -4138,6 +4256,109 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sidebar_session_drag_routes_outside_release_and_keeps_order_after_reconnect() {
+        let (tx, _rx) = mpsc::channel::<String>(1);
+        let client = Arc::new(RpcClient::with_rpc(Arc::new(
+            crate::jsonrpc::RpcOutbound::new(tx),
+        )));
+        let mut chat_pane = chat::Chat::new(client.clone(), chat::PaneKind::Chat);
+        let mut acp_pane = acp::Acp::new(client.clone());
+        chat_pane.activate_session_for_test("chat-session");
+        acp_pane.activate_session_for_test("code-session");
+        let mut sidebar = crate::agent_sidebar::AgentSidebar::new();
+        let area = Rect::new(70, 0, 30, 10);
+        let ctx = crate::agent_sidebar::SidebarCtx {
+            active_pane: Some(chat::PaneKind::Chat),
+            quickstart_active: false,
+            connected: true,
+        };
+        let mut rows = acp_pane.session_summaries();
+        rows.extend(chat_pane.session_summaries());
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 20))
+            .expect("test terminal");
+        terminal
+            .draw(|frame| sidebar.draw(frame, area, &rows, &ctx))
+            .unwrap();
+
+        let mut mouse = crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: area.x + 1,
+            row: area.y + 1,
+            modifiers: KeyModifiers::NONE,
+        };
+        let (consumed, event) = route_agent_sidebar_mouse(
+            Mode::Chat,
+            &mut chat_pane,
+            &mut acp_pane,
+            &mut sidebar,
+            &mouse,
+        );
+        assert!(consumed);
+        assert_eq!(
+            event,
+            Some(crate::agent_sidebar::SidebarEvent::FocusSession {
+                pane: chat::PaneKind::Acp,
+                session_id: "code-session".into(),
+            })
+        );
+        terminal
+            .draw(|frame| sidebar.draw(frame, area, &rows, &ctx))
+            .unwrap();
+        mouse.kind = MouseEventKind::Drag(MouseButton::Left);
+        mouse.row += 1;
+        assert!(sidebar.captures_mouse(&mouse));
+        let (consumed, event) = route_agent_sidebar_mouse(
+            Mode::Chat,
+            &mut chat_pane,
+            &mut acp_pane,
+            &mut sidebar,
+            &mouse,
+        );
+        assert!(consumed);
+        assert_eq!(event, None);
+        mouse.kind = MouseEventKind::Up(MouseButton::Left);
+        mouse.column = 20; // Release over the conversation, outside Sessions.
+        let (consumed, event) = route_agent_sidebar_mouse(
+            Mode::Chat,
+            &mut chat_pane,
+            &mut acp_pane,
+            &mut sidebar,
+            &mouse,
+        );
+        assert!(consumed);
+        assert_eq!(event, None);
+        assert!(!sidebar.captures_mouse(&mouse));
+
+        // Use the same constructors and handoff as build_panes on reconnect.
+        let mut reconnected_chat = chat::Chat::new(client.clone(), chat::PaneKind::Chat);
+        reconnected_chat.set_resume_sessions(chat_pane.resume_entries());
+        let mut reconnected_code = acp::Acp::new(client);
+        reconnected_code.set_resume_sessions(acp_pane.resume_entries());
+        let mut rows = reconnected_code.session_summaries();
+        rows.extend(reconnected_chat.session_summaries());
+        terminal
+            .draw(|frame| sidebar.draw(frame, area, &rows, &ctx))
+            .unwrap();
+        mouse.kind = MouseEventKind::Down(MouseButton::Left);
+        mouse.column = area.x + 1;
+        mouse.row = area.y + 1;
+        let (_, event) = route_agent_sidebar_mouse(
+            Mode::Chat,
+            &mut reconnected_chat,
+            &mut reconnected_code,
+            &mut sidebar,
+            &mouse,
+        );
+        assert_eq!(
+            event,
+            Some(crate::agent_sidebar::SidebarEvent::FocusSession {
+                pane: chat::PaneKind::Chat,
+                session_id: "chat-session".into(),
+            })
+        );
+    }
+
+    #[tokio::test]
     async fn sidebar_mouse_up_finishes_chat_and_code_transcript_drags() {
         let (tx, _rx) = mpsc::channel::<String>(1);
         let client = Arc::new(RpcClient::with_rpc(Arc::new(
@@ -5349,6 +5570,184 @@ mod tests {
         let expected = action_key_labels(GlobalAction::Help);
 
         assert_eq!(help.keys, expected);
+    }
+
+    #[test]
+    fn session_shortcut_help_groups_all_live_ordinals() {
+        use crate::keymap::{GlobalAction, action_key_labels};
+
+        let entries = global_help_entries();
+        let switch = entries
+            .iter()
+            .find(|entry| entry.action == crate::i18n::t("zc-chat-help-switch-session"))
+            .expect("global Help should advertise direct session switching");
+        let expected = [
+            GlobalAction::FocusSession1,
+            GlobalAction::FocusSession2,
+            GlobalAction::FocusSession3,
+            GlobalAction::FocusSession4,
+            GlobalAction::FocusSession5,
+            GlobalAction::FocusSession6,
+            GlobalAction::FocusSession7,
+            GlobalAction::FocusSession8,
+        ]
+        .into_iter()
+        .flat_map(action_key_labels)
+        .collect::<Vec<_>>();
+
+        assert_eq!(switch.keys, expected);
+    }
+
+    #[test]
+    fn session_shortcut_targets_follow_visible_code_then_chat_order() {
+        let summary = |pane_kind, session_id: &str| chat::SidebarSessionSummary {
+            session_id: session_id.to_string(),
+            agent_alias: "test".to_string(),
+            message_count: 0,
+            status: chat::SidebarStatus::Ready,
+            pane_kind,
+            focused: false,
+        };
+        let acp = vec![
+            summary(chat::PaneKind::Acp, "code-1"),
+            summary(chat::PaneKind::Acp, "code-2"),
+        ];
+        let chat = vec![summary(chat::PaneKind::Chat, "chat-1")];
+        let sessions = session_summaries_in_sidebar_order(
+            &crate::agent_sidebar::AgentSidebar::new(),
+            acp,
+            chat,
+        );
+
+        assert_eq!(
+            session_shortcut_event(
+                session_shortcut_ordinal(Some(GlobalAction::FocusSession2)).unwrap(),
+                &sessions,
+            ),
+            Some(crate::agent_sidebar::SidebarEvent::FocusSession {
+                pane: chat::PaneKind::Acp,
+                session_id: "code-2".to_string(),
+            })
+        );
+        assert_eq!(
+            session_shortcut_event(
+                session_shortcut_ordinal(Some(GlobalAction::FocusSession3)).unwrap(),
+                &sessions,
+            ),
+            Some(crate::agent_sidebar::SidebarEvent::FocusSession {
+                pane: chat::PaneKind::Chat,
+                session_id: "chat-1".to_string(),
+            })
+        );
+        assert_eq!(
+            session_shortcut_event(
+                session_shortcut_ordinal(Some(GlobalAction::FocusSession4)).unwrap(),
+                &sessions,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn session_shortcut_targets_follow_dragged_sidebar_order() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let summary = |pane_kind, session_id: &str| chat::SidebarSessionSummary {
+            session_id: session_id.to_string(),
+            agent_alias: "test".to_string(),
+            message_count: 0,
+            status: chat::SidebarStatus::Ready,
+            pane_kind,
+            focused: false,
+        };
+        let acp = vec![
+            summary(chat::PaneKind::Acp, "code-1"),
+            summary(chat::PaneKind::Acp, "code-2"),
+        ];
+        let chat = vec![summary(chat::PaneKind::Chat, "chat-1")];
+        let mut rows = acp.clone();
+        rows.extend(chat.clone());
+        let mut sidebar = crate::agent_sidebar::AgentSidebar::new();
+        let area = Rect::new(0, 0, 30, 10);
+        let ctx = crate::agent_sidebar::SidebarCtx {
+            active_pane: Some(chat::PaneKind::Acp),
+            quickstart_active: false,
+            connected: true,
+        };
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(30, 10)).unwrap();
+        term.draw(|frame| sidebar.draw(frame, area, &rows, &ctx))
+            .unwrap();
+        // Rows start one line inside the panel border: drag the Chat row
+        // (third) to the top.
+        let mouse = |kind, row| MouseEvent {
+            kind,
+            column: 2,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        sidebar.handle_mouse(&mouse(MouseEventKind::Down(MouseButton::Left), 3));
+        sidebar.handle_mouse(&mouse(MouseEventKind::Drag(MouseButton::Left), 1));
+        sidebar.handle_mouse(&mouse(MouseEventKind::Up(MouseButton::Left), 1));
+        term.draw(|frame| sidebar.draw(frame, area, &rows, &ctx))
+            .unwrap();
+
+        let sessions = session_summaries_in_sidebar_order(&sidebar, acp, chat);
+        let target = |action| {
+            session_shortcut_event(session_shortcut_ordinal(Some(action)).unwrap(), &sessions)
+        };
+        let focus = |pane, id: &str| {
+            Some(crate::agent_sidebar::SidebarEvent::FocusSession {
+                pane,
+                session_id: id.to_string(),
+            })
+        };
+        assert_eq!(
+            target(GlobalAction::FocusSession1),
+            focus(chat::PaneKind::Chat, "chat-1")
+        );
+        assert_eq!(
+            target(GlobalAction::FocusSession2),
+            focus(chat::PaneKind::Acp, "code-1")
+        );
+        assert_eq!(
+            target(GlobalAction::FocusSession3),
+            focus(chat::PaneKind::Acp, "code-2")
+        );
+    }
+
+    #[test]
+    fn session_shortcut_dispatch_respects_composer_and_other_input_owners() {
+        assert!(
+            session_shortcut_is_available(Mode::Chat, true, false),
+            "typed composer text must not disable the modified session shortcut"
+        );
+        assert!(
+            !session_shortcut_is_available(Mode::Chat, true, true),
+            "an explicit Chat or input-bar binding must retain the chord"
+        );
+        assert!(
+            !session_shortcut_is_available(Mode::Config, true, false),
+            "non-chat text editors retain their existing input ownership"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn session_shortcut_decoder_preserves_ctrl_command_modifiers() {
+        let original = Event::Key(KeyEvent::new(
+            KeyCode::Char('1'),
+            KeyModifiers::CONTROL | KeyModifiers::SUPER,
+        ));
+        let mut decoder = SgrMouseEventDecoder::default();
+        decoder.feed(original.clone());
+
+        assert_eq!(decoder.next(), Some(original));
+        assert_eq!(
+            GlobalAction::from_chord(&KeyEvent::new(
+                KeyCode::Char('1'),
+                KeyModifiers::CONTROL | KeyModifiers::SUPER,
+            )),
+            Some(GlobalAction::FocusSession1)
+        );
     }
 
     #[test]

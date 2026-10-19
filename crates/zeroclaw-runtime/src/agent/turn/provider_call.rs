@@ -9,7 +9,9 @@ use super::outcome::{
     is_tool_loop_cancelled,
 };
 use super::redact::scrub_credentials;
-use super::stream_consume::{StreamProviderFailure, consume_provider_streaming_response};
+use super::stream_consume::{
+    StreamProviderFailure, consume_provider_streaming_response_with_policy,
+};
 use crate::agent::cost::check_tool_loop_budget;
 use crate::cost::types::BudgetCheck;
 use crate::observability::ObserverEvent;
@@ -256,10 +258,10 @@ pub(crate) async fn call_provider(
     active_model_provider_name: &str,
     active_model: &str,
     active_dispatch_model: &str,
-    prepared_messages: &[ChatMessage],
+    original_request: ChatRequest<'_>,
     image_recovery_messages: Option<&[ChatMessage]>,
-    request_tools: Option<&[ToolSpec]>,
     should_consume_provider_stream: bool,
+    policy: zeroclaw_api::model_provider::ToolRoundPolicy,
     iteration: usize,
     guard_tools: Option<&[ToolSpec]>,
 ) -> Result<ProviderCallOutcome> {
@@ -267,14 +269,8 @@ pub(crate) async fn call_provider(
     let mut streamed_protocol_suppressed = false;
     let mut streamed_visible_text = String::new();
     let mut image_recovery_succeeded = false;
-    let original_request = ChatRequest {
-        messages: prepared_messages,
-        tools: request_tools,
-        thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
-            .try_with(Clone::clone)
-            .ok()
-            .flatten(),
-    };
+    let prepared_messages = original_request.messages;
+    let request_tools = original_request.tools;
 
     let (chat_result, accounting) = if should_consume_provider_stream {
         // The stream is lazily consumed inside this call-scoped owner. Its
@@ -283,10 +279,9 @@ pub(crate) async fn call_provider(
         let scope = zeroclaw_providers::dispatch::AccountedChatScope::new();
         let (result, live_deltas, protocol_suppressed, visible_text, recovered_image_request) = scope
             .scope(Box::pin(zeroclaw_providers::reliable::scope_provider_fallback(Box::pin(async {
-                    match consume_provider_streaming_response(
+                    match consume_provider_streaming_response_with_policy(
                         active_model_provider,
-                        prepared_messages,
-                        request_tools,
+                        original_request,
                         active_dispatch_model,
                         ctx.temperature,
                         ctx.cancellation_token,
@@ -294,6 +289,7 @@ pub(crate) async fn call_provider(
                         ctx.event_tx,
                         ctx.strict_tool_parsing,
                         ctx.draft_reasoning,
+                        policy,
                         guard_tools,
                     )
                     .await
@@ -316,6 +312,9 @@ pub(crate) async fn call_provider(
                         }
                         Err(stream_err)
                             if stream_err
+                                .downcast_ref::<super::stream_consume::SingleToolRoundViolation>()
+                                .is_some()
+                                || stream_err
                                 .downcast_ref::<StreamPreExecutedToolsWithoutFinalResponse>()
                                 .is_some()
                                 || is_tool_loop_cancelled(&stream_err)
@@ -325,8 +324,13 @@ pub(crate) async fn call_provider(
                                 =>
                         {
                             if let Some(usage) = stream_err
+                                .downcast_ref::<super::stream_consume::SingleToolRoundViolation>()
+                                .and_then(|error| error.usage.clone())
+                                .or_else(|| {
+                                    stream_err
                                 .downcast_ref::<StreamPreExecutedToolsWithoutFinalResponse>()
                                 .and_then(|error| error.usage.clone())
+                                })
                                 .or_else(|| {
                                     stream_err
                                         .downcast_ref::<StreamInterruptedAfterOutput>()
@@ -443,10 +447,7 @@ pub(crate) async fn call_provider(
                                 let request = ChatRequest {
                                     messages: recovery_messages,
                                     tools: request_tools,
-                                    thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
-                                        .try_with(Clone::clone)
-                                        .ok()
-                                        .flatten(),
+                                    thinking: original_request.thinking,
                                 };
                                 let recovery = with_exact_dispatch_route(
                                     active_model_provider_name.to_string(),
@@ -455,20 +456,22 @@ pub(crate) async fn call_provider(
                                         match streamed_refusal {
                                             Some(refusal) => {
                                                 dispatcher
-                                                    .chat_after_stream_refusal(
+                                                    .chat_after_stream_refusal_with_tool_round_policy(
                                                         request,
                                                         active_dispatch_model,
                                                         ctx.temperature,
                                                         refusal,
+                                                        policy,
                                                     )
                                                     .await
                                             }
                                             None => {
                                                 dispatcher
-                                                    .chat(
+                                                    .chat_with_tool_round_policy(
                                                         request,
                                                         active_dispatch_model,
                                                         ctx.temperature,
+                                                        policy,
                                                     )
                                                     .await
                                             }
@@ -545,7 +548,12 @@ pub(crate) async fn call_provider(
                 .scope(Box::pin(with_exact_dispatch_route(
                     active_model_provider_name.to_string(),
                     active_model.to_string(),
-                    dispatcher.chat(original_request, active_dispatch_model, ctx.temperature),
+                    dispatcher.chat_with_tool_round_policy(
+                        original_request,
+                        active_dispatch_model,
+                        ctx.temperature,
+                        policy,
+                    ),
                 )))
                 .await;
 
@@ -561,18 +569,16 @@ pub(crate) async fn call_provider(
                             scope.scope(with_exact_dispatch_route(
                                 active_model_provider_name.to_string(),
                                 active_model.to_string(),
-                                dispatcher.chat(
+                                dispatcher.chat_with_tool_round_policy(
                                     ChatRequest {
                                         messages: image_recovery_messages
                                             .unwrap_or(prepared_messages),
                                         tools: request_tools,
-                                        thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
-                                            .try_with(Clone::clone)
-                                            .ok()
-                                            .flatten(),
+                                        thinking: original_request.thinking,
                                     },
                                     active_dispatch_model,
                                     ctx.temperature,
+                                    policy,
                                 ),
                             )),
                         )
@@ -1167,7 +1173,9 @@ mod streaming_fallback_tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::net::TcpListener;
     use zeroclaw_api::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
-    use zeroclaw_api::model_provider::{ModelRefusalError, StreamError, StreamEvent};
+    use zeroclaw_api::model_provider::{
+        ModelRefusalError, StreamError, StreamEvent, ToolRoundPolicy,
+    };
     use zeroclaw_config::schema::PacingConfig;
     use zeroclaw_providers::compatible::{AuthStyle, OpenAiCompatibleModelProvider};
     use zeroclaw_providers::reliable::ReliableModelProvider;
@@ -1274,10 +1282,17 @@ mod streaming_fallback_tests {
                 "test-provider",
                 "test-model",
                 "test-model",
-                &original,
+                ChatRequest {
+                    messages: &original,
+                    tools: None,
+                    thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                        .try_with(Clone::clone)
+                        .ok()
+                        .flatten(),
+                },
                 Some(&recovery),
-                None,
                 false,
+                zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
                 0,
                 None,
             );
@@ -1320,10 +1335,17 @@ mod streaming_fallback_tests {
                 "test-provider",
                 "test-model",
                 "test-model",
-                &original,
+                ChatRequest {
+                    messages: &original,
+                    tools: None,
+                    thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                        .try_with(Clone::clone)
+                        .ok()
+                        .flatten(),
+                },
                 Some(&recovery),
-                None,
                 false,
+                zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
                 0,
                 None,
             ),
@@ -1347,6 +1369,7 @@ mod streaming_fallback_tests {
         stream_calls: Arc<AtomicUsize>,
         non_stream_calls: Arc<AtomicUsize>,
         cancel_on_final: Option<tokio_util::sync::CancellationToken>,
+        policies: Arc<std::sync::Mutex<Vec<ToolRoundPolicy>>>,
     }
 
     struct PreExecutedToolThenEmptyProvider {
@@ -1446,6 +1469,29 @@ mod streaming_fallback_tests {
 
     #[async_trait]
     impl ModelProvider for EmptyStreamThenTextProvider {
+        async fn chat_with_tool_round_policy(
+            &self,
+            request: ChatRequest<'_>,
+            model: &str,
+            temperature: Option<f64>,
+            policy: ToolRoundPolicy,
+        ) -> Result<ChatResponse> {
+            self.policies.lock().unwrap().push(policy);
+            self.chat(request, model, temperature).await
+        }
+
+        fn stream_chat_with_tool_round_policy(
+            &self,
+            request: ChatRequest<'_>,
+            model: &str,
+            temperature: Option<f64>,
+            options: StreamOptions,
+            policy: ToolRoundPolicy,
+        ) -> BoxStream<'static, StreamResult<StreamEvent>> {
+            self.policies.lock().unwrap().push(policy);
+            self.stream_chat(request, model, temperature, options)
+        }
+
         async fn chat_with_system(
             &self,
             _system_prompt: Option<&str>,
@@ -1789,22 +1835,26 @@ mod streaming_fallback_tests {
 
     #[tokio::test]
     async fn completed_empty_stream_uses_one_non_streaming_fallback() {
-        check_empty_stream_recovery(false).await;
+        for policy in [ToolRoundPolicy::Batch, ToolRoundPolicy::Single] {
+            check_empty_stream_recovery(false, policy).await;
+        }
     }
 
     #[tokio::test]
     async fn cancelled_empty_stream_does_not_start_recovery() {
-        check_empty_stream_recovery(true).await;
+        check_empty_stream_recovery(true, ToolRoundPolicy::Batch).await;
     }
 
-    async fn check_empty_stream_recovery(cancel_on_final: bool) {
+    async fn check_empty_stream_recovery(cancel_on_final: bool, policy: ToolRoundPolicy) {
         let stream_calls = Arc::new(AtomicUsize::new(0));
         let non_stream_calls = Arc::new(AtomicUsize::new(0));
+        let policies = Arc::new(std::sync::Mutex::new(Vec::new()));
         let token = tokio_util::sync::CancellationToken::new();
         let provider = EmptyStreamThenTextProvider {
             stream_calls: Arc::clone(&stream_calls),
             non_stream_calls: Arc::clone(&non_stream_calls),
             cancel_on_final: cancel_on_final.then(|| token.clone()),
+            policies: Arc::clone(&policies),
         };
         let provider = ReliableModelProvider::new(
             "test",
@@ -1856,10 +1906,17 @@ mod streaming_fallback_tests {
                         "test-provider",
                         "test-model",
                         "test-model",
-                        &[ChatMessage::user("go")],
-                        None,
+                        ChatRequest {
+                            messages: &[ChatMessage::user("go")],
+                            tools: None,
+                            thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                                .try_with(Clone::clone)
+                                .ok()
+                                .flatten(),
+                        },
                         None,
                         true,
+                        policy,
                         0,
                         None,
                     ),
@@ -1869,6 +1926,11 @@ mod streaming_fallback_tests {
             .expect("provider call returns its terminal outcome");
 
         assert_eq!(stream_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            *policies.lock().unwrap(),
+            vec![policy; if cancel_on_final { 1 } else { 2 }],
+            "non-stream recovery must preserve the stream request's explicit policy"
+        );
         assert!(matches!(
             event_rx
                 .try_recv()
@@ -1955,10 +2017,17 @@ mod streaming_fallback_tests {
             "test-provider",
             "test-model",
             "test-model",
-            &[ChatMessage::user("go")],
-            None,
+            ChatRequest {
+                messages: &[ChatMessage::user("go")],
+                tools: None,
+                thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                    .try_with(Clone::clone)
+                    .ok()
+                    .flatten(),
+            },
             None,
             true,
+            zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
             0,
             None,
         )
@@ -2011,10 +2080,17 @@ mod streaming_fallback_tests {
             "test-provider",
             "test-model",
             "test-model",
-            &[ChatMessage::user("go")],
-            None,
+            ChatRequest {
+                messages: &[ChatMessage::user("go")],
+                tools: None,
+                thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                    .try_with(Clone::clone)
+                    .ok()
+                    .flatten(),
+            },
             None,
             true,
+            zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
             0,
             None,
         )
@@ -2148,10 +2224,17 @@ mod streaming_fallback_tests {
                 "test-provider",
                 "test-model",
                 "test-model",
-                &[ChatMessage::user("go")],
-                None,
+                ChatRequest {
+                    messages: &[ChatMessage::user("go")],
+                    tools: None,
+                    thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                        .try_with(Clone::clone)
+                        .ok()
+                        .flatten(),
+                },
                 None,
                 true,
+                zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
                 0,
                 None,
             )
@@ -2272,10 +2355,17 @@ mod streaming_fallback_tests {
             "test-provider",
             "test-model",
             "hint:images",
-            &original,
+            ChatRequest {
+                messages: &original,
+                tools: None,
+                thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                    .try_with(Clone::clone)
+                    .ok()
+                    .flatten(),
+            },
             Some(&recovery),
-            None,
             false,
+            zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
             0,
             None,
         )
@@ -2355,10 +2445,17 @@ mod streaming_fallback_tests {
                 "requested-provider",
                 "requested-model",
                 "requested-model",
-                &[ChatMessage::user("go")],
-                None,
+                ChatRequest {
+                    messages: &[ChatMessage::user("go")],
+                    tools: None,
+                    thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                        .try_with(Clone::clone)
+                        .ok()
+                        .flatten(),
+                },
                 None,
                 true,
+                zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
                 0,
                 None,
             )
@@ -2460,10 +2557,17 @@ mod streaming_fallback_tests {
             "test-provider",
             "test-model",
             "test-model",
-            &[ChatMessage::user("go")],
-            None,
+            ChatRequest {
+                messages: &[ChatMessage::user("go")],
+                tools: None,
+                thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                    .try_with(Clone::clone)
+                    .ok()
+                    .flatten(),
+            },
             None,
             true,
+            zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
             0,
             None,
         )
@@ -2532,10 +2636,17 @@ mod streaming_fallback_tests {
             "requested-provider",
             "requested-model",
             "requested-model",
-            &[ChatMessage::user("go")],
-            None,
+            ChatRequest {
+                messages: &[ChatMessage::user("go")],
+                tools: None,
+                thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                    .try_with(Clone::clone)
+                    .ok()
+                    .flatten(),
+            },
             None,
             false,
+            zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
             0,
             None,
         )
@@ -2605,10 +2716,17 @@ mod streaming_fallback_tests {
             "requested-provider",
             "requested-model",
             "requested-model",
-            &[ChatMessage::user("go")],
-            None,
+            ChatRequest {
+                messages: &[ChatMessage::user("go")],
+                tools: None,
+                thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                    .try_with(Clone::clone)
+                    .ok()
+                    .flatten(),
+            },
             None,
             false,
+            zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
             0,
             None,
         )
@@ -2631,6 +2749,136 @@ mod streaming_fallback_tests {
             zeroclaw_providers::dispatch::AttemptUsageOutcome::Complete(usage)
                 if usage.input_tokens == Some(10) && usage.output_tokens == Some(5)
         ));
+    }
+
+    #[derive(Default)]
+    struct ImageRecoveryPolicyProvider {
+        requests: std::sync::Mutex<Vec<(ToolRoundPolicy, bool)>>,
+    }
+
+    impl ImageRecoveryPolicyProvider {
+        fn record_request(&self, request: ChatRequest<'_>, policy: ToolRoundPolicy) -> bool {
+            let has_image =
+                zeroclaw_providers::multimodal::count_image_markers(request.messages) > 0;
+            self.requests.lock().unwrap().push((policy, has_image));
+            has_image
+        }
+    }
+
+    impl Attributable for ImageRecoveryPolicyProvider {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+
+        fn alias(&self) -> &str {
+            "image-recovery-policy"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for ImageRecoveryPolicyProvider {
+        fn supports_exact_request_replay(&self, _request: ChatRequest<'_>, _model: &str) -> bool {
+            true
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            unreachable!("every request must retain its explicit tool-round policy")
+        }
+
+        async fn chat_with_tool_round_policy(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            policy: ToolRoundPolicy,
+        ) -> anyhow::Result<ChatResponse> {
+            if self.record_request(request, policy) {
+                return Err(StreamError::HttpStatus {
+                    status: 400,
+                    message: "image request rejected".to_string(),
+                }
+                .into());
+            }
+            Ok(ChatResponse {
+                text: Some("recovered".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+
+        fn stream_chat_with_tool_round_policy(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+            policy: ToolRoundPolicy,
+        ) -> BoxStream<'static, StreamResult<StreamEvent>> {
+            assert!(self.record_request(request, policy));
+            Box::pin(futures_util::stream::iter(vec![Err(
+                StreamError::HttpStatus {
+                    status: 400,
+                    message: "image request rejected".to_string(),
+                },
+            )]))
+        }
+    }
+
+    #[tokio::test]
+    async fn image_recovery_preserves_tool_round_policy_in_both_transports() {
+        for streaming in [false, true] {
+            for policy in [ToolRoundPolicy::Batch, ToolRoundPolicy::Single] {
+                let provider = ImageRecoveryPolicyProvider::default();
+                let observer = NoopObserver;
+                let pacing = PacingConfig::default();
+                let ctx = recovery_test_ctx(&observer, &pacing);
+                let original = [ChatMessage::user(
+                    "inspect [IMAGE:https://example.test/image.png]",
+                )];
+                let recovery = [ChatMessage::user("inspect")];
+                let outcome = call_provider(
+                    &ctx,
+                    &provider,
+                    "test-provider",
+                    "test-model",
+                    "test-model",
+                    ChatRequest {
+                        messages: &original,
+                        tools: None,
+                        thinking: None,
+                    },
+                    Some(&recovery),
+                    streaming,
+                    policy,
+                    0,
+                    None,
+                )
+                .await
+                .unwrap();
+
+                assert_eq!(
+                    outcome.chat_result.unwrap().text.as_deref(),
+                    Some("recovered")
+                );
+                assert!(outcome.image_recovery_succeeded);
+                assert_eq!(
+                    *provider.requests.lock().unwrap(),
+                    vec![(policy, true), (policy, false)],
+                    "streaming={streaming}, policy={policy:?}"
+                );
+            }
+        }
     }
 
     struct ImageRecoveryStreamProvider {
@@ -2807,10 +3055,17 @@ mod streaming_fallback_tests {
             "test-provider",
             "test-model",
             "test-model",
-            &original,
+            ChatRequest {
+                messages: &original,
+                tools: None,
+                thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                    .try_with(Clone::clone)
+                    .ok()
+                    .flatten(),
+            },
             Some(&recovery),
-            None,
             true,
+            zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
             0,
             None,
         );
@@ -2859,10 +3114,17 @@ mod streaming_fallback_tests {
             "test-provider",
             "test-model",
             "test-model",
-            &original,
+            ChatRequest {
+                messages: &original,
+                tools: None,
+                thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                    .try_with(Clone::clone)
+                    .ok()
+                    .flatten(),
+            },
             Some(&recovery),
-            None,
             true,
+            zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
             0,
             None,
         )
@@ -2906,10 +3168,17 @@ mod streaming_fallback_tests {
                 "test-provider",
                 "test-model",
                 "test-model",
-                &original,
+                ChatRequest {
+                    messages: &original,
+                    tools: None,
+                    thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                        .try_with(Clone::clone)
+                        .ok()
+                        .flatten(),
+                },
                 Some(&recovery),
-                None,
                 true,
+                zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
                 0,
                 None,
             )
@@ -3020,10 +3289,17 @@ mod streaming_fallback_tests {
                 "context-overflow",
                 "test-model",
                 "test-model",
-                &original,
+                ChatRequest {
+                    messages: &original,
+                    tools: None,
+                    thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                        .try_with(Clone::clone)
+                        .ok()
+                        .flatten(),
+                },
                 Some(&recovery),
-                None,
                 streaming,
+                zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
                 0,
                 None,
             )
@@ -3071,10 +3347,17 @@ mod streaming_fallback_tests {
                 "test-provider",
                 "test-model",
                 "test-model",
-                &original,
+                ChatRequest {
+                    messages: &original,
+                    tools: None,
+                    thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                        .try_with(Clone::clone)
+                        .ok()
+                        .flatten(),
+                },
                 Some(&recovery),
-                None,
                 true,
+                zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
                 0,
                 None,
             )
@@ -3229,10 +3512,17 @@ mod streaming_fallback_tests {
                         "router-test",
                         "test-model",
                         "test-model",
-                        &[ChatMessage::user("go")],
-                        None,
+                        ChatRequest {
+                            messages: &[ChatMessage::user("go")],
+                            tools: None,
+                            thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                                .try_with(Clone::clone)
+                                .ok()
+                                .flatten(),
+                        },
                         None,
                         true,
+                        zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
                         0,
                         None,
                     ),
@@ -3336,10 +3626,17 @@ mod streaming_fallback_tests {
                         "router-test",
                         "test-model",
                         "test-model",
-                        &[ChatMessage::user("go")],
-                        None,
+                        ChatRequest {
+                            messages: &[ChatMessage::user("go")],
+                            tools: None,
+                            thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                                .try_with(Clone::clone)
+                                .ok()
+                                .flatten(),
+                        },
                         None,
                         true,
+                        zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
                         0,
                         None,
                     ),
@@ -3596,10 +3893,17 @@ mod streaming_fallback_tests {
                         "router-test",
                         "test-model",
                         "test-model",
-                        &[ChatMessage::user("go")],
-                        None,
+                        ChatRequest {
+                            messages: &[ChatMessage::user("go")],
+                            tools: None,
+                            thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                                .try_with(Clone::clone)
+                                .ok()
+                                .flatten(),
+                        },
                         None,
                         true,
+                        zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
                         0,
                         None,
                     ),
@@ -3674,10 +3978,17 @@ mod streaming_fallback_tests {
                         "router-test",
                         "test-model",
                         "test-model",
-                        &[ChatMessage::user("go")],
-                        None,
+                        ChatRequest {
+                            messages: &[ChatMessage::user("go")],
+                            tools: None,
+                            thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                                .try_with(Clone::clone)
+                                .ok()
+                                .flatten(),
+                        },
                         None,
                         true,
+                        zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
                         0,
                         None,
                     ),

@@ -1,5 +1,6 @@
 //! Turn-loop control-flow outcomes: cancellation and model-switch errors.
 
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 /// Callback type for checking if model has been switched during tool execution.
@@ -25,6 +26,11 @@ tokio::task_local! {
     /// Pending model switch for one active tool loop. The loop owns this state;
     /// tools only borrow the current task-local handle while they execute.
     static MODEL_SWITCH_REQUEST: ModelSwitchCallback;
+
+    /// Provider profiles that a model-issued switch may target in this tool
+    /// loop. This is separate from the general provider-attempt scope so
+    /// unrelated tools keep their own network and provider policies.
+    static MODEL_SWITCH_PROVIDER_ALLOWLIST: Option<Arc<HashSet<String>>>;
 }
 
 pub(crate) fn current_model_switch_state() -> anyhow::Result<ModelSwitchCallback> {
@@ -38,6 +44,26 @@ where
     F: std::future::Future,
 {
     MODEL_SWITCH_REQUEST.scope(state, future).await
+}
+
+pub(crate) fn model_switch_provider_allowed(provider_ref: &str) -> bool {
+    MODEL_SWITCH_PROVIDER_ALLOWLIST
+        .try_with(|allowed| {
+            allowed
+                .as_ref()
+                .is_none_or(|allowed| allowed.contains(provider_ref))
+        })
+        .unwrap_or(true)
+}
+
+pub(crate) async fn scope_model_switch_provider_allowlist<F>(
+    allowed: Option<Arc<HashSet<String>>>,
+    future: F,
+) -> F::Output
+where
+    F: std::future::Future,
+{
+    MODEL_SWITCH_PROVIDER_ALLOWLIST.scope(allowed, future).await
 }
 
 #[derive(Debug)]
@@ -398,6 +424,26 @@ impl std::fmt::Display for ModelSwitchRequested {
 }
 
 impl std::error::Error for ModelSwitchRequested {}
+
+/// A loop running with `LoopKnobs::yield_to_steering` stopped after a tool
+/// round because steering is waiting. The round's messages are already in the
+/// canonical buffer; `display_text` is the text the round showed, for the
+/// caller to commit before it starts the steered round. `reported_usage` is
+/// the last request's provider-reported usage, for the caller to hand to the
+/// resumed run so its token calibration carries over.
+#[derive(Debug)]
+pub(crate) struct SteeringPending {
+    pub(crate) display_text: String,
+    pub(crate) reported_usage: Option<super::ReportedRequestUsage>,
+}
+
+impl std::fmt::Display for SteeringPending {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("tool loop yielded to pending steering")
+    }
+}
+
+impl std::error::Error for SteeringPending {}
 
 pub fn is_model_switch_requested(err: &anyhow::Error) -> Option<(String, String)> {
     err.chain()

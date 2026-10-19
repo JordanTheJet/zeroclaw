@@ -177,6 +177,12 @@ tool-memory-store = Store a fact, preference, or note in long-term memory. Use c
 tool-microsoft365 = Microsoft 365 integration: manage Outlook mail, Teams messages, Calendar events, OneDrive files, and SharePoint search via Microsoft Graph API
 
 tool-model-routing-config = Manage default model settings, scenario-based provider/model routes, classification rules, and aliased agent profiles
+tool-model-routing-config-error-missing-risk-profile = agent `{$agent}` references missing risk profile `{$profile}`
+tool-model-routing-config-error-shared-risk-profile = risk profile `{$profile}` is shared by another agent; refusing an agent-scoped mutation
+tool-model-routing-config-error-risk-profile-collision = risk profile `{$profile}` already exists; refusing to overwrite it while isolating agent `{$agent}`
+tool-model-routing-config-error-missing-runtime-profile = agent `{$agent}` references missing runtime profile `{$profile}`
+tool-model-routing-config-error-shared-runtime-profile = runtime profile `{$profile}` is shared by another agent; refusing an agent-scoped mutation
+tool-model-routing-config-error-runtime-profile-collision = runtime profile `{$profile}` already exists; refusing to overwrite it while isolating agent `{$agent}`
 
 tool-notion = Interact with Notion: query databases, read/create/update pages, and search the workspace.
 
