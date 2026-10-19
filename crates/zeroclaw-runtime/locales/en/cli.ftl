@@ -700,6 +700,7 @@ cli-quickstart-auth-anthropic-skip-hint = {"  "}Finish later with: claude setup-
 cli-quickstart-auth-failed = {"  "}Auth setup didn't complete: {$error}
 cli-quickstart-model-field-missing-warning = WARN: schema produced no `model` field for `{$provider}` — falling back to manual entry. Please report this.
 cli-quickstart-model-id-for = Model id for {$name}
+cli-quickstart-model-type-id = Type a model ID…
 cli-quickstart-risk-profile-prompt = Risk profile
 cli-quickstart-memory-backend-prompt = Memory backend
 cli-quickstart-add-channel = + Add a channel

@@ -608,6 +608,7 @@ cli-quickstart-auth-anthropic-skip-hint = {"  "}後で完了させるには: cla
 cli-quickstart-auth-failed = {"  "}認証の設定が完了しませんでした: {$error}
 cli-quickstart-model-field-missing-warning = 警告: スキーマが `{$provider}` の `model` フィールドを生成しませんでした — 手動入力にフォールバックします。報告してください。
 cli-quickstart-model-id-for = {$name} のモデルID
+cli-quickstart-model-type-id = モデルIDを入力…
 cli-quickstart-risk-profile-prompt = リスクプロファイル
 cli-quickstart-memory-backend-prompt = メモリバックエンド
 cli-quickstart-add-channel = + チャンネルを追加

@@ -2290,28 +2290,24 @@ async fn run_quickstart_cli(
                             continue;
                         }
                     }
-                    // For the model field, upgrade the descriptor with a
-                    // live catalog so `prompt_for_field` renders a picker
-                    // instead of a free-text input. Empty catalog (live=false)
-                    // leaves the descriptor unchanged → free-text fallback.
-                    let upgraded;
-                    let d_used = if d.key.eq_ignore_ascii_case("model") {
+                    // For the model field, list a live catalog from the
+                    // endpoint and key entered above and offer it as a picker.
+                    // Empty catalog (live=false) → free-text fallback.
+                    let collected = if d.key.eq_ignore_ascii_case("model") {
                         let (models, _pricing, live) =
-                            zeroclaw_runtime::quickstart::model_catalog(&chosen.kind).await;
+                            Box::pin(zeroclaw_runtime::quickstart::model_catalog_for_fields(
+                                &chosen.kind,
+                                &field_buf,
+                            ))
+                            .await;
                         if live && !models.is_empty() {
-                            upgraded = zeroclaw_runtime::quickstart::FieldDescriptor {
-                                kind: zeroclaw_config::traits::PropKind::Enum,
-                                enum_variants: Some(models),
-                                ..d.clone()
-                            };
-                            &upgraded
+                            prompt_for_catalog_model(d, &models)?
                         } else {
-                            d
+                            prompt_for_field(d, None)?
                         }
                     } else {
-                        d
+                        prompt_for_field(d, None)?
                     };
-                    let collected = prompt_for_field(d_used, None)?;
                     let Some(value) = collected else {
                         aborted = true;
                         break;
@@ -3354,6 +3350,39 @@ fn prompt_for_field(
             }
         }
     }
+}
+
+/// Model picker over a live catalog. The last entry lets the operator type a
+/// model ID instead, since a catalog can be incomplete or come from another
+/// server than the one meant.
+#[cfg(feature = "agent-runtime")]
+fn prompt_for_catalog_model(
+    desc: &zeroclaw_runtime::quickstart::FieldDescriptor,
+    models: &[String],
+) -> anyhow::Result<Option<String>> {
+    use dialoguer::FuzzySelect;
+    if !desc.help.is_empty() {
+        println!("  {}", desc.help);
+    }
+    let mut items = models.to_vec();
+    items.push(t("cli-quickstart-model-type-id", "Type a model ID…"));
+    let Some(i) = FuzzySelect::new()
+        .with_prompt(desc.label.clone())
+        .items(&items)
+        .default(0)
+        .max_length(items.len())
+        .interact_opt()?
+    else {
+        return Ok(None);
+    };
+    if let Some(model) = models.get(i) {
+        return Ok(Some(model.clone()));
+    }
+    let typed = zeroclaw_runtime::quickstart::FieldDescriptor {
+        help: String::new(),
+        ..desc.clone()
+    };
+    prompt_for_field(&typed, None)
 }
 
 #[cfg(feature = "agent-runtime")]

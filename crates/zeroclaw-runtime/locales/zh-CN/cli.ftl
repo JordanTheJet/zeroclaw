@@ -609,6 +609,7 @@ cli-quickstart-auth-anthropic-skip-hint = {"  "}稍后完成：claude setup-toke
 cli-quickstart-auth-failed = {"  "}身份验证设置未完成：{$error}
 cli-quickstart-model-field-missing-warning = 警告：架构没有为 `{$provider}` 生成 `model` 字段 — 将退回到手动输入。请报告此问题。
 cli-quickstart-model-id-for = {$name} 的模型 ID
+cli-quickstart-model-type-id = 输入模型 ID…
 cli-quickstart-risk-profile-prompt = 风险配置文件
 cli-quickstart-memory-backend-prompt = 记忆后端
 cli-quickstart-add-channel = + 添加通道

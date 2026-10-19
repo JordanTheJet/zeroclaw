@@ -613,6 +613,7 @@ cli-quickstart-auth-anthropic-skip-hint = {"  "}Terminez plus tard avec : claude
 cli-quickstart-auth-failed = {"  "}La configuration de l'authentification ne s'est pas terminée : {$error}
 cli-quickstart-model-field-missing-warning = AVERTISSEMENT : le schéma n'a produit aucun champ `model` pour `{$provider}` — saisie manuelle utilisée. Merci de le signaler.
 cli-quickstart-model-id-for = ID de modèle pour {$name}
+cli-quickstart-model-type-id = Saisir un ID de modèle…
 cli-quickstart-risk-profile-prompt = Profil de risque
 cli-quickstart-memory-backend-prompt = Backend mémoire
 cli-quickstart-add-channel = + Ajouter un canal
