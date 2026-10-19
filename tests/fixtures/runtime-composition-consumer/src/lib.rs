@@ -26,8 +26,8 @@ mod tests {
         PeripheralBoardConfig, RiskProfileConfig, RuntimeProfileConfig,
     };
     use zeroclaw_runtime::composition::{
-        ChannelSource, MemoryRequest, MemorySource, ProviderRequest, ProviderSource,
-        RuntimeCapabilities, ToolRequest, ToolSource,
+        ChannelSource, MemoryRequest, MemorySource, NativeRecipeInputs, NativeRegistryRecipe,
+        ProviderRequest, ProviderSource, RuntimeCapabilities, ToolRequest, ToolSource,
     };
 
     const AGENT: &str = "consumer";
@@ -42,7 +42,6 @@ mod tests {
         tool_requests: AtomicUsize,
         tool_calls: AtomicUsize,
         channel_lookups: AtomicUsize,
-        native_peripheral_constructions: AtomicUsize,
         observed_events: AtomicUsize,
         flushes: AtomicUsize,
         catalogs: Mutex<Vec<Vec<String>>>,
@@ -356,6 +355,36 @@ mod tests {
         }
     }
 
+    /// Boards the process-wide peripheral factory was asked to load. The
+    /// factory is registered once per test process and builds nothing, so
+    /// each test reads only the loads of its own uniquely named board.
+    static PERIPHERAL_LOADS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    fn register_peripheral_trap() {
+        static REGISTER: std::sync::Once = std::sync::Once::new();
+        REGISTER.call_once(|| {
+            zeroclaw_runtime::agent::loop_::register_peripheral_tools_fn(Box::new(|config| {
+                if config.enabled {
+                    PERIPHERAL_LOADS
+                        .lock()
+                        .unwrap()
+                        .extend(config.boards.iter().map(|board| board.board.clone()));
+                }
+                Box::pin(async { Ok(Vec::new()) })
+            }));
+        });
+    }
+
+    fn peripheral_loads(config: &Config) -> usize {
+        let board = &config.peripherals.boards[0].board;
+        PERIPHERAL_LOADS
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|loaded| *loaded == board)
+            .count()
+    }
+
     fn config(root: &std::path::Path) -> Config {
         let workspace = root.join("workspace");
         std::fs::create_dir_all(&workspace).unwrap();
@@ -411,7 +440,10 @@ mod tests {
         );
         c.peripherals.enabled = true;
         c.peripherals.boards.push(PeripheralBoardConfig {
-            board: "consumer-construction-trap".into(),
+            board: format!(
+                "consumer-construction-trap-{}",
+                root.file_name().unwrap().to_string_lossy()
+            ),
             ..PeripheralBoardConfig::default()
         });
         // Select the session tools so the native factory opens the session
@@ -498,22 +530,7 @@ mod tests {
     #[test]
     fn real_turn_uses_only_supplied_capabilities() {
         let evidence = Arc::new(Evidence::default());
-        let trap = evidence.clone();
-        zeroclaw_runtime::agent::loop_::register_peripheral_tools_fn(Box::new(move |config| {
-            let trap = trap.clone();
-            Box::pin(async move {
-                if config.enabled
-                    && config
-                        .boards
-                        .iter()
-                        .any(|b| b.board == "consumer-construction-trap")
-                {
-                    trap.native_peripheral_constructions
-                        .fetch_add(1, Ordering::SeqCst);
-                }
-                Ok(Vec::new())
-            })
-        }));
+        register_peripheral_trap();
         let channels: Arc<dyn ChannelSource> = Arc::new(Channels(evidence.clone()));
         let capabilities = RuntimeCapabilities {
             providers: Arc::new(Providers(evidence.clone())),
@@ -531,6 +548,7 @@ mod tests {
             runtime.block_on(async move {
                 let root = tempfile::TempDir::new().unwrap();
                 let c = config(root.path());
+                let trap_config = c.clone();
                 let native_marker = c.data_dir.join("sessions/sessions.db");
                 assert!(!native_marker.exists(), "tool construction trap must start unarmed");
                 let reply = tokio::time::timeout(Duration::from_secs(30), Box::pin(zeroclaw_runtime::agent::run_with_capabilities(
@@ -543,6 +561,7 @@ mod tests {
                 println!("consumer catalogs: {:?}", turn_evidence.catalogs.lock().unwrap());
                 println!("native tool constructor marker present: {}", native_marker.exists());
                 assert!(!native_marker.exists(), "generic turn constructed native session tools, even if their catalog is later hidden");
+                assert_eq!(peripheral_loads(&trap_config), 0, "generic turn invoked the native peripheral constructor");
             });
         }).unwrap().join().unwrap_or_else(|p| std::panic::resume_unwind(p));
         assert_eq!(evidence.provider_requests.load(Ordering::SeqCst), 1);
@@ -558,13 +577,6 @@ mod tests {
             [("consumer-proof".to_owned(), CONTENT.to_owned())]
         );
         assert_eq!(evidence.delivered.lock().unwrap().as_slice(), [CONTENT]);
-        assert_eq!(
-            evidence
-                .native_peripheral_constructions
-                .load(Ordering::SeqCst),
-            0,
-            "generic turn invoked the native peripheral constructor"
-        );
         let catalogs = evidence.catalogs.lock().unwrap();
         assert_eq!(
             catalogs.len(),
@@ -578,6 +590,120 @@ mod tests {
                 "generic turn leaked concrete native tools"
             );
         }
+    }
+
+    /// The peripheral factory sees the runtime's own peripheral loader, so a
+    /// turn that loaded peripherals would show up in `peripheral_loads`.
+    #[test]
+    fn native_peripheral_construction_trap_is_armed() {
+        register_peripheral_trap();
+        let root = tempfile::TempDir::new().unwrap();
+        let c = config(root.path());
+        assert_eq!(peripheral_loads(&c), 0);
+        on_large_runtime(move |runtime| {
+            runtime.block_on(async {
+                zeroclaw_runtime::agent::loop_::load_peripheral_tools(c.peripherals.clone()).await;
+                assert_eq!(
+                    peripheral_loads(&c),
+                    1,
+                    "the peripheral trap did not count a load"
+                );
+            })
+        });
+    }
+
+    /// Supplies `consumer_echo` and selects the native recipe through an
+    /// external closure that wraps the runtime's own recipe.
+    struct NativeTools {
+        tools: Tools,
+        recipe: Box<NativeRegistryRecipe>,
+    }
+    impl ToolSource for NativeTools {
+        fn native_recipe<'s>(
+            &'s self,
+            _: &ToolRequest<'_>,
+        ) -> anyhow::Result<Option<&'s NativeRegistryRecipe>> {
+            Ok(Some(self.recipe.as_ref()))
+        }
+        fn tools(&self, r: &ToolRequest<'_>) -> anyhow::Result<Vec<Box<dyn Tool>>> {
+            self.tools.tools(r)
+        }
+    }
+
+    /// A source outside the crate can select native compatibility: the turn
+    /// builds the native registry (the session store opens, peripherals load)
+    /// and still serves the supplied tool, with native names alongside it.
+    #[test]
+    fn external_recipe_selects_native_compatibility() {
+        register_peripheral_trap();
+        let evidence = Arc::new(Evidence::default());
+        let recipe_calls = Arc::new(AtomicUsize::new(0));
+        let calls = recipe_calls.clone();
+        let channels: Arc<dyn ChannelSource> = Arc::new(Channels(evidence.clone()));
+        let mut capabilities = capabilities(&evidence);
+        capabilities.tools = Arc::new(NativeTools {
+            tools: Tools {
+                evidence: evidence.clone(),
+                channels,
+            },
+            recipe: Box::new(move |inputs: NativeRecipeInputs<'_>| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                zeroclaw_runtime::composition::defaults::native_compat_registry(inputs)
+            }),
+        });
+        let turn_evidence = evidence.clone();
+        on_large_runtime(move |runtime| {
+            runtime.block_on(async move {
+                let root = tempfile::TempDir::new().unwrap();
+                let c = config(root.path());
+                let trap_config = c.clone();
+                let native_marker = c.data_dir.join("sessions/sessions.db");
+                let reply = tokio::time::timeout(
+                    Duration::from_secs(30),
+                    Box::pin(zeroclaw_runtime::agent::run_with_capabilities(
+                        c,
+                        capabilities,
+                        None,
+                        AGENT,
+                        Some("Use consumer_echo to record the supplied value.".into()),
+                        None,
+                        None,
+                        None,
+                        Vec::new(),
+                        false,
+                        None,
+                        None,
+                        TurnOrigin::Interactive,
+                        zeroclaw_runtime::agent::loop_::AgentRunOverrides::default(),
+                    )),
+                )
+                .await
+                .expect("native-recipe consumer turn timed out")
+                .expect("native-recipe consumer turn failed");
+                assert_eq!(reply, "consumer turn complete");
+                assert_eq!(turn_evidence.tool_calls.load(Ordering::SeqCst), 1);
+                assert!(
+                    native_marker.is_file(),
+                    "the native recipe built the session tools"
+                );
+                assert!(
+                    peripheral_loads(&trap_config) > 0,
+                    "the native recipe loaded peripherals"
+                );
+            })
+        });
+        assert_eq!(
+            recipe_calls.load(Ordering::SeqCst),
+            1,
+            "the external recipe ran once"
+        );
+        let catalogs = evidence.catalogs.lock().unwrap();
+        let first = catalogs.first().expect("the turn asked the provider");
+        assert!(first.iter().any(|name| name == TOOL), "{first:?}");
+        assert!(
+            first.iter().any(|name| name == "sessions_list"),
+            "native tools are offered alongside the supplied tool: {first:?}"
+        );
     }
 
     fn capabilities(evidence: &Arc<Evidence>) -> RuntimeCapabilities {

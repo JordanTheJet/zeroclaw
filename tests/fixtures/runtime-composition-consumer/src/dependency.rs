@@ -141,8 +141,7 @@ fn dependency_boundary() {
     // `run` and `process_message` without capabilities reach these bodies
     // through one adapter statement that builds the config-backed set. That
     // statement is the only allowed construction; it appears at most once.
-    const ADAPTER: &str =
-        "letcapabilities=capabilities.unwrap_or_else(||RuntimeCapabilities::config_backed(&config));";
+    const ADAPTER: &str = "letcapabilities=capabilities.unwrap_or_else(||RuntimeCapabilities::config_backed(&config));";
     let boundaries = [
         ("crates/zeroclaw-runtime/src/agent/loop_.rs", "run_inner"),
         (
