@@ -29,6 +29,8 @@ use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::schema::Config;
 
 mod config_backed;
+#[cfg(all(test, unix))]
+mod supplied_only_traps;
 
 /// The config-backed sources the compatibility adapters use, for an
 /// application layer that composes the same recipe.
