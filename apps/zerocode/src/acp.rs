@@ -12,6 +12,11 @@ pub(crate) struct Acp {
 }
 
 impl Acp {
+    #[cfg(test)]
+    pub(crate) fn from_chat_for_test(inner: chat::Chat) -> Self {
+        Self { inner }
+    }
+
     pub(crate) fn new(rpc: Arc<RpcClient>) -> Self {
         Self {
             inner: chat::Chat::new(rpc, chat::PaneKind::Acp),
@@ -102,6 +107,10 @@ impl Acp {
         self.inner.tick_transport_events();
     }
 
+    pub(crate) fn has_pending_transport_events(&self) -> bool {
+        self.inner.has_pending_transport_events()
+    }
+
     pub(crate) fn draw_with_dock(
         &mut self,
         frame: &mut ratatui::Frame,
@@ -161,6 +170,10 @@ impl Acp {
         self.inner.claims_pane_navigation(key)
     }
 
+    pub(crate) fn claims_session_shortcut(&self, key: &KeyEvent) -> bool {
+        self.inner.claims_session_shortcut(key)
+    }
+
     pub(crate) fn clear_input(&mut self) {
         self.inner.clear_input();
     }
@@ -197,7 +210,7 @@ impl Acp {
         self.inner.handle_paste(text);
     }
 
-    pub(crate) fn ctx_tokens(&self) -> (Option<u64>, Option<u64>, Option<u64>) {
+    pub(crate) fn ctx_tokens(&self) -> (Option<u64>, Option<String>, Option<u64>, Option<u64>) {
         self.inner.ctx_tokens()
     }
 
@@ -205,8 +218,16 @@ impl Acp {
         self.inner.selected_agent()
     }
 
+    pub(crate) fn focused_runtime_context(&self) -> Option<chat::FocusedRuntimeContext<'_>> {
+        self.inner.focused_runtime_context()
+    }
+
     pub(crate) fn current_cwd(&self) -> Option<&str> {
         self.inner.current_cwd()
+    }
+
+    pub(crate) fn info_message(&mut self) -> Option<&crate::widgets::InfoMessage> {
+        self.inner.info_message()
     }
 }
 

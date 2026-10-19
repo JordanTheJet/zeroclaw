@@ -1,6 +1,6 @@
 use anyhow::Context;
 use async_trait::async_trait;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::Mutex;
 use reqwest::multipart::{Form, Part};
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -61,6 +61,9 @@ struct MultiDraftKey {
 #[derive(Debug)]
 struct SendChunksError {
     delivered: usize,
+    /// The chunk failed because Telegram is still flood-limiting this chat.
+    /// Callers must not resume or resend inside the penalty window.
+    rate_limited: bool,
     source: anyhow::Error,
 }
 
@@ -72,6 +75,45 @@ impl std::fmt::Display for SendChunksError {
             self.delivered, self.source
         )
     }
+}
+
+/// Longest `retry_after` the send path waits out inline before retrying the
+/// same request. A longer penalty fails the send instead of blocking the reply
+/// task for many minutes; either way no request is fired into an active limit.
+const TELEGRAM_MAX_INLINE_RETRY_AFTER: Duration = Duration::from_secs(60);
+
+/// How many times one `sendMessage` request is retried after HTTP 429.
+const TELEGRAM_RATE_LIMIT_RETRIES: u32 = 2;
+
+/// Server-directed wait for a Telegram flood-limit response.
+///
+/// Returns `None` unless `status` is HTTP 429. Telegram reports the penalty in
+/// `parameters.retry_after` (seconds); a 429 without it waits one second.
+fn telegram_retry_after(status: reqwest::StatusCode, body: &str) -> Option<Duration> {
+    if status != reqwest::StatusCode::TOO_MANY_REQUESTS {
+        return None;
+    }
+    let secs = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("parameters")?.get("retry_after")?.as_u64())
+        .unwrap_or(1);
+    Some(Duration::from_secs(secs))
+}
+
+/// Result of one logical `sendMessage` call after rate-limit handling.
+enum SendMessageAttempt {
+    Sent,
+    /// Still flood-limited after waiting, or the penalty was too long to wait.
+    /// Callers must not retry with a different format: that is another request
+    /// into the same limit.
+    RateLimited {
+        status: reqwest::StatusCode,
+        body: String,
+    },
+    Failed {
+        status: reqwest::StatusCode,
+        body: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -1858,7 +1900,7 @@ impl TelegramChannel {
         let Some(config) = &self.persist else {
             return false;
         };
-        let config = config.config();
+        let config = config.live_handle();
         let live = config.read();
         let Some(context) =
             Self::model_picker_context(&live, &self.alias, state.runtime_routes.as_ref())
@@ -1919,7 +1961,7 @@ impl TelegramChannel {
             return ModelPickerCallbackOutcome::Rejected;
         }
         let context = {
-            let config = config.config();
+            let config = config.live_handle();
             let live = config.read();
             let Some(mut context) =
                 Self::model_picker_context(&live, &self.alias, state.runtime_routes.as_ref())
@@ -2746,7 +2788,7 @@ impl TelegramChannel {
             .as_ref()
             .and_then(|config| {
                 config
-                    .config()
+                    .live_handle()
                     .read()
                     .channels
                     .telegram
@@ -3056,6 +3098,37 @@ impl TelegramChannel {
                             if e.delivered > skip {
                                 skip = e.delivered;
                                 last_sent_at = Some(std::time::Instant::now());
+                            }
+                            // Telegram is flood-limiting this chat: neither
+                            // another narration attempt nor the final-answer
+                            // send below may go out inside `retry_after`. The
+                            // accepted narration chunks stay posted (never
+                            // resent); the final answer was not delivered, so
+                            // report it as undelivered and not to be resent.
+                            if e.rate_limited {
+                                ::zeroclaw_log::record!(
+                                    WARN,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Fail
+                                    )
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                    .with_attrs(
+                                        ::serde_json::json!({
+                                            "error": format!("{}", e.source),
+                                            "chunks_delivered": skip,
+                                        })
+                                    ),
+                                    "Telegram flood limit during multi-message pending narration; not sending more narration or the final answer"
+                                );
+                                return Err(zeroclaw_api::channel::FinalizeUndelivered {
+                                    reason: format!(
+                                        "flood-limited while delivering pending narration \
+                                         ({skip} chunk(s) accepted): {:#}",
+                                        e.source
+                                    ),
+                                }
+                                .into());
                             }
                             attempt += 1;
                             if attempt >= MULTI_MESSAGE_FINALIZE_RETRIES {
@@ -3565,15 +3638,6 @@ impl TelegramChannel {
         value.trim().trim_start_matches('@').to_string()
     }
 
-    /// Write a paired user into `peer_groups` and save. Standalone callers
-    /// may provide a config Arc through [`Self::with_persistence`], which
-    /// pairs it with a local mutation witness; supervised callers use
-    /// [`Self::with_persistence_authority`] to share the daemon witness.
-    pub fn with_persistence(mut self, config: Arc<RwLock<Config>>) -> Self {
-        self.persist = Some(zeroclaw_runtime::LiveConfigAuthority::from_config(config));
-        self
-    }
-
     /// Wire the daemon generation's live-config authority for pairing writes.
     pub fn with_persistence_authority(
         mut self,
@@ -3587,7 +3651,7 @@ impl TelegramChannel {
     ///
     /// Asked before `try_pair`, because pairing consumes the one-time code.
     fn pairing_deny_conflict(&self, identities: &[String]) -> Option<String> {
-        let config = self.persist.as_ref()?.config();
+        let config = self.persist.as_ref()?.live_handle();
         // The same set `is_any_user_allowed` judges at message time. Checking
         // only the identity that would be *written* lets an `ignore` naming the
         // username pass a bind whose numeric id is the one persisted, and every
@@ -5989,26 +6053,31 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 markdown_body["message_thread_id"] = serde_json::Value::String(tid.to_string());
             }
 
-            let markdown_resp = self
-                .http_client()
-                .post(self.api_url("sendMessage"))
-                .json(&markdown_body)
-                .send()
+            let (markdown_status, markdown_err) = match self
+                .send_message_honoring_rate_limit(&markdown_body)
                 .await
                 .map_err(|e| SendChunksError {
                     delivered: index,
+                    rate_limited: false,
                     source: e.into(),
-                })?;
-
-            if markdown_resp.status().is_success() {
-                if index < chunks.len() - 1 {
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+                })? {
+                SendMessageAttempt::Sent => {
+                    if index < chunks.len() - 1 {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                    continue;
                 }
-                continue;
-            }
-
-            let markdown_status = markdown_resp.status();
-            let markdown_err = markdown_resp.text().await.unwrap_or_default();
+                SendMessageAttempt::RateLimited { status, body } => {
+                    return Err(SendChunksError {
+                        delivered: index,
+                        rate_limited: true,
+                        source: anyhow::Error::msg(format!(
+                            "Telegram sendMessage rate limited ({status}): {body}"
+                        )),
+                    });
+                }
+                SendMessageAttempt::Failed { status, body } => (status, body),
+            };
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -6026,26 +6095,39 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             if let Some(tid) = thread_id {
                 plain_body["message_thread_id"] = serde_json::Value::String(tid.to_string());
             }
-            let plain_resp = self
-                .http_client()
-                .post(self.api_url("sendMessage"))
-                .json(&plain_body)
-                .send()
+            match self
+                .send_message_honoring_rate_limit(&plain_body)
                 .await
                 .map_err(|e| SendChunksError {
                     delivered: index,
+                    rate_limited: false,
                     source: e.into(),
-                })?;
-
-            if !plain_resp.status().is_success() {
-                let plain_status = plain_resp.status();
-                let plain_err = plain_resp.text().await.unwrap_or_default();
-                return Err(SendChunksError {
-                    delivered: index,
-                    source: anyhow::Error::msg(format!(
-                        "Telegram sendMessage failed (markdown {markdown_status}: {markdown_err}; plain {plain_status}: {plain_err})"
-                    )),
-                });
+                })? {
+                SendMessageAttempt::Sent => {}
+                SendMessageAttempt::RateLimited {
+                    status: plain_status,
+                    body: plain_err,
+                } => {
+                    return Err(SendChunksError {
+                        delivered: index,
+                        rate_limited: true,
+                        source: anyhow::Error::msg(format!(
+                            "Telegram sendMessage rate limited (markdown {markdown_status}: {markdown_err}; plain {plain_status}: {plain_err})"
+                        )),
+                    });
+                }
+                SendMessageAttempt::Failed {
+                    status: plain_status,
+                    body: plain_err,
+                } => {
+                    return Err(SendChunksError {
+                        delivered: index,
+                        rate_limited: false,
+                        source: anyhow::Error::msg(format!(
+                            "Telegram sendMessage failed (markdown {markdown_status}: {markdown_err}; plain {plain_status}: {plain_err})"
+                        )),
+                    });
+                }
             }
 
             if index < chunks.len() - 1 {
@@ -6054,6 +6136,58 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         }
 
         Ok(chunks.len())
+    }
+
+    /// Posts one `sendMessage` request. On HTTP 429 it waits the server's
+    /// `retry_after` (up to [`TELEGRAM_MAX_INLINE_RETRY_AFTER`]) and resends the
+    /// same body, at most [`TELEGRAM_RATE_LIMIT_RETRIES`] times, so a flood
+    /// limit is never answered with immediate extra requests.
+    async fn send_message_honoring_rate_limit(
+        &self,
+        body: &serde_json::Value,
+    ) -> Result<SendMessageAttempt, reqwest::Error> {
+        let mut retries = 0;
+        loop {
+            let resp = self
+                .http_client()
+                .post(self.api_url("sendMessage"))
+                .json(body)
+                .send()
+                .await?;
+            let status = resp.status();
+            if status.is_success() {
+                return Ok(SendMessageAttempt::Sent);
+            }
+            let text = resp.text().await.unwrap_or_default();
+            let Some(wait) = telegram_retry_after(status, &text) else {
+                return Ok(SendMessageAttempt::Failed { status, body: text });
+            };
+            if retries >= TELEGRAM_RATE_LIMIT_RETRIES || wait > TELEGRAM_MAX_INLINE_RETRY_AFTER {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "retry_after_secs": wait.as_secs(),
+                            "retries": retries,
+                        })),
+                    "Telegram sendMessage rate limited; not retrying inside the penalty window"
+                );
+                return Ok(SendMessageAttempt::RateLimited { status, body: text });
+            }
+            retries += 1;
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "retry_after_secs": wait.as_secs(),
+                        "attempt": retries,
+                    })),
+                "Telegram sendMessage rate limited; waiting retry_after before resending"
+            );
+            tokio::time::sleep(wait).await;
+        }
     }
 
     /// Finalize-time chunked send that never duplicates an accepted prefix.
@@ -6068,6 +6202,13 @@ Allowlist Telegram username (without '@') or numeric user ID.",
     /// Telegram already delivered. A failure before any chunk is accepted
     /// (`delivered == 0`) is returned as the plain source error: nothing is on
     /// the wire, so a full-message fallback is safe.
+    ///
+    /// A flood-limit failure is different: Telegram has asked for no requests
+    /// until `retry_after` has passed, so neither the resume nor the
+    /// orchestrator's full-message fallback may send. It is reported as
+    /// [`FinalizePartialDelivery`] when some chunks were accepted, and as
+    /// [`FinalizeUndelivered`] when none were, so the orchestrator neither
+    /// resends nor counts the reply as delivered.
     async fn finalize_send_chunks(
         &self,
         text: &str,
@@ -6078,7 +6219,21 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             Ok(_) => Ok(()),
             Err(SendChunksError {
                 delivered: 0,
+                rate_limited: true,
                 source,
+            }) => Err(zeroclaw_api::channel::FinalizeUndelivered {
+                reason: format!("{source:#}"),
+            }
+            .into()),
+            Err(SendChunksError {
+                delivered,
+                rate_limited: true,
+                ..
+            }) => Err(zeroclaw_api::channel::FinalizePartialDelivery { delivered }.into()),
+            Err(SendChunksError {
+                delivered: 0,
+                source,
+                ..
             }) => Err(source),
             Err(SendChunksError { delivered, .. }) => {
                 // Some chunks are already posted. Resume from the first unsent
@@ -7392,7 +7547,7 @@ impl Channel for TelegramChannel {
                 .collect::<Vec<_>>(),
         );
         let context = {
-            let config = config.config();
+            let config = config.live_handle();
             let live = config.read();
             let Some(mut context) =
                 Self::model_picker_context(&live, &self.alias, runtime_routes.as_ref())
@@ -8700,11 +8855,10 @@ impl UpdateDisposition {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use parking_lot::RwLock;
-    use std::sync::Arc;
     use zeroclaw_config::schema::{Config, TelegramConfig};
+    use zeroclaw_runtime::LiveConfigAuthority;
 
-    fn telegram_alias_config(alias: &str, multi_message_delay_ms: u64) -> Arc<RwLock<Config>> {
+    fn telegram_alias_config(alias: &str, multi_message_delay_ms: u64) -> LiveConfigAuthority {
         let mut config = Config::default();
         config.channels.telegram.insert(
             alias.to_string(),
@@ -8714,7 +8868,7 @@ mod tests {
                 ..TelegramConfig::default()
             },
         );
-        Arc::new(RwLock::new(config))
+        LiveConfigAuthority::new(config)
     }
 
     fn multi_message_test_channel(alias: &str, multi_message_delay_ms: u64) -> TelegramChannel {
@@ -8724,7 +8878,7 @@ mod tests {
             Arc::new(|| vec!["*".into()]),
             false,
         )
-        .with_persistence(telegram_alias_config(alias, multi_message_delay_ms))
+        .with_persistence_authority(telegram_alias_config(alias, multi_message_delay_ms))
         .with_streaming(StreamMode::MultiMessage, 750)
     }
 
@@ -8739,16 +8893,17 @@ mod tests {
             false,
         )
         .with_streaming(StreamMode::MultiMessage, 750)
-        .with_persistence(Arc::clone(&config));
+        .with_persistence_authority(config.clone());
 
         assert_eq!(ch.multi_message_delay_ms(), 500);
-        config
-            .write()
+        let mut updated = config.snapshot_config();
+        updated
             .channels
             .telegram
             .get_mut(alias)
             .expect("telegram alias")
             .multi_message_delay_ms = 0;
+        config.publish_for_test(updated);
         assert_eq!(ch.multi_message_delay_ms(), 0);
     }
 
@@ -8781,11 +8936,8 @@ mod tests {
         .with_persistence_authority(authority.clone());
         let stored = channel.persist.as_ref().expect("authority is stored");
 
-        assert!(Arc::ptr_eq(&authority.config(), &stored.config()));
-        assert!(Arc::ptr_eq(
-            &authority.config_write_lock(),
-            &stored.config_write_lock()
-        ));
+        assert!(authority.live_handle().same_storage(&stored.live_handle()));
+        assert_eq!(authority.config_epoch(), stored.config_epoch());
     }
 
     #[tokio::test]
@@ -8816,7 +8968,7 @@ mod tests {
 
         assert!(
             authority
-                .config()
+                .live_handle()
                 .read()
                 .channel_external_peers("telegram", "default")
                 .is_empty()
@@ -13146,7 +13298,7 @@ mod tests {
             Arc::new(|| vec!["test_user".into()]),
             false,
         )
-        .with_persistence(Arc::new(RwLock::new(model_picker_config())))
+        .with_persistence_authority(LiveConfigAuthority::new(model_picker_config()))
         .with_mock_api_base(server.uri());
         let request = ChannelModelPickerRequest {
             requesting_user: "test_user".into(),
@@ -13228,7 +13380,7 @@ mod tests {
                 Arc::new(|| vec!["test_user".into()]),
                 false,
             )
-            .with_persistence(Arc::new(RwLock::new(model_picker_config())))
+            .with_persistence_authority(LiveConfigAuthority::new(model_picker_config()))
             .with_mock_api_base(server.uri()),
         );
         let pacing = zeroclaw_config::schema::TelegramConfig {
@@ -13282,7 +13434,7 @@ mod tests {
             Arc::new(|| vec!["test_user".into()]),
             false,
         )
-        .with_persistence(Arc::new(RwLock::new(model_picker_config())))
+        .with_persistence_authority(LiveConfigAuthority::new(model_picker_config()))
         .with_mock_api_base(server.uri());
         let request = ChannelModelPickerRequest {
             requesting_user: "test_user".into(),
@@ -13339,7 +13491,7 @@ mod tests {
             Arc::new(|| vec!["test_user".into()]),
             false,
         )
-        .with_persistence(Arc::new(RwLock::new(model_picker_config())))
+        .with_persistence_authority(LiveConfigAuthority::new(model_picker_config()))
         .with_mock_api_base(server.uri());
         let request = ChannelModelPickerRequest {
             requesting_user: "test_user".into(),
@@ -13504,7 +13656,7 @@ mod tests {
             Arc::new(|| vec!["test_user".into()]),
             false,
         )
-        .with_persistence(Arc::new(RwLock::new(model_picker_config())));
+        .with_persistence_authority(LiveConfigAuthority::new(model_picker_config()));
         let runtime_routes = model_picker_runtime_routes(&model_picker_config());
         let base = PendingModelPicker {
             created_at: Instant::now(),
@@ -13814,7 +13966,7 @@ mod tests {
             Arc::new(|| vec!["test_user".into()]),
             false,
         )
-        .with_persistence(Arc::new(RwLock::new(model_picker_config())))
+        .with_persistence_authority(LiveConfigAuthority::new(model_picker_config()))
         .with_mock_api_base(server.uri());
         let token = uuid::Uuid::new_v4().to_string();
         channel
@@ -13890,7 +14042,7 @@ mod tests {
             Arc::new(|| vec!["test_user".into()]),
             false,
         )
-        .with_persistence(Arc::new(RwLock::new(model_picker_config())))
+        .with_persistence_authority(LiveConfigAuthority::new(model_picker_config()))
         .with_mock_api_base(server.uri());
         let open_token = uuid::Uuid::new_v4().to_string();
         let cancel_token = uuid::Uuid::new_v4().to_string();
@@ -13994,7 +14146,7 @@ mod tests {
             Arc::new(|| vec!["test_user".into()]),
             false,
         )
-        .with_persistence(Arc::new(RwLock::new(model_picker_config())))
+        .with_persistence_authority(LiveConfigAuthority::new(model_picker_config()))
         .with_mock_api_base(server.uri());
         let open_token = uuid::Uuid::new_v4().to_string();
         let cancel_token = uuid::Uuid::new_v4().to_string();
@@ -14150,7 +14302,7 @@ mod tests {
             Arc::new(|| vec!["test_user".into()]),
             false,
         )
-        .with_persistence(Arc::new(RwLock::new(model_picker_config())))
+        .with_persistence_authority(LiveConfigAuthority::new(model_picker_config()))
         .with_mock_api_base(server.uri());
         let token = uuid::Uuid::new_v4().to_string();
         channel
@@ -14237,7 +14389,7 @@ mod tests {
             Arc::new(|| vec!["test_user".into()]),
             false,
         )
-        .with_persistence(Arc::new(RwLock::new(model_picker_config())))
+        .with_persistence_authority(LiveConfigAuthority::new(model_picker_config()))
         .with_mock_api_base(server.uri());
         let token = uuid::Uuid::new_v4().to_string();
         channel
@@ -14344,7 +14496,7 @@ mod tests {
             Arc::new(|| vec!["test_user".into()]),
             false,
         )
-        .with_persistence(Arc::new(RwLock::new(model_picker_config())))
+        .with_persistence_authority(LiveConfigAuthority::new(model_picker_config()))
         .with_mock_api_base(server.uri());
         let token = uuid::Uuid::new_v4().to_string();
         channel
@@ -14451,7 +14603,7 @@ mod tests {
             Arc::new(|| vec!["test_user".into()]),
             false,
         )
-        .with_persistence(Arc::new(RwLock::new(model_picker_config())))
+        .with_persistence_authority(LiveConfigAuthority::new(model_picker_config()))
         .with_mock_api_base(server.uri());
         let token = uuid::Uuid::new_v4().to_string();
         channel
@@ -14558,7 +14710,7 @@ mod tests {
             Arc::new(|| vec!["test_user".into()]),
             false,
         )
-        .with_persistence(Arc::new(RwLock::new(model_picker_config())))
+        .with_persistence_authority(LiveConfigAuthority::new(model_picker_config()))
         .with_mock_api_base(server.uri());
         let token = uuid::Uuid::new_v4().to_string();
         channel
@@ -14716,10 +14868,10 @@ mod tests {
                 ..Default::default()
             },
         );
-        let config = Arc::new(RwLock::new(config));
+        let config = LiveConfigAuthority::new(config);
 
         let ch = TelegramChannel::new("t".into(), "default", Arc::new(Vec::new), false)
-            .with_persistence(Arc::clone(&config));
+            .with_persistence_authority(config.clone());
 
         let err = ch
             .persist_allowed_identity("123456789")
@@ -14735,7 +14887,7 @@ mod tests {
             "the identity is personal data and the bind path logs this error: {message}"
         );
 
-        let cfg = config.read();
+        let cfg = config.snapshot_config();
         assert_eq!(
             cfg.peer_groups
                 .get("telegram_default")
@@ -14797,14 +14949,14 @@ mod tests {
                     ..Default::default()
                 },
             );
-            Arc::new(RwLock::new(config))
+            LiveConfigAuthority::new(config)
         };
 
         let bind = |ignored: bool| {
             let uri = mock_server.uri();
             async move {
                 let ch = TelegramChannel::new("t".into(), "default", Arc::new(Vec::new), false)
-                    .with_persistence(config_with(ignored))
+                    .with_persistence_authority(config_with(ignored))
                     .with_api_base(uri);
                 let code = ch
                     .pairing
@@ -14881,10 +15033,10 @@ mod tests {
                 ..Default::default()
             },
         );
-        let config = Arc::new(RwLock::new(config));
+        let config = LiveConfigAuthority::new(config);
 
         let ch = TelegramChannel::new("t".into(), "default", Arc::new(Vec::new), false)
-            .with_persistence(Arc::clone(&config))
+            .with_persistence_authority(config.clone())
             .with_api_base(mock_server.uri());
 
         let code = ch
@@ -14914,7 +15066,7 @@ mod tests {
         );
         assert!(
             config
-                .read()
+                .snapshot_config()
                 .peer_groups
                 .get("telegram_default")
                 .expect("group untouched")
@@ -14967,10 +15119,10 @@ mod tests {
                 ..Default::default()
             },
         );
-        let config = Arc::new(RwLock::new(config));
+        let config = LiveConfigAuthority::new(config);
 
         let ch = TelegramChannel::new("t".into(), "default", Arc::new(Vec::new), false)
-            .with_persistence(Arc::clone(&config))
+            .with_persistence_authority(config.clone())
             .with_api_base(mock_server.uri());
 
         let guard = ch.pairing.as_ref().expect("pairing offered");
@@ -14996,7 +15148,7 @@ mod tests {
         );
         assert!(
             config
-                .read()
+                .snapshot_config()
                 .peer_groups
                 .get("telegram_default")
                 .expect("group untouched")
@@ -24061,7 +24213,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn approval_card_shows_the_batch_position_in_html_and_in_the_plain_fallback() {
+    async fn approval_card_preserves_delegate_identity_and_batch_position_in_html_and_plain_fallback()
+     {
         use wiremock::matchers::{body_string_contains, method, path_regex};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -24099,9 +24252,16 @@ mod tests {
         .with_mock_api_base(mock_server.uri())
         .with_approval_timeout_secs(1);
 
+        let target = format!("{:?}", "target<&");
+        let caller = format!("{:?}", "caller>");
+        let attribution = i18n::get_required_cli_string_with_args(
+            "channel-approval-independent-delegate",
+            &[("target", &target), ("caller", &caller)],
+        );
+        let summary = format!("{attribution}\npwd");
         let request = zeroclaw_api::channel::ChannelApprovalRequest {
             tool_name: "shell".to_string(),
-            arguments_summary: "ls -la".to_string(),
+            arguments_summary: summary.clone(),
             raw_arguments: None,
             position: Some(zeroclaw_api::channel::ApprovalPosition { index: 2, total: 3 }),
         };
@@ -24128,6 +24288,9 @@ mod tests {
             "the first send is the HTML card"
         );
         let html_text = html["text"].as_str().unwrap();
+        assert!(html_text.contains(&TelegramChannel::escape_html(&summary)));
+        assert!(html_text.contains("<code>shell</code>"));
+        println!("Telegram HTML API output: {html_text}");
         assert!(
             html_text.contains(escaped.as_str()),
             "HTML card should carry the escaped position; want {escaped:?}, got {html_text}"
@@ -24145,6 +24308,9 @@ mod tests {
             "the retry is the plain-text fallback"
         );
         let plain_text = plain["text"].as_str().unwrap();
+        assert!(plain_text.contains(&summary));
+        assert!(plain_text.contains("shell"));
+        println!("Telegram plain API output: {plain_text}");
         assert!(
             plain_text.contains(raw),
             "plain fallback should carry the raw position; want {raw:?}, got {plain_text}"
@@ -24244,5 +24410,327 @@ mod tests {
     fn non_approval_callback_data_is_ignored() {
         let cb_data = "some_other_action:data";
         assert!(cb_data.strip_prefix("approval:").is_none());
+    }
+    fn rate_limit_test_channel(api_base: String) -> TelegramChannel {
+        TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_mock_api_base(api_base)
+    }
+
+    fn flood_limit_response(retry_after: u64) -> wiremock::ResponseTemplate {
+        wiremock::ResponseTemplate::new(429).set_body_json(serde_json::json!({
+            "ok": false,
+            "error_code": 429,
+            "description": format!("Too Many Requests: retry after {retry_after}"),
+            "parameters": { "retry_after": retry_after }
+        }))
+    }
+
+    #[test]
+    fn telegram_retry_after_reads_only_flood_limit_responses() {
+        let body = r#"{"ok":false,"error_code":429,"parameters":{"retry_after":536}}"#;
+        assert_eq!(
+            telegram_retry_after(reqwest::StatusCode::TOO_MANY_REQUESTS, body),
+            Some(Duration::from_secs(536))
+        );
+        assert_eq!(
+            telegram_retry_after(reqwest::StatusCode::TOO_MANY_REQUESTS, "not json"),
+            Some(Duration::from_secs(1))
+        );
+        assert_eq!(
+            telegram_retry_after(reqwest::StatusCode::BAD_REQUEST, body),
+            None
+        );
+    }
+
+    /// A 429 must wait out `retry_after` and resend the same
+    /// HTML request, not fire an immediate plain-text retry into the limit.
+    #[tokio::test]
+    async fn send_text_chunks_waits_retry_after_then_resends_same_format() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(flood_limit_response(1))
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "message_id": 7 }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let ch = rate_limit_test_channel(mock_server.uri());
+        let started = Instant::now();
+        let sent = ch.send_text_chunks("hello", "123", None, 0).await.unwrap();
+        assert_eq!(sent, 1);
+        assert!(
+            started.elapsed() >= Duration::from_secs(1),
+            "the resend must wait for retry_after"
+        );
+
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2);
+        for request in &requests {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            assert_eq!(body["parse_mode"], "HTML", "no plain-text retry on 429");
+        }
+    }
+
+    /// A penalty too long to wait inline fails the chunk without
+    /// sending any more requests inside the penalty window.
+    #[tokio::test]
+    async fn send_text_chunks_does_not_retry_inside_long_flood_penalty() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(flood_limit_response(536))
+            .mount(&mock_server)
+            .await;
+
+        let ch = rate_limit_test_channel(mock_server.uri());
+        let err = ch
+            .send_text_chunks("hello", "123", None, 0)
+            .await
+            .unwrap_err();
+        assert_eq!(err.delivered, 0);
+        assert!(err.to_string().contains("rate limited"), "{err}");
+
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(
+            requests.len(),
+            1,
+            "no markdown or plain retry into the limit"
+        );
+    }
+
+    /// Repeated short 429s stop after the retry cap: the original request plus
+    /// `TELEGRAM_RATE_LIMIT_RETRIES` resends, all with the same body.
+    #[tokio::test]
+    async fn send_text_chunks_stops_after_rate_limit_retry_cap() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(flood_limit_response(1))
+            .mount(&mock_server)
+            .await;
+
+        let ch = rate_limit_test_channel(mock_server.uri());
+        let err = ch
+            .send_text_chunks("hello", "123", None, 0)
+            .await
+            .unwrap_err();
+        assert_eq!(err.delivered, 0);
+        assert!(err.rate_limited);
+
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(
+            requests.len(),
+            1 + TELEGRAM_RATE_LIMIT_RETRIES as usize,
+            "one request plus the capped resends"
+        );
+        for request in &requests {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            assert_eq!(body["parse_mode"], "HTML", "no plain-text retry on 429");
+        }
+    }
+
+    /// A 429 on the plain-text fallback also waits `retry_after` and resends
+    /// the same plain-text body.
+    #[tokio::test]
+    async fn plain_text_fallback_waits_retry_after_and_keeps_body() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "ok": false,
+                "error_code": 400,
+                "description": "Bad Request: can't parse entities"
+            })))
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(flood_limit_response(1))
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "message_id": 7 }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let ch = rate_limit_test_channel(mock_server.uri());
+        let started = Instant::now();
+        let sent = ch.send_text_chunks("hello", "123", None, 0).await.unwrap();
+        assert_eq!(sent, 1);
+        assert!(
+            started.elapsed() >= Duration::from_secs(1),
+            "the plain-text resend must wait for retry_after"
+        );
+
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 3);
+        let bodies: Vec<serde_json::Value> = requests
+            .iter()
+            .map(|r| serde_json::from_slice(&r.body).unwrap())
+            .collect();
+        assert_eq!(bodies[0]["parse_mode"], "HTML");
+        assert!(bodies[1].get("parse_mode").is_none());
+        assert_eq!(bodies[1], bodies[2], "the plain-text resend keeps its body");
+    }
+
+    /// A flood-limited finalize must not resume or let the orchestrator fall
+    /// back to a full resend. With no chunk accepted it reports
+    /// `FinalizeUndelivered`, not `FinalizePartialDelivery`, so the reply is not
+    /// counted as sent.
+    #[tokio::test]
+    async fn finalize_send_chunks_does_not_resend_inside_flood_penalty() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(flood_limit_response(536))
+            .mount(&mock_server)
+            .await;
+
+        let ch = rate_limit_test_channel(mock_server.uri());
+        let err = ch
+            .finalize_send_chunks("hello", "123", None)
+            .await
+            .unwrap_err();
+        assert!(
+            err.downcast_ref::<zeroclaw_api::channel::FinalizeUndelivered>()
+                .is_some(),
+            "rate-limited finalize with nothing accepted must report FinalizeUndelivered, got: {err:#}"
+        );
+        assert!(
+            err.downcast_ref::<zeroclaw_api::channel::FinalizePartialDelivery>()
+                .is_none(),
+            "nothing was accepted, so this must not look like partial delivery"
+        );
+
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1, "no resume inside the penalty window");
+    }
+
+    /// Regression: a long flood limit hit while `finalize_draft` (multi-message
+    /// mode) delivers pending narration must stop the whole finalization: no
+    /// further narration attempt and no final-answer send inside `retry_after`,
+    /// reported as `FinalizeUndelivered` so the orchestrator does not resend.
+    /// `accepted_narration_chunks` covers both the zero-prefix case and a
+    /// partially accepted narration prefix, which must be posted exactly once.
+    async fn assert_finalize_stops_on_narration_flood_limit(accepted_narration_chunks: usize) {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mut narration = "N".repeat(3000);
+        narration.push_str(&"M".repeat(6000));
+        let chunks = split_message_for_telegram(narration.trim());
+        assert!(chunks.len() >= 2, "narration fixture must span two chunks");
+
+        let mock_server = MockServer::start().await;
+        if accepted_narration_chunks > 0 {
+            Mock::given(method("POST"))
+                .and(path_regex(r"/bot[^/]+/sendMessage$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({ "ok": true, "result": { "message_id": 1 } }),
+                ))
+                .up_to_n_times(accepted_narration_chunks as u64)
+                .mount(&mock_server)
+                .await;
+        }
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(flood_limit_response(536))
+            .mount(&mock_server)
+            .await;
+
+        let ch =
+            multi_message_test_channel("telegram_test_alias", 0).with_api_base(mock_server.uri());
+        let recipient = "100:7";
+        let draft_id = TelegramChannel::new_multi_message_draft_id();
+        {
+            let mut drafts = ch.multi_message_drafts.lock();
+            let mut state = MultiDraftState::new(Some("7".into()));
+            state.latest_visible = narration.clone();
+            drafts.insert(
+                TelegramChannel::multi_draft_key(recipient, &draft_id),
+                state,
+            );
+        }
+
+        let final_answer = "Distinct final answer text, unrelated to the narration.";
+        let err = ch
+            .finalize_draft(recipient, &draft_id, final_answer, true)
+            .await
+            .expect_err("a flood-limited finalize must not report success");
+        assert!(
+            err.downcast_ref::<zeroclaw_api::channel::FinalizeUndelivered>()
+                .is_some(),
+            "must report a no-resend undelivered finalization, got: {err:#}"
+        );
+
+        let bodies: Vec<String> = mock_server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.url.path().ends_with("/sendMessage"))
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .collect();
+        assert_eq!(
+            bodies.len(),
+            accepted_narration_chunks + 1,
+            "no request after the flood-limited one; final answer sent: {}",
+            bodies.iter().any(|b| b.contains(final_answer))
+        );
+        assert!(
+            !bodies.iter().any(|b| b.contains(final_answer)),
+            "the final answer must not be sent inside the flood penalty"
+        );
+        for chunk in &chunks[..accepted_narration_chunks] {
+            let posts = bodies.iter().filter(|b| b.contains(chunk.as_str())).count();
+            assert_eq!(
+                posts, 1,
+                "an accepted narration chunk is posted exactly once"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn finalize_draft_multi_message_stops_on_narration_flood_limit() {
+        assert_finalize_stops_on_narration_flood_limit(0).await;
+    }
+
+    #[tokio::test]
+    async fn finalize_draft_multi_message_stops_on_narration_flood_limit_after_accepted_prefix() {
+        assert_finalize_stops_on_narration_flood_limit(1).await;
     }
 }

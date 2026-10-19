@@ -1,5 +1,7 @@
 #[cfg(all(feature = "agent-runtime", feature = "channel-acp-server"))]
 mod acp_cli;
+#[cfg(all(feature = "agent-runtime", feature = "channel-acp-server"))]
+mod acp_retry_stop_notice_stdio;
 #[cfg(feature = "channel-acp-server")]
 mod acp_session_cwd_stdio;
 mod agents_export_cli;
@@ -39,3 +41,5 @@ mod whatsapp_webhook_security;
 
 #[cfg(feature = "plugins-wasm")]
 mod plugin_info_cli;
+#[cfg(feature = "plugins-wasm")]
+mod plugin_update_cli;
