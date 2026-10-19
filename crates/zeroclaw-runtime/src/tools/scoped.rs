@@ -111,6 +111,20 @@ impl BuildRegistry {
         }
     }
 
+    fn retire_supplied_names(&mut self, names: &HashSet<String>) {
+        for entry in &mut self.entries {
+            if entry.origin == EntryOrigin::Supplied
+                && entry
+                    .value
+                    .as_ref()
+                    .is_some_and(|tool| names.contains(tool.name()))
+            {
+                entry.value = None;
+                entry.top_level = false;
+            }
+        }
+    }
+
     fn iter(&self) -> impl Iterator<Item = (SlotId, &BuildSlot)> {
         self.entries
             .iter()
@@ -1196,6 +1210,12 @@ impl ScopedToolRegistry {
                 }
             }
         }
+
+        // MCP names belong to the MCP registry, as `execute_pipeline` and
+        // `tool_search` belong to their native creators. A same-name source tool
+        // would otherwise come first in dispatch, ahead of the eager wrapper or a
+        // later deferred activation. The seal drops it from child views too.
+        tools_registry.retire_supplied_names(&mcp_tool_names);
 
         // 5. Skills (uniform: the gateway used to skip them). Registered under the same
         //    `SecurityPolicy`, resolving builtin elevation against context-filtered arcs.
@@ -3045,6 +3065,108 @@ mod tests {
         .await
         .expect("assemble must not hang");
         out.registry.iter().map(|t| t.name().to_string()).collect()
+    }
+
+    /// A source extension that reuses an MCP tool's `<server>__<tool>` name.
+    struct McpNamedSourceTool;
+
+    zeroclaw_api::mock_tool_attribution!(McpNamedSourceTool);
+
+    const MCP_NAMED_SOURCE: &str = "source tool reusing an MCP name";
+
+    #[async_trait]
+    impl Tool for McpNamedSourceTool {
+        fn name(&self) -> &str {
+            "remote__echo"
+        }
+        fn description(&self) -> &str {
+            MCP_NAMED_SOURCE
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            Ok(ToolResult {
+                success: true,
+                output: ToolOutput::default(),
+                error: None,
+            })
+        }
+    }
+
+    async fn assemble_native_compat_with_mcp_named_source(deferred: bool) -> ScopedAssembled {
+        let server = mock_mcp_http_server().await;
+        let server2 = mock_mcp_http_server().await;
+        let mut config = config_with_bundled_mcp(server.uri(), server2.uri());
+        config.mcp.deferred_loading = deferred;
+        let security = Arc::new(SecurityPolicy {
+            workspace_dir: std::env::temp_dir(),
+            ..SecurityPolicy::default()
+        });
+        let built = built_with(vec![Box::new(McpNamedSourceTool)]);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            ScopedToolRegistry::assemble_prepared(
+                ScopedAssembly {
+                    config: &config,
+                    agent_alias: "scoped",
+                    security: &security,
+                    built,
+                    skills: &[],
+                    runtime: Arc::new(crate::platform::NativeRuntime::new()),
+                    caller_allowed: None,
+                    connect_mcp: true,
+                    connect_peripherals: false,
+                    exclude_memory: false,
+                    acp_delivery: false,
+                    list_deferred_mcp_specs: false,
+                    emit_assembly_logs: false,
+                    mcp_registry: None,
+                },
+                RegistryConstruction::NativeCompat,
+                0..1,
+            ),
+        )
+        .await
+        .expect("assemble must not hang")
+    }
+
+    /// In native compatibility mode an MCP tool keeps its `<server>__<tool>`
+    /// name, as `execute_pipeline` and `tool_search` keep theirs: an eager MCP
+    /// wrapper is the only tool dispatch finds under that name.
+    #[tokio::test]
+    async fn native_compat_eager_mcp_tool_retires_a_same_name_source_tool() {
+        let out = assemble_native_compat_with_mcp_named_source(false).await;
+        let named: Vec<_> = out
+            .registry
+            .iter()
+            .filter(|tool| tool.name() == "remote__echo")
+            .collect();
+        assert_eq!(named.len(), 1, "one tool owns the MCP name");
+        let found = crate::agent::tool_execution::find_tool(&out.registry, "remote__echo")
+            .expect("the MCP tool is registered");
+        assert_ne!(
+            found.description(),
+            MCP_NAMED_SOURCE,
+            "dispatch must reach the MCP wrapper, not the source tool"
+        );
+        assert!(out.mcp_tool_names.contains("remote__echo"));
+    }
+
+    /// Deferred loading: the MCP name is reserved before any activation, so a
+    /// later `tool_search` activation is not shadowed by a static source tool.
+    #[tokio::test]
+    async fn native_compat_deferred_mcp_name_retires_a_same_name_source_tool() {
+        let out = assemble_native_compat_with_mcp_named_source(true).await;
+        assert!(out.mcp_tool_names.contains("remote__echo"));
+        assert!(
+            out.activated_handle.is_some(),
+            "deferred MCP tools activate through tool_search"
+        );
+        assert!(
+            crate::agent::tool_execution::find_tool(&out.registry, "remote__echo").is_none(),
+            "no static source tool may answer before the deferred MCP tool activates"
+        );
     }
 
     #[tokio::test]
