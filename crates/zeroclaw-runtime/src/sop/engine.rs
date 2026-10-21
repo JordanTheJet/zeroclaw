@@ -245,17 +245,20 @@ struct StaleRunCopy {
 
 impl std::fmt::Display for StaleRunCopy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "Run {} changed in the store since this engine last read it (revision {} -> {}, \
-             now {} on step {}); this engine adopted the stored record and did not apply the transition",
-            self.run_id,
-            self.seen_revision
-                .map_or_else(|| "unknown".to_string(), |r| r.to_string()),
-            self.stored_revision,
-            self.stored_status,
-            self.stored_step
-        )
+        let seen_revision = self.seen_revision.map_or_else(
+            || crate::i18n::get_required_cli_string("cli-sop-run-copy-revision-unknown"),
+            |r| r.to_string(),
+        );
+        f.write_str(&crate::i18n::get_required_cli_string_with_args(
+            "cli-sop-run-copy-stale",
+            &[
+                ("run_id", self.run_id.as_str()),
+                ("seen_revision", seen_revision.as_str()),
+                ("stored_revision", &self.stored_revision.to_string()),
+                ("status", &self.stored_status.to_string()),
+                ("step", &self.stored_step.to_string()),
+            ],
+        ))
     }
 }
 
@@ -1009,14 +1012,15 @@ impl SopEngine {
         let stored = match self.store.load_run(run_id) {
             Ok(Some(stored)) => stored,
             Ok(None) => {
-                return anyhow::Error::msg(format!(
-                    "Run {run_id} changed in the store since this engine last read it"
+                return anyhow::Error::msg(crate::i18n::get_required_cli_string_with_args(
+                    "cli-sop-run-copy-changed",
+                    &[("run_id", run_id)],
                 ));
             }
             Err(e) => {
-                return anyhow::Error::msg(format!(
-                    "Run {run_id} changed in the store since this engine last read it, \
-                     and reloading it failed: {e}"
+                return anyhow::Error::msg(crate::i18n::get_required_cli_string_with_args(
+                    "cli-sop-run-copy-reload-failed",
+                    &[("run_id", run_id), ("error", &e.to_string())],
                 ));
             }
         };
@@ -9353,6 +9357,39 @@ mod tests {
     fn is_stale_copy_refusal(err: &anyhow::Error) -> bool {
         err.to_string()
             .contains("adopted the stored record and did not apply the transition")
+    }
+
+    /// The refusal is rendered from the Fluent catalog with every argument
+    /// filled in, so it follows the selected language.
+    #[test]
+    fn stale_copy_refusal_renders_from_the_catalog() {
+        let status = SopRunStatus::CancelRequested.to_string();
+        let refusal = StaleRunCopy {
+            run_id: "run-7".into(),
+            local_step: Some(1),
+            seen_revision: Some(3),
+            stored_revision: 5,
+            stored_status: SopRunStatus::CancelRequested,
+            stored_step: 2,
+        }
+        .to_string();
+        assert_eq!(
+            refusal,
+            crate::i18n::get_required_cli_string_with_args(
+                "cli-sop-run-copy-stale",
+                &[
+                    ("run_id", "run-7"),
+                    ("seen_revision", "3"),
+                    ("stored_revision", "5"),
+                    ("status", status.as_str()),
+                    ("step", "2"),
+                ],
+            )
+        );
+        assert!(
+            refusal.contains("run-7") && refusal.contains("3 -> 5") && !refusal.contains('{'),
+            "got {refusal}"
+        );
     }
 
     fn four_step_sop(name: &str) -> Sop {
