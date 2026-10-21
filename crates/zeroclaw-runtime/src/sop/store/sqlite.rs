@@ -1113,6 +1113,42 @@ mod tests {
         assert_eq!(stored.last_progress_at, "1");
     }
 
+    /// Two writers that build the same state from the same revision write
+    /// records that differ only in their writer. The second is a competing
+    /// write, not a retry of the first, so it is refused; a retry from the
+    /// writer whose record is stored still matches.
+    #[test]
+    fn same_revision_write_from_another_writer_conflicts() {
+        let s = SqliteRunStore::open_in_memory().unwrap();
+        let mut first = run("r1", SopRunStatus::Running, "1");
+        first.revision = 5;
+        first.writer = Some("engine-a".into());
+        let mut second = first.clone();
+        second.writer = Some("engine-b".into());
+        s.save_run(&first).unwrap();
+        assert!(matches!(
+            s.save_run(&second),
+            Err(StoreError::RevisionConflict { revision: 5, .. })
+        ));
+        s.save_run(&first).unwrap();
+
+        let mut terminal = run("r1", SopRunStatus::Completed, "2");
+        terminal.revision = 6;
+        terminal.writer = Some("engine-a".into());
+        let mut competing = terminal.clone();
+        competing.writer = Some("engine-b".into());
+        s.finish_run("r1", &terminal).unwrap();
+        assert!(matches!(
+            s.finish_run("r1", &competing),
+            Err(StoreError::TerminalRun { .. })
+        ));
+        s.finish_run("r1", &terminal).unwrap();
+        assert_eq!(
+            s.load_run("r1").unwrap().unwrap().writer.as_deref(),
+            Some("engine-a")
+        );
+    }
+
     #[test]
     fn finish_run_revision_guard_protects_state_and_claim() {
         let s = SqliteRunStore::open_in_memory().unwrap();

@@ -132,6 +132,11 @@ pub struct SopEngine {
     /// engine over the same store) has since moved on, instead of letting the
     /// older copy overwrite the record.
     run_revisions: parking_lot::Mutex<HashMap<String, u64>>,
+    /// Identifies this engine as the writer of every run record it persists.
+    /// Two engines that build identical state from the same revision then
+    /// still write different records, so the store refuses the second write
+    /// as a conflict instead of accepting it as a retry of the first.
+    writer_id: String,
 }
 
 /// Cap on the in-memory per-message dispatch-dedup window (`SopEngine::dispatch_dedup`).
@@ -486,6 +491,7 @@ impl SopEngine {
             pending_orphan_settlements: OrphanedRunSettlementQueue::default(),
             decision_models: HashMap::new(),
             run_revisions: parking_lot::Mutex::new(HashMap::new()),
+            writer_id: uuid::Uuid::new_v4().to_string(),
         }
     }
 
@@ -956,6 +962,15 @@ impl SopEngine {
         }
     }
 
+    /// The record this engine writes for `run`: stamped one past the revision
+    /// it last read or wrote, and carrying this engine as its writer.
+    fn persisted_run(&self, run: &SopRun) -> PersistedRun {
+        let mut pr = PersistedRun::new(run.clone(), now_iso8601(), run.trigger_event.source);
+        pr.revision = self.next_run_revision(&run.run_id);
+        pr.writer = Some(self.writer_id.clone());
+        pr
+    }
+
     fn note_run_revision(&self, run_id: &str, revision: u64) {
         self.run_revisions
             .lock()
@@ -1188,10 +1203,9 @@ impl SopEngine {
             return ActivePersistOutcome::Saved;
         };
         self.heartbeat_claim_for_run(run);
-        let mut pr = PersistedRun::new(run.clone(), now_iso8601(), run.trigger_event.source);
         // Each persist is a new state revision; the store rejects a
         // same-revision divergent write, so advance past what is stored.
-        pr.revision = self.next_run_revision(run_id);
+        let pr = self.persisted_run(run);
         let saved = match max_pending {
             Some(max_pending) => self
                 .store
@@ -1283,8 +1297,7 @@ impl SopEngine {
             .cloned()
             .ok_or_else(|| anyhow::Error::msg(format!("Active run not found: {run_id}")))?;
         self.heartbeat_claim_for_run(&run);
-        let mut persisted = PersistedRun::new(run.clone(), now_iso8601(), run.trigger_event.source);
-        persisted.revision = self.next_run_revision(run_id);
+        let persisted = self.persisted_run(&run);
         Ok((persisted, run))
     }
 
@@ -1745,10 +1758,9 @@ impl SopEngine {
 
     /// Persist a run that has reached a terminal state and release its claim atomically.
     fn persist_terminal(&self, run: &SopRun) -> Result<()> {
-        let mut pr = PersistedRun::new(run.clone(), now_iso8601(), run.trigger_event.source);
         // The terminal write is the run's final revision; advance past the last
         // active snapshot so the store's revision guard accepts it.
-        pr.revision = self.next_run_revision(&run.run_id);
+        let pr = self.persisted_run(run);
         self.store.finish_run(&run.run_id, &pr).map_err(|e| {
             ::zeroclaw_log::record!(
                 WARN,
@@ -1773,8 +1785,7 @@ impl SopEngine {
     /// terminal run, release its claim, and append the gate-resolution ledger row
     /// in one store transaction.
     fn persist_terminal_with_gate_event(&self, run: &SopRun, event: &SopEventRecord) -> Result<()> {
-        let mut pr = PersistedRun::new(run.clone(), now_iso8601(), run.trigger_event.source);
-        pr.revision = self.next_run_revision(&run.run_id);
+        let pr = self.persisted_run(run);
         self.store
             .finish_run_with_event(&run.run_id, &pr, event)
             .map_err(|e| {
@@ -9663,6 +9674,128 @@ mod tests {
             stale.active_runs()[&run_id].current_step,
             2,
             "the stale engine adopts the stored record"
+        );
+    }
+
+    /// Wait until the wall clock is early in a second, so that the writes made
+    /// right after it carry the same second-precision timestamp.
+    fn wait_for_the_start_of_a_second() {
+        while std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_millis()
+            > 50
+        {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    /// Two engines hold the same copy of a run, and the same result for its
+    /// current step reaches both within one second. Both pass the stale check
+    /// before either writes (the second engine's check is served the record
+    /// both started from), so both stamp the same next revision. Building
+    /// identical state from the same revision must not let the second write
+    /// through as a retry of the first, or both engines hand out the next step
+    /// and its side effects run twice.
+    fn assert_matching_writes_dispatch_the_next_step_once(store: Arc<dyn SopRunStore>) {
+        let sop = four_step_sop("matching-writes");
+        let mut first = engine_with_sops(vec![sop.clone()]).with_store(store.clone());
+        let action = first.start_run("matching-writes", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+        let lagging = Arc::new(LaggingLoadStore {
+            inner: store.clone(),
+            lagged: parking_lot::Mutex::new(None),
+        });
+        let mut second = engine_with_sops(vec![sop]).with_store(lagging.clone());
+        second.restore_runs();
+        let seen = store.load_run(&run_id).unwrap().unwrap();
+
+        let result = completed_step_result(1, "one");
+        wait_for_the_start_of_a_second();
+        let a = first.advance_step(&run_id, result.clone());
+        *lagging.lagged.lock() = Some(seen.clone());
+        let b = second.advance_step(&run_id, result);
+
+        let dispatched = [&a, &b]
+            .into_iter()
+            .filter(|action| {
+                matches!(action, Ok(SopRunAction::ExecuteStep { step, .. }) if step.number == 2)
+            })
+            .count();
+        assert_eq!(
+            dispatched, 1,
+            "step 2 must be handed out once, got {a:?} and {b:?}"
+        );
+        assert!(
+            b.as_ref().is_err_and(is_stale_copy_refusal),
+            "the second write must be refused, got {b:?}"
+        );
+        let stored = store.load_run(&run_id).unwrap().unwrap();
+        assert_eq!(stored.revision, seen.revision + 1);
+        assert_eq!(stored.run.current_step, 2);
+        assert_eq!(stored.run.step_results.len(), 1);
+        assert_eq!(
+            second.active_runs()[&run_id].current_step,
+            2,
+            "the refused engine adopts the stored record"
+        );
+    }
+
+    #[test]
+    fn matching_writes_dispatch_the_next_step_once_in_sqlite() {
+        assert_matching_writes_dispatch_the_next_step_once(Arc::new(
+            super::super::store::SqliteRunStore::open_in_memory().unwrap(),
+        ));
+    }
+
+    #[test]
+    fn matching_writes_dispatch_the_next_step_once_in_memory() {
+        assert_matching_writes_dispatch_the_next_step_once(Arc::new(InMemoryRunStore::new()));
+    }
+
+    /// The same race over two connections to one database file, the way a
+    /// CLI process and the daemon share `runs.db`.
+    #[test]
+    fn matching_writes_dispatch_the_next_step_once_across_connections() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("runs.db");
+        let sop = four_step_sop("matching-files");
+        let first_store: Arc<dyn SopRunStore> =
+            Arc::new(super::super::store::SqliteRunStore::open(&path).unwrap());
+        let second_store = Arc::new(LaggingLoadStore {
+            inner: Arc::new(super::super::store::SqliteRunStore::open(&path).unwrap()),
+            lagged: parking_lot::Mutex::new(None),
+        });
+        let mut first = engine_with_sops(vec![sop.clone()]).with_store(first_store.clone());
+        let action = first.start_run("matching-files", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+        let mut second = engine_with_sops(vec![sop]).with_store(second_store.clone());
+        second.restore_runs();
+        let seen = first_store.load_run(&run_id).unwrap().unwrap();
+
+        let result = completed_step_result(1, "one");
+        wait_for_the_start_of_a_second();
+        let a = first.advance_step(&run_id, result.clone());
+        *second_store.lagged.lock() = Some(seen);
+        let b = second.advance_step(&run_id, result);
+
+        assert!(
+            matches!(a, Ok(SopRunAction::ExecuteStep { ref step, .. }) if step.number == 2),
+            "got {a:?}"
+        );
+        assert!(
+            b.as_ref().is_err_and(is_stale_copy_refusal),
+            "the second write must be refused, got {b:?}"
+        );
+        assert_eq!(
+            first_store
+                .load_run(&run_id)
+                .unwrap()
+                .unwrap()
+                .run
+                .step_results
+                .len(),
+            1
         );
     }
 
