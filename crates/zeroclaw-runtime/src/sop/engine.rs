@@ -1110,6 +1110,37 @@ impl SopEngine {
         Ok(None)
     }
 
+    /// A driver boundary's transition passed the stale check, but its write was
+    /// refused because another writer moved the run on in between. A refused
+    /// dispatch or park write has adopted the stored record already; a refused
+    /// terminal write has not, so adopt it here. As at the stale check, a
+    /// cancellation requested through another engine is then finished at this
+    /// boundary, so the run is not left claimed with nobody to finish it.
+    /// Anything else stays refused, and an error that is not a refused write,
+    /// or a reload that fails, is returned unchanged.
+    fn finish_cancel_after_refused_write(
+        &mut self,
+        run_id: &str,
+        advanced: Result<SopRunAction>,
+    ) -> Result<SopRunAction> {
+        let (stale, recorded) = match advanced {
+            Err(e) if err_is_stale_terminal_write(&e) => {
+                let stale = self.drop_stale_copy(run_id);
+                if !err_is_stale_run_copy(&stale) {
+                    return Err(e);
+                }
+                (stale, false)
+            }
+            // A refused dispatch or park write has recorded its refusal.
+            Err(e) if err_is_stale_run_copy(&e) => (e, true),
+            advanced => return advanced,
+        };
+        if let Some(cancelled) = self.finish_requested_cancellation(run_id)? {
+            return Ok(cancelled);
+        }
+        Err(if recorded { stale } else { self.refused(stale) })
+    }
+
     /// Refuse a gate decision on a held run whose stored record is newer than
     /// this engine's copy. The stored record is adopted first, so a retry works
     /// from current state instead of being refused again. When the stored
@@ -2499,6 +2530,17 @@ impl SopEngine {
                 _ => return Err(self.refused(stale)),
             }
         }
+        let advanced = self.advance_current_step(run_id, result);
+        self.finish_cancel_after_refused_write(run_id, advanced)
+    }
+
+    /// Route a result for the step this engine's copy of the run is on: the
+    /// part of `advance_step` after its stale check.
+    fn advance_current_step(
+        &mut self,
+        run_id: &str,
+        result: SopStepResult,
+    ) -> Result<SopRunAction> {
         let (sop_name, current_step_number) = {
             let run = self.active_runs.get(run_id).ok_or_else(|| {
                 ::zeroclaw_log::record!(
@@ -5089,7 +5131,7 @@ impl SopEngine {
         if let Some(cancelled) = self.finish_requested_cancellation(run_id)? {
             return Ok(cancelled);
         }
-        match action {
+        let advanced = match action {
             SopRunAction::DeterministicStep {
                 ref step,
                 ref input,
@@ -5111,7 +5153,8 @@ impl SopEngine {
                 self.fail_headless_driverless_step(run_id, &sop_name, step)
             }
             terminal => Ok(terminal),
-        }
+        };
+        self.finish_cancel_after_refused_write(run_id, advanced)
     }
 
     /// Fail a run whose headless driver consumed its bounded step budget.
@@ -9799,6 +9842,177 @@ mod tests {
         );
     }
 
+    /// The same race at the final step: the second engine's terminal write is
+    /// a competing completion, not a retry of the first, so only one engine
+    /// completes the run and the other adopts the stored terminal record.
+    #[test]
+    fn matching_final_writes_complete_the_run_once() {
+        let store: Arc<dyn SopRunStore> =
+            Arc::new(super::super::store::SqliteRunStore::open_in_memory().unwrap());
+        let sop = test_sop(
+            "matching-final",
+            SopExecutionMode::Auto,
+            SopPriority::Normal,
+        );
+        let mut first = engine_with_sops(vec![sop.clone()]).with_store(store.clone());
+        let action = first.start_run("matching-final", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+        first
+            .advance_step(&run_id, completed_step_result(1, "one"))
+            .unwrap();
+        let lagging = Arc::new(LaggingLoadStore {
+            inner: store.clone(),
+            lagged: parking_lot::Mutex::new(None),
+        });
+        let mut second = engine_with_sops(vec![sop]).with_store(lagging.clone());
+        second.restore_runs();
+        let seen = store.load_run(&run_id).unwrap().unwrap();
+
+        let result = completed_step_result(2, "two");
+        wait_for_the_start_of_a_second();
+        let a = first.advance_step(&run_id, result.clone());
+        *lagging.lagged.lock() = Some(seen);
+        let b = second.advance_step(&run_id, result);
+
+        assert!(matches!(a, Ok(SopRunAction::Completed { .. })), "got {a:?}");
+        assert!(
+            b.as_ref().is_err_and(is_stale_copy_refusal),
+            "the second completion must be refused, got {b:?}"
+        );
+        assert!(!second.active_runs().contains_key(&run_id));
+        assert_eq!(
+            second.get_run(&run_id).map(|run| run.status),
+            Some(SopRunStatus::Completed)
+        );
+    }
+
+    /// A cancel requested through another engine lands after the final
+    /// step's result passed the driver's stale check, so the run's terminal
+    /// write is refused. The driver adopts the stored request and finishes
+    /// the cancellation, instead of exiting with the run claimed and `Running`
+    /// in its copy and nobody left to finish it.
+    #[test]
+    fn remote_cancel_after_the_final_step_check_is_finished_by_the_driver() {
+        let inner: Arc<dyn SopRunStore> =
+            Arc::new(super::super::store::SqliteRunStore::open_in_memory().unwrap());
+        let lagging = Arc::new(LaggingLoadStore {
+            inner: inner.clone(),
+            lagged: parking_lot::Mutex::new(None),
+        });
+        let sop = test_sop("cancel-final", SopExecutionMode::Auto, SopPriority::Normal);
+        let mut owner = engine_with_sops(vec![sop.clone()]).with_store(lagging.clone());
+        let action = owner.start_run("cancel-final", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+        owner
+            .advance_step(&run_id, completed_step_result(1, "one"))
+            .unwrap();
+        let seen = inner.load_run(&run_id).unwrap().unwrap();
+        let mut other = engine_with_sops(vec![sop]).with_store(inner.clone());
+        other.restore_runs();
+        assert_eq!(
+            other
+                .cancel_run_idempotent(&run_id, None, Some("gateway:operator".into()))
+                .unwrap(),
+            Some(CancelOutcome::Requested)
+        );
+        *lagging.lagged.lock() = Some(seen);
+
+        let action = owner.advance_step(&run_id, completed_step_result(2, "two"));
+        assert!(
+            matches!(action, Ok(SopRunAction::Cancelled { .. })),
+            "got {action:?}"
+        );
+        let stored = inner.load_run(&run_id).unwrap().unwrap();
+        assert_eq!(stored.run.status, SopRunStatus::Cancelled);
+        assert_eq!(inner.claim_counts("cancel-final").unwrap(), (0, 0));
+        assert!(!owner.active_runs().contains_key(&run_id));
+    }
+
+    /// The same race at a step that hands out the next one: the refused
+    /// dispatch write adopts the stored request, and the driver finishes the
+    /// cancellation there instead of only refusing.
+    #[test]
+    fn remote_cancel_after_a_step_check_is_finished_at_the_dispatch_write() {
+        let inner: Arc<dyn SopRunStore> =
+            Arc::new(super::super::store::SqliteRunStore::open_in_memory().unwrap());
+        let lagging = Arc::new(LaggingLoadStore {
+            inner: inner.clone(),
+            lagged: parking_lot::Mutex::new(None),
+        });
+        let sop = four_step_sop("cancel-dispatch");
+        let mut owner = engine_with_sops(vec![sop.clone()]).with_store(lagging.clone());
+        let action = owner.start_run("cancel-dispatch", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+        let seen = inner.load_run(&run_id).unwrap().unwrap();
+        let mut other = engine_with_sops(vec![sop]).with_store(inner.clone());
+        other.restore_runs();
+        assert_eq!(
+            other
+                .cancel_run_idempotent(&run_id, None, Some("gateway:operator".into()))
+                .unwrap(),
+            Some(CancelOutcome::Requested)
+        );
+        *lagging.lagged.lock() = Some(seen);
+
+        let action = owner.advance_step(&run_id, completed_step_result(1, "one"));
+        assert!(
+            matches!(action, Ok(SopRunAction::Cancelled { .. })),
+            "got {action:?}"
+        );
+        let stored = inner.load_run(&run_id).unwrap().unwrap();
+        assert_eq!(stored.run.status, SopRunStatus::Cancelled);
+        assert_eq!(inner.claim_counts("cancel-dispatch").unwrap(), (0, 0));
+        assert!(!owner.active_runs().contains_key(&run_id));
+    }
+
+    /// Another engine finished the run after the final step's check passed.
+    /// The refused terminal write adopts the stored terminal record, so this
+    /// engine stops holding a `Running` copy of a finished run.
+    #[test]
+    fn terminal_write_refused_by_a_finished_run_adopts_its_record() {
+        let inner: Arc<dyn SopRunStore> =
+            Arc::new(super::super::store::SqliteRunStore::open_in_memory().unwrap());
+        let lagging = Arc::new(LaggingLoadStore {
+            inner: inner.clone(),
+            lagged: parking_lot::Mutex::new(None),
+        });
+        let sop = test_sop(
+            "finished-elsewhere",
+            SopExecutionMode::Auto,
+            SopPriority::Normal,
+        );
+        let mut owner = engine_with_sops(vec![sop.clone()]).with_store(lagging.clone());
+        let action = owner
+            .start_run("finished-elsewhere", manual_event())
+            .unwrap();
+        let run_id = extract_run_id(&action).to_string();
+        owner
+            .advance_step(&run_id, completed_step_result(1, "one"))
+            .unwrap();
+        let seen = inner.load_run(&run_id).unwrap().unwrap();
+        let mut other = engine_with_sops(vec![sop]).with_store(inner.clone());
+        other.restore_runs();
+        let done = other
+            .advance_step(&run_id, completed_step_result(2, "two, elsewhere"))
+            .unwrap();
+        assert!(matches!(done, SopRunAction::Completed { .. }));
+        *lagging.lagged.lock() = Some(seen);
+
+        let action = owner.advance_step(&run_id, completed_step_result(2, "two"));
+        assert!(
+            action.as_ref().is_err_and(is_stale_copy_refusal),
+            "got {action:?}"
+        );
+        let stored = inner.load_run(&run_id).unwrap().unwrap();
+        assert_eq!(stored.run.status, SopRunStatus::Completed);
+        assert_eq!(stored.run.step_results[1].output, "two, elsewhere");
+        assert!(!owner.active_runs().contains_key(&run_id));
+        assert_eq!(
+            owner.get_run(&run_id).map(|run| run.status),
+            Some(SopRunStatus::Completed)
+        );
+    }
+
     /// A gate the owner already resolved must not time out from a stale
     /// engine's copy. The sweep adopts the stored record and skips the run.
     #[test]
@@ -10287,6 +10501,127 @@ mod tests {
         let stored = store.load_run(&run_id).unwrap().unwrap();
         assert_eq!(stored.run.status, SopRunStatus::Cancelled);
         assert_eq!(store.claim_counts("det-remote-cancel").unwrap(), (0, 0));
+    }
+
+    /// Requests the run's cancellation through another engine while it runs,
+    /// the way an operator cancel lands during a long capability. The first
+    /// call returns normally; every later call cancels before returning.
+    struct CancelThroughAnotherEngine {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        other: Arc<parking_lot::Mutex<Option<SopEngine>>>,
+    }
+
+    impl super::super::capability::SopCapability for CancelThroughAnotherEngine {
+        fn id(&self) -> &'static str {
+            "cancel.elsewhere"
+        }
+
+        fn describe(&self) -> super::super::capability::CapabilityInfo {
+            super::super::capability::CapabilityInfo {
+                id: self.id(),
+                description: "Cancel the run through another engine",
+                deterministic: true,
+                idempotent: false,
+                reversible: false,
+                supports_retry: false,
+                required_permissions: Vec::new(),
+                input_schema: None,
+                output_schema: None,
+            }
+        }
+
+        fn execute(
+            &self,
+            ctx: super::super::capability::CapabilityContext,
+            _input: serde_json::Value,
+        ) -> anyhow::Result<super::super::capability::CapabilityResult> {
+            if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0
+                && let Some(other) = self.other.lock().as_mut()
+            {
+                other.restore_runs();
+                assert_eq!(
+                    other
+                        .cancel_run_idempotent(&ctx.run_id, None, Some("gateway:operator".into()))
+                        .unwrap(),
+                    Some(CancelOutcome::Requested)
+                );
+            }
+            Ok(super::super::capability::CapabilityResult::success(
+                serde_json::json!({"ok": true}),
+            ))
+        }
+    }
+
+    /// A cancel requested through another engine while the driver's second
+    /// capability runs. Whether the write after it hands out a third step or
+    /// finishes the run, it is refused, and the driver finishes the adopted
+    /// cancellation instead of exiting with the run still claimed.
+    fn assert_cancel_during_a_capability_is_finished(steps: u32) {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let other = Arc::new(parking_lot::Mutex::new(None));
+        let mut registry = SopCapabilityRegistry::with_builtins();
+        registry.register(CancelThroughAnotherEngine {
+            calls: calls.clone(),
+            other: other.clone(),
+        });
+        let registry = Arc::new(registry);
+        let mut sop = deterministic_sop_all_execute("det-cancel-mid-step");
+        while sop.steps.len() < steps as usize {
+            let number = sop.steps.len() as u32 + 1;
+            sop.steps.push(SopStep {
+                number,
+                title: format!("Step {number}"),
+                body: format!("Do step {number}"),
+                kind: SopStepKind::Execute,
+                ..SopStep::default()
+            });
+        }
+        for step in &mut sop.steps {
+            step.kind = SopStepKind::Capability;
+            step.capability = Some("cancel.elsewhere".into());
+        }
+        let store: Arc<dyn SopRunStore> =
+            Arc::new(super::super::store::SqliteRunStore::open_in_memory().unwrap());
+        let mut owner = engine_with_sops(vec![sop.clone()])
+            .with_store(store.clone())
+            .with_capabilities(registry.clone());
+        *other.lock() = Some(
+            engine_with_sops(vec![sop])
+                .with_store(store.clone())
+                .with_capabilities(registry),
+        );
+        let first = owner
+            .start_run("det-cancel-mid-step", manual_event())
+            .unwrap();
+        let run_id = extract_run_id(&first).to_string();
+        let second = owner
+            .advance_headless_deterministic_step(&run_id, first)
+            .unwrap();
+        assert!(
+            matches!(second, SopRunAction::DeterministicStep { ref step, .. } if step.number == 2),
+            "got {second:?}"
+        );
+
+        let action = owner.advance_headless_deterministic_step(&run_id, second);
+        assert!(
+            matches!(action, Ok(SopRunAction::Cancelled { .. })),
+            "got {action:?}"
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        let stored = store.load_run(&run_id).unwrap().unwrap();
+        assert_eq!(stored.run.status, SopRunStatus::Cancelled);
+        assert_eq!(store.claim_counts("det-cancel-mid-step").unwrap(), (0, 0));
+        assert!(!owner.active_runs().contains_key(&run_id));
+    }
+
+    #[test]
+    fn cancel_during_the_final_capability_is_finished_by_the_driver() {
+        assert_cancel_during_a_capability_is_finished(2);
+    }
+
+    #[test]
+    fn cancel_during_a_capability_is_finished_at_the_next_dispatch_write() {
+        assert_cancel_during_a_capability_is_finished(3);
     }
 
     /// The late rejection was first seen on runs resumed through an approval
