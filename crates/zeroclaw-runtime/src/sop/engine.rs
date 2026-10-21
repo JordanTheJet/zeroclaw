@@ -10050,6 +10050,47 @@ mod tests {
         );
     }
 
+    /// The stale check cannot read the stored record (here a damaged row). The
+    /// step result is refused rather than treated as current, so nothing is
+    /// recorded or handed out and the stored row is left as it was.
+    #[test]
+    fn unreadable_stored_record_fails_the_stale_check_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("runs.db");
+        let store: Arc<dyn SopRunStore> =
+            Arc::new(super::super::store::SqliteRunStore::open(&path).unwrap());
+        let sop = four_step_sop("unreadable");
+        let mut engine = engine_with_sops(vec![sop]).with_store(store.clone());
+        let action = engine.start_run("unreadable", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+        let damage = rusqlite::Connection::open(&path).unwrap();
+        damage
+            .execute(
+                "UPDATE sop_runs SET json = 'not a run' WHERE run_id = ?1",
+                rusqlite::params![run_id],
+            )
+            .unwrap();
+        let row = |conn: &rusqlite::Connection| -> (i64, String) {
+            conn.query_row(
+                "SELECT revision, json FROM sop_runs WHERE run_id = ?1",
+                rusqlite::params![run_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+        };
+        let before = row(&damage);
+
+        let advanced = engine.advance_step(&run_id, completed_step_result(1, "one"));
+        assert!(advanced.is_err(), "got {advanced:?}");
+        assert_eq!(row(&damage), before, "the stored row must be untouched");
+        let run = &engine.active_runs()[&run_id];
+        assert_eq!(run.current_step, 1);
+        assert!(
+            run.step_results.is_empty(),
+            "the result must not be recorded"
+        );
+    }
+
     /// A gate the owner already resolved must not time out from a stale
     /// engine's copy. The sweep adopts the stored record and skips the run.
     #[test]
