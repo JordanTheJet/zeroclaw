@@ -950,7 +950,7 @@ pub enum CacheTtl {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "providers.models"]
 pub struct ModelProviderConfig {
-    /// Secret API token for this model_provider. Grab it from the model_provider's dashboard (OpenAI platform, Anthropic console, OpenRouter keys page, etc.). Stored via the OS keyring when possible; never commit it to config.toml directly.
+    /// Secret API token for this model_provider. Grab it from the model_provider's dashboard (OpenAI platform, Anthropic console, OpenRouter keys page, etc.). Stored encrypted in config.toml, with the key in `.secret_key` beside it (plaintext if `secrets.encrypt = false`). Set it with `zeroclaw config set` rather than pasting it into the file, and keep `.secret_key` out of version control.
     #[secret]
     #[credential_class = "encrypted_secret"]
     #[tab(Connection)]
@@ -44366,6 +44366,13 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
 
         let email = crate::scattered_types::EmailConfig::default().prop_fields();
         assert_description(&email, ".observer_mode", "never modifies any IMAP flag");
+
+        let model_provider = ModelProviderConfig::default().prop_fields();
+        assert_description(
+            &model_provider,
+            ".api_key",
+            "stored encrypted in config.toml",
+        );
     }
 
     #[test]

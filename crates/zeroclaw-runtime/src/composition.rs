@@ -572,13 +572,14 @@ pub(crate) mod test_support {
         }
     }
 
-    // The peripheral trap serves the Unix-only construction-trap tests.
+    // The peripheral trap serves the Unix-only construction-trap tests and
+    // the plugin late-name test.
 
     /// Description of every tool the peripheral trap factory builds.
-    #[cfg(unix)]
+    #[cfg(any(unix, feature = "plugins-wasm-cranelift"))]
     pub(crate) const PERIPHERAL_TRAP_TOOL: &str = "native peripheral trap tool";
 
-    #[cfg(unix)]
+    #[cfg(any(unix, feature = "plugins-wasm-cranelift"))]
     static PERIPHERAL_TRAP_LOADS: std::sync::LazyLock<
         Mutex<std::collections::HashMap<String, usize>>,
     > = std::sync::LazyLock::new(Default::default);
@@ -587,7 +588,7 @@ pub(crate) mod test_support {
     /// of a board named `native-trap-*` and, for a board named
     /// `native-trap-tool-<name>`, builds one tool called `<name>`. Other
     /// boards get nothing, so tests that do not use trap boards see no change.
-    #[cfg(unix)]
+    #[cfg(any(unix, feature = "plugins-wasm-cranelift"))]
     pub(crate) fn register_peripheral_trap() {
         static REGISTER: std::sync::Once = std::sync::Once::new();
         REGISTER.call_once(|| {
@@ -619,10 +620,10 @@ pub(crate) mod test_support {
             .unwrap_or(0)
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, feature = "plugins-wasm-cranelift"))]
     struct PeripheralTrapTool(String);
 
-    #[cfg(unix)]
+    #[cfg(any(unix, feature = "plugins-wasm-cranelift"))]
     impl zeroclaw_api::attribution::Attributable for PeripheralTrapTool {
         fn role(&self) -> zeroclaw_api::attribution::Role {
             zeroclaw_api::attribution::Role::Tool(zeroclaw_api::attribution::ToolKind::Plugin)
@@ -632,7 +633,7 @@ pub(crate) mod test_support {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, feature = "plugins-wasm-cranelift"))]
     #[async_trait]
     impl Tool for PeripheralTrapTool {
         fn name(&self) -> &str {

@@ -725,6 +725,27 @@ impl ScopedToolRegistry {
                 delegate_tool: _,
         } = built;
 
+        // 1. Peripherals. Loading CONNECTS hardware (serial opens are exclusive for
+        //    real devices), so this is gated: execution surfaces pass
+        //    `connect_peripherals: true`; listing-only surfaces pass `false` and
+        //    enumerate without holding devices. They are loaded before guest
+        //    names are settled and registered after the guests.
+        let peripheral_tools = if connect_peripherals {
+            let peripheral_tools = load_peripheral_tools(config.peripherals.clone()).await;
+            if emit_assembly_logs && !peripheral_tools.is_empty() {
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Load)
+                        .with_category(::zeroclaw_log::EventCategory::Tool)
+                        .with_attrs(::serde_json::json!({"count": peripheral_tools.len()})),
+                    "Peripheral tools added"
+                );
+            }
+            peripheral_tools
+        } else {
+            Vec::new()
+        };
+
         // Builtin declarations own their names independently of whether the
         // current selection constructed them. Prebuilt inputs also retain the
         // canonical deferred/context-withdrawn owners.
@@ -746,6 +767,17 @@ impl ScopedToolRegistry {
                 .map(|(tool, _, _, _)| tool.name().to_string()),
         );
         tools::reserve_deferred_host_names(config, &mut host_tool_names);
+        // Peripheral and skill tools register after the guests, so the plugin
+        // loader cannot see their names. A skill tool's composed name loses its
+        // `__` separator when it is shortened, so the MCP-namespace refusal does
+        // not always cover it. Source tools give way to these names too.
+        host_tool_names.extend(peripheral_tools.iter().map(|tool| tool.name().to_string()));
+        host_tool_names.extend(skills.iter().flat_map(|skill| {
+            skill
+                .tools
+                .iter()
+                .map(|tool| tools::skill_tool::composed_tool_name(&skill.name, &tool.name))
+        }));
         tools_registry.retain(|(tool, supplied, _, _)| {
             let taken = *supplied && host_tool_names.contains(tool.name());
             if taken {
@@ -753,11 +785,22 @@ impl ScopedToolRegistry {
             }
             !taken
         });
-        tools_registry.extend(
-            plugin_tools
-                .into_iter()
-                .filter(|(tool, _, _, _)| !host_tool_names.contains(tool.name())),
-        );
+        tools_registry.extend(plugin_tools.into_iter().filter(|(tool, _, _, _)| {
+            let taken = host_tool_names.contains(tool.name());
+            if taken && emit_assembly_logs {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Load)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "tool": tool.name(),
+                            "error_key": "plugin_tool_name_conflict",
+                        })),
+                    "Plugin tool conflicts with a host tool"
+                );
+            }
+            !taken
+        }));
         unfiltered_tool_arcs
             .retain(|tool| !is_guest(tool.as_ref()) || !host_tool_names.contains(tool.name()));
         if let Some(parent) = delegate_handle.as_ref() {
@@ -773,38 +816,12 @@ impl ScopedToolRegistry {
             .map(|(tool, _, _, _)| tool.name().to_string())
             .collect();
 
-        // 1. Peripherals. Loading CONNECTS hardware (serial opens are exclusive for
-        //    real devices), so this is gated: execution surfaces pass
-        //    `connect_peripherals: true`; listing-only surfaces pass `false` and
-        //    enumerate without holding devices.
-        if connect_peripherals {
-            let peripheral_tools = load_peripheral_tools(config.peripherals.clone()).await;
-            if emit_assembly_logs && !peripheral_tools.is_empty() {
-                ::zeroclaw_log::record!(
-                    INFO,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Load)
-                        .with_category(::zeroclaw_log::EventCategory::Tool)
-                        .with_attrs(::serde_json::json!({"count": peripheral_tools.len()})),
-                    "Peripheral tools added"
-                );
-            }
-            // Peripheral tools are native, so a source tool with the same name
-            // gives way here, as it does to every other native creator.
-            let peripheral_names: HashSet<&str> =
-                peripheral_tools.iter().map(|tool| tool.name()).collect();
-            tools_registry.retain(|(tool, supplied, _, _)| {
-                let taken = *supplied && peripheral_names.contains(tool.name());
-                if taken {
-                    log_retired_source_tool(tool.name(), "peripheral");
-                }
-                !taken
-            });
-            tools_registry.extend(
-                peripheral_tools
-                    .into_iter()
-                    .map(|tool| (tool, false, None, None)),
-            );
-        }
+        // Peripheral tools follow the guests and stay out of the views built above.
+        tools_registry.extend(
+            peripheral_tools
+                .into_iter()
+                .map(|tool| (tool, false, None, None)),
+        );
 
         let mut tools_registry = BuildRegistry {
             entries: tools_registry
@@ -1333,16 +1350,6 @@ impl ScopedToolRegistry {
                 5,
                 skill_tools.len(),
             );
-            // Skill tools are native too: a source tool that takes a prepared
-            // skill tool's name gives way before the snapshot below.
-            let skill_names: HashSet<String> = skill_tools
-                .iter()
-                .map(|tool| match tool {
-                    PreparedSkill::Ready(tool) => tool.name().to_string(),
-                    PreparedSkill::Elevated { prepared, .. } => prepared.tool_name.clone(),
-                })
-                .collect();
-            tools_registry.retire_supplied_names(&skill_names, "skill");
             // The complete batch is prepared before the one fixed snapshot.
             let existing_names = tools_registry
                 .iter()
