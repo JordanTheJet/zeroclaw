@@ -700,6 +700,7 @@ cli-quickstart-auth-anthropic-skip-hint = {"  "}Finish later with: claude setup-
 cli-quickstart-auth-failed = {"  "}Auth setup didn't complete: {$error}
 cli-quickstart-model-field-missing-warning = WARN: schema produced no `model` field for `{$provider}` — falling back to manual entry. Please report this.
 cli-quickstart-model-id-for = Model id for {$name}
+cli-quickstart-model-type-id = Type a model ID…
 cli-quickstart-risk-profile-prompt = Risk profile
 cli-quickstart-memory-backend-prompt = Memory backend
 cli-quickstart-add-channel = + Add a channel
@@ -831,7 +832,6 @@ cli-quickstart-plugins-missing-row = {$name} has no config entry, so Quickstart 
 cli-quickstart-plugins-row-skipped = {$name} stays installed without a config entry, so it reaches no network destination. To create the entry later, without network access, run: {$command}
 cli-quickstart-plugins-grant-declared-later = To let {$name} reach its {$count} declared destination(s), also run this after creating the entry: {$command}
 cli-quickstart-plugins-no-declared-hosts = {$name} requests network access but declares no destinations, so its config entry grants none. To grant the hosts your deployment uses, append them to this command as one comma-separated value: {$command}
-cli-quickstart-plugins-declared-hosts-not-granted = {$name} declares these destinations: {$hosts}. Quickstart offers to grant declared destinations only to plugins that request http_client, so its config entry grants none of them. To grant them, run: {$command}
 cli-quickstart-plugins-activation-heading = Activating plugins turns on {$settings}, which activates:
 cli-quickstart-plugins-activation-tool = tool plugin {$name}
 cli-quickstart-plugins-activation-skill = skill plugin {$name}
@@ -909,6 +909,11 @@ cli-security-status-autonomy = Autonomy:   {$v}
 cli-security-status-approvals = Approvals:  medium-risk approval required: {$medium}, high-risk commands blocked: {$high}
 cli-security-status-sandbox = Sandbox:    requested {$requested}, active {$active} ({$description})
 cli-security-status-sandbox-description-docker-runtime = Docker runtime container isolation (runtime.kind = "docker"; no additional sandbox wrapper)
+cli-security-status-sandbox-description-firejail-args-rejected = Firejail selected, but firejail_args were rejected; commands are blocked ({$reason})
+cli-security-firejail-args-error-empty = firejail_args rejected: an entry is empty
+cli-security-firejail-args-error-whitespace = firejail_args rejected: {$arg} has leading or trailing whitespace
+cli-security-firejail-args-error-not-option = firejail_args rejected: {$arg} is not a Firejail option; write each option as one `--option` or `--option=value` entry
+cli-security-firejail-args-error-conflict = firejail_args rejected: {$name} conflicts with the options ZeroClaw's Firejail wrapper sets
 cli-security-status-workspace = Workspace:  {$dir}; workspace-only: {$workspace_only}; rw roots: {$read_write_roots}; read-only roots: {$read_only_roots}; write-only roots: {$write_only_roots}; env passthrough: {$env_passthrough}
 cli-security-status-credentials = Credentials: encryption: {$encryption}; secrets set: {$secrets_set}/{$secrets_total}; classified fields: {$classified_total}; classes: {$classification_summary}
 cli-security-status-credentials-classes-none = none
