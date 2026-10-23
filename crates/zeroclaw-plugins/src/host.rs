@@ -603,7 +603,10 @@ impl PluginHost {
     /// same name, whether an install or an update left them, are cleared once
     /// no process holds their leases. A stage whose lease is held is left
     /// alone, as is a legacy PID-named stage, whose owner cannot be proved,
-    /// and a stage that cannot be cleared is skipped.
+    /// and a stage that cannot be cleared is skipped. A source inside one of
+    /// that name's stages is refused before any is cleared, as
+    /// [`PluginError::SourceInStage`]: its `skills/` tree is still to be
+    /// copied, and clearing the stage would delete it.
     pub fn install_admitted(&mut self, admitted: AdmittedSource) -> Result<String, PluginError> {
         let AdmittedSource {
             manifest,
@@ -636,6 +639,15 @@ impl PluginHost {
                     },
                 });
             }
+        }
+        // Admission kept the manifest and component, but `skills/` is still
+        // copied from the source. A source inside a stage of this name, such
+        // as the package a failed install reports keeping, would be deleted by
+        // the sweep below before that copy, so the install refuses first.
+        if let Some(stage) = self.stage_holding(root, &manifest.name, &source_dir)? {
+            return Err(PluginError::SourceInStage {
+                path: stage.display().to_string(),
+            });
         }
         // The abandoned `installing` stages of this name, whether an install
         // or an update left them, are cleared first, as `remove` clears them:
@@ -1099,6 +1111,41 @@ impl PluginHost {
             }
         }
         Ok(retained)
+    }
+
+    /// The `installing` stage of `name` that `source_dir` lies in, if one
+    /// does. Compared by directory identity, not spelling, so a source reached
+    /// through a symlink, a `..`, or another path to the plugins directory is
+    /// still found in its stage. The source is resolved only when the name has
+    /// a stage.
+    fn stage_holding(
+        &self,
+        root: &recovery::Root,
+        name: &str,
+        source_dir: &Path,
+    ) -> Result<Option<PathBuf>, PluginError> {
+        let mut stages = Vec::new();
+        for entry in root.dir.entries()? {
+            let entry_name = entry?.file_name();
+            if let Some(entry_name) = entry_name.to_str()
+                && recovery::is_transaction(entry_name, name, "installing")
+            {
+                stages.push(self.plugins_dir.join(entry_name));
+            }
+        }
+        if stages.is_empty() {
+            return Ok(None);
+        }
+        let holders = std::fs::canonicalize(source_dir)?
+            .ancestors()
+            .map(directory_identity)
+            .collect::<std::io::Result<Vec<_>>>()?;
+        for stage in stages {
+            if holders.contains(&directory_identity(&stage)?) {
+                return Ok(Some(stage));
+            }
+        }
+        Ok(None)
     }
 
     /// Clear `entry` if it is an abandoned leased stage of `name`. Returns
@@ -2685,6 +2732,7 @@ fn is_structural_admission_failure(error: &PluginError) -> bool {
         | PluginError::ReplacementInterrupted { .. }
         | PluginError::MoveUnsupported(_)
         | PluginError::MoveUnsupportedCleanup { .. }
+        | PluginError::SourceInStage { .. }
         | PluginError::InvalidConfig(_)
         | PluginError::InvalidInstanceId(_)
         | PluginError::InvalidEndpoint(_)
@@ -4755,6 +4803,157 @@ capabilities = ["tool"]
         assert_eq!(hidden_entries(plugins.path()), [live.entry.as_str()]);
         assert_eq!(live.dir.read("package/bytes").unwrap(), b"live stage");
         drop(live);
+    }
+
+    /// Leave an abandoned `installing` stage of `name` holding a whole skill
+    /// package, as an install stopped before publishing leaves one, and
+    /// return its entry and package path.
+    fn abandon_skill_stage(host: &PluginHost, name: &str) -> (String, PathBuf) {
+        let source = tempdir().unwrap();
+        write_skill_bundle_plugin(source.path(), name, &["alpha"]);
+        let tx = host
+            .root()
+            .unwrap()
+            .transaction(name, "installing")
+            .unwrap();
+        let package = host.plugins_dir().join(&tx.entry).join(recovery::PACKAGE);
+        copy_dir_recursive(&source.path().join(name), &package).unwrap();
+        (tx.entry.clone(), package)
+    }
+
+    /// A failed publication keeps the staged package and reports its path.
+    /// Installing a skill package from that path refuses before the sweep
+    /// clears anything, so the stage keeps the `skills/` tree admission did
+    /// not retain, and so does another abandoned stage of the name. A copy
+    /// taken out of the stage installs, and that install clears both stages.
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    #[test]
+    fn an_install_from_the_stage_a_failed_install_kept_refuses_and_keeps_it() {
+        struct Reset(Option<rustix::io::Errno>);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                recovery::FORCE_RENAME_ERROR.with(|error| error.set(self.0));
+            }
+        }
+        let plugins = tempdir().unwrap();
+        let mut host = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+        let source = tempdir().unwrap();
+        write_skill_bundle_plugin(source.path(), "notes", &["alpha"]);
+        let reset = Reset(
+            recovery::FORCE_RENAME_ERROR
+                .with(|error| error.replace(Some(rustix::io::Errno::EXIST))),
+        );
+        let kept = match host.install(source.path().join("notes").to_str().unwrap()) {
+            Err(PluginError::RecoveryRetained { path, .. }) => PathBuf::from(path),
+            other => panic!("a failed publication keeps its stage: {other:?}"),
+        };
+        drop(reset);
+        let stage = kept.parent().unwrap().to_path_buf();
+        let staged = nested_package_bytes(&kept);
+        assert!(
+            staged
+                .iter()
+                .any(|(path, _)| path == Path::new("skills/alpha/SKILL.md")),
+            "{staged:?}"
+        );
+        let (other, other_package) = abandon_transaction(&host, "notes", "installing");
+        let other_bytes = package_bytes(&other_package);
+        let mut stages = vec![
+            stage.file_name().unwrap().to_str().unwrap().to_string(),
+            other,
+        ];
+        stages.sort();
+
+        let err = host
+            .install(kept.to_str().unwrap())
+            .expect_err("the source is inside a stage the sweep would clear");
+
+        assert!(
+            matches!(&err, PluginError::SourceInStage { path } if Path::new(path) == stage),
+            "{err}"
+        );
+        assert_eq!(hidden_entries(plugins.path()), stages);
+        assert_eq!(nested_package_bytes(&kept), staged);
+        assert_eq!(package_bytes(&other_package), other_bytes);
+        assert!(!plugins.path().join("notes").exists());
+
+        let copy = tempdir().unwrap();
+        copy_dir_recursive(&kept, copy.path()).unwrap();
+        assert_eq!(
+            host.install(copy.path().to_str().unwrap()).unwrap(),
+            "notes"
+        );
+        assert!(hidden_entries(plugins.path()).is_empty());
+        assert_eq!(nested_package_bytes(&plugins.path().join("notes")), staged);
+    }
+
+    /// The source is matched to its stage by identity, not spelling: a
+    /// trailing separator, a `.`, a `..` through the plugins directory's own
+    /// name, the manifest's path, a symlink to the staged package, and the
+    /// stage reached through a symlinked plugins directory each name it, and
+    /// each install refuses and leaves the stage as it was.
+    #[test]
+    fn an_install_refuses_a_source_in_its_stage_however_the_path_is_spelled() {
+        let plugins = tempdir().unwrap();
+        let mut host = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+        let (entry, package) = abandon_skill_stage(&host, "notes");
+        let staged = nested_package_bytes(&package);
+        let stage = plugins.path().join(&entry);
+        let mut refuses = |source: &Path| {
+            let err = host
+                .install(source.to_str().unwrap())
+                .expect_err("the source is inside a stage the sweep would clear");
+            assert!(
+                matches!(&err, PluginError::SourceInStage { path } if Path::new(path) == stage),
+                "{}: {err}",
+                source.display()
+            );
+            assert_eq!(
+                hidden_entries(plugins.path()),
+                [entry.as_str()],
+                "{}",
+                source.display()
+            );
+            assert_eq!(
+                nested_package_bytes(&package),
+                staged,
+                "{}",
+                source.display()
+            );
+        };
+
+        refuses(&PathBuf::from(format!(
+            "{}{}",
+            package.display(),
+            std::path::MAIN_SEPARATOR
+        )));
+        refuses(
+            &plugins
+                .path()
+                .join(".")
+                .join(&entry)
+                .join(recovery::PACKAGE),
+        );
+        refuses(
+            &plugins
+                .path()
+                .join("..")
+                .join(plugins.path().file_name().unwrap())
+                .join(&entry)
+                .join(recovery::PACKAGE),
+        );
+        refuses(&package.join("manifest.toml"));
+        #[cfg(unix)]
+        {
+            let links = tempdir().unwrap();
+            let linked_package = links.path().join("package");
+            std::os::unix::fs::symlink(&package, &linked_package).unwrap();
+            refuses(&linked_package);
+            let linked_plugins = links.path().join("plugins");
+            std::os::unix::fs::symlink(plugins.path(), &linked_plugins).unwrap();
+            refuses(&linked_plugins.join(&entry).join(recovery::PACKAGE));
+        }
+        assert!(!plugins.path().join("notes").exists());
     }
 
     /// Sorted names of every entry in `dir`, hidden ones included.

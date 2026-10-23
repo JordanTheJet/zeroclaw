@@ -197,7 +197,10 @@ the incomplete final package is recovered. If no final package exists,
 delete that an earlier `plugin remove` had begun. An install stopped before it
 published its package leaves only such a stage, and the next `plugin install`
 of that name clears it before staging its own. Active and legacy stages are
-left as they are.
+left as they are. An install whose source is inside one of that name's stages,
+such as the staged copy a failed install reports keeping, is refused before
+anything is cleared, whatever path names the source. To install that copy,
+copy the package out of the stage first and install from the copy.
 
 Other occupants are refused, and the command prints why: a symlink or a
 file at the name, a directory that holds files but no `manifest.toml`, one

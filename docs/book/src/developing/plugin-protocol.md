@@ -1142,7 +1142,10 @@ PID as ownership evidence. Recovery cleans an abandoned protocol stage only
 while recovering an actual final package, or while finishing the delete of one
 an earlier remove had judged. An install cleans the abandoned protocol stages
 of the package it installs before it stages its own, skipping any it cannot
-clear. Legacy PID-only stages without proof of abandonment are retained, and
+clear. It first refuses a source that lies inside one of that package's
+stages, compared by directory identity rather than path spelling, because the
+source's `skills/` tree is copied after the clean; nothing is cleaned then.
+Legacy PID-only stages without proof of abandonment are retained, and
 `plugin remove` prints their paths; they do not prevent a new install from
 using fresh staging.
 
