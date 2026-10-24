@@ -652,7 +652,7 @@ fn owner_refusal(path: &Path, owner_uid: u32, euid: u32, dir: OwnedDir) -> Strin
     let command = remedy_command(
         &format!(
             "sudo chown -R {}",
-            crate::tools::coding_cli_executor::shell_escape(std::ffi::OsStr::new(&chown_to))
+            crate::util::shell_escape(std::ffi::OsStr::new(&chown_to))
         ),
         path,
     );
@@ -717,10 +717,7 @@ fn lock_dir_creation_error(
 
 #[cfg(unix)]
 fn remedy_command(command: &str, path: &Path) -> String {
-    format!(
-        "{command} {}",
-        crate::tools::coding_cli_executor::shell_escape(path.as_os_str())
-    )
+    format!("{command} {}", crate::util::shell_escape(path.as_os_str()))
 }
 
 /// The account name for `uid`, when the user database has one.
@@ -1906,7 +1903,7 @@ mod tests {
                 .expect_err("a lifecycle dir other users can write must be refused")
                 .to_string();
 
-            let quoted = crate::tools::coding_cli_executor::shell_escape(lock_dir.as_os_str());
+            let quoted = crate::util::shell_escape(lock_dir.as_os_str());
             assert!(
                 quoted.starts_with('\''),
                 "the path with a space must be quoted"
@@ -1954,10 +1951,7 @@ mod tests {
             .expect_err("a symlinked lifecycle dir must be refused")
             .to_string();
 
-        let command = format!(
-            "rm {}",
-            crate::tools::coding_cli_executor::shell_escape(lock_dir.as_os_str())
-        );
+        let command = format!("rm {}", crate::util::shell_escape(lock_dir.as_os_str()));
         assert!(error.contains(&command), "missing `{command}`: {error}");
         assert_copyable(&error);
         assert!(!elsewhere.path().join(LIFECYCLE_LOCK_FILE).exists());
@@ -2006,7 +2000,7 @@ mod tests {
         let owned = regular_user_dir(&temp);
         let owner_uid = owned.uid();
         let euid = owner_uid + 1;
-        let quoted = crate::tools::coding_cli_executor::shell_escape(lock_dir.as_os_str());
+        let quoted = crate::util::shell_escape(lock_dir.as_os_str());
 
         let error = check_lock_dir(&lock_dir, &owned, euid)
             .expect_err("a lifecycle dir owned by another user must be refused")
@@ -2016,7 +2010,7 @@ mod tests {
         let chown_to = user_name(euid).unwrap_or_else(|| euid.to_string());
         let chown = format!(
             "sudo chown -R {} {quoted}",
-            crate::tools::coding_cli_executor::shell_escape(std::ffi::OsStr::new(&chown_to))
+            crate::util::shell_escape(std::ffi::OsStr::new(&chown_to))
         );
         let run_as = format!("Otherwise run ZeroClaw as {owner}.");
         let chown_at = error
@@ -2105,7 +2099,7 @@ mod tests {
         let user = user_name(euid).unwrap_or_else(|| euid.to_string());
         let chown = format!(
             "sudo chown -R {} /",
-            crate::tools::coding_cli_executor::shell_escape(std::ffi::OsStr::new(&user))
+            crate::util::shell_escape(std::ffi::OsStr::new(&user))
         );
         assert!(error.contains(&chown), "missing `{chown}`: {error}");
         assert_sentence_follows(&error, &chown);
@@ -2253,8 +2247,8 @@ mod tests {
         let user = user_name(euid).unwrap_or_else(|| euid.to_string());
         let chown = format!(
             "sudo chown -R {} {}",
-            crate::tools::coding_cli_executor::shell_escape(std::ffi::OsStr::new(&user)),
-            crate::tools::coding_cli_executor::shell_escape(root_dir.as_os_str())
+            crate::util::shell_escape(std::ffi::OsStr::new(&user)),
+            crate::util::shell_escape(root_dir.as_os_str())
         );
         assert!(error.contains(&chown), "missing `{chown}`: {error}");
         assert_sentence_follows(&error, &chown);
@@ -2301,8 +2295,8 @@ mod tests {
         let user = user_name(euid).unwrap_or_else(|| euid.to_string());
         let chown = format!(
             "sudo chown -R {} {}",
-            crate::tools::coding_cli_executor::shell_escape(std::ffi::OsStr::new(&user)),
-            crate::tools::coding_cli_executor::shell_escape(resolved.as_os_str())
+            crate::util::shell_escape(std::ffi::OsStr::new(&user)),
+            crate::util::shell_escape(resolved.as_os_str())
         );
         assert!(error.contains(&chown), "missing `{chown}`: {error}");
         assert_copyable(&error);
@@ -2334,8 +2328,8 @@ mod tests {
         );
         let chown = format!(
             "sudo chown -R {} {}",
-            crate::tools::coding_cli_executor::shell_escape(std::ffi::OsStr::new(&chown_to)),
-            crate::tools::coding_cli_executor::shell_escape(data_dir.as_os_str())
+            crate::util::shell_escape(std::ffi::OsStr::new(&chown_to)),
+            crate::util::shell_escape(data_dir.as_os_str())
         );
         let position = |needle: &str| {
             error
