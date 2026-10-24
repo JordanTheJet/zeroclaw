@@ -589,6 +589,10 @@ cli-sop-logs-row = {$timestamp} {$severity} {$category}.{$action} {$message}
 cli-sop-logs-disabled = Log persistence is not enabled.
 cli-sop-logs-incomplete = Some retained log segments could not be read; this history may be incomplete.
 cli-sop-status-failure-reason = Failure reason: {$reason}
+cli-sop-run-copy-stale = Run {$run_id} changed in the store since this engine last read it (revision {$seen_revision} -> {$stored_revision}, now {$status} on step {$step}); this engine adopted the stored record and did not apply the transition
+cli-sop-run-copy-revision-unknown = unknown
+cli-sop-run-copy-changed = Run {$run_id} changed in the store since this engine last read it
+cli-sop-run-copy-reload-failed = Run {$run_id} changed in the store since this engine last read it, and reloading it failed: {$error}
 # gateway WebSocket SOP approval error frames (UI-surfaced)
 cli-sop-ws-invalid-approval = sop approval_response requires run_id and a decision of approve or deny
 cli-sop-ws-resolve-failed = sop resolve failed: {$error}
