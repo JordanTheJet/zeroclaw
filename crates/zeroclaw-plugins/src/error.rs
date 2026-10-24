@@ -1,5 +1,6 @@
 //! Plugin error types.
 
+use std::path::PathBuf;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -20,6 +21,18 @@ pub enum PluginError {
     /// `reason` says why.
     #[error("plugin recovery retained bytes at {path}: {reason}")]
     RecoveryRetained { path: String, reason: String },
+
+    /// An update claimed the installed package and could neither publish its
+    /// replacement nor put the claimed generation back. `preserved` holds that
+    /// generation, in a transaction whose lease is released on return, so
+    /// `PluginHost::recover_interrupted_update` can put it back, unless a
+    /// package of that name is installed by then.
+    #[error("plugin '{name}' was not replaced and its previous package could not be moved back ({cause}); it is preserved at {}", preserved.display())]
+    ReplacementInterrupted {
+        name: String,
+        preserved: PathBuf,
+        cause: String,
+    },
 
     /// The platform or filesystem has no rename that refuses an existing
     /// destination, so install removed the copy it staged and installed
