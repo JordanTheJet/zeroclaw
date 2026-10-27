@@ -5448,6 +5448,11 @@ permissions = ["http_client"]
         );
     }
 
+    /// Peripheral and skill tools register during assembly, after plugin
+    /// tools, so the loader cannot reserve their names. Assembly does: a guest
+    /// that declares a connected peripheral's tool name, or a skill tool's name
+    /// shortened past its `__` separator, is refused there and the host tool
+    /// keeps the name. The guest with an ordinary name is the control.
     #[cfg(feature = "plugins-wasm-cranelift")]
     #[tokio::test]
     async fn colliding_plugin_tools_taking_late_host_tool_names_are_refused_in_assembly() {
