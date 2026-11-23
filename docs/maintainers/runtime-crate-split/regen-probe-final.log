@@ -1,0 +1,56 @@
+base: e02b7fb6f feat(providers): add Cheaper Inference model provider (#11104)
+== 1. util -> zeroclaw-infra
+moved 1 files (319 lines) from zeroclaw-runtime to zeroclaw-infra, unedited
+  widened crates/zeroclaw-infra/src/util.rs:111  pub(crate) fn shell_escape(value: &std::ffi::OsStr) -> String {
+  1 edits; other error codes seen: none
+  check ok (round 2): errors: none  warnings: none  finished: ok  cargo warnings: 0
+== 2. redaction prep
+prep_redact: done (redaction owned by zeroclaw-providers::redact; old paths re-exported)
+  check ok (round 1): errors: none  warnings: none  finished: ok  cargo warnings: 0
+== 3. observability -> zeroclaw-observability
+moved 12 files (6190 lines) from zeroclaw-runtime to zeroclaw-observability, unedited
+  declared feature test-util in crates/zeroclaw-observability/Cargo.toml
+  enabled zeroclaw-observability/test-util from crates/zeroclaw-runtime dev-dependencies
+  widened crates/zeroclaw-observability/src/observability/mod.rs:436  test-util: pub(crate) static HOOK_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex:
+  1 edits; other error codes seen: none
+  check ok (round 2): errors: none  warnings: none  finished: ok  cargo warnings: 0
+== final checks on the finished stack (each must be clean)
+  cargo fmt --check: ok
+  workspace, all targets, with OTel: rc=0 errors: none  warnings: none  finished: ok  cargo warnings: 0
+  workspace, all targets, default features (CI row): rc=0 errors: none  warnings: none  finished: ok  cargo warnings: 0
+  workspace, no default features (CI row): rc=0 errors: none  warnings: none  finished: ok  cargo warnings: 0
+  zeroclaw-observability alone, no features: rc=0 errors: none  warnings: none  finished: ok  cargo warnings: 0
+  zeroclaw-observability alone, observability-prometheus: rc=0 errors: none  warnings: none  finished: ok  cargo warnings: 0
+  zeroclaw-observability alone, observability-otel: rc=0 errors: none  warnings: none  finished: ok  cargo warnings: 0
+  zeroclaw-observability alone, test-util: rc=0 errors: none  warnings: none  finished: ok  cargo warnings: 0
+  zeroclaw-observability alone, observability-otel,observability-prometheus,test-util: rc=0 errors: none  warnings: none  finished: ok  cargo warnings: 0
+  retained-dependency list: ok (17 entries)
+  every file in the stack that is not an exact rename:
+    M	Cargo.lock
+    M	Cargo.toml
+    M	crates/zeroclaw-infra/Cargo.toml
+    M	crates/zeroclaw-infra/src/lib.rs
+    R099	crates/zeroclaw-runtime/src/util.rs	crates/zeroclaw-infra/src/util.rs
+    A	crates/zeroclaw-observability/Cargo.toml
+    A	crates/zeroclaw-observability/src/lib.rs
+    R099	crates/zeroclaw-runtime/src/observability/mod.rs	crates/zeroclaw-observability/src/observability/mod.rs
+    R099	crates/zeroclaw-runtime/src/observability/otel.rs	crates/zeroclaw-observability/src/observability/otel.rs
+    M	crates/zeroclaw-providers/src/lib.rs
+    R086	crates/zeroclaw-runtime/src/agent/turn/redact.rs	crates/zeroclaw-providers/src/redact.rs
+    M	crates/zeroclaw-runtime/Cargo.toml
+    M	crates/zeroclaw-runtime/src/agent/loop_.rs
+    M	crates/zeroclaw-runtime/src/agent/turn/mod.rs
+    M	crates/zeroclaw-runtime/src/approval/mod.rs
+    M	crates/zeroclaw-runtime/src/hooks/builtin/webhook_audit.rs
+    M	crates/zeroclaw-runtime/src/lib.rs
+    M	tests/fixtures/runtime-composition-consumer/retained-dependencies.json
+regenerated and checked in 754s
+00f5528ae refactor(infra): move runtime util helpers into zeroclaw-infra
+ 5 files changed, 7 insertions(+), 2 deletions(-)
+d52aacbbd refactor(providers): give credential redaction one owner below the agent loop
+ 7 files changed, 54 insertions(+), 52 deletions(-)
+e238eba34 refactor(observability): extract observer backends into zeroclaw-observability
+ 19 files changed, 100 insertions(+), 6 deletions(-)
+ALL CHECKS PASSED
+DRIVER_EXIT:0
+ALLDONE

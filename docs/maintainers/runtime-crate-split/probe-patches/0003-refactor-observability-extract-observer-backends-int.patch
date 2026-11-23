@@ -1,0 +1,302 @@
+From e238eba3407d1845d4cc5ae2012eff4f092ea566 Mon Sep 17 00:00:00 2001
+From: runtime-detangle-probe <probe@localhost>
+Date: Sun, 22 Nov 2026 19:07:42 -0500
+Subject: [PATCH 3/3] refactor(observability): extract observer backends into
+ zeroclaw-observability
+
+---
+ Cargo.lock                                    | 28 +++++++++++++
+ Cargo.toml                                    |  3 +-
+ crates/zeroclaw-observability/Cargo.toml      | 42 +++++++++++++++++++
+ crates/zeroclaw-observability/src/lib.rs      | 17 ++++++++
+ .../src/observability/broadcast.rs            |  0
+ .../src/observability/log.rs                  |  0
+ .../src/observability/mod.rs                  |  4 +-
+ .../src/observability/multi.rs                |  0
+ .../src/observability/noop.rs                 |  0
+ .../src/observability/otel.rs                 |  0
+ .../src/observability/otel_config.rs          |  0
+ .../src/observability/otel_logs.rs            |  0
+ .../src/observability/prometheus.rs           |  0
+ .../src/observability/runtime_trace.rs        |  0
+ .../src/observability/traits.rs               |  0
+ .../src/observability/verbose.rs              |  0
+ crates/zeroclaw-runtime/Cargo.toml            |  6 ++-
+ crates/zeroclaw-runtime/src/lib.rs            |  2 +-
+ .../retained-dependencies.json                |  4 ++
+ 19 files changed, 100 insertions(+), 6 deletions(-)
+ create mode 100644 crates/zeroclaw-observability/Cargo.toml
+ create mode 100644 crates/zeroclaw-observability/src/lib.rs
+ rename crates/{zeroclaw-runtime => zeroclaw-observability}/src/observability/broadcast.rs (100%)
+ rename crates/{zeroclaw-runtime => zeroclaw-observability}/src/observability/log.rs (100%)
+ rename crates/{zeroclaw-runtime => zeroclaw-observability}/src/observability/mod.rs (99%)
+ rename crates/{zeroclaw-runtime => zeroclaw-observability}/src/observability/multi.rs (100%)
+ rename crates/{zeroclaw-runtime => zeroclaw-observability}/src/observability/noop.rs (100%)
+ rename crates/{zeroclaw-runtime => zeroclaw-observability}/src/observability/otel.rs (100%)
+ rename crates/{zeroclaw-runtime => zeroclaw-observability}/src/observability/otel_config.rs (100%)
+ rename crates/{zeroclaw-runtime => zeroclaw-observability}/src/observability/otel_logs.rs (100%)
+ rename crates/{zeroclaw-runtime => zeroclaw-observability}/src/observability/prometheus.rs (100%)
+ rename crates/{zeroclaw-runtime => zeroclaw-observability}/src/observability/runtime_trace.rs (100%)
+ rename crates/{zeroclaw-runtime => zeroclaw-observability}/src/observability/traits.rs (100%)
+ rename crates/{zeroclaw-runtime => zeroclaw-observability}/src/observability/verbose.rs (100%)
+
+diff --git a/Cargo.lock b/Cargo.lock
+index 8cc47dd10..59490257d 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -14377,6 +14377,33 @@ dependencies = [
+  "wit-bindgen 0.51.0",
+ ]
+ 
++[[package]]
++name = "zeroclaw-observability"
++version = "0.9.0"
++dependencies = [
++ "anyhow",
++ "async-trait",
++ "axum",
++ "chrono",
++ "opentelemetry",
++ "opentelemetry-otlp",
++ "opentelemetry-proto",
++ "opentelemetry_sdk",
++ "parking_lot",
++ "prometheus",
++ "prost",
++ "regex",
++ "serde_json",
++ "tokio",
++ "toml 1.1.2+spec-1.1.0",
++ "zeroclaw-api",
++ "zeroclaw-config",
++ "zeroclaw-infra",
++ "zeroclaw-log",
++ "zeroclaw-providers",
++ "zeroclaw-spawn",
++]
++
+ [[package]]
+ name = "zeroclaw-plugins"
+ version = "0.9.0"
+@@ -14576,6 +14603,7 @@ dependencies = [
+  "zeroclaw-log",
+  "zeroclaw-macros",
+  "zeroclaw-memory",
++ "zeroclaw-observability",
+  "zeroclaw-plugins",
+  "zeroclaw-providers",
+  "zeroclaw-relay-proto",
+diff --git a/Cargo.toml b/Cargo.toml
+index d5a78082a..c2f7a4634 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -1,5 +1,5 @@
+ [workspace]
+-members = [".", "crates/zeroclaw-api", "crates/zeroclaw-buildinfo", "crates/zeroclaw-rpc-proto", "crates/zeroclaw-rpc-client", "crates/zeroclaw-infra", "crates/zeroclaw-config", "crates/zeroclaw-dist", "crates/zeroclaw-log", "crates/zeroclaw-log/tests/fixtures/attribution-macro-support", "crates/zeroclaw-log/tests/fixtures/attribution-macro-consumer", "crates/zeroclaw-tls", "crates/zeroclaw-relay-proto", "apps/zerorelay", "crates/zeroclaw-spawn", "crates/zeroclaw-commands", "crates/zeroclaw-providers", "crates/zeroclaw-memory", "crates/zeroclaw-channels", "crates/zeroclaw-tools", "crates/zeroclaw-sop-graph", "crates/zeroclaw-runtime", "crates/zeroclaw-eval", "apps/zerocode", "crates/zeroclaw-plugins", "crates/zeroclaw-plugins/tests/fixtures/channel-fixture", "crates/zeroclaw-plugins/tests/fixtures/channel-egress-fixture", "crates/zeroclaw-plugins/tests/fixtures/channel-websocket-fixture", "crates/zeroclaw-plugins/tests/fixtures/egress-fixture", "crates/zeroclaw-plugins/tests/fixtures/memory-fixture", "crates/zeroclaw-plugins/tests/fixtures/tool-fixture", "crates/zeroclaw-plugins/tests/fixtures/tool-timeout-fixture", "crates/zeroclaw-plugins/tests/fixtures/tool-sequential-fixture", "crates/zeroclaw-plugins/tests/fixtures/tool-secret-fixture", "crates/zeroclaw-plugins/tests/fixtures/tool-socket-fixture", "crates/zeroclaw-plugins/tests/fixtures/tool-websocket-fixture", "crates/zeroclaw-gateway", "crates/zeroclaw-hardware", "crates/zeroclaw-tool-call-parser", "crates/zeroclaw-macros", "apps/tauri", "tools/fill-translations", "xtask", "tests/fixtures/runtime-composition-consumer"]
++members = [".", "crates/zeroclaw-api", "crates/zeroclaw-buildinfo", "crates/zeroclaw-rpc-proto", "crates/zeroclaw-rpc-client", "crates/zeroclaw-infra", "crates/zeroclaw-config", "crates/zeroclaw-dist", "crates/zeroclaw-log", "crates/zeroclaw-log/tests/fixtures/attribution-macro-support", "crates/zeroclaw-log/tests/fixtures/attribution-macro-consumer", "crates/zeroclaw-tls", "crates/zeroclaw-relay-proto", "apps/zerorelay", "crates/zeroclaw-spawn", "crates/zeroclaw-commands", "crates/zeroclaw-providers", "crates/zeroclaw-memory", "crates/zeroclaw-channels", "crates/zeroclaw-tools", "crates/zeroclaw-sop-graph", "crates/zeroclaw-observability", "crates/zeroclaw-runtime", "crates/zeroclaw-eval", "apps/zerocode", "crates/zeroclaw-plugins", "crates/zeroclaw-plugins/tests/fixtures/channel-fixture", "crates/zeroclaw-plugins/tests/fixtures/channel-egress-fixture", "crates/zeroclaw-plugins/tests/fixtures/channel-websocket-fixture", "crates/zeroclaw-plugins/tests/fixtures/egress-fixture", "crates/zeroclaw-plugins/tests/fixtures/memory-fixture", "crates/zeroclaw-plugins/tests/fixtures/tool-fixture", "crates/zeroclaw-plugins/tests/fixtures/tool-timeout-fixture", "crates/zeroclaw-plugins/tests/fixtures/tool-sequential-fixture", "crates/zeroclaw-plugins/tests/fixtures/tool-secret-fixture", "crates/zeroclaw-plugins/tests/fixtures/tool-socket-fixture", "crates/zeroclaw-plugins/tests/fixtures/tool-websocket-fixture", "crates/zeroclaw-gateway", "crates/zeroclaw-hardware", "crates/zeroclaw-tool-call-parser", "crates/zeroclaw-macros", "apps/tauri", "tools/fill-translations", "xtask", "tests/fixtures/runtime-composition-consumer"]
+ exclude = ["vendor/crossterm-0.29.0"]
+ resolver = "2"
+ 
+@@ -30,6 +30,7 @@ zeroclaw-memory = { path = "crates/zeroclaw-memory", version = "0.9.0" }
+ zeroclaw-channels = { path = "crates/zeroclaw-channels", version = "0.9.0", default-features = false }
+ zeroclaw-tools = { path = "crates/zeroclaw-tools", version = "0.9.0" }
+ zeroclaw-sop-graph = { path = "crates/zeroclaw-sop-graph", version = "0.9.0", default-features = false }
++zeroclaw-observability = { path = "crates/zeroclaw-observability", version = "0.9.0" }
+ zeroclaw-runtime = { path = "crates/zeroclaw-runtime", version = "0.9.0", default-features = false }
+ zeroclaw-eval = { path = "crates/zeroclaw-eval", version = "0.9.0" }
+ zeroclaw-plugins = { path = "crates/zeroclaw-plugins", version = "0.9.0" }
+diff --git a/crates/zeroclaw-observability/Cargo.toml b/crates/zeroclaw-observability/Cargo.toml
+new file mode 100644
+index 000000000..269674c6f
+--- /dev/null
++++ b/crates/zeroclaw-observability/Cargo.toml
+@@ -0,0 +1,42 @@
++[package]
++name = "zeroclaw-observability"
++version.workspace = true
++edition.workspace = true
++license.workspace = true
++description = "Observer backends for ZeroClaw: log, verbose, Prometheus and OpenTelemetry export."
++repository.workspace = true
++homepage.workspace = true
++publish = true
++
++[dependencies]
++zeroclaw-api.workspace = true
++zeroclaw-config.workspace = true
++zeroclaw-log.workspace = true
++zeroclaw-providers.workspace = true
++anyhow = "1.0"
++async-trait = "0.1"
++chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
++parking_lot = "0.12"
++regex = "1.10"
++serde_json = { version = "1.0", default-features = false, features = ["std"] }
++tokio = { version = "1.50", default-features = false, features = ["rt-multi-thread", "macros", "time", "net", "io-util", "sync", "process", "io-std", "fs", "signal"] }
++prometheus = { version = "0.14", default-features = false, optional = true }
++opentelemetry = { version = "0.33", default-features = false, features = ["trace", "metrics", "logs"], optional = true }
++opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace", "metrics", "logs"], optional = true }
++opentelemetry-otlp = { version = "0.33", default-features = false, features = ["trace", "metrics", "logs", "http-proto", "reqwest-blocking-client", "reqwest-rustls"], optional = true }
++zeroclaw-infra.workspace = true
++
++[features]
++# Test-only helpers for OTHER crates' test builds; no production edge enables it.
++test-util = []
++observability-otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp"]
++observability-prometheus = ["dep:prometheus"]
++
++[dev-dependencies]
++zeroclaw-spawn.workspace = true
++toml = "1.0"
++opentelemetry-proto = { version = "0.33", default-features = false, features = ["gen-tonic-messages", "logs"] }
++prost = { version = "0.14", default-features = false, features = ["derive"] }
++axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
++tokio = { version = "1.50", features = ["rt-multi-thread", "macros", "test-util"] }
++zeroclaw-config = { workspace = true, features = ["test-helpers"] }
+diff --git a/crates/zeroclaw-observability/src/lib.rs b/crates/zeroclaw-observability/src/lib.rs
+new file mode 100644
+index 000000000..b9be9c854
+--- /dev/null
++++ b/crates/zeroclaw-observability/src/lib.rs
+@@ -0,0 +1,17 @@
++#![allow(
++    clippy::to_string_in_format_args,
++    clippy::useless_format,
++    clippy::manual_inspect
++)]
++//! Observer backends for ZeroClaw: log, verbose, Prometheus and OpenTelemetry export.
++//!
++//! Extracted from `zeroclaw-runtime`. Each module keeps its original name here, and
++//! `zeroclaw-runtime` re-exports it, so existing `zeroclaw_runtime::<module>` paths are unchanged.
++
++pub mod observability;
++
++// The moved files keep their original `crate::<module>` paths; these aliases point
++// them at the crate that owns that module now.
++// Each alias carries the same feature gate as the files that use it.
++#[cfg(feature = "observability-otel")]
++pub(crate) use zeroclaw_infra::util;
+diff --git a/crates/zeroclaw-runtime/src/observability/broadcast.rs b/crates/zeroclaw-observability/src/observability/broadcast.rs
+similarity index 100%
+rename from crates/zeroclaw-runtime/src/observability/broadcast.rs
+rename to crates/zeroclaw-observability/src/observability/broadcast.rs
+diff --git a/crates/zeroclaw-runtime/src/observability/log.rs b/crates/zeroclaw-observability/src/observability/log.rs
+similarity index 100%
+rename from crates/zeroclaw-runtime/src/observability/log.rs
+rename to crates/zeroclaw-observability/src/observability/log.rs
+diff --git a/crates/zeroclaw-runtime/src/observability/mod.rs b/crates/zeroclaw-observability/src/observability/mod.rs
+similarity index 99%
+rename from crates/zeroclaw-runtime/src/observability/mod.rs
+rename to crates/zeroclaw-observability/src/observability/mod.rs
+index 2205541f1..7274306dd 100644
+--- a/crates/zeroclaw-runtime/src/observability/mod.rs
++++ b/crates/zeroclaw-observability/src/observability/mod.rs
+@@ -432,8 +432,8 @@ fn create_primary_observer(config: &ObservabilityConfig) -> Box<dyn Observer> {
+ /// `parking_lot`) so async tests can hold the guard across the `.await` on
+ /// `run()` without tripping `clippy::await_holding_lock`; plain `#[test]`s
+ /// use [`tokio::sync::Mutex::blocking_lock`].
+-#[cfg(test)]
+-pub(crate) static HOOK_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
++#[cfg(any(test, feature = "test-util"))]
++pub static HOOK_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+ 
+ #[cfg(test)]
+ mod tests {
+diff --git a/crates/zeroclaw-runtime/src/observability/multi.rs b/crates/zeroclaw-observability/src/observability/multi.rs
+similarity index 100%
+rename from crates/zeroclaw-runtime/src/observability/multi.rs
+rename to crates/zeroclaw-observability/src/observability/multi.rs
+diff --git a/crates/zeroclaw-runtime/src/observability/noop.rs b/crates/zeroclaw-observability/src/observability/noop.rs
+similarity index 100%
+rename from crates/zeroclaw-runtime/src/observability/noop.rs
+rename to crates/zeroclaw-observability/src/observability/noop.rs
+diff --git a/crates/zeroclaw-runtime/src/observability/otel.rs b/crates/zeroclaw-observability/src/observability/otel.rs
+similarity index 100%
+rename from crates/zeroclaw-runtime/src/observability/otel.rs
+rename to crates/zeroclaw-observability/src/observability/otel.rs
+diff --git a/crates/zeroclaw-runtime/src/observability/otel_config.rs b/crates/zeroclaw-observability/src/observability/otel_config.rs
+similarity index 100%
+rename from crates/zeroclaw-runtime/src/observability/otel_config.rs
+rename to crates/zeroclaw-observability/src/observability/otel_config.rs
+diff --git a/crates/zeroclaw-runtime/src/observability/otel_logs.rs b/crates/zeroclaw-observability/src/observability/otel_logs.rs
+similarity index 100%
+rename from crates/zeroclaw-runtime/src/observability/otel_logs.rs
+rename to crates/zeroclaw-observability/src/observability/otel_logs.rs
+diff --git a/crates/zeroclaw-runtime/src/observability/prometheus.rs b/crates/zeroclaw-observability/src/observability/prometheus.rs
+similarity index 100%
+rename from crates/zeroclaw-runtime/src/observability/prometheus.rs
+rename to crates/zeroclaw-observability/src/observability/prometheus.rs
+diff --git a/crates/zeroclaw-runtime/src/observability/runtime_trace.rs b/crates/zeroclaw-observability/src/observability/runtime_trace.rs
+similarity index 100%
+rename from crates/zeroclaw-runtime/src/observability/runtime_trace.rs
+rename to crates/zeroclaw-observability/src/observability/runtime_trace.rs
+diff --git a/crates/zeroclaw-runtime/src/observability/traits.rs b/crates/zeroclaw-observability/src/observability/traits.rs
+similarity index 100%
+rename from crates/zeroclaw-runtime/src/observability/traits.rs
+rename to crates/zeroclaw-observability/src/observability/traits.rs
+diff --git a/crates/zeroclaw-runtime/src/observability/verbose.rs b/crates/zeroclaw-observability/src/observability/verbose.rs
+similarity index 100%
+rename from crates/zeroclaw-runtime/src/observability/verbose.rs
+rename to crates/zeroclaw-observability/src/observability/verbose.rs
+diff --git a/crates/zeroclaw-runtime/Cargo.toml b/crates/zeroclaw-runtime/Cargo.toml
+index faadb6abf..74007b657 100644
+--- a/crates/zeroclaw-runtime/Cargo.toml
++++ b/crates/zeroclaw-runtime/Cargo.toml
+@@ -86,6 +86,7 @@ webpki-roots = "1.0.6"
+ which = "8.0"
+ zeroize = { version = "1.8", features = ["alloc"] }
+ zeroclaw-macros.workspace = true
++zeroclaw-observability.workspace = true
+ 
+ # Optional deps
+ prometheus = { version = "0.14", default-features = false, optional = true }
+@@ -106,8 +107,8 @@ process-wrap = { version = "=9.0.0", default-features = false, features = ["job-
+ 
+ [features]
+ default = ["observability-prometheus", "schema-export"]
+-observability-prometheus = ["dep:prometheus"]
+-observability-otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp"]
++observability-prometheus = ["dep:prometheus", "zeroclaw-observability/observability-prometheus"]
++observability-otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "zeroclaw-observability/observability-otel"]
+ sandbox-landlock = ["dep:landlock"]
+ schema-export = [
+     "dep:schemars",
+@@ -152,6 +153,7 @@ sandbox-bubblewrap = []
+ test-util = []
+ 
+ [dev-dependencies]
++zeroclaw-observability = { workspace = true, features = ["test-util"] }
+ opentelemetry-proto = { version = "0.33", default-features = false, features = ["gen-tonic-messages", "logs"] }
+ prost = { version = "0.14", default-features = false, features = ["derive"] }
+ axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+diff --git a/crates/zeroclaw-runtime/src/lib.rs b/crates/zeroclaw-runtime/src/lib.rs
+index 8e6290346..8b1caac37 100644
+--- a/crates/zeroclaw-runtime/src/lib.rs
++++ b/crates/zeroclaw-runtime/src/lib.rs
+@@ -31,7 +31,7 @@ pub mod heartbeat;
+ pub mod hooks;
+ pub mod i18n;
+ pub mod integrations;
+-pub mod observability;
++pub use zeroclaw_observability::observability;
+ pub mod peers;
+ pub mod platform;
+ pub mod plugin_runtime;
+diff --git a/tests/fixtures/runtime-composition-consumer/retained-dependencies.json b/tests/fixtures/runtime-composition-consumer/retained-dependencies.json
+index 95cbc1b34..50223abf8 100644
+--- a/tests/fixtures/runtime-composition-consumer/retained-dependencies.json
++++ b/tests/fixtures/runtime-composition-consumer/retained-dependencies.json
+@@ -61,6 +61,10 @@
+       "owner": "crates/zeroclaw-runtime/src/agent/turn/mod.rs",
+       "reason": "Canonical native/text tool-call parser used by the real engine."
+     },
++    "zeroclaw-observability": {
++      "owner": "crates/zeroclaw-runtime/src/lib.rs",
++      "reason": "Observer backends (log, verbose, Prometheus, OpenTelemetry) extracted from this crate; the runtime re-exports the module so existing zeroclaw_runtime::observability paths keep resolving."
++    },
+     "zeroclaw-macros": {
+       "owner": "crates/zeroclaw-runtime/src/lib.rs",
+       "reason": "Existing compile-time attribution/registration helpers used by runtime-owned agent and tools; no concrete adapter selection or runtime policy cache."
+-- 
+2.43.0
+

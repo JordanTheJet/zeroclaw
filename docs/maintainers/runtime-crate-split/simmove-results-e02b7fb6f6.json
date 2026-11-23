@@ -1,0 +1,285 @@
+{
+ "observability pure": {
+  "touching": 4,
+  "candidates": 25,
+  "clean_today": 6,
+  "newly_conflicting": 0,
+  "newly_conflicting_ready": 0,
+  "newly_conflicting_direct": 0,
+  "kinds": {},
+  "prs": []
+ },
+ "hooks pure": {
+  "touching": 9,
+  "candidates": 26,
+  "clean_today": 8,
+  "newly_conflicting": 0,
+  "newly_conflicting_ready": 0,
+  "newly_conflicting_direct": 0,
+  "kinds": {},
+  "prs": []
+ },
+ "cron pure": {
+  "touching": 35,
+  "candidates": 54,
+  "clean_today": 23,
+  "newly_conflicting": 0,
+  "newly_conflicting_ready": 0,
+  "newly_conflicting_direct": 0,
+  "kinds": {},
+  "prs": []
+ },
+ "sop pure": {
+  "touching": 42,
+  "candidates": 58,
+  "clean_today": 27,
+  "newly_conflicting": 1,
+  "newly_conflicting_ready": 1,
+  "newly_conflicting_direct": 1,
+  "kinds": {
+   "file location": 1
+  },
+  "prs": [
+   10391
+  ]
+ },
+ "security pure": {
+  "touching": 22,
+  "candidates": 43,
+  "clean_today": 15,
+  "newly_conflicting": 2,
+  "newly_conflicting_ready": 2,
+  "newly_conflicting_direct": 2,
+  "kinds": {
+   "file location": 2
+  },
+  "prs": [
+   11264,
+   11990
+  ]
+ },
+ "skills pure": {
+  "touching": 29,
+  "candidates": 46,
+  "clean_today": 23,
+  "newly_conflicting": 1,
+  "newly_conflicting_ready": 1,
+  "newly_conflicting_direct": 1,
+  "kinds": {
+   "rename/delete": 1
+  },
+  "prs": [
+   12615
+  ]
+ },
+ "daemon pure": {
+  "touching": 65,
+  "candidates": 70,
+  "clean_today": 23,
+  "newly_conflicting": 0,
+  "newly_conflicting_ready": 0,
+  "newly_conflicting_direct": 0,
+  "kinds": {},
+  "prs": []
+ },
+ "doctor pure": {
+  "touching": 10,
+  "candidates": 32,
+  "clean_today": 12,
+  "newly_conflicting": 0,
+  "newly_conflicting_ready": 0,
+  "newly_conflicting_direct": 0,
+  "kinds": {},
+  "prs": []
+ },
+ "quickstart pure": {
+  "touching": 13,
+  "candidates": 33,
+  "clean_today": 11,
+  "newly_conflicting": 0,
+  "newly_conflicting_ready": 0,
+  "newly_conflicting_direct": 0,
+  "kinds": {},
+  "prs": []
+ },
+ "control_plane pure": {
+  "touching": 16,
+  "candidates": 26,
+  "clean_today": 8,
+  "newly_conflicting": 2,
+  "newly_conflicting_ready": 0,
+  "newly_conflicting_direct": 2,
+  "kinds": {
+   "file location": 2
+  },
+  "prs": [
+   11881,
+   11882
+  ]
+ },
+ "rpc pure": {
+  "touching": 118,
+  "candidates": 119,
+  "clean_today": 58,
+  "newly_conflicting": 1,
+  "newly_conflicting_ready": 0,
+  "newly_conflicting_direct": 1,
+  "kinds": {
+   "file location": 1
+  },
+  "prs": [
+   11273
+  ]
+ },
+ "tools pure": {
+  "touching": 112,
+  "candidates": 117,
+  "clean_today": 66,
+  "newly_conflicting": 4,
+  "newly_conflicting_ready": 4,
+  "newly_conflicting_direct": 4,
+  "kinds": {
+   "file location": 4
+  },
+  "prs": [
+   10391,
+   11456,
+   11730,
+   12440
+  ]
+ },
+ "agent pure": {
+  "touching": 122,
+  "candidates": 130,
+  "clean_today": 83,
+  "newly_conflicting": 4,
+  "newly_conflicting_ready": 3,
+  "newly_conflicting_direct": 4,
+  "kinds": {
+   "file location": 4
+  },
+  "prs": [
+   10407,
+   12038,
+   12578,
+   12579
+  ]
+ },
+ "observability rewritten": {
+  "touching": 4,
+  "candidates": 25,
+  "clean_today": 6,
+  "newly_conflicting": 0,
+  "newly_conflicting_ready": 0,
+  "newly_conflicting_direct": 0,
+  "kinds": {},
+  "prs": []
+ },
+ "cron rewritten": {
+  "touching": 35,
+  "candidates": 54,
+  "clean_today": 23,
+  "newly_conflicting": 9,
+  "newly_conflicting_ready": 9,
+  "newly_conflicting_direct": 9,
+  "kinds": {
+   "content": 9
+  },
+  "prs": [
+   11441,
+   11644,
+   11910,
+   12240,
+   12271,
+   12450,
+   12452,
+   12453,
+   12511
+  ]
+ },
+ "sop rewritten": {
+  "touching": 42,
+  "candidates": 58,
+  "clean_today": 27,
+  "newly_conflicting": 12,
+  "newly_conflicting_ready": 12,
+  "newly_conflicting_direct": 12,
+  "kinds": {
+   "content": 11,
+   "file location": 1
+  },
+  "prs": [
+   10391,
+   12444,
+   12445,
+   12446,
+   12448,
+   12450,
+   12452,
+   12453,
+   12454,
+   12455,
+   12456,
+   12457
+  ]
+ },
+ "security rewritten": {
+  "touching": 22,
+  "candidates": 43,
+  "clean_today": 15,
+  "newly_conflicting": 2,
+  "newly_conflicting_ready": 2,
+  "newly_conflicting_direct": 2,
+  "kinds": {
+   "file location": 2
+  },
+  "prs": [
+   11264,
+   11990
+  ]
+ },
+ "locales+i18n pure": {
+  "touching": 140,
+  "candidates": 146,
+  "clean_today": 77,
+  "newly_conflicting": 0,
+  "newly_conflicting_ready": 0,
+  "newly_conflicting_direct": 0,
+  "kinds": {},
+  "prs": []
+ },
+ "whole crate rename": {
+  "touching": 345,
+  "candidates": 345,
+  "clean_today": 215,
+  "newly_conflicting": 20,
+  "newly_conflicting_ready": 12,
+  "newly_conflicting_direct": 20,
+  "kinds": {
+   "rename/delete": 1,
+   "file location": 19
+  },
+  "prs": [
+   9745,
+   10391,
+   10407,
+   11214,
+   11264,
+   11273,
+   11456,
+   11730,
+   11878,
+   11879,
+   11880,
+   11881,
+   11882,
+   11990,
+   12020,
+   12038,
+   12440,
+   12578,
+   12579,
+   12615
+  ]
+ }
+}

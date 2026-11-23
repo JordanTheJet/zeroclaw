@@ -1,0 +1,180 @@
+crate src: crates/zeroclaw-runtime/src
+files no mod declaration reaches (not counted): 3, 879 lines: platform/traits.rs, platform/wasm.rs, skills/symlink_tests.rs
+production lines: 160631   test lines: 284313
+nodes: 46   real edges: 124 (1304 refs)   passthrough-only refs: 115
+
+cycle groups (strongly connected components with >1 node): 3
+  13 nodes, 109688 prod lines: agent(29.9K), sop(24.1K), tools(21.5K), security(11.2K), skills(7.2K), cron(6.3K), observability(3.3K), quickstart(2.4K), plugin_runtime(1.2K), hooks(1.0K), composition(0.7K), approval(0.5K), calendar(0.2K)
+  3 nodes, 30068 prod lines: rpc(24.6K), daemon(3.4K), doctor(2.1K)
+  2 nodes, 2609 prod lines: relay(1.6K), enroll(1.0K)
+
+largest cycle, greedy layering top -> bottom:
+  tools > quickstart > agent > approval > skills > cron > composition > sop > security > calendar > observability > hooks > plugin_runtime
+
+back-edges under that layering (15 edges, 87 refs):
+  observability    -> agent               1  [loop_::scrub_for_export x1]
+                                       e.g. observability/otel.rs:2
+  sop              -> cron                1  [normalize_expression x1]
+                                       e.g. sop/dispatch.rs:1693
+  sop              -> tools               1  [default_tools x1]
+                                       e.g. sop/mod.rs:95
+  hooks            -> agent               2  [loop_::scrub_for_export x1, turn::redact::scrub_credentials_value x1]
+                                       e.g. hooks/builtin/webhook_audit.rs:7, hooks/builtin/webhook_audit.rs:8
+  calendar         -> sop                 2  [types::SopEvent x1, types::SopTriggerSource x1]
+                                       e.g. calendar/poller.rs:8, calendar/poller.rs:8
+  composition      -> agent               2  [agent::config_switch_provider x1, loop_::CLI_CHANNEL_FN x1]
+                                       e.g. composition/config_backed.rs:131, composition/config_backed.rs:258
+  cron             -> tools               2  [shell_output::decode_shell_output x2]
+                                       e.g. cron/scheduler.rs:1715, cron/scheduler.rs:1716
+  security         -> sop                 2  [types::SopEvent x1, types::SopTriggerSource x1]
+                                       e.g. security/external_content.rs:8, security/external_content.rs:8
+  plugin_runtime   -> tools               3  [resolve_instance_config x1, plugin_egress_service x1, plugin_host_services x1]
+                                       e.g. plugin_runtime.rs:795, plugin_runtime.rs:1178, plugin_runtime.rs:1179
+  composition      -> tools               6  [AllToolsResult x4, ForwardedEnvironment x1, all_tools_with_runtime_context x1]
+                                       e.g. composition.rs:31, composition.rs:93, composition.rs:169
+  cron             -> agent               6  [terminal_completion_error_message x1, loop_::AgentRunOverrides x1, loop_::AgentRunOverrides::default x1, run_with_capabilities x1, run x1, context_window_exceeded_from_error x1]
+                                       e.g. cron/scheduler.rs:1136, cron/scheduler.rs:1228, cron/scheduler.rs:1256
+  skills           -> agent               8  [turn::ResolvedModelAccess x2, turn::run_tool_call_loop x1, turn::ToolLoop x1, turn::ResolvedAgentExecution::resolve x1, turn::ResolvedIo x1, turn::ResolvedRuntimeKnobs x1]
+                                       e.g. skills/creator.rs:204, skills/review.rs:132, skills/review.rs:132
+  sop              -> agent              12  [turn::redact::scrub_credentials x3, history::truncate_tool_result x2, turn::redact::scrub_credentials_value x2, terminal_completion_error_message x1, semantic_empty_terminal_completion_message x1, turn::step_agent_memory x1]
+                                       e.g. sop/audit.rs:7, sop/audit.rs:8, sop/capability/llm_generate.rs:166
+  skills           -> tools              13  [skill_tool::composed_tool_name x3, shell_output::decode_shell_output x2, skill_manage::SkillManageTool x1, skill_manage::SkillViewTool x1, skill_manage::SkillsListTool x1, scoped::ScopedToolRegistry::assemble x1]
+                                       e.g. skills/mod.rs:1856, skills/mod.rs:1867, skills/mod.rs:1888
+  agent            -> tools              26  [scoped::ScopedToolRegistry x6, tools x2, ForwardedEnvironment x2, DelegateTool::NAME x2, scoped::ScopedToolRegistry::assemble_prepared x2, scoped::ScopedAssembly x2]
+                                       e.g. agent/agent.rs:14, agent/agent.rs:545, agent/agent.rs:549
+
+all edges inside the largest cycle (row uses column; refs):
+  tools            -> agent:64, sop:49, skills:31, composition:29, security:28, cron:17, approval:2, plugin_runtime:2, quickstart:1
+  quickstart       -> agent:4
+  agent            -> composition:65, sop:43, security:30, tools:26, skills:25, observability:22, approval:16, hooks:16
+  approval         -> security:1
+  skills           -> tools:13, agent:8, security:8, plugin_runtime:1, observability:1, composition:1
+  cron             -> composition:8, agent:6, security:2, tools:2
+  composition      -> tools:6, sop:2, observability:2, agent:2
+  sop              -> agent:12, security:10, calendar:2, cron:1, tools:1
+  security         -> sop:2
+  calendar         -> sop:2
+  observability    -> agent:1
+  hooks            -> agent:2
+  plugin_runtime   -> tools:3
+
+outside the largest cycle:
+  rpc                       24608  above uses=[agent,agent_lifecycle,cron,daemon,doctor,enroll,health,hooks,i18n,live_config_authority,observability,process_stats,quickstart,security,skills,sop,tools,util] used-by=[daemon]
+  daemon                     3395  above uses=[agent,control_plane,cron,health,heartbeat,hooks,i18n,live_config_authority,observability,restart,rpc,security,sop,util] used-by=[doctor,rpc]
+  control_plane              2903  below uses=[] used-by=[agent_lifecycle,daemon,tools]
+  verifiable_intent          2511  below uses=[] used-by=[tools]
+  service                    2391  free  uses=[i18n] used-by=[doctor]
+  tunnel                     2194  free  uses=[] used-by=[]
+  doctor                     2065  above uses=[agent,daemon,i18n,identity,observability,service] used-by=[rpc]
+  relay                      1649  free  uses=[enroll,relay_dashboard] used-by=[enroll]
+  live_config_authority      1551  below uses=[config_application,i18n,util] used-by=[agent,composition,cron,daemon,quickstart,rpc,sop,tools]
+  identity                    985  below uses=[] used-by=[agent,doctor]
+  enroll                      960  above uses=[relay,security] used-by=[relay,rpc]
+  heartbeat                   617  above uses=[observability] used-by=[daemon]
+  plugin_state                603  below uses=[] used-by=[tools]
+  agent_lifecycle             472  above uses=[control_plane,cron] used-by=[rpc]
+  migration                   453  free  uses=[i18n] used-by=[]
+  browse                      374  free  uses=[] used-by=[]
+  integrations                373  above uses=[i18n,tools] used-by=[]
+  i18n                        359  below uses=[generated_locales] used-by=[agent,approval,cron,daemon,doctor,integrations,live_config_authority,migration,quickstart,rpc,security,service,skills,sop,tools]
+  cli_input                   346  below uses=[] used-by=[agent]
+  routines                    306  free  uses=[] used-by=[]
+  rag                         271  below uses=[] used-by=[agent]
+  relay_dashboard             252  free  uses=[] used-by=[relay]
+  restart                     227  free  uses=[] used-by=[daemon]
+  trust                       192  free  uses=[] used-by=[]
+  process_stats               145  free  uses=[] used-by=[rpc]
+  health                      144  below uses=[] used-by=[cron,daemon,rpc,sop]
+  config_application          136  free  uses=[] used-by=[live_config_authority]
+  subagent                    134  below uses=[] used-by=[tools]
+  util                        122  below uses=[] used-by=[agent,daemon,live_config_authority,observability,rpc,tools]
+  peers                       101  below uses=[] used-by=[tools]
+  generated_locales            38  free  uses=[] used-by=[i18n]
+  cost                          4  free  uses=[] used-by=[]
+  platform                      2  below uses=[] used-by=[agent]
+
+external users of `zeroclaw_runtime::<module>` (prod refs / test refs):
+  crates
+      sop                            173 / 0
+      agent                          145 / 4
+      security                        62 / 18
+      live_config_authority           74 / 2
+      (ext-reexport)                  57 / 0
+      i18n                            46 / 0
+      rpc                             26 / 14
+      skills                          27 / 0
+      cron                            26 / 0
+      health                          25 / 0
+      daemon                          17 / 6
+      relay                            0 / 23
+      tools                           17 / 5
+      quickstart                      20 / 0
+      observability                   18 / 0
+      relay_dashboard                  6 / 6
+      hooks                           11 / 0
+      browse                          10 / 0
+      enroll                           0 / 8
+      service                          8 / 0
+      restart                          4 / 0
+      integrations                     4 / 0
+      doctor                           4 / 0
+      plugin_runtime                   3 / 0
+      agent_lifecycle                  2 / 0
+      platform                         2 / 0
+      tunnel                           2 / 0
+      identity                         2 / 0
+      process_stats                    2 / 0
+      cli_input                        1 / 0
+      approval                         1 / 0
+      util                             1 / 0
+      peers                            1 / 0
+  src
+      i18n                            37 / 13
+      sop                             45 / 0
+      quickstart                      22 / 0
+      security                        18 / 0
+      plugin_runtime                  16 / 0
+      agent                           15 / 0
+      skills                          14 / 0
+      relay                           11 / 0
+      (ext-reexport)                  10 / 0
+      live_config_authority            9 / 0
+      restart                          8 / 0
+      rpc                              7 / 0
+      tunnel                           6 / 0
+      enroll                           6 / 0
+      daemon                           4 / 0
+      agent_lifecycle                  4 / 0
+      relay_dashboard                  3 / 0
+      observability                    3 / 0
+      cron                             2 / 0
+      hooks                            2 / 0
+      util                             1 / 0
+      cli_input                        1 / 0
+      browse                           1 / 0
+      identity                         1 / 0
+      migration                        1 / 0
+      tools                            1 / 0
+      health                           1 / 0
+      doctor                           1 / 0
+      rag                              1 / 0
+      integrations                     1 / 0
+      heartbeat                        1 / 0
+      routines                         1 / 0
+      trust                            1 / 0
+      verifiable_intent                1 / 0
+      service                          1 / 0
+      approval                         1 / 0
+  tests
+      quickstart                       3 / 0
+      plugin_runtime                   2 / 0
+      cron                             1 / 0
+      security                         1 / 0
+      live_config_authority            1 / 0
+      agent                            1 / 0
+      observability                    1 / 0
+      (ext-reexport)                   1 / 0
+  xtask
+      sop                              3 / 0
+      rpc                              2 / 0
+      tools                            1 / 0

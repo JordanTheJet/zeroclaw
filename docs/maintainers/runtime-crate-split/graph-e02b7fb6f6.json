@@ -1,0 +1,3357 @@
+{
+ "cycle": [
+  "agent",
+  "approval",
+  "calendar",
+  "composition",
+  "cron",
+  "hooks",
+  "observability",
+  "plugin_runtime",
+  "quickstart",
+  "security",
+  "skills",
+  "sop",
+  "tools"
+ ],
+ "edges": {
+  "agent": {
+   "approval": 16,
+   "cli_input": 1,
+   "composition": 65,
+   "hooks": 16,
+   "i18n": 54,
+   "identity": 2,
+   "live_config_authority": 4,
+   "observability": 22,
+   "platform": 2,
+   "rag": 7,
+   "security": 30,
+   "skills": 25,
+   "sop": 43,
+   "tools": 26,
+   "util": 5
+  },
+  "agent_lifecycle": {
+   "control_plane": 1,
+   "cron": 3
+  },
+  "approval": {
+   "i18n": 2,
+   "security": 1
+  },
+  "browse": {},
+  "calendar": {
+   "sop": 2
+  },
+  "cli_input": {},
+  "composition": {
+   "agent": 2,
+   "live_config_authority": 1,
+   "observability": 2,
+   "sop": 2,
+   "tools": 6
+  },
+  "config_application": {},
+  "control_plane": {},
+  "cost": {},
+  "cron": {
+   "agent": 6,
+   "composition": 8,
+   "health": 6,
+   "i18n": 1,
+   "live_config_authority": 3,
+   "security": 2,
+   "tools": 2
+  },
+  "daemon": {
+   "agent": 7,
+   "control_plane": 6,
+   "cron": 4,
+   "health": 21,
+   "heartbeat": 10,
+   "hooks": 5,
+   "i18n": 3,
+   "live_config_authority": 6,
+   "observability": 4,
+   "restart": 1,
+   "rpc": 14,
+   "security": 3,
+   "sop": 9,
+   "util": 2
+  },
+  "doctor": {
+   "agent": 5,
+   "daemon": 1,
+   "i18n": 27,
+   "identity": 1,
+   "observability": 3,
+   "service": 6
+  },
+  "enroll": {
+   "relay": 1,
+   "security": 4
+  },
+  "generated_locales": {},
+  "health": {},
+  "heartbeat": {
+   "observability": 2
+  },
+  "hooks": {
+   "agent": 2
+  },
+  "i18n": {
+   "generated_locales": 1
+  },
+  "identity": {},
+  "integrations": {
+   "i18n": 2,
+   "tools": 1
+  },
+  "live_config_authority": {
+   "config_application": 1,
+   "i18n": 4,
+   "util": 2
+  },
+  "migration": {
+   "i18n": 1
+  },
+  "observability": {
+   "agent": 1,
+   "util": 2
+  },
+  "peers": {},
+  "platform": {},
+  "plugin_runtime": {
+   "tools": 3
+  },
+  "plugin_state": {},
+  "process_stats": {},
+  "quickstart": {
+   "agent": 4,
+   "i18n": 4,
+   "live_config_authority": 1
+  },
+  "rag": {},
+  "relay": {
+   "enroll": 4,
+   "relay_dashboard": 4
+  },
+  "relay_dashboard": {},
+  "restart": {},
+  "routines": {},
+  "rpc": {
+   "agent": 76,
+   "agent_lifecycle": 5,
+   "cron": 23,
+   "daemon": 6,
+   "doctor": 8,
+   "enroll": 1,
+   "health": 1,
+   "hooks": 1,
+   "i18n": 44,
+   "live_config_authority": 24,
+   "observability": 2,
+   "process_stats": 1,
+   "quickstart": 23,
+   "security": 24,
+   "skills": 10,
+   "sop": 75,
+   "tools": 11,
+   "util": 4
+  },
+  "security": {
+   "i18n": 3,
+   "sop": 2
+  },
+  "service": {
+   "i18n": 1
+  },
+  "skills": {
+   "agent": 8,
+   "composition": 1,
+   "i18n": 11,
+   "observability": 1,
+   "plugin_runtime": 1,
+   "security": 8,
+   "tools": 13
+  },
+  "sop": {
+   "agent": 12,
+   "calendar": 2,
+   "cron": 1,
+   "health": 6,
+   "i18n": 10,
+   "live_config_authority": 7,
+   "security": 10,
+   "tools": 1
+  },
+  "subagent": {},
+  "tools": {
+   "agent": 64,
+   "approval": 2,
+   "composition": 29,
+   "control_plane": 53,
+   "cron": 17,
+   "i18n": 19,
+   "live_config_authority": 7,
+   "peers": 2,
+   "plugin_runtime": 2,
+   "plugin_state": 1,
+   "quickstart": 1,
+   "security": 28,
+   "skills": 31,
+   "sop": 49,
+   "subagent": 2,
+   "util": 1,
+   "verifiable_intent": 9
+  },
+  "trust": {},
+  "tunnel": {},
+  "util": {},
+  "verifiable_intent": {}
+ },
+ "ext_crates": {
+  "agent": {
+   "zeroclaw_api": 222,
+   "zeroclaw_config": 183,
+   "zeroclaw_infra": 9,
+   "zeroclaw_log": 1,
+   "zeroclaw_memory": 24,
+   "zeroclaw_providers": 143,
+   "zeroclaw_spawn": 3,
+   "zeroclaw_tool_call_parser": 16,
+   "zeroclaw_tools": 12
+  },
+  "agent_lifecycle": {
+   "zeroclaw_api": 1,
+   "zeroclaw_config": 2,
+   "zeroclaw_infra": 2
+  },
+  "approval": {
+   "zeroclaw_config": 1
+  },
+  "browse": {
+   "zeroclaw_config": 2
+  },
+  "composition": {
+   "zeroclaw_api": 12,
+   "zeroclaw_config": 4,
+   "zeroclaw_memory": 1,
+   "zeroclaw_providers": 5
+  },
+  "config_application": {
+   "zeroclaw_config": 1,
+   "zeroclaw_rpc_proto": 1
+  },
+  "control_plane": {
+   "zeroclaw_spawn": 1
+  },
+  "cost": {
+   "zeroclaw_config": 2
+  },
+  "cron": {
+   "zeroclaw_api": 11,
+   "zeroclaw_config": 18,
+   "zeroclaw_log": 5,
+   "zeroclaw_plugins": 1
+  },
+  "daemon": {
+   "zeroclaw_api": 5,
+   "zeroclaw_config": 9,
+   "zeroclaw_infra": 5,
+   "zeroclaw_log": 1,
+   "zeroclaw_memory": 4,
+   "zeroclaw_providers": 6,
+   "zeroclaw_spawn": 5
+  },
+  "doctor": {
+   "zeroclaw_api": 1,
+   "zeroclaw_config": 14,
+   "zeroclaw_providers": 7
+  },
+  "enroll": {
+   "zeroclaw_config": 2,
+   "zeroclaw_spawn": 2,
+   "zeroclaw_tls": 3
+  },
+  "heartbeat": {
+   "zeroclaw_config": 1
+  },
+  "hooks": {
+   "zeroclaw_api": 9,
+   "zeroclaw_config": 4,
+   "zeroclaw_infra": 5,
+   "zeroclaw_spawn": 1
+  },
+  "i18n": {
+   "zeroclaw_config": 1
+  },
+  "identity": {
+   "zeroclaw_config": 1
+  },
+  "integrations": {
+   "zeroclaw_config": 2,
+   "zeroclaw_providers": 2
+  },
+  "live_config_authority": {
+   "zeroclaw_config": 16,
+   "zeroclaw_infra": 1,
+   "zeroclaw_spawn": 1
+  },
+  "migration": {
+   "zeroclaw_config": 1,
+   "zeroclaw_memory": 6
+  },
+  "observability": {
+   "zeroclaw_api": 3,
+   "zeroclaw_config": 8,
+   "zeroclaw_log": 14
+  },
+  "peers": {
+   "zeroclaw_config": 1
+  },
+  "platform": {
+   "zeroclaw_config": 1
+  },
+  "plugin_runtime": {
+   "zeroclaw_api": 2,
+   "zeroclaw_config": 7,
+   "zeroclaw_plugins": 14
+  },
+  "plugin_state": {
+   "zeroclaw_config": 1,
+   "zeroclaw_plugins": 3
+  },
+  "quickstart": {
+   "zeroclaw_api": 4,
+   "zeroclaw_config": 26,
+   "zeroclaw_providers": 12
+  },
+  "rag": {
+   "zeroclaw_memory": 1
+  },
+  "relay": {
+   "zeroclaw_relay_proto": 7,
+   "zeroclaw_spawn": 6,
+   "zeroclaw_tls": 6
+  },
+  "relay_dashboard": {
+   "zeroclaw_config": 1
+  },
+  "rpc": {
+   "zeroclaw_api": 113,
+   "zeroclaw_commands": 1,
+   "zeroclaw_config": 73,
+   "zeroclaw_infra": 45,
+   "zeroclaw_log": 10,
+   "zeroclaw_memory": 4,
+   "zeroclaw_providers": 13,
+   "zeroclaw_rpc_proto": 4,
+   "zeroclaw_spawn": 16,
+   "zeroclaw_tls": 5,
+   "zeroclaw_tools": 1
+  },
+  "security": {
+   "zeroclaw_api": 8,
+   "zeroclaw_config": 21
+  },
+  "service": {
+   "zeroclaw_config": 1,
+   "zeroclaw_spawn": 2
+  },
+  "skills": {
+   "zeroclaw_api": 14,
+   "zeroclaw_config": 45,
+   "zeroclaw_infra": 5,
+   "zeroclaw_memory": 2,
+   "zeroclaw_plugins": 4,
+   "zeroclaw_providers": 3,
+   "zeroclaw_tools": 1
+  },
+  "sop": {
+   "zeroclaw_api": 16,
+   "zeroclaw_config": 32,
+   "zeroclaw_log": 5,
+   "zeroclaw_macros": 1,
+   "zeroclaw_memory": 5,
+   "zeroclaw_providers": 1,
+   "zeroclaw_sop_graph": 1,
+   "zeroclaw_spawn": 1,
+   "zeroclaw_tools": 1
+  },
+  "subagent": {
+   "zeroclaw_config": 2
+  },
+  "tools": {
+   "zeroclaw_api": 91,
+   "zeroclaw_config": 99,
+   "zeroclaw_infra": 6,
+   "zeroclaw_log": 2,
+   "zeroclaw_memory": 12,
+   "zeroclaw_plugins": 34,
+   "zeroclaw_providers": 20,
+   "zeroclaw_spawn": 6,
+   "zeroclaw_tools": 99
+  },
+  "trust": {
+   "zeroclaw_config": 1
+  },
+  "tunnel": {
+   "zeroclaw_config": 3,
+   "zeroclaw_spawn": 2
+  }
+ },
+ "ext_use": {
+  "crates": {
+   "(ext-reexport)": {
+    "prod": 57
+   },
+   "agent": {
+    "prod": 145,
+    "test": 4
+   },
+   "agent_lifecycle": {
+    "prod": 2
+   },
+   "approval": {
+    "prod": 1
+   },
+   "browse": {
+    "prod": 10
+   },
+   "cli_input": {
+    "prod": 1
+   },
+   "cron": {
+    "prod": 26
+   },
+   "daemon": {
+    "prod": 17,
+    "test": 6
+   },
+   "doctor": {
+    "prod": 4
+   },
+   "enroll": {
+    "test": 8
+   },
+   "health": {
+    "prod": 25
+   },
+   "hooks": {
+    "prod": 11
+   },
+   "i18n": {
+    "prod": 46
+   },
+   "identity": {
+    "prod": 2
+   },
+   "integrations": {
+    "prod": 4
+   },
+   "live_config_authority": {
+    "prod": 74,
+    "test": 2
+   },
+   "observability": {
+    "prod": 18
+   },
+   "peers": {
+    "prod": 1
+   },
+   "platform": {
+    "prod": 2
+   },
+   "plugin_runtime": {
+    "prod": 3
+   },
+   "process_stats": {
+    "prod": 2
+   },
+   "quickstart": {
+    "prod": 20
+   },
+   "relay": {
+    "test": 23
+   },
+   "relay_dashboard": {
+    "prod": 6,
+    "test": 6
+   },
+   "restart": {
+    "prod": 4
+   },
+   "rpc": {
+    "prod": 26,
+    "test": 14
+   },
+   "security": {
+    "prod": 62,
+    "test": 18
+   },
+   "service": {
+    "prod": 8
+   },
+   "skills": {
+    "prod": 27
+   },
+   "sop": {
+    "prod": 173
+   },
+   "tools": {
+    "prod": 17,
+    "test": 5
+   },
+   "tunnel": {
+    "prod": 2
+   },
+   "util": {
+    "prod": 1
+   }
+  },
+  "src": {
+   "(ext-reexport)": {
+    "prod": 10
+   },
+   "agent": {
+    "prod": 15
+   },
+   "agent_lifecycle": {
+    "prod": 4
+   },
+   "approval": {
+    "prod": 1
+   },
+   "browse": {
+    "prod": 1
+   },
+   "cli_input": {
+    "prod": 1
+   },
+   "cron": {
+    "prod": 2
+   },
+   "daemon": {
+    "prod": 4
+   },
+   "doctor": {
+    "prod": 1
+   },
+   "enroll": {
+    "prod": 6
+   },
+   "health": {
+    "prod": 1
+   },
+   "heartbeat": {
+    "prod": 1
+   },
+   "hooks": {
+    "prod": 2
+   },
+   "i18n": {
+    "prod": 37,
+    "test": 13
+   },
+   "identity": {
+    "prod": 1
+   },
+   "integrations": {
+    "prod": 1
+   },
+   "live_config_authority": {
+    "prod": 9
+   },
+   "migration": {
+    "prod": 1
+   },
+   "observability": {
+    "prod": 3
+   },
+   "plugin_runtime": {
+    "prod": 16
+   },
+   "quickstart": {
+    "prod": 22
+   },
+   "rag": {
+    "prod": 1
+   },
+   "relay": {
+    "prod": 11
+   },
+   "relay_dashboard": {
+    "prod": 3
+   },
+   "restart": {
+    "prod": 8
+   },
+   "routines": {
+    "prod": 1
+   },
+   "rpc": {
+    "prod": 7
+   },
+   "security": {
+    "prod": 18
+   },
+   "service": {
+    "prod": 1
+   },
+   "skills": {
+    "prod": 14
+   },
+   "sop": {
+    "prod": 45
+   },
+   "tools": {
+    "prod": 1
+   },
+   "trust": {
+    "prod": 1
+   },
+   "tunnel": {
+    "prod": 6
+   },
+   "util": {
+    "prod": 1
+   },
+   "verifiable_intent": {
+    "prod": 1
+   }
+  },
+  "tests": {
+   "(ext-reexport)": {
+    "prod": 1
+   },
+   "agent": {
+    "prod": 1
+   },
+   "cron": {
+    "prod": 1
+   },
+   "live_config_authority": {
+    "prod": 1
+   },
+   "observability": {
+    "prod": 1
+   },
+   "plugin_runtime": {
+    "prod": 2
+   },
+   "quickstart": {
+    "prod": 3
+   },
+   "security": {
+    "prod": 1
+   }
+  },
+  "xtask": {
+   "rpc": {
+    "prod": 2
+   },
+   "sop": {
+    "prod": 3
+   },
+   "tools": {
+    "prod": 1
+   }
+  }
+ },
+ "features": {
+  "agent": {
+   "observability-otel": 4,
+   "plugins-wasm-cranelift": 5,
+   "test-util": 6
+  },
+  "composition": {
+   "plugins-wasm-cranelift": 6
+  },
+  "cron": {
+   "plugins-wasm": 2
+  },
+  "health": {
+   "schema-export": 2
+  },
+  "lib": {
+   "plugins-wasm": 1
+  },
+  "live_config_authority": {
+   "test-util": 2
+  },
+  "observability": {
+   "observability-otel": 13,
+   "observability-prometheus": 5
+  },
+  "plugin_runtime": {
+   "plugins-wasm": 41
+  },
+  "process_stats": {
+   "schema-export": 1
+  },
+  "rpc": {
+   "test-util": 2
+  },
+  "security": {
+   "sandbox-bubblewrap": 12,
+   "sandbox-landlock": 35,
+   "webauthn": 1
+  },
+  "skills": {
+   "plugins-wasm": 13,
+   "plugins-wasm-cranelift": 3,
+   "schema-export": 1
+  },
+  "sop": {
+   "schema-export": 34,
+   "test-util": 2,
+   "tools-external": 1
+  },
+  "tools": {
+   "plugins-wasm": 33,
+   "plugins-wasm-cranelift": 54,
+   "test-util": 1,
+   "tool-claude-code": 11,
+   "tool-claude-code-runner": 4,
+   "tool-codex-cli": 12,
+   "tool-composio": 7,
+   "tool-gemini-cli": 11,
+   "tool-google-workspace": 4,
+   "tool-jira": 5,
+   "tool-linkedin": 4,
+   "tool-microsoft365": 4,
+   "tool-notion": 5,
+   "tool-opencode-cli": 11,
+   "tool-project-intel": 7,
+   "tools-external": 31
+  }
+ },
+ "loc_prod": {
+  "agent": 29917,
+  "agent_lifecycle": 472,
+  "approval": 502,
+  "browse": 374,
+  "calendar": 182,
+  "cli_input": 346,
+  "composition": 669,
+  "config_application": 136,
+  "control_plane": 2903,
+  "cost": 4,
+  "cron": 6317,
+  "daemon": 3395,
+  "doctor": 2065,
+  "enroll": 960,
+  "generated_locales": 38,
+  "health": 144,
+  "heartbeat": 617,
+  "hooks": 1034,
+  "i18n": 359,
+  "identity": 985,
+  "integrations": 373,
+  "lib": 60,
+  "live_config_authority": 1551,
+  "migration": 453,
+  "observability": 3273,
+  "peers": 101,
+  "platform": 2,
+  "plugin_runtime": 1247,
+  "plugin_state": 603,
+  "process_stats": 145,
+  "quickstart": 2431,
+  "rag": 271,
+  "relay": 1649,
+  "relay_dashboard": 252,
+  "restart": 227,
+  "routines": 306,
+  "rpc": 24608,
+  "security": 11238,
+  "service": 2391,
+  "skills": 7249,
+  "sop": 24118,
+  "subagent": 134,
+  "tools": 21511,
+  "trust": 192,
+  "tunnel": 2194,
+  "util": 122,
+  "verifiable_intent": 2511
+ },
+ "loc_test": {
+  "agent": 85704,
+  "agent_lifecycle": 171,
+  "approval": 826,
+  "browse": 405,
+  "calendar": 205,
+  "cli_input": 184,
+  "composition": 1222,
+  "config_application": 125,
+  "control_plane": 2138,
+  "cost": 0,
+  "cron": 8994,
+  "daemon": 5074,
+  "doctor": 1915,
+  "enroll": 1139,
+  "generated_locales": 0,
+  "health": 156,
+  "heartbeat": 615,
+  "hooks": 1789,
+  "i18n": 3517,
+  "identity": 505,
+  "integrations": 511,
+  "lib": 0,
+  "live_config_authority": 1518,
+  "migration": 354,
+  "observability": 2917,
+  "peers": 48,
+  "platform": 47,
+  "plugin_runtime": 1232,
+  "plugin_state": 364,
+  "process_stats": 147,
+  "quickstart": 1957,
+  "rag": 82,
+  "relay": 1143,
+  "relay_dashboard": 147,
+  "restart": 35,
+  "routines": 331,
+  "rpc": 56686,
+  "security": 14157,
+  "service": 2413,
+  "skills": 6882,
+  "sop": 27863,
+  "subagent": 204,
+  "tools": 45503,
+  "trust": 722,
+  "tunnel": 1579,
+  "util": 197,
+  "verifiable_intent": 2590
+ },
+ "order": [
+  "tools",
+  "quickstart",
+  "agent",
+  "approval",
+  "skills",
+  "cron",
+  "composition",
+  "sop",
+  "security",
+  "calendar",
+  "observability",
+  "hooks",
+  "plugin_runtime"
+ ],
+ "passthrough": {
+  "agent": {
+   "cost": 5,
+   "platform": 2,
+   "tools": 45
+  },
+  "composition": {
+   "tools": 2
+  },
+  "cron": {
+   "platform": 5
+  },
+  "daemon": {
+   "tools": 17
+  },
+  "doctor": {
+   "tools": 1
+  },
+  "live_config_authority": {
+   "config_application": 2
+  },
+  "rpc": {
+   "agent": 3,
+   "config_application": 3
+  },
+  "skills": {
+   "platform": 5
+  },
+  "tools": {
+   "agent": 2,
+   "cost": 3,
+   "observability": 6,
+   "platform": 10,
+   "security": 4
+  }
+ },
+ "passthrough_symbols": {
+  "agent->cost": {
+   "cost::CostTracker": 1,
+   "cost::types::BudgetCheck": 2,
+   "cost::types::TokenUsage": 1,
+   "cost::types::UsagePeriod": 1
+  },
+  "agent->platform": {
+   "platform::RuntimeAdapter": 1,
+   "platform::create_runtime": 1
+  },
+  "agent->tools": {
+   "tools::ActivatedToolSet": 17,
+   "tools::DeferredMcpToolSet": 1,
+   "tools::McpRegistry": 1,
+   "tools::Tool": 11,
+   "tools::ToolResult": 1,
+   "tools::ToolSearchTool": 1,
+   "tools::ToolSearchTool::NAME": 1,
+   "tools::ToolSpec": 12
+  },
+  "composition->tools": {
+   "tools::AcpSessionReadView": 1,
+   "tools::CanvasStore": 1
+  },
+  "cron->platform": {
+   "platform::create_runtime": 5
+  },
+  "daemon->tools": {
+   "tools::McpRegistry": 9,
+   "tools::McpRegistry::connect_all": 1,
+   "tools::McpRegistry::from_servers": 1,
+   "tools::McpServer": 6
+  },
+  "doctor->tools": {
+   "tools::discover_cli_tools": 1
+  },
+  "live_config_authority->config_application": {
+   "config_application::ConfigApplicationStatus": 1,
+   "config_application::ConfigApplicationTarget": 1
+  },
+  "rpc->agent": {
+   "agent::agent::TurnEvent": 3
+  },
+  "rpc->config_application": {
+   "config_application::ConfigApplicationTarget": 1,
+   "config_application::ConfigApplicationTarget::Session": 2
+  },
+  "skills->platform": {
+   "platform::NativeRuntime::new": 2,
+   "platform::RuntimeAdapter": 3
+  },
+  "tools->agent": {
+   "agent::loop_::TOOL_LOOP_SESSION_KEY": 1,
+   "agent::loop_::TOOL_LOOP_THREAD_ID": 1
+  },
+  "tools->cost": {
+   "cost::CostTracker": 2,
+   "cost::CostTracker::get_or_init_global": 1
+  },
+  "tools->observability": {
+   "observability::traits::Observer": 2,
+   "observability::traits::ObserverEvent": 2,
+   "observability::traits::ObserverMetric": 2
+  },
+  "tools->platform": {
+   "platform::NativeRuntime": 2,
+   "platform::NativeRuntime::new": 1,
+   "platform::RuntimeAdapter": 7
+  },
+  "tools->security": {
+   "security::policy::ToolOperation": 4
+  }
+ },
+ "restricted_vis": {
+  "agent": 348,
+  "agent_lifecycle": 0,
+  "approval": 3,
+  "browse": 0,
+  "calendar": 0,
+  "cli_input": 3,
+  "composition": 13,
+  "config_application": 5,
+  "control_plane": 13,
+  "cost": 0,
+  "cron": 26,
+  "daemon": 19,
+  "doctor": 2,
+  "enroll": 1,
+  "generated_locales": 0,
+  "health": 0,
+  "heartbeat": 0,
+  "hooks": 4,
+  "i18n": 0,
+  "identity": 0,
+  "integrations": 0,
+  "lib": 1,
+  "live_config_authority": 4,
+  "migration": 0,
+  "observability": 8,
+  "peers": 0,
+  "platform": 0,
+  "plugin_runtime": 5,
+  "plugin_state": 2,
+  "process_stats": 0,
+  "quickstart": 1,
+  "rag": 0,
+  "relay": 0,
+  "relay_dashboard": 0,
+  "restart": 0,
+  "routines": 0,
+  "rpc": 77,
+  "security": 14,
+  "service": 3,
+  "skills": 14,
+  "sop": 94,
+  "subagent": 0,
+  "tools": 91,
+  "trust": 0,
+  "tunnel": 0,
+  "util": 1,
+  "verifiable_intent": 0
+ },
+ "root": "crates/zeroclaw-runtime/src",
+ "sites": {
+  "agent->approval": [
+   "agent/agent.rs:7",
+   "agent/loop_.rs:2",
+   "agent/tool_execution.rs:8",
+   "agent/turn/approval_gate.rs:8"
+  ],
+  "agent->cli_input": [
+   "agent/loop_.rs:2741"
+  ],
+  "agent->composition": [
+   "agent/agent.rs:61",
+   "agent/agent.rs:70",
+   "agent/agent.rs:666",
+   "agent/agent.rs:745"
+  ],
+  "agent->hooks": [
+   "agent/agent.rs:646",
+   "agent/agent.rs:888",
+   "agent/agent.rs:1244",
+   "agent/agent.rs:3661"
+  ],
+  "agent->i18n": [
+   "agent/agent.rs:1651",
+   "agent/agent.rs:3729",
+   "agent/agent.rs:3866",
+   "agent/agent.rs:5183"
+  ],
+  "agent->identity": [
+   "agent/prompt.rs:2",
+   "agent/system_prompt.rs:6"
+  ],
+  "agent->live_config_authority": [
+   "agent/agent.rs:8",
+   "agent/loop_.rs:4",
+   "agent/loop_.rs:4",
+   "agent/turn/mod.rs:94"
+  ],
+  "agent->observability": [
+   "agent/agent.rs:9",
+   "agent/agent.rs:9",
+   "agent/agent.rs:4433",
+   "agent/agent.rs:5000"
+  ],
+  "agent->platform": [
+   "agent/agent.rs:10",
+   "agent/loop_.rs:228"
+  ],
+  "agent->rag": [
+   "agent/loop_.rs:985",
+   "agent/loop_.rs:2013",
+   "agent/loop_.rs:2019",
+   "agent/loop_.rs:2021"
+  ],
+  "agent->security": [
+   "agent/agent.rs:11",
+   "agent/agent.rs:12",
+   "agent/agent.rs:12",
+   "agent/agent.rs:608"
+  ],
+  "agent->skills": [
+   "agent/agent.rs:583",
+   "agent/agent.rs:872",
+   "agent/agent.rs:1096",
+   "agent/agent.rs:3436"
+  ],
+  "agent->sop": [
+   "agent/agent.rs:13",
+   "agent/agent.rs:13",
+   "agent/agent.rs:3394",
+   "agent/loop_.rs:726"
+  ],
+  "agent->tools": [
+   "agent/agent.rs:14",
+   "agent/agent.rs:545",
+   "agent/agent.rs:549",
+   "agent/agent.rs:854"
+  ],
+  "agent->util": [
+   "agent/loop_.rs:232",
+   "agent/memory_inject.rs:37",
+   "agent/turn/call_prep.rs:15",
+   "agent/turn/mod.rs:96"
+  ],
+  "agent_lifecycle->control_plane": [
+   "agent_lifecycle.rs:336"
+  ],
+  "agent_lifecycle->cron": [
+   "agent_lifecycle.rs:224",
+   "agent_lifecycle.rs:244",
+   "agent_lifecycle.rs:421"
+  ],
+  "approval->i18n": [
+   "approval/mod.rs:348",
+   "approval/mod.rs:353"
+  ],
+  "approval->security": [
+   "approval/mod.rs:5"
+  ],
+  "calendar->sop": [
+   "calendar/poller.rs:8",
+   "calendar/poller.rs:8"
+  ],
+  "composition->agent": [
+   "composition/config_backed.rs:131",
+   "composition/config_backed.rs:258"
+  ],
+  "composition->live_config_authority": [
+   "composition.rs:350"
+  ],
+  "composition->observability": [
+   "composition/config_backed.rs:36",
+   "composition/config_backed.rs:42"
+  ],
+  "composition->sop": [
+   "composition.rs:344",
+   "composition.rs:346"
+  ],
+  "composition->tools": [
+   "composition.rs:31",
+   "composition.rs:93",
+   "composition.rs:169",
+   "composition.rs:342"
+  ],
+  "cron->agent": [
+   "cron/scheduler.rs:1136",
+   "cron/scheduler.rs:1228",
+   "cron/scheduler.rs:1256",
+   "cron/scheduler.rs:1265"
+  ],
+  "cron->composition": [
+   "cron/scheduler.rs:314",
+   "cron/scheduler.rs:337",
+   "cron/scheduler.rs:791",
+   "cron/scheduler.rs:864"
+  ],
+  "cron->health": [
+   "cron/scheduler.rs:490",
+   "cron/scheduler.rs:576",
+   "cron/scheduler.rs:586",
+   "cron/scheduler.rs:609"
+  ],
+  "cron->i18n": [
+   "cron/scheduler.rs:1137"
+  ],
+  "cron->live_config_authority": [
+   "cron/scheduler.rs:10",
+   "cron/scheduler.rs:10",
+   "cron/scheduler.rs:10"
+  ],
+  "cron->security": [
+   "cron/mod.rs:1",
+   "cron/scheduler.rs:13"
+  ],
+  "cron->tools": [
+   "cron/scheduler.rs:1715",
+   "cron/scheduler.rs:1716"
+  ],
+  "daemon->agent": [
+   "daemon/mod.rs:756",
+   "daemon/mod.rs:2450",
+   "daemon/mod.rs:2462",
+   "daemon/mod.rs:2468"
+  ],
+  "daemon->control_plane": [
+   "daemon/mod.rs:924",
+   "daemon/mod.rs:925",
+   "daemon/mod.rs:927",
+   "daemon/mod.rs:939"
+  ],
+  "daemon->cron": [
+   "daemon/mod.rs:1346",
+   "daemon/mod.rs:2538",
+   "daemon/mod.rs:2833",
+   "daemon/mod.rs:2852"
+  ],
+  "daemon->health": [
+   "daemon/mod.rs:733",
+   "daemon/mod.rs:944",
+   "daemon/mod.rs:979",
+   "daemon/mod.rs:987"
+  ],
+  "daemon->heartbeat": [
+   "daemon/mod.rs:750",
+   "daemon/mod.rs:2442",
+   "daemon/mod.rs:2448",
+   "daemon/mod.rs:2477"
+  ],
+  "daemon->hooks": [
+   "daemon/mod.rs:265",
+   "daemon/mod.rs:880",
+   "daemon/mod.rs:883",
+   "daemon/mod.rs:1098"
+  ],
+  "daemon->i18n": [
+   "daemon/mod.rs:1608",
+   "daemon/mod.rs:1620",
+   "daemon/mod.rs:1620"
+  ],
+  "daemon->live_config_authority": [
+   "daemon/mod.rs:692",
+   "daemon/mod.rs:716",
+   "daemon/mod.rs:724",
+   "daemon/mod.rs:2444"
+  ],
+  "daemon->observability": [
+   "daemon/mod.rs:741",
+   "daemon/mod.rs:2498",
+   "daemon/mod.rs:2499",
+   "daemon/registry.rs:96"
+  ],
+  "daemon->restart": [
+   "daemon/mod.rs:510"
+  ],
+  "daemon->rpc": [
+   "daemon/mod.rs:783",
+   "daemon/mod.rs:817",
+   "daemon/mod.rs:825",
+   "daemon/mod.rs:1007"
+  ],
+  "daemon->security": [
+   "daemon/mod.rs:838",
+   "daemon/mod.rs:839",
+   "daemon/registry.rs:86"
+  ],
+  "daemon->sop": [
+   "daemon/registry.rs:146",
+   "daemon/registry.rs:147",
+   "daemon/registry.rs:148",
+   "daemon/registry.rs:155"
+  ],
+  "daemon->util": [
+   "daemon/mod.rs:1042",
+   "daemon/mod.rs:1937"
+  ],
+  "doctor->agent": [
+   "doctor/mod.rs:1",
+   "doctor/mod.rs:1",
+   "doctor/mod.rs:1",
+   "doctor/mod.rs:1"
+  ],
+  "doctor->daemon": [
+   "doctor/mod.rs:1800"
+  ],
+  "doctor->i18n": [
+   "doctor/mod.rs:197",
+   "doctor/mod.rs:203",
+   "doctor/mod.rs:211",
+   "doctor/mod.rs:275"
+  ],
+  "doctor->identity": [
+   "doctor/mod.rs:1703"
+  ],
+  "doctor->observability": [
+   "doctor/mod.rs:1059",
+   "doctor/mod.rs:1065",
+   "doctor/mod.rs:1090"
+  ],
+  "doctor->service": [
+   "doctor/mod.rs:1961",
+   "doctor/mod.rs:1963",
+   "doctor/mod.rs:1968",
+   "doctor/mod.rs:1971"
+  ],
+  "enroll->relay": [
+   "enroll/mod.rs:70"
+  ],
+  "enroll->security": [
+   "enroll/mod.rs:35",
+   "enroll/mod.rs:35",
+   "enroll/mod.rs:35",
+   "enroll/mod.rs:35"
+  ],
+  "heartbeat->observability": [
+   "heartbeat/engine.rs:1",
+   "heartbeat/engine.rs:1"
+  ],
+  "hooks->agent": [
+   "hooks/builtin/webhook_audit.rs:7",
+   "hooks/builtin/webhook_audit.rs:8"
+  ],
+  "i18n->generated_locales": [
+   "i18n.rs:36"
+  ],
+  "integrations->i18n": [
+   "integrations/mod.rs:4",
+   "integrations/mod.rs:4"
+  ],
+  "integrations->tools": [
+   "integrations/registry.rs:5"
+  ],
+  "live_config_authority->config_application": [
+   "live_config_authority.rs:11"
+  ],
+  "live_config_authority->i18n": [
+   "live_config_authority.rs:592",
+   "live_config_authority.rs:604",
+   "live_config_authority.rs:648",
+   "live_config_authority.rs:670"
+  ],
+  "live_config_authority->util": [
+   "live_config_authority.rs:661",
+   "live_config_authority.rs:749"
+  ],
+  "migration->i18n": [
+   "migration.rs:128"
+  ],
+  "observability->agent": [
+   "observability/otel.rs:2"
+  ],
+  "observability->util": [
+   "observability/otel.rs:4",
+   "observability/otel.rs:4"
+  ],
+  "plugin_runtime->tools": [
+   "plugin_runtime.rs:795",
+   "plugin_runtime.rs:1178",
+   "plugin_runtime.rs:1179"
+  ],
+  "quickstart->agent": [
+   "quickstart/mod.rs:718",
+   "quickstart/mod.rs:2152",
+   "quickstart/mod.rs:2163",
+   "quickstart/mod.rs:2164"
+  ],
+  "quickstart->i18n": [
+   "quickstart/mod.rs:159",
+   "quickstart/mod.rs:912",
+   "quickstart/mod.rs:1008",
+   "quickstart/mod.rs:1009"
+  ],
+  "quickstart->live_config_authority": [
+   "quickstart/mod.rs:445"
+  ],
+  "relay->enroll": [
+   "relay.rs:148",
+   "relay.rs:1147",
+   "relay.rs:1167",
+   "relay.rs:1255"
+  ],
+  "relay->relay_dashboard": [
+   "relay.rs:198",
+   "relay.rs:200",
+   "relay.rs:1119",
+   "relay.rs:1319"
+  ],
+  "rpc->agent": [
+   "rpc/dispatch.rs:344",
+   "rpc/dispatch.rs:345",
+   "rpc/dispatch.rs:383",
+   "rpc/dispatch.rs:393"
+  ],
+  "rpc->agent_lifecycle": [
+   "rpc/dispatch.rs:11313",
+   "rpc/dispatch.rs:11452",
+   "rpc/dispatch.rs:11510",
+   "rpc/dispatch.rs:11591"
+  ],
+  "rpc->cron": [
+   "rpc/dispatch.rs:1630",
+   "rpc/dispatch.rs:1634",
+   "rpc/dispatch.rs:1641",
+   "rpc/dispatch.rs:3175"
+  ],
+  "rpc->daemon": [
+   "rpc/context.rs:20",
+   "rpc/dispatch.rs:696",
+   "rpc/local.rs:600",
+   "rpc/local.rs:609"
+  ],
+  "rpc->doctor": [
+   "rpc/dispatch.rs:367",
+   "rpc/dispatch.rs:371",
+   "rpc/dispatch.rs:375",
+   "rpc/dispatch.rs:4037"
+  ],
+  "rpc->enroll": [
+   "rpc/dispatch.rs:3961"
+  ],
+  "rpc->health": [
+   "rpc/dispatch.rs:4024"
+  ],
+  "rpc->hooks": [
+   "rpc/context.rs:224"
+  ],
+  "rpc->i18n": [
+   "rpc/auth.rs:108",
+   "rpc/auth.rs:111",
+   "rpc/auth.rs:114",
+   "rpc/auth.rs:117"
+  ],
+  "rpc->live_config_authority": [
+   "rpc/context.rs:19",
+   "rpc/context.rs:21",
+   "rpc/context.rs:21",
+   "rpc/context.rs:162"
+  ],
+  "rpc->observability": [
+   "rpc/context.rs:187",
+   "rpc/dispatch.rs:12312"
+  ],
+  "rpc->process_stats": [
+   "rpc/dispatch.rs:4026"
+  ],
+  "rpc->quickstart": [
+   "rpc/dispatch.rs:12150",
+   "rpc/dispatch.rs:12156",
+   "rpc/dispatch.rs:12727",
+   "rpc/dispatch.rs:12732"
+  ],
+  "rpc->security": [
+   "rpc/auth.rs:40",
+   "rpc/auth.rs:40",
+   "rpc/auth.rs:40",
+   "rpc/auth.rs:40"
+  ],
+  "rpc->skills": [
+   "rpc/dispatch.rs:11705",
+   "rpc/dispatch.rs:11724",
+   "rpc/dispatch.rs:11743",
+   "rpc/dispatch.rs:11760"
+  ],
+  "rpc->sop": [
+   "rpc/context.rs:216",
+   "rpc/context.rs:220",
+   "rpc/context.rs:221",
+   "rpc/dispatch.rs:14"
+  ],
+  "rpc->tools": [
+   "rpc/dispatch.rs:1175",
+   "rpc/dispatch.rs:2080",
+   "rpc/dispatch.rs:2120",
+   "rpc/dispatch.rs:13537"
+  ],
+  "rpc->util": [
+   "rpc/dispatch.rs:5534",
+   "rpc/dispatch.rs:5737",
+   "rpc/dispatch.rs:5954",
+   "rpc/orphans.rs:60"
+  ],
+  "security->i18n": [
+   "security/detect.rs:148",
+   "security/detect.rs:520",
+   "security/firejail.rs:73"
+  ],
+  "security->sop": [
+   "security/external_content.rs:8",
+   "security/external_content.rs:8"
+  ],
+  "service->i18n": [
+   "service/mod.rs:3458"
+  ],
+  "skills->agent": [
+   "skills/creator.rs:204",
+   "skills/review.rs:132",
+   "skills/review.rs:132",
+   "skills/review.rs:136"
+  ],
+  "skills->composition": [
+   "skills/review.rs:51"
+  ],
+  "skills->i18n": [
+   "skills/mod.rs:484",
+   "skills/mod.rs:3172",
+   "skills/mod.rs:3179",
+   "skills/mod.rs:3188"
+  ],
+  "skills->observability": [
+   "skills/review.rs:10"
+  ],
+  "skills->plugin_runtime": [
+   "skills/mod.rs:3477"
+  ],
+  "skills->security": [
+   "skills/creator.rs:529",
+   "skills/creator.rs:530",
+   "skills/creator.rs:531",
+   "skills/mod.rs:1918"
+  ],
+  "skills->tools": [
+   "skills/mod.rs:1856",
+   "skills/mod.rs:1867",
+   "skills/mod.rs:1888",
+   "skills/review.rs:11"
+  ],
+  "sop->agent": [
+   "sop/audit.rs:7",
+   "sop/audit.rs:8",
+   "sop/capability/llm_generate.rs:166",
+   "sop/capability/llm_generate.rs:183"
+  ],
+  "sop->calendar": [
+   "sop/engine.rs:24",
+   "sop/engine.rs:24"
+  ],
+  "sop->cron": [
+   "sop/dispatch.rs:1693"
+  ],
+  "sop->health": [
+   "sop/dispatch.rs:182",
+   "sop/dispatch.rs:709",
+   "sop/dispatch.rs:771",
+   "sop/dispatch.rs:821"
+  ],
+  "sop->i18n": [
+   "sop/dispatch.rs:843",
+   "sop/dispatch.rs:1256",
+   "sop/engine.rs:249",
+   "sop/engine.rs:252"
+  ],
+  "sop->live_config_authority": [
+   "sop/engine.rs:25",
+   "sop/executor.rs:18",
+   "sop/mod.rs:174",
+   "sop/types.rs:8"
+  ],
+  "sop->security": [
+   "sop/dispatch.rs:11",
+   "sop/dispatch.rs:11",
+   "sop/dispatch.rs:11",
+   "sop/dispatch.rs:1589"
+  ],
+  "sop->tools": [
+   "sop/mod.rs:95"
+  ],
+  "tools->agent": [
+   "tools/delegate.rs:1",
+   "tools/delegate.rs:1",
+   "tools/delegate.rs:1",
+   "tools/delegate.rs:1"
+  ],
+  "tools->approval": [
+   "tools/delegate.rs:13",
+   "tools/delegate.rs:13"
+  ],
+  "tools->composition": [
+   "tools/cron_run.rs:19",
+   "tools/cron_run.rs:103",
+   "tools/delegate.rs:515",
+   "tools/delegate.rs:983"
+  ],
+  "tools->control_plane": [
+   "tools/delegate.rs:228",
+   "tools/delegate.rs:230",
+   "tools/delegate.rs:231",
+   "tools/delegate.rs:232"
+  ],
+  "tools->cron": [
+   "tools/cron_add.rs:4",
+   "tools/cron_add.rs:4",
+   "tools/cron_add.rs:4",
+   "tools/cron_add.rs:4"
+  ],
+  "tools->i18n": [
+   "tools/delegate.rs:1754",
+   "tools/delegate.rs:2978",
+   "tools/delegate.rs:3162",
+   "tools/delegate.rs:3168"
+  ],
+  "tools->live_config_authority": [
+   "tools/cron_run.rs:2",
+   "tools/delegate.rs:14",
+   "tools/delegate.rs:14",
+   "tools/mod.rs:157"
+  ],
+  "tools->peers": [
+   "tools/param_options.rs:14",
+   "tools/send_message_to_peer.rs:14"
+  ],
+  "tools->plugin_runtime": [
+   "tools/mod.rs:3888",
+   "tools/mod.rs:4009"
+  ],
+  "tools->plugin_state": [
+   "tools/mod.rs:1983"
+  ],
+  "tools->quickstart": [
+   "tools/model_switch.rs:29"
+  ],
+  "tools->security": [
+   "tools/coding_cli_executor.rs:2",
+   "tools/cron_add.rs:5",
+   "tools/cron_remove.rs:2",
+   "tools/cron_run.rs:3"
+  ],
+  "tools->skills": [
+   "tools/delegate.rs:624",
+   "tools/delegate.rs:1844",
+   "tools/delegate.rs:5050",
+   "tools/delegate.rs:5058"
+  ],
+  "tools->sop": [
+   "tools/delegate.rs:3866",
+   "tools/delegate.rs:3905",
+   "tools/delegate.rs:4209",
+   "tools/delegate.rs:4335"
+  ],
+  "tools->subagent": [
+   "tools/spawn_subagent.rs:10",
+   "tools/spawn_subagent.rs:10"
+  ],
+  "tools->util": [
+   "tools/coding_cli_executor.rs:3"
+  ],
+  "tools->verifiable_intent": [
+   "tools/verifiable_intent.rs:15",
+   "tools/verifiable_intent.rs:16",
+   "tools/verifiable_intent.rs:16",
+   "tools/verifiable_intent.rs:16"
+  ]
+ },
+ "symbols": {
+  "agent->approval": {
+   "approval::ApprovalManager": 8,
+   "approval::ApprovalManager::for_non_interactive": 1,
+   "approval::ApprovalManager::propagates_runtime_command_approval": 1,
+   "approval::ApprovalRequest": 1,
+   "approval::ApprovalRequirement": 1,
+   "approval::ApprovalResponse": 1,
+   "approval::looks_like_secret_key": 1,
+   "approval::sanitize_tool_replacement": 1,
+   "approval::summarize_args": 1
+  },
+  "agent->cli_input": {
+   "cli_input::ensure_terminal_utf8_erase": 1
+  },
+  "agent->composition": {
+   "composition::BoundCapabilities": 12,
+   "composition::ChannelSource": 1,
+   "composition::NativeRecipeInputs": 4,
+   "composition::PreparedRegistry": 4,
+   "composition::ProviderRequest": 9,
+   "composition::ProviderSource": 1,
+   "composition::RegistryConstruction::NativeCompat": 15,
+   "composition::RegistryConstruction::SuppliedOnly": 4,
+   "composition::RuntimeCapabilities": 8,
+   "composition::RuntimeCapabilities::config_backed": 1,
+   "composition::RuntimeCapabilities::config_backed_unobserved": 1,
+   "composition::ToolRequest": 4,
+   "composition::config_backed::NoOutboundChannels": 1
+  },
+  "agent->hooks": {
+   "hooks::HookResult::Cancel": 3,
+   "hooks::HookResult::Continue": 2,
+   "hooks::HookRunner": 7,
+   "hooks::HookRunner::from_root_config": 1,
+   "hooks::tool_call_hook_context": 3
+  },
+  "agent->i18n": {
+   "i18n::detect_locale": 2,
+   "i18n::get_required_cli_string": 38,
+   "i18n::get_required_cli_string_with_args": 12,
+   "i18n::get_tool_description": 2
+  },
+  "agent->identity": {
+   "identity": 2
+  },
+  "agent->live_config_authority": {
+   "live_config_authority::AgentExecutionAdmission": 2,
+   "live_config_authority::AgentExecutionCapability": 2
+  },
+  "agent->observability": {
+   "observability": 1,
+   "observability::AgentTurnGuard::start": 4,
+   "observability::Observer": 10,
+   "observability::ObserverEvent": 7
+  },
+  "agent->platform": {
+   "platform": 2
+  },
+  "agent->rag": {
+   "rag::HardwareRag": 5,
+   "rag::HardwareRag::load": 2
+  },
+  "agent->security": {
+   "security::AutonomyLevel": 6,
+   "security::AutonomyLevel::Full": 3,
+   "security::AutonomyLevel::ReadOnly": 2,
+   "security::AutonomyLevel::Supervised": 1,
+   "security::SecurityPolicy": 10,
+   "security::SecurityPolicy::default": 1,
+   "security::SecurityPolicy::for_agent": 1,
+   "security::ingress::IngressPolicy": 2,
+   "security::ingress::ingress_policy": 1,
+   "security::ingress::steering_policy": 2,
+   "security::scrub": 1
+  },
+  "agent->skills": {
+   "skills::Skill": 7,
+   "skills::creator::SkillCreator::new": 1,
+   "skills::creator::extract_tool_calls_from_history": 1,
+   "skills::improver::extract_skill_executions_from_history": 1,
+   "skills::load_skills_for_agent_from_config": 4,
+   "skills::render_missing_skill_install_suggestion": 3,
+   "skills::review::maybe_run_skill_review": 1,
+   "skills::skills_prompt_mode_with_loader_fallback": 2,
+   "skills::skills_require_read_tool": 2,
+   "skills::skills_to_prompt_with_mode_and_availability": 3
+  },
+  "agent->sop": {
+   "sop::SopAuditLogger": 2,
+   "sop::SopEngine": 2,
+   "sop::SopRunAction::Cancelled": 1,
+   "sop::SopRunAction::CheckpointWait": 1,
+   "sop::SopRunAction::Completed": 1,
+   "sop::SopRunAction::DeterministicStep": 1,
+   "sop::SopRunAction::ExecuteStep": 1,
+   "sop::SopRunAction::Failed": 1,
+   "sop::SopRunAction::Pending": 1,
+   "sop::SopRunAction::WaitApproval": 1,
+   "sop::SopStep": 1,
+   "sop::SopStepResult": 2,
+   "sop::SopStepStatus::Completed": 1,
+   "sop::SopStepStatus::Failed": 1,
+   "sop::active_scope::HeadlessStepScope": 2,
+   "sop::active_scope::SOP_CONTROL_TOOLS": 1,
+   "sop::active_scope::active_headless_step_scope": 2,
+   "sop::active_scope::resolve_active_step_scope": 1,
+   "sop::audit::audit_for_run": 1,
+   "sop::build_sop_engine_with_capability": 3,
+   "sop::engine::now_iso8601": 2,
+   "sop::executor::MAX_HEADLESS_DRIVE_STEPS": 1,
+   "sop::executor::QueuedSopAction": 2,
+   "sop::executor::advance_sop_step": 1,
+   "sop::executor::audit_sop_step": 1,
+   "sop::executor::drain_live_actions": 1,
+   "sop::executor::drain_step_calls": 1,
+   "sop::executor::fail_exhausted_step_budget": 1,
+   "sop::executor::new_live_action_queue": 1,
+   "sop::executor::new_step_call_sink": 1,
+   "sop::executor::record_step_tool_call": 1,
+   "sop::executor::scope_live_action_queue": 1,
+   "sop::executor::scope_step_call_sink": 1,
+   "sop::executor::step_capture_active": 1
+  },
+  "agent->tools": {
+   "tools": 2,
+   "tools::DelegateTool": 1,
+   "tools::DelegateTool::NAME": 2,
+   "tools::ForwardedEnvironment": 2,
+   "tools::PerToolChannelHandle": 1,
+   "tools::REENTRANT_AGENT_TOOLS": 1,
+   "tools::composio_tool_available": 2,
+   "tools::scoped": 1,
+   "tools::scoped::ScopedAssembled": 2,
+   "tools::scoped::ScopedAssembly": 2,
+   "tools::scoped::ScopedToolRegistry": 6,
+   "tools::scoped::ScopedToolRegistry::assemble_prepared": 2,
+   "tools::supplied_registry_base": 1,
+   "tools::todo_write::parse_entries": 1
+  },
+  "agent->util": {
+   "util::truncate_with_ellipsis": 5
+  },
+  "agent_lifecycle->control_plane": {
+   "control_plane::SqliteTaskStore::new": 1
+  },
+  "agent_lifecycle->cron": {
+   "cron::list_jobs_by_agent": 1,
+   "cron::remove_jobs_by_agent": 1,
+   "cron::rename_jobs_by_agent": 1
+  },
+  "approval->i18n": {
+   "i18n::get_required_cli_string_with_args": 2
+  },
+  "approval->security": {
+   "security::AutonomyLevel": 1
+  },
+  "calendar->sop": {
+   "sop::types::SopEvent": 1,
+   "sop::types::SopTriggerSource": 1
+  },
+  "composition->agent": {
+   "agent::agent::config_switch_provider": 1,
+   "agent::loop_::CLI_CHANNEL_FN": 1
+  },
+  "composition->live_config_authority": {
+   "live_config_authority::AgentExecutionCapability": 1
+  },
+  "composition->observability": {
+   "observability::NoopObserver": 1,
+   "observability::create_observer": 1
+  },
+  "composition->sop": {
+   "sop::SopAuditLogger": 1,
+   "sop::SopEngine": 1
+  },
+  "composition->tools": {
+   "tools::AllToolsResult": 4,
+   "tools::ForwardedEnvironment": 1,
+   "tools::all_tools_with_runtime_context": 1
+  },
+  "cron->agent": {
+   "agent::context_window_exceeded_from_error": 1,
+   "agent::loop_::AgentRunOverrides": 1,
+   "agent::loop_::AgentRunOverrides::default": 1,
+   "agent::run": 1,
+   "agent::run_with_capabilities": 1,
+   "agent::terminal_completion_error_message": 1
+  },
+  "cron->composition": {
+   "composition::RuntimeCapabilities": 7,
+   "composition::RuntimeCapabilities::config_backed_unobserved": 1
+  },
+  "cron->health": {
+   "health::mark_component_error": 1,
+   "health::mark_component_ok": 5
+  },
+  "cron->i18n": {
+   "i18n::get_required_cli_string": 1
+  },
+  "cron->live_config_authority": {
+   "live_config_authority::AgentExecutionAdmission": 1,
+   "live_config_authority::AgentExecutionCapability": 1,
+   "live_config_authority::AgentExecutionSelection": 1
+  },
+  "cron->security": {
+   "security::SecurityPolicy": 2
+  },
+  "cron->tools": {
+   "tools::shell_output::decode_shell_output": 2
+  },
+  "daemon->agent": {
+   "agent::loop_::AgentRunOverrides": 2,
+   "agent::loop_::AgentRunOverrides::default": 2,
+   "agent::pricing_catalog::load_global_pricing_catalog": 1,
+   "agent::run": 2
+  },
+  "daemon->control_plane": {
+   "control_plane::ControlPlaneRecoveryOwner::start": 1,
+   "control_plane::control_plane": 2,
+   "control_plane::init_control_plane": 1,
+   "control_plane::reaper::DEFAULT_MAX_RUNTIME_SECS": 1,
+   "control_plane::spawn_control_plane_reaper": 1
+  },
+  "daemon->cron": {
+   "cron::scheduler::announce_delivery_decision": 1,
+   "cron::scheduler::deliver_announcement": 2,
+   "cron::scheduler::run_with_capability": 1
+  },
+  "daemon->health": {
+   "health::bump_component_restart": 1,
+   "health::mark_component_error": 7,
+   "health::mark_component_ok": 12,
+   "health::snapshot_json": 1
+  },
+  "daemon->heartbeat": {
+   "heartbeat::engine::HeartbeatEngine": 1,
+   "heartbeat::engine::HeartbeatEngine::build_decision_prompt": 1,
+   "heartbeat::engine::HeartbeatEngine::ensure_heartbeat_file": 1,
+   "heartbeat::engine::HeartbeatTask": 2,
+   "heartbeat::engine::TaskPriority": 1,
+   "heartbeat::engine::TaskStatus": 1,
+   "heartbeat::engine::compute_adaptive_interval": 1,
+   "heartbeat::store::record_run": 2
+  },
+  "daemon->hooks": {
+   "hooks::HookRunner": 3,
+   "hooks::HookRunner::from_config": 1,
+   "hooks::HookRunner::from_root_config": 1
+  },
+  "daemon->i18n": {
+   "i18n::get_required_cli_string": 2,
+   "i18n::get_required_cli_string_with_args": 1
+  },
+  "daemon->live_config_authority": {
+   "live_config_authority::AgentExecutionCapability": 2,
+   "live_config_authority::ConfigOwnershipGuard": 1,
+   "live_config_authority::LiveConfigAuthority": 2,
+   "live_config_authority::LiveConfigAuthority::new_owned": 1
+  },
+  "daemon->observability": {
+   "observability::EventBus": 1,
+   "observability::EventBus::new": 1,
+   "observability::Observer": 1,
+   "observability::create_observer": 1
+  },
+  "daemon->restart": {
+   "restart::shutdown_notify": 1
+  },
+  "daemon->rpc": {
+   "rpc::CONNECTION_DRAIN_GRACE": 1,
+   "rpc::auth::RpcInboundAuth": 1,
+   "rpc::auth::RpcInboundAuth::from_config": 1,
+   "rpc::context::ApprovalPendingMap::default": 1,
+   "rpc::context::RpcContext": 2,
+   "rpc::inproc::InprocConnector": 1,
+   "rpc::inproc::InprocConnector::new": 1,
+   "rpc::local::socket_path": 2,
+   "rpc::orphans::spawn_orphan_retirement": 1,
+   "rpc::session::SessionStore": 1,
+   "rpc::tui_identity::TuiRegistry": 1,
+   "rpc::tui_identity::TuiRegistry::for_config": 1
+  },
+  "daemon->security": {
+   "security::audit::AuditLogger": 2,
+   "security::audit::AuditLogger::open_shared": 1
+  },
+  "daemon->sop": {
+   "sop::SopAuditLogger": 3,
+   "sop::SopDriverHandles": 3,
+   "sop::SopEngine": 3
+  },
+  "daemon->util": {
+   "util::release_freed_heap": 2
+  },
+  "doctor->agent": {
+   "agent::system_prompt::BOOTSTRAP_FILES": 1,
+   "agent::system_prompt::BOOTSTRAP_MAX_CHARS": 1,
+   "agent::system_prompt::COMPACT_BOOTSTRAP_MAX_CHARS": 1,
+   "agent::system_prompt::CONDITIONAL_BOOTSTRAP_FILES": 1,
+   "agent::system_prompt::truncate_bootstrap_content": 1
+  },
+  "doctor->daemon": {
+   "daemon::state_file_path": 1
+  },
+  "doctor->i18n": {
+   "i18n::get_required_cli_string": 10,
+   "i18n::get_required_cli_string_with_args": 17
+  },
+  "doctor->identity": {
+   "identity::is_aieos_configured": 1
+  },
+  "doctor->observability": {
+   "observability::runtime_trace::find_event_by_id": 1,
+   "observability::runtime_trace::load_events": 1,
+   "observability::runtime_trace::resolve_trace_path": 1
+  },
+  "doctor->service": {
+   "service::SystemdUserLinger": 1,
+   "service::SystemdUserLinger::Disabled": 1,
+   "service::SystemdUserLinger::Enabled": 1,
+   "service::SystemdUserLinger::Unknown": 1,
+   "service::linux_systemd_runtime_present": 1,
+   "service::systemd_user_linger_status": 1
+  },
+  "enroll->relay": {
+   "relay::ensure_node_id": 1
+  },
+  "enroll->security": {
+   "security::cert_ledger::CertLedger": 1,
+   "security::cert_ledger::CertStatus": 1,
+   "security::cert_ledger::IssuanceActor": 1,
+   "security::cert_ledger::LedgerEntry": 1
+  },
+  "heartbeat->observability": {
+   "observability::Observer": 1,
+   "observability::ObserverEvent": 1
+  },
+  "hooks->agent": {
+   "agent::loop_::scrub_for_export": 1,
+   "agent::turn::redact::scrub_credentials_value": 1
+  },
+  "i18n->generated_locales": {
+   "generated_locales::AVAILABLE_LOCALES": 1
+  },
+  "integrations->i18n": {
+   "i18n::get_required_cli_string": 1,
+   "i18n::get_required_cli_string_with_args": 1
+  },
+  "integrations->tools": {
+   "tools::BUILTIN_TOOL_INTEGRATIONS": 1
+  },
+  "live_config_authority->config_application": {
+   "config_application::ConfigApplicationLedger": 1
+  },
+  "live_config_authority->i18n": {
+   "i18n::get_required_cli_string_with_args": 4
+  },
+  "live_config_authority->util": {
+   "util::shell_escape": 2
+  },
+  "migration->i18n": {
+   "i18n::get_required_cli_string": 1
+  },
+  "observability->agent": {
+   "agent::loop_::scrub_for_export": 1
+  },
+  "observability->util": {
+   "util::truncate_field": 1,
+   "util::truncate_json_leaves": 1
+  },
+  "plugin_runtime->tools": {
+   "tools::plugin_egress_service": 1,
+   "tools::plugin_host_services": 1,
+   "tools::resolve_instance_config": 1
+  },
+  "quickstart->agent": {
+   "agent::personality::EDITABLE_PERSONALITY_FILES": 2,
+   "agent::personality::MAX_FILE_CHARS": 2
+  },
+  "quickstart->i18n": {
+   "i18n::get_required_cli_string": 3,
+   "i18n::get_required_cli_string_with_args": 1
+  },
+  "quickstart->live_config_authority": {
+   "live_config_authority::ConfigCommit": 1
+  },
+  "relay->enroll": {
+   "enroll::BridgePortSet": 4
+  },
+  "relay->relay_dashboard": {
+   "relay_dashboard::DashboardConn::new": 1,
+   "relay_dashboard::DashboardIngress": 1,
+   "relay_dashboard::DashboardOrigin": 1,
+   "relay_dashboard::dashboard_peer": 1
+  },
+  "rpc->agent": {
+   "agent::Agent::strip_interruption_marker_from": 1,
+   "agent::SteeringAdmission": 1,
+   "agent::SteeringAdmission::Refused": 1,
+   "agent::SteeringAdmit": 1,
+   "agent::SteeringInput": 5,
+   "agent::SteeringInput::new": 1,
+   "agent::SteeringInput::with_admission": 1,
+   "agent::SteeringPosture": 3,
+   "agent::agent::Agent": 13,
+   "agent::agent::Agent::from_snapshot_with_tui_env_with_capability": 2,
+   "agent::agent::StreamedTurnError": 3,
+   "agent::agent::StreamedTurnSuccess": 2,
+   "agent::agent::build_session_model_provider": 3,
+   "agent::agent::tool_dispatcher_for_provider": 3,
+   "agent::append_safeguard_fallback_notice": 1,
+   "agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT": 1,
+   "agent::cost::ToolLoopCostTrackingContext": 1,
+   "agent::cost::ToolLoopCostTrackingContext::new": 1,
+   "agent::cost::build_model_provider_pricing": 1,
+   "agent::dispatcher::ToolDispatcher": 2,
+   "agent::loop_::ConfiguredChannelMaps": 1,
+   "agent::loop_::configured_channel_generation_revocation": 1,
+   "agent::loop_::configured_channel_maps": 1,
+   "agent::loop_::refresh_channel_handles": 2,
+   "agent::loop_::scope_session_key": 1,
+   "agent::personality::EDITABLE_PERSONALITY_FILES": 3,
+   "agent::personality::MAX_FILE_CHARS": 4,
+   "agent::personality_templates::TemplateContext": 2,
+   "agent::personality_templates::render_preset_default": 1,
+   "agent::prompt::InteractionSurface": 5,
+   "agent::prompt::InteractionSurface::from_persisted": 5,
+   "agent::prompt::InteractionSurface::resolve": 1,
+   "agent::terminal_completion_error_message": 1,
+   "agent::turn::is_tool_loop_cancelled": 1
+  },
+  "rpc->agent_lifecycle": {
+   "agent_lifecycle::archive_agent_workspace": 1,
+   "agent_lifecycle::cascade_owned_state": 1,
+   "agent_lifecycle::cascade_rename_agent": 1,
+   "agent_lifecycle::plan_agent_delete_with_acp_count": 2
+  },
+  "rpc->cron": {
+   "cron::CronJob": 3,
+   "cron::CronJobPatch": 1,
+   "cron::CronRun": 1,
+   "cron::DeliveryConfig": 1,
+   "cron::JobType::Agent": 2,
+   "cron::Schedule": 1,
+   "cron::add_shell_job_authorized": 1,
+   "cron::get_job": 1,
+   "cron::job_not_found": 2,
+   "cron::list_jobs": 1,
+   "cron::list_jobs_by_agent": 1,
+   "cron::list_runs": 1,
+   "cron::list_runs_for_agent": 1,
+   "cron::remove_job": 1,
+   "cron::remove_job_for_agent": 1,
+   "cron::scheduler::CronDeliveryContext::RpcManual": 1,
+   "cron::scheduler::run_manual_job_with_selection": 1,
+   "cron::update_job_authorized": 1,
+   "cron::validate_shell_command": 1
+  },
+  "rpc->daemon": {
+   "daemon::ChannelGenerationControl": 1,
+   "daemon::PreparedChannelGenerationDrain": 1,
+   "daemon::SocketReadinessReporter": 4
+  },
+  "rpc->doctor": {
+   "doctor::DiagResult": 2,
+   "doctor::Severity": 1,
+   "doctor::Severity::Error": 1,
+   "doctor::Severity::Ok": 1,
+   "doctor::Severity::Warn": 1,
+   "doctor::probe_models": 1,
+   "doctor::run_structured_with_probe": 1
+  },
+  "rpc->enroll": {
+   "enroll::relay_profile": 1
+  },
+  "rpc->health": {
+   "health::snapshot_json": 1
+  },
+  "rpc->hooks": {
+   "hooks::HookRunner": 1
+  },
+  "rpc->i18n": {
+   "i18n::available_locales": 2,
+   "i18n::get_required_cli_string": 35,
+   "i18n::get_required_cli_string_with_args": 7
+  },
+  "rpc->live_config_authority": {
+   "live_config_authority::AgentAdmissionReservation": 2,
+   "live_config_authority::AgentDeleteLease": 1,
+   "live_config_authority::AgentExecutionCapability::from_parts": 4,
+   "live_config_authority::AgentLifecycleCoordinator": 1,
+   "live_config_authority::AgentSessionLease": 2,
+   "live_config_authority::ConfigCommit": 6,
+   "live_config_authority::ConfigCommitError": 2,
+   "live_config_authority::LiveConfigAuthority": 1,
+   "live_config_authority::spawn_agent_lifecycle_job": 5
+  },
+  "rpc->observability": {
+   "observability::EventBuffer": 1,
+   "observability::broadcast::history_events": 1
+  },
+  "rpc->process_stats": {
+   "process_stats::sample": 1
+  },
+  "rpc->quickstart": {
+   "quickstart::AppliedAgent": 1,
+   "quickstart::FieldDescriptor": 1,
+   "quickstart::FieldSection": 1,
+   "quickstart::QuickstartApplyOutcome::Applied": 1,
+   "quickstart::QuickstartApplyOutcome::CommittedWithSideEffectErrors": 1,
+   "quickstart::QuickstartError": 2,
+   "quickstart::QuickstartStep": 1,
+   "quickstart::QuickstartStep::Agent": 1,
+   "quickstart::Surface": 1,
+   "quickstart::Surface::Tui": 5,
+   "quickstart::complete_staged_apply_as_commit": 1,
+   "quickstart::field_shape": 1,
+   "quickstart::model_catalog_with_config_result": 1,
+   "quickstart::model_provider_is_local": 1,
+   "quickstart::record_dismissed": 1,
+   "quickstart::snapshot_state": 1,
+   "quickstart::stage_apply_checked": 1,
+   "quickstart::validate_only_with_surface": 1
+  },
+  "rpc->security": {
+   "security::audit::AuditLogger": 1,
+   "security::audit::AuditLogger::open_shared": 1,
+   "security::auth_provider::Credential": 6,
+   "security::auth_provider::Credential::None": 2,
+   "security::auth_provider::Credential::Peercred": 1,
+   "security::auth_provider::NativeAuthProvider": 1,
+   "security::auth_provider::OidcAuthProvider": 1,
+   "security::auth_provider::PeercredAuthProvider": 1,
+   "security::auth_provider::ProviderRegistry": 1,
+   "security::auth_provider::UidRoster": 1,
+   "security::cert_ledger::CertLedger": 1,
+   "security::cert_ledger::CertStatus": 1,
+   "security::cert_ledger::ISSUANCE_PRECONDITION_FAILED": 1,
+   "security::cert_ledger::LedgerEntry": 1,
+   "security::cert_ledger::effective_revoked_list_path": 1,
+   "security::principal_resolver::PrincipalResolver": 1,
+   "security::principal_resolver::ResolvedPrincipal": 1,
+   "security::principal_resolver::ResolverPolicy": 1
+  },
+  "rpc->skills": {
+   "skills::document::SkillDocument": 1,
+   "skills::frontmatter::SkillFrontmatter": 1,
+   "skills::reference::SkillRef": 1,
+   "skills::service::RemoveMode::Archive": 1,
+   "skills::service::SkillsService": 1,
+   "skills::service::SkillsService::new": 5
+  },
+  "rpc->sop": {
+   "sop::Sop": 8,
+   "sop::SopAuditLogger": 1,
+   "sop::SopAuthorError::AlreadyExists": 2,
+   "sop::SopAuthorError::Io": 2,
+   "sop::SopAuthorError::NotFound": 3,
+   "sop::SopAuthorError::Other": 1,
+   "sop::SopDriverHandles": 1,
+   "sop::SopEngine": 1,
+   "sop::SopEvent": 1,
+   "sop::SopExecutionMode": 2,
+   "sop::SopGraph::from_sop_with_specs": 3,
+   "sop::SopGraphExt": 1,
+   "sop::SopRunAction::DeterministicStep": 1,
+   "sop::SopRunAction::ExecuteStep": 1,
+   "sop::SopTriggerSource::Manual": 1,
+   "sop::ToolSpecs": 1,
+   "sop::WireEdit": 1,
+   "sop::apply_wire": 1,
+   "sop::approval::ApprovalDecision": 1,
+   "sop::approval::ApprovalPrincipal::cli": 1,
+   "sop::approval::BrokerOutcome": 1,
+   "sop::approval::ResolveOutcome": 1,
+   "sop::create_sop_typed": 1,
+   "sop::delete_sop_typed": 1,
+   "sop::dispatch::DispatchResult::BlockedUnsafe": 1,
+   "sop::dispatch::DispatchResult::Coalesced": 1,
+   "sop::dispatch::DispatchResult::Deferred": 1,
+   "sop::dispatch::DispatchResult::NoMatch": 1,
+   "sop::dispatch::DispatchResult::Skipped": 1,
+   "sop::dispatch::DispatchResult::Started": 1,
+   "sop::dispatch::MAX_ACTIVE_DEDUP_KEY_BYTES": 2,
+   "sop::dispatch::SopEffectGuard": 1,
+   "sop::dispatch::dispatch_sop_event_to_authorized": 1,
+   "sop::dispatch::process_headless_results": 1,
+   "sop::drive_resumed_broker_action_with_capability": 1,
+   "sop::engine::now_iso8601": 1,
+   "sop::load_sop_by_name": 6,
+   "sop::load_sops_from_directory": 1,
+   "sop::parse_execution_mode": 1,
+   "sop::parse_steps": 1,
+   "sop::registry_from_config": 1,
+   "sop::rename_sop_typed": 1,
+   "sop::render_steps": 1,
+   "sop::resolve_sop_dir": 1,
+   "sop::resolve_sops_dir": 1,
+   "sop::run_detail_for": 1,
+   "sop::run_overlay_for": 2,
+   "sop::run_summaries_for": 1,
+   "sop::save_existing_sop_typed": 1,
+   "sop::spawn_and_register_sop_driver": 1,
+   "sop::spawn_headless_run_driver": 1,
+   "sop::tool_specs_from_config": 1,
+   "sop::types::SopRunDetail::from_run": 1,
+   "sop::validate_sop_strict": 1
+  },
+  "rpc->tools": {
+   "tools::ForwardedEnvironment": 5,
+   "tools::PerToolChannelHandle": 3,
+   "tools::default_tools": 1,
+   "tools::param_options::resolve_options": 2
+  },
+  "rpc->util": {
+   "util::release_freed_heap": 4
+  },
+  "security->i18n": {
+   "i18n::get_required_cli_string": 1,
+   "i18n::get_required_cli_string_with_args": 2
+  },
+  "security->sop": {
+   "sop::types::SopEvent": 1,
+   "sop::types::SopTriggerSource": 1
+  },
+  "service->i18n": {
+   "i18n::get_required_cli_string_with_args": 1
+  },
+  "skills->agent": {
+   "agent::turn::LoopKnobs::default": 1,
+   "agent::turn::ResolvedAgentExecution::resolve": 1,
+   "agent::turn::ResolvedIo": 1,
+   "agent::turn::ResolvedModelAccess": 2,
+   "agent::turn::ResolvedRuntimeKnobs": 1,
+   "agent::turn::ToolLoop": 1,
+   "agent::turn::run_tool_call_loop": 1
+  },
+  "skills->composition": {
+   "composition::BoundCapabilities": 1
+  },
+  "skills->i18n": {
+   "i18n::get_required_cli_string_with_args": 11
+  },
+  "skills->observability": {
+   "observability::Observer": 1
+  },
+  "skills->plugin_runtime": {
+   "plugin_runtime::PluginActivationPlan::build": 1
+  },
+  "skills->security": {
+   "security::LeakDetector::new": 1,
+   "security::LeakResult::Clean": 1,
+   "security::LeakResult::Detected": 1,
+   "security::SecurityPolicy": 5
+  },
+  "skills->tools": {
+   "tools::AllToolsResult::from_prebuilt_tools": 1,
+   "tools::scoped::ScopedAssembly": 1,
+   "tools::scoped::ScopedToolRegistry::assemble": 1,
+   "tools::shell_output::decode_shell_output": 2,
+   "tools::skill_http::*": 1,
+   "tools::skill_manage::SkillManageTool": 1,
+   "tools::skill_manage::SkillViewTool": 1,
+   "tools::skill_manage::SkillsListTool": 1,
+   "tools::skill_tool::*": 1,
+   "tools::skill_tool::composed_tool_name": 3
+  },
+  "sop->agent": {
+   "agent::history::truncate_tool_result": 2,
+   "agent::loop_::AgentRunOverrides": 1,
+   "agent::run": 1,
+   "agent::semantic_empty_terminal_completion_message": 1,
+   "agent::terminal_completion_error_message": 1,
+   "agent::turn::redact::scrub_credentials": 3,
+   "agent::turn::redact::scrub_credentials_value": 2,
+   "agent::turn::step_agent_memory": 1
+  },
+  "sop->calendar": {
+   "calendar::CALENDAR_NO_SHOW_TOPIC": 1,
+   "calendar::CalendarNoShowEvent": 1
+  },
+  "sop->cron": {
+   "cron::normalize_expression": 1
+  },
+  "sop->health": {
+   "health::mark_component_error": 5,
+   "health::mark_component_ok": 1
+  },
+  "sop->i18n": {
+   "i18n::get_required_cli_string": 6,
+   "i18n::get_required_cli_string_with_args": 4
+  },
+  "sop->live_config_authority": {
+   "live_config_authority::AgentExecutionAdmission": 1,
+   "live_config_authority::AgentExecutionCapability": 4,
+   "live_config_authority::AgentExecutionError": 1,
+   "live_config_authority::AgentExecutionSelection": 1
+  },
+  "sop->security": {
+   "security::ContentSafety": 2,
+   "security::LeakDetector": 1,
+   "security::LeakResult": 1,
+   "security::ScanOutcome": 1,
+   "security::ScreenVerdict": 1,
+   "security::cap_untrusted": 2,
+   "security::new_marker_id": 1,
+   "security::scrub": 1
+  },
+  "sop->tools": {
+   "tools::default_tools": 1
+  },
+  "tools->agent": {
+   "agent::AgentAttribution": 3,
+   "agent::agent::RoutedApprovalChannel::new": 1,
+   "agent::agent::build_session_model_provider_with_capabilities": 1,
+   "agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT": 2,
+   "agent::cost::TOOL_LOOP_TURN_USAGE": 2,
+   "agent::cost::ToolLoopCostTrackingContext": 2,
+   "agent::cost::TurnUsage": 2,
+   "agent::cost::tool_loop_cost_tracking_context_for_agent": 1,
+   "agent::cost::tool_loop_cost_tracking_context_from_tracker": 1,
+   "agent::dispatcher::ToolDispatcher": 1,
+   "agent::dispatcher::XmlToolDispatcher": 1,
+   "agent::execution_tree_budget::ExecutionTreeBudget": 1,
+   "agent::loop_::AgentRunOverrides": 1,
+   "agent::loop_::IMAGE_DATA_URI_REGEX": 1,
+   "agent::loop_::append_pinned_mcp_section": 1,
+   "agent::loop_::apply_text_tool_prompt_policy": 1,
+   "agent::loop_::eager_mcp_tool_allowed": 1,
+   "agent::loop_::live_approval_channel_registry": 1,
+   "agent::loop_::load_peripheral_tools": 1,
+   "agent::loop_::mcp_allowed_tool_count": 1,
+   "agent::loop_::mcp_tool_access_policy": 1,
+   "agent::loop_::preactivate_always_filter_groups": 1,
+   "agent::loop_::process_message_shared_with_capabilities": 1,
+   "agent::loop_::process_message_shared_with_live_config_and_admission_and_principal": 1,
+   "agent::loop_::register_eager_mcp_tool_if_allowed": 1,
+   "agent::prompt::DateTimeSection": 1,
+   "agent::prompt::PromptContext": 1,
+   "agent::prompt::RuntimeSection": 1,
+   "agent::prompt::SafetySection": 1,
+   "agent::prompt::ShellSection": 1,
+   "agent::prompt::SkillsSection": 1,
+   "agent::prompt::SystemPromptBuilder": 1,
+   "agent::prompt::ToolsSection": 1,
+   "agent::prompt::WorkspaceSection": 1,
+   "agent::run": 1,
+   "agent::run_with_capabilities": 1,
+   "agent::thinking::apply_thinking_level_with_config": 1,
+   "agent::thinking::clamp_temperature": 1,
+   "agent::tool_receipts::TOOL_LOOP_RECEIPT_CONTEXT": 4,
+   "agent::tool_receipts::detached_scope": 1,
+   "agent::tool_receipts::scope_receipts": 1,
+   "agent::turn::LoopKnobs": 1,
+   "agent::turn::MemoryPreamble": 1,
+   "agent::turn::ResolvedAgentExecution": 1,
+   "agent::turn::ResolvedIo": 1,
+   "agent::turn::ResolvedModelAccess": 1,
+   "agent::turn::ResolvedRuntimeKnobs": 1,
+   "agent::turn::ToolLoop": 1,
+   "agent::turn::current_model_switch_state": 1,
+   "agent::turn::model_switch_provider_allowed": 1,
+   "agent::turn::outcome::semantic_empty_terminal_completion_message": 1,
+   "agent::turn::outcome::terminal_completion_error_message": 1,
+   "agent::turn::redact::SENSITIVE_KEY_REGEX": 1,
+   "agent::turn::redact::SENSITIVE_KV_REGEX": 1,
+   "agent::turn::run_tool_call_loop": 1
+  },
+  "tools->approval": {
+   "approval::ApprovalManager": 1,
+   "approval::ApprovalRequirement": 1
+  },
+  "tools->composition": {
+   "composition::BoundCapabilities": 4,
+   "composition::CapabilitySlot": 9,
+   "composition::NativeRecipeInputs": 1,
+   "composition::PreparedRegistry": 1,
+   "composition::RegistryConstruction": 2,
+   "composition::RegistryConstruction::NativeCompat": 4,
+   "composition::RegistryConstruction::SuppliedOnly": 3,
+   "composition::RuntimeCapabilities": 2,
+   "composition::RuntimeCapabilities::config_backed_unobserved": 1,
+   "composition::ToolRequest": 2
+  },
+  "tools->control_plane": {
+   "control_plane::ControlPlaneHandle": 3,
+   "control_plane::TaskKind": 1,
+   "control_plane::TaskKind::Delegate": 2,
+   "control_plane::TaskKind::Subagent": 1,
+   "control_plane::TaskProgress": 2,
+   "control_plane::TaskProgressTool": 1,
+   "control_plane::TaskRecord": 4,
+   "control_plane::TaskRegistry": 7,
+   "control_plane::TaskStatus": 4,
+   "control_plane::TaskStatus::Cancelled": 3,
+   "control_plane::TaskStatus::Completed": 4,
+   "control_plane::TaskStatus::Failed": 5,
+   "control_plane::TaskStatus::Lost": 1,
+   "control_plane::TaskStatus::Paused": 1,
+   "control_plane::TaskStatus::Running": 4,
+   "control_plane::TaskStatus::TimedOut": 1,
+   "control_plane::control_plane": 4,
+   "control_plane::non_daemon_control_plane": 2,
+   "control_plane::reaper::recover_exited_delegate_worker": 1,
+   "control_plane::task_registry::TerminalSettlementIntent": 2
+  },
+  "tools->cron": {
+   "cron": 7,
+   "cron::CronJob": 1,
+   "cron::CronJobPatch": 1,
+   "cron::DeliveryConfig": 1,
+   "cron::JobType": 2,
+   "cron::Schedule": 2,
+   "cron::SessionTarget": 1,
+   "cron::deserialize_maybe_stringified": 1,
+   "cron::scheduler::deliver_announcement": 1
+  },
+  "tools->i18n": {
+   "i18n::get_required_cli_string": 7,
+   "i18n::get_required_cli_string_with_args": 11,
+   "i18n::get_tool_description": 1
+  },
+  "tools->live_config_authority": {
+   "live_config_authority::AgentExecutionAdmission": 2,
+   "live_config_authority::AgentExecutionCapability": 5
+  },
+  "tools->peers": {
+   "peers::resolve_peer_set": 2
+  },
+  "tools->plugin_runtime": {
+   "plugin_runtime::PluginActivationPlan::build": 1,
+   "plugin_runtime::plugin_limits": 1
+  },
+  "tools->plugin_state": {
+   "plugin_state::PluginStateStore::new": 1
+  },
+  "tools->quickstart": {
+   "quickstart::model_listing_is_unsupported": 1
+  },
+  "tools->security": {
+   "security::AutonomyLevel::default": 1,
+   "security::NoopSandbox": 1,
+   "security::Sandbox": 1,
+   "security::SandboxExtraRoots": 1,
+   "security::SecurityPolicy": 14,
+   "security::create_sandbox": 1,
+   "security::playbook::Playbook": 1,
+   "security::playbook::StepStatus": 1,
+   "security::playbook::evaluate_step": 1,
+   "security::playbook::load_playbooks": 1,
+   "security::playbook::severity_level": 1,
+   "security::traits::Sandbox": 2,
+   "security::vulnerability::generate_summary": 1,
+   "security::vulnerability::parse_vulnerability_json": 1
+  },
+  "tools->skills": {
+   "skills::Skill": 9,
+   "skills::SkillTool": 5,
+   "skills::audit::SkillAuditOptions": 2,
+   "skills::audit::audit_skill_directory_with_options": 2,
+   "skills::builtin_skill_source": 1,
+   "skills::improver::SkillImprover::new": 1,
+   "skills::improver::validate_skill_content": 1,
+   "skills::load_skills_for_agent_from_config": 3,
+   "skills::load_skills_from_directory": 2,
+   "skills::prepare_skill_tools_with_runtime": 1,
+   "skills::resolve_skill_elevation": 1,
+   "skills::skills_dir": 1,
+   "skills::skills_require_read_tool": 1,
+   "skills::skills_to_tools_with_context_and_runtime_optional_nat64": 1
+  },
+  "tools->sop": {
+   "sop::ProposalStatus": 1,
+   "sop::SopAuditLogger": 3,
+   "sop::SopEngine": 6,
+   "sop::SopMetricsCollector": 2,
+   "sop::SopMetricsCollector::shared": 1,
+   "sop::active_scope::active_headless_step_scope": 5,
+   "sop::active_scope::with_inherited_headless_step_scope": 3,
+   "sop::approval::ApprovalDecision": 1,
+   "sop::approval::ApprovalPrincipal": 1,
+   "sop::approval::BrokerOutcome": 1,
+   "sop::approval::ResolveOutcome": 1,
+   "sop::audit::SopAuditLogger": 1,
+   "sop::audit::audit_for_run": 2,
+   "sop::audit::session_audit": 3,
+   "sop::engine::SopEngine": 1,
+   "sop::engine::now_iso8601": 2,
+   "sop::executor::enqueue_live_action": 3,
+   "sop::procedural_memory::ProposalDraft": 1,
+   "sop::procedural_memory::apply_proposal": 1,
+   "sop::procedural_memory::capture_successful_run": 1,
+   "sop::procedural_memory::create_proposal": 1,
+   "sop::procedural_memory::set_proposal_status": 1,
+   "sop::types::SopEvent": 1,
+   "sop::types::SopRunAction": 3,
+   "sop::types::SopStepResult": 1,
+   "sop::types::SopStepStatus": 1,
+   "sop::types::SopTriggerSource": 1
+  },
+  "tools->subagent": {
+   "subagent::SubAgentOverrides": 1,
+   "subagent::SubAgentSpawn": 1
+  },
+  "tools->util": {
+   "util::shell_escape": 1
+  },
+  "tools->verifiable_intent": {
+   "verifiable_intent::error::ViError": 1,
+   "verifiable_intent::types::Constraint": 1,
+   "verifiable_intent::types::Fulfillment": 1,
+   "verifiable_intent::types::MandateMode": 1,
+   "verifiable_intent::verification::ConstraintCheckResult": 1,
+   "verifiable_intent::verification::StrictnessMode": 1,
+   "verifiable_intent::verification::check_constraints": 1,
+   "verifiable_intent::verification::verify_sd_hash_binding": 1,
+   "verifiable_intent::verification::verify_timestamps": 1
+  }
+ },
+ "test_edges": {
+  "agent": {
+   "approval": 23,
+   "composition": 104,
+   "hooks": 79,
+   "i18n": 67,
+   "live_config_authority": 10,
+   "observability": 176,
+   "rag": 1,
+   "rpc": 5,
+   "security": 69,
+   "skills": 34,
+   "sop": 143,
+   "tools": 327
+  },
+  "agent_lifecycle": {
+   "control_plane": 5
+  },
+  "composition": {
+   "agent": 7,
+   "observability": 2,
+   "skills": 2,
+   "sop": 1,
+   "tools": 11
+  },
+  "cron": {
+   "agent": 1,
+   "composition": 5,
+   "health": 4,
+   "i18n": 3,
+   "live_config_authority": 6,
+   "security": 6,
+   "tools": 10
+  },
+  "daemon": {
+   "agent": 14,
+   "health": 6,
+   "heartbeat": 5,
+   "hooks": 2,
+   "i18n": 1,
+   "live_config_authority": 11,
+   "observability": 4,
+   "rpc": 8,
+   "security": 1,
+   "tools": 1
+  },
+  "doctor": {
+   "i18n": 11,
+   "service": 3
+  },
+  "enroll": {
+   "security": 8
+  },
+  "heartbeat": {
+   "observability": 6
+  },
+  "live_config_authority": {
+   "util": 11
+  },
+  "migration": {
+   "i18n": 1
+  },
+  "plugin_runtime": {
+   "tools": 1
+  },
+  "quickstart": {
+   "live_config_authority": 1
+  },
+  "relay": {
+   "enroll": 5,
+   "relay_dashboard": 4
+  },
+  "rpc": {
+   "agent": 78,
+   "cron": 63,
+   "daemon": 7,
+   "doctor": 7,
+   "hooks": 11,
+   "i18n": 17,
+   "live_config_authority": 10,
+   "observability": 51,
+   "security": 62,
+   "skills": 1,
+   "sop": 195,
+   "tools": 38
+  },
+  "security": {
+   "i18n": 2,
+   "sop": 1,
+   "tools": 1
+  },
+  "service": {
+   "restart": 3
+  },
+  "skills": {
+   "agent": 2,
+   "i18n": 1,
+   "observability": 1,
+   "security": 2,
+   "tools": 6
+  },
+  "sop": {
+   "agent": 5,
+   "i18n": 2,
+   "live_config_authority": 3,
+   "tools": 2
+  },
+  "tools": {
+   "agent": 53,
+   "composition": 48,
+   "control_plane": 20,
+   "cron": 22,
+   "i18n": 24,
+   "live_config_authority": 12,
+   "observability": 2,
+   "plugin_state": 1,
+   "security": 29,
+   "skills": 26,
+   "sop": 57
+  }
+ },
+ "test_files": [
+  "agent/parity.rs",
+  "agent/plugin_live_config.rs",
+  "agent/safety_net.rs",
+  "agent/safety_net_loop_recovery.rs",
+  "agent/tests.rs",
+  "composition/supplied_only_traps.rs",
+  "rpc/dispatch/tests/principal_headless.rs",
+  "rpc/dispatch/tests/sop_principal.rs",
+  "rpc/dispatch/tests/steering_posture.rs",
+  "sop/store/testing.rs",
+  "tools/r5_namespace_tests.rs",
+  "trust/tests.rs"
+ ],
+ "test_symbols": {
+  "agent->approval": {
+   "approval::ApprovalManager": 5,
+   "approval::ApprovalManager::for_bounded_non_interactive": 1,
+   "approval::ApprovalManager::for_non_interactive": 9,
+   "approval::ApprovalManager::for_non_interactive_backchannel": 3,
+   "approval::ApprovalRequirement::NotRequired": 1,
+   "approval::ApprovalRequirement::Prompt": 1,
+   "approval::ApprovalResponse::Always": 1,
+   "approval::ApprovalResponse::No": 1,
+   "approval::ApprovalResponse::Yes": 1
+  },
+  "agent->composition": {
+   "composition::BoundCapabilities": 10,
+   "composition::ChannelSource": 1,
+   "composition::MemoryRequest": 3,
+   "composition::MemorySource": 3,
+   "composition::NativeRecipeInputs": 4,
+   "composition::NativeRegistryRecipe": 4,
+   "composition::ProviderRequest": 4,
+   "composition::ProviderSource": 3,
+   "composition::RuntimeCapabilities": 4,
+   "composition::RuntimeCapabilities::config_backed_unobserved": 3,
+   "composition::ToolRequest": 3,
+   "composition::ToolSource": 2,
+   "composition::config_backed::NoOutboundChannels": 1,
+   "composition::config_backed::NoSuppliedTools": 1,
+   "composition::config_backed::native_compat_registry": 2,
+   "composition::test_support::CountingEndpoint": 1,
+   "composition::test_support::IMAGE_TURN": 5,
+   "composition::test_support::NoTools": 5,
+   "composition::test_support::PrincipalRequiredProviders": 1,
+   "composition::test_support::REFUSAL": 1,
+   "composition::test_support::RecordingMemory": 5,
+   "composition::test_support::RecordingProviders": 7,
+   "composition::test_support::RefusingProviders": 1,
+   "composition::test_support::STUB_REPLY": 3,
+   "composition::test_support::SeenProviderRequest": 2,
+   "composition::test_support::VISION_REFUSAL": 3,
+   "composition::test_support::VISION_REPLY": 2,
+   "composition::test_support::VisionRouteProviders": 5,
+   "composition::test_support::capabilities_with_providers": 7,
+   "composition::test_support::counting_endpoint": 3,
+   "composition::test_support::recording_capabilities": 5
+  },
+  "agent->hooks": {
+   "hooks::HookHandler": 16,
+   "hooks::HookResult": 16,
+   "hooks::HookResult::Cancel": 5,
+   "hooks::HookResult::Continue": 11,
+   "hooks::HookRunner": 8,
+   "hooks::HookRunner::new": 23
+  },
+  "agent->i18n": {
+   "i18n::get_disk_override_cli_string_for_test": 2,
+   "i18n::get_english_cli_string_with_args": 18,
+   "i18n::get_required_cli_string": 44,
+   "i18n::get_required_cli_string_with_args": 3
+  },
+  "agent->live_config_authority": {
+   "live_config_authority::AgentAdmissionError::Deleting": 1,
+   "live_config_authority::AgentDeleteBlocker": 1,
+   "live_config_authority::AgentExecutionCapability": 2,
+   "live_config_authority::AgentExecutionError": 1,
+   "live_config_authority::AgentExecutionError::Admission": 1,
+   "live_config_authority::AgentLifecycleCoordinator": 1,
+   "live_config_authority::LiveConfigAuthority": 1,
+   "live_config_authority::LiveConfigAuthority::new": 2
+  },
+  "agent->observability": {
+   "observability": 3,
+   "observability::NoopObserver": 142,
+   "observability::Observer": 12,
+   "observability::ObserverEvent": 6,
+   "observability::ObserverEvent::LlmRequest": 2,
+   "observability::ObserverEvent::MemoryRecall": 1,
+   "observability::ObserverEvent::ToolCall": 1,
+   "observability::noop::NoopObserver": 9
+  },
+  "agent->rag": {
+   "rag::HardwareRag::load": 1
+  },
+  "agent->rpc": {
+   "rpc::approval_channel::RpcApprovalChannel": 2,
+   "rpc::context::ApprovalPendingMap": 2,
+   "rpc::dispatch::notification_for_turn_event_for_test": 1
+  },
+  "agent->security": {
+   "security::AutonomyLevel": 3,
+   "security::AutonomyLevel::Full": 10,
+   "security::AutonomyLevel::Supervised": 3,
+   "security::AutonomyLevel::default": 4,
+   "security::SecurityPolicy": 17,
+   "security::SecurityPolicy::default": 30,
+   "security::ingress::with_test_policy_probe": 2
+  },
+  "agent->skills": {
+   "skills::Skill": 16,
+   "skills::SkillTool": 12,
+   "skills::creator::SkillCreator": 1,
+   "skills::creator::ToolCallRecord": 1,
+   "skills::review::maybe_run_skill_review": 4
+  },
+  "agent->sop": {
+   "sop::Sop": 2,
+   "sop::SopAuditLogger": 2,
+   "sop::SopAuditLogger::new": 2,
+   "sop::SopEngine": 13,
+   "sop::SopEngine::new": 12,
+   "sop::SopExecutionMode::Auto": 2,
+   "sop::SopPriority::Normal": 2,
+   "sop::SopRunStatus::Completed": 2,
+   "sop::SopStep": 4,
+   "sop::SopStep::default": 4,
+   "sop::SopStepKind::default": 2,
+   "sop::SopStepResult": 1,
+   "sop::SopStepStatus::Completed": 1,
+   "sop::SopTrigger::Manual": 2,
+   "sop::StepToolScope": 2,
+   "sop::active_scope::HeadlessStepScope": 3,
+   "sop::active_scope::with_active_headless_step_scope": 1,
+   "sop::active_scope::with_inherited_headless_step_scope": 1,
+   "sop::build_sop_engine": 1,
+   "sop::executor::MAX_HEADLESS_DRIVE_STEPS": 1,
+   "sop::executor::QueuedSopAction": 1,
+   "sop::executor::drain_live_actions": 5,
+   "sop::executor::new_live_action_queue": 5,
+   "sop::executor::scope_live_action_queue": 5,
+   "sop::types::*": 1,
+   "sop::types::Sop": 4,
+   "sop::types::SopAdmissionPolicy::Parallel": 2,
+   "sop::types::SopEvent": 3,
+   "sop::types::SopExecutionMode": 9,
+   "sop::types::SopExecutionMode::Auto": 2,
+   "sop::types::SopExecutionMode::Supervised": 1,
+   "sop::types::SopPriority": 3,
+   "sop::types::SopRunAction": 10,
+   "sop::types::SopRunAction::DeterministicStep": 1,
+   "sop::types::SopRunStatus": 1,
+   "sop::types::SopStep": 3,
+   "sop::types::SopStep::default": 1,
+   "sop::types::SopStepKind": 1,
+   "sop::types::SopStepResult": 5,
+   "sop::types::SopStepStatus::Completed": 9,
+   "sop::types::SopStepStatus::Failed": 5,
+   "sop::types::SopTrigger": 3,
+   "sop::types::SopTriggerSource": 3
+  },
+  "agent->tools": {
+   "tools::AllToolsResult": 2,
+   "tools::AllToolsResult::from_prebuilt_tools": 4,
+   "tools::ArcToolRef": 7,
+   "tools::DelegateParentToolsHandle": 2,
+   "tools::DelegateTool": 3,
+   "tools::DelegateTool::new": 6,
+   "tools::SopExecuteTool::new": 2,
+   "tools::SpawnSubagentTool::NAME": 1,
+   "tools::SpawnSubagentTool::new": 1,
+   "tools::all_tools": 2,
+   "tools::all_tools_with_runtime": 1,
+   "tools::all_tools_with_runtime_context": 2,
+   "tools::default_tools": 1,
+   "tools::late_tool_search_observer::CaseTrace::default": 1,
+   "tools::late_tool_search_observer::scope_case": 1,
+   "tools::scoped::ScopedAssembly": 8,
+   "tools::scoped::ScopedToolRegistry": 14,
+   "tools::scoped::ScopedToolRegistry::assemble": 6,
+   "tools::scoped::ScopedToolRegistry::from_raw_for_test": 253,
+   "tools::shell::ShellTool::new": 2,
+   "tools::skill_tool::SkillBuiltinTool": 1,
+   "tools::skill_tool::SkillBuiltinTool::new": 3,
+   "tools::skill_tool::composed_tool_name": 1,
+   "tools::spawn_subagent::CHILD_MEMORY_SINK": 3
+  },
+  "agent_lifecycle->control_plane": {
+   "control_plane::SqliteTaskStore": 1,
+   "control_plane::TaskKind": 1,
+   "control_plane::TaskRecord": 1,
+   "control_plane::TaskRegistry": 1,
+   "control_plane::TaskStatus": 1
+  },
+  "composition->agent": {
+   "agent::agent::Agent::from_config_with_capabilities": 1,
+   "agent::loop_::AgentRunOverrides::default": 1,
+   "agent::loop_::process_message_with_capabilities": 1,
+   "agent::loop_::register_peripheral_tools_fn": 1,
+   "agent::loop_::run_with_capabilities": 1,
+   "agent::tool_execution::find_tool": 1,
+   "agent::turn::assemble_owned_execution_with_capabilities": 1
+  },
+  "composition->observability": {
+   "observability::NoopObserver": 2
+  },
+  "composition->skills": {
+   "skills::Skill": 1,
+   "skills::load_skills_for_agent_from_config": 1
+  },
+  "composition->sop": {
+   "sop::SopEngine::new": 1
+  },
+  "composition->tools": {
+   "tools::AllToolsResult::from_prebuilt_tools": 2,
+   "tools::DelegateParentToolsHandle": 3,
+   "tools::delegate::DelegateTool::new": 1,
+   "tools::scoped::ScopedAssembled": 2,
+   "tools::scoped::ScopedAssembly": 1,
+   "tools::scoped::ScopedToolRegistry::assemble_prepared": 1,
+   "tools::skill_tool::composed_tool_name": 1
+  },
+  "cron->agent": {
+   "agent::ContextWindowExceeded": 1
+  },
+  "cron->composition": {
+   "composition::test_support::NoTools": 1,
+   "composition::test_support::RecordingMemory": 1,
+   "composition::test_support::RecordingProviders": 1,
+   "composition::test_support::STUB_REPLY": 1,
+   "composition::test_support::recording_capabilities": 1
+  },
+  "cron->health": {
+   "health::mark_component_error": 1,
+   "health::mark_component_ok": 1,
+   "health::snapshot_json": 2
+  },
+  "cron->i18n": {
+   "i18n::get_required_cli_string": 3
+  },
+  "cron->live_config_authority": {
+   "live_config_authority::AgentDeleteBlocker::ActiveTurns": 1,
+   "live_config_authority::LiveConfigAuthority::new": 5
+  },
+  "cron->security": {
+   "security::AutonomyLevel": 1,
+   "security::AutonomyLevel::Full": 1,
+   "security::AutonomyLevel::ReadOnly": 2,
+   "security::AutonomyLevel::Supervised": 1,
+   "security::SecurityPolicy": 1
+  },
+  "cron->tools": {
+   "tools::shell::shell_grammar_test_support::BASH_ONLY_HEREDOC": 2,
+   "tools::shell::shell_grammar_test_support::MispredictingRuntime": 2,
+   "tools::shell::shell_grammar_test_support::RAN_OUTSIDE_BASH": 1,
+   "tools::shell::shell_grammar_test_support::host_bash": 2,
+   "tools::shell::shell_grammar_test_support::host_shell_other_than_bash": 1,
+   "tools::shell::shell_grammar_test_support::wildcard_policy": 2
+  },
+  "daemon->agent": {
+   "agent::agent::Agent::builder": 1,
+   "agent::dispatcher::NativeToolDispatcher": 1,
+   "agent::loop_::AgentRunOverrides": 6,
+   "agent::loop_::AgentRunOverrides::default": 6
+  },
+  "daemon->health": {
+   "health::snapshot_json": 6
+  },
+  "daemon->heartbeat": {
+   "heartbeat::engine::HeartbeatEngine::ensure_heartbeat_file": 1,
+   "heartbeat::engine::HeartbeatEngine::new": 1,
+   "heartbeat::engine::HeartbeatTask": 1,
+   "heartbeat::engine::TaskPriority": 1,
+   "heartbeat::engine::TaskStatus": 1
+  },
+  "daemon->hooks": {
+   "hooks::HookHandler": 1,
+   "hooks::HookRunner::new": 1
+  },
+  "daemon->i18n": {
+   "i18n::init": 1
+  },
+  "daemon->live_config_authority": {
+   "live_config_authority::AgentAdmissionError": 1,
+   "live_config_authority::AgentExecutionError": 1,
+   "live_config_authority::ConfigOwnershipError": 2,
+   "live_config_authority::ConfigOwnershipGuard": 2,
+   "live_config_authority::LiveConfigAuthority::new": 1,
+   "live_config_authority::LiveConfigAuthority::new_owned": 2,
+   "live_config_authority::LiveConfigAuthority::new_with_ownership": 2
+  },
+  "daemon->observability": {
+   "observability::HOOK_TEST_LOCK": 1,
+   "observability::NoopObserver": 1,
+   "observability::Observer": 1,
+   "observability::noop::NoopObserver": 1
+  },
+  "daemon->rpc": {
+   "rpc::CONNECTION_DRAIN_GRACE": 1,
+   "rpc::context::RpcContext::minimal": 1,
+   "rpc::inproc::InprocConnector": 1,
+   "rpc::local::socket_path": 2,
+   "rpc::session::RpcSession::new": 1,
+   "rpc::session::SessionStore": 1,
+   "rpc::subscription::SubscriptionHub::new": 1
+  },
+  "daemon->security": {
+   "security::AutonomyLevel::Full": 1
+  },
+  "daemon->tools": {
+   "tools::scoped::ScopedToolRegistry::from_raw_for_test": 1
+  },
+  "doctor->i18n": {
+   "i18n::get_required_cli_string": 6,
+   "i18n::get_required_cli_string_with_args": 5
+  },
+  "doctor->service": {
+   "service::SystemdUserLinger::Disabled": 1,
+   "service::SystemdUserLinger::Enabled": 1,
+   "service::SystemdUserLinger::Unknown": 1
+  },
+  "enroll->security": {
+   "security::audit::AuditLogger::new": 3,
+   "security::cert_ledger::CertLedger": 1,
+   "security::cert_ledger::revoked_list_path": 4
+  },
+  "heartbeat->observability": {
+   "observability::NoopObserver": 6
+  },
+  "live_config_authority->util": {
+   "util::shell_escape": 11
+  },
+  "migration->i18n": {
+   "i18n::get_required_cli_string": 1
+  },
+  "plugin_runtime->tools": {
+   "tools::plugin_host_services": 1
+  },
+  "quickstart->live_config_authority": {
+   "live_config_authority::LiveConfigAuthority::new": 1
+  },
+  "relay->enroll": {
+   "enroll::BridgePortSet": 5
+  },
+  "relay->relay_dashboard": {
+   "relay_dashboard::DashboardIngress::new": 2,
+   "relay_dashboard::DashboardOrigin::new": 2
+  },
+  "rpc->agent": {
+   "agent::Agent::builder": 1,
+   "agent::SteeringInput": 1,
+   "agent::agent::Agent": 12,
+   "agent::agent::Agent::builder": 23,
+   "agent::agent::TestTurnEntryPause::new": 1,
+   "agent::append_safeguard_fallback_notice": 1,
+   "agent::dispatcher::NativeToolDispatcher": 33,
+   "agent::history_trim::trim_conversation_to_recent_turns": 1,
+   "agent::loop_::register_approval_channel_map_fn": 1,
+   "agent::prompt::InteractionSurface": 1,
+   "agent::semantic_empty_terminal_completion_message": 1,
+   "agent::terminal_completion_error_message": 1,
+   "agent::turn::ToolLoopCancelled": 1
+  },
+  "rpc->cron": {
+   "cron::CronJob": 2,
+   "cron::DeliveryConfig": 1,
+   "cron::RunOutcomes": 2,
+   "cron::RunProvenance": 2,
+   "cron::Schedule::Cron": 5,
+   "cron::Schedule::Every": 1,
+   "cron::SessionTarget::Isolated": 3,
+   "cron::add_agent_job": 3,
+   "cron::add_shell_job_with_approval": 4,
+   "cron::get_job": 12,
+   "cron::list_jobs": 13,
+   "cron::list_runs": 6,
+   "cron::notify_patch_writer_wait_for_test": 1,
+   "cron::pause_job": 2,
+   "cron::record_run": 2,
+   "cron::rename_jobs_by_agent": 1,
+   "cron::reset_write_connection_count_for_tests": 1,
+   "cron::scheduler::register_delivery_fn": 1,
+   "cron::write_connection_count_for_tests": 1
+  },
+  "rpc->daemon": {
+   "daemon::ChannelGenerationControl::new": 1,
+   "daemon::RpcDrain::Complete": 2,
+   "daemon::SocketReadinessReporter::new": 2,
+   "daemon::await_rpc_connection_drain_with": 2
+  },
+  "rpc->doctor": {
+   "doctor::DiagResult": 2,
+   "doctor::Severity::Error": 1,
+   "doctor::Severity::Ok": 2,
+   "doctor::Severity::Warn": 2
+  },
+  "rpc->hooks": {
+   "hooks::HookHandler": 2,
+   "hooks::HookRunner::new": 9
+  },
+  "rpc->i18n": {
+   "i18n::available_locales": 2,
+   "i18n::get_required_cli_string": 15
+  },
+  "rpc->live_config_authority": {
+   "live_config_authority::AgentDeleteBlocker": 2,
+   "live_config_authority::AgentDeleteBlocker::Deleting": 2,
+   "live_config_authority::LiveConfigAuthority::for_tests": 4,
+   "live_config_authority::LiveConfigAuthority::for_tests_sharing_writer": 1,
+   "live_config_authority::LiveConfigAuthority::new": 1
+  },
+  "rpc->observability": {
+   "observability::BroadcastObserver": 2,
+   "observability::EventBuffer": 1,
+   "observability::EventBus": 2,
+   "observability::EventBus::with_capacities": 2,
+   "observability::HOOK_TEST_LOCK": 1,
+   "observability::NoopObserver": 6,
+   "observability::Observer": 7,
+   "observability::ObserverEvent": 3,
+   "observability::clear_broadcast_hook": 2,
+   "observability::create_observer": 1,
+   "observability::noop::NoopObserver": 23,
+   "observability::set_scoped_broadcast_hook": 1
+  },
+  "rpc->security": {
+   "security::AutonomyLevel::Full": 1,
+   "security::audit::AuditEvent": 1,
+   "security::audit::AuditEventType::CertRenewed": 1,
+   "security::audit::AuditLogger::open_shared": 1,
+   "security::audit::verify_chain": 2,
+   "security::auth_provider::Credential": 1,
+   "security::auth_provider::Credential::None": 13,
+   "security::auth_provider::Credential::Peercred": 14,
+   "security::auth_provider::PeercredAuthProvider::current_process_uid": 2,
+   "security::cert_ledger::CertLedger": 8,
+   "security::cert_ledger::CertStatus": 8,
+   "security::cert_ledger::LedgerEntry": 8,
+   "security::cert_ledger::effective_revoked_list_path": 1,
+   "security::cert_ledger::revoked_list_path": 1
+  },
+  "rpc->skills": {
+   "skills::load_skills_for_agent_from_config": 1
+  },
+  "rpc->sop": {
+   "sop::DecisionModel": 2,
+   "sop::Sop": 8,
+   "sop::SopAuditLogger": 1,
+   "sop::SopAuditLogger::new": 5,
+   "sop::SopDriverHandles": 3,
+   "sop::SopDriverHandles::default": 5,
+   "sop::SopEngine": 10,
+   "sop::SopEngine::new": 14,
+   "sop::SopEvent": 4,
+   "sop::SopExecutionMode": 5,
+   "sop::SopExecutionMode::Supervised": 2,
+   "sop::SopPriority": 5,
+   "sop::SopRunAction": 3,
+   "sop::SopRunAction::Failed": 1,
+   "sop::SopRunAction::WaitApproval": 1,
+   "sop::SopRunStatus": 4,
+   "sop::SopRunStatus::Cancelled": 2,
+   "sop::SopRunStatus::WaitingApproval": 5,
+   "sop::SopRunStore": 2,
+   "sop::SopStep": 5,
+   "sop::SopStepKind": 4,
+   "sop::SopTrigger": 5,
+   "sop::SopTriggerSource": 3,
+   "sop::SopTriggerSource::Manual": 1,
+   "sop::SqliteRunStore::open": 1,
+   "sop::StepToolScope": 1,
+   "sop::approval::ApprovalBroker::disabled": 1,
+   "sop::decision::Answers": 1,
+   "sop::decision::Question": 1,
+   "sop::engine::now_iso8601": 5,
+   "sop::load_sop_by_name": 2,
+   "sop::save_sop": 15,
+   "sop::store::InMemoryRunStore": 1,
+   "sop::store::InMemoryRunStore::new": 1,
+   "sop::store::PersistedRun": 1,
+   "sop::store::SopRunStore": 1,
+   "sop::types::Sop": 7,
+   "sop::types::SopAdmissionPolicy": 3,
+   "sop::types::SopAdmissionPolicy::Parallel": 6,
+   "sop::types::SopEvent": 4,
+   "sop::types::SopExecutionMode": 3,
+   "sop::types::SopExecutionMode::Auto": 1,
+   "sop::types::SopExecutionMode::Deterministic": 1,
+   "sop::types::SopPriority": 3,
+   "sop::types::SopPriority::Normal": 1,
+   "sop::types::SopRun": 1,
+   "sop::types::SopRunAction": 2,
+   "sop::types::SopRunStatus": 2,
+   "sop::types::SopRunStatus::Completed": 3,
+   "sop::types::SopRunStatus::Failed": 1,
+   "sop::types::SopRunStatus::Running": 1,
+   "sop::types::SopStep": 7,
+   "sop::types::SopStep::default": 3,
+   "sop::types::SopStepKind": 3,
+   "sop::types::SopStepKind::Capability": 1,
+   "sop::types::SopStepResult": 1,
+   "sop::types::SopStepStatus": 1,
+   "sop::types::SopTrigger": 1,
+   "sop::types::SopTrigger::Manual": 1,
+   "sop::types::SopTriggerSource": 5,
+   "sop::types::StepSchema": 1,
+   "sop::types::StepToolCall": 1
+  },
+  "rpc->tools": {
+   "tools::DelegateTool::NAME": 2,
+   "tools::PerToolChannelHandle": 1,
+   "tools::SESSION_DATA_TOOL_NAMES": 5,
+   "tools::scoped::ScopedToolRegistry::from_raw_for_test": 30
+  },
+  "security->i18n": {
+   "i18n::get_required_cli_string": 1,
+   "i18n::get_required_cli_string_with_args": 1
+  },
+  "security->sop": {
+   "sop::types::SopTriggerSource": 1
+  },
+  "security->tools": {
+   "tools::shell::ShellTool": 1
+  },
+  "service->restart": {
+   "restart::DESKTOP_RESTART_EXIT_CODE": 1,
+   "restart::DESKTOP_RESTART_MARKER_ENV": 1,
+   "restart::DESKTOP_SUPERVISED_ENV": 1
+  },
+  "skills->agent": {
+   "agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT": 1,
+   "agent::cost::ToolLoopCostTrackingContext": 1
+  },
+  "skills->i18n": {
+   "i18n::get_english_cli_string_with_args": 1
+  },
+  "skills->observability": {
+   "observability::noop::NoopObserver": 1
+  },
+  "skills->security": {
+   "security::SecurityPolicy::default": 2
+  },
+  "skills->tools": {
+   "tools::late_tool_search_observer::record": 3,
+   "tools::skill_tool::composed_tool_name": 3
+  },
+  "sop->agent": {
+   "agent::history_trim::is_sop_step_prompt": 1,
+   "agent::loop_::AgentRunOverrides": 1,
+   "agent::semantic_empty_terminal_completion_message": 2,
+   "agent::turn::collect_callable_tool_names": 1
+  },
+  "sop->i18n": {
+   "i18n::get_required_cli_string_with_args": 2
+  },
+  "sop->live_config_authority": {
+   "live_config_authority::AgentDeleteBlocker::ActiveTurns": 1,
+   "live_config_authority::LiveConfigAuthority": 1,
+   "live_config_authority::LiveConfigAuthority::new": 1
+  },
+  "sop->tools": {
+   "tools::SopApproveTool": 1,
+   "tools::all_tools_with_runtime": 1
+  },
+  "tools->agent": {
+   "agent::Agent::from_live_config_with_tui_env_and_principal_tools": 2,
+   "agent::agent::Agent": 2,
+   "agent::agent::Agent::from_config_with_capabilities": 1,
+   "agent::cost::ToolLoopCostTrackingContext": 3,
+   "agent::cost::record_tool_loop_cost_usage": 2,
+   "agent::dispatcher::NativeToolDispatcher": 1,
+   "agent::execution_tree_budget::ExecutionTreeBudget": 1,
+   "agent::execution_tree_budget::ExecutionTreeBudgetRole": 2,
+   "agent::execution_tree_budget::ExecutionTreeReservation": 2,
+   "agent::loop_::AgentRunOverrides": 1,
+   "agent::loop_::apply_policy_tool_filter": 1,
+   "agent::loop_::scope_session_key": 4,
+   "agent::loop_::scope_thread_id": 3,
+   "agent::tool_execution::find_tool": 14,
+   "agent::tool_receipts::ReceiptGenerator": 2,
+   "agent::tool_receipts::ReceiptScope": 2,
+   "agent::tool_receipts::TOOL_LOOP_RECEIPT_CONTEXT": 2,
+   "agent::turn::ModelSwitchCallback": 1,
+   "agent::turn::current_model_switch_state": 1,
+   "agent::turn::outcome::StreamPreExecutedToolsWithoutFinalResponse": 1,
+   "agent::turn::outcome::terminal_completion_error_message": 1,
+   "agent::turn::provider_call::enforce_tool_loop_budget": 2,
+   "agent::turn::scope_model_switch_provider_allowlist": 1,
+   "agent::turn::scope_model_switch_state": 1
+  },
+  "tools->composition": {
+   "composition::MemoryRequest": 1,
+   "composition::MemorySource": 1,
+   "composition::NativeRecipeInputs": 3,
+   "composition::NativeRegistryRecipe": 3,
+   "composition::ProviderRequest": 2,
+   "composition::ProviderSource": 2,
+   "composition::RegistryConstruction::NativeCompat": 2,
+   "composition::RuntimeCapabilities": 3,
+   "composition::ToolRequest": 4,
+   "composition::ToolSource": 1,
+   "composition::config_backed::NoSuppliedTools": 1,
+   "composition::config_backed::native_compat_registry": 2,
+   "composition::test_support::IMAGE_TURN": 1,
+   "composition::test_support::NoTools": 2,
+   "composition::test_support::RecordingMemory": 2,
+   "composition::test_support::RecordingProviders": 1,
+   "composition::test_support::RecordingProviders::default": 1,
+   "composition::test_support::STUB_REPLY": 2,
+   "composition::test_support::StubProvider": 2,
+   "composition::test_support::VISION_REFUSAL": 1,
+   "composition::test_support::VISION_REPLY": 1,
+   "composition::test_support::VisionRouteProviders": 2,
+   "composition::test_support::capabilities_with_providers": 5,
+   "composition::test_support::counting_endpoint": 1,
+   "composition::test_support::recording_capabilities": 1,
+   "composition::test_support::register_peripheral_trap": 1
+  },
+  "tools->control_plane": {
+   "control_plane::ControlPlaneHandle": 4,
+   "control_plane::SqliteTaskStore": 2,
+   "control_plane::TaskKind": 1,
+   "control_plane::TaskProgress": 1,
+   "control_plane::TaskProgress::default": 1,
+   "control_plane::TaskProgressTool": 1,
+   "control_plane::TaskProgressTool::default": 1,
+   "control_plane::TaskRecord": 1,
+   "control_plane::TaskRegistry": 1,
+   "control_plane::TaskSnapshot": 1,
+   "control_plane::TaskStatus": 1,
+   "control_plane::reaper::recovery_pass": 2,
+   "control_plane::task_registry::TerminalSettlementIntent": 3
+  },
+  "tools->cron": {
+   "cron::CronJob": 5,
+   "cron::Schedule::Cron": 10,
+   "cron::SessionTarget::Isolated": 7
+  },
+  "tools->i18n": {
+   "i18n::get_english_cli_string_with_args": 1,
+   "i18n::get_required_cli_string": 16,
+   "i18n::get_required_cli_string_with_args": 6,
+   "i18n::get_tool_description": 1
+  },
+  "tools->live_config_authority": {
+   "live_config_authority::AgentDeleteBlocker::ActiveTurns": 5,
+   "live_config_authority::AgentLifecycleCoordinator": 1,
+   "live_config_authority::LiveConfigAuthority": 1,
+   "live_config_authority::LiveConfigAuthority::new": 5
+  },
+  "tools->observability": {
+   "observability::NoopObserver": 1,
+   "observability::Observer": 1
+  },
+  "tools->plugin_state": {
+   "plugin_state::PluginStateStore::new": 1
+  },
+  "tools->security": {
+   "security::AutonomyLevel": 10,
+   "security::AutonomyLevel::Full": 4,
+   "security::AutonomyLevel::Supervised": 1,
+   "security::NoopSandbox": 5,
+   "security::SecurityPolicy": 8,
+   "security::traits::Sandbox": 1
+  },
+  "tools->skills": {
+   "skills::Skill": 11,
+   "skills::SkillTool": 13,
+   "skills::load_plugin_skills_from_config": 1,
+   "skills::load_skills_for_agent_from_config": 1
+  },
+  "tools->sop": {
+   "sop::SopAuditLogger::new": 4,
+   "sop::SopEngine": 1,
+   "sop::SopEngine::new": 2,
+   "sop::SopRunAction::ExecuteStep": 1,
+   "sop::SopRunStatus::Failed": 1,
+   "sop::SopStep": 4,
+   "sop::SopStep::default": 3,
+   "sop::StepToolScope": 4,
+   "sop::active_scope::HeadlessStepScope": 5,
+   "sop::active_scope::with_active_headless_step_scope": 4,
+   "sop::approval::ApprovalBroker::disabled": 1,
+   "sop::engine::SopEngine": 5,
+   "sop::engine::now_iso8601": 1,
+   "sop::types::*": 5,
+   "sop::types::Sop": 1,
+   "sop::types::SopAdmissionPolicy": 1,
+   "sop::types::SopAdmissionPolicy::Parallel": 5,
+   "sop::types::SopEvent": 1,
+   "sop::types::SopExecutionMode": 1,
+   "sop::types::SopPriority": 1,
+   "sop::types::SopRunAction": 1,
+   "sop::types::SopRunStatus": 1,
+   "sop::types::SopStep": 1,
+   "sop::types::SopStepKind": 1,
+   "sop::types::SopTrigger": 1,
+   "sop::types::SopTriggerSource": 1
+  }
+ }
+}

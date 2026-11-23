@@ -1,0 +1,20 @@
+observability pure     touch=  4 merge-clean-today=  6  newly-conflicting=  0 (ready 0; of which touch the module 0)  kinds={}
+hooks pure             touch=  9 merge-clean-today=  8  newly-conflicting=  0 (ready 0; of which touch the module 0)  kinds={}
+cron pure              touch= 35 merge-clean-today= 23  newly-conflicting=  0 (ready 0; of which touch the module 0)  kinds={}
+sop pure               touch= 42 merge-clean-today= 27  newly-conflicting=  1 (ready 1; of which touch the module 1)  kinds={'file location': 1}
+security pure          touch= 22 merge-clean-today= 15  newly-conflicting=  2 (ready 2; of which touch the module 2)  kinds={'file location': 2}
+skills pure            touch= 29 merge-clean-today= 23  newly-conflicting=  1 (ready 1; of which touch the module 1)  kinds={'rename/delete': 1}
+daemon pure            touch= 65 merge-clean-today= 23  newly-conflicting=  0 (ready 0; of which touch the module 0)  kinds={}
+doctor pure            touch= 10 merge-clean-today= 12  newly-conflicting=  0 (ready 0; of which touch the module 0)  kinds={}
+quickstart pure        touch= 13 merge-clean-today= 11  newly-conflicting=  0 (ready 0; of which touch the module 0)  kinds={}
+control_plane pure     touch= 16 merge-clean-today=  8  newly-conflicting=  2 (ready 0; of which touch the module 2)  kinds={'file location': 2}
+rpc pure               touch=118 merge-clean-today= 58  newly-conflicting=  1 (ready 0; of which touch the module 1)  kinds={'file location': 1}
+tools pure             touch=112 merge-clean-today= 66  newly-conflicting=  4 (ready 4; of which touch the module 4)  kinds={'file location': 4}
+agent pure             touch=122 merge-clean-today= 83  newly-conflicting=  4 (ready 3; of which touch the module 4)  kinds={'file location': 4}
+observability rewritten touch=  4 merge-clean-today=  6  newly-conflicting=  0 (ready 0; of which touch the module 0)  kinds={}
+cron rewritten         touch= 35 merge-clean-today= 23  newly-conflicting=  9 (ready 9; of which touch the module 9)  kinds={'content': 9}
+sop rewritten          touch= 42 merge-clean-today= 27  newly-conflicting= 12 (ready 12; of which touch the module 12)  kinds={'content': 11, 'file location': 1}
+security rewritten     touch= 22 merge-clean-today= 15  newly-conflicting=  2 (ready 2; of which touch the module 2)  kinds={'file location': 2}
+locales+i18n pure      touch=140 merge-clean-today= 77  newly-conflicting=  0 (ready 0; of which touch the module 0)  kinds={}
+whole crate rename     touch=345 merge-clean-today=215  newly-conflicting= 20 (ready 12; of which touch the module 20)  kinds={'rename/delete': 1, 'file location': 19}
+DONE
