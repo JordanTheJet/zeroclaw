@@ -33,7 +33,7 @@ Discussion, the open decisions and the pull request checklist are in the tracker
 
 ## The picture
 
-**The crate today.** Numbers in boxes are thousands of production lines. Solid arrows are the intended direction of calls. Dotted arrows are the 42 references that point the wrong way, each with its count. `agent` and `tools` call each other 26 and 64 times, which is why they stay together.
+**The crate today.** Numbers in boxes are thousands of production lines. Solid arrows are the intended direction of calls. Dotted arrows are the 42 references that point the wrong way, each with its count. `agent` and `tools` refer to each other 26 and 64 times, which is why they stay together.
 
 ```mermaid
 flowchart TB
@@ -90,7 +90,7 @@ flowchart TB
   cronc["zeroclaw-cron, new<br/>cron, 6.3K<br/>Status: not designed,<br/>design note first"]
   sopc["zeroclaw-sop, new<br/>sop and calendar, 24.3K<br/>Status: not designed"]
   infra["zeroclaw-infra, exists<br/>gains util, health, shell_output<br/>about 0.4K<br/>Status: util built, the rest proposed"]
-  prov["zeroclaw-providers, exists<br/>gains the redaction helpers<br/>about 0.3K<br/>Status: built"]
+  prov["zeroclaw-providers, exists<br/>gains the redaction helpers<br/>about 0.3K<br/>Status: built, home not decided"]
   hostcr --> rt
   rt --> obsc
   rt --> cronc
