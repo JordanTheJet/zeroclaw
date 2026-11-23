@@ -3,6 +3,9 @@
 **Status: a proposal for discussion.** Measured at `master` commit `e02b7fb6f6` on 2026-11-22. Nothing here is
 decided, and none of the code has been opened as a pull request.
 
+Discussion, the open decisions and the pull request checklist are in the tracker issue:
+<https://github.com/zeroclaw-labs/zeroclaw/issues/12697>.
+
 ## Start here
 
 | Read | For |
