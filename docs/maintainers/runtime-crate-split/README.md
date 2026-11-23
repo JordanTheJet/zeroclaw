@@ -82,14 +82,15 @@ flowchart TB
 **The proposed split.** Arrows read "depends on". A thick border means built and compile-checked. A dashed border means proposed and not decided. A dotted border means not designed yet. About 4K lines (`quickstart`, `hooks`, `browse`, `routines`, `trust`) are left for later and not drawn.
 
 ```mermaid
+%%{init: {"flowchart": {"wrappingWidth": 420}}}%%
 flowchart TB
-  hostcr["Host crates, new<br/>daemon, heartbeat, restart, doctor, service, tunnel,<br/>integrations, migration, later relay and enroll<br/>about 14.6K<br/>Status: not designed"]
-  rt["zeroclaw-runtime after the split, about 107K<br/>agent, tools, skills, composition, approval,<br/>security, rpc, plugin_runtime, plugin_state,<br/>live_config_authority, config_application,<br/>control_plane, i18n, small helpers<br/>Status: proposed, the RFC decides"]
+  hostcr["Host crates, new<br/>daemon, heartbeat, restart, doctor,<br/>service, tunnel, integrations,<br/>migration, later relay and enroll<br/>about 14.6K<br/>Status: not designed"]
+  rt["zeroclaw-runtime after the split<br/>about 107K<br/>agent, tools, skills, composition,<br/>approval, security, rpc, i18n,<br/>plugin_runtime, plugin_state,<br/>live_config_authority, control_plane,<br/>config_application, small helpers<br/>Status: proposed, the RFC decides"]
   obsc["zeroclaw-observability, new<br/>observability, 3.3K<br/>Status: built"]
-  cronc["zeroclaw-cron, new<br/>cron, 6.3K<br/>Status: not designed, design note first"]
+  cronc["zeroclaw-cron, new<br/>cron, 6.3K<br/>Status: not designed,<br/>design note first"]
   sopc["zeroclaw-sop, new<br/>sop and calendar, 24.3K<br/>Status: not designed"]
-  infra["zeroclaw-infra, exists<br/>gains util, health, shell_output, about 0.4K<br/>Status: util built, the rest proposed"]
-  prov["zeroclaw-providers, exists<br/>gains the redaction helpers, about 0.3K<br/>Status: built"]
+  infra["zeroclaw-infra, exists<br/>gains util, health, shell_output<br/>about 0.4K<br/>Status: util built, the rest proposed"]
+  prov["zeroclaw-providers, exists<br/>gains the redaction helpers<br/>about 0.3K<br/>Status: built"]
   hostcr --> rt
   rt --> obsc
   rt --> cronc
