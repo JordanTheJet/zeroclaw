@@ -11,9 +11,10 @@ Discussion, the open decisions and the pull request checklist are in the tracker
 | Read | For |
 |---|---|
 | [`REPORT.md`](REPORT.md) | One screen: the recommendation, the first three pull requests, the open decisions, and what was not verified |
+| [`WORK-PLAN.md`](WORK-PLAN.md) | The order of work: what each step waits on and who is needed |
 | [`PLAN.md`](PLAN.md) | The target layout, the governance question, the pull request sequence, the landing method, and what to do with #10557 |
 | [`ARCHITECTURE.md`](ARCHITECTURE.md) | The crate as measured: its layers, its cycles, the 42 upward references, and where the exceptions cluster |
-| [`REVIEW-LOG.md`](REVIEW-LOG.md) | Five adversarial review passes and what each one changed |
+| [`REVIEW-LOG.md`](REVIEW-LOG.md) | Seven adversarial review passes and what each one changed |
 
 ## The short version
 
@@ -114,7 +115,8 @@ flowchart TB
 - **Drafted by an AI coding assistant (Claude)** working from the repository at the commit above, for a maintainer who
   asked for a split whose pull requests merge within days.
 - **Every number comes from a script in this folder** and can be re-run.
-- **A second model reviewed it adversarially five times** (`gpt-6.2-astra`, in a read-only sandbox). The first pass
+- **A second model reviewed it adversarially five times** (`gpt-6.2-astra`, in a read-only sandbox), and the work
+  plan and diagrams twice more. The first pass
   was a BLOCK and was right on most findings; the documents were revised after each pass. The raw reviews are the
   `ASTRA-REVIEW-*.md` files.
 - **It is a checked draft, not a decision.** `REPORT.md` lists what was not verified.
@@ -139,7 +141,8 @@ flowchart TB
 | `open-prs-20261122.json` | The 588 open pull requests it measured, with each head commit |
 | `simmove-results-e02b7fb6f6.json`, `.txt` | Its results per module |
 | `exposure-stack-e02b7fb6f6.json`, `exposure-pr-list.txt` | The same measurement for the three real commits |
-| `ASTRA-REVIEW-*.md` | The five reviews |
+| `ASTRA-REVIEW-*.md` | The seven reviews: five of the documents, two of the work plan and the diagrams |
+| `ISSUE-DIAGRAMS.md` | The two diagrams as they appear in the tracker issue and under "The picture" above |
 
 ## Re-running it
 

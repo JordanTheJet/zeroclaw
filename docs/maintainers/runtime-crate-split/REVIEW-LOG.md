@@ -1,4 +1,4 @@
-# Review log: astra's five passes and what each changed
+# Review log: astra's passes and what each changed
 
 2026-11-22. This is the detail behind the "Review status" lines in `REPORT.md`. The reviewer is a second model,
 `gpt-6.2-astra` (called astra here), run in a read-only sandbox and asked to attack the documents: recompute the
@@ -72,3 +72,17 @@ agree with them. Its first BLOCK was on treating the governance question as sett
 specified; both were accepted and the documents no longer do either. Its later BLOCKs are on merging the move scripts into the
 repository, which is also accepted: they are a proof. It approved the `observability` extraction for pull request
 review, and the three commits as compile evidence.
+
+## Passes 6 and 7: the work plan and the issue diagrams
+
+`WORK-PLAN.md` and the two diagrams in the tracker issue (`ISSUE-DIAGRAMS.md`) were written after the five passes
+above and reviewed separately: `ASTRA-REVIEW-6-20261123.md` and `ASTRA-REVIEW-7-20261125.md`.
+
+| Pass | Verdict | What it turned on |
+|---|---|---|
+| 6 | Work plan: BLOCK. Diagrams: APPROVE WITH FIXES | The work plan said no commit on `master` had touched the patched files, when seven had. It left the `health` and shell-output move and the crate-name decision out of the gates for the cron extraction. It did not say that the regeneration script cannot produce the third pull request alone, or that the third pull request may exceed the plan's own size limit. In the diagrams, every size and count matched the data; the host box had dropped `relay_dashboard`, `zeroclaw-infra` was drawn as fully built, and the redaction home read as decided |
+| 7 | Work plan: APPROVE WITH FIXES. Diagrams: APPROVE | All seven findings fixed or partly fixed. Remaining: follow-up after every merge and not only two of them, the driver's staging of the registration files, the review of the scripts placed at merge time, and the vote wording. Those are applied |
+
+The gate diagram in `WORK-PLAN.md` was redrawn after pass 7 and has not been reviewed since. Neither pass could
+compile anything or render a diagram. The two issue diagrams were checked in a browser in their first form; the
+corrected second one and the work plan's diagram were not.
