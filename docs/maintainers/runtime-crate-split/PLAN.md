@@ -295,6 +295,9 @@ of open pull requests that merge today and would stop merging.
 | 2 | `refactor(providers): give credential redaction one owner` | `agent/turn/redact.rs`, `approval::looks_like_secret_key`, `agent::loop_::scrub_for_export`. Old paths re-export | `observability`→`agent` (1), `hooks`→`agent` (2) | 0 | +54/−52 | 2 |
 | 3 | `refactor(observability): extract observer backends into zeroclaw-observability` | 12 files, 6,190 lines, unchanged but for 2 lines | Removes `observability` and `hooks` from the cycle | 0 | +100/−6 plus about 55 lines of labeler, CODEOWNERS and docs registration | 6, all in the root `Cargo.toml` |
 
+With its registration edits, pull request 3 comes to about 161 lines outside renames, over the 150-line limit in
+rule 4 below. Measure the real figure, and split the docs registration into a follow-up if it stays over.
+
 No row is retired here: `observability` appears in none. This phase exists to prove the method on the module with the
 least traffic (4 open pull requests) before using it where it matters.
 
@@ -307,7 +310,7 @@ precedent tidux approved on #10557 for `shell_output`; it would mean moving `scr
 | # | Change | What it does | Size | Exposure |
 |---|---|---|---|---|
 | 4 | **Design note:** who owns execution admission for cron | A short written design, reviewed before any cron code. See below | 1 to 2 pages | None |
-| 5 | `refactor(infra): move health and shell-output decoding down` | `health.rs` (144 lines) and `tools/shell_output.rs`, unchanged, re-exported. Cuts `cron`→`tools` (2) and `skills`→`tools` (2) | About 30 lines | `health` has 1 open pull request |
+| 5 | `refactor(infra): move health and shell-output decoding down` | `health/mod.rs` (144 production lines) and `tools/shell_output.rs`, unchanged, re-exported. Cuts `cron`→`tools` (2) and `skills`→`tools` (2) | About 30 lines | `health` has 1 open pull request |
 | 6 | `refactor(cron): put a host seam between the scheduler and the runtime` | **In place, no file moves.** Whatever 4 decides | Unknown until 4. Not small: `scheduler.rs` names the admission types at about 20 places | 35 open pull requests touch `cron`; this is the one change in the sequence that edits those files |
 | 7 | `refactor(cron): extract cron into zeroclaw-cron` | `cron/` moves unchanged, by script | About 100 lines | 0 of 23 for the code (measured) |
 | 8 | `feat(cron): add the precondition gate` | `precondition.rs`, the schema key and docs from #10557, now in `zeroclaw-cron` | About 900 lines | Normal feature review |

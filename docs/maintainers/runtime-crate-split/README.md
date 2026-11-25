@@ -17,8 +17,8 @@ Discussion, the open decisions and the pull request checklist are in the tracker
 
 ## The short version
 
-- **The crate is three layers, not one knot.** It has 160,631 production lines. 42 references point up from seven
-  subsystems into the core. `agent` and `tools` are one unit and stay together.
+- **The crate is three layers, not one knot.** It has 160,631 production lines. 42 references from seven subsystems
+  point the wrong way: 39 up into the core and 3 between subsystems. `agent` and `tools` are one unit and stay together.
 - **The exceptions come from two documents that disagree.** 55 of the 60 rows in the exception table send code to
   `zeroclaw-kernel`, a crate nothing schedules. Settling which modules may live in `zeroclaw-runtime` is a governance
   change and needs an RFC and a vote.
@@ -79,18 +79,18 @@ flowchart TB
   security -.->|"2"| sop
 ```
 
-**The proposed split.** Arrows read "depends on". A thick border means built and compile-checked. A dashed border means proposed and not decided. A dotted border means not designed yet. About 4K lines (`quickstart`, `hooks`, `browse`, `routines`, `trust`) are left for later and not drawn.
+**The proposed split.** Arrows read "depends on". A thick border means built and compile-checked. A thick dashed border means partly built. A thin dashed border means proposed and not decided. A dotted border means not designed yet. About 4K lines (`quickstart`, `hooks`, `browse`, `routines`, `trust`) are left for later and not drawn.
 
 ```mermaid
 %%{init: {"flowchart": {"wrappingWidth": 420}}}%%
 flowchart TB
-  hostcr["Host crates, new<br/>daemon, heartbeat, restart, doctor,<br/>service, tunnel, integrations,<br/>migration, later relay and enroll<br/>about 14.6K<br/>Status: not designed"]
+  hostcr["Host crates, new<br/>daemon, heartbeat, restart, doctor,<br/>service, tunnel, integrations,<br/>migration, later relay, enroll,<br/>relay_dashboard<br/>about 14.6K<br/>Status: not designed"]
   rt["zeroclaw-runtime after the split<br/>about 107K<br/>agent, tools, skills, composition,<br/>approval, security, rpc, i18n,<br/>plugin_runtime, plugin_state,<br/>live_config_authority, control_plane,<br/>config_application, small helpers<br/>Status: proposed, the RFC decides"]
   obsc["zeroclaw-observability, new<br/>observability, 3.3K<br/>Status: built"]
   cronc["zeroclaw-cron, new<br/>cron, 6.3K<br/>Status: not designed,<br/>design note first"]
   sopc["zeroclaw-sop, new<br/>sop and calendar, 24.3K<br/>Status: not designed"]
   infra["zeroclaw-infra, exists<br/>gains util, health, shell_output<br/>about 0.4K<br/>Status: util built, the rest proposed"]
-  prov["zeroclaw-providers, exists<br/>gains the redaction helpers<br/>about 0.3K<br/>Status: built, home not decided"]
+  prov["zeroclaw-providers, exists<br/>prototype home for redaction<br/>about 0.3K<br/>Status: built in the prototype,<br/>zeroclaw-infra is the alternative"]
   hostcr --> rt
   rt --> obsc
   rt --> cronc
@@ -100,9 +100,11 @@ flowchart TB
   obsc --> infra
   obsc --> prov
   classDef built stroke-width:3px;
+  classDef partly stroke-width:3px,stroke-dasharray:6 4;
   classDef proposed stroke-dasharray:6 4;
   classDef undesigned stroke-dasharray:2 3;
-  class obsc,infra,prov built;
+  class obsc,prov built;
+  class infra partly;
   class rt proposed;
   class hostcr,cronc,sopc undesigned;
 ```

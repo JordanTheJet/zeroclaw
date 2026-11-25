@@ -13,7 +13,7 @@ modules stay in `zeroclaw-runtime`. Do not start cron until a short design note 
   nothing schedules. FND-001 (line 612) puts the agent loop, security policy, plugin host and IPC API in
   `zeroclaw-runtime`; the holding-crate contract lists the agent loop, security and skills for extraction. Settling
   that is a governance change and needs an RFC and a vote (FND-003 §8).
-- **The crate is three layers, not one knot.** 42 references point up from seven subsystems into the core. `agent`
+- **The crate is three layers, not one knot.** 42 references from seven subsystems point the wrong way: 39 up into the core and 3 between subsystems. `agent`
   and `tools` are one unit and stay together.
 - **A move that does not edit the moved files breaks very few open pull requests.** Measured against all 588: moving
   `cron` byte-for-byte breaks 0 of the 23 that merge today; the same move with path edits inside the files breaks 9.
